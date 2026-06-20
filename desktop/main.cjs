@@ -261,28 +261,6 @@ ipcMain.handle("codex:restore", async () => {
   return result;
 });
 
-ipcMain.handle("codex:restart", async () => {
-  if (process.platform !== "win32") {
-    throw new Error("Restart Codex is currently supported on Windows only.");
-  }
-  const codexProcess = await findRunningCodexProcess();
-  if (!codexProcess?.path) {
-    throw new Error("没有找到正在运行的 Codex/ChatGPT 进程。请先手动打开 Codex，再点重启。");
-  }
-  await runWindowsCommand("taskkill", ["/PID", String(codexProcess.pid), "/T", "/F"], {
-    allowFailure: true,
-  });
-  await delay(900);
-  const child = spawn(codexProcess.path, [], {
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true,
-  });
-  child.unref();
-  appendLog(`Restarted ${codexProcess.name}: ${codexProcess.path}`);
-  return { ok: true, path: codexProcess.path, processName: codexProcess.name };
-});
-
 ipcMain.handle("router:start", async () => {
   if (routerProcess) {
     return { ok: true, message: "Router is already running." };
@@ -518,62 +496,6 @@ function emptyUsageSummary() {
   };
 }
 
-async function findRunningCodexProcess() {
-  const command =
-    "$names=@('Codex','ChatGPT','OpenAICodex','OpenAI Codex'); " +
-    "Get-Process | Where-Object { $names -contains $_.ProcessName } | " +
-    "Select-Object -First 1 Id,ProcessName,Path | ConvertTo-Json -Compress";
-  const result = await runWindowsCommand("powershell.exe", [
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-Command",
-    command,
-  ], { allowFailure: true });
-  const output = result.output.trim();
-  if (!output) {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(output);
-    if (!parsed?.Path || !fs.existsSync(parsed.Path)) {
-      return null;
-    }
-    return {
-      pid: parsed.Id,
-      name: parsed.ProcessName,
-      path: parsed.Path,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function runWindowsCommand(command, args, options = {}) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { windowsHide: true });
-    let output = "";
-    child.stdout.on("data", (chunk) => {
-      output += chunk.toString("utf8");
-    });
-    child.stderr.on("data", (chunk) => {
-      output += chunk.toString("utf8");
-    });
-    child.on("error", reject);
-    child.on("exit", (code) => {
-      if (code !== 0 && !options.allowFailure) {
-        reject(new Error(output.trim() || `${command} exited with code ${code}`));
-        return;
-      }
-      resolve({ code, output });
-    });
-  });
-}
-
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 async function runDesktopSmokeChecks() {
   try {
     const result = await mainWindow.webContents.executeJavaScript(`
@@ -581,7 +503,6 @@ async function runDesktopSmokeChecks() {
         const required = [
           "#initializeCodex",
           "#restoreCodexConfig",
-          "#restartCodex",
           "#routerToggle",
           "#saveModelSelectionPanel",
           "#providerGrid",

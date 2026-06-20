@@ -24,5 +24,8 @@
   "devDependencies": {
     "@electron/packager": "^20.0.1",
     "electron": "^39.2.7"
+  },
+  "dependencies": {
+    "undici": "^7.28.0"
   }
 }

@@ -43,7 +43,6 @@ const appPaths = await packager({
     /^\/\.github(?:\/|$)/,
     /^\/AGENTS\.md$/,
     /^\/Start-CodexBridge\.cmd$/,
-    /^\/node_modules(?:\/|$)/,
     /^\/release(?:\/|$)/,
     /^\/dist(?:\/|$)/,
     /^\/build(?:\/|$)/,

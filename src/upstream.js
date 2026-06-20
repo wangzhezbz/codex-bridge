@@ -6,6 +6,7 @@ import {
   chatResponseToResponse,
   responseToSse,
 } from "./chat-to-responses.js";
+import { fetchInitWithProxy, proxyLogLabel } from "./proxy.js";
 
 export class UpstreamHttpError extends Error {
   constructor(statusCode, bodyText, upstreamUrl) {
@@ -38,11 +39,11 @@ export async function proxyResponsesApi(requestBody, route, res, context = {}) {
 
   const upstreamUrl = joinUpstreamUrl(route.baseUrl, "/responses");
   logRoute(context, route, upstreamUrl);
-  const upstream = await fetch(upstreamUrl, {
+  const upstream = await fetch(upstreamUrl, fetchInitWithProxy(upstreamUrl, {
     method: "POST",
     headers: upstreamHeaders(route, context),
     body: JSON.stringify(payload),
-  });
+  }));
   logStatus(context, route, upstream.status);
 
   if (!upstream.ok) {
@@ -99,11 +100,11 @@ export async function proxyChatCompletions(
 }
 
 export async function callJsonUpstream(upstreamUrl, route, payload, context = {}) {
-  const upstream = await fetch(upstreamUrl, {
+  const upstream = await fetch(upstreamUrl, fetchInitWithProxy(upstreamUrl, {
     method: "POST",
     headers: upstreamHeaders(route, context),
     body: JSON.stringify(payload),
-  });
+  }));
   const text = await upstream.text();
   if (!upstream.ok) {
     throw new UpstreamHttpError(upstream.status, text, upstreamUrl);
@@ -177,10 +178,12 @@ function filteredHeaders(headers) {
 
 function logRoute(context, route, upstreamUrl) {
   const requestId = context.requestId || "req";
+  const proxy = proxyLogLabel(upstreamUrl);
   console.log(
     `[${new Date().toISOString()}] ${requestId} -> upstream ` +
       `route=${route.id} api=${route.api} upstream_model=${route.model} ` +
-      `url=${safeUrl(upstreamUrl)}`,
+      `url=${safeUrl(upstreamUrl)}` +
+      (proxy ? ` proxy=${proxy}` : ""),
   );
 }
 

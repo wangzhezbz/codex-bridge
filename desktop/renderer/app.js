@@ -62,13 +62,6 @@ document.querySelector("#restoreCodexConfig").addEventListener("click", (event) 
   }),
 );
 
-document.querySelector("#restartCodex").addEventListener("click", (event) =>
-  runAction(event.currentTarget, async () => {
-    await api.restartCodex();
-    showToast("Codex 已重启。");
-  }),
-);
-
 els.routerToggle.addEventListener("click", () =>
   runAction(els.routerToggle, async () => {
     if (state?.routerRunning) {
