@@ -118,6 +118,31 @@ Developer preview requires Node.js 20 or newer.
 
 当前开发预览版需要 Node.js 20 或更高版本。
 
+### Desktop manager / 桌面管理器
+
+On Windows, double-click:
+
+Windows 下可以直接双击：
+
+```text
+Start-CodexBridge.cmd
+```
+
+The first launch installs desktop dependencies if needed, then opens the CodexBridge window. In the window, choose a billing mode, fill API keys, generate the model catalog, apply Codex config, and start the router.
+
+第一次启动会自动安装桌面依赖，然后打开 CodexBridge 窗口。你可以在窗口里选择计费模式、填写 API Key、生成模型目录、写入 Codex 配置并启动 router。
+
+For development, you can also run:
+
+开发时也可以运行：
+
+```powershell
+npm install
+npm run desktop
+```
+
+### Headless router / 无界面路由
+
 ```powershell
 git clone https://github.com/wangzhezbz/codex-bridge.git
 cd codex-bridge

@@ -18,6 +18,22 @@ This guide is for the current headless developer preview. The future desktop app
 
 ## 1. Prepare Config / 准备配置
 
+Recommended for most users:
+
+大多数用户建议直接双击：
+
+```text
+Start-CodexBridge.cmd
+```
+
+Then use the desktop window to select mode, fill API keys, generate the catalog, apply Codex config, and start the router.
+
+然后在桌面窗口里选择模式、填写 API Key、生成模型目录、写入 Codex 配置并启动 router。
+
+Manual developer setup:
+
+手动开发配置：
+
 ```powershell
 cd F:\game_code\router
 Copy-Item .\config\router.config.example.json .\config\router.config.json

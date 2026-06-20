@@ -8,9 +8,15 @@
     "node": ">=20"
   },
   "scripts": {
+    "desktop": "electron desktop/main.cjs",
+    "desktop:dev": "electron desktop/main.cjs",
+    "desktop:smoke": "node scripts/desktop-smoke.mjs",
     "start": "node src/server.js",
     "catalog": "node scripts/generate-catalog.js",
     "test": "node --test tests/*.test.js",
-    "check": "node --check src/server.js && node --check scripts/generate-catalog.js && node --test tests/*.test.js"
+    "check": "node --check src/server.js && node --check scripts/generate-catalog.js && node --check scripts/desktop-smoke.mjs && node --check desktop/main.cjs && node --check desktop/preload.cjs && node --check desktop/renderer/app.js && node --test tests/*.test.js"
+  },
+  "devDependencies": {
+    "electron": "^39.2.7"
   }
 }

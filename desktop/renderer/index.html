@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self';"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CodexBridge</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">CB</div>
+          <div>
+            <div class="brand-title">CodexBridge</div>
+            <div class="brand-subtitle">多模型本地网关</div>
+          </div>
+        </div>
+        <nav class="nav-list" aria-label="Primary">
+          <button class="nav-item active" data-section="dashboard">概览</button>
+          <button class="nav-item" data-section="models">模型</button>
+          <button class="nav-item" data-section="providers">密钥</button>
+          <button class="nav-item" data-section="codex">Codex</button>
+          <button class="nav-item" data-section="logs">日志</button>
+        </nav>
+        <button class="ghost-button full" id="openGitHub">GitHub</button>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <h1>CodexBridge 控制台</h1>
+            <p>把 GPT、DeepSeek、Kimi 和更多模型放进同一个 Codex 模型栏。</p>
+          </div>
+          <div class="status-cluster">
+            <span class="status-pill" id="routerStatus">Router 未启动</span>
+            <span class="status-pill muted" id="modeStatus">读取中</span>
+          </div>
+        </header>
+
+        <section class="section-panel" id="dashboard">
+          <div class="grid two">
+            <article class="panel">
+              <div class="panel-header">
+                <div>
+                  <h2>计费模式</h2>
+                  <p>选择用户最关心的模型费用来源。</p>
+                </div>
+              </div>
+              <div class="mode-grid">
+                <button class="mode-card" data-mode="hybrid">
+                  <span class="mode-title">推荐：GPT 走订阅</span>
+                  <span class="mode-copy">GPT-5.5 / GPT-5.4 使用 Codex/OpenAI 认证，DeepSeek/Kimi 使用各自 API Key。</span>
+                </button>
+                <button class="mode-card" data-mode="all_api">
+                  <span class="mode-title">全部 API</span>
+                  <span class="mode-copy">所有模型都使用你配置的 API Key，适合统一走接口账户。</span>
+                </button>
+              </div>
+            </article>
+
+            <article class="panel">
+              <div class="panel-header">
+                <div>
+                  <h2>一键操作</h2>
+                  <p>按顺序点完这几个按钮，不需要手敲命令。</p>
+                </div>
+              </div>
+              <div class="action-stack">
+                <button class="primary-button" id="saveSecrets">保存 API Key</button>
+                <button class="plain-button" id="generateCatalog">生成模型目录</button>
+                <button class="plain-button" id="applyCodex">写入 Codex 配置</button>
+                <div class="split-actions">
+                  <button class="primary-button" id="startRouter">启动 Router</button>
+                  <button class="danger-button" id="stopRouter">停止</button>
+                </div>
+              </div>
+            </article>
+          </div>
+
+          <div class="grid three metric-row">
+            <article class="metric">
+              <span class="metric-label">项目目录</span>
+              <strong id="rootDir">-</strong>
+            </article>
+            <article class="metric">
+              <span class="metric-label">模型数量</span>
+              <strong id="modelCount">0</strong>
+            </article>
+            <article class="metric">
+              <span class="metric-label">密钥状态</span>
+              <strong id="keySummary">-</strong>
+            </article>
+          </div>
+        </section>
+
+        <section class="section-panel hidden" id="models">
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>模型栏预览</h2>
+                <p>这里显示的就是 Codex 模型栏会看到的模型。</p>
+              </div>
+              <button class="ghost-button" id="openConfigFolder">打开配置目录</button>
+            </div>
+            <div class="model-table" id="modelTable"></div>
+          </article>
+        </section>
+
+        <section class="section-panel hidden" id="providers">
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>API Key</h2>
+                <p>密钥只保存在本机 `config/secrets.local.json`，不会提交到 Git。</p>
+              </div>
+            </div>
+            <div class="form-grid">
+              <label>
+                <span>GPT API Key</span>
+                <input id="fennoKey" type="password" placeholder="全部 API 模式才需要" />
+              </label>
+              <label>
+                <span>DeepSeek API Key</span>
+                <input id="deepseekKey" type="password" placeholder="sk-..." />
+              </label>
+              <label>
+                <span>Kimi / Moonshot API Key</span>
+                <input id="moonshotKey" type="password" placeholder="sk-..." />
+              </label>
+            </div>
+          </article>
+        </section>
+
+        <section class="section-panel hidden" id="codex">
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>Codex 接入</h2>
+                <p>写入前会自动备份原来的 `%USERPROFILE%\.codex\config.toml`。</p>
+              </div>
+              <button class="ghost-button" id="openCodexFolder">打开 Codex 目录</button>
+            </div>
+            <div class="notice">
+              混合模式会写入 <code>requires_openai_auth = true</code>。全部 API 模式会写入本地 router token。
+            </div>
+          </article>
+        </section>
+
+        <section class="section-panel hidden" id="logs">
+          <article class="panel logs-panel">
+            <div class="panel-header">
+              <div>
+                <h2>实时日志</h2>
+                <p>确认请求实际走到了哪个 provider、哪个模型。</p>
+              </div>
+            </div>
+            <pre id="logOutput"></pre>
+          </article>
+        </section>
+      </main>
+    </div>
+    <script src="./app.js"></script>
+  </body>
+</html>
+
