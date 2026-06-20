@@ -29,16 +29,8 @@ where npm >> "%LOG%" 2>&1
 >> "%LOG%" echo npm version:
 call npm --version >> "%LOG%" 2>&1
 
-if not exist "node_modules\electron\dist\electron.exe" (
-  echo Installing CodexBridge desktop dependencies...
-  >> "%LOG%" echo.
-  >> "%LOG%" echo Installing dependencies with npm install...
-  set ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
-  call npm install >> "%LOG%" 2>&1
-  if errorlevel 1 (
-    goto fail
-  )
-)
+call :ensureElectron
+if errorlevel 1 goto fail
 
 if /I "%~1"=="--smoke" (
   echo Running CodexBridge desktop smoke check...
@@ -62,6 +54,45 @@ if errorlevel 1 (
   >> "%LOG%" echo Missing required command: %1
   exit /b 1
 )
+exit /b 0
+
+:ensureElectron
+call :checkElectron
+if not errorlevel 1 (
+  >> "%LOG%" echo Electron check passed.
+  exit /b 0
+)
+
+echo Electron is missing or damaged. Repairing desktop dependency...
+>> "%LOG%" echo.
+>> "%LOG%" echo Electron check failed. Repairing Electron package...
+set "ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/"
+set "npm_config_electron_mirror=https://npmmirror.com/mirrors/electron/"
+
+call npm rebuild electron >> "%LOG%" 2>&1
+call :checkElectron
+if not errorlevel 1 (
+  >> "%LOG%" echo Electron repaired with npm rebuild electron.
+  exit /b 0
+)
+
+>> "%LOG%" echo npm rebuild did not repair Electron. Running npm install --force...
+call npm install --force >> "%LOG%" 2>&1
+if errorlevel 1 exit /b 1
+
+call :checkElectron
+if errorlevel 1 (
+  >> "%LOG%" echo Electron is still not usable after repair.
+  exit /b 1
+)
+
+>> "%LOG%" echo Electron repaired with npm install --force.
+exit /b 0
+
+:checkElectron
+if not exist "node_modules\electron\package.json" exit /b 1
+node -e "require('electron')" >> "%LOG%" 2>&1
+if errorlevel 1 exit /b 1
 exit /b 0
 
 :fail
