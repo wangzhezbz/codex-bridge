@@ -24,6 +24,7 @@
           <button class="nav-item active" data-section="dashboard">概览</button>
           <button class="nav-item" data-section="models">模型</button>
           <button class="nav-item" data-section="providers">密钥</button>
+          <button class="nav-item" data-section="stats">统计</button>
           <button class="nav-item" data-section="codex">Codex</button>
           <button class="nav-item" data-section="logs">日志</button>
         </nav>
@@ -50,53 +51,61 @@
               <div class="panel-header">
                 <div>
                   <h2>计费模式</h2>
-                  <p>混合模式适合 GPT 走订阅、其他模型走 API；全部 API 模式适合统一走接口账户。</p>
+                  <p>混合模式适合 GPT 走 Codex 订阅、其他模型走各自 API；全部 API 模式适合统一走中转或团队接口。</p>
                 </div>
               </div>
               <div class="mode-grid">
                 <button class="mode-card" data-mode="hybrid">
                   <span class="mode-title">推荐：GPT 走订阅</span>
-                  <span class="mode-copy">GPT-5.5 / GPT-5.4 使用 Codex 登录态，DeepSeek/Kimi/其他模型使用各自 API Key。</span>
+                  <span class="mode-copy">GPT-5.5 / GPT-5.4 使用 Codex 登录态，DeepSeek、Kimi 和其他模型使用各自 API Key。</span>
                 </button>
                 <button class="mode-card" data-mode="all_api">
                   <span class="mode-title">全部 API</span>
-                  <span class="mode-copy">所有模型都使用你配置的 API Key，适合统一走中转或团队接口账户。</span>
+                  <span class="mode-copy">所有模型都使用你配置的 API Key，适合统一走 GPT API、中转或团队接口账户。</span>
                 </button>
               </div>
             </article>
 
-            <article class="panel">
+            <article class="panel run-panel">
               <div class="panel-header">
                 <div>
-                  <h2>一键操作</h2>
-                  <p>按钮会显示执行结果；失败时会把具体错误写进日志。</p>
+                  <h2>运行控制</h2>
+                  <p>初始化会生成模型目录并写入 Codex 配置；Router 开关负责本地网关是否接收 Codex 请求。</p>
                 </div>
               </div>
-              <div class="action-stack">
-                <button class="primary-button" id="saveSecrets">保存当前密钥</button>
-                <button class="plain-button" id="saveModelSelection">保存模型选择</button>
-                <button class="plain-button" id="generateCatalog">生成模型目录</button>
-                <button class="plain-button" id="applyCodex">写入 Codex 配置</button>
-                <div class="split-actions">
-                  <button class="primary-button" id="startRouter">启动 Router</button>
-                  <button class="danger-button" id="stopRouter">停止</button>
-                </div>
+              <button class="router-toggle" id="routerToggle" aria-pressed="false">
+                <span class="switch-track"><span></span></span>
+                <strong>Router 已关闭</strong>
+                <small>点击启动本地网关</small>
+              </button>
+              <div class="action-grid">
+                <button class="primary-button" id="initializeCodex">初始化 Codex 配置</button>
+                <button class="plain-button" id="restartCodex">重启 Codex</button>
               </div>
+              <p class="helper-copy">常规流程：选模型、填密钥、初始化配置、启动 Router，然后重启 Codex。</p>
             </article>
           </div>
 
-          <div class="grid three metric-row">
+          <div class="grid four metric-row">
             <article class="metric">
               <span class="metric-label">数据目录</span>
               <strong id="rootDir">-</strong>
+              <p>保存配置、密钥状态、模型目录和本地日志。</p>
             </article>
             <article class="metric">
-              <span class="metric-label">Codex 当前显示</span>
+              <span class="metric-label">Codex 模型栏</span>
               <strong><span id="selectedCount">0</span>/<span id="maxModels">5</span></strong>
+              <p>Codex 目前最多显示 5 个模型。</p>
             </article>
             <article class="metric">
-              <span class="metric-label">密钥状态</span>
+              <span class="metric-label">所选模型密钥</span>
               <strong id="keySummary">-</strong>
+              <p>只统计当前 5 个槽位需要的 API Key。</p>
+            </article>
+            <article class="metric">
+              <span class="metric-label">最近调用</span>
+              <strong id="latestUsage">暂无</strong>
+              <p>来自 Router 日志解析。</p>
             </article>
           </div>
         </section>
@@ -106,14 +115,14 @@
             <div class="panel-header">
               <div>
                 <h2>模型栏选择</h2>
-                <p>Codex 模型栏最多显示 5 个。这里勾选的顺序会映射到 Codex 的 5 个槽位。</p>
+                <p>Codex 模型栏最多显示 5 个。拖动上方槽位可调整顺序，下方模型卡片负责加入或移除。</p>
               </div>
               <div class="header-actions">
                 <button class="primary-button small" id="saveModelSelectionPanel">保存选择</button>
                 <button class="ghost-button light small" id="openConfigFolder">打开配置目录</button>
               </div>
             </div>
-            <div class="selection-strip" id="selectedModels"></div>
+            <div class="selection-strip" id="selectedModels" aria-label="当前 Codex 模型栏槽位"></div>
             <div class="model-pool" id="modelPool"></div>
           </article>
 
@@ -121,19 +130,41 @@
             <div class="panel-header">
               <div>
                 <h2>添加自定义模型</h2>
-                <p>支持 OpenAI-compatible 的 Responses 或 Chat Completions 接口。</p>
+                <p>用于接入任何 OpenAI-compatible 服务商。显示名给 Codex 看，真实模型名发给服务商。</p>
               </div>
             </div>
             <form class="custom-form" id="customModelForm">
-              <input id="customProviderName" placeholder="Provider 名称，例如 My API" />
-              <input id="customDisplayName" placeholder="Codex 显示名，例如 My Coder" />
-              <input id="customModelName" placeholder="真实模型名，例如 my-coder-v1" />
-              <input id="customBaseUrl" placeholder="Base URL，例如 https://api.example.com/v1" />
-              <input id="customKeyUrl" placeholder="获取 Key 链接，可选" />
-              <select id="customApiType">
-                <option value="chat_completions">Chat Completions</option>
-                <option value="responses">Responses</option>
-              </select>
+              <label>
+                <span>服务商名称</span>
+                <input id="customProviderName" placeholder="例如 My API / 火山方舟" />
+              </label>
+              <label>
+                <span>Codex 显示名</span>
+                <input id="customDisplayName" placeholder="例如 My Coder" />
+              </label>
+              <label>
+                <span>真实模型名</span>
+                <input id="customModelName" placeholder="例如 my-coder-v1" />
+              </label>
+              <label>
+                <span>Base URL</span>
+                <input id="customBaseUrl" placeholder="例如 https://api.example.com/v1" />
+              </label>
+              <label>
+                <span>获取 Key 链接，可选</span>
+                <input id="customKeyUrl" placeholder="例如 https://example.com/keys" />
+              </label>
+              <label>
+                <span>接口类型</span>
+                <select id="customApiType">
+                  <option value="chat_completions">Chat Completions</option>
+                  <option value="responses">Responses</option>
+                </select>
+              </label>
+              <div class="form-help">
+                <strong>怎么填</strong>
+                <p>大多数国产模型选 Chat Completions；如果服务商明确支持 OpenAI Responses API，再选 Responses。</p>
+              </div>
               <button class="primary-button" type="submit">添加模型</button>
             </form>
           </article>
@@ -144,10 +175,41 @@
             <div class="panel-header">
               <div>
                 <h2>API Key</h2>
-                <p>密钥只保存在本机 CodexBridgeData/config/secrets.local.json，不会提交到 Git。</p>
+                <p>密钥只保存在本机 CodexBridgeData/config/secrets.local.json，不会提交到 Git。每张卡片单独保存，空输入不会覆盖旧密钥。</p>
               </div>
             </div>
             <div class="provider-grid" id="providerGrid"></div>
+          </article>
+        </section>
+
+        <section class="section-panel hidden" id="stats">
+          <article class="panel stats-panel">
+            <div class="panel-header">
+              <div>
+                <h2>调用统计</h2>
+                <p>记录每次请求的入口模型、实际上游模型、状态码、耗时和 token。用于确认到底走了 GPT、DeepSeek、Kimi 还是中转。</p>
+              </div>
+            </div>
+            <div class="grid four stat-summary">
+              <article class="metric">
+                <span class="metric-label">总调用</span>
+                <strong id="statCalls">0</strong>
+              </article>
+              <article class="metric">
+                <span class="metric-label">总 Token</span>
+                <strong id="statTokens">0</strong>
+              </article>
+              <article class="metric">
+                <span class="metric-label">输入 Token</span>
+                <strong id="statPrompt">0</strong>
+              </article>
+              <article class="metric">
+                <span class="metric-label">输出 Token</span>
+                <strong id="statCompletion">0</strong>
+              </article>
+            </div>
+            <div class="usage-chart" id="usageChart"></div>
+            <div class="usage-table" id="usageTable"></div>
           </article>
         </section>
 
@@ -161,7 +223,11 @@
               <button class="ghost-button light" id="openCodexFolder">打开 Codex 目录</button>
             </div>
             <div class="notice">
-              混合模式会写入 <code>requires_openai_auth = true</code>。全部 API 模式会写入本地 router token。
+              混合模式会写入 <code>requires_openai_auth = true</code>，GPT 订阅模型使用 Codex 登录态；全部 API 模式会写入本地 Router token。
+            </div>
+            <div class="action-grid codex-actions">
+              <button class="plain-button" id="generateCatalog">只生成模型目录</button>
+              <button class="plain-button" id="applyCodex">只写入 Codex 配置</button>
             </div>
           </article>
         </section>

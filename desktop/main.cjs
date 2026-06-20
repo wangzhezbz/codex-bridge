@@ -8,11 +8,24 @@ const dataRootDir = process.env.CODEXBRIDGE_DATA_DIR || (app.isPackaged
   ? path.join(path.dirname(process.execPath), "CodexBridgeData")
   : appRootDir);
 const runtimeLogPath = path.join(dataRootDir, "logs", "desktop-runtime.log");
+const usageEventsPath = path.join(dataRootDir, "logs", "usage.local.json");
 let settingsPromise;
 let mainWindow;
 let routerProcess = null;
 let logLines = [];
 let smokeErrors = [];
+let usageStore = null;
+
+import("./usage.mjs")
+  .then(({ createUsageStore }) => {
+    usageStore = createUsageStore({ initialEvents: readUsageEvents() });
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      broadcastState().catch((error) => appendRuntimeLog(formatError("usageBroadcast", error)));
+    }
+  })
+  .catch((error) => {
+    appendRuntimeLog(formatError("usageStore", error));
+  });
 
 if (process.env.CODEXBRIDGE_DESKTOP_SMOKE === "1") {
   app.disableHardwareAcceleration();
@@ -86,16 +99,7 @@ app.whenReady().then(() => {
     }, 15000);
     mainWindow.webContents.once("did-finish-load", () => {
       clearTimeout(timeout);
-      if (smokeErrors.length) {
-        console.error(`CodexBridge desktop smoke saw ${smokeErrors.length} renderer error(s).`);
-        for (const error of smokeErrors) {
-          console.error(error);
-        }
-        app.exit(1);
-        return;
-      }
-      console.log("CodexBridge desktop smoke loaded.");
-      app.quit();
+      runDesktopSmokeChecks();
     });
   }
 });
@@ -132,6 +136,8 @@ ipcMain.handle("state:get", async () => {
     modelSlots: settings.CODEX_MODEL_SLOTS || [],
     customModels: settings.readCustomModels(dataRootDir),
     secretStatus: settings.secretStatus(dataRootDir),
+    usageEvents: usageStore?.events() || [],
+    usageSummary: usageStore?.summary() || emptyUsageSummary(),
     logs: logLines,
   };
 });
@@ -208,6 +214,57 @@ ipcMain.handle("codex:apply", async () => {
     appendLog(`Backup created: ${result.backup}`);
   }
   return result;
+});
+
+ipcMain.handle("codex:initialize", async () => {
+  const settings = await loadSettings();
+  let config = settings.readRouterConfig(dataRootDir);
+  const mode = settings.detectModeFromConfig(config);
+  config = settings.writeRouterConfigFromSelection(dataRootDir, mode);
+  const catalogResult = await runNodeScript([
+    scriptPath("scripts/generate-catalog.js"),
+    settings.catalogPath(dataRootDir),
+  ]);
+  if (!catalogResult.ok) {
+    throw new Error(catalogResult.output || "Failed to generate model catalog.");
+  }
+  const codexResult = settings.applyCodexConfig({
+    rootDir: dataRootDir,
+    mode,
+    port: config?.port || 15722,
+  });
+  appendLog(`Initialized Codex config: ${codexResult.target}`);
+  if (codexResult.backup) {
+    appendLog(`Backup created: ${codexResult.backup}`);
+  }
+  broadcastState();
+  return {
+    ok: true,
+    catalog: catalogResult,
+    codex: codexResult,
+  };
+});
+
+ipcMain.handle("codex:restart", async () => {
+  if (process.platform !== "win32") {
+    throw new Error("Restart Codex is currently supported on Windows only.");
+  }
+  const codexPath = await findRunningCodexPath();
+  if (!codexPath) {
+    throw new Error("没有找到正在运行的 Codex。请先手动打开一次 Codex，再点重启。");
+  }
+  await runWindowsCommand("taskkill", ["/IM", "Codex.exe", "/T", "/F"], {
+    allowFailure: true,
+  });
+  await delay(900);
+  const child = spawn(codexPath, [], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  child.unref();
+  appendLog(`Restarted Codex: ${codexPath}`);
+  return { ok: true, path: codexPath };
 });
 
 ipcMain.handle("router:start", async () => {
@@ -337,10 +394,13 @@ function appendLog(line) {
     return;
   }
   for (const entry of String(line).split(/\r?\n/)) {
+    usageStore?.recordLine(entry);
     logLines.push(`[${new Date().toLocaleTimeString()}] ${entry}`);
   }
+  persistUsageEvents();
   logLines = logLines.slice(-300);
   mainWindow?.webContents.send("logs:update", logLines);
+  mainWindow?.webContents.send("usage:update", usagePayload());
 }
 
 function recordDesktopError(message) {
@@ -356,6 +416,36 @@ function appendRuntimeLog(line) {
     fs.appendFileSync(runtimeLogPath, `[${new Date().toISOString()}] ${line}\n`, "utf8");
   } catch {
     // Logging must never crash the desktop app.
+  }
+}
+
+function readUsageEvents() {
+  try {
+    if (!fs.existsSync(usageEventsPath)) {
+      return [];
+    }
+    const parsed = JSON.parse(fs.readFileSync(usageEventsPath, "utf8"));
+    return Array.isArray(parsed?.events) ? parsed.events : [];
+  } catch (error) {
+    appendRuntimeLog(formatError("readUsageEvents", error));
+    return [];
+  }
+}
+
+function persistUsageEvents() {
+  if (!usageStore) {
+    return;
+  }
+  try {
+    fs.mkdirSync(path.dirname(usageEventsPath), { recursive: true });
+    const events = usageStore.events().slice().reverse();
+    fs.writeFileSync(
+      usageEventsPath,
+      `${JSON.stringify({ version: 1, events }, null, 2)}\n`,
+      "utf8",
+    );
+  } catch (error) {
+    appendRuntimeLog(formatError("persistUsageEvents", error));
   }
 }
 
@@ -387,6 +477,135 @@ async function getStatePayload(settings) {
     modelSlots: settings.CODEX_MODEL_SLOTS || [],
     customModels: settings.readCustomModels(dataRootDir),
     secretStatus: settings.secretStatus(dataRootDir),
+    usageEvents: usageStore?.events() || [],
+    usageSummary: usageStore?.summary() || emptyUsageSummary(),
     logs: logLines,
   };
+}
+
+function usagePayload() {
+  return {
+    usageEvents: usageStore?.events() || [],
+    usageSummary: usageStore?.summary() || emptyUsageSummary(),
+  };
+}
+
+function emptyUsageSummary() {
+  return {
+    totalCalls: 0,
+    totalTokens: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    statusCounts: {},
+    byModel: [],
+    latest: null,
+  };
+}
+
+async function findRunningCodexPath() {
+  const command =
+    "Get-Process Codex -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Path";
+  const result = await runWindowsCommand("powershell.exe", [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-Command",
+    command,
+  ]);
+  const found = result.output.trim().split(/\r?\n/).find(Boolean);
+  return found && fs.existsSync(found) ? found : "";
+}
+
+function runWindowsCommand(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { windowsHide: true });
+    let output = "";
+    child.stdout.on("data", (chunk) => {
+      output += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      output += chunk.toString("utf8");
+    });
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code !== 0 && !options.allowFailure) {
+        reject(new Error(output.trim() || `${command} exited with code ${code}`));
+        return;
+      }
+      resolve({ code, output });
+    });
+  });
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runDesktopSmokeChecks() {
+  try {
+    const result = await mainWindow.webContents.executeJavaScript(`
+      (async () => {
+        const required = [
+          "#initializeCodex",
+          "#restartCodex",
+          "#routerToggle",
+          "#saveModelSelectionPanel",
+          "#providerGrid",
+          "#stats",
+          "#usageChart"
+        ];
+        for (const selector of required) {
+          if (!document.querySelector(selector)) {
+            throw new Error("Missing UI element: " + selector);
+          }
+        }
+        const waitFor = (fn) => new Promise((resolve, reject) => {
+          const started = Date.now();
+          const timer = setInterval(() => {
+            if (fn()) {
+              clearInterval(timer);
+              resolve(true);
+              return;
+            }
+            if (Date.now() - started > 5000) {
+              clearInterval(timer);
+              reject(new Error("Timed out waiting for UI render"));
+            }
+          }, 80);
+        });
+        await waitFor(() => document.querySelectorAll(".provider-card").length >= 3);
+        document.querySelector('[data-section="providers"]').click();
+        if (document.querySelector("#providers").classList.contains("hidden")) {
+          throw new Error("Providers nav did not activate");
+        }
+        if (!document.querySelector("[data-save-provider]")) {
+          throw new Error("Provider save button missing");
+        }
+        if (!document.querySelector("[data-toggle-secret]")) {
+          throw new Error("Provider reveal button missing");
+        }
+        document.querySelector('[data-section="stats"]').click();
+        if (document.querySelector("#stats").classList.contains("hidden")) {
+          throw new Error("Stats nav did not activate");
+        }
+        return {
+          providers: document.querySelectorAll(".provider-card").length,
+          nav: document.querySelector(".nav-item.active")?.textContent?.trim()
+        };
+      })()
+    `);
+    if (smokeErrors.length) {
+      console.error(`CodexBridge desktop smoke saw ${smokeErrors.length} renderer error(s).`);
+      for (const error of smokeErrors) {
+        console.error(error);
+      }
+      app.exit(1);
+      return;
+    }
+    console.log(`CodexBridge desktop smoke loaded. providers=${result.providers} nav=${result.nav}`);
+    app.quit();
+  } catch (error) {
+    console.error(formatError("Desktop smoke interaction failed", error));
+    app.exit(1);
+  }
 }

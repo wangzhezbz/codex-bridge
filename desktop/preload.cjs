@@ -9,6 +9,8 @@ contextBridge.exposeInMainWorld("codexBridge", {
   removeCustomModel: (presetId) => ipcRenderer.invoke("customModel:remove", presetId),
   generateCatalog: () => ipcRenderer.invoke("catalog:generate"),
   applyCodexConfig: () => ipcRenderer.invoke("codex:apply"),
+  initializeCodex: () => ipcRenderer.invoke("codex:initialize"),
+  restartCodex: () => ipcRenderer.invoke("codex:restart"),
   startRouter: () => ipcRenderer.invoke("router:start"),
   stopRouter: () => ipcRenderer.invoke("router:stop"),
   openFolder: (target) => ipcRenderer.invoke("folder:open", target),
@@ -19,5 +21,8 @@ contextBridge.exposeInMainWorld("codexBridge", {
   },
   onState: (callback) => {
     ipcRenderer.on("state:update", (_event, state) => callback(state));
+  },
+  onUsage: (callback) => {
+    ipcRenderer.on("usage:update", (_event, usage) => callback(usage));
   },
 });

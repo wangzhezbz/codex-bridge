@@ -1,6 +1,7 @@
 const api = window.codexBridge;
 let state = null;
 let draftSelection = [];
+let dragSlotIndex = null;
 
 const els = {
   routerStatus: document.querySelector("#routerStatus"),
@@ -9,12 +10,20 @@ const els = {
   selectedCount: document.querySelector("#selectedCount"),
   maxModels: document.querySelector("#maxModels"),
   keySummary: document.querySelector("#keySummary"),
+  latestUsage: document.querySelector("#latestUsage"),
   providerGrid: document.querySelector("#providerGrid"),
   selectedModels: document.querySelector("#selectedModels"),
   modelPool: document.querySelector("#modelPool"),
+  statCalls: document.querySelector("#statCalls"),
+  statTokens: document.querySelector("#statTokens"),
+  statPrompt: document.querySelector("#statPrompt"),
+  statCompletion: document.querySelector("#statCompletion"),
+  usageChart: document.querySelector("#usageChart"),
+  usageTable: document.querySelector("#usageTable"),
   logOutput: document.querySelector("#logOutput"),
   toast: document.querySelector("#toast"),
   customModelForm: document.querySelector("#customModelForm"),
+  routerToggle: document.querySelector("#routerToggle"),
 };
 
 document.querySelectorAll(".nav-item").forEach((button) => {
@@ -28,38 +37,45 @@ document.querySelectorAll(".nav-item").forEach((button) => {
 
 document.querySelectorAll(".mode-card").forEach((button) => {
   button.addEventListener("click", () =>
-    runAction(button, "正在切换模式...", async () => {
+    runAction(button, async () => {
       state = await api.selectMode(button.dataset.mode);
       draftSelection = [...state.selectedModelIds];
       render();
-      showToast("模式已切换，并已生成对应模型配置。");
+      showToast("计费模式已切换，模型配置已按该模式更新。");
     }),
   );
 });
 
-document.querySelector("#saveSecrets").addEventListener("click", (event) =>
-  runAction(event.currentTarget, "正在保存密钥...", async () => {
-    const secrets = {};
-    document.querySelectorAll("[data-key-env]").forEach((input) => {
-      if (input.value.trim()) {
-        secrets[input.dataset.keyEnv] = input.value.trim();
-      }
-    });
-    await api.saveSecrets(secrets);
-    document.querySelectorAll("[data-key-env]").forEach((input) => {
-      input.value = "";
-    });
+document.querySelector("#initializeCodex").addEventListener("click", (event) =>
+  runAction(event.currentTarget, async () => {
+    await api.initializeCodex();
     await refresh();
-    showToast("密钥已保存。");
+    showToast("Codex 配置已初始化：模型目录和 config.toml 都已写入。");
   }),
 );
 
-document.querySelectorAll("#saveModelSelection, #saveModelSelectionPanel").forEach((button) => {
-  button.addEventListener("click", () => saveModelSelection(button));
-});
+document.querySelector("#restartCodex").addEventListener("click", (event) =>
+  runAction(event.currentTarget, async () => {
+    await api.restartCodex();
+    showToast("Codex 已重启。");
+  }),
+);
+
+els.routerToggle.addEventListener("click", () =>
+  runAction(els.routerToggle, async () => {
+    if (state?.routerRunning) {
+      await api.stopRouter();
+      showToast("Router 已关闭。");
+    } else {
+      await api.startRouter();
+      showToast("Router 已启动。");
+    }
+    await refresh();
+  }),
+);
 
 document.querySelector("#generateCatalog").addEventListener("click", (event) =>
-  runAction(event.currentTarget, "正在生成模型目录...", async () => {
+  runAction(event.currentTarget, async () => {
     const result = await api.generateCatalog();
     if (!result.ok) {
       throw new Error(result.output || "生成模型目录失败");
@@ -70,32 +86,20 @@ document.querySelector("#generateCatalog").addEventListener("click", (event) =>
 );
 
 document.querySelector("#applyCodex").addEventListener("click", (event) =>
-  runAction(event.currentTarget, "正在写入 Codex 配置...", async () => {
+  runAction(event.currentTarget, async () => {
     const result = await api.applyCodexConfig();
     await refresh();
     showToast(result.backup ? "Codex 配置已写入，旧配置已备份。" : "Codex 配置已写入。");
   }),
 );
 
-document.querySelector("#startRouter").addEventListener("click", (event) =>
-  runAction(event.currentTarget, "正在启动 Router...", async () => {
-    await api.startRouter();
-    await refresh();
-    showToast("Router 已启动。");
-  }),
-);
-
-document.querySelector("#stopRouter").addEventListener("click", (event) =>
-  runAction(event.currentTarget, "正在停止 Router...", async () => {
-    await api.stopRouter();
-    await refresh();
-    showToast("Router 已停止。");
-  }),
+document.querySelector("#saveModelSelectionPanel").addEventListener("click", (event) =>
+  saveModelSelection(event.currentTarget),
 );
 
 els.customModelForm.addEventListener("submit", (event) => {
   event.preventDefault();
-  runAction(els.customModelForm.querySelector("button"), "正在添加模型...", async () => {
+  runAction(els.customModelForm.querySelector("button"), async () => {
     const model = {
       providerName: value("#customProviderName"),
       displayName: value("#customDisplayName"),
@@ -107,7 +111,7 @@ els.customModelForm.addEventListener("submit", (event) => {
     await api.saveCustomModel(model);
     els.customModelForm.reset();
     await refresh();
-    showToast("自定义模型已添加。");
+    showToast("自定义模型已添加。去“密钥”页保存它的 API Key，再在模型池里选中它。");
   });
 });
 
@@ -116,6 +120,18 @@ document.querySelector("#openCodexFolder").addEventListener("click", () => api.o
 document.querySelector("#openGitHub").addEventListener("click", () => api.openGitHub());
 
 api.onLogs((logs) => renderLogs(logs));
+api.onUsage((usage) => {
+  if (!state) {
+    return;
+  }
+  state = {
+    ...state,
+    usageEvents: usage.usageEvents || [],
+    usageSummary: usage.usageSummary || emptyUsageSummary(),
+  };
+  renderUsage();
+  renderOverviewUsage();
+});
 api.onState((nextState) => {
   state = nextState;
   draftSelection = [...(state.selectedModelIds || [])];
@@ -142,30 +158,51 @@ function render() {
   els.rootDir.textContent = state.rootDir;
   els.selectedCount.textContent = String(draftSelection.length);
   els.maxModels.textContent = String(state.maxModels || 5);
-  els.keySummary.textContent = summarizeKeys();
+  els.keySummary.textContent = keySummaryInfo().text;
 
   document.querySelectorAll(".mode-card").forEach((button) => {
     button.classList.toggle("active", button.dataset.mode === state.mode);
   });
 
+  renderRouterToggle();
   renderProviders();
   renderSelectedModels();
   renderModelPool();
+  renderUsage();
+  renderOverviewUsage();
   renderLogs(state.logs || []);
+}
+
+function renderRouterToggle() {
+  els.routerToggle.classList.toggle("running", Boolean(state.routerRunning));
+  els.routerToggle.setAttribute("aria-pressed", state.routerRunning ? "true" : "false");
+  els.routerToggle.querySelector("strong").textContent = state.routerRunning ? "Router 运行中" : "Router 已关闭";
+  els.routerToggle.querySelector("small").textContent = state.routerRunning ? "点击关闭本地网关" : "点击启动本地网关";
 }
 
 function renderProviders() {
   const cards = state.providers.map((provider) => {
     const saved = provider.keyEnv ? Boolean(state.secretStatus?.[provider.keyEnv]) : true;
     const status = provider.keyEnv ? (saved ? "已保存" : "未保存") : "无需 Key";
-    const input = provider.keyEnv
-      ? `<input type="password" data-key-env="${escapeHtml(provider.keyEnv)}" placeholder="${saved ? "已保存，留空则不修改" : "sk-..."}" />`
-      : `<div class="no-key">使用 Codex 登录态，无需在这里填写 API Key。</div>`;
+    const keyControl = provider.keyEnv
+      ? `
+        <label>
+          <span>${escapeHtml(provider.keyLabel || "API Key")}</span>
+          <div class="secret-row">
+            <input type="password" data-key-env="${escapeHtml(provider.keyEnv)}" placeholder="${saved ? "已保存，留空不修改" : "sk-..."}" />
+            <button class="ghost-button light small" type="button" data-toggle-secret>显示</button>
+          </div>
+        </label>
+      `
+      : `<div class="no-key">使用 Codex/OpenAI 登录态，无需在这里填写 API Key。</div>`;
+    const saveButton = provider.keyEnv
+      ? `<button class="primary-button small" data-save-provider="${escapeHtml(provider.id)}">保存这个 Key</button>`
+      : "";
     const keyButton = provider.keyUrl
       ? `<button class="plain-button small" data-open-url="${escapeHtml(provider.keyUrl)}">获取 API Key</button>`
       : "";
     return `
-      <article class="provider-card">
+      <article class="provider-card" data-provider-id="${escapeHtml(provider.id)}">
         <div class="provider-head">
           <div>
             <h3>${escapeHtml(provider.name)}</h3>
@@ -173,11 +210,9 @@ function renderProviders() {
           </div>
           <span class="tag ${saved ? "ok" : ""}">${status}</span>
         </div>
-        <label>
-          <span>${escapeHtml(provider.keyLabel || "API Key")}</span>
-          ${input}
-        </label>
+        ${keyControl}
         <div class="provider-actions">
+          ${saveButton}
           ${keyButton}
           ${provider.docsUrl ? `<button class="ghost-button light small" data-open-url="${escapeHtml(provider.docsUrl)}">文档</button>` : ""}
         </div>
@@ -185,8 +220,34 @@ function renderProviders() {
     `;
   });
   els.providerGrid.innerHTML = cards.join("");
+
   els.providerGrid.querySelectorAll("[data-open-url]").forEach((button) => {
     button.addEventListener("click", () => api.openExternal(button.dataset.openUrl));
+  });
+  els.providerGrid.querySelectorAll("[data-toggle-secret]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const input = button.closest(".secret-row").querySelector("input");
+      const showing = input.type === "text";
+      input.type = showing ? "password" : "text";
+      button.textContent = showing ? "显示" : "隐藏";
+    });
+  });
+  els.providerGrid.querySelectorAll("[data-save-provider]").forEach((button) => {
+    button.addEventListener("click", () => saveProviderSecret(button));
+  });
+}
+
+function saveProviderSecret(button) {
+  return runAction(button, async () => {
+    const card = button.closest(".provider-card");
+    const input = card.querySelector("[data-key-env]");
+    if (!input?.value.trim()) {
+      throw new Error("请输入新的 API Key。空输入不会覆盖旧密钥。");
+    }
+    await api.saveSecrets({ [input.dataset.keyEnv]: input.value.trim() });
+    input.value = "";
+    await refresh();
+    showToast("这个 API Key 已保存到本机。");
   });
 }
 
@@ -196,14 +257,54 @@ function renderSelectedModels() {
     .map((slot, index) => {
       const model = modelsById.get(draftSelection[index]);
       return `
-        <div class="slot-card ${model ? "filled" : ""}">
+        <div class="slot-card ${model ? "filled" : ""}" draggable="${model ? "true" : "false"}" data-slot-index="${index}">
           <span>${escapeHtml(slot.label)}</span>
           <strong>${model ? escapeHtml(model.displayName) : "未选择"}</strong>
-          <small>${model ? escapeHtml(providerName(model.providerId)) : "最多显示 5 个"}</small>
+          <small>${model ? escapeHtml(providerName(model.providerId)) : "拖动已选模型到这里可调整顺序"}</small>
         </div>
       `;
     })
     .join("");
+
+  els.selectedModels.querySelectorAll(".slot-card").forEach((card) => {
+    card.addEventListener("dragstart", (event) => {
+      dragSlotIndex = Number(card.dataset.slotIndex);
+      event.dataTransfer.effectAllowed = "move";
+      card.classList.add("dragging");
+    });
+    card.addEventListener("dragend", () => {
+      dragSlotIndex = null;
+      card.classList.remove("dragging");
+      els.selectedModels.querySelectorAll(".slot-card").forEach((item) => item.classList.remove("drop-target"));
+    });
+    card.addEventListener("dragover", (event) => {
+      if (dragSlotIndex === null) {
+        return;
+      }
+      event.preventDefault();
+      card.classList.add("drop-target");
+    });
+    card.addEventListener("dragleave", () => card.classList.remove("drop-target"));
+    card.addEventListener("drop", (event) => {
+      event.preventDefault();
+      const targetIndex = Number(card.dataset.slotIndex);
+      reorderDraftSelection(dragSlotIndex, targetIndex);
+      dragSlotIndex = null;
+      render();
+      showToast("顺序已调整，点“保存选择”后写入 Codex 模型栏。");
+    });
+  });
+}
+
+function reorderDraftSelection(fromIndex, targetSlotIndex) {
+  if (!Number.isInteger(fromIndex) || fromIndex < 0 || fromIndex >= draftSelection.length) {
+    return;
+  }
+  const next = [...draftSelection];
+  const [moved] = next.splice(fromIndex, 1);
+  const insertIndex = Math.max(0, Math.min(targetSlotIndex, next.length));
+  next.splice(insertIndex, 0, moved);
+  draftSelection = next;
 }
 
 function renderModelPool() {
@@ -232,7 +333,7 @@ function renderModelPool() {
   });
   els.modelPool.querySelectorAll("[data-remove-custom]").forEach((button) => {
     button.addEventListener("click", () =>
-      runAction(button, "正在删除模型...", async () => {
+      runAction(button, async () => {
         state = await api.removeCustomModel(button.dataset.removeCustom);
         draftSelection = [...state.selectedModelIds];
         render();
@@ -248,7 +349,7 @@ function modelCard(model, selected, max) {
   const isMaxed = !isSelected && draftSelection.length >= max;
   const disabled = isNativeDisabled || isMaxed;
   const reason = isNativeDisabled
-    ? "全部 API 模式不能选订阅模型"
+    ? "全部 API 模式不能选择订阅模型"
     : isMaxed
       ? "已选满 5 个"
       : providerName(model.providerId);
@@ -275,20 +376,119 @@ function toggleModel(presetId) {
 }
 
 function saveModelSelection(button) {
-  return runAction(button, "正在保存模型选择...", async () => {
+  return runAction(button, async () => {
     state = await api.saveModelSelection(draftSelection);
     draftSelection = [...state.selectedModelIds];
     render();
-    showToast("模型选择已保存。");
+    showToast("模型选择已保存，并已更新 Router 配置。");
   });
 }
 
-async function runAction(button, pendingText, fn) {
-  const oldText = button?.textContent;
+function renderUsage() {
+  const summary = state.usageSummary || emptyUsageSummary();
+  const events = state.usageEvents || [];
+  els.statCalls.textContent = formatNumber(summary.totalCalls || 0);
+  els.statTokens.textContent = formatNumber(summary.totalTokens || 0);
+  els.statPrompt.textContent = formatNumber(summary.promptTokens || 0);
+  els.statCompletion.textContent = formatNumber(summary.completionTokens || 0);
+  renderUsageChart(summary.byModel || []);
+  renderUsageTable(summary.byModel || [], events);
+}
+
+function renderOverviewUsage() {
+  const latest = state.usageSummary?.latest;
+  if (!latest) {
+    els.latestUsage.textContent = "暂无";
+    return;
+  }
+  els.latestUsage.textContent = `${latest.route || latest.codexModel} · ${latest.status || "unknown"} · ${formatNumber(latest.totalTokens || 0)} token`;
+}
+
+function renderUsageChart(rows) {
+  if (!rows.length) {
+    els.usageChart.innerHTML = `<div class="empty-state">还没有调用记录。启动 Router 后，在 Codex 里对话一次，这里会显示每个模型的调用量。</div>`;
+    return;
+  }
+  const maxTokens = Math.max(...rows.map((row) => row.totalTokens || 0));
+  const maxCalls = Math.max(...rows.map((row) => row.calls || 0), 1);
+  els.usageChart.innerHTML = rows
+    .map((row) => {
+      const value = maxTokens > 0 ? row.totalTokens : row.calls;
+      const max = maxTokens > 0 ? maxTokens : maxCalls;
+      const width = Math.max(5, Math.ceil(((value / max) * 100) / 5) * 5);
+      const label = maxTokens > 0 ? `${formatNumber(row.totalTokens)} token` : `${formatNumber(row.calls)} 次`;
+      return `
+        <div class="usage-bar">
+          <div class="usage-bar-head">
+            <strong>${escapeHtml(displayRoute(row.route))}</strong>
+            <span>${escapeHtml(row.upstreamModel || "-")} · ${label}</span>
+          </div>
+          <div class="bar-track"><span class="w-${width}"></span></div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+function renderUsageTable(rows, events) {
+  const modelRows = rows.length
+    ? rows
+        .map(
+          (row) => `
+            <div class="usage-row">
+              <span>${escapeHtml(displayRoute(row.route))}</span>
+              <span>${escapeHtml(row.upstreamModel || "-")}</span>
+              <span>${escapeHtml(row.api || "-")}</span>
+              <span>${formatNumber(row.calls)}</span>
+              <span>${formatNumber(row.promptTokens)}</span>
+              <span>${formatNumber(row.completionTokens)}</span>
+              <span>${formatNumber(row.totalTokens)}</span>
+              <span>${row.errors ? `${row.errors} 错误` : row.lastStatus || "-"}</span>
+              <span>${formatTime(row.lastAt)}</span>
+            </div>
+          `,
+        )
+        .join("")
+    : `<div class="empty-state">暂无模型汇总。</div>`;
+  const eventRows = events.length
+    ? events
+        .slice(0, 40)
+        .map(
+          (event) => `
+            <div class="usage-row recent">
+              <span>${escapeHtml(displayRoute(event.route))}</span>
+              <span>${escapeHtml(event.upstreamModel || "-")}</span>
+              <span>${escapeHtml(event.api || "-")}</span>
+              <span>${event.status || "-"}</span>
+              <span>${formatNumber(event.promptTokens)}</span>
+              <span>${formatNumber(event.completionTokens)}</span>
+              <span>${formatNumber(event.totalTokens)}</span>
+              <span>${formatDuration(event.durationMs)}</span>
+              <span>${formatTime(event.finishedAt || event.startedAt)}</span>
+            </div>
+          `,
+        )
+        .join("")
+    : `<div class="empty-state">暂无明细记录。</div>`;
+  els.usageTable.innerHTML = `
+    <h3>按模型汇总</h3>
+    <div class="usage-grid header">
+      <span>Codex 槽位</span><span>实际上游模型</span><span>接口</span><span>次数</span><span>输入</span><span>输出</span><span>总量</span><span>状态</span><span>最近时间</span>
+    </div>
+    <div class="usage-grid">${modelRows}</div>
+    <h3>最近请求</h3>
+    <div class="usage-grid header">
+      <span>Codex 槽位</span><span>实际上游模型</span><span>接口</span><span>状态</span><span>输入</span><span>输出</span><span>总量</span><span>耗时</span><span>时间</span>
+    </div>
+    <div class="usage-grid">${eventRows}</div>
+  `;
+}
+
+async function runAction(button, fn) {
   try {
     if (button) {
       button.disabled = true;
-      button.textContent = pendingText;
+      button.classList.add("loading");
     }
     await fn();
   } catch (error) {
@@ -298,12 +498,12 @@ async function runAction(button, pendingText, fn) {
   } finally {
     if (button) {
       button.disabled = false;
-      button.textContent = oldText;
+      button.classList.remove("loading");
     }
   }
 }
 
-function summarizeKeys() {
+function keySummaryInfo() {
   const needed = new Set();
   const modelsById = modelMap();
   for (const id of draftSelection) {
@@ -314,7 +514,11 @@ function summarizeKeys() {
     }
   }
   const saved = [...needed].filter((key) => state.secretStatus?.[key]).length;
-  return `${saved}/${needed.size} 个所选模型密钥已保存`;
+  return {
+    needed: needed.size,
+    saved,
+    text: `${saved}/${needed.size} 已保存`,
+  };
 }
 
 function renderLogs(logs) {
@@ -331,6 +535,18 @@ function showToast(message, type = "success") {
   showToast.timer = window.setTimeout(() => {
     els.toast.classList.add("hidden");
   }, 3600);
+}
+
+function emptyUsageSummary() {
+  return {
+    totalCalls: 0,
+    totalTokens: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    statusCounts: {},
+    byModel: [],
+    latest: null,
+  };
 }
 
 function groupByProvider(models) {
@@ -356,8 +572,38 @@ function modelMap() {
   return new Map((state.modelPresets || []).map((model) => [model.presetId, model]));
 }
 
+function displayRoute(route) {
+  const slot = (state.modelSlots || []).find((item) => item.id === route);
+  return slot?.label || route || "-";
+}
+
 function value(selector) {
   return document.querySelector(selector).value.trim();
+}
+
+function formatNumber(value) {
+  return Number(value || 0).toLocaleString("zh-CN");
+}
+
+function formatTime(value) {
+  if (!value) {
+    return "-";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function formatDuration(value) {
+  if (!Number.isFinite(value)) {
+    return "-";
+  }
+  if (value < 1000) {
+    return `${value} ms`;
+  }
+  return `${(value / 1000).toFixed(1)} s`;
 }
 
 function escapeHtml(value) {

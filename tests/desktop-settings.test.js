@@ -11,6 +11,7 @@ import {
   buildCodexToml,
   detectModeFromConfig,
   ensureRouterConfig,
+  providerCatalog,
   saveCustomModel,
   saveSelection,
   saveSecrets,
@@ -83,6 +84,12 @@ test("saveSecrets records only non-empty values", () => {
     SILICONFLOW_API_KEY: false,
     ZHIPUAI_API_KEY: false,
   });
+});
+
+test("provider catalog uses the current Kimi API key console", () => {
+  const kimi = providerCatalog(makeTempProject()).find((provider) => provider.id === "kimi");
+
+  assert.equal(kimi.keyUrl, "https://platform.kimi.com/console/api-keys");
 });
 
 test("buildRouterConfigFromSelection maps selected models into five Codex slots", () => {
