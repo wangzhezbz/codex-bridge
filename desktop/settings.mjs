@@ -21,17 +21,18 @@ export function codexConfigPath(homeDir = os.homedir()) {
   return path.join(homeDir, ".codex", "config.toml");
 }
 
-export function exampleConfigForMode(rootDir, mode) {
+export function exampleConfigForMode(rootDir, mode, templateRootDir = rootDir) {
   const file =
     mode === MODE_HYBRID
       ? "router.config.hybrid.example.json"
       : "router.config.example.json";
-  return path.join(rootDir, "config", file);
+  return path.join(templateRootDir, "config", file);
 }
 
-export function ensureRouterConfig(rootDir, mode) {
-  const source = exampleConfigForMode(rootDir, mode);
+export function ensureRouterConfig(rootDir, mode, templateRootDir = rootDir) {
+  const source = exampleConfigForMode(rootDir, mode, templateRootDir);
   const target = routerConfigPath(rootDir);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.copyFileSync(source, target);
   return target;
 }

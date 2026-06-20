@@ -4,6 +4,7 @@ node_modules/
 # Build outputs
 dist/
 build/
+release/
 coverage/
 target/
 src-tauri/target/

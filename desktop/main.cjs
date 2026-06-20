@@ -3,8 +3,11 @@ const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const rootDir = path.resolve(__dirname, "..");
-const runtimeLogPath = path.join(rootDir, "logs", "desktop-runtime.log");
+const appRootDir = path.resolve(__dirname, "..");
+const dataRootDir = app.isPackaged
+  ? path.join(path.dirname(process.execPath), "CodexBridgeData")
+  : appRootDir;
+const runtimeLogPath = path.join(dataRootDir, "logs", "desktop-runtime.log");
 let settingsPromise;
 let mainWindow;
 let routerProcess = null;
@@ -112,45 +115,51 @@ app.on("activate", () => {
 
 ipcMain.handle("state:get", async () => {
   const settings = await loadSettings();
-  const config = settings.readRouterConfig(rootDir);
+  const config = settings.readRouterConfig(dataRootDir);
   const mode = settings.detectModeFromConfig(config);
   return {
-    rootDir,
+    rootDir: dataRootDir,
+    appRootDir,
+    packaged: app.isPackaged,
     mode,
     routerRunning: Boolean(routerProcess),
     configExists: Boolean(config),
     models: config?.models || [],
-    secretStatus: settings.secretStatus(rootDir),
+    secretStatus: settings.secretStatus(dataRootDir),
     logs: logLines,
   };
 });
 
 ipcMain.handle("mode:select", async (_event, mode) => {
   const settings = await loadSettings();
-  settings.ensureRouterConfig(rootDir, mode);
+  settings.ensureRouterConfig(dataRootDir, mode, appRootDir);
   appendLog(`Selected ${mode === settings.MODE_HYBRID ? "Hybrid" : "All API"} mode.`);
   return ipcMain.emit ? getStatePayload(settings) : null;
 });
 
 ipcMain.handle("secrets:save", async (_event, secrets) => {
   const settings = await loadSettings();
-  const saved = settings.saveSecrets(rootDir, secrets);
+  const saved = settings.saveSecrets(dataRootDir, secrets);
   appendLog(`Saved API key settings: ${Object.keys(saved).join(", ") || "none"}.`);
-  return settings.secretStatus(rootDir);
+  return settings.secretStatus(dataRootDir);
 });
 
 ipcMain.handle("catalog:generate", async () => {
-  const result = await runNodeScript(["scripts/generate-catalog.js"]);
+  const settings = await loadSettings();
+  const result = await runNodeScript([
+    scriptPath("scripts/generate-catalog.js"),
+    settings.catalogPath(dataRootDir),
+  ]);
   appendLog(result.ok ? "Generated model-catalog.json." : `Catalog generation failed: ${result.output}`);
   return result;
 });
 
 ipcMain.handle("codex:apply", async () => {
   const settings = await loadSettings();
-  const config = settings.readRouterConfig(rootDir);
+  const config = settings.readRouterConfig(dataRootDir);
   const mode = settings.detectModeFromConfig(config);
   const result = settings.applyCodexConfig({
-    rootDir,
+    rootDir: dataRootDir,
     mode,
     port: config?.port || 15722,
   });
@@ -168,9 +177,9 @@ ipcMain.handle("router:start", async () => {
 
   const settings = await loadSettings();
   const nodePath = nodeExecutable();
-  routerProcess = spawn(nodePath, ["src/server.js"], {
-    cwd: rootDir,
-    env: settings.envWithSecrets(rootDir, process.env),
+  routerProcess = spawn(nodePath, [scriptPath("src/server.js")], {
+    cwd: appRootDir,
+    env: runtimeEnv(settings),
     windowsHide: true,
   });
 
@@ -200,8 +209,8 @@ ipcMain.handle("folder:open", async (_event, target) => {
     target === "codex"
       ? path.dirname(settings.codexConfigPath())
       : target === "config"
-        ? path.join(rootDir, "config")
-        : rootDir;
+        ? path.join(dataRootDir, "config")
+        : dataRootDir;
   await shell.openPath(folder);
   return { ok: true };
 });
@@ -228,8 +237,8 @@ async function runNodeScript(args) {
   const nodePath = nodeExecutable();
   return new Promise((resolve) => {
     const child = spawn(nodePath, args, {
-      cwd: rootDir,
-      env: settings.envWithSecrets(rootDir, process.env),
+      cwd: appRootDir,
+      env: runtimeEnv(settings),
       windowsHide: true,
     });
     let output = "";
@@ -250,7 +259,25 @@ async function runNodeScript(args) {
 }
 
 function nodeExecutable() {
+  if (app.isPackaged) {
+    return process.execPath;
+  }
   return process.env.npm_node_execpath || "node";
+}
+
+function runtimeEnv(settings) {
+  const env = settings.envWithSecrets(dataRootDir, {
+    ...process.env,
+    ROUTER_CONFIG: settings.routerConfigPath(dataRootDir),
+  });
+  if (app.isPackaged) {
+    env.ELECTRON_RUN_AS_NODE = "1";
+  }
+  return env;
+}
+
+function scriptPath(relativePath) {
+  return path.join(appRootDir, relativePath);
 }
 
 function appendLog(line) {
@@ -291,14 +318,16 @@ async function broadcastState() {
 }
 
 async function getStatePayload(settings) {
-  const config = settings.readRouterConfig(rootDir);
+  const config = settings.readRouterConfig(dataRootDir);
   return {
-    rootDir,
+    rootDir: dataRootDir,
+    appRootDir,
+    packaged: app.isPackaged,
     mode: settings.detectModeFromConfig(config),
     routerRunning: Boolean(routerProcess),
     configExists: Boolean(config),
     models: config?.models || [],
-    secretStatus: settings.secretStatus(rootDir),
+    secretStatus: settings.secretStatus(dataRootDir),
     logs: logLines,
   };
 }

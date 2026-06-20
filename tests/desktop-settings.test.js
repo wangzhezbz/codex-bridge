@@ -91,6 +91,26 @@ test("ensureRouterConfig copies the selected example", () => {
   assert.equal(copied.clientAuth.allowOpenAiBearer, true);
 });
 
+test("ensureRouterConfig can copy bundled templates into a separate data directory", () => {
+  const dataRootDir = makeTempProject();
+  const templateRootDir = makeTempProject();
+  fs.mkdirSync(path.join(templateRootDir, "config"), { recursive: true });
+  fs.writeFileSync(
+    path.join(templateRootDir, "config", "router.config.example.json"),
+    '{"clientAuth":{"allowOpenAiBearer":false},"models":[{"id":"api"}]}',
+  );
+  fs.writeFileSync(
+    path.join(templateRootDir, "config", "router.config.hybrid.example.json"),
+    '{"clientAuth":{"allowOpenAiBearer":true},"models":[{"id":"hybrid"}]}',
+  );
+
+  const target = ensureRouterConfig(dataRootDir, MODE_HYBRID, templateRootDir);
+  const copied = JSON.parse(fs.readFileSync(target, "utf8"));
+
+  assert.equal(target, path.join(dataRootDir, "config", "router.config.json"));
+  assert.equal(copied.models[0].id, "hybrid");
+});
+
 test("applyCodexConfig writes config and creates backup", () => {
   const rootDir = makeTempProject();
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));

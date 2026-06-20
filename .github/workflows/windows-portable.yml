@@ -1,0 +1,39 @@
+name: Windows Portable Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run checks
+        run: npm run check
+
+      - name: Package Windows portable app
+        run: npm run package:win
+
+      - name: Smoke test packaged app
+        run: npm run package:win:smoke
+
+      - name: Upload portable app
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodexBridge-windows-portable
+          path: release/**
