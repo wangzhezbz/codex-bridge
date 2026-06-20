@@ -1,5 +1,5 @@
 import { cloneJson, jsonResponse, openAiError, tryParseJson } from "./json.js";
-import { joinUpstreamUrl, requireApiKey } from "./config.js";
+import { authModeForRoute, joinUpstreamUrl, requireApiKey } from "./config.js";
 import { responsesToChatRequest } from "./responses-to-chat.js";
 import {
   assistantHistoryMessageFromChat,
@@ -40,7 +40,7 @@ export async function proxyResponsesApi(requestBody, route, res, context = {}) {
   logRoute(context, route, upstreamUrl);
   const upstream = await fetch(upstreamUrl, {
     method: "POST",
-    headers: upstreamHeaders(route),
+    headers: upstreamHeaders(route, context),
     body: JSON.stringify(payload),
   });
   logStatus(context, route, upstream.status);
@@ -71,7 +71,7 @@ export async function proxyChatCompletions(
   const converted = responsesToChatRequest(requestBody, route, history);
   const upstreamUrl = joinUpstreamUrl(route.baseUrl, "/chat/completions");
   logRoute(context, route, upstreamUrl);
-  const upstream = await callJsonUpstream(upstreamUrl, route, converted.body);
+  const upstream = await callJsonUpstream(upstreamUrl, route, converted.body, context);
   logUsage(context, route, upstream.usage);
   const response = chatResponseToResponse(
     upstream,
@@ -98,10 +98,10 @@ export async function proxyChatCompletions(
   jsonResponse(res, 200, response);
 }
 
-export async function callJsonUpstream(upstreamUrl, route, payload) {
+export async function callJsonUpstream(upstreamUrl, route, payload, context = {}) {
   const upstream = await fetch(upstreamUrl, {
     method: "POST",
-    headers: upstreamHeaders(route),
+    headers: upstreamHeaders(route, context),
     body: JSON.stringify(payload),
   });
   const text = await upstream.text();
@@ -134,11 +134,25 @@ export function sendUpstreamError(res, error) {
   jsonResponse(res, statusCode, openAiError(error.message, statusCode));
 }
 
-function upstreamHeaders(route) {
+function upstreamHeaders(route, context = {}) {
   return {
     "content-type": "application/json",
-    authorization: `Bearer ${requireApiKey(route)}`,
+    authorization: `Bearer ${upstreamBearerToken(route, context)}`,
   };
+}
+
+function upstreamBearerToken(route, context = {}) {
+  if (authModeForRoute(route) === "codex_openai") {
+    if (context.clientAuth?.kind === "codex_openai" && context.clientAuth.bearerToken) {
+      return context.clientAuth.bearerToken;
+    }
+    const error = new Error(
+      `Route ${route.id} requires Codex/OpenAI bearer authentication.`,
+    );
+    error.statusCode = 401;
+    throw error;
+  }
+  return requireApiKey(route);
 }
 
 function filteredHeaders(headers) {

@@ -3,7 +3,7 @@
   "port": 15722,
   "authToken": "sk-local-codex-router",
   "clientAuth": {
-    "allowOpenAiBearer": false
+    "allowOpenAiBearer": true
   },
   "defaultModel": "gpt-5.5",
   "catalog": {
@@ -15,24 +15,22 @@
     {
       "id": "gpt-5.5",
       "displayName": "GPT-5.5",
-      "description": "GPT-5.5 via your GPT/OpenAI-compatible provider.",
+      "description": "GPT-5.5 through Codex/OpenAI authentication.",
       "api": "responses",
-      "baseUrl": "https://api.fenno.ai/v1",
+      "baseUrl": "https://api.openai.com/v1",
       "model": "gpt-5.5",
-      "authMode": "api_key",
-      "apiKeyEnv": "FENNO_API_KEY",
+      "authMode": "codex_openai",
       "contextWindow": 1000000,
       "priority": 0
     },
     {
       "id": "gpt-5.4",
       "displayName": "GPT-5.4",
-      "description": "GPT-5.4 via your GPT/OpenAI-compatible provider.",
+      "description": "GPT-5.4 through Codex/OpenAI authentication.",
       "api": "responses",
-      "baseUrl": "https://api.fenno.ai/v1",
+      "baseUrl": "https://api.openai.com/v1",
       "model": "gpt-5.4",
-      "authMode": "api_key",
-      "apiKeyEnv": "FENNO_API_KEY",
+      "authMode": "codex_openai",
       "contextWindow": 1000000,
       "priority": 1
     },

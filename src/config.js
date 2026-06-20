@@ -41,6 +41,12 @@ export function validateConfig(config) {
     if (!["responses", "chat_completions"].includes(model.api)) {
       throw new Error(`model ${model.id} has unsupported api ${model.api}`);
     }
+    if (
+      model.authMode &&
+      !["api_key", "codex_openai"].includes(model.authMode)
+    ) {
+      throw new Error(`model ${model.id} has unsupported authMode ${model.authMode}`);
+    }
     seen.add(model.id);
   }
 }
@@ -63,6 +69,10 @@ export function apiKeyForRoute(route) {
     return process.env[route.apiKeyEnv];
   }
   return undefined;
+}
+
+export function authModeForRoute(route) {
+  return route.authMode || "api_key";
 }
 
 export function requireApiKey(route) {

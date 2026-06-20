@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { buildModelCatalog } from "../src/model-catalog.js";
+import { authModeForRoute, validateConfig } from "../src/config.js";
 import { ResponseHistory } from "../src/history.js";
 import { responsesToChatRequest } from "../src/responses-to-chat.js";
 import {
@@ -77,6 +78,51 @@ test("responses passthrough models expose reasoning levels", () => {
   assert.equal(catalog.models[0].display_name, "GPT-5.5");
   assert.equal(Array.isArray(catalog.models[0].supported_reasoning_levels), true);
   assert.equal(catalog.models[0].default_reasoning_level, "medium");
+});
+
+test("hybrid auth modes validate and default to api_key", () => {
+  const config = {
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        api: "responses",
+        baseUrl: "https://api.openai.com/v1",
+        model: "gpt-5.5",
+        authMode: "codex_openai",
+      },
+      {
+        id: "gpt-5.2",
+        displayName: "Kimi K2.7 Code",
+        api: "chat_completions",
+        baseUrl: "https://api.moonshot.cn/v1",
+        model: "kimi-k2.7-code",
+      },
+    ],
+  };
+
+  assert.doesNotThrow(() => validateConfig(config));
+  assert.equal(authModeForRoute(config.models[0]), "codex_openai");
+  assert.equal(authModeForRoute(config.models[1]), "api_key");
+});
+
+test("invalid auth modes fail config validation", () => {
+  assert.throws(
+    () =>
+      validateConfig({
+        models: [
+          {
+            id: "gpt-5.5",
+            displayName: "GPT-5.5",
+            api: "responses",
+            baseUrl: "https://api.openai.com/v1",
+            model: "gpt-5.5",
+            authMode: "browser_magic",
+          },
+        ],
+      }),
+    /unsupported authMode browser_magic/,
+  );
 });
 
 test("custom apply_patch maps to chat function and back to custom_tool_call", () => {

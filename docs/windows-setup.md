@@ -24,6 +24,18 @@ Copy-Item .\config\router.config.example.json .\config\router.config.json
 notepad .\config\router.config.json
 ```
 
+Use `router.config.example.json` when every model should use API keys.
+
+所有模型都走 API Key 时，使用 `router.config.example.json`。
+
+Use `router.config.hybrid.example.json` when GPT should use Codex/OpenAI authentication and third-party models should use their own API keys:
+
+如果希望 GPT 使用 Codex/OpenAI 认证，而第三方模型使用各自 API Key，使用 `router.config.hybrid.example.json`：
+
+```powershell
+Copy-Item .\config\router.config.hybrid.example.json .\config\router.config.json
+```
+
 Edit model names, base URLs, and enabled providers for your own account.
 
 根据你的账号情况修改模型名、base URL 和启用的 provider。
@@ -108,16 +120,38 @@ wire_api = "responses"
 experimental_bearer_token = "sk-local-codex-router"
 ```
 
+Hybrid mode example:
+
+混合模式示例：
+
+```toml
+model_provider = "codex-bridge"
+model = "gpt-5.5"
+model_catalog_json = "F:/game_code/router/model-catalog.json"
+model_reasoning_effort = "medium"
+disable_response_storage = true
+network_access = "enabled"
+windows_wsl_setup_acknowledged = true
+
+[model_providers.codex-bridge]
+name = "CodexBridge"
+base_url = "http://127.0.0.1:15722/v1"
+wire_api = "responses"
+requires_openai_auth = true
+```
+
 Rules:
 
 规则：
 
 - `model_catalog_json` must point to your real `model-catalog.json` path.
 - `experimental_bearer_token` must match `authToken` in `config/router.config.json`.
+- Hybrid mode uses `requires_openai_auth = true` instead of `experimental_bearer_token`.
 - Restart Codex Desktop after changing the catalog path.
 
 - `model_catalog_json` 必须指向你电脑里的真实 `model-catalog.json` 路径。
 - `experimental_bearer_token` 必须和 `config/router.config.json` 里的 `authToken` 一致。
+- 混合模式使用 `requires_openai_auth = true`，不要再写 `experimental_bearer_token`。
 - 修改模型目录路径后，需要重启 Codex Desktop。
 
 ## 6. Verify / 验证

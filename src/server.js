@@ -1,7 +1,7 @@
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadConfig, routeForModel } from "./config.js";
+import { authModeForRoute, loadConfig, routeForModel } from "./config.js";
 import { ResponseHistory } from "./history.js";
 import {
   jsonResponse,
@@ -54,20 +54,25 @@ export function createRouterServer(config = loadConfig()) {
         req.method === "POST" &&
         ["/v1/responses", "/responses"].includes(url.pathname)
       ) {
-        if (!isAuthorized(req, config)) {
+        const body = await readJsonRequest(req);
+        const route = routeForModel(config, body.model);
+        const clientAuth = authorizeClient(req, config);
+        if (!clientAuth.ok) {
           jsonResponse(res, 401, openAiError("Invalid router token", 401, "unauthorized"));
           return;
         }
-        const body = await readJsonRequest(req);
-        const route = routeForModel(config, body.model);
         const requestId = makeRequestId();
         console.log(
           `[${new Date().toISOString()}] ${requestId} <- /v1/responses ` +
             `model=${body.model || "(default)"} route=${route.id} ` +
             `api=${route.api} upstream_model=${route.model} stream=${Boolean(body.stream)} ` +
-            `previous_response_id=${body.previous_response_id || "-"}`,
+            `previous_response_id=${body.previous_response_id || "-"} ` +
+            `client_auth=${clientAuth.kind} upstream_auth=${authModeForRoute(route)}`,
         );
-        await handleResponsesRequest(body, route, history, res, { requestId });
+        await handleResponsesRequest(body, route, history, res, {
+          requestId,
+          clientAuth,
+        });
         return;
       }
 
@@ -93,11 +98,29 @@ export function startServer(config = loadConfig()) {
   return server;
 }
 
-function isAuthorized(req, config) {
+function authorizeClient(req, config) {
+  const bearerToken = bearerTokenFromHeader(req.headers.authorization);
   if (!config.authToken) {
-    return true;
+    if (bearerToken) {
+      return { ok: true, kind: "codex_openai", bearerToken };
+    }
+    return { ok: true, kind: "none" };
   }
-  return req.headers.authorization === `Bearer ${config.authToken}`;
+  if (bearerToken && bearerToken === config.authToken) {
+    return { ok: true, kind: "local", bearerToken };
+  }
+  if (config.clientAuth?.allowOpenAiBearer && bearerToken) {
+    return { ok: true, kind: "codex_openai", bearerToken };
+  }
+  return { ok: false, kind: "invalid" };
+}
+
+function bearerTokenFromHeader(value) {
+  if (!value || typeof value !== "string") {
+    return "";
+  }
+  const match = value.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : "";
 }
 
 function writeCors(res) {

@@ -50,6 +50,68 @@ CodexBridge 的角色就是本地桥接层：
 Codex Desktop -> CodexBridge -> GPT / DeepSeek / Kimi / 更多模型
 ```
 
+## Billing Modes / 计费模式
+
+CodexBridge supports per-model authentication.
+
+CodexBridge 支持按模型选择认证方式。
+
+### All API / 全部 API
+
+Every model uses the API key configured for its upstream provider.
+
+所有模型都使用各自 provider 配置的 API Key。
+
+Use:
+
+使用：
+
+```text
+config/router.config.example.json
+```
+
+Codex config uses a local router token:
+
+Codex 配置使用本地 router token：
+
+```toml
+[model_providers.codex-bridge]
+name = "CodexBridge"
+base_url = "http://127.0.0.1:15722/v1"
+wire_api = "responses"
+experimental_bearer_token = "sk-local-codex-router"
+```
+
+### Hybrid / 混合模式
+
+GPT models can use the Codex/OpenAI authentication that Codex sends to the local provider, while DeepSeek, Kimi, and other third-party models keep using their own API keys.
+
+GPT 模型可以使用 Codex 传给本地 provider 的 Codex/OpenAI 认证；DeepSeek、Kimi 和其他第三方模型继续使用各自 API Key。
+
+Use:
+
+使用：
+
+```text
+config/router.config.hybrid.example.json
+```
+
+Codex config uses OpenAI authentication:
+
+Codex 配置使用 OpenAI 认证：
+
+```toml
+[model_providers.codex-bridge]
+name = "CodexBridge"
+base_url = "http://127.0.0.1:15722/v1"
+wire_api = "responses"
+requires_openai_auth = true
+```
+
+Hybrid mode is implemented in the router core, but real ChatGPT subscription billing must be verified on a signed-in Codex account because unit tests cannot create a ChatGPT subscription bearer token.
+
+混合模式的路由底座已经实现，但真实 ChatGPT 订阅额度需要在已登录的 Codex 账号上实测，因为单元测试不能生成 ChatGPT 订阅 bearer token。
+
 ## Quick Start / 快速开始
 
 Developer preview requires Node.js 20 or newer.
@@ -61,6 +123,14 @@ git clone https://github.com/wangzhezbz/codex-bridge.git
 cd codex-bridge
 Copy-Item .\config\router.config.example.json .\config\router.config.json
 notepad .\config\router.config.json
+```
+
+For hybrid mode, copy the hybrid example instead:
+
+如果使用混合模式，复制混合示例：
+
+```powershell
+Copy-Item .\config\router.config.hybrid.example.json .\config\router.config.json
 ```
 
 Set API keys for the providers you enabled:
