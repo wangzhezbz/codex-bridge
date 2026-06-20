@@ -1,16 +1,39 @@
 const { app, BrowserWindow, dialog, ipcMain, shell } = require("electron");
 const { spawn } = require("node:child_process");
+const fs = require("node:fs");
 const path = require("node:path");
 
 const rootDir = path.resolve(__dirname, "..");
+const runtimeLogPath = path.join(rootDir, "logs", "desktop-runtime.log");
 let settingsPromise;
 let mainWindow;
 let routerProcess = null;
 let logLines = [];
+let smokeErrors = [];
 
 if (process.env.CODEXBRIDGE_DESKTOP_SMOKE === "1") {
   app.disableHardwareAcceleration();
 }
+
+process.on("uncaughtException", (error) => {
+  const message = formatError("uncaughtException", error);
+  appendRuntimeLog(message);
+  try {
+    dialog.showErrorBox("CodexBridge crashed", message);
+  } catch {
+    // The app may not be ready enough to show a dialog.
+  }
+  app.exit(1);
+});
+
+process.on("unhandledRejection", (reason) => {
+  const message = formatError("unhandledRejection", reason);
+  appendRuntimeLog(message);
+  if (process.env.CODEXBRIDGE_DESKTOP_SMOKE === "1") {
+    console.error(message);
+    app.exit(1);
+  }
+});
 
 function loadSettings() {
   if (!settingsPromise) {
@@ -34,6 +57,20 @@ function createWindow() {
     },
   });
 
+  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
+    recordDesktopError(`Window failed to load ${validatedURL}: ${errorCode} ${errorDescription}`);
+  });
+
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    recordDesktopError(`Renderer process gone: ${details.reason} exitCode=${details.exitCode}`);
+  });
+
+  mainWindow.webContents.on("console-message", (_event, level, message, line, sourceId) => {
+    if (level >= 2) {
+      recordDesktopError(`Renderer console error: ${message} (${sourceId}:${line})`);
+    }
+  });
+
   mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
 }
 
@@ -46,6 +83,14 @@ app.whenReady().then(() => {
     }, 15000);
     mainWindow.webContents.once("did-finish-load", () => {
       clearTimeout(timeout);
+      if (smokeErrors.length) {
+        console.error(`CodexBridge desktop smoke saw ${smokeErrors.length} renderer error(s).`);
+        for (const error of smokeErrors) {
+          console.error(error);
+        }
+        app.exit(1);
+        return;
+      }
       console.log("CodexBridge desktop smoke loaded.");
       app.quit();
     });
@@ -217,6 +262,27 @@ function appendLog(line) {
   }
   logLines = logLines.slice(-300);
   mainWindow?.webContents.send("logs:update", logLines);
+}
+
+function recordDesktopError(message) {
+  const line = String(message || "Unknown desktop error");
+  appendRuntimeLog(line);
+  appendLog(line);
+  smokeErrors.push(line);
+}
+
+function appendRuntimeLog(line) {
+  try {
+    fs.mkdirSync(path.dirname(runtimeLogPath), { recursive: true });
+    fs.appendFileSync(runtimeLogPath, `[${new Date().toISOString()}] ${line}\n`, "utf8");
+  } catch {
+    // Logging must never crash the desktop app.
+  }
+}
+
+function formatError(prefix, error) {
+  const details = error?.stack || error?.message || String(error);
+  return `${prefix}: ${details}`;
 }
 
 async function broadcastState() {
