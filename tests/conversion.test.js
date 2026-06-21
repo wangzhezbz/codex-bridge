@@ -426,3 +426,44 @@ test("chat conversion deduplicates repeated tool names for strict providers", ()
     ["shell_command", "apply_patch"],
   );
 });
+
+test("minimax chat routes request separated reasoning output", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "hello",
+    },
+    {
+      ...route,
+      id: "gpt-5.4-mini",
+      provider: "minimax",
+      model: "MiniMax-M3",
+      baseUrl: "https://api.minimaxi.com/v1",
+    },
+    new ResponseHistory(),
+  );
+
+  assert.equal(converted.body.reasoning_split, true);
+});
+
+test("minimax reasoning tags are hidden from Codex output", () => {
+  const response = chatResponseToResponse(
+    {
+      id: "chatcmpl_minimax",
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content:
+              "<think>\nI should not show this internal reasoning.\n</think>\n我是 MiniMax M3。",
+          },
+        },
+      ],
+    },
+    "gpt-5.4-mini",
+    {},
+    { stripReasoningTags: true },
+  );
+
+  assert.equal(response.output_text, "我是 MiniMax M3。");
+  assert.equal(response.output[0].content[0].text, "我是 MiniMax M3。");
+});

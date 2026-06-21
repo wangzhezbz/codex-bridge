@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { responseToolCallFromChat } from "./tools.js";
 
-export function chatResponseToResponse(chat, requestedModel, toolContext) {
+export function chatResponseToResponse(chat, requestedModel, toolContext, options = {}) {
   const choice = chat?.choices?.[0] || {};
   const message = choice.message || {};
   const id = responseIdFromChat(chat?.id);
   const output = [];
-  const text = messageText(message);
+  const text = visibleMessageText(message, options);
 
   if (text) {
     output.push({
@@ -192,6 +192,20 @@ function messageText(message) {
       .join("\n");
   }
   return "";
+}
+
+function visibleMessageText(message, options = {}) {
+  const text = messageText(message);
+  if (!options.stripReasoningTags) {
+    return text;
+  }
+  return stripReasoningTags(text);
+}
+
+function stripReasoningTags(text) {
+  return String(text || "")
+    .replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, "")
+    .trimStart();
 }
 
 function responseIdFromChat(chatId) {

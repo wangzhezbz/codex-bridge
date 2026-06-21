@@ -19,7 +19,7 @@ test("packaged desktop data defaults to stable user appdata directory", () => {
       APPDATA: "C:\\Users\\Alice\\AppData\\Roaming",
     },
     execPath:
-      "C:\\Users\\Alice\\Desktop\\CodexBridge-v0.1.7\\CodexBridge-win32-x64\\CodexBridge.exe",
+      "C:\\Users\\Alice\\Desktop\\CodexBridge-v0.1.8\\CodexBridge-win32-x64\\CodexBridge.exe",
     isPackaged: true,
     platform: "win32",
   });
@@ -101,7 +101,7 @@ test("legacy portable candidate search finds older extracted packages nearby", (
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-packages-"));
   const currentExe = path.join(
     parent,
-    "codexbridge-0.1.7",
+    "codexbridge-0.1.8",
     "CodexBridge-win32-x64",
     "CodexBridge.exe",
   );

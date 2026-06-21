@@ -27,6 +27,9 @@ export function responsesToChatRequest(request, route, history) {
     messages,
     stream: false,
   };
+  if (shouldRequestSeparatedReasoning(route)) {
+    body.reasoning_split = true;
+  }
 
   if (toolContext.chatTools.length > 0) {
     body.tools = toolContext.chatTools;
@@ -376,5 +379,20 @@ function shouldDrop(route, param) {
 function copyScalar(source, target, key) {
   if (source[key] !== undefined) {
     target[key] = source[key];
+  }
+}
+
+function shouldRequestSeparatedReasoning(route = {}) {
+  if (route.provider === "minimax") {
+    return true;
+  }
+  if (/^minimax-/i.test(route.model || "")) {
+    return true;
+  }
+  try {
+    const hostname = new URL(route.baseUrl || "").hostname.toLowerCase();
+    return hostname.includes("minimaxi.com") || hostname.includes("minimax.io");
+  } catch {
+    return false;
   }
 }

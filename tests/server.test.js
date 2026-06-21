@@ -256,6 +256,87 @@ test("api_key routes ignore incoming Codex bearer and use provider key", async (
   }
 });
 
+test("minimax routes split and hide reasoning text", async () => {
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/chat/completions");
+    assert.equal(req.headers.authorization, "Bearer minimax-provider-key");
+
+    const chunks = [];
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    assert.equal(body.model, "MiniMax-M3");
+    assert.equal(body.reasoning_split, true);
+
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: "chatcmpl_minimax_reasoning",
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content:
+                "<think>\nThis reasoning should stay hidden.\n</think>\n我是 MiniMax M3。",
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: 20,
+          total_tokens: 30,
+        },
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const upstreamUrl = serverUrl(upstream);
+
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "gpt-5.4-mini",
+    models: [
+      {
+        id: "gpt-5.4-mini",
+        displayName: "MiniMax M3",
+        provider: "minimax",
+        api: "chat_completions",
+        baseUrl: `${upstreamUrl}/v1`,
+        model: "MiniMax-M3",
+        authMode: "api_key",
+        apiKey: "minimax-provider-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const baseUrl = serverUrl(router);
+
+  try {
+    const response = await fetchJson(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.4-mini",
+        input: "hello",
+      }),
+    });
+    assert.equal(response.output_text, "我是 MiniMax M3。");
+    assert.equal(response.usage.total_tokens, 30);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
 test("server logs request-scoped upstream network errors", async () => {
   const router = createRouterServer({
     host: "127.0.0.1",

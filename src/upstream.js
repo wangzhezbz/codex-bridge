@@ -112,6 +112,7 @@ export async function proxyChatCompletions(
     upstream,
     requestBody.model || route.id,
     converted.toolContext,
+    { stripReasoningTags: shouldStripReasoningTags(route) },
   );
 
   history.record(response.id, [
@@ -402,5 +403,20 @@ function safeUrl(value) {
     return `${url.origin}${url.pathname}`;
   } catch {
     return String(value);
+  }
+}
+
+function shouldStripReasoningTags(route = {}) {
+  if (route.provider === "minimax") {
+    return true;
+  }
+  if (/^minimax-/i.test(route.model || "")) {
+    return true;
+  }
+  try {
+    const hostname = new URL(route.baseUrl || "").hostname.toLowerCase();
+    return hostname.includes("minimaxi.com") || hostname.includes("minimax.io");
+  } catch {
+    return false;
   }
 }
