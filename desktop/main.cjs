@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, shell } = require("electron");
+const { app, BrowserWindow, clipboard, dialog, ipcMain, shell } = require("electron");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -33,6 +33,7 @@ let routerProcess = null;
 let logLines = [];
 let smokeErrors = [];
 let usageStore = null;
+let lastHealth = null;
 
 for (const message of legacyDataMigration.messages) {
   appendRuntimeLog(message);
@@ -78,6 +79,10 @@ function loadSettings() {
     settingsPromise = import("./settings.mjs");
   }
   return settingsPromise;
+}
+
+async function loadRouterHealth() {
+  return import("./router-health.mjs");
 }
 
 function createWindow() {
@@ -159,7 +164,9 @@ ipcMain.handle("state:get", async () => {
     modelSlots: settings.CODEX_MODEL_SLOTS || [],
     customModels: settings.readCustomModels(dataRootDir),
     secretStatus: settings.secretStatus(dataRootDir),
+    desktopOptions: settings.loadDesktopOptions(dataRootDir),
     diagnostics,
+    lastHealth,
     usageEvents: usageStore?.events() || [],
     usageSummary: usageStore?.summary() || emptyUsageSummary(),
     legacyDataMigration,
@@ -187,6 +194,18 @@ ipcMain.handle("secrets:save", async (_event, secrets) => {
 ipcMain.handle("secrets:get", async (_event, keyEnv) => {
   const settings = await loadSettings();
   return settings.secretValue(dataRootDir, String(keyEnv || ""));
+});
+
+ipcMain.handle("options:save", async (_event, options) => {
+  const settings = await loadSettings();
+  const saved = settings.saveDesktopOptions(dataRootDir, options || {});
+  appendLog(
+    saved.bypassSystemProxy
+      ? "System proxy bypass enabled for Router process."
+      : "System proxy bypass disabled for Router process.",
+  );
+  broadcastState();
+  return getStatePayload(settings);
 });
 
 ipcMain.handle("models:saveSelection", async (_event, selectedModelIds) => {
@@ -339,9 +358,17 @@ ipcMain.handle("router:start", async () => {
   routerProcess.on("exit", (code) => {
     appendLog(`Router stopped with code ${code ?? "unknown"}.`);
     routerProcess = null;
+    lastHealth = {
+      ok: false,
+      status: 0,
+      models: [],
+      message: `Router stopped with code ${code ?? "unknown"}.`,
+      checkedAt: new Date().toISOString(),
+    };
     broadcastState();
   });
 
+  await refreshRouterHealth(prepared.config);
   broadcastState();
   return { ok: true, message: "Router started." };
 });
@@ -349,8 +376,31 @@ ipcMain.handle("router:start", async () => {
 ipcMain.handle("router:stop", async () => {
   stopRouter();
   appendLog("Router stop requested.");
+  lastHealth = {
+    ok: false,
+    status: 0,
+    models: [],
+    message: "Router is stopped.",
+    checkedAt: new Date().toISOString(),
+  };
   broadcastState();
   return { ok: true };
+});
+
+ipcMain.handle("diagnostics:copy", async () => {
+  const settings = await loadSettings();
+  const config = settings.readRouterConfig(dataRootDir);
+  const diagnostics = settings.supportDiagnostics(dataRootDir, {
+    appVersion: app.getVersion(),
+    routerRunning: Boolean(routerProcess),
+    lastHealth,
+    config,
+    logs: logLines,
+  });
+  clipboard.writeText(diagnostics.text);
+  appendLog("Copied sanitized diagnostics to clipboard.");
+  broadcastState();
+  return diagnostics.summary;
 });
 
 ipcMain.handle("folder:open", async (_event, target) => {
@@ -425,10 +475,7 @@ function nodeExecutable() {
 }
 
 function runtimeEnv(settings) {
-  const env = settings.envWithSecrets(dataRootDir, {
-    ...process.env,
-    ROUTER_CONFIG: settings.routerConfigPath(dataRootDir),
-  });
+  const env = settings.routerRuntimeEnv(dataRootDir, process.env);
   if (app.isPackaged) {
     env.ELECTRON_RUN_AS_NODE = "1";
   }
@@ -552,12 +599,40 @@ async function getStatePayload(settings) {
     modelSlots: settings.CODEX_MODEL_SLOTS || [],
     customModels: settings.readCustomModels(dataRootDir),
     secretStatus: settings.secretStatus(dataRootDir),
+    desktopOptions: settings.loadDesktopOptions(dataRootDir),
     diagnostics,
+    lastHealth,
     usageEvents: usageStore?.events() || [],
     usageSummary: usageStore?.summary() || emptyUsageSummary(),
     legacyDataMigration,
     logs: logLines,
   };
+}
+
+async function refreshRouterHealth(config) {
+  const { probeRouterHealth } = await loadRouterHealth();
+  const host = config?.host || "127.0.0.1";
+  const port = config?.port || 15722;
+  const origin = `http://${host}:${port}`;
+  let result = null;
+  for (let attempt = 1; attempt <= 6; attempt += 1) {
+    result = await probeRouterHealth({ origin, timeoutMs: 1200 });
+    if (result.ok) {
+      break;
+    }
+    await delay(250);
+  }
+  lastHealth = result;
+  appendLog(
+    result.ok
+      ? `Health OK: ${result.models.join(", ") || "no models listed"}.`
+      : `Health failed: ${result.message}`,
+  );
+  return result;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function usagePayload() {
@@ -587,10 +662,13 @@ async function runDesktopSmokeChecks() {
           "#initializeCodex",
           "#recoverHistoryAccess",
           "#routerToggle",
+          "#healthStatus",
+          "#bypassSystemProxy",
           "#saveModelSelectionPanel",
           "#providerGrid",
           "#stats",
-          "#usageChart"
+          "#usageChart",
+          "#copyDiagnostics"
         ];
         for (const selector of required) {
           if (!document.querySelector(selector)) {

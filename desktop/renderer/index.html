@@ -82,6 +82,14 @@
                 <strong>Router 已关闭</strong>
                 <small>点击启动本地网关</small>
               </button>
+              <div class="health-card" id="healthStatus">Router 健康检查：尚未检查</div>
+              <label class="option-toggle">
+                <input id="bypassSystemProxy" type="checkbox" />
+                <span>
+                  <strong>本应用绕过系统代理</strong>
+                  <small>遇到 502、fetch failed 或 VPN/代理冲突时可开启；只影响 CodexBridge Router。</small>
+                </span>
+              </label>
               <p class="helper-copy">常规流程：选模型、填密钥、更新配置、启动 Router，然后手动关闭并重新打开 Codex。右上角“找回历史对话”会恢复 CodexBridge 写入前的配置，帮助 Codex 显示原来的会话列表。</p>
             </article>
           </div>
@@ -242,6 +250,7 @@
                 <h2>实时日志</h2>
                 <p>确认请求实际走到哪个 provider、哪个真实模型，以及按钮执行结果。</p>
               </div>
+              <button class="primary-button small" id="copyDiagnostics">复制诊断信息</button>
             </div>
             <pre id="logOutput"></pre>
           </article>

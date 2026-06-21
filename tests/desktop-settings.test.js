@@ -12,17 +12,21 @@ import {
   buildCodexToml,
   detectModeFromConfig,
   ensureRouterConfig,
+  loadDesktopOptions,
   providerCatalog,
   prepareRouterStartConfig,
   readCustomModels,
   recoverCodexHistoryAccess,
   restoreCodexConfig,
   routerConfigDiagnostics,
+  routerRuntimeEnv,
   saveCustomModel,
+  saveDesktopOptions,
   saveSelection,
   saveSecrets,
   secretValue,
   secretStatus,
+  supportDiagnostics,
 } from "../desktop/settings.mjs";
 
 test("detectModeFromConfig distinguishes all-api and hybrid", () => {
@@ -170,6 +174,83 @@ test("routerConfigDiagnostics reports invalid upstream base URLs", () => {
 
   assert.equal(diagnostics.ok, false);
   assert.deepEqual(diagnostics.invalidBaseUrls.map((item) => item.id), ["bad-url"]);
+});
+
+test("desktop options persist proxy bypass setting", () => {
+  const rootDir = makeTempProject();
+
+  assert.equal(loadDesktopOptions(rootDir).bypassSystemProxy, false);
+  const saved = saveDesktopOptions(rootDir, { bypassSystemProxy: true });
+
+  assert.equal(saved.bypassSystemProxy, true);
+  assert.equal(loadDesktopOptions(rootDir).bypassSystemProxy, true);
+});
+
+test("routerRuntimeEnv disables system proxy when desktop option is enabled", () => {
+  const rootDir = makeTempProject();
+  saveDesktopOptions(rootDir, { bypassSystemProxy: true });
+
+  const env = routerRuntimeEnv(rootDir, {
+    PATH: "base-path",
+    CODEXBRIDGE_DISABLE_SYSTEM_PROXY: "0",
+  });
+
+  assert.equal(env.PATH, "base-path");
+  assert.equal(env.ROUTER_CONFIG, path.join(rootDir, "config", "router.config.json"));
+  assert.equal(env.CODEXBRIDGE_DISABLE_SYSTEM_PROXY, "1");
+});
+
+test("supportDiagnostics redacts keys and summarizes current config", () => {
+  const rootDir = makeTempProject();
+  saveSecrets(rootDir, {
+    DEEPSEEK_API_KEY: "sk-secret-value",
+  });
+  saveDesktopOptions(rootDir, { bypassSystemProxy: true });
+
+  const diagnostics = supportDiagnostics(rootDir, {
+    appVersion: "0.1.18",
+    routerRunning: true,
+    lastHealth: { ok: false, message: "connect ECONNREFUSED 127.0.0.1:15722" },
+    config: {
+      port: 15722,
+      models: [
+        {
+          id: "gpt-5.4-mini",
+          displayName: "DeepSeek V4 Pro",
+          api: "chat_completions",
+          baseUrl: "https://api.deepseek.com/v1",
+          model: "deepseek-v4-pro",
+          authMode: "api_key",
+          apiKeyEnv: "DEEPSEEK_API_KEY",
+        },
+        {
+          id: "gpt-5.2",
+          displayName: "Kimi K2.7 Code",
+          api: "chat_completions",
+          baseUrl: "https://api.moonshot.cn/v1",
+          model: "kimi-k2.7-code",
+          authMode: "api_key",
+          apiKeyEnv: "MOONSHOT_API_KEY",
+        },
+      ],
+    },
+    logs: [
+      "[10:00:00] access POST /v1/responses host=localhost:15722 ua=Codex",
+      "[10:00:01] req_a1234567 !! upstream route=gpt-5.2 status=502 error=fetch failed cause=UND_ERR_CONNECT_TIMEOUT",
+      "[10:00:02] authorization=Bearer sk-sensitive-token",
+    ],
+  });
+
+  assert.match(diagnostics.text, /CodexBridge Diagnostics/);
+  assert.match(diagnostics.text, /version: 0\.1\.18/);
+  assert.match(diagnostics.text, /routerRunning: true/);
+  assert.match(diagnostics.text, /bypassSystemProxy: true/);
+  assert.match(diagnostics.text, /DEEPSEEK_API_KEY: saved/);
+  assert.match(diagnostics.text, /MOONSHOT_API_KEY: missing/);
+  assert.match(diagnostics.text, /Kimi K2\.7 Code -> kimi-k2\.7-code/);
+  assert.match(diagnostics.text, /UND_ERR_CONNECT_TIMEOUT/);
+  assert.doesNotMatch(diagnostics.text, /sk-secret-value/);
+  assert.doesNotMatch(diagnostics.text, /sk-sensitive-token/);
 });
 
 test("secretValue returns only known provider secrets", () => {

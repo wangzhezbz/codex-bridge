@@ -343,6 +343,58 @@ h3 {
   transform: translateX(20px);
 }
 
+.health-card,
+.option-toggle {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.health-card {
+  min-height: 42px;
+  padding: 11px 12px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.health-card.ok {
+  border-color: #b7ded8;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.health-card.bad {
+  border-color: #ffd0ca;
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.option-toggle {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px;
+  align-items: start;
+  padding: 12px;
+}
+
+.option-toggle input {
+  width: 18px;
+  height: 18px;
+  margin-top: 2px;
+  accent-color: var(--accent);
+}
+
+.option-toggle strong,
+.option-toggle small {
+  display: block;
+}
+
+.option-toggle small {
+  margin-top: 3px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
 .primary-button,
 .plain-button,
 .ghost-button,

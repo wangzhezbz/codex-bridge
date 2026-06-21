@@ -39,6 +39,10 @@ export function customModelsPath(rootDir) {
   return path.join(rootDir, "config", "custom-models.json");
 }
 
+export function desktopOptionsPath(rootDir) {
+  return path.join(rootDir, "config", "desktop-options.json");
+}
+
 export function codexConfigPath(homeDir = os.homedir()) {
   return path.join(homeDir, ".codex", "config.toml");
 }
@@ -97,6 +101,22 @@ export function loadSecrets(rootDir) {
   return readJsonIfExists(secretsPath(rootDir), {});
 }
 
+export function loadDesktopOptions(rootDir) {
+  const saved = readJsonIfExists(desktopOptionsPath(rootDir), {});
+  return normalizeDesktopOptions(saved);
+}
+
+export function saveDesktopOptions(rootDir, options = {}) {
+  const saved = {
+    ...loadDesktopOptions(rootDir),
+    ...normalizeDesktopOptions(options),
+  };
+  const target = desktopOptionsPath(rootDir);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, `${JSON.stringify(saved, null, 2)}\n`, "utf8");
+  return saved;
+}
+
 export function secretStatus(rootDir) {
   const secrets = loadSecrets(rootDir);
   const status = {};
@@ -125,6 +145,17 @@ export function envWithSecrets(rootDir, baseEnv = process.env) {
     ...baseEnv,
     ...loadSecrets(rootDir),
   };
+}
+
+export function routerRuntimeEnv(rootDir, baseEnv = process.env) {
+  const env = envWithSecrets(rootDir, {
+    ...baseEnv,
+    ROUTER_CONFIG: routerConfigPath(rootDir),
+  });
+  if (loadDesktopOptions(rootDir).bypassSystemProxy) {
+    env.CODEXBRIDGE_DISABLE_SYSTEM_PROXY = "1";
+  }
+  return env;
 }
 
 export function routerConfigDiagnostics(rootDir, config = readRouterConfig(rootDir)) {
@@ -170,6 +201,75 @@ export function routerConfigDiagnostics(rootDir, config = readRouterConfig(rootD
     codexOpenAiRoutes,
     missingApiKeys,
     invalidBaseUrls,
+  };
+}
+
+export function supportDiagnostics(rootDir, {
+  appVersion = "",
+  routerRunning = false,
+  lastHealth = null,
+  config = readRouterConfig(rootDir),
+  logs = [],
+  platform = process.platform,
+  arch = process.arch,
+  release = os.release(),
+} = {}) {
+  const options = loadDesktopOptions(rootDir);
+  const routeDiagnostics = routerConfigDiagnostics(rootDir, config);
+  const secretMap = loadSecrets(rootDir);
+  const selectedRoutes = Array.isArray(config?.models) ? config.models : [];
+  const selectedKeyEnvs = [
+    ...new Set(
+      selectedRoutes
+        .map((route) => route.apiKeyEnv || route.keyEnv || "")
+        .filter(Boolean),
+    ),
+  ].sort();
+  const errorLines = StringLines(logs)
+    .filter((line) => /\b(error|status=4\d\d|status=5\d\d|!! upstream|Health failed|Preflight)/i.test(line))
+    .slice(-20)
+    .map(redactSecretText);
+
+  const lines = [
+    "CodexBridge Diagnostics",
+    `version: ${appVersion || "unknown"}`,
+    `platform: ${platform} ${arch} ${release}`,
+    `dataRoot: ${rootDir}`,
+    `routerRunning: ${Boolean(routerRunning)}`,
+    `routerPort: ${config?.port || 15722}`,
+    `bypassSystemProxy: ${Boolean(options.bypassSystemProxy)}`,
+    `health: ${lastHealth?.ok ? "ok" : lastHealth?.message || "unknown"}`,
+    "",
+    "Selected models:",
+    ...(selectedRoutes.length
+      ? selectedRoutes.map(
+          (route) =>
+            `- ${route.id}: ${route.displayName} -> ${route.model} (${route.api}, ${route.authMode || "api_key"}) ${route.baseUrl}`,
+        )
+      : ["- none"]),
+    "",
+    "API keys:",
+    ...(selectedKeyEnvs.length
+      ? selectedKeyEnvs.map((keyEnv) => `- ${keyEnv}: ${secretMap[keyEnv] || process.env[keyEnv] ? "saved" : "missing"}`)
+      : ["- none required"]),
+    "",
+    "Config diagnostics:",
+    `- ok: ${routeDiagnostics.ok}`,
+    `- missingApiKeys: ${routeDiagnostics.missingApiKeys.map((item) => `${item.displayName || item.id}:${item.apiKeyEnv || "API Key"}`).join(", ") || "none"}`,
+    `- invalidBaseUrls: ${routeDiagnostics.invalidBaseUrls.map((item) => `${item.displayName || item.id}:${item.baseUrl || "(empty)"}`).join(", ") || "none"}`,
+    "",
+    "Recent errors:",
+    ...(errorLines.length ? errorLines.map((line) => `- ${line}`) : ["- none"]),
+  ];
+
+  return {
+    summary: {
+      ok: routeDiagnostics.ok && Boolean(lastHealth?.ok || !routerRunning),
+      missingApiKeys: routeDiagnostics.missingApiKeys,
+      invalidBaseUrls: routeDiagnostics.invalidBaseUrls,
+      errorCount: errorLines.length,
+    },
+    text: lines.join("\n"),
   };
 }
 
@@ -593,6 +693,12 @@ function routeDiagnosticItem(route = {}) {
   };
 }
 
+function normalizeDesktopOptions(options = {}) {
+  return {
+    bypassSystemProxy: Boolean(options.bypassSystemProxy),
+  };
+}
+
 function isValidHttpUrl(value) {
   try {
     const url = new URL(String(value || ""));
@@ -600,6 +706,21 @@ function isValidHttpUrl(value) {
   } catch {
     return false;
   }
+}
+
+function StringLines(lines) {
+  if (Array.isArray(lines)) {
+    return lines.map((line) => String(line || ""));
+  }
+  return String(lines || "").split(/\r?\n/);
+}
+
+function redactSecretText(value) {
+  return String(value || "")
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
+    .replace(/\bsk-[A-Za-z0-9._-]{8,}\b/g, "sk-[REDACTED]")
+    .replace(/(api[_-]?key["'\s:=]+)[A-Za-z0-9._-]{8,}/gi, "$1[REDACTED]")
+    .slice(0, 1000);
 }
 
 function timestamp(date = new Date()) {

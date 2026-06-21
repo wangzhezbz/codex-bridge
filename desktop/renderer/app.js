@@ -12,6 +12,9 @@ const els = {
   maxModels: document.querySelector("#maxModels"),
   keySummary: document.querySelector("#keySummary"),
   keySummaryDetail: document.querySelector("#keySummaryDetail"),
+  healthStatus: document.querySelector("#healthStatus"),
+  bypassSystemProxy: document.querySelector("#bypassSystemProxy"),
+  copyDiagnostics: document.querySelector("#copyDiagnostics"),
   latestUsage: document.querySelector("#latestUsage"),
   providerGrid: document.querySelector("#providerGrid"),
   selectedModels: document.querySelector("#selectedModels"),
@@ -78,6 +81,28 @@ els.routerToggle.addEventListener("click", () =>
       showToast("Router 已启动。");
     }
     await refresh();
+  }),
+);
+
+els.bypassSystemProxy.addEventListener("change", () =>
+  runAction(null, async () => {
+    state = await api.saveOptions({
+      bypassSystemProxy: els.bypassSystemProxy.checked,
+    });
+    render();
+    showToast(
+      els.bypassSystemProxy.checked
+        ? "已开启代理绕过；重新启动 Router 后生效。"
+        : "已关闭代理绕过；重新启动 Router 后生效。",
+    );
+  }),
+);
+
+els.copyDiagnostics.addEventListener("click", () =>
+  runAction(els.copyDiagnostics, async () => {
+    const summary = await api.copyDiagnostics();
+    await refresh();
+    showToast(`诊断信息已复制。最近错误 ${summary?.errorCount || 0} 条，发给我就能排查。`);
   }),
 );
 
@@ -181,12 +206,14 @@ function render() {
   const keySummary = keySummaryInfo();
   els.keySummary.textContent = keySummary.text;
   els.keySummaryDetail.textContent = keySummary.detail;
+  els.bypassSystemProxy.checked = Boolean(state.desktopOptions?.bypassSystemProxy);
 
   document.querySelectorAll(".mode-card").forEach((button) => {
     button.classList.toggle("active", button.dataset.mode === state.mode);
   });
 
   renderRouterToggle();
+  renderHealthStatus();
   renderProviders();
   renderSelectedModels();
   renderModelPool();
@@ -194,6 +221,20 @@ function render() {
   renderUsage();
   renderOverviewUsage();
   renderLogs(state.logs || []);
+}
+
+function renderHealthStatus() {
+  const health = state.lastHealth;
+  els.healthStatus.classList.toggle("ok", Boolean(health?.ok));
+  els.healthStatus.classList.toggle("bad", Boolean(health && !health.ok));
+  if (!health) {
+    els.healthStatus.textContent = "Router 健康检查：尚未检查";
+    return;
+  }
+  const checkedAt = health.checkedAt ? ` · ${formatTime(health.checkedAt)}` : "";
+  els.healthStatus.textContent = health.ok
+    ? `Router 健康检查通过：${health.models?.length || 0} 个模型已加载${checkedAt}`
+    : `Router 健康检查失败：${health.message || "未知错误"}${checkedAt}`;
 }
 
 function renderRouterToggle() {
