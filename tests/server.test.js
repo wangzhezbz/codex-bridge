@@ -659,10 +659,14 @@ test("server logs request-scoped upstream network errors", async () => {
       }),
     });
     assert.equal(response.ok, false);
-    assert.equal(response.status, 500);
+    assert.equal(response.status, 502);
+    const body = await response.json();
+    assert.equal(body.error.code, "upstream_network_error");
+    assert.match(body.error.message, /GPT-5\.5/);
+    assert.match(body.error.message, /network/i);
     assert.match(
       errors.join("\n"),
-      /req_[a-z0-9]+ !! upstream route=gpt-5\.5 status=599 error=fetch failed/,
+      /req_[a-z0-9]+ !! upstream route=gpt-5\.5 status=502 error=CodexBridge network error/,
     );
   } finally {
     console.error = originalError;

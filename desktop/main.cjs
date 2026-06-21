@@ -143,6 +143,7 @@ ipcMain.handle("state:get", async () => {
   const settings = await loadSettings();
   const config = settings.readRouterConfig(dataRootDir);
   const mode = settings.detectModeFromConfig(config);
+  const diagnostics = settings.routerConfigDiagnostics(dataRootDir, config);
   return {
     rootDir: dataRootDir,
     appRootDir,
@@ -158,6 +159,7 @@ ipcMain.handle("state:get", async () => {
     modelSlots: settings.CODEX_MODEL_SLOTS || [],
     customModels: settings.readCustomModels(dataRootDir),
     secretStatus: settings.secretStatus(dataRootDir),
+    diagnostics,
     usageEvents: usageStore?.events() || [],
     usageSummary: usageStore?.summary() || emptyUsageSummary(),
     legacyDataMigration,
@@ -304,6 +306,7 @@ ipcMain.handle("router:start", async () => {
   const settings = await loadSettings();
   const config = settings.readRouterConfig(dataRootDir);
   const mode = settings.detectModeFromConfig(config);
+  appendDiagnosticsLog(settings.routerConfigDiagnostics(dataRootDir, config));
   const prepared = settings.prepareRouterStartConfig({
     rootDir: dataRootDir,
     mode,
@@ -450,6 +453,30 @@ function appendLog(line) {
   mainWindow?.webContents.send("usage:update", usagePayload());
 }
 
+function appendDiagnosticsLog(diagnostics) {
+  if (!diagnostics) {
+    return;
+  }
+  if (diagnostics.ok) {
+    appendLog("Preflight OK: selected model keys and base URLs are ready.");
+    return;
+  }
+  if (diagnostics.invalidBaseUrls?.length) {
+    appendLog(
+      `Preflight invalid base URLs: ${diagnostics.invalidBaseUrls
+        .map((item) => `${item.displayName || item.id} -> ${item.baseUrl || "(empty)"}`)
+        .join("; ")}`,
+    );
+  }
+  if (diagnostics.missingApiKeys?.length) {
+    appendLog(
+      `Preflight missing API keys: ${diagnostics.missingApiKeys
+        .map((item) => `${item.displayName || item.id} -> ${item.apiKeyEnv || "API Key"}`)
+        .join("; ")}`,
+    );
+  }
+}
+
 function recordDesktopError(message) {
   const line = String(message || "Unknown desktop error");
   appendRuntimeLog(line);
@@ -509,6 +536,7 @@ async function broadcastState() {
 async function getStatePayload(settings) {
   const config = settings.readRouterConfig(dataRootDir);
   const mode = settings.detectModeFromConfig(config);
+  const diagnostics = settings.routerConfigDiagnostics(dataRootDir, config);
   return {
     rootDir: dataRootDir,
     appRootDir,
@@ -524,6 +552,7 @@ async function getStatePayload(settings) {
     modelSlots: settings.CODEX_MODEL_SLOTS || [],
     customModels: settings.readCustomModels(dataRootDir),
     secretStatus: settings.secretStatus(dataRootDir),
+    diagnostics,
     usageEvents: usageStore?.events() || [],
     usageSummary: usageStore?.summary() || emptyUsageSummary(),
     legacyDataMigration,

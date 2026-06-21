@@ -17,6 +17,7 @@ import {
   readCustomModels,
   recoverCodexHistoryAccess,
   restoreCodexConfig,
+  routerConfigDiagnostics,
   saveCustomModel,
   saveSelection,
   saveSecrets,
@@ -106,6 +107,69 @@ test("saveSecrets records only non-empty values", () => {
     STEPFUN_API_KEY: false,
     ZHIPUAI_API_KEY: false,
   });
+});
+
+test("routerConfigDiagnostics reports selected API routes missing provider keys", () => {
+  const rootDir = makeTempProject();
+  saveSecrets(rootDir, {
+    DEEPSEEK_API_KEY: "deepseek-key",
+  });
+  const diagnostics = routerConfigDiagnostics(rootDir, {
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        api: "responses",
+        baseUrl: "https://api.openai.com/v1",
+        model: "gpt-5.5",
+        authMode: "codex_openai",
+      },
+      {
+        id: "gpt-5.4-mini",
+        displayName: "DeepSeek V4 Pro",
+        api: "chat_completions",
+        baseUrl: "https://api.deepseek.com/v1",
+        model: "deepseek-v4-pro",
+        authMode: "api_key",
+        apiKeyEnv: "DEEPSEEK_API_KEY",
+      },
+      {
+        id: "gpt-5.2",
+        displayName: "Kimi K2.7 Code",
+        api: "chat_completions",
+        baseUrl: "https://api.moonshot.cn/v1",
+        model: "kimi-k2.7-code",
+        authMode: "api_key",
+        apiKeyEnv: "MOONSHOT_API_KEY",
+      },
+    ],
+  });
+
+  assert.equal(diagnostics.ok, false);
+  assert.equal(diagnostics.apiKeyRoutes, 2);
+  assert.equal(diagnostics.savedApiKeyRoutes, 1);
+  assert.deepEqual(diagnostics.missingApiKeys.map((item) => item.apiKeyEnv), ["MOONSHOT_API_KEY"]);
+  assert.match(diagnostics.missingApiKeys[0].displayName, /Kimi/);
+});
+
+test("routerConfigDiagnostics reports invalid upstream base URLs", () => {
+  const rootDir = makeTempProject();
+  const diagnostics = routerConfigDiagnostics(rootDir, {
+    models: [
+      {
+        id: "bad-url",
+        displayName: "Bad URL",
+        api: "chat_completions",
+        baseUrl: "api.example.com/v1",
+        model: "bad-model",
+        authMode: "api_key",
+        apiKey: "inline-key",
+      },
+    ],
+  });
+
+  assert.equal(diagnostics.ok, false);
+  assert.deepEqual(diagnostics.invalidBaseUrls.map((item) => item.id), ["bad-url"]);
 });
 
 test("secretValue returns only known provider secrets", () => {

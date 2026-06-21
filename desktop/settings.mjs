@@ -127,6 +127,52 @@ export function envWithSecrets(rootDir, baseEnv = process.env) {
   };
 }
 
+export function routerConfigDiagnostics(rootDir, config = readRouterConfig(rootDir)) {
+  const routes = Array.isArray(config?.models) ? config.models : [];
+  const secrets = loadSecrets(rootDir);
+  const missingApiKeys = [];
+  const invalidBaseUrls = [];
+  let apiKeyRoutes = 0;
+  let savedApiKeyRoutes = 0;
+  let codexOpenAiRoutes = 0;
+
+  for (const route of routes) {
+    if (!isValidHttpUrl(route.baseUrl)) {
+      invalidBaseUrls.push(routeDiagnosticItem(route));
+    }
+
+    if ((route.authMode || "api_key") === "codex_openai") {
+      codexOpenAiRoutes += 1;
+      continue;
+    }
+
+    apiKeyRoutes += 1;
+    const apiKeyEnv = route.apiKeyEnv || route.keyEnv || "";
+    const hasKey = Boolean(
+      route.apiKey ||
+        (apiKeyEnv && (secrets[apiKeyEnv] || process.env[apiKeyEnv])),
+    );
+    if (hasKey) {
+      savedApiKeyRoutes += 1;
+    } else {
+      missingApiKeys.push({
+        ...routeDiagnosticItem(route),
+        apiKeyEnv,
+      });
+    }
+  }
+
+  return {
+    ok: missingApiKeys.length === 0 && invalidBaseUrls.length === 0,
+    totalRoutes: routes.length,
+    apiKeyRoutes,
+    savedApiKeyRoutes,
+    codexOpenAiRoutes,
+    missingApiKeys,
+    invalidBaseUrls,
+  };
+}
+
 export function providerCatalog(rootDir) {
   const customProviders = new Map();
   for (const model of readCustomModels(rootDir)) {
@@ -534,6 +580,26 @@ function normalizeInputModalities(value) {
     normalized.unshift("text");
   }
   return normalized;
+}
+
+function routeDiagnosticItem(route = {}) {
+  return {
+    id: route.id || "",
+    displayName: route.displayName || route.id || "",
+    provider: route.provider || "",
+    model: route.model || "",
+    api: route.api || "",
+    baseUrl: route.baseUrl || "",
+  };
+}
+
+function isValidHttpUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 function timestamp(date = new Date()) {

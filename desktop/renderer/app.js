@@ -11,6 +11,7 @@ const els = {
   selectedCount: document.querySelector("#selectedCount"),
   maxModels: document.querySelector("#maxModels"),
   keySummary: document.querySelector("#keySummary"),
+  keySummaryDetail: document.querySelector("#keySummaryDetail"),
   latestUsage: document.querySelector("#latestUsage"),
   providerGrid: document.querySelector("#providerGrid"),
   selectedModels: document.querySelector("#selectedModels"),
@@ -177,7 +178,9 @@ function render() {
   els.rootDir.textContent = state.rootDir;
   els.selectedCount.textContent = String(draftSelection.length);
   els.maxModels.textContent = String(state.maxModels || 5);
-  els.keySummary.textContent = keySummaryInfo().text;
+  const keySummary = keySummaryInfo();
+  els.keySummary.textContent = keySummary.text;
+  els.keySummaryDetail.textContent = keySummary.detail;
 
   document.querySelectorAll(".mode-card").forEach((button) => {
     button.classList.toggle("active", button.dataset.mode === state.mode);
@@ -642,6 +645,46 @@ async function runAction(button, fn) {
 }
 
 function keySummaryInfo() {
+  const diagnostics = state.diagnostics;
+  if (diagnostics) {
+    const invalidBaseUrls = diagnostics.invalidBaseUrls || [];
+    const missingApiKeys = diagnostics.missingApiKeys || [];
+    if (invalidBaseUrls.length) {
+      return {
+        needed: diagnostics.apiKeyRoutes || 0,
+        saved: diagnostics.savedApiKeyRoutes || 0,
+        text: `发现 ${invalidBaseUrls.length} 个地址错误`,
+        detail: invalidBaseUrls
+          .map((item) => `${item.displayName || item.id}: ${item.baseUrl || "Base URL 为空"}`)
+          .join("；"),
+      };
+    }
+    if (missingApiKeys.length) {
+      return {
+        needed: diagnostics.apiKeyRoutes || 0,
+        saved: diagnostics.savedApiKeyRoutes || 0,
+        text: `还缺 ${missingApiKeys.length} 个 API Key`,
+        detail: missingApiKeys
+          .map((item) => `${item.displayName || item.id}: ${item.apiKeyEnv || "API Key"}`)
+          .join("；"),
+      };
+    }
+    if (!diagnostics.apiKeyRoutes) {
+      return {
+        needed: 0,
+        saved: 0,
+        text: "当前选择无需 API Key",
+        detail: "GPT 订阅模型会使用 Codex/OpenAI 登录态。",
+      };
+    }
+    return {
+      needed: diagnostics.apiKeyRoutes,
+      saved: diagnostics.savedApiKeyRoutes,
+      text: "所需 API Key 已全部保存",
+      detail: `已选 ${diagnostics.apiKeyRoutes} 个 API 模型，密钥已准备好。`,
+    };
+  }
+
   const needed = new Set();
   const modelsById = modelMap();
   for (const id of draftSelection) {
@@ -662,6 +705,10 @@ function keySummaryInfo() {
     needed: needed.size,
     saved,
     text,
+    detail:
+      needed.size === 0
+        ? "GPT 订阅模型会使用 Codex/OpenAI 登录态。"
+        : "只看当前模型栏里 DeepSeek、Kimi 等 API 模型需要的密钥。",
   };
 }
 

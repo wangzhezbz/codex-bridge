@@ -45,6 +45,24 @@ export class UpstreamHttpError extends Error {
   }
 }
 
+export class UpstreamNetworkError extends Error {
+  constructor(cause, upstreamUrl, route = {}, proxyLabel = "") {
+    super(networkErrorMessage(cause, upstreamUrl, route, proxyLabel));
+    this.name = "UpstreamNetworkError";
+    this.statusCode = 502;
+    this.code = "upstream_network_error";
+    this.cause = cause;
+    this.upstreamUrl = upstreamUrl;
+    this.proxyLabel = proxyLabel;
+    this.route = {
+      id: route.id || "",
+      displayName: route.displayName || "",
+      model: route.model || "",
+      api: route.api || "",
+    };
+  }
+}
+
 export async function handleResponsesRequest(
   requestBody,
   route,
@@ -163,6 +181,15 @@ export async function callJsonUpstream(upstreamUrl, route, payload, context = {}
 }
 
 export function sendUpstreamError(res, error) {
+  if (error instanceof UpstreamNetworkError) {
+    jsonResponse(
+      res,
+      error.statusCode,
+      openAiError(error.message, error.statusCode, error.code),
+    );
+    return;
+  }
+
   if (error instanceof UpstreamHttpError) {
     const parsed = tryParseJson(error.bodyText);
     if (isMissingResponsesWriteScope(parsed, error.bodyText)) {
@@ -358,14 +385,23 @@ function logUsage(context, route, usage) {
 async function fetchUpstream(upstreamUrl, init, context = {}, route = {}) {
   const proxiedInit = fetchInitWithProxy(upstreamUrl, init);
   const usedProxy = Boolean(proxiedInit.dispatcher);
+  const proxyLabel = proxyLogLabel(upstreamUrl);
   try {
     return await fetch(upstreamUrl, proxiedInit);
   } catch (error) {
     if (!usedProxy || !isNetworkFetchFailure(error)) {
-      throw error;
+      throw isNetworkFetchFailure(error)
+        ? new UpstreamNetworkError(error, upstreamUrl, route, proxyLabel)
+        : error;
     }
     logProxyFallback(context, route, error);
-    return fetch(upstreamUrl, init);
+    try {
+      return await fetch(upstreamUrl, init);
+    } catch (directError) {
+      throw isNetworkFetchFailure(directError)
+        ? new UpstreamNetworkError(directError, upstreamUrl, route, proxyLabel)
+        : directError;
+    }
   }
 }
 
@@ -395,6 +431,25 @@ export function upstreamErrorLogPreview(error) {
     return "";
   }
   return ` body=${safeText(error.bodyText, 500)}`;
+}
+
+function networkErrorMessage(cause, upstreamUrl, route = {}, proxyLabel = "") {
+  const routeLabel = [route.displayName, route.id].filter(Boolean).join(" / ");
+  const model = route.model ? ` upstream_model=${route.model}` : "";
+  const api = route.api ? ` api=${route.api}` : "";
+  const causeLabel =
+    cause?.cause?.code ||
+    cause?.cause?.message ||
+    cause?.message ||
+    String(cause || "unknown network error");
+  return (
+    `CodexBridge network error` +
+    (routeLabel ? ` from ${routeLabel}` : "") +
+    `${model}${api}: ${safeText(causeLabel, 200)}. ` +
+    "Check network, provider Base URL, API proxy/VPN, and whether the provider is reachable." +
+    (proxyLabel ? ` proxy=${proxyLabel}` : "") +
+    ` url=${safeUrl(upstreamUrl)}`
+  );
 }
 
 function extractResponsesUsage(text) {
