@@ -32,22 +32,24 @@ test("detectModeFromConfig distinguishes all-api and hybrid", () => {
 });
 
 test("buildCodexToml uses local token in all-api mode", () => {
+  const rootDir = path.join(os.tmpdir(), "codex-bridge-router");
   const toml = buildCodexToml({
-    rootDir: "F:\\game_code\\router",
+    rootDir,
     mode: MODE_ALL_API,
     port: 15722,
   });
 
+  const expectedCatalogPath = path.resolve(rootDir, "model-catalog.json").replaceAll("\\", "/");
   assert.match(toml, /experimental_bearer_token = "sk-local-codex-router"/);
   assert.match(toml, /supports_websockets = false/);
   assert.match(toml, /base_url = "http:\/\/localhost:15722\/v1"/);
   assert.doesNotMatch(toml, /requires_openai_auth/);
-  assert.match(toml, /model_catalog_json = "F:\/game_code\/router\/model-catalog.json"/);
+  assert.match(toml, new RegExp(`model_catalog_json = "${escapeRegExp(expectedCatalogPath)}"`));
 });
 
 test("buildCodexToml uses OpenAI auth in hybrid mode", () => {
   const toml = buildCodexToml({
-    rootDir: "F:\\game_code\\router",
+    rootDir: path.join(os.tmpdir(), "codex-bridge-router"),
     mode: MODE_HYBRID,
     port: 15722,
   });
@@ -527,4 +529,8 @@ test("restoreCodexConfig explains when no backup exists", () => {
 
 function makeTempProject() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "codex-bridge-test-"));
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

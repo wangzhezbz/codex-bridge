@@ -61,7 +61,7 @@ test("developer and explicit data directories still keep their current behavior"
       isPackaged: true,
       platform: "win32",
     }),
-    path.resolve("D:\\CodexBridgeData"),
+    path.win32.resolve("D:\\CodexBridgeData"),
   );
 });
 

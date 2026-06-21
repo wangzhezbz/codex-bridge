@@ -14,15 +14,16 @@ function resolveDataRootDir({
 } = {}) {
   const override = String(env.CODEXBRIDGE_DATA_DIR || "").trim();
   if (override) {
-    return path.resolve(override);
+    return platform === "win32" ? path.win32.resolve(override) : path.resolve(override);
   }
   if (!isPackaged) {
     return appRootDir;
   }
   if (platform === "win32") {
-    const appData = env.APPDATA || (env.USERPROFILE && path.join(env.USERPROFILE, "AppData", "Roaming"));
+    const appData =
+      env.APPDATA || (env.USERPROFILE && path.win32.join(env.USERPROFILE, "AppData", "Roaming"));
     if (appData) {
-      return path.join(appData, APP_DIR_NAME);
+      return path.win32.join(appData, APP_DIR_NAME);
     }
   }
   if (platform === "darwin") {
