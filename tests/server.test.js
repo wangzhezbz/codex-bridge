@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
+import path from "node:path";
+import { loadConfig } from "../src/config.js";
 import { createRouterServer } from "../src/server.js";
 
 test("server exposes health, models, catalog, and converted responses", async () => {
@@ -169,6 +173,199 @@ test("codex_openai routes forward incoming Codex bearer upstream", async () => {
       }),
     });
     assert.equal(response.output_text, "hello from subscription gpt");
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("codex_openai routes accept Codex bearer even when legacy config omits clientAuth flag", async () => {
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/responses");
+    assert.equal(req.headers.authorization, "Bearer codex-openai-token");
+
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: "resp_legacy_hybrid_gpt",
+        object: "response",
+        status: "completed",
+        model: "gpt-5.5",
+        output: [],
+        output_text: "legacy config accepted",
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const upstreamUrl = serverUrl(upstream);
+
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "gpt-5.5",
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        api: "responses",
+        baseUrl: `${upstreamUrl}/v1`,
+        model: "gpt-5.5",
+        authMode: "codex_openai",
+      },
+    ],
+  });
+
+  await listen(router);
+  const baseUrl = serverUrl(router);
+
+  try {
+    const response = await fetchJson(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer codex-openai-token",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        input: "hello",
+      }),
+    });
+    assert.equal(response.output_text, "legacy config accepted");
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("invalid router token response explains how to refresh CodexBridge config", async () => {
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        api: "chat_completions",
+        baseUrl: "http://127.0.0.1:9/v1",
+        model: "deepseek-v4-pro",
+        authMode: "api_key",
+        apiKey: "deepseek-provider-key",
+      },
+    ],
+  });
+  await listen(router);
+  const baseUrl = serverUrl(router);
+
+  try {
+    const response = await fetch(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer stale-or-codex-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        input: "hello",
+      }),
+    });
+    const body = await response.json();
+    assert.equal(response.status, 401);
+    assert.match(body.error.message, /CodexBridge/);
+    assert.match(body.error.message, /Router/);
+    assert.equal(body.error.code, "invalid_router_token");
+  } finally {
+    await close(router);
+  }
+});
+
+test("server reloads router config file before authorizing requests", async () => {
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/responses");
+    assert.equal(req.headers.authorization, "Bearer codex-openai-token");
+
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: "resp_reloaded_config",
+        object: "response",
+        status: "completed",
+        model: "gpt-5.5",
+        output: [],
+        output_text: "reloaded config accepted",
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const upstreamUrl = serverUrl(upstream);
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-bridge-router-config-"));
+  const configPath = path.join(tempDir, "router.config.json");
+  fs.writeFileSync(
+    configPath,
+    JSON.stringify({
+      host: "127.0.0.1",
+      port: 0,
+      authToken: "router-token",
+      clientAuth: { allowOpenAiBearer: false },
+      defaultModel: "gpt-5.5",
+      models: [
+        {
+          id: "gpt-5.5",
+          displayName: "GPT-5.5 API",
+          api: "responses",
+          baseUrl: "http://127.0.0.1:9/v1",
+          model: "gpt-5.5",
+          authMode: "api_key",
+          apiKey: "stale-api-key",
+        },
+      ],
+    }),
+    "utf8",
+  );
+
+  const router = createRouterServer(loadConfig(configPath));
+  await listen(router);
+  const baseUrl = serverUrl(router);
+
+  fs.writeFileSync(
+    configPath,
+    JSON.stringify({
+      host: "127.0.0.1",
+      port: 0,
+      authToken: "router-token",
+      clientAuth: { allowOpenAiBearer: true },
+      defaultModel: "gpt-5.5",
+      models: [
+        {
+          id: "gpt-5.5",
+          displayName: "GPT-5.5",
+          api: "responses",
+          baseUrl: `${upstreamUrl}/v1`,
+          model: "gpt-5.5",
+          authMode: "codex_openai",
+        },
+      ],
+    }),
+    "utf8",
+  );
+
+  try {
+    const response = await fetchJson(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer codex-openai-token",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        input: "hello",
+      }),
+    });
+    assert.equal(response.output_text, "reloaded config accepted");
   } finally {
     await close(router);
     await close(upstream);

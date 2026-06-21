@@ -13,12 +13,11 @@ import { handleResponsesRequest, sendUpstreamError } from "./upstream.js";
 
 export function createRouterServer(config = loadConfig()) {
   const history = new ResponseHistory();
-  const catalog = buildModelCatalog(config);
-  const modelsList = openAiModelsList(config);
 
   return http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url || "/", "http://127.0.0.1");
+      const activeConfig = currentConfig(config);
 
       if (req.method === "OPTIONS") {
         writeCors(res);
@@ -28,8 +27,8 @@ export function createRouterServer(config = loadConfig()) {
       if (req.method === "GET" && url.pathname === "/health") {
         jsonResponse(res, 200, {
           ok: true,
-          config: config.__path || null,
-          models: config.models.map((model) => model.id),
+          config: activeConfig.__path || null,
+          models: activeConfig.models.map((model) => model.id),
         });
         return;
       }
@@ -38,7 +37,7 @@ export function createRouterServer(config = loadConfig()) {
         req.method === "GET" &&
         ["/v1/models", "/models"].includes(url.pathname)
       ) {
-        jsonResponse(res, 200, modelsList);
+        jsonResponse(res, 200, openAiModelsList(activeConfig));
         return;
       }
 
@@ -46,7 +45,7 @@ export function createRouterServer(config = loadConfig()) {
         req.method === "GET" &&
         ["/model-catalog.json", "/v1/model-catalog.json"].includes(url.pathname)
       ) {
-        jsonResponse(res, 200, catalog);
+        jsonResponse(res, 200, buildModelCatalog(activeConfig));
         return;
       }
 
@@ -55,10 +54,18 @@ export function createRouterServer(config = loadConfig()) {
         ["/v1/responses", "/responses"].includes(url.pathname)
       ) {
         const body = await readJsonRequest(req);
-        const route = routeForModel(config, body.model);
-        const clientAuth = authorizeClient(req, config);
+        const route = routeForModel(activeConfig, body.model);
+        const clientAuth = authorizeClient(req, activeConfig, route);
         if (!clientAuth.ok) {
-          jsonResponse(res, 401, openAiError("Invalid router token", 401, "unauthorized"));
+          jsonResponse(
+            res,
+            401,
+            openAiError(
+              "CodexBridge Router token mismatch. 请在 CodexBridge 点“更新 Codex 配置”，关闭并重新启动 Router，然后重试。",
+              401,
+              "invalid_router_token",
+            ),
+          );
           return;
         }
         const requestId = makeRequestId();
@@ -104,7 +111,7 @@ export function startServer(config = loadConfig()) {
   return server;
 }
 
-function authorizeClient(req, config) {
+function authorizeClient(req, config, route) {
   const bearerToken = bearerTokenFromHeader(req.headers.authorization);
   if (!config.authToken) {
     if (bearerToken) {
@@ -115,10 +122,20 @@ function authorizeClient(req, config) {
   if (bearerToken && bearerToken === config.authToken) {
     return { ok: true, kind: "local", bearerToken };
   }
-  if (config.clientAuth?.allowOpenAiBearer && bearerToken) {
+  if (
+    bearerToken &&
+    (config.clientAuth?.allowOpenAiBearer || authModeForRoute(route) === "codex_openai")
+  ) {
     return { ok: true, kind: "codex_openai", bearerToken };
   }
   return { ok: false, kind: "invalid" };
+}
+
+function currentConfig(config) {
+  if (!config.__path) {
+    return config;
+  }
+  return loadConfig(config.__path);
 }
 
 function bearerTokenFromHeader(value) {
