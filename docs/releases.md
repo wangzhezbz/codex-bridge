@@ -29,7 +29,7 @@ The extracted release folder includes the tag/version:
 解压后的 release 目录包含 tag/版本号：
 
 ```text
-CodexBridge-Windows-x64-Portable-v0.1.2
+CodexBridge-Windows-x64-Portable-v0.1.3
 ```
 
 ## Release Checklist / 发布检查
@@ -49,8 +49,8 @@ Then push a tag:
 然后推送 tag：
 
 ```powershell
-git tag v0.1.2
-git push origin v0.1.2
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
 GitHub Actions builds the Windows portable zip and attaches it to the release.

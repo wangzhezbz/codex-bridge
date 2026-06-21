@@ -255,6 +255,35 @@ test("custom models can be saved and routed with their own API key env", () => {
   assert.deepEqual(config.models[0].inputModalities, ["text", "image"]);
 });
 
+test("legacy custom models without saved modalities default to image input", () => {
+  const rootDir = makeTempProject();
+  fs.mkdirSync(path.join(rootDir, "config"), { recursive: true });
+  fs.writeFileSync(
+    path.join(rootDir, "config", "custom-models.json"),
+    JSON.stringify([
+      {
+        presetId: "custom-legacy-vision",
+        providerId: "custom-legacy",
+        providerName: "Legacy Provider",
+        displayName: "Legacy Vision",
+        api: "chat_completions",
+        baseUrl: "https://api.example.com/v1",
+        model: "legacy-vision",
+        authMode: "api_key",
+        apiKeyEnv: "LEGACY_PROVIDER_API_KEY",
+        keyEnv: "LEGACY_PROVIDER_API_KEY",
+        custom: true,
+      },
+    ], null, 2),
+    "utf8",
+  );
+  saveSelection(rootDir, ["custom-legacy-vision"]);
+
+  const config = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
+
+  assert.deepEqual(config.models[0].inputModalities, ["text", "image"]);
+});
+
 test("ensureRouterConfig copies the selected example", () => {
   const rootDir = makeTempProject();
   fs.mkdirSync(path.join(rootDir, "config"), { recursive: true });

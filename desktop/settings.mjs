@@ -414,6 +414,9 @@ function routeForSelectedModel(model, slot, priority) {
       route[key] = model[key];
     }
   }
+  if (model.custom && route.inputModalities === undefined) {
+    route.inputModalities = normalizeInputModalities(model.inputModalities);
+  }
   return route;
 }
 
