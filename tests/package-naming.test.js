@@ -34,6 +34,9 @@ test("macOS release archives use formal x64 and arm64 package naming", () => {
   assert.match(workflow, /CodexBridge-macOS-arm64-Portable\.zip/);
   assert.match(workflow, /CodexBridge-macOS-x64-Portable\.zip/);
   assert.match(workflow, /macos-latest/);
+  assert.match(workflow, /macos-15-intel/);
+  assert.match(workflow, /runner:\s*macos-latest/);
+  assert.match(workflow, /runner:\s*macos-15-intel/);
   assert.match(workflow, /CODEXBRIDGE_MAC_ARCH/);
   assert.match(workflow, /releases\/latest\/download\/CodexBridge-macOS-arm64-Portable\.zip/);
   assert.match(workflow, /releases\/latest\/download\/CodexBridge-macOS-x64-Portable\.zip/);
