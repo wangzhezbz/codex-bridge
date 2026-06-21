@@ -4,7 +4,7 @@ import { stringifyJson, tryParseJson } from "./json.js";
 const APPLY_PATCH = "apply_patch";
 const VALID_CHAT_TOOL_NAME = /^[A-Za-z0-9_-]{1,64}$/;
 
-export function buildToolContext(responseTools = []) {
+export function buildToolContext(responseTools = [], options = {}) {
   const context = {
     chatTools: [],
     customToolNames: new Set(),
@@ -12,6 +12,7 @@ export function buildToolContext(responseTools = []) {
     chatToolNames: new Set(),
     chatNameToResponseName: new Map(),
     responseNameToChatName: new Map(),
+    route: options.route || {},
   };
 
   for (const tool of responseTools || []) {
@@ -147,13 +148,13 @@ function appendResponseTool(context, tool) {
       function: {
         name: chatName,
         description: tool.description || "Search for deferred local tools.",
-        parameters: tool.parameters || {
+        parameters: chatToolParameters(context, tool.parameters || {
           type: "object",
           properties: {
             query: { type: "string" },
           },
           required: ["query"],
-        },
+        }),
       },
     });
     return;
@@ -196,12 +197,19 @@ function appendResponseTool(context, tool) {
     function: {
       name: chatName,
       description: fn.description || "",
-      parameters: fn.parameters || {
+      parameters: chatToolParameters(context, fn.parameters || {
         type: "object",
         properties: {},
-      },
+      }),
     },
   });
+}
+
+function chatToolParameters(context, parameters) {
+  if (!shouldUseMoonshotSchemaFlavor(context.route)) {
+    return parameters;
+  }
+  return normalizeMoonshotJsonSchema(parameters);
 }
 
 function appendChatTool(context, chatName, chatTool) {
@@ -224,6 +232,83 @@ function normalizeFunctionTool(tool) {
     };
   }
   return null;
+}
+
+function shouldUseMoonshotSchemaFlavor(route = {}) {
+  if (["kimi", "moonshot"].includes(String(route.provider || "").toLowerCase())) {
+    return true;
+  }
+  if (/kimi|moonshot/i.test(route.model || "")) {
+    return true;
+  }
+  try {
+    const hostname = new URL(route.baseUrl || "").hostname.toLowerCase();
+    return hostname.includes("moonshot") || hostname.includes("kimi");
+  } catch {
+    return false;
+  }
+}
+
+function normalizeMoonshotJsonSchema(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeMoonshotJsonSchema(item));
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+
+  const result = {};
+  let legacyDefinitions;
+  let componentSchemas;
+
+  for (const [key, raw] of Object.entries(value)) {
+    if (key === "definitions") {
+      legacyDefinitions = normalizeMoonshotJsonSchema(raw);
+      continue;
+    }
+    if (key === "components" && raw && typeof raw === "object" && raw.schemas) {
+      const { schemas, ...rest } = raw;
+      componentSchemas = normalizeMoonshotJsonSchema(schemas);
+      if (Object.keys(rest).length > 0) {
+        result.components = normalizeMoonshotJsonSchema(rest);
+      }
+      continue;
+    }
+    if (key === "$ref" && typeof raw === "string") {
+      result.$ref = moonshotRef(raw);
+      continue;
+    }
+    result[key] = normalizeMoonshotJsonSchema(raw);
+  }
+
+  if (legacyDefinitions !== undefined) {
+    result.$defs = mergeSchemaDefinitions(legacyDefinitions, result.$defs);
+  }
+  if (componentSchemas !== undefined) {
+    result.$defs = mergeSchemaDefinitions(componentSchemas, result.$defs);
+  }
+
+  return result;
+}
+
+function moonshotRef(value) {
+  return String(value)
+    .replace(/^#\/definitions\//, "#/$defs/")
+    .replace(/^#\/components\/schemas\//, "#/$defs/");
+}
+
+function mergeSchemaDefinitions(incoming, existing) {
+  if (existing === undefined) {
+    return incoming;
+  }
+  if (isPlainObject(incoming) && isPlainObject(existing)) {
+    return { ...incoming, ...existing };
+  }
+  return existing;
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function chatNameForResponseName(context, responseName) {

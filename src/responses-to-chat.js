@@ -8,7 +8,7 @@ import {
 } from "./tools.js";
 
 export function responsesToChatRequest(request, route, history) {
-  const toolContext = buildToolContext(request.tools || []);
+  const toolContext = buildToolContext(request.tools || [], { route });
   const priorMessages = history.get(request.previous_response_id);
   const currentMessages = responseInputToChatMessages(
     request.messages ?? request.input,

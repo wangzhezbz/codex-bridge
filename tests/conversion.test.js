@@ -427,6 +427,52 @@ test("chat conversion deduplicates repeated tool names for strict providers", ()
   );
 });
 
+test("kimi chat conversion rewrites legacy JSON schema refs to $defs", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "use typed tool",
+      tools: [
+        {
+          type: "function",
+          name: "select_body_parts",
+          description: "Select body parts.",
+          parameters: {
+            type: "object",
+            properties: {
+              excludedBodyParts: {
+                type: "array",
+                items: {
+                  $ref: "#/definitions/BodyPart",
+                },
+              },
+            },
+            definitions: {
+              BodyPart: {
+                type: "string",
+                enum: ["head", "arm", "leg"],
+              },
+            },
+          },
+        },
+      ],
+    },
+    {
+      ...route,
+      id: "gpt-5.2",
+      displayName: "Kimi K2.7 Code",
+      provider: "kimi",
+      model: "kimi-k2.7-code",
+      baseUrl: "https://api.moonshot.cn/v1",
+    },
+    new ResponseHistory(),
+  );
+
+  const parameters = converted.body.tools[0].function.parameters;
+  assert.equal(parameters.properties.excludedBodyParts.items.$ref, "#/$defs/BodyPart");
+  assert.deepEqual(parameters.$defs.BodyPart.enum, ["head", "arm", "leg"]);
+  assert.equal(parameters.definitions, undefined);
+});
+
 test("minimax chat routes request separated reasoning output", () => {
   const converted = responsesToChatRequest(
     {
