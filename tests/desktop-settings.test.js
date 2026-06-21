@@ -13,6 +13,7 @@ import {
   detectModeFromConfig,
   ensureRouterConfig,
   providerCatalog,
+  readCustomModels,
   restoreCodexConfig,
   saveCustomModel,
   saveSelection,
@@ -301,6 +302,33 @@ test("custom models can be saved and routed with their own API key env", () => {
   assert.equal(config.models[0].displayName, "My Coder");
   assert.equal(config.models[0].apiKeyEnv, "MY_PROVIDER_API_KEY");
   assert.deepEqual(config.models[0].inputModalities, ["text", "image"]);
+});
+
+test("editing a custom model preserves its existing API key slot", () => {
+  const rootDir = makeTempProject();
+  const custom = saveCustomModel(rootDir, {
+    providerName: "Original Provider",
+    displayName: "Original Coder",
+    model: "original-coder-v1",
+    baseUrl: "https://api.original.example/v1",
+    api: "chat_completions",
+  });
+
+  const edited = saveCustomModel(rootDir, {
+    presetId: custom.presetId,
+    providerName: "Renamed Provider",
+    displayName: "Renamed Coder",
+    model: "renamed-coder-v2",
+    baseUrl: "https://api.renamed.example/v1",
+    api: "responses",
+  });
+  const saved = readCustomModels(rootDir);
+
+  assert.equal(saved.length, 1);
+  assert.equal(edited.presetId, custom.presetId);
+  assert.equal(edited.displayName, "Renamed Coder");
+  assert.equal(edited.keyEnv, custom.keyEnv);
+  assert.equal(edited.apiKeyEnv, custom.apiKeyEnv);
 });
 
 test("legacy custom models without saved modalities default to image input", () => {

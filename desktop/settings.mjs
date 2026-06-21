@@ -182,8 +182,18 @@ export function readCustomModels(rootDir) {
 }
 
 export function saveCustomModel(rootDir, input) {
-  const model = normalizeCustomModel(input);
-  const models = readCustomModels(rootDir).filter(
+  const existingModels = readCustomModels(rootDir);
+  const existing = input?.presetId
+    ? existingModels.find((item) => item.presetId === input.presetId)
+    : null;
+  const model = normalizeCustomModel({
+    ...input,
+    keyEnv: input?.keyEnv || existing?.keyEnv || existing?.apiKeyEnv,
+    inputModalities: input?.inputModalities || existing?.inputModalities,
+    docsUrl: input?.docsUrl ?? existing?.docsUrl,
+    contextWindow: input?.contextWindow || existing?.contextWindow,
+  });
+  const models = existingModels.filter(
     (item) => item.presetId !== model.presetId,
   );
   models.push(model);

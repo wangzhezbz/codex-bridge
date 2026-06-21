@@ -427,6 +427,10 @@ h3 {
   }
 }
 
+.hidden {
+  display: none !important;
+}
+
 .metric-row,
 .stat-summary,
 .codex-actions {
@@ -561,7 +565,14 @@ h3 {
   padding: 12px;
 }
 
+.model-card-shell {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
 .model-card {
+  width: 100%;
   min-height: 104px;
   padding: 13px;
   border: 1px solid var(--line);
@@ -604,8 +615,14 @@ h3 {
   font-weight: 650;
 }
 
-.remove-model {
-  margin-top: -4px;
+.model-card-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.edit-model {
+  color: var(--accent);
 }
 
 .provider-grid {
@@ -719,6 +736,13 @@ select:focus {
   color: #456072;
   font-size: 12px;
   line-height: 1.45;
+}
+
+.form-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
 }
 
 .notice {

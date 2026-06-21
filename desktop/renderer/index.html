@@ -129,8 +129,8 @@
           <article class="panel">
             <div class="panel-header">
               <div>
-                <h2>添加自定义模型</h2>
-                <p>用于接入任何 OpenAI-compatible 服务商。显示名给 Codex 看，真实模型名发给服务商。</p>
+                <h2 id="customFormTitle">添加自定义模型</h2>
+                <p id="customFormDescription">用于接入任何 OpenAI-compatible 服务商。显示名给 Codex 看，真实模型名发给服务商。</p>
               </div>
             </div>
             <form class="custom-form" id="customModelForm">
@@ -165,7 +165,10 @@
                 <strong>怎么填</strong>
                 <p>大多数国产模型选 Chat Completions；如果服务商明确支持 OpenAI Responses API，再选 Responses。</p>
               </div>
-              <button class="primary-button" type="submit">添加模型</button>
+              <div class="form-actions">
+                <button class="primary-button" id="customSubmitButton" type="submit">添加模型</button>
+                <button class="plain-button hidden" id="cancelCustomEdit" type="button">取消编辑</button>
+              </div>
             </form>
           </article>
         </section>

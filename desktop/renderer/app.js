@@ -2,6 +2,7 @@ const api = window.codexBridge;
 let state = null;
 let draftSelection = [];
 let dragSlotIndex = null;
+let editingCustomPresetId = null;
 
 const els = {
   routerStatus: document.querySelector("#routerStatus"),
@@ -23,6 +24,10 @@ const els = {
   logOutput: document.querySelector("#logOutput"),
   toast: document.querySelector("#toast"),
   customModelForm: document.querySelector("#customModelForm"),
+  customFormTitle: document.querySelector("#customFormTitle"),
+  customFormDescription: document.querySelector("#customFormDescription"),
+  customSubmitButton: document.querySelector("#customSubmitButton"),
+  cancelCustomEdit: document.querySelector("#cancelCustomEdit"),
   routerToggle: document.querySelector("#routerToggle"),
 };
 
@@ -100,21 +105,34 @@ document.querySelector("#saveModelSelectionPanel").addEventListener("click", (ev
 
 els.customModelForm.addEventListener("submit", (event) => {
   event.preventDefault();
-  runAction(els.customModelForm.querySelector("button"), async () => {
+  runAction(els.customSubmitButton, async () => {
+    const editingModel = editingCustomPresetId ? modelMap().get(editingCustomPresetId) : null;
+    const wasEditing = Boolean(editingCustomPresetId);
     const model = {
+      presetId: editingCustomPresetId || undefined,
       providerName: value("#customProviderName"),
       displayName: value("#customDisplayName"),
       model: value("#customModelName"),
       baseUrl: value("#customBaseUrl"),
       keyUrl: value("#customKeyUrl"),
       api: value("#customApiType"),
+      keyEnv: editingModel?.keyEnv || editingModel?.apiKeyEnv,
+      inputModalities: editingModel?.inputModalities,
+      docsUrl: editingModel?.docsUrl,
+      contextWindow: editingModel?.contextWindow,
     };
     await api.saveCustomModel(model);
-    els.customModelForm.reset();
+    resetCustomModelForm();
     await refresh();
-    showToast("自定义模型已添加。去“密钥”页保存它的 API Key，再在模型池里选中它。");
+    showToast(
+      wasEditing
+        ? "自定义模型已更新，已保留原来的 API Key 槽位。"
+        : "自定义模型已添加。去“密钥”页保存它的 API Key，再在模型池里选中它。",
+    );
   });
 });
+
+els.cancelCustomEdit.addEventListener("click", () => resetCustomModelForm());
 
 document.querySelector("#openConfigFolder").addEventListener("click", () => api.openFolder("config"));
 document.querySelector("#openCodexFolder").addEventListener("click", () => api.openFolder("codex"));
@@ -169,6 +187,7 @@ function render() {
   renderProviders();
   renderSelectedModels();
   renderModelPool();
+  renderCustomFormState();
   renderUsage();
   renderOverviewUsage();
   renderLogs(state.logs || []);
@@ -340,9 +359,15 @@ function renderModelPool() {
   els.modelPool.querySelectorAll("[data-model-id]").forEach((button) => {
     button.addEventListener("click", () => toggleModel(button.dataset.modelId));
   });
+  els.modelPool.querySelectorAll("[data-edit-custom]").forEach((button) => {
+    button.addEventListener("click", () => startCustomModelEdit(button.dataset.editCustom));
+  });
   els.modelPool.querySelectorAll("[data-remove-custom]").forEach((button) => {
     button.addEventListener("click", () =>
       runAction(button, async () => {
+        if (editingCustomPresetId === button.dataset.removeCustom) {
+          resetCustomModelForm();
+        }
         state = await api.removeCustomModel(button.dataset.removeCustom);
         draftSelection = [...state.selectedModelIds];
         render();
@@ -363,12 +388,21 @@ function modelCard(model, selected, max) {
       ? "已选满 5 个"
       : providerName(model.providerId);
   return `
-    <button class="model-card ${isSelected ? "selected" : ""}" data-model-id="${escapeHtml(model.presetId)}" ${disabled ? "disabled" : ""}>
-      <span class="model-title">${escapeHtml(model.displayName)}</span>
-      <span class="model-meta">${escapeHtml(model.model)} · ${escapeHtml(model.api)}</span>
-      <span class="model-foot">${escapeHtml(reason)}</span>
-    </button>
-    ${model.custom ? `<button class="text-button remove-model" data-remove-custom="${escapeHtml(model.presetId)}">删除 ${escapeHtml(model.displayName)}</button>` : ""}
+    <div class="model-card-shell">
+      <button class="model-card ${isSelected ? "selected" : ""}" data-model-id="${escapeHtml(model.presetId)}" ${disabled ? "disabled" : ""}>
+        <span class="model-title">${escapeHtml(model.displayName)}</span>
+        <span class="model-meta">${escapeHtml(model.model)} · ${escapeHtml(model.api)}</span>
+        <span class="model-foot">${escapeHtml(reason)}</span>
+      </button>
+      ${
+        model.custom
+          ? `<div class="model-card-actions">
+              <button class="text-button edit-model" data-edit-custom="${escapeHtml(model.presetId)}">编辑</button>
+              <button class="text-button remove-model" data-remove-custom="${escapeHtml(model.presetId)}">删除</button>
+            </div>`
+          : ""
+      }
+    </div>
   `;
 }
 
@@ -391,6 +425,39 @@ function saveModelSelection(button) {
     render();
     showToast("模型选择已保存，并已更新 Router 配置。");
   });
+}
+
+function startCustomModelEdit(presetId) {
+  const model = modelMap().get(presetId);
+  if (!model?.custom) {
+    showToast("没有找到这个自定义模型。", "error");
+    return;
+  }
+  editingCustomPresetId = presetId;
+  setValue("#customProviderName", model.providerName || providerName(model.providerId));
+  setValue("#customDisplayName", model.displayName || "");
+  setValue("#customModelName", model.model || "");
+  setValue("#customBaseUrl", model.baseUrl || "");
+  setValue("#customKeyUrl", model.keyUrl || "");
+  setValue("#customApiType", model.api === "responses" ? "responses" : "chat_completions");
+  renderCustomFormState();
+  els.customModelForm.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function resetCustomModelForm() {
+  editingCustomPresetId = null;
+  els.customModelForm.reset();
+  renderCustomFormState();
+}
+
+function renderCustomFormState() {
+  const editing = Boolean(editingCustomPresetId);
+  els.customFormTitle.textContent = editing ? "编辑自定义模型" : "添加自定义模型";
+  els.customFormDescription.textContent = editing
+    ? "修改后会覆盖当前自定义模型，并保留原来的 API Key 槽位。"
+    : "用于接入任何 OpenAI-compatible 服务商。显示名给 Codex 看，真实模型名发给服务商。";
+  els.customSubmitButton.textContent = editing ? "保存修改" : "添加模型";
+  els.cancelCustomEdit.classList.toggle("hidden", !editing);
 }
 
 function renderUsage() {
@@ -660,6 +727,10 @@ function displayRoute(route) {
 
 function value(selector) {
   return document.querySelector(selector).value.trim();
+}
+
+function setValue(selector, value) {
+  document.querySelector(selector).value = value || "";
 }
 
 function formatNumber(value) {
