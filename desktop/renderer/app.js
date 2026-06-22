@@ -31,6 +31,7 @@ const els = {
   customFormTitle: document.querySelector("#customFormTitle"),
   customFormDescription: document.querySelector("#customFormDescription"),
   customSubmitButton: document.querySelector("#customSubmitButton"),
+  customImageInput: document.querySelector("#customImageInput"),
   cancelCustomEdit: document.querySelector("#cancelCustomEdit"),
   routerToggle: document.querySelector("#routerToggle"),
 };
@@ -151,7 +152,7 @@ els.customModelForm.addEventListener("submit", (event) => {
       keyUrl: value("#customKeyUrl"),
       api: value("#customApiType"),
       keyEnv: editingModel?.keyEnv || editingModel?.apiKeyEnv,
-      inputModalities: editingModel?.inputModalities,
+      inputModalities: els.customImageInput.checked ? ["text", "image"] : ["text"],
       docsUrl: editingModel?.docsUrl,
       contextWindow: editingModel?.contextWindow,
     };
@@ -411,6 +412,22 @@ function renderModelPool() {
   els.modelPool.querySelectorAll("[data-model-id]").forEach((button) => {
     button.addEventListener("click", () => toggleModel(button.dataset.modelId));
   });
+  els.modelPool.querySelectorAll("[data-image-input-toggle]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      runAction(button, async () => {
+        const model = modelMap().get(button.dataset.imageInputToggle);
+        const next = !modelSupportsImage(model);
+        state = await api.saveModelImageInput({
+          presetId: button.dataset.imageInputToggle,
+          imageInput: next,
+        });
+        draftSelection = [...state.selectedModelIds];
+        render();
+        showToast(next ? "图片上传已开启。" : "图片上传已关闭。");
+      });
+    });
+  });
   els.modelPool.querySelectorAll("[data-edit-custom]").forEach((button) => {
     button.addEventListener("click", () => startCustomModelEdit(button.dataset.editCustom));
   });
@@ -431,6 +448,7 @@ function renderModelPool() {
 
 function modelCard(model, selected, max) {
   const isSelected = selected.has(model.presetId);
+  const supportsImage = modelSupportsImage(model);
   const isNativeDisabled = state.mode === "all_api" && model.authMode === "codex_openai";
   const isMaxed = !isSelected && draftSelection.length >= max;
   const disabled = isNativeDisabled || isMaxed;
@@ -446,6 +464,16 @@ function modelCard(model, selected, max) {
         <span class="model-meta">${escapeHtml(model.model)} · ${escapeHtml(model.api)}</span>
         <span class="model-foot">${escapeHtml(reason)}</span>
       </button>
+      <button
+        class="capability-toggle ${supportsImage ? "enabled" : ""}"
+        type="button"
+        data-image-input-toggle="${escapeHtml(model.presetId)}"
+        aria-pressed="${supportsImage ? "true" : "false"}"
+        title="${supportsImage ? "点击关闭图片上传" : "点击开启图片上传"}"
+      >
+        <span>图片上传</span>
+        <strong>${supportsImage ? "开" : "关"}</strong>
+      </button>
       ${
         model.custom
           ? `<div class="model-card-actions">
@@ -456,6 +484,10 @@ function modelCard(model, selected, max) {
       }
     </div>
   `;
+}
+
+function modelSupportsImage(model) {
+  return Array.isArray(model?.inputModalities) && model.inputModalities.includes("image");
 }
 
 function toggleModel(presetId) {
@@ -492,6 +524,7 @@ function startCustomModelEdit(presetId) {
   setValue("#customBaseUrl", model.baseUrl || "");
   setValue("#customKeyUrl", model.keyUrl || "");
   setValue("#customApiType", model.api === "responses" ? "responses" : "chat_completions");
+  els.customImageInput.checked = modelSupportsImage(model);
   renderCustomFormState();
   els.customModelForm.scrollIntoView({ behavior: "smooth", block: "start" });
 }

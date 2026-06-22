@@ -73,6 +73,10 @@ export function customModelsPath(rootDir) {
   return path.join(rootDir, "config", "custom-models.json");
 }
 
+export function modelCapabilitiesPath(rootDir) {
+  return path.join(rootDir, "config", "model-capabilities.json");
+}
+
 export function desktopOptionsPath(rootDir) {
   return path.join(rootDir, "config", "desktop-options.json");
 }
@@ -565,7 +569,10 @@ export function providerCatalog(rootDir) {
 }
 
 export function modelCatalog(rootDir) {
-  return [...MODEL_PRESETS, ...readCustomModels(rootDir)];
+  const overrides = readModelImageInputOverrides(rootDir);
+  return [...MODEL_PRESETS, ...readCustomModels(rootDir)]
+    .map((model) => modelWithDefaultCapabilities(model))
+    .map((model) => applyModelImageInputOverride(model, overrides));
 }
 
 export function readSelection(rootDir, mode = MODE_HYBRID) {
@@ -591,6 +598,40 @@ export function saveSelection(rootDir, selectedModelIds, mode = MODE_HYBRID) {
 export function readCustomModels(rootDir) {
   const saved = readJsonIfExists(customModelsPath(rootDir), []);
   return Array.isArray(saved) ? saved : [];
+}
+
+export function readModelImageInputOverrides(rootDir) {
+  const saved = readJsonIfExists(modelCapabilitiesPath(rootDir), {});
+  const source = saved?.imageInput && typeof saved.imageInput === "object"
+    ? saved.imageInput
+    : saved;
+  if (!source || typeof source !== "object" || Array.isArray(source)) {
+    return {};
+  }
+  const overrides = {};
+  for (const [presetId, enabled] of Object.entries(source)) {
+    if (typeof enabled === "boolean") {
+      overrides[presetId] = enabled;
+    }
+  }
+  return overrides;
+}
+
+export function saveModelImageInputOverride(rootDir, presetId, enabled) {
+  const id = String(presetId || "").trim();
+  if (!id) {
+    throw new Error("Model id is required.");
+  }
+  const overrides = readModelImageInputOverrides(rootDir);
+  overrides[id] = Boolean(enabled);
+  const target = modelCapabilitiesPath(rootDir);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(
+    target,
+    `${JSON.stringify({ version: 1, imageInput: overrides }, null, 2)}\n`,
+    "utf8",
+  );
+  return { presetId: id, imageInput: overrides[id] };
 }
 
 export function saveCustomModel(rootDir, input) {
@@ -1758,6 +1799,27 @@ function normalizeSelection(rootDir, selectedModelIds, mode) {
     unique.push(id);
   }
   return unique.slice(0, CODEX_MODEL_SLOTS.length);
+}
+
+function modelWithDefaultCapabilities(model) {
+  if (model.custom && model.inputModalities === undefined) {
+    return {
+      ...model,
+      inputModalities: normalizeInputModalities(model.inputModalities),
+    };
+  }
+  return model;
+}
+
+function applyModelImageInputOverride(model, overrides) {
+  if (overrides[model.presetId] === undefined) {
+    return model;
+  }
+  return {
+    ...model,
+    inputModalities: overrides[model.presetId] ? ["text", "image"] : ["text"],
+    imageInputOverride: overrides[model.presetId],
+  };
 }
 
 function routeForSelectedModel(model, slot, priority) {

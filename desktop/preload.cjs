@@ -7,6 +7,7 @@ contextBridge.exposeInMainWorld("codexBridge", {
   getSecret: (keyEnv) => ipcRenderer.invoke("secrets:get", keyEnv),
   saveOptions: (options) => ipcRenderer.invoke("options:save", options),
   saveModelSelection: (selectedModelIds) => ipcRenderer.invoke("models:saveSelection", selectedModelIds),
+  saveModelImageInput: (payload) => ipcRenderer.invoke("models:saveImageInput", payload),
   saveCustomModel: (model) => ipcRenderer.invoke("customModel:save", model),
   removeCustomModel: (presetId) => ipcRenderer.invoke("customModel:remove", presetId),
   generateCatalog: () => ipcRenderer.invoke("catalog:generate"),

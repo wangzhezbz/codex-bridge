@@ -21,6 +21,7 @@ import {
   restoreCodexConfig,
   routerConfigDiagnostics,
   routerRuntimeEnv,
+  saveModelImageInputOverride,
   saveCustomModel,
   saveDesktopOptions,
   saveSelection,
@@ -510,6 +511,39 @@ test("custom models can be saved and routed with their own API key env", () => {
   assert.equal(config.models[0].displayName, "My Coder");
   assert.equal(config.models[0].apiKeyEnv, "MY_PROVIDER_API_KEY");
   assert.deepEqual(config.models[0].inputModalities, ["text", "image"]);
+});
+
+test("preset image upload support can be overridden per model", () => {
+  const rootDir = makeTempProject();
+  saveSelection(rootDir, ["deepseek-v4-pro"]);
+
+  const defaultConfig = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
+  assert.equal(defaultConfig.models[0].inputModalities, undefined);
+
+  saveModelImageInputOverride(rootDir, "deepseek-v4-pro", true);
+  const enabledConfig = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
+  assert.deepEqual(enabledConfig.models[0].inputModalities, ["text", "image"]);
+
+  saveModelImageInputOverride(rootDir, "deepseek-v4-pro", false);
+  const disabledConfig = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
+  assert.deepEqual(disabledConfig.models[0].inputModalities, ["text"]);
+});
+
+test("custom models can disable image upload support", () => {
+  const rootDir = makeTempProject();
+  const custom = saveCustomModel(rootDir, {
+    providerName: "Text Provider",
+    displayName: "Text Coder",
+    model: "text-coder-v1",
+    baseUrl: "https://api.example.com/v1",
+    api: "chat_completions",
+    inputModalities: ["text"],
+  });
+  saveSelection(rootDir, [custom.presetId]);
+
+  const config = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
+
+  assert.deepEqual(config.models[0].inputModalities, ["text"]);
 });
 
 test("editing a custom model preserves its existing API key slot", () => {

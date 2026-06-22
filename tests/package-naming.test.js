@@ -58,3 +58,14 @@ test("desktop packages include native app icon assets", () => {
   assert.equal(icns.subarray(0, 4).toString("ascii"), "icns");
   assert.match(main, /codexbridge-icon\.png/);
 });
+
+test("desktop close button hides to tray instead of quitting", () => {
+  const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
+
+  assert.match(main, /\bTray\b/);
+  assert.match(main, /\bMenu\b/);
+  assert.match(main, /mainWindow\.on\("close"/);
+  assert.match(main, /event\.preventDefault\(\)/);
+  assert.match(main, /mainWindow\.hide\(\)/);
+  assert.match(main, /退出 CodexBridge|Quit CodexBridge/);
+});

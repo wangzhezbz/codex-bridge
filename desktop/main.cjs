@@ -1,4 +1,4 @@
-const { app, BrowserWindow, clipboard, dialog, ipcMain, shell } = require("electron");
+const { app, BrowserWindow, Menu, Tray, clipboard, dialog, ipcMain, shell } = require("electron");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -10,6 +10,9 @@ const {
 
 const appRootDir = path.resolve(__dirname, "..");
 const appIconPath = path.join(__dirname, "assets", "codexbridge-icon.png");
+const trayIconPath = process.platform === "win32"
+  ? path.join(__dirname, "assets", "codexbridge-icon.ico")
+  : appIconPath;
 const dataRootDir = resolveDataRootDir({
   appRootDir,
   env: process.env,
@@ -35,6 +38,8 @@ let logLines = [];
 let smokeErrors = [];
 let usageStore = null;
 let lastHealth = null;
+let tray = null;
+let isQuitting = false;
 
 for (const message of legacyDataMigration.messages) {
   appendRuntimeLog(message);
@@ -116,12 +121,23 @@ function createWindow() {
     }
   });
 
+  mainWindow.on("close", (event) => {
+    if (isQuitting || process.env.CODEXBRIDGE_DESKTOP_SMOKE === "1") {
+      return;
+    }
+    event.preventDefault();
+    mainWindow.hide();
+  });
+
   mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
 }
 
 app.whenReady().then(() => {
   if (process.platform === "win32") {
     app.setAppUserModelId("com.codexbridge.app");
+  }
+  if (process.env.CODEXBRIDGE_DESKTOP_SMOKE !== "1") {
+    createTray();
   }
   createWindow();
   if (process.env.CODEXBRIDGE_DESKTOP_SMOKE === "1") {
@@ -136,18 +152,56 @@ app.whenReady().then(() => {
   }
 });
 
-app.on("window-all-closed", () => {
+app.on("before-quit", () => {
+  isQuitting = true;
   stopRouter();
-  if (process.platform !== "darwin") {
-    app.quit();
-  }
+});
+
+app.on("window-all-closed", () => {
+  // Keep CodexBridge alive in the tray after the main window is closed.
 });
 
 app.on("activate", () => {
-  if (BrowserWindow.getAllWindows().length === 0) {
+  showMainWindow();
+});
+
+function createTray() {
+  if (tray) {
+    return tray;
+  }
+  tray = new Tray(trayIconPath);
+  tray.setToolTip("CodexBridge");
+  tray.setContextMenu(Menu.buildFromTemplate([
+    {
+      label: "打开 CodexBridge",
+      click: () => showMainWindow(),
+    },
+    {
+      type: "separator",
+    },
+    {
+      label: "退出 CodexBridge",
+      click: () => {
+        isQuitting = true;
+        stopRouter();
+        app.quit();
+      },
+    },
+  ]));
+  tray.on("click", () => showMainWindow());
+  return tray;
+}
+
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
     createWindow();
   }
-});
+  mainWindow.show();
+  if (mainWindow.isMinimized()) {
+    mainWindow.restore();
+  }
+  mainWindow.focus();
+}
 
 ipcMain.handle("state:get", async () => {
   const settings = await loadSettings();
@@ -220,6 +274,27 @@ ipcMain.handle("models:saveSelection", async (_event, selectedModelIds) => {
   const saved = settings.saveSelection(dataRootDir, selectedModelIds, mode);
   settings.writeRouterConfigFromSelection(dataRootDir, mode);
   appendLog(`Saved model selection: ${saved.join(", ")}.`);
+  broadcastState();
+  return getStatePayload(settings);
+});
+
+ipcMain.handle("models:saveImageInput", async (_event, payload) => {
+  const settings = await loadSettings();
+  const presetId = String(payload?.presetId || "");
+  const saved = settings.saveModelImageInputOverride(dataRootDir, presetId, Boolean(payload?.imageInput));
+  const config = settings.readRouterConfig(dataRootDir);
+  const mode = settings.detectModeFromConfig(config);
+  settings.writeRouterConfigFromSelection(dataRootDir, mode);
+  const catalogResult = await runNodeScript([
+    scriptPath("scripts/generate-catalog.js"),
+    settings.catalogPath(dataRootDir),
+  ]);
+  if (!catalogResult.ok) {
+    throw new Error(catalogResult.output || "Failed to generate model catalog.");
+  }
+  appendLog(
+    `Updated image upload support: ${saved.presetId} ${saved.imageInput ? "enabled" : "disabled"}.`,
+  );
   broadcastState();
   return getStatePayload(settings);
 });
