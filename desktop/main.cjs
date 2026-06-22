@@ -508,6 +508,11 @@ function appendHistorySyncLog(historySync) {
   if (!historySync) {
     return;
   }
+  const hasHistoryChanges = (
+    historySync.totalImportedThreads > 0 ||
+    historySync.totalUpdatedThreads > 0 ||
+    historySync.totalNormalizedThreads > 0
+  );
   if (historySync.totalImportedThreads > 0) {
     appendLog(
       `Merged Codex history: ${historySync.totalImportedThreads} missing conversation(s) restored from Codex state backups.`,
@@ -517,10 +522,18 @@ function appendHistorySyncLog(historySync) {
     appendLog(
       `Merged Codex history: ${historySync.totalUpdatedThreads} legacy CodexBridge conversation(s) moved into the built-in OpenAI history provider.`,
     );
-  } else if (historySync.skipped && historySync.reason) {
-    appendLog(`Codex history sync skipped: ${historySync.reason}.`);
-  } else {
-    appendLog("Codex history sync checked: no legacy CodexBridge conversations found.");
+  }
+  if (historySync.totalNormalizedThreads > 0) {
+    appendLog(
+      `Merged Codex history: ${historySync.totalNormalizedThreads} conversation metadata record(s) normalized for Codex visibility.`,
+    );
+  }
+  if (!hasHistoryChanges) {
+    if (historySync.skipped && historySync.reason) {
+      appendLog(`Codex history sync skipped: ${historySync.reason}.`);
+    } else {
+      appendLog("Codex history sync checked: no legacy CodexBridge conversations found.");
+    }
   }
   for (const database of historySync.databases || []) {
     if (database.backup) {

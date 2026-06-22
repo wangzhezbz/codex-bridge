@@ -33,6 +33,14 @@ const CODEX_BRIDGE_TOP_LEVEL_KEYS = new Set([
   "windows_wsl_setup_acknowledged",
 ]);
 
+const LEGACY_CODEX_BRIDGE_THREAD_SOURCES = [
+  "codex-bridge",
+  "codexbridge",
+  "codex_bridge",
+  "local",
+  "unknown",
+];
+
 export function routerConfigPath(rootDir) {
   return path.join(rootDir, "config", "router.config.json");
 }
@@ -530,6 +538,7 @@ export function syncCodexBridgeConversationProviders({ homeDir = os.homedir() } 
     reason: "",
     totalUpdatedThreads: 0,
     totalImportedThreads: 0,
+    totalNormalizedThreads: 0,
     databases: [],
   };
 
@@ -571,12 +580,14 @@ export function syncCodexBridgeConversationProviders({ homeDir = os.homedir() } 
       reason: "",
       updatedThreads: 0,
       importedThreads: 0,
+      normalizedThreads: 0,
       backup: null,
     };
     try {
       const missingBackupThreads = countMissingThreadsFromHistoryBackups(DatabaseSync, dbPath);
       const legacyThreads = countLegacyCodexBridgeThreads(DatabaseSync, dbPath);
-      if (legacyThreads < 1 && missingBackupThreads < 1) {
+      const hiddenLegacyMetadataThreads = countHiddenLegacyMetadataThreads(DatabaseSync, dbPath);
+      if (legacyThreads < 1 && missingBackupThreads < 1 && hiddenLegacyMetadataThreads < 1) {
         item.skipped = true;
         item.reason = "no_legacy_threads";
         result.databases.push(item);
@@ -586,8 +597,10 @@ export function syncCodexBridgeConversationProviders({ homeDir = os.homedir() } 
       item.backup = backupCodexStateDatabase(dbPath);
       item.importedThreads = importMissingThreadsFromHistoryBackups(DatabaseSync, dbPath);
       item.updatedThreads = updateLegacyCodexBridgeThreads(DatabaseSync, dbPath);
+      item.normalizedThreads = normalizeHiddenLegacyThreadMetadata(DatabaseSync, dbPath);
       result.totalImportedThreads += item.importedThreads;
       result.totalUpdatedThreads += item.updatedThreads;
+      result.totalNormalizedThreads += item.normalizedThreads;
       result.databases.push(item);
     } catch (error) {
       item.ok = false;
@@ -888,17 +901,94 @@ function countLegacyCodexBridgeThreads(DatabaseSync, dbPath) {
   }
 }
 
+function countHiddenLegacyMetadataThreads(DatabaseSync, dbPath) {
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec("PRAGMA busy_timeout = 1500");
+    if (!hasTable(db, "threads")) {
+      return 0;
+    }
+    const columns = tableColumns(db, "threads");
+    if (!columns.includes("model_provider") || !columns.includes("source")) {
+      return 0;
+    }
+    return Number(
+      db
+        .prepare(
+          "SELECT COUNT(*) AS count FROM threads " +
+            "WHERE model_provider = ? " +
+            `AND LOWER(source) IN (${legacyThreadSourceSqlList()})`,
+        )
+        .get("openai").count,
+    );
+  } finally {
+    db.close();
+  }
+}
+
 function updateLegacyCodexBridgeThreads(DatabaseSync, dbPath) {
   const db = new DatabaseSync(dbPath);
   try {
     db.exec("PRAGMA busy_timeout = 1500");
+    const columns = tableColumns(db, "threads");
+    const assignments = ["model_provider = ?"];
+    if (columns.includes("source")) {
+      assignments.push(
+        "source = CASE " +
+          `WHEN source IS NULL OR source = '' OR LOWER(source) IN (${legacyThreadSourceSqlList()}) THEN 'vscode' ` +
+          "ELSE source END",
+      );
+    }
+    if (columns.includes("thread_source")) {
+      assignments.push(
+        "thread_source = CASE " +
+          "WHEN thread_source IS NULL OR thread_source = '' THEN 'user' " +
+          "ELSE thread_source END",
+      );
+    }
     const result = db
-      .prepare("UPDATE threads SET model_provider = ? WHERE model_provider = ?")
+      .prepare(`UPDATE threads SET ${assignments.join(", ")} WHERE model_provider = ?`)
       .run("openai", "codex-bridge");
     return Number(result.changes || 0);
   } finally {
     db.close();
   }
+}
+
+function normalizeHiddenLegacyThreadMetadata(DatabaseSync, dbPath) {
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec("PRAGMA busy_timeout = 1500");
+    if (!hasTable(db, "threads")) {
+      return 0;
+    }
+    const columns = tableColumns(db, "threads");
+    if (!columns.includes("model_provider") || !columns.includes("source")) {
+      return 0;
+    }
+    const assignments = ["source = 'vscode'"];
+    if (columns.includes("thread_source")) {
+      assignments.push(
+        "thread_source = CASE " +
+          "WHEN thread_source IS NULL OR thread_source = '' THEN 'user' " +
+          "ELSE thread_source END",
+      );
+    }
+    const result = db
+      .prepare(
+        `UPDATE threads SET ${assignments.join(", ")} ` +
+          "WHERE model_provider = ? " +
+          `AND LOWER(source) IN (${legacyThreadSourceSqlList()})`,
+      )
+      .run("openai");
+    return Number(result.changes || 0);
+  } finally {
+    db.close();
+  }
+}
+
+function legacyThreadSourceSqlList() {
+  return LEGACY_CODEX_BRIDGE_THREAD_SOURCES.map(sqlString).join(", ");
 }
 
 function hasThreadProviderColumn(db) {

@@ -911,6 +911,54 @@ test("syncCodexBridgeConversationProviders also merges missing threads from rest
   assert.equal(threadTitle(dbPath, "thread_new_bridge"), "New Bridge thread");
 });
 
+test("syncCodexBridgeConversationProviders normalizes legacy user thread metadata for Codex visibility", () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
+  const codexDir = path.join(homeDir, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  const dbPath = createCodexStateDbWithMetadata(codexDir, [
+    {
+      id: "thread_bridge_visible",
+      modelProvider: "codex-bridge",
+      source: "codex-bridge",
+      threadSource: null,
+      title: "Bridge should be visible",
+    },
+  ]);
+
+  const result = syncCodexBridgeConversationProviders({ homeDir });
+  const metadata = threadMetadata(dbPath, "thread_bridge_visible");
+
+  assert.equal(result.totalUpdatedThreads, 1);
+  assert.equal(metadata.model_provider, "openai");
+  assert.equal(metadata.source, "vscode");
+  assert.equal(metadata.thread_source, "user");
+  assert.equal(metadata.archived, 0);
+});
+
+test("syncCodexBridgeConversationProviders repairs metadata left behind after provider-only migration", () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
+  const codexDir = path.join(homeDir, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  const dbPath = createCodexStateDbWithMetadata(codexDir, [
+    {
+      id: "thread_already_openai",
+      modelProvider: "openai",
+      source: "codex-bridge",
+      threadSource: null,
+      title: "Provider fixed but still hidden",
+    },
+  ]);
+
+  const result = syncCodexBridgeConversationProviders({ homeDir });
+  const metadata = threadMetadata(dbPath, "thread_already_openai");
+
+  assert.equal(result.totalUpdatedThreads, 0);
+  assert.equal(result.totalNormalizedThreads, 1);
+  assert.equal(metadata.model_provider, "openai");
+  assert.equal(metadata.source, "vscode");
+  assert.equal(metadata.thread_source, "user");
+});
+
 function makeTempProject() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "codex-bridge-test-"));
 }
@@ -942,6 +990,45 @@ function createCodexStateDb(codexDir, rows, dbPath = path.join(codexDir, "state_
   return dbPath;
 }
 
+function createCodexStateDbWithMetadata(codexDir, rows, dbPath = path.join(codexDir, "state_5.sqlite")) {
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec(
+      [
+        "CREATE TABLE threads (",
+        "id TEXT PRIMARY KEY,",
+        "model_provider TEXT,",
+        "model TEXT,",
+        "title TEXT,",
+        "source TEXT,",
+        "thread_source TEXT,",
+        "archived INTEGER DEFAULT 0",
+        ")",
+      ].join(" "),
+    );
+    db.exec(
+      "CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT, status TEXT)",
+    );
+    const insert = db.prepare(
+      "INSERT INTO threads (id, model_provider, model, title, source, thread_source, archived) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    );
+    for (const row of rows) {
+      insert.run(
+        row.id,
+        row.modelProvider,
+        row.model || "gpt-5.5",
+        row.title,
+        row.source,
+        row.threadSource,
+        row.archived || 0,
+      );
+    }
+  } finally {
+    db.close();
+  }
+  return dbPath;
+}
+
 function threadCount(dbPath) {
   const db = new DatabaseSync(dbPath, { readOnly: true });
   try {
@@ -955,6 +1042,17 @@ function threadTitle(dbPath, id) {
   const db = new DatabaseSync(dbPath, { readOnly: true });
   try {
     return db.prepare("SELECT title FROM threads WHERE id = ?").get(id).title;
+  } finally {
+    db.close();
+  }
+}
+
+function threadMetadata(dbPath, id) {
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    return db
+      .prepare("SELECT model_provider, source, thread_source, archived FROM threads WHERE id = ?")
+      .get(id);
   } finally {
     db.close();
   }
