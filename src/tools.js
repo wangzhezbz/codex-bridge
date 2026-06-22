@@ -9,6 +9,7 @@ export function buildToolContext(responseTools = [], options = {}) {
     chatTools: [],
     customToolNames: new Set(),
     specialToolTypes: new Map(),
+    responseToolMetadata: new Map(),
     chatToolNames: new Set(),
     chatNameToResponseName: new Map(),
     responseNameToChatName: new Map(),
@@ -28,6 +29,8 @@ export function responseToolCallFromChat(call, context) {
   const callId = call?.id || `call_${stableSuffix(responseName + Date.now())}`;
   const args = call?.function?.arguments ?? call?.arguments ?? "";
   const specialType = context.specialToolTypes.get(responseName);
+  const metadata = context.responseToolMetadata.get(responseName) || {};
+  const responseCallName = metadata.name || responseName;
 
   if (specialType === "tool_search_call") {
     return {
@@ -39,29 +42,40 @@ export function responseToolCallFromChat(call, context) {
     };
   }
 
+  if (specialType === "computer_call") {
+    return withNamespace(metadata, {
+      id: `cc_${stableSuffix(callId)}`,
+      type: "computer_call",
+      call_id: callId,
+      name: responseCallName,
+      arguments: argumentsObject(args),
+      status: "completed",
+    });
+  }
+
   if (responseName === APPLY_PATCH || context.customToolNames.has(responseName)) {
-    return {
+    return withNamespace(metadata, {
       id: `ctc_${stableSuffix(callId)}`,
       type: "custom_tool_call",
       call_id: callId,
-      name: responseName,
+      name: responseCallName,
       input: customInputFromArguments(args),
       status: "completed",
-    };
+    });
   }
 
-  return {
+  return withNamespace(metadata, {
     id: `fc_${stableSuffix(callId)}`,
     type: "function_call",
     call_id: callId,
-    name: responseName,
+    name: responseCallName,
     arguments: stringifyJson(args),
     status: "completed",
-  };
+  });
 }
 
 export function chatToolCallFromResponseItem(item, context) {
-  const responseName = item.name || item.type || "tool";
+  const responseName = namespacedToolName(item.name || item.type || "tool", item.namespace);
   const chatName = chatNameForResponseName(context, responseName);
 
   if (item.type === "custom_tool_call") {
@@ -152,6 +166,7 @@ function appendResponseTool(context, tool, namespace = "") {
     const name = namespacedToolName(tool.name || "tool_search", namespace);
     const chatName = chatNameForResponseName(context, name);
     context.specialToolTypes.set(name, "tool_search_call");
+    setResponseToolMetadata(context, name, tool.name || "tool_search", namespace);
     appendChatTool(context, chatName, {
       type: "function",
       function: {
@@ -173,6 +188,7 @@ function appendResponseTool(context, tool, namespace = "") {
     const name = namespacedToolName(tool.name || "custom_tool", namespace);
     const chatName = chatNameForResponseName(context, name);
     context.customToolNames.add(name);
+    setResponseToolMetadata(context, name, tool.name || "custom_tool", namespace);
     appendChatTool(context, chatName, {
       type: "function",
       function: {
@@ -202,6 +218,10 @@ function appendResponseTool(context, tool, namespace = "") {
   }
   const responseName = namespacedToolName(fn.name, namespace);
   const chatName = chatNameForResponseName(context, responseName);
+  if (tool.type === "computer_use") {
+    context.specialToolTypes.set(responseName, "computer_call");
+  }
+  setResponseToolMetadata(context, responseName, fn.name, namespace);
   appendChatTool(context, chatName, {
     type: "function",
     function: {
@@ -244,6 +264,37 @@ function namespacedToolName(name, namespace) {
     return rawName;
   }
   return rawName.startsWith(namespace) ? rawName : `${namespace}${rawName}`;
+}
+
+function setResponseToolMetadata(context, responseName, originalName, namespace = "") {
+  if (!responseName || context.responseToolMetadata.has(responseName)) {
+    return;
+  }
+  context.responseToolMetadata.set(responseName, {
+    name: originalName || responseName,
+    namespace: namespace || undefined,
+  });
+}
+
+function withNamespace(metadata, item) {
+  if (metadata?.namespace) {
+    return {
+      ...item,
+      namespace: metadata.namespace,
+    };
+  }
+  return item;
+}
+
+function argumentsObject(args) {
+  if (args && typeof args === "object" && !Array.isArray(args)) {
+    return args;
+  }
+  const parsed = tryParseJson(args);
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    return parsed;
+  }
+  return {};
 }
 
 function normalizeFunctionTool(tool) {

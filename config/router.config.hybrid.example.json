@@ -21,7 +21,11 @@
       "baseUrl": "https://chatgpt.com/backend-api/codex",
       "model": "gpt-5.5",
       "authMode": "codex_openai",
-      "contextWindow": 1000000,
+      "contextWindow": 258400,
+      "inputModalities": [
+        "text",
+        "image"
+      ],
       "additionalSpeedTiers": [
         "fast"
       ],
@@ -42,7 +46,11 @@
       "baseUrl": "https://chatgpt.com/backend-api/codex",
       "model": "gpt-5.4",
       "authMode": "codex_openai",
-      "contextWindow": 1000000,
+      "contextWindow": 258400,
+      "inputModalities": [
+        "text",
+        "image"
+      ],
       "additionalSpeedTiers": [
         "fast"
       ],

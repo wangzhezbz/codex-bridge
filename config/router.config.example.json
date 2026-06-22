@@ -23,6 +23,10 @@
       "authMode": "api_key",
       "apiKeyEnv": "OPENAI_API_KEY",
       "contextWindow": 1047576,
+      "inputModalities": [
+        "text",
+        "image"
+      ],
       "priority": 0
     },
     {
@@ -35,6 +39,10 @@
       "authMode": "api_key",
       "apiKeyEnv": "OPENAI_API_KEY",
       "contextWindow": 1047576,
+      "inputModalities": [
+        "text",
+        "image"
+      ],
       "priority": 1
     },
     {

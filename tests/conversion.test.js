@@ -708,6 +708,67 @@ test("namespace tools keep unique names so MCP tools are not dropped", () => {
   );
 });
 
+test("chat namespace tool calls are returned with namespace metadata", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "use node repl",
+      tools: [
+        {
+          type: "namespace",
+          name: "mcp__node_repl__",
+          tools: [
+            {
+              type: "function",
+              name: "js",
+              description: "Run JavaScript.",
+              parameters: {
+                type: "object",
+                properties: {
+                  code: { type: "string" },
+                },
+                required: ["code"],
+              },
+            },
+          ],
+        },
+      ],
+    },
+    route,
+    new ResponseHistory(),
+  );
+
+  const response = chatResponseToResponse(
+    {
+      id: "chatcmpl_mcp",
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call_mcp",
+                type: "function",
+                function: {
+                  name: "mcp__node_repl__js",
+                  arguments: '{"code":"1 + 1"}',
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    "deepseek-v4-pro",
+    converted.toolContext,
+  );
+
+  assert.equal(response.output[0].type, "function_call");
+  assert.equal(response.output[0].namespace, "mcp__node_repl__");
+  assert.equal(response.output[0].name, "js");
+  assert.equal(response.output[0].arguments, '{"code":"1 + 1"}');
+});
+
 test("non-function Codex tools with schemas are exposed to chat providers", () => {
   const converted = responsesToChatRequest(
     {
@@ -732,6 +793,60 @@ test("non-function Codex tools with schemas are exposed to chat providers", () =
 
   assert.equal(converted.body.tools.length, 1);
   assert.equal(converted.body.tools[0].function.name, "computer_screenshot");
+});
+
+test("chat computer tool calls are returned as computer_call items", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "take screenshot",
+      tools: [
+        {
+          type: "computer_use",
+          name: "computer_screenshot",
+          description: "Capture the screen.",
+          parameters: {
+            type: "object",
+            properties: {
+              display_id: { type: "string" },
+            },
+          },
+        },
+      ],
+    },
+    route,
+    new ResponseHistory(),
+  );
+
+  const response = chatResponseToResponse(
+    {
+      id: "chatcmpl_computer",
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call_screen",
+                type: "function",
+                function: {
+                  name: "computer_screenshot",
+                  arguments: '{"display_id":"main"}',
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    "deepseek-v4-pro",
+    converted.toolContext,
+  );
+
+  assert.equal(response.output[0].type, "computer_call");
+  assert.equal(response.output[0].call_id, "call_screen");
+  assert.equal(response.output[0].name, "computer_screenshot");
+  assert.deepEqual(response.output[0].arguments, { display_id: "main" });
 });
 
 test("computer call items are kept as paired chat tool calls", () => {

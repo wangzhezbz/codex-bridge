@@ -178,11 +178,11 @@ export const PROVIDERS = [
 ];
 
 export const MODEL_PRESETS = [
-  route("codex-gpt-5-5", "codex", "GPT-5.5", "gpt-5.5", "responses", 1000000, codexFastMode()),
-  route("codex-gpt-5-4", "codex", "GPT-5.4", "gpt-5.4", "responses", 1000000, codexFastMode()),
-  route("codex-gpt-5-4-mini", "codex", "GPT-5.4-Mini", "gpt-5.4-mini", "responses", 1000000),
-  route("openai-gpt-4-1", "openai", "OpenAI GPT-4.1", "gpt-4.1", "responses", 1047576),
-  route("openai-gpt-4-1-mini", "openai", "OpenAI GPT-4.1 Mini", "gpt-4.1-mini", "responses", 1047576),
+  route("codex-gpt-5-5", "codex", "GPT-5.5", "gpt-5.5", "responses", 258400, imageInput(codexFastMode())),
+  route("codex-gpt-5-4", "codex", "GPT-5.4", "gpt-5.4", "responses", 258400, imageInput(codexFastMode())),
+  route("codex-gpt-5-4-mini", "codex", "GPT-5.4-Mini", "gpt-5.4-mini", "responses", 258400, imageInput()),
+  route("openai-gpt-4-1", "openai", "OpenAI GPT-4.1", "gpt-4.1", "responses", 1047576, imageInput()),
+  route("openai-gpt-4-1-mini", "openai", "OpenAI GPT-4.1 Mini", "gpt-4.1-mini", "responses", 1047576, imageInput()),
   route("deepseek-v4-pro", "deepseek", "DeepSeek V4 Pro", "deepseek-v4-pro", "chat_completions", 1000000, {
     dropParams: ["response_format", "parallel_tool_calls"],
   }),

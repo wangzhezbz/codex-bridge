@@ -361,6 +361,11 @@ test("model presets include extra domestic coding and general models", () => {
 test("vision-capable presets advertise image input and text-only presets stay text-only", () => {
   const byId = new Map(MODEL_PRESETS.map((model) => [model.presetId, model]));
 
+  assert.deepEqual(byId.get("codex-gpt-5-5")?.inputModalities, ["text", "image"]);
+  assert.deepEqual(byId.get("codex-gpt-5-4")?.inputModalities, ["text", "image"]);
+  assert.deepEqual(byId.get("codex-gpt-5-4-mini")?.inputModalities, ["text", "image"]);
+  assert.deepEqual(byId.get("openai-gpt-4-1")?.inputModalities, ["text", "image"]);
+  assert.deepEqual(byId.get("openai-gpt-4-1-mini")?.inputModalities, ["text", "image"]);
   assert.deepEqual(byId.get("kimi-k2-7-code")?.inputModalities, ["text", "image"]);
   assert.deepEqual(byId.get("kimi-k2-6")?.inputModalities, ["text", "image"]);
   assert.deepEqual(byId.get("xiaomi-mimo-v2-5-pro")?.inputModalities, ["text", "image"]);
@@ -387,6 +392,14 @@ test("native GPT subscription presets advertise Codex fast mode", () => {
   }
   assert.equal(byId.get("codex-gpt-5-4-mini")?.serviceTiers, undefined);
   assert.equal(byId.get("openai-gpt-4-1")?.serviceTiers, undefined);
+});
+
+test("native GPT subscription presets use the Codex desktop context window", () => {
+  const byId = new Map(MODEL_PRESETS.map((model) => [model.presetId, model]));
+
+  assert.equal(byId.get("codex-gpt-5-5")?.contextWindow, 258400);
+  assert.equal(byId.get("codex-gpt-5-4")?.contextWindow, 258400);
+  assert.equal(byId.get("codex-gpt-5-4-mini")?.contextWindow, 258400);
 });
 
 test("built-in catalog does not recommend the private Fenno GPT provider", () => {
