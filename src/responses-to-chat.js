@@ -21,10 +21,11 @@ export function responsesToChatRequest(request, route, history) {
     messages.push({ role: "system", content: instructions });
   }
   messages.push(...priorMessages, ...currentMessages);
+  const normalizedMessages = normalizeToolCallPairs(messages);
 
   const body = {
     model: route.model,
-    messages,
+    messages: normalizedMessages,
     stream: false,
   };
   if (shouldRequestSeparatedReasoning(route)) {
@@ -65,7 +66,7 @@ export function responsesToChatRequest(request, route, history) {
     body,
     toolContext,
     wantsStream: Boolean(request.stream),
-    messagesForHistory: messages,
+    messagesForHistory: normalizedMessages,
   };
 }
 
@@ -395,4 +396,78 @@ function shouldRequestSeparatedReasoning(route = {}) {
   } catch {
     return false;
   }
+}
+
+function normalizeToolCallPairs(messages) {
+  const normalized = [];
+
+  for (let index = 0; index < messages.length;) {
+    const message = messages[index];
+    if (hasToolCalls(message)) {
+      const expectedIds = new Set(
+        message.tool_calls
+          .map((toolCall) => toolCall?.id)
+          .filter(Boolean),
+      );
+      const toolMessages = [];
+      let nextIndex = index + 1;
+      while (nextIndex < messages.length && messages[nextIndex]?.role === "tool") {
+        toolMessages.push(messages[nextIndex]);
+        nextIndex += 1;
+      }
+
+      const actualIds = new Set(
+        toolMessages
+          .map((toolMessage) => toolMessage.tool_call_id)
+          .filter(Boolean),
+      );
+      const complete =
+        expectedIds.size > 0 &&
+        [...expectedIds].every((toolCallId) => actualIds.has(toolCallId));
+
+      if (complete) {
+        normalized.push(message, ...toolMessages);
+      } else {
+        const textOnly = assistantTextOnlyMessage(message);
+        if (textOnly) {
+          normalized.push(textOnly);
+        }
+      }
+      index = nextIndex;
+      continue;
+    }
+
+    if (message?.role !== "tool") {
+      normalized.push(message);
+    }
+    index += 1;
+  }
+
+  return normalized;
+}
+
+function hasToolCalls(message) {
+  return (
+    message?.role === "assistant" &&
+    Array.isArray(message.tool_calls) &&
+    message.tool_calls.length > 0
+  );
+}
+
+function assistantTextOnlyMessage(message) {
+  if (!messageHasContent(message)) {
+    return null;
+  }
+  const { tool_calls, ...textOnly } = message;
+  return textOnly;
+}
+
+function messageHasContent(message) {
+  if (typeof message?.content === "string") {
+    return message.content.trim().length > 0;
+  }
+  if (Array.isArray(message?.content)) {
+    return message.content.length > 0;
+  }
+  return Boolean(message?.content);
 }

@@ -355,6 +355,58 @@ test("previous_response_id restores assistant tool calls before tool output", ()
   assert.equal(second.body.messages.at(-1).tool_call_id, "call_shell");
 });
 
+test("chat conversion drops stale assistant tool calls without tool outputs", () => {
+  const history = new ResponseHistory();
+  history.record("resp_stale_tool", [
+    { role: "user", content: "create a file" },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        {
+          id: "call_stale",
+          type: "function",
+          function: {
+            name: "shell_command",
+            arguments: '{"command":"touch stale.txt"}',
+          },
+        },
+      ],
+    },
+  ]);
+
+  const converted = responsesToChatRequest(
+    {
+      model: "deepseek-v4-pro",
+      previous_response_id: "resp_stale_tool",
+      input: "hello again",
+      tools: [
+        {
+          type: "function",
+          name: "shell_command",
+          description: "Run command",
+          parameters: {
+            type: "object",
+            properties: { command: { type: "string" } },
+            required: ["command"],
+          },
+        },
+      ],
+    },
+    route,
+    history,
+  );
+
+  assert.equal(
+    converted.body.messages.some((message) => Array.isArray(message.tool_calls)),
+    false,
+  );
+  assert.deepEqual(
+    converted.body.messages.map((message) => message.content),
+    ["create a file", "hello again"],
+  );
+});
+
 test("namespace tools are flattened for chat providers", () => {
   const converted = responsesToChatRequest(
     {
