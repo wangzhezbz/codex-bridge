@@ -19,6 +19,7 @@ test("Windows release archive uses formal portable package naming", () => {
   assert.doesNotMatch(workflow, /CodexBridge-windows-portable/);
   assert.match(packager, /CODEXBRIDGE_RELEASE_VERSION/);
   assert.match(packager, /CodexBridge-Windows-x64-Portable-/);
+  assert.match(packager, /codexbridge-icon\.ico/);
 });
 
 test("macOS release archives use formal x64 and arm64 package naming", () => {
@@ -42,4 +43,18 @@ test("macOS release archives use formal x64 and arm64 package naming", () => {
   assert.match(workflow, /releases\/latest\/download\/CodexBridge-macOS-x64-Portable\.zip/);
   assert.match(packager, /platform:\s*"darwin"/);
   assert.match(packager, /CodexBridge-macOS-\$\{targetArch\}-Portable-/);
+  assert.match(packager, /codexbridge-icon\.icns/);
+});
+
+test("desktop packages include native app icon assets", () => {
+  const assetsDir = path.join(process.cwd(), "desktop", "assets");
+  const png = fs.readFileSync(path.join(assetsDir, "codexbridge-icon.png"));
+  const ico = fs.readFileSync(path.join(assetsDir, "codexbridge-icon.ico"));
+  const icns = fs.readFileSync(path.join(assetsDir, "codexbridge-icon.icns"));
+  const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
+
+  assert.equal(png.subarray(1, 4).toString("ascii"), "PNG");
+  assert.deepEqual([...ico.subarray(0, 4)], [0, 0, 1, 0]);
+  assert.equal(icns.subarray(0, 4).toString("ascii"), "icns");
+  assert.match(main, /codexbridge-icon\.png/);
 });

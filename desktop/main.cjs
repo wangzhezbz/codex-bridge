@@ -9,6 +9,7 @@ const {
 } = require("./data-dir.cjs");
 
 const appRootDir = path.resolve(__dirname, "..");
+const appIconPath = path.join(__dirname, "assets", "codexbridge-icon.png");
 const dataRootDir = resolveDataRootDir({
   appRootDir,
   env: process.env,
@@ -93,6 +94,7 @@ function createWindow() {
     minHeight: 640,
     title: "CodexBridge",
     backgroundColor: "#f5f7f9",
+    icon: appIconPath,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
@@ -118,6 +120,9 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  if (process.platform === "win32") {
+    app.setAppUserModelId("com.codexbridge.app");
+  }
   createWindow();
   if (process.env.CODEXBRIDGE_DESKTOP_SMOKE === "1") {
     const timeout = setTimeout(() => {

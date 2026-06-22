@@ -22,6 +22,7 @@ const releaseVersion =
   `v${packageJson.version}-local-${localStamp}`;
 const safeReleaseVersion = releaseVersion.replace(/[^A-Za-z0-9._-]/g, "-");
 const outDir = path.join(repoRoot, "release", `CodexBridge-Windows-x64-Portable-${safeReleaseVersion}`);
+const iconPath = path.join(repoRoot, "desktop", "assets", "codexbridge-icon.ico");
 
 fs.mkdirSync(outDir, { recursive: true });
 
@@ -37,6 +38,7 @@ const appPaths = await packager({
   overwrite: false,
   appVersion: packageJson.version,
   electronVersion: electronPackageJson.version,
+  icon: iconPath,
   appCopyright: "Copyright (c) 2026 CodexBridge contributors",
   download: {
     mirrorOptions: {

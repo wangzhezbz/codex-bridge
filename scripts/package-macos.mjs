@@ -27,6 +27,7 @@ const outDir = path.join(
   "release",
   `CodexBridge-macOS-${targetArch}-Portable-${safeReleaseVersion}`,
 );
+const iconPath = path.join(repoRoot, "desktop", "assets", "codexbridge-icon.icns");
 
 fs.mkdirSync(outDir, { recursive: true });
 
@@ -43,6 +44,7 @@ const appPaths = await packager({
   appVersion: packageJson.version,
   appBundleId: "com.codexbridge.app",
   electronVersion: electronPackageJson.version,
+  icon: iconPath,
   appCopyright: "Copyright (c) 2026 CodexBridge contributors",
   download: {
     mirrorOptions: {
