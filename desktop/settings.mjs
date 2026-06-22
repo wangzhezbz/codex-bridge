@@ -239,9 +239,11 @@ export function supportDiagnostics(rootDir, {
   platform = process.platform,
   arch = process.arch,
   release = os.release(),
+  homeDir = os.homedir(),
 } = {}) {
   const options = loadDesktopOptions(rootDir);
   const routeDiagnostics = routerConfigDiagnostics(rootDir, config);
+  const historyDiagnostics = codexHistoryDiagnostics({ homeDir });
   const secretMap = loadSecrets(rootDir);
   const selectedRoutes = Array.isArray(config?.models) ? config.models : [];
   const selectedKeyEnvs = [
@@ -284,6 +286,9 @@ export function supportDiagnostics(rootDir, {
     `- missingApiKeys: ${routeDiagnostics.missingApiKeys.map((item) => `${item.displayName || item.id}:${item.apiKeyEnv || "API Key"}`).join(", ") || "none"}`,
     `- invalidBaseUrls: ${routeDiagnostics.invalidBaseUrls.map((item) => `${item.displayName || item.id}:${item.baseUrl || "(empty)"}`).join(", ") || "none"}`,
     "",
+    "Codex history diagnostics:",
+    ...historyDiagnostics.lines,
+    "",
     "Recent errors:",
     ...(errorLines.length ? errorLines.map((line) => `- ${line}`) : ["- none"]),
   ];
@@ -294,9 +299,226 @@ export function supportDiagnostics(rootDir, {
       missingApiKeys: routeDiagnostics.missingApiKeys,
       invalidBaseUrls: routeDiagnostics.invalidBaseUrls,
       errorCount: errorLines.length,
+      history: historyDiagnostics.summary,
     },
     text: lines.join("\n"),
   };
+}
+
+function codexHistoryDiagnostics({ homeDir = os.homedir() } = {}) {
+  const summary = {
+    ok: true,
+    reason: "",
+    databases: [],
+  };
+  let DatabaseSync;
+  try {
+    ({ DatabaseSync } = require("node:sqlite"));
+  } catch (error) {
+    summary.ok = false;
+    summary.reason = "node_sqlite_unavailable";
+    return {
+      summary,
+      lines: [`- unavailable: node:sqlite ${redactSecretText(error.message)}`],
+    };
+  }
+
+  const codexDir = path.join(homeDir, ".codex");
+  if (!fs.existsSync(codexDir)) {
+    summary.reason = "codex_dir_missing";
+    return {
+      summary,
+      lines: ["- no .codex directory found"],
+    };
+  }
+
+  const dbPaths = codexStateDatabasePaths(codexDir);
+  if (!dbPaths.length) {
+    summary.reason = "state_db_missing";
+    return {
+      summary,
+      lines: ["- no state*.sqlite database found"],
+    };
+  }
+
+  const lines = [];
+  for (const dbPath of dbPaths) {
+    const item = summarizeCodexHistoryDatabase(DatabaseSync, dbPath);
+    summary.databases.push(item);
+    if (!item.ok) {
+      summary.ok = false;
+      lines.push(`- ${path.basename(dbPath)}: error=${redactSecretText(item.error)}`);
+      continue;
+    }
+    lines.push(
+      `- ${path.basename(dbPath)}: threads=${item.totalThreads}, hiddenCandidates=${item.hiddenCandidates}, ` +
+        `legacyProvider=${item.legacyProvider}, legacySource=${item.legacySource}, archived=${item.archived}, ` +
+        `missingUserEvent=${item.missingUserEvent}, backups=${item.backups}, hiddenBackupRefs=${item.hiddenBackupReferenced}`,
+    );
+    if (item.providerGroups.length) {
+      lines.push(`  providers: ${formatCountGroups(item.providerGroups)}`);
+    }
+    if (item.sourceGroups.length) {
+      lines.push(`  sources: ${formatCountGroups(item.sourceGroups)}`);
+    }
+    if (item.threadSourceGroups.length) {
+      lines.push(`  threadSources: ${formatCountGroups(item.threadSourceGroups)}`);
+    }
+    if (item.recentThreads.length) {
+      lines.push("  recentThreads:");
+      for (const row of item.recentThreads) {
+        lines.push(
+          `  - ${row.id} provider=${row.model_provider} source=${row.source} threadSource=${row.thread_source} ` +
+            `archived=${row.archived} hasUserEvent=${row.has_user_event} title=${row.title}`,
+        );
+      }
+    }
+  }
+
+  return { summary, lines };
+}
+
+function summarizeCodexHistoryDatabase(DatabaseSync, dbPath) {
+  const item = {
+    path: dbPath,
+    ok: true,
+    totalThreads: 0,
+    hiddenCandidates: 0,
+    legacyProvider: 0,
+    legacySource: 0,
+    archived: 0,
+    missingUserEvent: 0,
+    backups: 0,
+    hiddenBackupReferenced: 0,
+    providerGroups: [],
+    sourceGroups: [],
+    threadSourceGroups: [],
+    recentThreads: [],
+  };
+  let db;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    db.exec("PRAGMA busy_timeout = 1500");
+    if (!hasTable(db, "threads")) {
+      return {
+        ...item,
+        ok: false,
+        error: "threads table missing",
+      };
+    }
+    const columns = tableColumns(db, "threads");
+    item.totalThreads = sqliteCount(db, "SELECT COUNT(*) AS count FROM threads");
+    item.backups = codexStateMergeSourcePaths(dbPath).length;
+    item.hiddenBackupReferenced = countHiddenBackupReferencedThreads(DatabaseSync, dbPath);
+    if (columns.includes("model_provider")) {
+      item.legacyProvider = sqliteCount(
+        db,
+        "SELECT COUNT(*) AS count FROM threads WHERE model_provider = ?",
+        "codex-bridge",
+      );
+      item.providerGroups = sqliteGroupedCounts(db, "threads", "model_provider");
+    }
+    if (columns.includes("source")) {
+      item.sourceGroups = sqliteGroupedCounts(db, "threads", "source");
+    }
+    if (columns.includes("thread_source")) {
+      item.threadSourceGroups = sqliteGroupedCounts(db, "threads", "thread_source");
+    }
+    if (columns.includes("model_provider") && columns.includes("source")) {
+      item.legacySource = sqliteCount(
+        db,
+        "SELECT COUNT(*) AS count FROM threads " +
+          "WHERE model_provider = ? " +
+          `AND LOWER(source) IN (${legacyThreadSourceSqlList()})`,
+        "openai",
+      );
+    }
+    if (columns.includes("archived")) {
+      item.archived = sqliteCount(db, "SELECT COUNT(*) AS count FROM threads WHERE archived != 0");
+    }
+    if (columns.includes("has_user_event")) {
+      item.missingUserEvent = sqliteCount(db, "SELECT COUNT(*) AS count FROM threads WHERE has_user_event = 0");
+    }
+    const predicate = visibilityIssuePredicate(columns);
+    if (predicate) {
+      item.hiddenCandidates = sqliteCount(db, `SELECT COUNT(*) AS count FROM threads WHERE ${predicate}`);
+    }
+    item.recentThreads = recentThreadDiagnostics(db, columns);
+    return item;
+  } catch (error) {
+    return {
+      ...item,
+      ok: false,
+      error: error.message,
+    };
+  } finally {
+    if (db) {
+      db.close();
+    }
+  }
+}
+
+function sqliteCount(db, sql, ...params) {
+  return Number(db.prepare(sql).get(...params).count || 0);
+}
+
+function sqliteGroupedCounts(db, tableName, columnName) {
+  return db
+    .prepare(
+      `SELECT COALESCE(NULLIF(CAST(${quoteIdentifier(columnName)} AS TEXT), ''), '(empty)') AS key, ` +
+        `COUNT(*) AS count FROM ${quoteIdentifier(tableName)} ` +
+        "GROUP BY key ORDER BY count DESC, key ASC LIMIT 8",
+    )
+    .all()
+    .map((row) => ({
+      key: redactSecretText(row.key),
+      count: Number(row.count || 0),
+    }));
+}
+
+function recentThreadDiagnostics(db, columns) {
+  const selectedColumns = [
+    "id",
+    "title",
+    "model_provider",
+    "source",
+    "thread_source",
+    "archived",
+    "has_user_event",
+  ].filter((column) => columns.includes(column));
+  if (!selectedColumns.includes("id")) {
+    return [];
+  }
+  const orderColumn = ["updated_at", "created_at", "last_active_at", "last_message_at"]
+    .find((column) => columns.includes(column));
+  const orderClause = orderColumn ? ` ORDER BY ${quoteIdentifier(orderColumn)} DESC` : " ORDER BY rowid DESC";
+  try {
+    return db
+      .prepare(`SELECT ${selectedColumns.map(quoteIdentifier).join(", ")} FROM threads${orderClause} LIMIT 5`)
+      .all()
+      .map(normalizeRecentThreadDiagnostic);
+  } catch {
+    return db
+      .prepare(`SELECT ${selectedColumns.map(quoteIdentifier).join(", ")} FROM threads LIMIT 5`)
+      .all()
+      .map(normalizeRecentThreadDiagnostic);
+  }
+}
+
+function normalizeRecentThreadDiagnostic(row) {
+  return {
+    id: redactSecretText(row.id || "(empty)"),
+    model_provider: redactSecretText(row.model_provider || "(missing)"),
+    source: redactSecretText(row.source || "(missing)"),
+    thread_source: redactSecretText(row.thread_source || "(missing)"),
+    archived: row.archived ?? "(missing)",
+    has_user_event: row.has_user_event ?? "(missing)",
+    title: redactSecretText(row.title || "(untitled)").slice(0, 80),
+  };
+}
+
+function formatCountGroups(groups) {
+  return groups.map((group) => `${group.key}=${group.count}`).join(", ") || "none";
 }
 
 export function providerCatalog(rootDir) {
@@ -587,7 +809,13 @@ export function syncCodexBridgeConversationProviders({ homeDir = os.homedir() } 
       const missingBackupThreads = countMissingThreadsFromHistoryBackups(DatabaseSync, dbPath);
       const legacyThreads = countLegacyCodexBridgeThreads(DatabaseSync, dbPath);
       const hiddenLegacyMetadataThreads = countHiddenLegacyMetadataThreads(DatabaseSync, dbPath);
-      if (legacyThreads < 1 && missingBackupThreads < 1 && hiddenLegacyMetadataThreads < 1) {
+      const hiddenBackupReferencedThreads = countHiddenBackupReferencedThreads(DatabaseSync, dbPath);
+      if (
+        legacyThreads < 1 &&
+        missingBackupThreads < 1 &&
+        hiddenLegacyMetadataThreads < 1 &&
+        hiddenBackupReferencedThreads < 1
+      ) {
         item.skipped = true;
         item.reason = "no_legacy_threads";
         result.databases.push(item);
@@ -597,7 +825,9 @@ export function syncCodexBridgeConversationProviders({ homeDir = os.homedir() } 
       item.backup = backupCodexStateDatabase(dbPath);
       item.importedThreads = importMissingThreadsFromHistoryBackups(DatabaseSync, dbPath);
       item.updatedThreads = updateLegacyCodexBridgeThreads(DatabaseSync, dbPath);
-      item.normalizedThreads = normalizeHiddenLegacyThreadMetadata(DatabaseSync, dbPath);
+      item.normalizedThreads =
+        normalizeHiddenLegacyThreadMetadata(DatabaseSync, dbPath) +
+        normalizeBackupReferencedThreadMetadata(DatabaseSync, dbPath);
       result.totalImportedThreads += item.importedThreads;
       result.totalUpdatedThreads += item.updatedThreads;
       result.totalNormalizedThreads += item.normalizedThreads;
@@ -926,6 +1156,35 @@ function countHiddenLegacyMetadataThreads(DatabaseSync, dbPath) {
   }
 }
 
+function countHiddenBackupReferencedThreads(DatabaseSync, dbPath) {
+  return withCodexStateMergeSources(DatabaseSync, dbPath, (db, alias) => {
+    if (!hasAttachedTable(db, alias, "threads") || !hasTable(db, "threads")) {
+      return 0;
+    }
+    const sourceColumns = attachedTableColumns(db, alias, "threads");
+    const mainColumns = tableColumns(db, "threads");
+    if (!sourceColumns.includes("id") || !sourceColumns.includes("model_provider")) {
+      return 0;
+    }
+    const predicate = visibilityIssuePredicate(mainColumns, "t");
+    if (!predicate) {
+      return 0;
+    }
+    return Number(
+      db
+        .prepare(
+          `SELECT COUNT(*) AS count FROM main.threads AS t ` +
+            `WHERE (${predicate}) ` +
+            `AND EXISTS (` +
+            `SELECT 1 FROM ${quoteIdentifier(alias)}.threads AS b ` +
+            "WHERE b.id = t.id AND b.model_provider = ?" +
+            ")",
+        )
+        .get("codex-bridge").count,
+    );
+  });
+}
+
 function updateLegacyCodexBridgeThreads(DatabaseSync, dbPath) {
   const db = new DatabaseSync(dbPath);
   try {
@@ -946,6 +1205,7 @@ function updateLegacyCodexBridgeThreads(DatabaseSync, dbPath) {
           "ELSE thread_source END",
       );
     }
+    addVisibleThreadAssignments(assignments, columns);
     const result = db
       .prepare(`UPDATE threads SET ${assignments.join(", ")} WHERE model_provider = ?`)
       .run("openai", "codex-bridge");
@@ -974,6 +1234,7 @@ function normalizeHiddenLegacyThreadMetadata(DatabaseSync, dbPath) {
           "ELSE thread_source END",
       );
     }
+    addVisibleThreadAssignments(assignments, columns);
     const result = db
       .prepare(
         `UPDATE threads SET ${assignments.join(", ")} ` +
@@ -985,6 +1246,104 @@ function normalizeHiddenLegacyThreadMetadata(DatabaseSync, dbPath) {
   } finally {
     db.close();
   }
+}
+
+function normalizeBackupReferencedThreadMetadata(DatabaseSync, dbPath) {
+  return withCodexStateMergeSources(DatabaseSync, dbPath, (db, alias) => {
+    if (!hasAttachedTable(db, alias, "threads") || !hasTable(db, "threads")) {
+      return 0;
+    }
+    const sourceColumns = attachedTableColumns(db, alias, "threads");
+    const mainColumns = tableColumns(db, "threads");
+    if (!sourceColumns.includes("id") || !sourceColumns.includes("model_provider")) {
+      return 0;
+    }
+    const predicate = visibilityIssuePredicate(mainColumns, "threads");
+    if (!predicate) {
+      return 0;
+    }
+    const assignments = [];
+    if (mainColumns.includes("source")) {
+      assignments.push(
+        "source = CASE " +
+          "WHEN source IS NULL OR source = '' THEN 'vscode' " +
+          "ELSE source END",
+      );
+    }
+    if (mainColumns.includes("thread_source")) {
+      assignments.push(
+        "thread_source = CASE " +
+          "WHEN thread_source IS NULL OR thread_source = '' THEN 'user' " +
+          "ELSE thread_source END",
+      );
+    }
+    addVisibleThreadAssignments(assignments, mainColumns);
+    if (!assignments.length) {
+      return 0;
+    }
+    const result = db
+      .prepare(
+        `UPDATE main.threads SET ${assignments.join(", ")} ` +
+          `WHERE (${predicate}) ` +
+          `AND EXISTS (` +
+          `SELECT 1 FROM ${quoteIdentifier(alias)}.threads AS b ` +
+          "WHERE b.id = main.threads.id AND b.model_provider = ?" +
+          ")",
+      )
+      .run("codex-bridge");
+    return Number(result.changes || 0);
+  });
+}
+
+function withCodexStateMergeSources(DatabaseSync, dbPath, callback) {
+  const backupPaths = codexStateMergeSourcePaths(dbPath);
+  if (!backupPaths.length) {
+    return 0;
+  }
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec("PRAGMA busy_timeout = 1500");
+    let total = 0;
+    backupPaths.forEach((backupPath, index) => {
+      const alias = `backup_${index}`;
+      db.exec(`ATTACH DATABASE ${sqlString(backupPath)} AS ${quoteIdentifier(alias)}`);
+      try {
+        total += Number(callback(db, alias, backupPath) || 0);
+      } finally {
+        db.exec(`DETACH DATABASE ${quoteIdentifier(alias)}`);
+      }
+    });
+    return total;
+  } finally {
+    db.close();
+  }
+}
+
+function addVisibleThreadAssignments(assignments, columns) {
+  if (columns.includes("archived")) {
+    assignments.push("archived = 0");
+  }
+  if (columns.includes("has_user_event")) {
+    assignments.push("has_user_event = 1");
+  }
+}
+
+function visibilityIssuePredicate(columns, tableAlias) {
+  const prefix = tableAlias ? `${tableAlias}.` : "";
+  const predicates = [];
+  if (columns.includes("source")) {
+    predicates.push(`(${prefix}source IS NULL OR ${prefix}source = '' OR LOWER(${prefix}source) IN (${legacyThreadSourceSqlList()}))`);
+  }
+  if (columns.includes("thread_source")) {
+    predicates.push(`(${prefix}thread_source IS NULL OR ${prefix}thread_source = '')`);
+  }
+  if (columns.includes("archived")) {
+    predicates.push(`${prefix}archived != 0`);
+  }
+  if (columns.includes("has_user_event")) {
+    predicates.push(`${prefix}has_user_event = 0`);
+  }
+  return predicates.join(" OR ");
 }
 
 function legacyThreadSourceSqlList() {

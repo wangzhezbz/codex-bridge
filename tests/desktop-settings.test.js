@@ -234,6 +234,20 @@ test("routerRuntimeEnv disables system proxy when desktop option is enabled", ()
 
 test("supportDiagnostics redacts keys and summarizes current config", () => {
   const rootDir = makeTempProject();
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-bridge-home-"));
+  const codexDir = path.join(homeDir, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  createCodexStateDbWithMetadata(codexDir, [
+    {
+      id: "thread_hidden_history",
+      modelProvider: "openai",
+      title: "Hidden migrated thread",
+      source: "vscode",
+      threadSource: "user",
+      archived: 1,
+      hasUserEvent: 0,
+    },
+  ]);
   saveSecrets(rootDir, {
     DEEPSEEK_API_KEY: "sk-secret-value",
   });
@@ -271,6 +285,7 @@ test("supportDiagnostics redacts keys and summarizes current config", () => {
       "[10:00:01] req_a1234567 !! upstream route=gpt-5.2 status=502 error=fetch failed cause=UND_ERR_CONNECT_TIMEOUT",
       "[10:00:02] authorization=Bearer sk-sensitive-token",
     ],
+    homeDir,
   });
 
   assert.match(diagnostics.text, /CodexBridge Diagnostics/);
@@ -280,6 +295,12 @@ test("supportDiagnostics redacts keys and summarizes current config", () => {
   assert.match(diagnostics.text, /DEEPSEEK_API_KEY: saved/);
   assert.match(diagnostics.text, /MOONSHOT_API_KEY: missing/);
   assert.match(diagnostics.text, /Kimi K2\.7 Code -> kimi-k2\.7-code/);
+  assert.match(diagnostics.text, /Codex history diagnostics/);
+  assert.match(diagnostics.text, /state_5\.sqlite: threads=1/);
+  assert.match(diagnostics.text, /hiddenCandidates=1/);
+  assert.match(diagnostics.text, /thread_hidden_history/);
+  assert.match(diagnostics.text, /archived=1/);
+  assert.match(diagnostics.text, /hasUserEvent=0/);
   assert.match(diagnostics.text, /UND_ERR_CONNECT_TIMEOUT/);
   assert.doesNotMatch(diagnostics.text, /sk-secret-value/);
   assert.doesNotMatch(diagnostics.text, /sk-sensitive-token/);
@@ -959,6 +980,79 @@ test("syncCodexBridgeConversationProviders repairs metadata left behind after pr
   assert.equal(metadata.thread_source, "user");
 });
 
+test("syncCodexBridgeConversationProviders unarchives and marks migrated user threads as having user events", () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
+  const codexDir = path.join(homeDir, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  const dbPath = createCodexStateDbWithMetadata(codexDir, [
+    {
+      id: "thread_archived_bridge",
+      modelProvider: "codex-bridge",
+      source: "codex-bridge",
+      threadSource: null,
+      archived: 1,
+      hasUserEvent: 0,
+      title: "Archived Bridge thread",
+    },
+  ]);
+
+  syncCodexBridgeConversationProviders({ homeDir });
+  const metadata = threadMetadata(dbPath, "thread_archived_bridge");
+
+  assert.equal(metadata.model_provider, "openai");
+  assert.equal(metadata.source, "vscode");
+  assert.equal(metadata.thread_source, "user");
+  assert.equal(metadata.archived, 0);
+  assert.equal(metadata.has_user_event, 1);
+});
+
+test("syncCodexBridgeConversationProviders repairs visibility for threads already migrated in a previous version", () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
+  const codexDir = path.join(homeDir, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  const dbPath = createCodexStateDbWithMetadata(codexDir, [
+    {
+      id: "thread_previously_migrated",
+      modelProvider: "openai",
+      source: "vscode",
+      threadSource: "user",
+      archived: 1,
+      hasUserEvent: 0,
+      title: "Already migrated but hidden",
+    },
+    {
+      id: "thread_real_user_archive",
+      modelProvider: "openai",
+      source: "vscode",
+      threadSource: "user",
+      archived: 1,
+      hasUserEvent: 1,
+      title: "Real user archive",
+    },
+  ]);
+  createCodexStateDbWithMetadata(codexDir, [
+    {
+      id: "thread_previously_migrated",
+      modelProvider: "codex-bridge",
+      source: "codex-bridge",
+      threadSource: null,
+      archived: 1,
+      hasUserEvent: 0,
+      title: "Already migrated but hidden",
+    },
+  ], `${dbPath}.codexbridge-history.2026-06-22-100000000.bak`);
+
+  const result = syncCodexBridgeConversationProviders({ homeDir });
+  const migrated = threadMetadata(dbPath, "thread_previously_migrated");
+  const archived = threadMetadata(dbPath, "thread_real_user_archive");
+
+  assert.equal(result.totalNormalizedThreads, 1);
+  assert.equal(migrated.archived, 0);
+  assert.equal(migrated.has_user_event, 1);
+  assert.equal(archived.archived, 1);
+  assert.equal(archived.has_user_event, 1);
+});
+
 function makeTempProject() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "codex-bridge-test-"));
 }
@@ -1002,7 +1096,8 @@ function createCodexStateDbWithMetadata(codexDir, rows, dbPath = path.join(codex
         "title TEXT,",
         "source TEXT,",
         "thread_source TEXT,",
-        "archived INTEGER DEFAULT 0",
+        "archived INTEGER DEFAULT 0,",
+        "has_user_event INTEGER DEFAULT 0",
         ")",
       ].join(" "),
     );
@@ -1010,7 +1105,7 @@ function createCodexStateDbWithMetadata(codexDir, rows, dbPath = path.join(codex
       "CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT, status TEXT)",
     );
     const insert = db.prepare(
-      "INSERT INTO threads (id, model_provider, model, title, source, thread_source, archived) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO threads (id, model_provider, model, title, source, thread_source, archived, has_user_event) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     );
     for (const row of rows) {
       insert.run(
@@ -1021,6 +1116,7 @@ function createCodexStateDbWithMetadata(codexDir, rows, dbPath = path.join(codex
         row.source,
         row.threadSource,
         row.archived || 0,
+        row.hasUserEvent || 0,
       );
     }
   } finally {
@@ -1051,7 +1147,7 @@ function threadMetadata(dbPath, id) {
   const db = new DatabaseSync(dbPath, { readOnly: true });
   try {
     return db
-      .prepare("SELECT model_provider, source, thread_source, archived FROM threads WHERE id = ?")
+      .prepare("SELECT model_provider, source, thread_source, archived, has_user_event FROM threads WHERE id = ?")
       .get(id);
   } finally {
     db.close();
