@@ -956,6 +956,29 @@ test("syncCodexBridgeConversationProviders normalizes legacy user thread metadat
   assert.equal(metadata.archived, 0);
 });
 
+test("syncCodexBridgeConversationProviders rewrites legacy thread_source values", () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
+  const codexDir = path.join(homeDir, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  const dbPath = createCodexStateDbWithMetadata(codexDir, [
+    {
+      id: "thread_bridge_thread_source",
+      modelProvider: "codex-bridge",
+      source: "codex-bridge",
+      threadSource: "codex-bridge",
+      title: "Bridge thread source",
+    },
+  ]);
+
+  const result = syncCodexBridgeConversationProviders({ homeDir });
+  const metadata = threadMetadata(dbPath, "thread_bridge_thread_source");
+
+  assert.equal(result.totalUpdatedThreads, 1);
+  assert.equal(metadata.model_provider, "openai");
+  assert.equal(metadata.source, "vscode");
+  assert.equal(metadata.thread_source, "user");
+});
+
 test("syncCodexBridgeConversationProviders repairs metadata left behind after provider-only migration", () => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
   const codexDir = path.join(homeDir, ".codex");
@@ -972,6 +995,30 @@ test("syncCodexBridgeConversationProviders repairs metadata left behind after pr
 
   const result = syncCodexBridgeConversationProviders({ homeDir });
   const metadata = threadMetadata(dbPath, "thread_already_openai");
+
+  assert.equal(result.totalUpdatedThreads, 0);
+  assert.equal(result.totalNormalizedThreads, 1);
+  assert.equal(metadata.model_provider, "openai");
+  assert.equal(metadata.source, "vscode");
+  assert.equal(metadata.thread_source, "user");
+});
+
+test("syncCodexBridgeConversationProviders repairs legacy thread_source left after prior migration", () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
+  const codexDir = path.join(homeDir, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  const dbPath = createCodexStateDbWithMetadata(codexDir, [
+    {
+      id: "thread_prior_migration_thread_source",
+      modelProvider: "openai",
+      source: "vscode",
+      threadSource: "codex-bridge",
+      title: "Provider and source fixed but thread source hidden",
+    },
+  ]);
+
+  const result = syncCodexBridgeConversationProviders({ homeDir });
+  const metadata = threadMetadata(dbPath, "thread_prior_migration_thread_source");
 
   assert.equal(result.totalUpdatedThreads, 0);
   assert.equal(result.totalNormalizedThreads, 1);

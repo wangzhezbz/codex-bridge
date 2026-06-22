@@ -1139,7 +1139,17 @@ function countHiddenLegacyMetadataThreads(DatabaseSync, dbPath) {
       return 0;
     }
     const columns = tableColumns(db, "threads");
-    if (!columns.includes("model_provider") || !columns.includes("source")) {
+    if (!columns.includes("model_provider")) {
+      return 0;
+    }
+    const predicates = [];
+    if (columns.includes("source")) {
+      predicates.push(legacySourceNeedsVscodeSql("source"));
+    }
+    if (columns.includes("thread_source")) {
+      predicates.push(legacyThreadSourceNeedsUserSql("thread_source"));
+    }
+    if (!predicates.length) {
       return 0;
     }
     return Number(
@@ -1147,7 +1157,7 @@ function countHiddenLegacyMetadataThreads(DatabaseSync, dbPath) {
         .prepare(
           "SELECT COUNT(*) AS count FROM threads " +
             "WHERE model_provider = ? " +
-            `AND LOWER(source) IN (${legacyThreadSourceSqlList()})`,
+            `AND (${predicates.join(" OR ")})`,
         )
         .get("openai").count,
     );
@@ -1194,14 +1204,14 @@ function updateLegacyCodexBridgeThreads(DatabaseSync, dbPath) {
     if (columns.includes("source")) {
       assignments.push(
         "source = CASE " +
-          `WHEN source IS NULL OR source = '' OR LOWER(source) IN (${legacyThreadSourceSqlList()}) THEN 'vscode' ` +
+          `WHEN ${legacySourceNeedsVscodeSql("source")} THEN 'vscode' ` +
           "ELSE source END",
       );
     }
     if (columns.includes("thread_source")) {
       assignments.push(
         "thread_source = CASE " +
-          "WHEN thread_source IS NULL OR thread_source = '' THEN 'user' " +
+          `WHEN ${legacyThreadSourceNeedsUserSql("thread_source")} THEN 'user' ` +
           "ELSE thread_source END",
       );
     }
@@ -1223,23 +1233,36 @@ function normalizeHiddenLegacyThreadMetadata(DatabaseSync, dbPath) {
       return 0;
     }
     const columns = tableColumns(db, "threads");
-    if (!columns.includes("model_provider") || !columns.includes("source")) {
+    if (!columns.includes("model_provider")) {
       return 0;
     }
-    const assignments = ["source = 'vscode'"];
+    const predicates = [];
+    const assignments = [];
+    if (columns.includes("source")) {
+      predicates.push(legacySourceNeedsVscodeSql("source"));
+      assignments.push(
+        "source = CASE " +
+          `WHEN ${legacySourceNeedsVscodeSql("source")} THEN 'vscode' ` +
+          "ELSE source END",
+      );
+    }
     if (columns.includes("thread_source")) {
+      predicates.push(legacyThreadSourceNeedsUserSql("thread_source"));
       assignments.push(
         "thread_source = CASE " +
-          "WHEN thread_source IS NULL OR thread_source = '' THEN 'user' " +
+          `WHEN ${legacyThreadSourceNeedsUserSql("thread_source")} THEN 'user' ` +
           "ELSE thread_source END",
       );
+    }
+    if (!assignments.length || !predicates.length) {
+      return 0;
     }
     addVisibleThreadAssignments(assignments, columns);
     const result = db
       .prepare(
         `UPDATE threads SET ${assignments.join(", ")} ` +
           "WHERE model_provider = ? " +
-          `AND LOWER(source) IN (${legacyThreadSourceSqlList()})`,
+          `AND (${predicates.join(" OR ")})`,
       )
       .run("openai");
     return Number(result.changes || 0);
@@ -1266,14 +1289,14 @@ function normalizeBackupReferencedThreadMetadata(DatabaseSync, dbPath) {
     if (mainColumns.includes("source")) {
       assignments.push(
         "source = CASE " +
-          "WHEN source IS NULL OR source = '' THEN 'vscode' " +
+          `WHEN ${legacySourceNeedsVscodeSql("source")} THEN 'vscode' ` +
           "ELSE source END",
       );
     }
     if (mainColumns.includes("thread_source")) {
       assignments.push(
         "thread_source = CASE " +
-          "WHEN thread_source IS NULL OR thread_source = '' THEN 'user' " +
+          `WHEN ${legacyThreadSourceNeedsUserSql("thread_source")} THEN 'user' ` +
           "ELSE thread_source END",
       );
     }
@@ -1332,10 +1355,10 @@ function visibilityIssuePredicate(columns, tableAlias) {
   const prefix = tableAlias ? `${tableAlias}.` : "";
   const predicates = [];
   if (columns.includes("source")) {
-    predicates.push(`(${prefix}source IS NULL OR ${prefix}source = '' OR LOWER(${prefix}source) IN (${legacyThreadSourceSqlList()}))`);
+    predicates.push(legacySourceNeedsVscodeSql(`${prefix}source`));
   }
   if (columns.includes("thread_source")) {
-    predicates.push(`(${prefix}thread_source IS NULL OR ${prefix}thread_source = '')`);
+    predicates.push(legacyThreadSourceNeedsUserSql(`${prefix}thread_source`));
   }
   if (columns.includes("archived")) {
     predicates.push(`${prefix}archived != 0`);
@@ -1348,6 +1371,14 @@ function visibilityIssuePredicate(columns, tableAlias) {
 
 function legacyThreadSourceSqlList() {
   return LEGACY_CODEX_BRIDGE_THREAD_SOURCES.map(sqlString).join(", ");
+}
+
+function legacyThreadSourceNeedsUserSql(columnExpr) {
+  return `(${columnExpr} IS NULL OR ${columnExpr} = '' OR LOWER(${columnExpr}) IN (${legacyThreadSourceSqlList()}))`;
+}
+
+function legacySourceNeedsVscodeSql(columnExpr) {
+  return `(${columnExpr} IS NULL OR ${columnExpr} = '' OR LOWER(${columnExpr}) IN (${legacyThreadSourceSqlList()}))`;
 }
 
 function hasThreadProviderColumn(db) {
