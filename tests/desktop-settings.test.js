@@ -890,6 +890,27 @@ test("syncCodexBridgeConversationProviders merges missing threads from history b
   assert.equal(threadTitle(dbPath, "thread_new_bridge"), "New Bridge thread");
 });
 
+test("syncCodexBridgeConversationProviders also merges missing threads from restore-era state backups", () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
+  const codexDir = path.join(homeDir, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  const dbPath = createCodexStateDb(codexDir, [
+    ["thread_old_history", "openai", "gpt-5.5", "Old history"],
+  ]);
+  createCodexStateDb(codexDir, [
+    ["thread_new_bridge", "codex-bridge", "gpt-5.4", "New Bridge thread"],
+  ], `${dbPath}.before-restore.2026-06-22-090000000.bak`);
+
+  const result = syncCodexBridgeConversationProviders({ homeDir });
+
+  assert.equal(result.totalImportedThreads, 1);
+  assert.equal(result.totalUpdatedThreads, 1);
+  assert.equal(threadCount(dbPath), 2);
+  assert.equal(providerCount(dbPath, "codex-bridge"), 0);
+  assert.equal(providerCount(dbPath, "openai"), 2);
+  assert.equal(threadTitle(dbPath, "thread_new_bridge"), "New Bridge thread");
+});
+
 function makeTempProject() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "codex-bridge-test-"));
 }

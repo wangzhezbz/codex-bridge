@@ -510,7 +510,7 @@ function appendHistorySyncLog(historySync) {
   }
   if (historySync.totalImportedThreads > 0) {
     appendLog(
-      `Merged Codex history: ${historySync.totalImportedThreads} missing conversation(s) restored from CodexBridge history backups.`,
+      `Merged Codex history: ${historySync.totalImportedThreads} missing conversation(s) restored from Codex state backups.`,
     );
   }
   if (historySync.totalUpdatedThreads > 0) {

@@ -601,7 +601,7 @@ export function syncCodexBridgeConversationProviders({ homeDir = os.homedir() } 
 }
 
 function countMissingThreadsFromHistoryBackups(DatabaseSync, dbPath) {
-  const backupPaths = codexStateHistoryBackupPaths(dbPath);
+  const backupPaths = codexStateMergeSourcePaths(dbPath);
   if (!backupPaths.length) {
     return 0;
   }
@@ -639,7 +639,7 @@ function countMissingThreadsFromHistoryBackups(DatabaseSync, dbPath) {
 }
 
 function importMissingThreadsFromHistoryBackups(DatabaseSync, dbPath) {
-  const backupPaths = codexStateHistoryBackupPaths(dbPath);
+  const backupPaths = codexStateMergeSourcePaths(dbPath);
   if (!backupPaths.length) {
     return 0;
   }
@@ -737,7 +737,7 @@ function copyRowsForImportedThreads(db, alias, tableName, threadColumns, threadI
     .run();
 }
 
-function codexStateHistoryBackupPaths(dbPath) {
+function codexStateMergeSourcePaths(dbPath) {
   const dir = path.dirname(dbPath);
   const baseName = path.basename(dbPath);
   if (!fs.existsSync(dir)) {
@@ -748,13 +748,29 @@ function codexStateHistoryBackupPaths(dbPath) {
     .filter((entry) => entry.isFile())
     .map((entry) => entry.name)
     .filter((name) => (
-      name.startsWith(`${baseName}.codexbridge-history.`) &&
+      name.startsWith(`${baseName}.`) &&
       name.endsWith(".bak") &&
       !name.endsWith(".bak-wal") &&
       !name.endsWith(".bak-shm")
     ))
     .sort()
-    .map((name) => path.join(dir, name));
+    .map((name) => path.join(dir, name))
+    .filter(isSQLiteDatabaseFile);
+}
+
+function isSQLiteDatabaseFile(filePath) {
+  try {
+    const handle = fs.openSync(filePath, "r");
+    try {
+      const header = Buffer.alloc(16);
+      const bytesRead = fs.readSync(handle, header, 0, header.length, 0);
+      return bytesRead === header.length && header.toString("utf8") === "SQLite format 3\0";
+    } finally {
+      fs.closeSync(handle);
+    }
+  } catch {
+    return false;
+  }
 }
 
 function hasTable(db, tableName) {
