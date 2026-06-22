@@ -91,7 +91,7 @@ export function chatToolCallFromResponseItem(item, context) {
     type: "function",
     function: {
       name: chatName,
-      arguments: stringifyJson(item.arguments || "{}"),
+      arguments: stringifyJson(item.arguments ?? item.action ?? item.input ?? "{}"),
     },
   };
 }
@@ -105,22 +105,30 @@ export function chatMessageFromToolOutput(item) {
 }
 
 export function isResponseToolCallItem(item) {
-  return (
-    item &&
-    ["function_call", "custom_tool_call", "tool_search_call"].includes(item.type)
-  );
+  if (!item || typeof item !== "object") {
+    return false;
+  }
+  if (["function_call", "custom_tool_call", "tool_search_call"].includes(item.type)) {
+    return true;
+  }
+  return typeof item.type === "string" && item.type.endsWith("_call");
 }
 
 export function isResponseToolOutputItem(item) {
-  return (
-    item &&
+  if (!item || typeof item !== "object") {
+    return false;
+  }
+  if (
     [
       "function_call_output",
       "custom_tool_call_output",
       "tool_search_call_output",
       "tool_result",
     ].includes(item.type)
-  );
+  ) {
+    return true;
+  }
+  return typeof item.type === "string" && item.type.endsWith("_call_output");
 }
 
 function appendResponseTool(context, tool, namespace = "") {

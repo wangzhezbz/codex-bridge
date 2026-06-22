@@ -679,7 +679,12 @@ function normalizeToolCallPairs(messages) {
       continue;
     }
 
-    if (message?.role !== "tool") {
+    if (message?.role === "tool") {
+      const orphanToolOutput = orphanToolOutputMessage(message);
+      if (orphanToolOutput) {
+        normalized.push(orphanToolOutput);
+      }
+    } else {
       normalized.push(message);
     }
     index += 1;
@@ -702,6 +707,18 @@ function assistantTextOnlyMessage(message) {
   }
   const { tool_calls, ...textOnly } = message;
   return textOnly;
+}
+
+function orphanToolOutputMessage(message) {
+  const content = contentToText(message?.content);
+  if (!content) {
+    return null;
+  }
+  const id = message?.tool_call_id ? ` ${message.tool_call_id}` : "";
+  return {
+    role: "user",
+    content: `[Tool output${id} without its matching assistant tool call]\n${content}`,
+  };
 }
 
 function messageHasContent(message) {

@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { responseToolCallFromChat } from "./tools.js";
+import {
+  chatToolCallFromResponseItem,
+  isResponseToolCallItem,
+  responseToolCallFromChat,
+} from "./tools.js";
 
 export function chatResponseToResponse(chat, requestedModel, toolContext, options = {}) {
   const choice = chat?.choices?.[0] || {};
@@ -55,11 +59,21 @@ export function assistantHistoryMessageFromChat(chat) {
   return history;
 }
 
-export function assistantHistoryMessageFromResponse(response) {
-  return {
+export function assistantHistoryMessageFromResponse(response, toolContext) {
+  const history = {
     role: "assistant",
     content: responseHistoryText(response) || null,
   };
+  const toolCalls = [];
+  for (const item of response?.output || []) {
+    if (isResponseToolCallItem(item)) {
+      toolCalls.push(chatToolCallFromResponseItem(item, toolContext));
+    }
+  }
+  if (toolCalls.length > 0) {
+    history.tool_calls = toolCalls;
+  }
+  return history;
 }
 
 export function responseToSse(response) {

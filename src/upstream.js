@@ -99,7 +99,7 @@ export async function proxyResponsesApi(
   }
   const payload = cloneJson(requestBody);
   payload.model = route.model;
-  const { messages: sourceMessages } = responseRequestToChatSourceMessages(
+  const { messages: sourceMessages, toolContext } = responseRequestToChatSourceMessages(
     requestBody,
     route,
     history,
@@ -143,7 +143,7 @@ export async function proxyResponsesApi(
   responseTail += decoder.decode();
   res.end();
   const completedResponse = extractResponsesObject(responseTail);
-  recordResponsesHistory(history, completedResponse, sourceMessages);
+  recordResponsesHistory(history, completedResponse, sourceMessages, toolContext);
   logUsage(
     context,
     route,
@@ -155,8 +155,21 @@ function shouldInlineLocalHistoryForResponses(requestBody, history) {
   if (!requestBody?.previous_response_id || !history?.getResponseMeta) {
     return false;
   }
-  const meta = history.getResponseMeta(requestBody.previous_response_id);
-  return Boolean(meta && meta.upstreamKnown === false);
+  const previousResponseId = requestBody.previous_response_id;
+  const meta = history.getResponseMeta(previousResponseId);
+  if (meta) {
+    return meta.upstreamKnown === false;
+  }
+  const localHistory = history.get?.(previousResponseId);
+  return (
+    isLikelyLocalChatResponseId(previousResponseId) &&
+    Array.isArray(localHistory) &&
+    localHistory.length > 0
+  );
+}
+
+function isLikelyLocalChatResponseId(responseId) {
+  return /^resp_chatcmpl[_-]/.test(String(responseId || ""));
 }
 
 function inlineLocalHistoryForResponsesPayload(payload, sourceMessages) {
@@ -717,13 +730,13 @@ function normalizeResponsesObject(value) {
   return null;
 }
 
-function recordResponsesHistory(history, response, sourceMessages) {
+function recordResponsesHistory(history, response, sourceMessages, toolContext) {
   if (!history || !isResponsesObject(response)) {
     return;
   }
   history.record(response.id, [
     ...sourceMessages,
-    assistantHistoryMessageFromResponse(response),
+    assistantHistoryMessageFromResponse(response, toolContext),
   ]);
   history.recordResponse(response, {
     api: "responses",

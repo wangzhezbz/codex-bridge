@@ -555,6 +555,39 @@ test("previous_response_id restores assistant tool calls before tool output", ()
   assert.equal(second.body.messages.at(-1).tool_call_id, "call_shell");
 });
 
+test("chat conversion keeps orphan tool output visible as user text", () => {
+  const converted = responsesToChatRequest(
+    {
+      model: "deepseek-v4-pro",
+      input: [
+        {
+          type: "function_call_output",
+          call_id: "call_missing",
+          output: "tool result that must not disappear",
+        },
+      ],
+      tools: [
+        {
+          type: "function",
+          name: "shell_command",
+          description: "Run command",
+          parameters: {
+            type: "object",
+            properties: { command: { type: "string" } },
+          },
+        },
+      ],
+    },
+    route,
+    new ResponseHistory(),
+  );
+
+  assert.equal(converted.body.messages.length, 1);
+  assert.equal(converted.body.messages[0].role, "user");
+  assert.match(converted.body.messages[0].content, /call_missing/);
+  assert.match(converted.body.messages[0].content, /tool result that must not disappear/);
+});
+
 test("chat conversion drops stale assistant tool calls without tool outputs", () => {
   const history = new ResponseHistory();
   history.record("resp_stale_tool", [
@@ -699,6 +732,50 @@ test("non-function Codex tools with schemas are exposed to chat providers", () =
 
   assert.equal(converted.body.tools.length, 1);
   assert.equal(converted.body.tools[0].function.name, "computer_screenshot");
+});
+
+test("computer call items are kept as paired chat tool calls", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: [
+        {
+          type: "computer_call",
+          call_id: "call_screen",
+          name: "computer_screenshot",
+          arguments: { display_id: "main" },
+        },
+        {
+          type: "computer_call_output",
+          call_id: "call_screen",
+          output: { text: "screenshot captured" },
+        },
+      ],
+      tools: [
+        {
+          type: "computer_use",
+          name: "computer_screenshot",
+          description: "Capture the screen.",
+          parameters: {
+            type: "object",
+            properties: {
+              display_id: { type: "string" },
+            },
+          },
+        },
+      ],
+    },
+    route,
+    new ResponseHistory(),
+  );
+
+  assert.equal(converted.body.messages.at(-2).role, "assistant");
+  assert.equal(
+    converted.body.messages.at(-2).tool_calls[0].function.name,
+    "computer_screenshot",
+  );
+  assert.equal(converted.body.messages.at(-1).role, "tool");
+  assert.equal(converted.body.messages.at(-1).tool_call_id, "call_screen");
+  assert.match(converted.body.messages.at(-1).content, /screenshot captured/);
 });
 
 test("chat conversion deduplicates exact tool names while keeping namespaced tools", () => {
