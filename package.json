@@ -8,7 +8,7 @@
   "description": "Local multi-model gateway and desktop manager for Codex.",
   "author": "CodexBridge contributors",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.15.0"
   },
   "scripts": {
     "desktop": "electron desktop/main.cjs",

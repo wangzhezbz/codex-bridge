@@ -16,12 +16,12 @@ Mac users:
 ## Requirements / 环境要求
 
 - Windows 10/11
-- Node.js 20 or newer
+- Node.js 22.15.0 or newer
 - Codex Desktop
 - API keys for the providers you want to use
 
 - Windows 10/11
-- Node.js 20 或更高版本
+- Node.js 22.15.0 或更高版本
 - Codex Desktop
 - 你想使用的 provider API Key
 

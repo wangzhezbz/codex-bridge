@@ -172,7 +172,11 @@ Starting Router from the desktop app also refreshes the Codex config and model c
 
 For development, you can also run:
 
+Source development requires Node.js 22.15.0 or newer because Codex Desktop may send zstd-compressed request bodies.
+
 开发时也可以运行：
+
+源码开发需要 Node.js 22.15.0 或更高版本，因为 Codex Desktop 可能发送 zstd 压缩请求体。
 
 ```powershell
 npm install

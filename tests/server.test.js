@@ -1115,137 +1115,115 @@ test("upstream HTTP errors include route and upstream message for diagnosis", as
   }
 });
 
-test("server accepts gzip encoded JSON request bodies from Codex", async () => {
-  const upstream = http.createServer(async (req, res) => {
-    assert.equal(req.url, "/v1/chat/completions");
+const codexRequestBodyEncodingCases = [
+  {
+    name: "plain",
+    contentEncoding: "",
+    encode: (text) => Buffer.from(text),
+  },
+  {
+    name: "gzip",
+    contentEncoding: "gzip",
+    encode: (text) => zlib.gzipSync(text),
+  },
+  {
+    name: "x-gzip",
+    contentEncoding: "x-gzip",
+    encode: (text) => zlib.gzipSync(text),
+  },
+  {
+    name: "deflate",
+    contentEncoding: "deflate",
+    encode: (text) => zlib.deflateSync(text),
+  },
+  {
+    name: "brotli",
+    contentEncoding: "br",
+    encode: (text) => zlib.brotliCompressSync(text),
+  },
+  {
+    name: "zstd",
+    contentEncoding: "zstd",
+    encode: (text) => zlib.zstdCompressSync(text),
+  },
+  {
+    name: "chained gzip and zstd",
+    contentEncoding: "gzip, zstd",
+    encode: (text) => zlib.zstdCompressSync(zlib.gzipSync(text)),
+  },
+];
 
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(
-      JSON.stringify({
-        id: "chatcmpl_gzip",
-        object: "chat.completion",
-        choices: [
-          {
-            message: {
-              role: "assistant",
-              content: "decoded gzip body",
-            },
-          },
-        ],
-      }),
-    );
-  });
+for (const encodingCase of codexRequestBodyEncodingCases) {
+  test(`server accepts ${encodingCase.name} encoded JSON request bodies from Codex`, async () => {
+    const upstream = http.createServer(async (req, res) => {
+      assert.equal(req.url, "/v1/chat/completions");
 
-  await listen(upstream);
-  const upstreamUrl = serverUrl(upstream);
-
-  const router = createRouterServer({
-    host: "127.0.0.1",
-    port: 0,
-    authToken: "router-token",
-    defaultModel: "gpt-5.4-mini",
-    models: [
-      {
-        id: "gpt-5.4-mini",
-        displayName: "DeepSeek V4 Pro",
-        api: "chat_completions",
-        baseUrl: `${upstreamUrl}/v1`,
-        model: "deepseek-v4-pro",
-        apiKey: "upstream-key",
-      },
-    ],
-  });
-
-  await listen(router);
-  const baseUrl = serverUrl(router);
-
-  try {
-    const response = await fetchJson(`${baseUrl}/v1/responses`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "content-encoding": "gzip",
-        authorization: "Bearer router-token",
-      },
-      body: zlib.gzipSync(
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
         JSON.stringify({
-          model: "gpt-5.4-mini",
-          input: "hello",
-        }),
-      ),
-    });
-    assert.equal(response.output_text, "decoded gzip body");
-  } finally {
-    await close(router);
-    await close(upstream);
-  }
-});
-
-test("server accepts zstd encoded JSON request bodies from Codex", async () => {
-  const upstream = http.createServer(async (req, res) => {
-    assert.equal(req.url, "/v1/chat/completions");
-
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(
-      JSON.stringify({
-        id: "chatcmpl_zstd",
-        object: "chat.completion",
-        choices: [
-          {
-            message: {
-              role: "assistant",
-              content: "decoded zstd body",
+          id: `chatcmpl_${encodingCase.name.replaceAll(" ", "_")}`,
+          object: "chat.completion",
+          choices: [
+            {
+              message: {
+                role: "assistant",
+                content: `decoded ${encodingCase.name} body`,
+              },
             },
-          },
-        ],
-      }),
-    );
-  });
-
-  await listen(upstream);
-  const upstreamUrl = serverUrl(upstream);
-
-  const router = createRouterServer({
-    host: "127.0.0.1",
-    port: 0,
-    authToken: "router-token",
-    defaultModel: "gpt-5.4-mini",
-    models: [
-      {
-        id: "gpt-5.4-mini",
-        displayName: "DeepSeek V4 Pro",
-        api: "chat_completions",
-        baseUrl: `${upstreamUrl}/v1`,
-        model: "deepseek-v4-pro",
-        apiKey: "upstream-key",
-      },
-    ],
-  });
-
-  await listen(router);
-  const baseUrl = serverUrl(router);
-
-  try {
-    const response = await fetchJson(`${baseUrl}/v1/responses`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "content-encoding": "zstd",
-        authorization: "Bearer router-token",
-      },
-      body: zlib.zstdCompressSync(
-        JSON.stringify({
-          model: "gpt-5.4-mini",
-          input: "hello",
+          ],
         }),
-      ),
+      );
     });
-    assert.equal(response.output_text, "decoded zstd body");
-  } finally {
-    await close(router);
-    await close(upstream);
-  }
-});
+
+    await listen(upstream);
+    const upstreamUrl = serverUrl(upstream);
+
+    const router = createRouterServer({
+      host: "127.0.0.1",
+      port: 0,
+      authToken: "router-token",
+      defaultModel: "gpt-5.4-mini",
+      models: [
+        {
+          id: "gpt-5.4-mini",
+          displayName: "DeepSeek V4 Pro",
+          api: "chat_completions",
+          baseUrl: `${upstreamUrl}/v1`,
+          model: "deepseek-v4-pro",
+          apiKey: "upstream-key",
+        },
+      ],
+    });
+
+    await listen(router);
+    const baseUrl = serverUrl(router);
+
+    try {
+      const headers = {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      };
+      if (encodingCase.contentEncoding) {
+        headers["content-encoding"] = encodingCase.contentEncoding;
+      }
+
+      const response = await fetchJson(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers,
+        body: encodingCase.encode(
+          JSON.stringify({
+            model: "gpt-5.4-mini",
+            input: "hello",
+          }),
+        ),
+      });
+      assert.equal(response.output_text, `decoded ${encodingCase.name} body`);
+    } finally {
+      await close(router);
+      await close(upstream);
+    }
+  });
+}
 
 function listen(server) {
   return new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
