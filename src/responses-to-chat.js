@@ -15,10 +15,12 @@ const OVERSIZED_IMAGE_PLACEHOLDER =
   "[image input omitted because it is too large for this chat provider]";
 const MCP_TOOL_GUIDANCE =
   "CodexBridge tool guidance: MCP namespace tools are exposed as flattened function names. " +
-  "If a Codex skill mentions the Node REPL js tool, call mcp__node_repl__js directly; " +
+  "If a Codex skill mentions the Node REPL js tool, call mcp__node_repl__js directly and run the plugin bootstrap through that tool; " +
   "empty MCP resource/resource-template lists do not mean the tool is unavailable. " +
-  "For Chrome, Browser, and Computer Use tasks, use the official Node REPL or computer tools when present. " +
-  "Do not substitute shell commands such as Start-Process unless the user explicitly asks for a manual fallback.";
+  "For Chrome, Browser, and Computer Use tasks, the official Chrome/Computer Use plugin path is the Node REPL bootstrap path. " +
+  "For Chrome, follow the skill path that imports scripts/browser-client.mjs through mcp__node_repl__js. " +
+  "For Computer Use, follow the skill path that imports scripts/computer-use-client.mjs through mcp__node_repl__js; do not import @oai/sky directly. " +
+  "Do not claim Node REPL is unavailable while mcp__node_repl__js is listed, and do not use shell or PowerShell fallbacks unless that tool is absent or the user explicitly asks for a manual fallback.";
 const COMMAND_TOOL_GUIDANCE =
   "CodexBridge command guidance: when the user explicitly asks you to run tests, commit, push, or publish " +
   "and a command or shell tool is available, call that tool and report the exact command output. " +
@@ -41,7 +43,7 @@ export function responsesToChatRequest(request, route, history) {
 
   if (toolContext.chatTools.length > 0) {
     body.tools = toolContext.chatTools;
-    const toolChoice = chatToolChoice(request.tool_choice, toolContext);
+    const toolChoice = chatToolChoice(request.tool_choice, toolContext, request);
     if (toolChoice) {
       body.tool_choice = toolChoice;
     }
@@ -463,9 +465,9 @@ function normalizeRole(role) {
   return null;
 }
 
-function chatToolChoice(toolChoice, toolContext) {
+function chatToolChoice(toolChoice, toolContext, request = {}) {
   if (!toolChoice) {
-    return "auto";
+    return preferredToolChoiceForRequest(toolContext, request) || "auto";
   }
   if (typeof toolChoice === "string") {
     return toolChoice;
@@ -480,6 +482,33 @@ function chatToolChoice(toolChoice, toolContext) {
   );
   const chatName = toolContext.responseNameToChatName.get(responseName) || responseName;
   return { type: "function", function: { name: chatName } };
+}
+
+function preferredToolChoiceForRequest(toolContext, request = {}) {
+  if (!requestMentionsInteractivePluginWork(request)) {
+    return null;
+  }
+  const nodeReplChatName = chatNameForTool(toolContext, "mcp__node_repl__js");
+  if (!nodeReplChatName) {
+    return null;
+  }
+  return { type: "function", function: { name: nodeReplChatName } };
+}
+
+function chatNameForTool(toolContext, responseName) {
+  const mapped = toolContext.responseNameToChatName.get(responseName);
+  if (mapped) {
+    return mapped;
+  }
+  const hasExactTool = toolContext.chatTools.some(
+    (tool) => tool?.function?.name === responseName,
+  );
+  return hasExactTool ? responseName : "";
+}
+
+function requestMentionsInteractivePluginWork(request = {}) {
+  const text = `${request.instructions || ""}\n${requestInputText(request.input ?? request.messages)}`;
+  return /@?chrome|browser|浏览器|谷歌浏览器|谷歌|youtube|网页|computer\s*use|电脑操控|控制电脑|电脑|桌面|窗口|打开\s*(?:notepad|记事本|画图|mspaint|chrome|youtube)|打开.*(?:应用|软件|浏览器|网页|网站)/i.test(text);
 }
 
 function shouldDrop(route, param) {

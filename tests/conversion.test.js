@@ -912,7 +912,156 @@ test("chat providers get guidance for flattened MCP tools", () => {
 
   assert.equal(converted.body.messages[0].role, "system");
   assert.match(converted.body.messages[0].content, /mcp__node_repl__js/);
-  assert.match(converted.body.messages[0].content, /Start-Process/);
+  assert.match(converted.body.messages[0].content, /bootstrap/);
+  assert.match(converted.body.messages[0].content, /official Chrome\/Computer Use plugin path/);
+  assert.match(converted.body.messages[0].content, /browser-client\.mjs/);
+  assert.match(converted.body.messages[0].content, /computer-use-client\.mjs/);
+  assert.match(converted.body.messages[0].content, /do not import @oai\/sky directly/);
+  assert.doesNotMatch(converted.body.messages[0].content, /Start-Process/);
+});
+
+test("chrome and computer-use requests force the Node REPL bootstrap tool when available", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "Chrome 打开 youtube",
+      tools: [
+        {
+          type: "namespace",
+          name: "mcp__node_repl__",
+          tools: [
+            {
+              type: "function",
+              name: "js",
+              description: "Run JavaScript.",
+              parameters: {
+                type: "object",
+                properties: {
+                  code: { type: "string" },
+                },
+                required: ["code"],
+              },
+            },
+          ],
+        },
+        {
+          type: "function",
+          name: "shell_command",
+          description: "Run shell.",
+          parameters: { type: "object", properties: {} },
+        },
+      ],
+    },
+    route,
+    new ResponseHistory(),
+  );
+
+  assert.deepEqual(converted.body.tool_choice, {
+    type: "function",
+    function: { name: "mcp__node_repl__js" },
+  });
+});
+
+test("interactive plugin requests stay auto when Node REPL is not available", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "Chrome 打开 youtube",
+      tools: [
+        {
+          type: "function",
+          name: "shell_command",
+          description: "Run shell.",
+          parameters: { type: "object", properties: {} },
+        },
+      ],
+    },
+    route,
+    new ResponseHistory(),
+  );
+
+  assert.equal(converted.body.tool_choice, "auto");
+});
+
+test("git push tasks are not forced through Node REPL", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "push this commit to GitHub",
+      tools: [
+        {
+          type: "namespace",
+          name: "mcp__node_repl__",
+          tools: [
+            {
+              type: "function",
+              name: "js",
+              description: "Run JavaScript.",
+              parameters: {
+                type: "object",
+                properties: {
+                  code: { type: "string" },
+                },
+                required: ["code"],
+              },
+            },
+          ],
+        },
+        {
+          type: "function",
+          name: "shell_command",
+          description: "Run shell.",
+          parameters: { type: "object", properties: {} },
+        },
+      ],
+    },
+    route,
+    new ResponseHistory(),
+  );
+
+  assert.equal(converted.body.tool_choice, "auto");
+});
+
+test("explicit tool choice is not replaced by the Node REPL preference", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "Chrome 打开 youtube",
+      tool_choice: {
+        type: "function",
+        name: "shell_command",
+      },
+      tools: [
+        {
+          type: "namespace",
+          name: "mcp__node_repl__",
+          tools: [
+            {
+              type: "function",
+              name: "js",
+              description: "Run JavaScript.",
+              parameters: {
+                type: "object",
+                properties: {
+                  code: { type: "string" },
+                },
+                required: ["code"],
+              },
+            },
+          ],
+        },
+        {
+          type: "function",
+          name: "shell_command",
+          description: "Run shell.",
+          parameters: { type: "object", properties: {} },
+        },
+      ],
+    },
+    route,
+    new ResponseHistory(),
+  );
+
+  assert.deepEqual(converted.body.tool_choice, {
+    type: "function",
+    function: { name: "shell_command" },
+  });
 });
 
 test("chat providers get command guidance for explicit git push tasks", () => {
