@@ -21,7 +21,9 @@ import {
   restoreCodexConfig,
   routerConfigDiagnostics,
   routerRuntimeEnv,
+  readModelImageGenerationOverrides,
   saveModelImageInputOverride,
+  saveModelImageGenerationOverride,
   saveCustomModel,
   saveDesktopOptions,
   saveSelection,
@@ -540,6 +542,41 @@ test("preset image upload support can be overridden per model", () => {
   saveModelImageInputOverride(rootDir, "deepseek-v4-pro", false);
   const disabledConfig = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
   assert.deepEqual(disabledConfig.models[0].inputModalities, ["text"]);
+});
+
+test("image generation provider can be configured per model", () => {
+  const rootDir = makeTempProject();
+  saveSelection(rootDir, ["codex-gpt-5-5", "deepseek-v4-pro"]);
+
+  const defaultConfig = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
+  assert.equal(defaultConfig.models[0].imageGeneration.mode, "official");
+  assert.equal(defaultConfig.models[0].imageGeneration.apiKeyEnv, "OPENAI_API_KEY");
+  assert.equal(defaultConfig.models[1].imageGeneration.mode, "official");
+
+  saveModelImageGenerationOverride(rootDir, "deepseek-v4-pro", {
+    mode: "custom",
+    displayName: "My Image API",
+    baseUrl: "https://images.example.com/v1",
+    endpoint: "/images/generations",
+    model: "image-model-v1",
+    size: "768x768",
+    apiKeyEnv: "MY_IMAGE_API_KEY",
+  });
+
+  const overrides = readModelImageGenerationOverrides(rootDir);
+  assert.equal(overrides["deepseek-v4-pro"].mode, "custom");
+
+  const customConfig = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
+  assert.deepEqual(customConfig.models[1].imageGeneration, {
+    enabled: true,
+    mode: "custom",
+    displayName: "My Image API",
+    baseUrl: "https://images.example.com/v1",
+    endpoint: "/images/generations",
+    model: "image-model-v1",
+    size: "768x768",
+    apiKeyEnv: "MY_IMAGE_API_KEY",
+  });
 });
 
 test("legacy false image overrides do not disable built-in vision presets", () => {

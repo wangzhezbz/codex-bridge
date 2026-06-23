@@ -93,6 +93,10 @@ export function modelCapabilitiesPath(rootDir) {
   return path.join(rootDir, "config", "model-capabilities.json");
 }
 
+export function modelImageGenerationPath(rootDir) {
+  return path.join(rootDir, "config", "model-image-generation.json");
+}
+
 export function desktopOptionsPath(rootDir) {
   return path.join(rootDir, "config", "desktop-options.json");
 }
@@ -177,24 +181,33 @@ export function saveDesktopOptions(rootDir, options = {}) {
 export function secretStatus(rootDir) {
   const secrets = loadSecrets(rootDir);
   const status = {};
-  for (const provider of providerCatalog(rootDir)) {
-    if (provider.keyEnv) {
-      status[provider.keyEnv] = Boolean(secrets[provider.keyEnv]);
-    }
+  for (const keyEnv of knownSecretKeyEnvs(rootDir)) {
+    status[keyEnv] = Boolean(secrets[keyEnv]);
   }
   return status;
 }
 
 export function secretValue(rootDir, keyEnv) {
-  const allowed = new Set(
-    providerCatalog(rootDir)
-      .map((provider) => provider.keyEnv)
-      .filter(Boolean),
-  );
+  const allowed = knownSecretKeyEnvs(rootDir);
   if (!allowed.has(keyEnv)) {
     throw new Error(`Unknown API key env: ${keyEnv}`);
   }
   return loadSecrets(rootDir)[keyEnv] || "";
+}
+
+function knownSecretKeyEnvs(rootDir) {
+  const keys = new Set(
+    providerCatalog(rootDir)
+      .map((provider) => provider.keyEnv)
+      .filter(Boolean),
+  );
+  keys.add("OPENAI_API_KEY");
+  for (const settings of Object.values(readModelImageGenerationOverrides(rootDir))) {
+    if (settings?.apiKeyEnv) {
+      keys.add(settings.apiKeyEnv);
+    }
+  }
+  return keys;
 }
 
 export function envWithSecrets(rootDir, baseEnv = process.env) {
@@ -654,6 +667,45 @@ export function saveModelImageInputOverride(rootDir, presetId, enabled) {
   return { presetId: id, imageInput: overrides[id] };
 }
 
+export function readModelImageGenerationOverrides(rootDir) {
+  const saved = readJsonIfExists(modelImageGenerationPath(rootDir), {});
+  const source = saved?.imageGeneration && typeof saved.imageGeneration === "object"
+    ? saved.imageGeneration
+    : saved;
+  if (!source || typeof source !== "object" || Array.isArray(source)) {
+    return {};
+  }
+  const overrides = {};
+  for (const [presetId, value] of Object.entries(source)) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      continue;
+    }
+    try {
+      overrides[presetId] = normalizeImageGenerationSettings(value);
+    } catch {
+      // Ignore invalid legacy entries instead of blocking the app startup.
+    }
+  }
+  return overrides;
+}
+
+export function saveModelImageGenerationOverride(rootDir, presetId, settings) {
+  const id = String(presetId || "").trim();
+  if (!id) {
+    throw new Error("Model id is required.");
+  }
+  const overrides = readModelImageGenerationOverrides(rootDir);
+  overrides[id] = normalizeImageGenerationSettings(settings);
+  const target = modelImageGenerationPath(rootDir);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(
+    target,
+    `${JSON.stringify({ version: 1, imageGeneration: overrides }, null, 2)}\n`,
+    "utf8",
+  );
+  return { presetId: id, imageGeneration: overrides[id] };
+}
+
 export function saveCustomModel(rootDir, input) {
   const existingModels = readCustomModels(rootDir);
   const existing = input?.presetId
@@ -715,8 +767,9 @@ export function buildRouterConfigFromSelection(rootDir, mode = MODE_HYBRID) {
     throw new Error("全部 API 模式不能选择“GPT 订阅”模型，请改选 API 模型或切换到混合模式。");
   }
 
+  const imageGenerationOverrides = readModelImageGenerationOverrides(rootDir);
   const routes = selected.map((model, index) =>
-    routeForSelectedModel(model, CODEX_MODEL_SLOTS[index], index),
+    routeForSelectedModel(model, CODEX_MODEL_SLOTS[index], index, imageGenerationOverrides),
   );
 
   return {
@@ -1899,7 +1952,7 @@ function builtInVisionPresetIds() {
   );
 }
 
-function routeForSelectedModel(model, slot, priority) {
+function routeForSelectedModel(model, slot, priority, imageGenerationOverrides = {}) {
   const provider = providerById(model.providerId);
   const route = {
     id: slot.id,
@@ -1914,6 +1967,7 @@ function routeForSelectedModel(model, slot, priority) {
     authMode: model.authMode || provider?.authMode || "api_key",
     contextWindow: model.contextWindow || 258400,
     priority,
+    imageGeneration: imageGenerationForModel(model, imageGenerationOverrides[model.presetId]),
   };
   if (route.authMode === "api_key") {
     route.apiKeyEnv = model.apiKeyEnv || model.keyEnv || provider?.keyEnv;
@@ -1936,6 +1990,59 @@ function routeForSelectedModel(model, slot, priority) {
     route.inputModalities = normalizeInputModalities(model.inputModalities);
   }
   return route;
+}
+
+function imageGenerationForModel(_model, override) {
+  return normalizeImageGenerationSettings(override || { mode: "official" });
+}
+
+function normalizeImageGenerationSettings(input = {}) {
+  const mode = String(input.mode || "official").trim().toLowerCase();
+  if (input.enabled === false || mode === "off" || mode === "disabled") {
+    return {
+      enabled: false,
+      mode: "off",
+      displayName: String(input.displayName || "Image Generation Disabled").trim(),
+      baseUrl: "",
+      endpoint: "/images/generations",
+      model: "",
+      size: String(input.size || "1024x1024").trim(),
+      apiKeyEnv: "",
+    };
+  }
+  if (mode === "custom") {
+    const baseUrl = String(input.baseUrl || "").trim().replace(/\/+$/, "");
+    const model = String(input.model || "").trim();
+    const apiKeyEnv = String(input.apiKeyEnv || "IMAGE_GENERATION_API_KEY").trim();
+    if (!baseUrl || !model || !apiKeyEnv) {
+      throw new Error("Custom image generation requires Base URL, model, and API key env.");
+    }
+    return {
+      enabled: true,
+      mode: "custom",
+      displayName: String(input.displayName || "Custom Image Generation").trim(),
+      baseUrl,
+      endpoint: normalizeEndpoint(input.endpoint || "/images/generations"),
+      model,
+      size: String(input.size || "1024x1024").trim(),
+      apiKeyEnv,
+    };
+  }
+  return {
+    enabled: true,
+    mode: "official",
+    displayName: "OpenAI Image Generation",
+    baseUrl: "https://api.openai.com/v1",
+    endpoint: "/images/generations",
+    model: "gpt-image-1",
+    size: "1024x1024",
+    apiKeyEnv: "OPENAI_API_KEY",
+  };
+}
+
+function normalizeEndpoint(value) {
+  const endpoint = String(value || "/images/generations").trim();
+  return endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
 }
 
 function normalizeCustomModel(input = {}) {

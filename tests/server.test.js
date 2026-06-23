@@ -7,6 +7,7 @@ import path from "node:path";
 import zlib from "node:zlib";
 import { loadConfig } from "../src/config.js";
 import { ResponseHistory } from "../src/history.js";
+import { shouldUseImageGenerationFallback } from "../src/image-generation.js";
 import { createRouterServer } from "../src/server.js";
 import { proxyResponsesApi } from "../src/upstream.js";
 
@@ -97,6 +98,307 @@ test("server exposes health, models, catalog, and converted responses", async ()
     await close(router);
     await close(upstream);
   }
+});
+
+test("chat routes use OpenAI image fallback for explicit image generation prompts", async () => {
+  const previousEnv = snapshotEnv([
+    "OPENAI_API_KEY",
+    "CODEXBRIDGE_IMAGE_BASE_URL",
+    "CODEXBRIDGE_IMAGE_MODEL",
+    "CODEXBRIDGE_IMAGE_SIZE",
+  ]);
+  let imagePayload = null;
+  const imageUpstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/images/generations");
+    assert.equal(req.headers.authorization, "Bearer image-key");
+
+    const chunks = [];
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+    imagePayload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        created: 1,
+        data: [
+          {
+            b64_json: "base64-png-data",
+            revised_prompt: "a small bridge between model nodes",
+          },
+        ],
+        usage: {
+          input_tokens: 12,
+          output_tokens: 0,
+          total_tokens: 12,
+        },
+      }),
+    );
+  });
+
+  await listen(imageUpstream);
+  process.env.OPENAI_API_KEY = "image-key";
+  process.env.CODEXBRIDGE_IMAGE_BASE_URL = `${serverUrl(imageUpstream)}/v1`;
+  process.env.CODEXBRIDGE_IMAGE_MODEL = "gpt-image-test";
+  process.env.CODEXBRIDGE_IMAGE_SIZE = "512x512";
+
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "kimi-k2-7-code",
+    models: [
+      {
+        id: "kimi-k2-7-code",
+        displayName: "Kimi K2.7 Code",
+        api: "chat_completions",
+        baseUrl: "http://127.0.0.1:1/v1",
+        model: "kimi-k2.7-code",
+        apiKey: "kimi-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const baseUrl = serverUrl(router);
+
+  try {
+    const response = await fetchJson(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "kimi-k2-7-code",
+        input: "请调用 image gen 帮我生成一张图片，一座桥连接多个模型节点",
+      }),
+    });
+
+    assert.equal(imagePayload.model, "gpt-image-test");
+    assert.equal(imagePayload.size, "512x512");
+    assert.match(imagePayload.prompt, /一座桥/);
+    assert.equal(response.object, "response");
+    assert.equal(response.codexbridge_image_generation.upstream_model, "gpt-image-test");
+    assert.equal(
+      response.output.find((item) => item.type === "image_generation_call")?.result,
+      "base64-png-data",
+    );
+    assert.equal(response.usage.total_tokens, 12);
+  } finally {
+    restoreEnv(previousEnv);
+    await close(router);
+    await close(imageUpstream);
+  }
+});
+
+test("chat routes can use a per-route custom image generation provider", async () => {
+  const previousEnv = snapshotEnv(["OPENAI_API_KEY", "CUSTOM_IMAGE_API_KEY"]);
+  delete process.env.OPENAI_API_KEY;
+  process.env.CUSTOM_IMAGE_API_KEY = "custom-image-key";
+
+  let imagePayload = null;
+  const imageUpstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/compatible/images/generations");
+    assert.equal(req.headers.authorization, "Bearer custom-image-key");
+
+    const chunks = [];
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+    imagePayload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        data: [{ url: "https://images.example/custom.png" }],
+        usage: { prompt_tokens: 9, completion_tokens: 0, total_tokens: 9 },
+      }),
+    );
+  });
+
+  await listen(imageUpstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        api: "chat_completions",
+        baseUrl: "http://127.0.0.1:1/v1",
+        model: "deepseek-v4-pro",
+        apiKey: "deepseek-key",
+        imageGeneration: {
+          enabled: true,
+          mode: "custom",
+          displayName: "Custom Image API",
+          baseUrl: `${serverUrl(imageUpstream)}/compatible`,
+          endpoint: "/images/generations",
+          model: "custom-image-v1",
+          size: "768x768",
+          apiKeyEnv: "CUSTOM_IMAGE_API_KEY",
+        },
+      },
+    ],
+  });
+
+  await listen(router);
+  const baseUrl = serverUrl(router);
+
+  try {
+    const response = await fetchJson(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        input: "generate an image of a small app icon",
+      }),
+    });
+
+    assert.equal(imagePayload.model, "custom-image-v1");
+    assert.equal(imagePayload.size, "768x768");
+    assert.match(imagePayload.prompt, /small app icon/);
+    assert.equal(response.codexbridge_image_generation.provider, "Custom Image API");
+    assert.equal(response.codexbridge_image_generation.upstream_model, "custom-image-v1");
+    assert.equal(response.usage.total_tokens, 9);
+  } finally {
+    restoreEnv(previousEnv);
+    await close(router);
+    await close(imageUpstream);
+  }
+});
+
+test("responses routes can override native image generation with a custom provider", async () => {
+  const previousEnv = snapshotEnv(["CUSTOM_IMAGE_API_KEY"]);
+  process.env.CUSTOM_IMAGE_API_KEY = "custom-image-key";
+
+  let imagePayload = null;
+  const imageUpstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/custom/images/generations");
+    assert.equal(req.headers.authorization, "Bearer custom-image-key");
+
+    const chunks = [];
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+    imagePayload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        data: [{ url: "https://images.example/responses-custom.png" }],
+      }),
+    );
+  });
+
+  await listen(imageUpstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "gpt-5.5",
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        api: "responses",
+        baseUrl: "http://127.0.0.1:1/v1",
+        model: "gpt-5.5",
+        authMode: "codex_openai",
+        imageGeneration: {
+          enabled: true,
+          mode: "custom",
+          displayName: "Custom Image API",
+          baseUrl: `${serverUrl(imageUpstream)}/custom`,
+          endpoint: "/images/generations",
+          model: "custom-image-v1",
+          apiKeyEnv: "CUSTOM_IMAGE_API_KEY",
+        },
+      },
+    ],
+  });
+
+  await listen(router);
+  const baseUrl = serverUrl(router);
+
+  try {
+    const response = await fetchJson(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        input: "generate an image of a tiny bridge icon",
+        tools: [{ type: "image_generation" }],
+      }),
+    });
+
+    assert.equal(imagePayload.model, "custom-image-v1");
+    assert.match(imagePayload.prompt, /tiny bridge icon/);
+    assert.equal(response.codexbridge_image_generation.provider, "Custom Image API");
+    assert.equal(response.codexbridge_image_generation.upstream_model, "custom-image-v1");
+  } finally {
+    restoreEnv(previousEnv);
+    await close(router);
+    await close(imageUpstream);
+  }
+});
+
+test("image fallback ignores image analysis prompts", () => {
+  assert.equal(
+    shouldUseImageGenerationFallback(
+      { input: "\u8bf7\u5206\u6790\u8fd9\u5f20\u56fe\u7247\u91cc\u7684\u753b\u9762" },
+      { api: "chat_completions" },
+    ),
+    false,
+  );
+  assert.equal(
+    shouldUseImageGenerationFallback(
+      { input: "\u5e2e\u6211\u753b\u4e00\u5f20\u6865\u7684\u56fe\u7247" },
+      { api: "chat_completions" },
+    ),
+    true,
+  );
+  assert.equal(
+    shouldUseImageGenerationFallback(
+      {
+        input: "generate an image of a bridge",
+        tools: [{ type: "image_generation" }],
+      },
+      {
+        api: "responses",
+        imageGeneration: { mode: "official" },
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    shouldUseImageGenerationFallback(
+      {
+        input: "generate an image of a bridge",
+        tools: [{ type: "image_generation" }],
+      },
+      {
+        api: "responses",
+        imageGeneration: {
+          mode: "custom",
+          baseUrl: "https://images.example/v1",
+          model: "image-model",
+          apiKeyEnv: "IMAGE_KEY",
+        },
+      },
+    ),
+    true,
+  );
 });
 
 test("server logs every incoming request before route handling", async () => {
@@ -2148,6 +2450,20 @@ test("streaming responses without object field are recorded for later chat-compl
   assert.match(chatText, /GPT streamed detail/);
   assert.match(chatText, /what did streaming GPT say/);
 });
+
+function snapshotEnv(keys) {
+  return Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+}
+
+function restoreEnv(snapshot) {
+  for (const [key, value] of Object.entries(snapshot)) {
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+}
 
 function listen(server) {
   return new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));

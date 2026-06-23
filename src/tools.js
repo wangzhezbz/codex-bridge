@@ -3,6 +3,11 @@ import { stringifyJson, tryParseJson } from "./json.js";
 
 const APPLY_PATCH = "apply_patch";
 const VALID_CHAT_TOOL_NAME = /^[A-Za-z0-9_-]{1,64}$/;
+const HOSTED_OUTPUT_CALL_TYPES = new Set([
+  "image_generation_call",
+  "web_search_call",
+  "web_search_preview_call",
+]);
 
 export function buildToolContext(responseTools = [], options = {}) {
   const context = {
@@ -121,6 +126,9 @@ export function chatMessageFromToolOutput(item) {
 
 export function isResponseToolCallItem(item) {
   if (!item || typeof item !== "object") {
+    return false;
+  }
+  if (HOSTED_OUTPUT_CALL_TYPES.has(item.type)) {
     return false;
   }
   if (["function_call", "custom_tool_call", "tool_search_call"].includes(item.type)) {

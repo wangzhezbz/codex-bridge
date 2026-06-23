@@ -774,6 +774,73 @@ h3 {
   color: var(--accent-strong);
 }
 
+.image-generation-panel {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.image-generation-head {
+  display: flex;
+  gap: 8px;
+  align-items: end;
+  justify-content: space-between;
+}
+
+.image-generation-head label {
+  display: grid;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.image-generation-head span,
+.image-generation-fields span {
+  color: #526776;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.image-generation-note {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.image-generation-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.image-generation-fields label {
+  display: grid;
+  gap: 6px;
+}
+
+.image-generation-fields .wide-field {
+  grid-column: 1 / -1;
+}
+
+.image-generation-fields input,
+.image-generation-head select {
+  min-height: 34px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.image-generation-panel.custom {
+  border-color: #9bd6cd;
+  background: #f6fcfb;
+}
+
 .edit-model {
   color: var(--accent);
 }

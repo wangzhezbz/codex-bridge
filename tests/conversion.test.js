@@ -555,6 +555,78 @@ test("previous_response_id restores assistant tool calls before tool output", ()
   assert.equal(second.body.messages.at(-1).tool_call_id, "call_shell");
 });
 
+test("Gemini chat conversion flattens prior tool calls because thought signatures cannot be replayed", () => {
+  const history = new ResponseHistory();
+  history.record("resp_gemini_tool", [
+    { role: "user", content: "run pwd" },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        {
+          id: "call_shell",
+          type: "function",
+          function: {
+            name: "shell_command",
+            arguments: '{"command":"pwd"}',
+          },
+        },
+      ],
+    },
+  ]);
+
+  const converted = responsesToChatRequest(
+    {
+      model: "gemini-3.1-pro-preview",
+      previous_response_id: "resp_gemini_tool",
+      input: [
+        {
+          type: "function_call_output",
+          call_id: "call_shell",
+          output: "F:\\game_code\\router",
+        },
+      ],
+      tools: [
+        {
+          type: "function",
+          name: "shell_command",
+          description: "Run command",
+          parameters: {
+            type: "object",
+            properties: { command: { type: "string" } },
+            required: ["command"],
+          },
+        },
+      ],
+    },
+    {
+      ...route,
+      id: "gemini-3-1-pro",
+      provider: "gemini",
+      model: "gemini-3.1-pro-preview",
+    },
+    history,
+  );
+
+  assert.equal(
+    converted.body.messages.some((message) => Array.isArray(message.tool_calls)),
+    false,
+  );
+  assert.equal(
+    converted.body.messages.some((message) => message.role === "tool"),
+    false,
+  );
+  assert.match(
+    converted.body.messages.map((message) => String(message.content || "")).join("\n"),
+    /shell_command/,
+  );
+  assert.match(
+    converted.body.messages.map((message) => String(message.content || "")).join("\n"),
+    /F:\\game_code\\router/,
+  );
+  assert.equal(converted.body.tools.length, 1);
+});
+
 test("chat conversion keeps orphan tool output visible as user text", () => {
   const converted = responsesToChatRequest(
     {

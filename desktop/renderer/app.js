@@ -428,6 +428,38 @@ function renderModelPool() {
       });
     });
   });
+  els.modelPool.querySelectorAll("[data-image-gen-mode]").forEach((select) => {
+    select.addEventListener("click", (event) => event.stopPropagation());
+    select.addEventListener("change", () => {
+      renderImageGenerationPanelMode(select.closest("[data-image-gen-config]"));
+    });
+  });
+  els.modelPool.querySelectorAll("[data-image-gen-save]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      saveImageGenerationSettings(button);
+    });
+  });
+  els.modelPool.querySelectorAll("[data-image-gen-toggle-secret]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      runAction(button, async () => {
+        const panel = button.closest("[data-image-gen-config]");
+        const input = panel.querySelector("[data-image-gen-api-key]");
+        const keyEnv = panel.querySelector("[data-image-gen-key-env]")?.value.trim();
+        if (input.type === "text") {
+          input.type = "password";
+          button.textContent = "查看";
+          return;
+        }
+        if (keyEnv && !input.value) {
+          input.value = await api.getSecret(keyEnv);
+        }
+        input.type = "text";
+        button.textContent = "隐藏";
+      });
+    });
+  });
   els.modelPool.querySelectorAll("[data-edit-custom]").forEach((button) => {
     button.addEventListener("click", () => startCustomModelEdit(button.dataset.editCustom));
   });
@@ -474,6 +506,7 @@ function modelCard(model, selected, max) {
         <span>图片上传</span>
         <strong>${supportsImage ? "开" : "关"}</strong>
       </button>
+      ${imageGenerationControl(model)}
       ${
         model.custom
           ? `<div class="model-card-actions">
@@ -484,6 +517,141 @@ function modelCard(model, selected, max) {
       }
     </div>
   `;
+}
+
+function imageGenerationControl(model) {
+  const settings = imageGenerationSettingsForModel(model);
+  const mode = settings.mode || "official";
+  const custom = mode === "custom";
+  const saved = Boolean(settings.apiKeyEnv && state.secretStatus?.[settings.apiKeyEnv]);
+  return `
+    <div class="image-generation-panel ${custom ? "custom" : ""}" data-image-gen-config data-preset-id="${escapeHtml(model.presetId)}">
+      <div class="image-generation-head">
+        <label>
+          <span>图片生成</span>
+          <select data-image-gen-mode>
+            <option value="official" ${mode === "official" ? "selected" : ""}>官方 OpenAI</option>
+            <option value="custom" ${mode === "custom" ? "selected" : ""}>自定义生图</option>
+            <option value="off" ${mode === "off" ? "selected" : ""}>关闭</option>
+          </select>
+        </label>
+        <button class="ghost-button light small" type="button" data-image-gen-save>保存生图设置</button>
+      </div>
+      <div class="image-generation-note" data-image-gen-note>
+        ${mode === "official"
+          ? "默认走 OpenAI 官方图片生成。订阅和 OpenAI API 模型建议保持这一项。"
+          : mode === "off"
+            ? "关闭后，这个模型遇到生图请求会按普通文本请求发给当前模型。"
+            : "这个模型的生图请求会转发到下面填写的图片生成接口。"}
+      </div>
+      <div class="image-generation-fields ${custom ? "" : "hidden"}">
+        <label>
+          <span>服务名</span>
+          <input data-image-gen-display-name value="${escapeHtml(settings.displayName || "Custom Image Generation")}" placeholder="例如 My Image API" />
+        </label>
+        <label>
+          <span>Base URL</span>
+          <input data-image-gen-base-url value="${escapeHtml(settings.baseUrl || "")}" placeholder="例如 https://api.example.com/v1" />
+        </label>
+        <label>
+          <span>Endpoint</span>
+          <input data-image-gen-endpoint value="${escapeHtml(settings.endpoint || "/images/generations")}" placeholder="/images/generations" />
+        </label>
+        <label>
+          <span>模型名</span>
+          <input data-image-gen-model value="${escapeHtml(settings.model || "")}" placeholder="例如 image-model-v1" />
+        </label>
+        <label>
+          <span>尺寸</span>
+          <input data-image-gen-size value="${escapeHtml(settings.size || "1024x1024")}" placeholder="1024x1024" />
+        </label>
+        <label>
+          <span>Key 名</span>
+          <input data-image-gen-key-env value="${escapeHtml(settings.apiKeyEnv || "IMAGE_GENERATION_API_KEY")}" placeholder="IMAGE_GENERATION_API_KEY" />
+        </label>
+        <label class="wide-field">
+          <span>API Key ${saved ? "（已保存）" : ""}</span>
+          <div class="secret-row">
+            <input type="password" data-image-gen-api-key placeholder="${saved ? "已保存，留空不修改" : "sk-..."}" />
+            ${saved ? `<button class="ghost-button light small" type="button" data-image-gen-toggle-secret>查看</button>` : ""}
+          </div>
+        </label>
+      </div>
+    </div>
+  `;
+}
+
+function imageGenerationSettingsForModel(model) {
+  const override = state.imageGenerationOverrides?.[model.presetId];
+  if (override) {
+    return override;
+  }
+  return {
+    enabled: true,
+    mode: "official",
+    displayName: "OpenAI Image Generation",
+    baseUrl: "https://api.openai.com/v1",
+    endpoint: "/images/generations",
+    model: "gpt-image-1",
+    size: "1024x1024",
+    apiKeyEnv: "OPENAI_API_KEY",
+  };
+}
+
+function renderImageGenerationPanelMode(panel) {
+  if (!panel) {
+    return;
+  }
+  const mode = panel.querySelector("[data-image-gen-mode]")?.value || "official";
+  panel.classList.toggle("custom", mode === "custom");
+  panel.querySelector(".image-generation-fields")?.classList.toggle("hidden", mode !== "custom");
+  const note = panel.querySelector("[data-image-gen-note]");
+  if (note) {
+    note.textContent = mode === "official"
+      ? "默认走 OpenAI 官方图片生成。订阅和 OpenAI API 模型建议保持这一项。"
+      : mode === "off"
+        ? "关闭后，这个模型遇到生图请求会按普通文本请求发给当前模型。"
+        : "这个模型的生图请求会转发到下面填写的图片生成接口。";
+  }
+}
+
+function saveImageGenerationSettings(button) {
+  return runAction(button, async () => {
+    const panel = button.closest("[data-image-gen-config]");
+    const imageGeneration = imageGenerationPayload(panel);
+    if (imageGeneration.mode === "custom") {
+      const apiKey = panel.querySelector("[data-image-gen-api-key]")?.value.trim();
+      if (apiKey) {
+        await api.saveSecrets({ [imageGeneration.apiKeyEnv]: apiKey });
+      }
+    }
+    state = await api.saveModelImageGeneration({
+      presetId: panel.dataset.presetId,
+      imageGeneration,
+    });
+    draftSelection = [...state.selectedModelIds];
+    render();
+    showToast("图片生成设置已保存，只影响这一张模型卡。");
+  });
+}
+
+function imageGenerationPayload(panel) {
+  const mode = panel.querySelector("[data-image-gen-mode]")?.value || "official";
+  if (mode === "off") {
+    return { mode: "off" };
+  }
+  if (mode !== "custom") {
+    return { mode: "official" };
+  }
+  return {
+    mode: "custom",
+    displayName: panel.querySelector("[data-image-gen-display-name]")?.value.trim(),
+    baseUrl: panel.querySelector("[data-image-gen-base-url]")?.value.trim(),
+    endpoint: panel.querySelector("[data-image-gen-endpoint]")?.value.trim(),
+    model: panel.querySelector("[data-image-gen-model]")?.value.trim(),
+    size: panel.querySelector("[data-image-gen-size]")?.value.trim(),
+    apiKeyEnv: panel.querySelector("[data-image-gen-key-env]")?.value.trim(),
+  };
 }
 
 function modelSupportsImage(model) {

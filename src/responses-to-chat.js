@@ -95,7 +95,9 @@ export function responseRequestToChatSourceMessages(request, route, history) {
     messages.push({ role: "system", content: toolGuidance });
   }
   messages.push(...priorMessages, ...currentMessages);
-  const sourceMessages = normalizeToolCallPairs(messages);
+  const sourceMessages = normalizeToolCallPairs(messages, {
+    flattenToolCalls: shouldFlattenToolCallHistory(route),
+  });
   return { messages: sourceMessages, toolContext };
 }
 
@@ -505,6 +507,26 @@ function shouldRequestSeparatedReasoning(route = {}) {
   }
 }
 
+function shouldFlattenToolCallHistory(route = {}) {
+  const provider = String(route.provider || route.providerId || "").toLowerCase();
+  if (provider.includes("gemini") || provider.includes("google")) {
+    return true;
+  }
+  const model = String(route.model || "").toLowerCase();
+  if (model.startsWith("gemini-") || model.includes("/gemini-")) {
+    return true;
+  }
+  try {
+    const hostname = new URL(route.baseUrl || "").hostname.toLowerCase();
+    return (
+      hostname.includes("generativelanguage.googleapis.com") ||
+      hostname.includes("aiplatform.googleapis.com")
+    );
+  } catch {
+    return false;
+  }
+}
+
 function trimMessagesToRouteContext(messages, route = {}) {
   const maxTokens = maxChatContextInputTokens(route);
   if (!maxTokens || estimatedMessagesTokens(messages) <= maxTokens) {
@@ -723,8 +745,9 @@ function trimTextForContextTokens(text, maxTokens) {
   return best || "[message omitted to fit context]";
 }
 
-function normalizeToolCallPairs(messages) {
+function normalizeToolCallPairs(messages, options = {}) {
   const normalized = [];
+  const flattenToolCalls = Boolean(options.flattenToolCalls);
 
   for (let index = 0; index < messages.length;) {
     const message = messages[index];
@@ -750,7 +773,9 @@ function normalizeToolCallPairs(messages) {
         expectedIds.size > 0 &&
         [...expectedIds].every((toolCallId) => actualIds.has(toolCallId));
 
-      if (complete) {
+      if (complete && flattenToolCalls) {
+        normalized.push(...flattenToolCallPairAsText(message, toolMessages));
+      } else if (complete) {
         normalized.push(message, ...toolMessages);
       } else {
         const textOnly = assistantTextOnlyMessage(message);
@@ -774,6 +799,44 @@ function normalizeToolCallPairs(messages) {
   }
 
   return normalized;
+}
+
+function flattenToolCallPairAsText(message, toolMessages) {
+  const flattened = [];
+  const toolCallText = toolCallsToText(message.tool_calls);
+  const assistantText = [contentToText(message.content), toolCallText]
+    .filter(Boolean)
+    .join("\n\n");
+  if (assistantText) {
+    flattened.push({
+      role: "assistant",
+      content: assistantText,
+    });
+  }
+
+  for (const toolMessage of toolMessages) {
+    const output = contentToText(toolMessage.content);
+    const id = toolMessage?.tool_call_id ? ` ${toolMessage.tool_call_id}` : "";
+    flattened.push({
+      role: "user",
+      content: `[Tool output${id}]\n${output || "[empty output]"}`,
+    });
+  }
+  return flattened;
+}
+
+function toolCallsToText(toolCalls) {
+  const lines = [];
+  for (const toolCall of toolCalls || []) {
+    const name = toolCall?.function?.name || toolCall?.name || "tool";
+    const args = toolCall?.function?.arguments ?? toolCall?.arguments ?? "{}";
+    const id = toolCall?.id ? ` ${toolCall.id}` : "";
+    lines.push(`- ${name}${id}: ${typeof args === "string" ? args : stringifyJson(args)}`);
+  }
+  if (lines.length === 0) {
+    return "";
+  }
+  return `[Assistant requested tool calls]\n${lines.join("\n")}`;
 }
 
 function hasToolCalls(message) {

@@ -8,6 +8,11 @@ const {
   resolveDataRootDir,
 } = require("./data-dir.cjs");
 
+if (shouldDisableChromiumSandbox()) {
+  app.commandLine.appendSwitch("no-sandbox");
+  app.commandLine.appendSwitch("disable-gpu-sandbox");
+}
+
 const appRootDir = path.resolve(__dirname, "..");
 const appIconPath = path.join(__dirname, "assets", "codexbridge-icon.png");
 const trayIconPath = process.platform === "win32"
@@ -40,6 +45,19 @@ let usageStore = null;
 let lastHealth = null;
 let tray = null;
 let isQuitting = false;
+
+function shouldDisableChromiumSandbox() {
+  if (process.env.CODEXBRIDGE_CHROMIUM_SANDBOX === "1") {
+    return false;
+  }
+  if (process.env.CODEXBRIDGE_NO_SANDBOX === "0") {
+    return false;
+  }
+  if (process.env.CODEXBRIDGE_NO_SANDBOX === "1") {
+    return true;
+  }
+  return process.platform === "win32";
+}
 
 for (const message of legacyDataMigration.messages) {
   appendRuntimeLog(message);
@@ -222,6 +240,7 @@ ipcMain.handle("state:get", async () => {
     maxModels: settings.CODEX_MODEL_SLOTS?.length || 5,
     modelSlots: settings.CODEX_MODEL_SLOTS || [],
     customModels: settings.readCustomModels(dataRootDir),
+    imageGenerationOverrides: settings.readModelImageGenerationOverrides(dataRootDir),
     secretStatus: settings.secretStatus(dataRootDir),
     desktopOptions: settings.loadDesktopOptions(dataRootDir),
     diagnostics,
@@ -294,6 +313,24 @@ ipcMain.handle("models:saveImageInput", async (_event, payload) => {
   }
   appendLog(
     `Updated image upload support: ${saved.presetId} ${saved.imageInput ? "enabled" : "disabled"}.`,
+  );
+  broadcastState();
+  return getStatePayload(settings);
+});
+
+ipcMain.handle("models:saveImageGeneration", async (_event, payload) => {
+  const settings = await loadSettings();
+  const presetId = String(payload?.presetId || "");
+  const saved = settings.saveModelImageGenerationOverride(
+    dataRootDir,
+    presetId,
+    payload?.imageGeneration || {},
+  );
+  const config = settings.readRouterConfig(dataRootDir);
+  const mode = settings.detectModeFromConfig(config);
+  settings.writeRouterConfigFromSelection(dataRootDir, mode);
+  appendLog(
+    `Updated image generation provider: ${saved.presetId} -> ${saved.imageGeneration.mode}.`,
   );
   broadcastState();
   return getStatePayload(settings);
@@ -741,6 +778,7 @@ async function getStatePayload(settings) {
     maxModels: settings.CODEX_MODEL_SLOTS?.length || 5,
     modelSlots: settings.CODEX_MODEL_SLOTS || [],
     customModels: settings.readCustomModels(dataRootDir),
+    imageGenerationOverrides: settings.readModelImageGenerationOverrides(dataRootDir),
     secretStatus: settings.secretStatus(dataRootDir),
     desktopOptions: settings.loadDesktopOptions(dataRootDir),
     diagnostics,

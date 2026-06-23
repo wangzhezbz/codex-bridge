@@ -3,6 +3,20 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 
+test("desktop disables Chromium sandbox before app startup on Windows", () => {
+  const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
+  const sandboxSwitchIndex = main.indexOf('app.commandLine.appendSwitch("no-sandbox")');
+  const readyIndex = main.indexOf("app.whenReady()");
+
+  assert.notEqual(sandboxSwitchIndex, -1);
+  assert.notEqual(readyIndex, -1);
+  assert.ok(
+    sandboxSwitchIndex < readyIndex,
+    "Chromium sandbox must be disabled before app.whenReady() for affected Windows machines",
+  );
+  assert.match(main, /CODEXBRIDGE_CHROMIUM_SANDBOX/);
+});
+
 test("desktop quit path does not send renderer updates after the window is destroyed", () => {
   const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
 

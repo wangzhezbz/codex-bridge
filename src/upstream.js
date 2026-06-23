@@ -11,6 +11,10 @@ import {
   chatResponseToResponse,
   responseToSse,
 } from "./chat-to-responses.js";
+import {
+  proxyImageGenerationFallback,
+  shouldUseImageGenerationFallback,
+} from "./image-generation.js";
 import { fetchInitWithProxy, proxyLogLabel } from "./proxy.js";
 import { markRouteRateLimited, waitForRouteCapacity } from "./rate-limit.js";
 
@@ -76,6 +80,16 @@ export async function handleResponsesRequest(
   res,
   context = {},
 ) {
+  if (shouldUseImageGenerationFallback(requestBody, route)) {
+    return proxyImageGenerationFallback(
+      requestBody,
+      route,
+      history,
+      res,
+      context,
+      callJsonUpstream,
+    );
+  }
   if (route.api === "responses") {
     return proxyResponsesApi(requestBody, route, history, res, context);
   }
