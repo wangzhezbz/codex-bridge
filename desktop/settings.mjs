@@ -621,12 +621,16 @@ export function readModelImageInputOverrides(rootDir) {
   const source = saved?.imageInput && typeof saved.imageInput === "object"
     ? saved.imageInput
     : saved;
+  const legacyFormat = Number(saved?.version || 0) < 2;
   if (!source || typeof source !== "object" || Array.isArray(source)) {
     return {};
   }
   const overrides = {};
   for (const [presetId, enabled] of Object.entries(source)) {
     if (typeof enabled === "boolean") {
+      if (legacyFormat && enabled === false && builtInVisionPresetIds().has(presetId)) {
+        continue;
+      }
       overrides[presetId] = enabled;
     }
   }
@@ -644,7 +648,7 @@ export function saveModelImageInputOverride(rootDir, presetId, enabled) {
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.writeFileSync(
     target,
-    `${JSON.stringify({ version: 1, imageInput: overrides }, null, 2)}\n`,
+    `${JSON.stringify({ version: 2, imageInput: overrides }, null, 2)}\n`,
     "utf8",
   );
   return { presetId: id, imageInput: overrides[id] };
@@ -1882,6 +1886,17 @@ function applyModelImageInputOverride(model, overrides) {
     inputModalities: overrides[model.presetId] ? ["text", "image"] : ["text"],
     imageInputOverride: overrides[model.presetId],
   };
+}
+
+function builtInVisionPresetIds() {
+  return new Set(
+    MODEL_PRESETS
+      .filter((model) =>
+        (Array.isArray(model.inputModalities) && model.inputModalities.includes("image")) ||
+        model.api === "responses"
+      )
+      .map((model) => model.presetId),
+  );
 }
 
 function routeForSelectedModel(model, slot, priority) {

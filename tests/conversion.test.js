@@ -809,6 +809,40 @@ test("namespace tool choice is flattened for chat providers", () => {
   });
 });
 
+test("chat providers get guidance for flattened MCP tools", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "open Chrome",
+      tools: [
+        {
+          type: "namespace",
+          name: "mcp__node_repl__",
+          tools: [
+            {
+              type: "function",
+              name: "js",
+              description: "Run JavaScript.",
+              parameters: {
+                type: "object",
+                properties: {
+                  code: { type: "string" },
+                },
+                required: ["code"],
+              },
+            },
+          ],
+        },
+      ],
+    },
+    route,
+    new ResponseHistory(),
+  );
+
+  assert.equal(converted.body.messages[0].role, "system");
+  assert.match(converted.body.messages[0].content, /mcp__node_repl__js/);
+  assert.match(converted.body.messages[0].content, /Start-Process/);
+});
+
 test("non-function Codex tools with schemas are exposed to chat providers", () => {
   const converted = responsesToChatRequest(
     {

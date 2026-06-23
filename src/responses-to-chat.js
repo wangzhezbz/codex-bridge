@@ -13,6 +13,12 @@ const CHAT_CONTEXT_INPUT_PERCENT = 65;
 const MIN_CHAT_CONTEXT_INPUT_TOKENS = 128;
 const OVERSIZED_IMAGE_PLACEHOLDER =
   "[image input omitted because it is too large for this chat provider]";
+const MCP_TOOL_GUIDANCE =
+  "CodexBridge tool guidance: MCP namespace tools are exposed as flattened function names. " +
+  "If a Codex skill mentions the Node REPL js tool, call mcp__node_repl__js directly; " +
+  "empty MCP resource/resource-template lists do not mean the tool is unavailable. " +
+  "For Chrome, Browser, and Computer Use tasks, use the official Node REPL or computer tools when present. " +
+  "Do not substitute shell commands such as Start-Process unless the user explicitly asks for a manual fallback.";
 
 export function responsesToChatRequest(request, route, history) {
   const { messages: sourceMessages, toolContext } =
@@ -78,6 +84,10 @@ export function responseRequestToChatSourceMessages(request, route, history) {
   const instructions = systemInstructionsFromRequest(request);
   if (instructions) {
     messages.push({ role: "system", content: instructions });
+  }
+  const toolGuidance = toolGuidanceFromContext(toolContext);
+  if (toolGuidance) {
+    messages.push({ role: "system", content: toolGuidance });
   }
   messages.push(...priorMessages, ...currentMessages);
   const sourceMessages = normalizeToolCallPairs(messages);
@@ -364,6 +374,22 @@ function systemInstructionsFromRequest(request) {
     }
   }
   return parts.join("\n\n");
+}
+
+function toolGuidanceFromContext(toolContext) {
+  if (!toolContext?.chatTools?.length) {
+    return "";
+  }
+  const names = toolContext.chatTools
+    .map((tool) => tool?.function?.name || "")
+    .filter(Boolean);
+  const needsGuidance = names.some((name) =>
+    name.startsWith("mcp__") ||
+    name.includes("computer") ||
+    name.includes("browser") ||
+    name.includes("chrome")
+  );
+  return needsGuidance ? MCP_TOOL_GUIDANCE : "";
 }
 
 function roleFromType(type) {

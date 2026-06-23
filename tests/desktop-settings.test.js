@@ -542,6 +542,32 @@ test("preset image upload support can be overridden per model", () => {
   assert.deepEqual(disabledConfig.models[0].inputModalities, ["text"]);
 });
 
+test("legacy false image overrides do not disable built-in vision presets", () => {
+  const rootDir = makeTempProject();
+  const capabilitiesPath = path.join(rootDir, "config", "model-capabilities.json");
+  fs.mkdirSync(path.dirname(capabilitiesPath), { recursive: true });
+  fs.writeFileSync(
+    capabilitiesPath,
+    `${JSON.stringify({
+      version: 1,
+      imageInput: {
+        "codex-gpt-5-5": false,
+        "deepseek-v4-pro": true,
+      },
+    }, null, 2)}\n`,
+    "utf8",
+  );
+  saveSelection(rootDir, ["codex-gpt-5-5", "deepseek-v4-pro"]);
+
+  const migratedConfig = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
+  assert.deepEqual(migratedConfig.models[0].inputModalities, ["text", "image"]);
+  assert.deepEqual(migratedConfig.models[1].inputModalities, ["text", "image"]);
+
+  saveModelImageInputOverride(rootDir, "codex-gpt-5-5", false);
+  const explicitConfig = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
+  assert.deepEqual(explicitConfig.models[0].inputModalities, ["text"]);
+});
+
 test("custom models can disable image upload support", () => {
   const rootDir = makeTempProject();
   const custom = saveCustomModel(rootDir, {
