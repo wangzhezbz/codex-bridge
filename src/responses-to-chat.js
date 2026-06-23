@@ -97,9 +97,9 @@ export function responseRequestToChatSourceMessages(request, route, history) {
     messages.push({ role: "system", content: toolGuidance });
   }
   messages.push(...priorMessages, ...currentMessages);
-  const sourceMessages = normalizeToolCallPairs(messages, {
+  const sourceMessages = sanitizeMessagesForRoute(normalizeToolCallPairs(messages, {
     flattenToolCalls: shouldFlattenToolCallHistory(route),
-  });
+  }), route);
   return { messages: sourceMessages, toolContext };
 }
 
@@ -420,8 +420,46 @@ function isCommandToolName(name) {
 }
 
 function requestMentionsCommandWork(request = {}) {
-  const text = `${request.instructions || ""}\n${requestInputText(request.input ?? request.messages)}`;
+  const text = requestCurrentUserText(request);
   return /git|github|push|publish|commit|test|run tests|推送|发布|提交|测试|运行测试/i.test(text);
+}
+
+function requestCurrentUserText(request = {}) {
+  return currentInputText(request.input ?? request.messages);
+}
+
+function currentInputText(input) {
+  if (input === undefined || input === null) {
+    return "";
+  }
+  if (typeof input === "string") {
+    return input;
+  }
+  if (Array.isArray(input)) {
+    for (let index = input.length - 1; index >= 0; index -= 1) {
+      const item = input[index];
+      if (
+        item &&
+        typeof item === "object" &&
+        ["system", "developer"].includes(item.role)
+      ) {
+        continue;
+      }
+      return currentInputText(item);
+    }
+    return "";
+  }
+  if (typeof input !== "object") {
+    return "";
+  }
+  if (isResponseToolOutputItem(input) || isResponseToolCallItem(input)) {
+    return "";
+  }
+  const role = normalizeRole(input.role || roleFromType(input.type));
+  if (role && role !== "user") {
+    return "";
+  }
+  return requestInputText(input);
 }
 
 function requestInputText(input) {
@@ -518,7 +556,7 @@ function requestMentionsInteractivePluginWork(request = {}) {
 }
 
 export function interactivePluginKindForRequest(request = {}) {
-  const text = `${request.instructions || ""}\n${requestInputText(request.input ?? request.messages)}`;
+  const text = requestCurrentUserText(request);
   if (/@chrome\b|control[-_\s]?chrome|chrome\s*:/i.test(text)) {
     return "chrome";
   }
@@ -541,6 +579,35 @@ export function interactivePluginKindForRequest(request = {}) {
     return "chrome";
   }
   return "";
+}
+
+function sanitizeMessagesForRoute(messages, route = {}) {
+  if (routeSupportsDeepSeekReasoningContent(route)) {
+    return messages;
+  }
+  return messages.map((message) => {
+    if (!message || typeof message !== "object" || !("reasoning_content" in message)) {
+      return message;
+    }
+    const { reasoning_content, ...rest } = message;
+    return rest;
+  });
+}
+
+function routeSupportsDeepSeekReasoningContent(route = {}) {
+  const provider = String(route.provider || route.providerId || "").toLowerCase();
+  if (provider.includes("deepseek")) {
+    return true;
+  }
+  const model = String(route.model || route.id || "").toLowerCase();
+  if (model.includes("deepseek")) {
+    return true;
+  }
+  try {
+    return new URL(route.baseUrl || "").hostname.toLowerCase().includes("deepseek");
+  } catch {
+    return false;
+  }
 }
 
 function shouldDrop(route, param) {

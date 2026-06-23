@@ -56,6 +56,9 @@ export function assistantHistoryMessageFromChat(chat) {
   if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
     history.tool_calls = message.tool_calls;
   }
+  if (typeof message.reasoning_content === "string" && message.reasoning_content) {
+    history.reasoning_content = message.reasoning_content;
+  }
   return history;
 }
 

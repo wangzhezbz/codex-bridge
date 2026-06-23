@@ -712,6 +712,142 @@ test("chat conversion drops stale assistant tool calls without tool outputs", ()
   );
 });
 
+test("interactive plugin detection only uses the current user turn", () => {
+  const history = new ResponseHistory();
+  history.record("resp_old_chrome_task", [
+    { role: "user", content: "Chrome 打开 youtube" },
+    { role: "assistant", content: "I opened YouTube." },
+  ]);
+
+  const converted = responsesToChatRequest(
+    {
+      previous_response_id: "resp_old_chrome_task",
+      input: "你好",
+      tools: [
+        {
+          type: "function",
+          name: "mcp__node_repl__js",
+          description: "Run JavaScript",
+          parameters: {
+            type: "object",
+            properties: { code: { type: "string" } },
+            required: ["code"],
+          },
+        },
+      ],
+    },
+    route,
+    history,
+  );
+
+  assert.equal(converted.body.tool_choice, "auto");
+});
+
+test("interactive plugin detection ignores older transcript messages", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: [
+        { role: "user", content: "Chrome 打开 youtube" },
+        { role: "assistant", content: "I opened YouTube." },
+        { role: "user", content: "你好" },
+      ],
+      tools: [
+        {
+          type: "function",
+          name: "mcp__node_repl__js",
+          description: "Run JavaScript",
+          parameters: {
+            type: "object",
+            properties: { code: { type: "string" } },
+            required: ["code"],
+          },
+        },
+      ],
+    },
+    route,
+    new ResponseHistory(),
+  );
+
+  assert.equal(converted.body.tool_choice, "auto");
+});
+
+test("interactive plugin detection ignores older prompts during tool-output turns", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: [
+        { role: "user", content: "Chrome 打开 youtube" },
+        {
+          type: "function_call_output",
+          call_id: "call_old",
+          output: "done",
+        },
+      ],
+      tools: [
+        {
+          type: "function",
+          name: "mcp__node_repl__js",
+          description: "Run JavaScript",
+          parameters: {
+            type: "object",
+            properties: { code: { type: "string" } },
+            required: ["code"],
+          },
+        },
+      ],
+    },
+    route,
+    new ResponseHistory(),
+  );
+
+  assert.equal(converted.body.tool_choice, "auto");
+});
+
+test("DeepSeek reasoning_content is replayed only for DeepSeek routes", () => {
+  const history = new ResponseHistory();
+  history.record("resp_deepseek_reasoning", [
+    { role: "user", content: "think" },
+    assistantHistoryMessageFromChat({
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: "answer",
+            reasoning_content: "private chain state",
+          },
+        },
+      ],
+    }),
+  ]);
+
+  const deepseek = responsesToChatRequest(
+    {
+      model: "deepseek-v4-pro",
+      previous_response_id: "resp_deepseek_reasoning",
+      input: "continue",
+    },
+    { ...route, provider: "deepseek" },
+    history,
+  );
+  const deepseekAssistant = deepseek.body.messages.find(
+    (message) => message.role === "assistant",
+  );
+  assert.equal(deepseekAssistant.reasoning_content, "private chain state");
+
+  const kimi = responsesToChatRequest(
+    {
+      model: "kimi-k2.7-code",
+      previous_response_id: "resp_deepseek_reasoning",
+      input: "continue",
+    },
+    { ...route, provider: "moonshot", model: "kimi-k2.7-code" },
+    history,
+  );
+  const kimiAssistant = kimi.body.messages.find(
+    (message) => message.role === "assistant",
+  );
+  assert.equal("reasoning_content" in kimiAssistant, false);
+});
+
 test("namespace tools are flattened for chat providers", () => {
   const converted = responsesToChatRequest(
     {
