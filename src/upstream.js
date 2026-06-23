@@ -344,7 +344,26 @@ export async function proxyChatCompletions(
     const textOnlyBody = chatBodyWithoutImages(converted.body);
     messagesForHistory = chatMessagesWithoutImages(converted.messagesForHistory);
     logRoute(context, route, upstreamUrl);
-    upstream = await callJsonUpstream(upstreamUrl, route, textOnlyBody, context);
+    try {
+      upstream = await callJsonUpstream(upstreamUrl, route, textOnlyBody, context, {
+        trackRateLimit: false,
+      });
+    } catch (retryError) {
+      console.warn(
+        `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+          `!! upstream route=${route.id} image retry failed; isolating failed image turn`,
+      );
+      return sendLocalImageRejectedResponse({
+        requestBody,
+        route,
+        history,
+        res,
+        context,
+        converted,
+        messagesForHistory,
+        retryError,
+      });
+    }
   }
   logUsage(context, route, upstream.usage);
   const response = chatResponseToResponse(
@@ -381,6 +400,83 @@ export async function proxyChatCompletions(
 
 const IMAGE_REJECTED_PLACEHOLDER =
   "[image input omitted because upstream rejected image content]";
+
+function sendLocalImageRejectedResponse({
+  requestBody,
+  route,
+  history,
+  res,
+  context,
+  converted,
+  messagesForHistory,
+  retryError,
+}) {
+  const localChat = localImageRejectedChat(route, retryError);
+  const response = chatResponseToResponse(
+    localChat,
+    requestBody.model || route.id,
+    converted.toolContext,
+    { stripReasoningTags: false },
+  );
+
+  history.record(response.id, [
+    ...messagesForHistory,
+    assistantHistoryMessageFromChat(localChat),
+  ]);
+  history.recordResponse(response, {
+    api: "chat_completions",
+    routeId: route.id || "",
+    upstreamModel: route.model || "",
+    upstreamKnown: false,
+    localFallback: "image_rejected",
+  });
+  logUsage(context, route, null);
+
+  if (converted.wantsStream) {
+    res.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    });
+    res.end(responseToSse(response));
+    return;
+  }
+
+  jsonResponse(res, 200, response);
+}
+
+function localImageRejectedChat(route, retryError) {
+  const status = retryError?.statusCode ? `HTTP ${retryError.statusCode}` : "";
+  const parsed = retryError instanceof UpstreamHttpError
+    ? tryParseJson(retryError.bodyText)
+    : null;
+  const upstreamMessage = retryError instanceof UpstreamHttpError
+    ? upstreamBodyMessage(retryError.bodyText, parsed)
+    : safeText(retryError?.message || "", 300);
+  const retryDetail = [status, upstreamMessage].filter(Boolean).join(" - ");
+  const displayName = route.displayName || route.id || "当前模型";
+  const content =
+    `这次消息里的图片没有继续发送给 ${displayName}：上游模型拒绝了图片输入。` +
+    "CodexBridge 已经把本轮历史改成文本占位，后续会话可以继续。" +
+    (retryDetail ? ` 去掉图片后上游仍返回：${retryDetail}。` : "") +
+    "建议关闭这个模型的“图片上传”开关后重试，或切换到真正支持图片的模型。";
+
+  return {
+    id: `chatcmpl_image_omitted_${Date.now().toString(36)}_${Math.random()
+      .toString(36)
+      .slice(2, 8)}`,
+    object: "chat.completion",
+    choices: [
+      {
+        message: {
+          role: "assistant",
+          content,
+        },
+      },
+    ],
+    usage: null,
+  };
+}
 
 function shouldRetryChatWithoutImages(error, body) {
   if (!(error instanceof UpstreamHttpError)) {
@@ -462,12 +558,18 @@ function chatContentWithoutImages(content) {
   return sanitizedParts;
 }
 
-export async function callJsonUpstream(upstreamUrl, route, payload, context = {}) {
+export async function callJsonUpstream(
+  upstreamUrl,
+  route,
+  payload,
+  context = {},
+  options = {},
+) {
   const upstream = await fetchUpstream(upstreamUrl, {
     method: "POST",
     headers: upstreamHeaders(route, context),
     body: JSON.stringify(payload),
-  }, context, route);
+  }, context, route, options);
   const text = await upstream.text();
   if (!upstream.ok) {
     throw new UpstreamHttpError(upstream.status, text, upstreamUrl, route);
@@ -686,13 +788,13 @@ function logUsage(context, route, usage) {
   );
 }
 
-async function fetchUpstream(upstreamUrl, init, context = {}, route = {}) {
+async function fetchUpstream(upstreamUrl, init, context = {}, route = {}, options = {}) {
   await waitForRouteCapacity(route, context);
   const proxiedInit = fetchInitWithProxy(upstreamUrl, init);
   const usedProxy = Boolean(proxiedInit.dispatcher);
   const proxyLabel = proxyLogLabel(upstreamUrl);
   try {
-    return await fetchAndTrackRateLimit(upstreamUrl, proxiedInit, route);
+    return await fetchAndTrackRateLimit(upstreamUrl, proxiedInit, route, options);
   } catch (error) {
     if (!usedProxy || !isNetworkFetchFailure(error)) {
       throw isNetworkFetchFailure(error)
@@ -701,7 +803,7 @@ async function fetchUpstream(upstreamUrl, init, context = {}, route = {}) {
     }
     logProxyFallback(context, route, error);
     try {
-      return await fetchAndTrackRateLimit(upstreamUrl, init, route);
+      return await fetchAndTrackRateLimit(upstreamUrl, init, route, options);
     } catch (directError) {
       throw isNetworkFetchFailure(directError)
         ? new UpstreamNetworkError(directError, upstreamUrl, route, proxyLabel)
@@ -710,9 +812,9 @@ async function fetchUpstream(upstreamUrl, init, context = {}, route = {}) {
   }
 }
 
-async function fetchAndTrackRateLimit(upstreamUrl, init, route) {
+async function fetchAndTrackRateLimit(upstreamUrl, init, route, options = {}) {
   const response = await fetch(upstreamUrl, init);
-  if (response.status === 429) {
+  if (response.status === 429 && options.trackRateLimit !== false) {
     markRouteRateLimited(route, response.headers);
   }
   return response;

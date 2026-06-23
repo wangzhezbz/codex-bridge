@@ -100,6 +100,119 @@ test("server exposes health, models, catalog, and converted responses", async ()
   }
 });
 
+test("server routes Chrome plugin requests to Node REPL for chat providers", async () => {
+  const chatBodies = [];
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/chat/completions");
+    const chunks = [];
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+    chatBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: "chatcmpl_chrome_tool",
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              tool_calls: [
+                {
+                  id: "call_node_repl",
+                  type: "function",
+                  function: {
+                    name: "mcp__node_repl__js",
+                    arguments: JSON.stringify({
+                      code: "nodeRepl.write('browser bootstrap')",
+                    }),
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const upstreamUrl = serverUrl(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        api: "chat_completions",
+        baseUrl: `${upstreamUrl}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const baseUrl = serverUrl(router);
+
+  try {
+    const response = await fetchJson(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        input: "Chrome 打开 youtube",
+        tools: [
+          {
+            type: "namespace",
+            name: "mcp__node_repl__",
+            tools: [
+              {
+                type: "function",
+                name: "js",
+                description: "Run JavaScript.",
+                parameters: {
+                  type: "object",
+                  properties: {
+                    code: { type: "string" },
+                  },
+                  required: ["code"],
+                },
+              },
+            ],
+          },
+          {
+            type: "function",
+            name: "shell_command",
+            description: "Run shell.",
+            parameters: { type: "object", properties: {} },
+          },
+        ],
+      }),
+    });
+
+    assert.equal(response.output[0].type, "function_call");
+    assert.equal(response.output[0].name, "mcp__node_repl__js");
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+
+  assert.equal(chatBodies.length, 1);
+  assert.deepEqual(chatBodies[0].tool_choice, {
+    type: "function",
+    function: { name: "mcp__node_repl__js" },
+  });
+});
+
 test("chat routes use OpenAI image fallback for explicit image generation prompts", async () => {
   const previousEnv = snapshotEnv([
     "OPENAI_API_KEY",
@@ -2562,6 +2675,246 @@ test("chat route image rejection is retried without poisoning later conversation
     /image input omitted because upstream rejected image content/,
   );
   assert.match(JSON.stringify(chatBodies[2].messages), /continue without the image/);
+});
+
+test("chat route image rejection is isolated even when text-only retry fails", async () => {
+  const chatBodies = [];
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    chatBodies.push(body);
+
+    if (JSON.stringify(body.messages).includes("\"image_url\"")) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: {
+            message: "image inputs are not supported by this model",
+          },
+        }),
+      );
+      return;
+    }
+
+    if (chatBodies.length === 2) {
+      res.writeHead(429, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "Too Many Requests" } }));
+      return;
+    }
+
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: `chatcmpl_after_image_${chatBodies.length}`,
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: "later turn succeeded",
+            },
+          },
+        ],
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const upstreamUrl = serverUrl(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        api: "chat_completions",
+        baseUrl: `${upstreamUrl}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+        inputModalities: ["text", "image"],
+      },
+    ],
+  });
+
+  await listen(router);
+  const baseUrl = serverUrl(router);
+
+  try {
+    const first = await fetchJson(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        input: [
+          {
+            role: "user",
+            content: [
+              { type: "input_text", text: "look at this image" },
+              {
+                type: "input_image",
+                image_url: "data:image/png;base64,abc123",
+              },
+            ],
+          },
+        ],
+      }),
+    });
+
+    assert.equal(first.status, "completed");
+    assert.match(first.output_text, /图片|image/i);
+
+    await fetchJson(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        previous_response_id: first.id,
+        input: "continue after failed image turn",
+      }),
+    });
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+
+  assert.equal(chatBodies.length, 3);
+  assert.match(JSON.stringify(chatBodies[0].messages), /image_url/);
+  assert.doesNotMatch(JSON.stringify(chatBodies[1].messages), /image_url/);
+  assert.doesNotMatch(JSON.stringify(chatBodies[2].messages), /image_url/);
+  assert.match(
+    JSON.stringify(chatBodies[2].messages),
+    /image input omitted because upstream rejected image content/,
+  );
+  assert.match(JSON.stringify(chatBodies[2].messages), /continue after failed image turn/);
+});
+
+test("streaming chat image rejection is isolated for later conversation turns", async () => {
+  const chatBodies = [];
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    chatBodies.push(body);
+
+    if (JSON.stringify(body.messages).includes("\"image_url\"")) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "vision input is unavailable" } }));
+      return;
+    }
+
+    if (chatBodies.length === 2) {
+      res.writeHead(422, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "retry failed after image removal" } }));
+      return;
+    }
+
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: `chatcmpl_stream_after_image_${chatBodies.length}`,
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: "stream later turn succeeded",
+            },
+          },
+        ],
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const upstreamUrl = serverUrl(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        api: "chat_completions",
+        baseUrl: `${upstreamUrl}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+        inputModalities: ["text", "image"],
+      },
+    ],
+  });
+
+  await listen(router);
+  const baseUrl = serverUrl(router);
+
+  try {
+    const first = await fetch(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        stream: true,
+        input: [
+          {
+            role: "user",
+            content: [
+              { type: "input_text", text: "stream image request" },
+              { type: "input_image", image_url: "data:image/png;base64,abc123" },
+            ],
+          },
+        ],
+      }),
+    });
+    const firstText = await first.text();
+    assert.equal(first.ok, true, firstText);
+    assert.match(firstText, /response\.completed/);
+    assert.match(firstText, /image input omitted because upstream rejected image content|图片/);
+    const completed = firstText.match(/event: response\.completed\ndata: ([^\n]+)/);
+    assert.ok(completed, firstText);
+    const firstId = JSON.parse(completed[1]).response.id;
+
+    await fetchJson(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        previous_response_id: firstId,
+        input: "continue after streamed image failure",
+      }),
+    });
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+
+  assert.equal(chatBodies.length, 3);
+  assert.match(JSON.stringify(chatBodies[0].messages), /image_url/);
+  assert.doesNotMatch(JSON.stringify(chatBodies[1].messages), /image_url/);
+  assert.doesNotMatch(JSON.stringify(chatBodies[2].messages), /image_url/);
+  assert.match(
+    JSON.stringify(chatBodies[2].messages),
+    /image input omitted because upstream rejected image content/,
+  );
+  assert.match(JSON.stringify(chatBodies[2].messages), /continue after streamed image failure/);
 });
 
 function snapshotEnv(keys) {

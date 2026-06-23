@@ -508,7 +508,14 @@ function chatNameForTool(toolContext, responseName) {
 
 function requestMentionsInteractivePluginWork(request = {}) {
   const text = `${request.instructions || ""}\n${requestInputText(request.input ?? request.messages)}`;
-  return /@?chrome|browser|浏览器|谷歌浏览器|谷歌|youtube|网页|computer\s*use|电脑操控|控制电脑|电脑|桌面|窗口|打开\s*(?:notepad|记事本|画图|mspaint|chrome|youtube)|打开.*(?:应用|软件|浏览器|网页|网站)/i.test(text);
+  if (/@chrome\b|computer\s*use|电脑操控|控制电脑/i.test(text)) {
+    return true;
+  }
+  const actionPattern =
+    /打开|启动|访问|搜索|点击|关闭|切换|控制|操作|截图|输入|填写|播放|暂停|导航|open|launch|visit|search|click|close|switch|control|operate|screenshot|type|fill|play|navigate/i;
+  const targetPattern =
+    /chrome|browser|谷歌浏览器|浏览器|youtube|网页|网站|电脑|桌面|窗口|notepad|记事本|画图|mspaint|应用|软件/i;
+  return actionPattern.test(text) && targetPattern.test(text);
 }
 
 function shouldDrop(route, param) {

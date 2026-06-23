@@ -1019,6 +1019,40 @@ test("git push tasks are not forced through Node REPL", () => {
   assert.equal(converted.body.tool_choice, "auto");
 });
 
+test("ordinary computer or web questions are not forced through Node REPL", () => {
+  for (const input of ["我的电脑配置适合跑本地模型吗", "网页开发怎么入门"]) {
+    const converted = responsesToChatRequest(
+      {
+        input,
+        tools: [
+          {
+            type: "namespace",
+            name: "mcp__node_repl__",
+            tools: [
+              {
+                type: "function",
+                name: "js",
+                description: "Run JavaScript.",
+                parameters: {
+                  type: "object",
+                  properties: {
+                    code: { type: "string" },
+                  },
+                  required: ["code"],
+                },
+              },
+            ],
+          },
+        ],
+      },
+      route,
+      new ResponseHistory(),
+    );
+
+    assert.equal(converted.body.tool_choice, "auto", input);
+  }
+});
+
 test("explicit tool choice is not replaced by the Node REPL preference", () => {
   const converted = responsesToChatRequest(
     {
