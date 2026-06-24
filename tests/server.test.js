@@ -3849,11 +3849,16 @@ test("custom conservative chat route completes text and drops risky params", asy
     provider: "custom",
     custom: true,
     model: "custom-model",
+  }, {
+    tools: [{ type: "function", function: { name: "lookup" } }],
+    tool_choice: { type: "function", function: { name: "lookup" } },
   });
 
   assert.equal(response.output_text, "smoke ok");
   assert.equal(upstreamBody.response_format, undefined);
   assert.equal(upstreamBody.parallel_tool_calls, undefined);
+  assert.equal(upstreamBody.tools, undefined);
+  assert.equal(upstreamBody.tool_choice, undefined);
   assert.equal(upstreamBody.messages.at(-1).content, "smoke text");
 });
 

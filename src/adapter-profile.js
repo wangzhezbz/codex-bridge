@@ -41,7 +41,18 @@ const CHAT_SAFE_PARAMS = [
   "reasoning_split",
 ];
 
+const CUSTOM_CONSERVATIVE_CHAT_SAFE_PARAMS = CHAT_SAFE_PARAMS.filter(
+  (param) =>
+    !["tools", "tool_choice", "parallel_tool_calls", "response_format"].includes(param),
+);
+
 const DEFAULT_CHAT_DROP_PARAMS = ["parallel_tool_calls", "response_format"];
+const CUSTOM_CONSERVATIVE_CHAT_DROP_PARAMS = [
+  "parallel_tool_calls",
+  "response_format",
+  "tool_choice",
+  "tools",
+];
 
 export function normalizeAdapterProfile(route = {}) {
   const providerFamily = providerFamilyForRoute(route);
@@ -83,7 +94,11 @@ export function normalizeAdapterProfile(route = {}) {
           : "text-placeholder",
     supportsResponsePreviousId: api === "responses",
     supportsPromptCaching: route.supportsPromptCaching || "unknown",
-    safeParams: api === "responses" ? RESPONSES_SAFE_PARAMS : CHAT_SAFE_PARAMS,
+    safeParams: api === "responses"
+      ? RESPONSES_SAFE_PARAMS
+      : customConservative
+        ? CUSTOM_CONSERVATIVE_CHAT_SAFE_PARAMS
+        : CHAT_SAFE_PARAMS,
     dropParams,
     maxToolContinuationTurns: positiveInteger(
       route.maxToolContinuationTurns ?? route.max_tool_continuation_turns,
@@ -170,7 +185,7 @@ function imageSupportForRoute(route, api, inputModalities, customConservative) {
 function normalizedDropParams(route, api, customConservative) {
   const configured = Array.isArray(route.dropParams) ? route.dropParams : [];
   const defaults = api === "chat_completions" && customConservative
-    ? DEFAULT_CHAT_DROP_PARAMS
+    ? CUSTOM_CONSERVATIVE_CHAT_DROP_PARAMS
     : [];
   return [...new Set([...configured, ...defaults])].sort();
 }
