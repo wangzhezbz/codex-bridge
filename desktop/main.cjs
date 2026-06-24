@@ -493,6 +493,15 @@ ipcMain.handle("router:start", async () => {
     broadcastState();
   });
 
+  lastHealth = {
+    ok: false,
+    status: 0,
+    models: [],
+    message: "Router is starting; waiting for health check...",
+    checkedAt: new Date().toISOString(),
+    starting: true,
+  };
+  broadcastState();
   await refreshRouterHealth(prepared.config);
   broadcastState();
   return { ok: true, message: "Router started." };
@@ -791,23 +800,22 @@ async function getStatePayload(settings) {
 }
 
 async function refreshRouterHealth(config) {
-  const { probeRouterHealth } = await loadRouterHealth();
+  const { waitForRouterHealth } = await loadRouterHealth();
   const host = config?.host || "127.0.0.1";
   const port = config?.port || 15722;
   const origin = `http://${host}:${port}`;
-  let result = null;
-  for (let attempt = 1; attempt <= 6; attempt += 1) {
-    result = await probeRouterHealth({ origin, timeoutMs: 1200 });
-    if (result.ok) {
-      break;
-    }
-    await delay(250);
-  }
+  const result = await waitForRouterHealth({
+    origin,
+    timeoutMs: 1500,
+    maxWaitMs: 20000,
+    intervalMs: 500,
+    isStillStarting: () => Boolean(routerProcess),
+  });
   lastHealth = result;
   appendLog(
     result.ok
       ? `Health OK: ${result.models.join(", ") || "no models listed"}.`
-      : `Health failed: ${result.message}`,
+      : `Health failed after ${result.attempts || 1} attempt(s): ${result.message}`,
   );
   return result;
 }

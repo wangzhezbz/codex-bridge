@@ -45,10 +45,49 @@ export async function probeRouterHealth({
   }
 }
 
+export async function waitForRouterHealth({
+  origin = "http://127.0.0.1:15722",
+  timeoutMs = 2500,
+  maxWaitMs = 20000,
+  intervalMs = 500,
+  fetchImpl = fetch,
+  sleepImpl = delay,
+  nowImpl = () => Date.now(),
+  isStillStarting = () => true,
+} = {}) {
+  const startedAt = nowImpl();
+  let attempts = 0;
+  let result = null;
+
+  while (true) {
+    attempts += 1;
+    result = await probeRouterHealth({ origin, timeoutMs, fetchImpl });
+    result.attempts = attempts;
+    if (result.ok) {
+      return result;
+    }
+    if (!isStillStarting()) {
+      return {
+        ...result,
+        message: `Router process exited before health check passed: ${result.message}`,
+      };
+    }
+    const remainingMs = maxWaitMs - (nowImpl() - startedAt);
+    if (remainingMs <= 0) {
+      return result;
+    }
+    await sleepImpl(Math.min(intervalMs, remainingMs));
+  }
+}
+
 function healthErrorMessage(error) {
   const cause = error?.cause?.code || error?.cause?.message || "";
   const message = error?.name === "AbortError"
     ? "Router health check timed out"
     : error?.message || String(error || "unknown error");
   return cause ? `${message} (${cause})` : message;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

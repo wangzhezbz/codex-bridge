@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { probeRouterHealth } from "../desktop/router-health.mjs";
+import { probeRouterHealth, waitForRouterHealth } from "../desktop/router-health.mjs";
 
 test("probeRouterHealth reports healthy router model list", async () => {
   const result = await probeRouterHealth({
@@ -34,4 +34,56 @@ test("probeRouterHealth reports failed router health with concrete reason", asyn
   assert.equal(result.ok, false);
   assert.equal(result.status, 0);
   assert.match(result.message, /ECONNREFUSED/);
+});
+
+test("waitForRouterHealth keeps polling while router is still starting", async () => {
+  let calls = 0;
+  const sleeps = [];
+  const result = await waitForRouterHealth({
+    origin: "http://127.0.0.1:15722",
+    timeoutMs: 10,
+    maxWaitMs: 5000,
+    intervalMs: 25,
+    sleepImpl: async (ms) => sleeps.push(ms),
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls < 4) {
+        throw Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:15722"), {
+          cause: { code: "ECONNREFUSED" },
+        });
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, models: ["gpt-5.5"] }),
+      };
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.attempts, 4);
+  assert.deepEqual(result.models, ["gpt-5.5"]);
+  assert.equal(sleeps.length, 3);
+});
+
+test("waitForRouterHealth stops polling when the router process exits", async () => {
+  let calls = 0;
+  const result = await waitForRouterHealth({
+    origin: "http://127.0.0.1:15722",
+    timeoutMs: 10,
+    maxWaitMs: 5000,
+    intervalMs: 25,
+    sleepImpl: async () => {},
+    isStillStarting: () => calls < 2,
+    fetchImpl: async () => {
+      calls += 1;
+      throw Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:15722"), {
+        cause: { code: "ECONNREFUSED" },
+      });
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.attempts, 2);
+  assert.match(result.message, /process exited/);
 });
