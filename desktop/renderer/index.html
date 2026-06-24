@@ -26,10 +26,12 @@
           <button class="nav-item" data-section="providers">密钥</button>
           <button class="nav-item" data-section="stats">统计</button>
           <button class="nav-item" data-section="codex">Codex</button>
-          <button class="nav-item" data-section="updates">更新</button>
           <button class="nav-item" data-section="logs">日志</button>
         </nav>
-        <button class="ghost-button full" id="openGitHub">GitHub</button>
+        <div class="sidebar-actions">
+          <button class="ghost-button full" id="checkUpdates">检查更新</button>
+          <button class="ghost-button full" id="openGitHub">GitHub</button>
+        </div>
       </aside>
 
       <main class="main">
@@ -246,42 +248,6 @@
             <div class="action-grid codex-actions">
               <button class="plain-button" id="generateCatalog">只生成模型目录</button>
               <button class="plain-button" id="applyCodex">只写入 Codex 配置</button>
-            </div>
-          </article>
-        </section>
-
-        <section class="section-panel hidden" id="updates">
-          <article class="panel update-panel">
-            <div class="panel-header">
-              <div>
-                <h2>软件更新</h2>
-                <p>从 GitHub Release 获取最新版，下载后退出当前程序并自动替换为新版。</p>
-              </div>
-              <div class="header-actions">
-                <button class="ghost-button light small" id="openUpdateFolder">打开更新目录</button>
-                <button class="ghost-button light small" id="openReleasePage" disabled>发布页</button>
-              </div>
-            </div>
-            <div class="update-status-card" id="updateStatus">
-              <span class="metric-label">当前版本</span>
-              <strong id="currentVersion">-</strong>
-              <p id="updateMessage">尚未检查更新。</p>
-            </div>
-            <div class="grid two update-grid">
-              <article class="metric">
-                <span class="metric-label">最新版本</span>
-                <strong id="latestVersion">-</strong>
-                <p id="updateDownloadInfo">检查后会显示当前系统匹配的更新包。</p>
-              </article>
-              <article class="metric">
-                <span class="metric-label">更新方式</span>
-                <strong>自动替换并重启</strong>
-                <p>旧程序目录会改名保留为 previous 备份，用户配置和密钥仍保存在用户数据目录。</p>
-              </article>
-            </div>
-            <div class="action-grid update-actions">
-              <button class="primary-button" id="checkUpdates">检查更新</button>
-              <button class="primary-button" id="installUpdate" disabled>下载并重启更新</button>
             </div>
           </article>
         </section>

@@ -18,12 +18,14 @@ test("desktop renderer keeps starting health state out of failed styling", () =>
   assert.match(rendererSource, /Router 正在启动/);
 });
 
-test("desktop renderer exposes direct update controls", () => {
-  assert.match(htmlSource, /data-section="updates"/);
+test("desktop renderer exposes update from sidebar without a dedicated page", () => {
+  assert.doesNotMatch(htmlSource, /data-section="updates"/);
+  assert.doesNotMatch(htmlSource, /id="updates"/);
   assert.match(htmlSource, /id="checkUpdates"/);
-  assert.match(htmlSource, /id="installUpdate"/);
+  assert.doesNotMatch(htmlSource, /id="installUpdate"/);
   assert.match(preloadSource, /checkForUpdates: \(\) => ipcRenderer\.invoke\("updates:check"\)/);
   assert.match(preloadSource, /installUpdate: \(\) => ipcRenderer\.invoke\("updates:install"\)/);
   assert.match(rendererSource, /api\.checkForUpdates\(\)/);
   assert.match(rendererSource, /api\.installUpdate\(\)/);
+  assert.match(rendererSource, /window\.confirm/);
 });

@@ -1018,9 +1018,7 @@ async function runDesktopSmokeChecks() {
           "#stats",
           "#usageChart",
           "#copyDiagnostics",
-          "#updates",
-          "#checkUpdates",
-          "#installUpdate"
+          "#checkUpdates"
         ];
         for (const selector of required) {
           if (!document.querySelector(selector)) {
@@ -1055,10 +1053,6 @@ async function runDesktopSmokeChecks() {
         document.querySelector('[data-section="stats"]').click();
         if (document.querySelector("#stats").classList.contains("hidden")) {
           throw new Error("Stats nav did not activate");
-        }
-        document.querySelector('[data-section="updates"]').click();
-        if (document.querySelector("#updates").classList.contains("hidden")) {
-          throw new Error("Updates nav did not activate");
         }
         return {
           providers: document.querySelectorAll(".provider-card").length,

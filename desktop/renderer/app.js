@@ -3,7 +3,6 @@ let state = null;
 let draftSelection = [];
 let dragSlotIndex = null;
 let editingCustomPresetId = null;
-let updatePlan = null;
 
 const els = {
   routerStatus: document.querySelector("#routerStatus"),
@@ -35,15 +34,7 @@ const els = {
   customImageInput: document.querySelector("#customImageInput"),
   cancelCustomEdit: document.querySelector("#cancelCustomEdit"),
   routerToggle: document.querySelector("#routerToggle"),
-  currentVersion: document.querySelector("#currentVersion"),
-  latestVersion: document.querySelector("#latestVersion"),
-  updateStatus: document.querySelector("#updateStatus"),
-  updateMessage: document.querySelector("#updateMessage"),
-  updateDownloadInfo: document.querySelector("#updateDownloadInfo"),
   checkUpdates: document.querySelector("#checkUpdates"),
-  installUpdate: document.querySelector("#installUpdate"),
-  openUpdateFolder: document.querySelector("#openUpdateFolder"),
-  openReleasePage: document.querySelector("#openReleasePage"),
 };
 
 document.querySelectorAll(".nav-item").forEach((button) => {
@@ -182,21 +173,26 @@ els.cancelCustomEdit.addEventListener("click", () => resetCustomModelForm());
 document.querySelector("#openConfigFolder").addEventListener("click", () => api.openFolder("config"));
 document.querySelector("#openCodexFolder").addEventListener("click", () => api.openFolder("codex"));
 document.querySelector("#openGitHub").addEventListener("click", () => api.openGitHub());
-els.openUpdateFolder.addEventListener("click", () => api.openFolder("updates"));
-els.openReleasePage.addEventListener("click", () => {
-  if (updatePlan?.releaseUrl) {
-    api.openExternal(updatePlan.releaseUrl);
-  }
-});
 els.checkUpdates.addEventListener("click", () =>
   runAction(els.checkUpdates, async () => {
-    updatePlan = await api.checkForUpdates();
-    renderUpdatePanel();
-    showToast(updatePlan.message || "更新检查完成。");
-  }),
-);
-els.installUpdate.addEventListener("click", () =>
-  runAction(els.installUpdate, async () => {
+    const updatePlan = await api.checkForUpdates();
+    if (!updatePlan.ok) {
+      throw new Error(updatePlan.message || "检查更新失败。");
+    }
+    if (!updatePlan.updateAvailable) {
+      showToast(updatePlan.message || "当前已经是最新版。");
+      return;
+    }
+    const assetText = updatePlan.asset
+      ? `\n更新包：${updatePlan.asset.name} · ${formatBytes(updatePlan.asset.size)}`
+      : "";
+    const accepted = window.confirm(
+      `发现新版本 v${updatePlan.latestVersion}，是否现在下载并重启更新？${assetText}`,
+    );
+    if (!accepted) {
+      showToast("已取消更新。");
+      return;
+    }
     const result = await api.installUpdate();
     showToast(result.message || "更新已开始，CodexBridge 将自动重启。");
   }),
@@ -258,7 +254,6 @@ function render() {
   renderCustomFormState();
   renderUsage();
   renderOverviewUsage();
-  renderUpdatePanel();
   renderLogs(state.logs || []);
 }
 
@@ -287,20 +282,6 @@ function renderRouterToggle() {
   els.routerToggle.setAttribute("aria-pressed", state.routerRunning ? "true" : "false");
   els.routerToggle.querySelector("strong").textContent = state.routerRunning ? "Router 运行中" : "Router 已关闭";
   els.routerToggle.querySelector("small").textContent = state.routerRunning ? "点击关闭本地网关" : "点击启动本地网关";
-}
-
-function renderUpdatePanel() {
-  els.currentVersion.textContent = state?.appVersion ? `v${state.appVersion}` : "-";
-  els.latestVersion.textContent = updatePlan?.latestVersion ? `v${updatePlan.latestVersion}` : "-";
-  els.updateMessage.textContent = updatePlan?.message || "尚未检查更新。";
-  els.updateDownloadInfo.textContent = updatePlan?.asset
-    ? `${updatePlan.asset.name} · ${formatBytes(updatePlan.asset.size)}`
-    : "检查后会显示当前系统匹配的更新包。";
-  els.updateStatus.classList.toggle("ok", Boolean(updatePlan?.ok && !updatePlan.updateAvailable));
-  els.updateStatus.classList.toggle("bad", Boolean(updatePlan && !updatePlan.ok));
-  els.updateStatus.classList.toggle("ready", Boolean(updatePlan?.ok && updatePlan.updateAvailable));
-  els.installUpdate.disabled = !updatePlan?.ok || !updatePlan.updateAvailable || !updatePlan.asset;
-  els.openReleasePage.disabled = !updatePlan?.releaseUrl;
 }
 
 function renderProviders() {
