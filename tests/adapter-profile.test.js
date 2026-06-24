@@ -84,49 +84,164 @@ test("custom chat routes default to conservative text-only behavior", () => {
   assert.deepEqual(profile.dropParams, ["parallel_tool_calls", "response_format"]);
 });
 
-test("all built-in presets normalize to complete adapter profiles", () => {
-  const seenAdapterIds = new Set();
-  const seenProviderFamilies = new Set();
+const BUILT_IN_PROVIDER_CONTRACTS = {
+  codex: {
+    providerFamily: "openai",
+    adapterId: "responses-native",
+    api: "responses",
+    supportsTools: "native",
+    supportsFiles: "native",
+    supportsResponsePreviousId: true,
+  },
+  openai: {
+    providerFamily: "openai",
+    adapterId: "responses-native",
+    api: "responses",
+    supportsTools: "native",
+    supportsFiles: "native",
+    supportsResponsePreviousId: true,
+  },
+  deepseek: {
+    providerFamily: "deepseek",
+    adapterId: "chat-deepseek",
+    api: "chat_completions",
+    supportsTools: "chat-functions",
+    supportsFiles: "text-placeholder",
+    supportsResponsePreviousId: false,
+  },
+  kimi: {
+    providerFamily: "kimi",
+    adapterId: "chat-kimi",
+    api: "chat_completions",
+    supportsTools: "chat-functions",
+    supportsFiles: "text-placeholder",
+    supportsResponsePreviousId: false,
+  },
+  xiaomi: {
+    providerFamily: "openai-compatible",
+    adapterId: "chat-openai-compatible",
+    api: "chat_completions",
+    supportsTools: "chat-functions",
+    supportsFiles: "text-placeholder",
+    supportsResponsePreviousId: false,
+  },
+  minimax: {
+    providerFamily: "minimax",
+    adapterId: "chat-minimax",
+    api: "chat_completions",
+    supportsTools: "chat-functions",
+    supportsFiles: "text-placeholder",
+    supportsResponsePreviousId: false,
+  },
+  stepfun: {
+    providerFamily: "openai-compatible",
+    adapterId: "chat-openai-compatible",
+    api: "chat_completions",
+    supportsTools: "chat-functions",
+    supportsFiles: "text-placeholder",
+    supportsResponsePreviousId: false,
+  },
+  qianfan: {
+    providerFamily: "baidu",
+    adapterId: "chat-openai-compatible",
+    api: "chat_completions",
+    supportsTools: "chat-functions",
+    supportsFiles: "text-placeholder",
+    supportsResponsePreviousId: false,
+  },
+  hunyuan: {
+    providerFamily: "openai-compatible",
+    adapterId: "chat-openai-compatible",
+    api: "chat_completions",
+    supportsTools: "chat-functions",
+    supportsFiles: "text-placeholder",
+    supportsResponsePreviousId: false,
+  },
+  volcengine: {
+    providerFamily: "doubao",
+    adapterId: "chat-doubao",
+    api: "chat_completions",
+    supportsTools: "chat-functions",
+    supportsFiles: "text-placeholder",
+    supportsResponsePreviousId: false,
+  },
+  qwen: {
+    providerFamily: "qwen",
+    adapterId: "chat-qwen",
+    api: "chat_completions",
+    supportsTools: "chat-functions",
+    supportsFiles: "text-placeholder",
+    supportsResponsePreviousId: false,
+  },
+  zhipu: {
+    providerFamily: "openai-compatible",
+    adapterId: "chat-openai-compatible",
+    api: "chat_completions",
+    supportsTools: "chat-functions",
+    supportsFiles: "text-placeholder",
+    supportsResponsePreviousId: false,
+  },
+  openrouter: {
+    providerFamily: "openai-compatible",
+    adapterId: "chat-openai-compatible",
+    api: "chat_completions",
+    supportsTools: "chat-functions",
+    supportsFiles: "text-placeholder",
+    supportsResponsePreviousId: false,
+  },
+  siliconflow: {
+    providerFamily: "openai-compatible",
+    adapterId: "chat-openai-compatible",
+    api: "chat_completions",
+    supportsTools: "chat-functions",
+    supportsFiles: "text-placeholder",
+    supportsResponsePreviousId: false,
+  },
+};
 
-  for (const route of MODEL_PRESETS) {
-    const profile = normalizeAdapterProfile(route);
-
-    assert.equal(typeof profile.adapterId, "string");
-    assert.notEqual(profile.adapterId.length, 0);
-    assert.equal(typeof profile.providerFamily, "string");
-    assert.notEqual(profile.providerFamily.length, 0);
-    assert.ok(Array.isArray(profile.safeParams));
-    assert.ok(profile.safeParams.length > 0);
-    assert.equal(profile.customConservative, false);
-    assert.ok(profile.supportsFiles === "native" || profile.supportsFiles === "text-placeholder");
-
-    seenAdapterIds.add(profile.adapterId);
-    seenProviderFamilies.add(profile.providerFamily);
+function expectedImageSupport(profileApi, inputModalities) {
+  if (!Array.isArray(inputModalities) || !inputModalities.includes("image")) {
+    return "none";
   }
 
-  for (const adapterId of [
-    "responses-native",
-    "chat-deepseek",
-    "chat-kimi",
-    "chat-minimax",
-    "chat-doubao",
-    "chat-qwen",
-    "chat-openai-compatible",
-  ]) {
-    assert.ok(seenAdapterIds.has(adapterId), `missing adapter category: ${adapterId}`);
-  }
+  return profileApi === "responses" ? "native" : "chat-image-url";
+}
 
-  for (const providerFamily of [
-    "openai",
-    "deepseek",
-    "kimi",
-    "minimax",
-    "doubao",
-    "qwen",
-  ]) {
-    assert.ok(seenProviderFamilies.has(providerFamily), `missing provider family: ${providerFamily}`);
-  }
+const BUILT_IN_PROVIDER_IDS = [...new Set(MODEL_PRESETS.map((route) => route.providerId))].sort();
+const EXPECTED_PROVIDER_IDS = Object.keys(BUILT_IN_PROVIDER_CONTRACTS).sort();
+
+test("built-in preset providerId set matches shipped categories", () => {
+  assert.deepEqual(BUILT_IN_PROVIDER_IDS, EXPECTED_PROVIDER_IDS);
 });
+
+const MODEL_PRESETS_BY_PROVIDER_ID = new Map();
+for (const route of MODEL_PRESETS) {
+  const routes = MODEL_PRESETS_BY_PROVIDER_ID.get(route.providerId) || [];
+  routes.push(route);
+  MODEL_PRESETS_BY_PROVIDER_ID.set(route.providerId, routes);
+}
+
+for (const [providerId, expected] of Object.entries(BUILT_IN_PROVIDER_CONTRACTS)) {
+  test(`built-in preset contract: ${providerId}`, () => {
+    const routes = MODEL_PRESETS_BY_PROVIDER_ID.get(providerId);
+    assert.ok(routes, `missing presets for providerId: ${providerId}`);
+
+    for (const route of routes) {
+      const profile = normalizeAdapterProfile(route);
+
+      assert.equal(profile.providerFamily, expected.providerFamily, `${route.presetId} providerFamily`);
+      assert.equal(profile.adapterId, expected.adapterId, `${route.presetId} adapterId`);
+      assert.equal(profile.api, expected.api, `${route.presetId} api`);
+      assert.equal(profile.supportsTools, expected.supportsTools, `${route.presetId} supportsTools`);
+      assert.equal(profile.supportsFiles, expected.supportsFiles, `${route.presetId} supportsFiles`);
+      assert.equal(profile.supportsResponsePreviousId, expected.supportsResponsePreviousId, `${route.presetId} supportsResponsePreviousId`);
+      assert.equal(profile.supportsImages, expectedImageSupport(profile.api, route.inputModalities), `${route.presetId} supportsImages`);
+      assert.equal(profile.customConservative, false, `${route.presetId} customConservative`);
+      assert.ok(Array.isArray(profile.safeParams), `${route.presetId} safeParams`);
+      assert.ok(profile.safeParams.length > 0, `${route.presetId} safeParams length`);
+    }
+  });
+}
 
 test("payload filtering keeps only adapter-safe chat parameters", () => {
   const payload = {
