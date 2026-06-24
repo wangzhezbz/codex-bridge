@@ -1,428 +1,428 @@
-# All-Model Session Safety Design
+# 全模型会话安全设计
 
-## Summary
+## 摘要
 
-CodexBridge needs a stronger session layer before adding more model-switching behavior. The product must keep all built-in and custom models usable without breaking Codex tasks, losing tool capability, sending unsupported provider parameters, corrupting history, looping on tools, or burning user tokens after a task is already stuck.
+CodexBridge 在继续增强模型切换能力之前，必须先补上一层更稳定的会话安全协议。它要保证所有内置模型和自定义模型在可用范围内稳定工作，不因为切换模型导致 Codex 任务损坏、工具能力丢失、上游参数报错、历史被污染、工具无限循环，或者在任务已经卡住后继续消耗用户 token。
 
-This design adds an all-model compatibility contract around the existing router. The router keeps its current Responses endpoint and provider adapters, but introduces explicit session state, model capability metadata, request rendering budgets, attachment policy, compression policy, and safety watchdogs.
+这份设计给现有路由器外面加一套“全模型兼容契约”。本地入口仍然是 Codex 使用的 Responses API，现有 provider 转换逻辑继续保留，但要逐步引入显式的会话状态、模型能力矩阵、请求渲染预算、附件策略、上下文压缩策略和安全熔断器。
 
-The goal is not to make every upstream model equally capable. Some models do not support tools, images, files, long context, or Responses-native workflows. The goal is to make those limits explicit and safe: unsupported capability should degrade locally or route to a capable model, not fail through repeated upstream trial-and-error.
+目标不是让所有上游模型都拥有同等能力。有些模型天然不支持工具、图片、文件、长上下文或 Responses 原生流程。目标是把这些限制显式化并安全处理：不支持就本地降级、明确提示或切到有能力的模型，而不是反复向上游试错。
 
-## Non-Negotiable Release Gates
+## 不可破坏的发布红线
 
-No release should ship if any of these regress:
+只要下面任意一条退化，就不能发版：
 
-- Any built-in preset model cannot complete a normal text request.
-- Any built-in preset model receives a known-unsupported parameter and returns provider 400 or 422 because of CodexBridge.
-- Tool results disappear during a model switch.
-- MCP namespace tools are dropped or renamed incorrectly.
-- A provider that does not support images or files is repeatedly called with image or file payloads.
-- A task keeps making upstream requests after repeated identical tool calls, identical tool outputs, identical provider errors, or client disconnect.
-- A small-context model permanently truncates or overwrites the global conversation state.
-- A model switch causes Codex to see only a short generic answer when tool output or conversation state should still be available.
+- 任意内置预设模型无法完成普通文本请求。
+- 任意内置预设模型因为 CodexBridge 转发了已知不支持的参数而返回 provider 400 或 422。
+- 模型切换后工具结果丢失。
+- MCP namespace 工具被丢弃、改名错误，或无法映射回 Codex。
+- 不支持图片或文件的 provider 被反复发送图片或文件 payload。
+- 一个任务在出现重复工具调用、重复工具输出、重复 provider 错误或客户端断开后仍继续请求上游。
+- 小上下文模型永久裁剪或覆盖全局会话状态。
+- 模型切换后，Codex 明明应该看到工具结果或历史状态，却只收到一句泛泛而谈的短回答。
 
-These gates apply to all built-in model categories, not only DeepSeek and Kimi:
+这些红线覆盖所有模型类别，不只覆盖 DeepSeek 和 Kimi：
 
-- GPT / native Responses routes.
-- OpenAI-compatible chat routes.
-- Domestic providers such as DeepSeek, Kimi, MiniMax, Doubao, Qwen, Baidu, and any enabled presets.
-- Vision-capable routes.
-- Text-only routes.
-- Conservative custom-model routes.
+- GPT / 原生 Responses 路由。
+- 通用 OpenAI-compatible chat 路由。
+- DeepSeek、Kimi、MiniMax、豆包、通义、百度、Gemini 等内置预设。
+- 支持视觉的模型。
+- 纯文本模型。
+- 自定义模型的保守模式。
 
-Custom models cannot be guaranteed to support every Codex task, but CodexBridge must not make them unsafe. Unknown custom models default to conservative behavior: text-only, minimal parameters, short context budget, no images, no files, no speculative tool features unless the user explicitly enables them.
+自定义模型不能保证完成所有 Codex 任务，因为它们可能本身不支持工具、图片、文件或长上下文。但 CodexBridge 必须保证：未知自定义模型默认安全保守，按纯文本、最小参数、短上下文、无图片、无文件、无推测工具能力处理；只有用户显式开启某项能力后，才允许使用对应能力。
 
-## Existing State
+## 当前已有基础
 
-The current implementation already has useful protections:
+现有实现已经有一些重要保护：
 
-- `ResponseHistory` keeps a unified local chat history so a small model's upstream truncation does not overwrite the larger history.
-- Chat routes trim payloads to the route's `contextWindow` before sending upstream.
-- MCP namespace tools are flattened for chat-completions providers.
-- Tool call and tool result pairs are normalized so providers receive coherent history.
-- Images can be removed and retried when a chat provider rejects image content.
-- Oversized data-image URLs are replaced with placeholders before chat requests.
-- Request bodies are capped at 25 MB, including decoded compressed bodies.
-- Client disconnect aborts upstream fetches.
-- Upstream timeouts, failure caching, rate-limit local fallback, and chat tool-loop guard reduce runaway token use.
+- `ResponseHistory` 保存统一本地 chat history，避免小模型的上游裁剪污染大模型历史。
+- chat 路由在发送上游前按该 route 的 `contextWindow` 裁剪 payload。
+- MCP namespace 工具会为 chat-completions provider 做扁平化映射。
+- 工具调用和工具结果会尽量成对规范化，避免 provider 收到断裂历史。
+- chat provider 拒绝图片时，可以去掉图片并重试文本。
+- 超大的 data image URL 会在 chat 请求前替换成占位文本。
+- 请求体有 25 MB 限制，压缩体解压后也会再次检查。
+- 客户端断开会中止上游请求。
+- 上游超时、失败短路、rate limit 本地回退、chat 工具循环 guard 已经能降低 token 跑飞风险。
 
-The missing piece is a coherent protocol that tells the router how to render one canonical conversation safely for many different model capabilities.
+缺失的是一套统一协议：同一个 canonical conversation 应该如何安全地渲染给不同能力、不同上下文长度、不同工具格式的模型。
 
-## Architecture
+## 架构设计
 
-### 1. Conversation State
+### 1. 会话状态层
 
-Introduce a `ConversationState` layer behind `ResponseHistory`.
+在 `ResponseHistory` 后面引入 `ConversationState`。
 
-It owns the canonical session record:
+它负责保存模型无关的 canonical session record：
 
-- User turns.
-- Assistant text.
-- Reasoning-visible public summaries only, not hidden chain of thought.
-- Tool calls.
-- Tool outputs.
-- Attachment metadata.
-- Local fallback messages.
-- Compression summaries.
-- Per-response metadata.
+- 用户轮次。
+- 助手可见文本。
+- 只保存公开摘要，不保存隐藏思维链。
+- 工具调用。
+- 工具输出。
+- 附件元信息。
+- 本地 fallback 消息。
+- 压缩摘要。
+- 每个 response 的元数据。
 
-The canonical record is model-neutral and never stores a provider-trimmed payload as the source of truth. A small model may receive a short rendered view, but that view cannot replace the canonical conversation.
+canonical 记录永远不能存成某个 provider 已经裁剪过的 payload。小模型可以拿到一个短视图，但这个短视图不能反过来覆盖全局会话。
 
-The existing `ResponseHistory` can remain as the first storage backend, but its responsibilities should narrow:
+现有 `ResponseHistory` 可以作为第一版存储后端，但职责要收窄：
 
-- Store canonical turns.
-- Store provider response objects for Codex probes.
-- Store metadata needed for handoff and safety decisions.
-- Keep byte and entry limits so memory stays bounded.
+- 保存 canonical turns。
+- 保存 Codex probe 需要的 provider response object。
+- 保存模型切换和安全判断需要的 metadata。
+- 用 byte limit 和 entry limit 控制内存。
 
-### 2. Model Capability Matrix
+### 2. 模型能力矩阵
 
-Every route gets normalized capabilities. Built-in presets define them explicitly; custom models derive safe defaults.
+每个 route 都要生成一份标准化能力描述。内置预设显式声明能力，自定义模型使用安全默认值。
 
-Capability fields:
+能力字段包括：
 
-- `api`: `responses` or `chat_completions`.
-- `providerFamily`: OpenAI, DeepSeek, Kimi, MiniMax, Doubao, Qwen, Gemini, Baidu, generic OpenAI-compatible, or custom.
-- `contextWindow`: real upstream input window.
-- `catalogContextWindow`: what Codex sees in model catalog.
-- `supportsTools`: native, chat-functions, limited, or none.
-- `supportsMcpNamespaces`: true only when the adapter can preserve names safely.
-- `supportsImages`: native, chat-image-url, text-placeholder, or none.
-- `supportsFiles`: native, text-placeholder, or none.
-- `supportsResponsePreviousId`: true for known upstream Responses routes that can own previous response state.
-- `supportsPromptCaching`: unknown, provider-native, or false.
-- `safeParams`: allow-list of request fields that may be forwarded.
-- `dropParams`: explicit denied fields, used after `safeParams`.
-- `maxToolContinuationTurns`: per-route loop limit.
-- `upstreamTimeoutMs`: per-route timeout.
+- `api`：`responses` 或 `chat_completions`。
+- `providerFamily`：OpenAI、DeepSeek、Kimi、MiniMax、Doubao、Qwen、Gemini、Baidu、generic OpenAI-compatible 或 custom。
+- `contextWindow`：真实上游输入窗口。
+- `catalogContextWindow`：暴露给 Codex 模型目录的窗口。
+- `supportsTools`：native、chat-functions、limited 或 none。
+- `supportsMcpNamespaces`：只有 adapter 能安全保留 namespace 时才为 true。
+- `supportsImages`：native、chat-image-url、text-placeholder 或 none。
+- `supportsFiles`：native、text-placeholder 或 none。
+- `supportsResponsePreviousId`：只有真正能维护 upstream previous response state 的 Responses route 才为 true。
+- `supportsPromptCaching`：unknown、provider-native 或 false。
+- `safeParams`：允许转发的参数白名单。
+- `dropParams`：显式禁止字段，在 `safeParams` 之后兜底。
+- `maxToolContinuationTurns`：每个 route 的工具循环阈值。
+- `upstreamTimeoutMs`：每个 route 的上游超时。
 
-The router should generate a single normalized `AdapterProfile` for each route at startup and after config reload. Tests should assert that each built-in preset has a profile.
+路由启动和配置热加载后，都要为每个 route 生成一个 `AdapterProfile`。测试必须断言每个内置预设都有 profile。
 
-### 3. Provider Adapters
+### 3. Provider Adapter
 
-Provider-specific logic should move out of scattered conditionals and into adapters.
+provider 特殊逻辑要从零散条件判断中收拢到 adapter。
 
-Each adapter handles:
+每个 adapter 负责：
 
-- Parameter allow-listing.
-- Tool schema shaping.
-- Tool-call response conversion.
-- Image and file rendering.
-- Provider-specific schema quirks.
-- Error classification.
-- Cache-awareness hints.
-- Fallback behavior.
+- 参数白名单。
+- 工具 schema 整形。
+- 工具调用返回转换。
+- 图片和文件渲染。
+- provider 特殊 schema 兼容。
+- 错误分类。
+- prompt cache 相关提示。
+- fallback 行为。
 
-Initial adapters:
+第一批 adapter：
 
-- `responses-native`: GPT / Codex auth routes.
-- `chat-openai-compatible`: generic conservative baseline.
-- `chat-deepseek`.
-- `chat-kimi`.
-- `chat-minimax`.
-- `chat-doubao`.
-- `chat-qwen`.
-- `chat-gemini`.
-- `custom-conservative`.
+- `responses-native`：GPT / Codex auth 路由。
+- `chat-openai-compatible`：通用保守基线。
+- `chat-deepseek`。
+- `chat-kimi`。
+- `chat-minimax`。
+- `chat-doubao`。
+- `chat-qwen`。
+- `chat-gemini`。
+- `custom-conservative`。
 
-The generic adapter must be strict. A provider-specific adapter may add capabilities only when tests prove support.
+通用 adapter 必须严格保守。provider 专用 adapter 只有在测试证明支持后，才能增加能力。
 
-### 4. Render Budget
+### 4. 请求渲染预算
 
-Before each upstream request, CodexBridge renders the canonical conversation into a provider payload.
+每次请求上游前，CodexBridge 都从 canonical conversation 渲染 provider payload。
 
-Render steps:
+渲染步骤：
 
-1. Gather canonical history from `ConversationState`.
-2. Choose adapter profile for the selected route.
-3. Build stable system prefix:
-   - User/developer instructions.
-   - Bridge tool guidance only when needed.
-   - Capability limitation note only when needed.
-4. Add global compressed summary if present.
-5. Add recent turns with tool-call pairs preserved.
-6. Add current user input and current tool outputs.
-7. Apply adapter-specific trimming.
-8. Validate the final payload against adapter rules before fetch.
+1. 从 `ConversationState` 获取 canonical history。
+2. 根据 route 选择 adapter profile。
+3. 构建稳定 system prefix：
+   - 用户和 developer 指令。
+   - 只有需要时才加入 Bridge 工具指导。
+   - 只有需要时才加入能力限制说明。
+4. 加入全局压缩摘要。
+5. 加入最近轮次，并保留工具调用/工具结果配对。
+6. 加入当前用户输入和当前工具输出。
+7. 执行 adapter 专属裁剪。
+8. fetch 之前验证最终 payload 是否符合 adapter 规则。
 
-The stable prefix matters for provider prompt caching. The renderer should avoid inserting volatile text such as timestamps, random IDs, noisy diagnostics, or repeated guidance unless the request actually needs it.
+稳定 prefix 对 provider prompt cache 很重要。renderer 不应插入时间戳、随机 id、噪声诊断、重复工具指导等会破坏缓存前缀的内容，除非当前请求真的需要。
 
-The renderer should report budget diagnostics internally:
+renderer 内部要输出预算诊断：
 
-- Canonical token estimate.
-- Rendered token estimate.
-- Summary tokens.
-- Recent-turn tokens.
-- Attachment placeholder tokens.
-- Dropped historical turns count.
-- Whether tool-call pairs were flattened.
+- canonical token 估算。
+- rendered token 估算。
+- 摘要 token。
+- 最近轮次 token。
+- 附件占位 token。
+- 被丢弃的历史轮次数。
+- 工具调用配对是否被 flatten。
 
-These diagnostics go to sanitized logs and tests, not to the model unless needed.
+这些信息写入脱敏日志和测试，不默认暴露给模型。
 
-### 5. Prompt Cache Strategy
+### 5. Prompt Cache 策略
 
-CodexBridge cannot force provider prompt caching, but it can avoid destroying cacheable prefixes.
+CodexBridge 不能强制 provider 命中 prompt cache，但可以避免自己破坏可缓存前缀。
 
-Rules:
+规则：
 
-- Keep stable instructions stable across model switches.
-- Put bridge guidance in deterministic sections and only when relevant.
-- Do not include provider error text in the reusable prefix.
-- Do not include route names or transient request IDs in prompt content.
-- Prefer canonical summaries over reflowed raw history for older context.
-- For same provider and same model, keep rendered older context byte-identical when the canonical history has not changed.
+- 模型切换时保持稳定指令结构。
+- Bridge 指导按确定性 section 插入，并且只在相关请求出现。
+- 不把 provider 错误文本放进可复用 prefix。
+- 不把 route 名、临时 request id、时间戳放进 prompt 内容。
+- 老历史优先使用 canonical summary，而不是每次重新排版原始长历史。
+- 同 provider、同模型、canonical history 未变化时，旧上下文渲染结果应尽量 byte-identical。
 
-Model switching still lowers cache hit rate because the upstream model/provider changes. The target is not cross-provider cache reuse; the target is preventing unnecessary churn inside a provider.
+跨 provider 切换本来就会降低缓存命中率。目标不是让不同 provider 共用缓存，而是避免同一 provider 内部因为 Bridge 自己的渲染抖动导致缓存命中变差。
 
-### 6. Compression Policy
+### 6. 上下文压缩策略
 
-Compression is global by default, model-specific only as a rendered view.
+压缩默认是全局的，模型专属只作为 rendered view。
 
-Canonical state can contain:
+canonical state 可以包含：
 
-- `globalSummary`: provider-neutral summary for all models.
-- `toolLedger`: compact record of completed tools and important outputs.
-- `attachmentLedger`: compact record of attachments, screenshots, images, and omitted file details.
-- `modelViewCache`: optional per-model rendered summaries used for performance, never source of truth.
+- `globalSummary`：所有模型共用的 provider-neutral 摘要。
+- `toolLedger`：已完成工具和关键输出的紧凑记录。
+- `attachmentLedger`：附件、截图、图片、被省略文件详情的紧凑记录。
+- `modelViewCache`：可选的每模型渲染摘要，只用于性能，不能作为事实源。
 
-Compression trigger:
+触发压缩的条件：
 
-- Canonical estimated size exceeds a configured threshold.
-- A route cannot fit required recent turns plus minimum tool ledger.
-- User explicitly asks to compress or continue long context.
+- canonical 估算大小超过阈值。
+- 某个 route 无法同时容纳必要最近轮次和最小工具 ledger。
+- 用户明确要求压缩或继续长上下文。
 
-Compression model selection:
+压缩模型选择：
 
-- Prefer a native Responses route with strong context and tool compatibility.
-- If no native route is available, use the best configured model marked `canSummarizeSafely`.
-- If no safe summarizer exists, do not compress destructively. Use deterministic truncation plus a local warning.
+- 优先使用强上下文、强工具兼容的原生 Responses route。
+- 如果没有原生 route，使用配置中标记为 `canSummarizeSafely` 的最佳模型。
+- 如果没有安全 summarizer，不做破坏性压缩，只做确定性裁剪并给本地提示。
 
-Compression output must be structured:
+压缩输出必须结构化：
 
-- Current objective.
-- Decisions.
-- Files and paths.
-- Tool results that matter.
-- External constraints.
-- Open tasks.
-- Known failed attempts.
-- Attachments and whether their contents were actually seen.
+- 当前目标。
+- 已做决定。
+- 文件和路径。
+- 关键工具结果。
+- 外部约束。
+- 未完成任务。
+- 已知失败尝试。
+- 附件信息，以及附件内容是否真的被模型看过。
 
-A small model's rendered context or summary cannot overwrite `globalSummary` unless it was produced by the selected compression policy and passes validation.
+小模型的 rendered context 或临时摘要不能覆盖 `globalSummary`，除非它是由压缩策略选中的模型生成，并且通过验证。
 
-### 7. Attachment Policy
+### 7. 附件策略
 
-Attachment handling must be explicit and per-model.
+附件必须按模型能力显式处理。
 
-Images:
+图片：
 
-- Native image-capable Responses routes receive image parts when within request size limits.
-- Chat routes that support image URLs receive image URL parts when the adapter allows it.
-- Text-only or unknown routes receive a deterministic placeholder with filename/type/size when known.
-- Oversized data images are not forwarded to chat providers. They become attachment ledger entries and placeholders.
+- 原生支持图片的 Responses route，在请求大小限制内接收 image part。
+- 支持 image URL 的 chat route，在 adapter 允许时接收 image URL part。
+- 纯文本或未知 route 接收确定性占位文本，尽量包含文件名、类型、大小。
+- 超大 data image 不转发给 chat provider，改写入 attachment ledger 并放入占位文本。
 
-Files:
+文件：
 
-- Native file-capable routes may receive supported file input only when the request format is known safe.
-- Chat providers do not receive raw file data by default.
-- Unsupported file input becomes a placeholder that says the file was not forwarded and includes safe metadata.
-- If a task clearly needs file contents and the selected model cannot receive them, CodexBridge should prefer a capable native route when auto-routing is enabled, or return a local explanation when auto-routing is disabled.
+- 原生支持文件的 route，只有在请求格式确认安全时才接收支持的 file input。
+- chat provider 默认不接收原始文件数据。
+- 不支持的文件输入变成占位文本，说明文件未转发，并带安全元信息。
+- 如果任务明显需要文件内容，而当前模型无法接收文件：开启 `autoRouteCapabilities` 时优先切到有能力的原生 route；关闭时返回本地解释，不向上游试错。
 
-Large request bodies:
+大请求：
 
-- Keep the existing 25 MB decoded request cap.
-- Add tests for compressed-body expansion over the limit.
-- Add adapter tests for oversized image, unsupported image, unsupported file, and mixed text/image/file turns.
+- 保留现有 25 MB decoded request cap。
+- 增加压缩体解压后超过限制的测试。
+- 增加超大图片、不支持图片、不支持文件、混合 text/image/file 的 adapter 测试。
 
-### 8. Tool, MCP, Skill, And Hook Safety
+### 8. 工具、MCP、Skill、Hook 安全
 
-Codex owns local tools. CodexBridge must preserve the tool contract while translating model APIs.
+本地工具归 Codex 执行。CodexBridge 要保证翻译模型 API 时不破坏工具契约。
 
-Rules:
+规则：
 
-- Never drop current-turn tools silently.
-- Never expose a tool call name that Codex cannot map back.
-- Preserve namespace prefixes for MCP tools.
-- Preserve complete assistant tool-call plus tool-output pairs when the provider supports them.
-- Flatten historical tool-call pairs into system context only when the provider cannot replay them safely.
-- Do not ask chat providers to bootstrap native Browser, Chrome, or Computer Use plugins unless the required tool is present and supported.
-- If a model cannot use the needed tool class, local fallback should be explicit.
+- 不能静默丢弃当前轮 tools。
+- 不能暴露 Codex 无法映射回来的 tool call name。
+- MCP 工具必须保留 namespace 前缀。
+- provider 支持时，保留完整 assistant tool-call + tool-output 配对。
+- provider 无法安全 replay 历史工具调用时，才能把历史配对 flatten 成 system context。
+- chat provider 不应引导 native Browser、Chrome、Computer Use 插件 bootstrap，除非必要工具存在且支持。
+- 模型无法使用所需工具类别时，要本地明确 fallback。
 
-Hook and plugin behavior should be treated as current-turn capability, not historical memory. Old prompts mentioning a plugin must not force new plugin bootstrap on later turns.
+Hook 和插件行为按当前轮能力处理，不按历史记忆处理。旧 prompt 提到插件，不能导致后续轮次自动反复 bootstrap 插件。
 
-### 9. Safety Watchdog
+### 9. 安全熔断器
 
-Add a request-level and conversation-level watchdog.
+增加 request-level 和 conversation-level watchdog。
 
-It tracks:
+跟踪内容：
 
-- Upstream request count per user turn.
-- Consecutive tool continuations.
-- Repeated tool call name plus arguments.
-- Repeated tool output with no new user input.
-- Repeated provider error fingerprint.
-- Repeated local fallback reason.
-- Client disconnect and timeout.
-- Token usage growth per turn.
+- 单个用户 turn 的上游请求次数。
+- 连续工具续写次数。
+- 重复 tool name + arguments。
+- 没有新用户输入时重复 tool output。
+- 重复 provider error fingerprint。
+- 重复本地 fallback reason。
+- 客户端断开和 timeout。
+- 单轮 token 使用增长。
 
-Actions:
+触发动作：
 
-- Stop locally when a loop threshold is reached.
-- Do not call upstream again after stop.
-- Preserve the latest useful tool result.
-- Return a concise local response explaining why CodexBridge stopped.
-- Log sanitized diagnostics.
+- 达到循环阈值后本地停止。
+- 停止后不再请求上游。
+- 保留最新有用工具结果。
+- 返回简洁本地解释，说明为什么 CodexBridge 停止。
+- 写入脱敏诊断日志。
 
-Default limits:
+默认限制：
 
-- Upstream timeout: 5 minutes.
-- Consecutive chat tool continuations: 2 by default, lower for weak adapters.
-- Repeated identical tool call: stop on second repeat within the same user turn.
-- Repeated identical upstream error: short-circuit for a bounded cooldown.
-- Provider 401: do not cache; user may fix auth.
+- 上游超时：5 分钟。
+- chat 连续工具续写：默认 2 次，弱 adapter 可以更低。
+- 重复相同工具调用：同一用户 turn 内第二次重复就停止。
+- 重复相同上游错误：短时间内本地短路。
+- provider 401 不缓存，因为用户可能马上修 auth。
 
-### 10. Auto-Routing Policy
+### 10. 自动路由策略
 
-Model switching should remain user-controlled by default. Automatic route changes are allowed only for safety or capability preservation and must be visible in metadata/logs.
+模型切换默认仍由用户控制。自动切换只允许用于安全或能力保全，并且必须在 metadata/log 中可见。
 
-Allowed automatic decisions:
+允许的自动决策：
 
-- Use native Responses route for compression when configured.
-- Use native file/image-capable route when a selected model cannot handle a required attachment and `autoRouteCapabilities` is enabled.
-- Return local fallback instead of upstream call when no safe route exists.
+- 压缩时使用配置好的原生 Responses route。
+- 当前模型无法处理必要附件且 `autoRouteCapabilities` 开启时，使用有文件/图片能力的原生 route。
+- 没有安全 route 时，返回本地 fallback，而不是上游试错。
 
-Disallowed decisions:
+禁止的自动决策：
 
-- Silently switch providers for ordinary text because another model might answer better.
-- Retry across providers after a provider rejects parameters.
-- Keep trying weaker models after a tool loop.
+- 普通文本请求因为另一个模型可能更好，就静默切 provider。
+- provider 拒绝参数后跨 provider 反复重试。
+- 工具循环后继续尝试更弱模型。
 
-### 11. Observability
+### 11. 可观测性
 
-Diagnostics must help prove where a request went and why.
+诊断必须能说明请求实际去了哪里、为什么这样处理。
 
-Add sanitized logs for:
+增加脱敏日志：
 
-- Route id.
-- Upstream model.
-- Adapter id.
-- Capability decisions.
-- Dropped params.
-- Attachment handling decision.
-- Render budget summary.
-- Watchdog decisions.
-- Token usage and cached token usage when provider reports it.
+- route id。
+- upstream model。
+- adapter id。
+- 能力决策。
+- 被丢弃的参数。
+- 附件处理决策。
+- 渲染预算摘要。
+- watchdog 决策。
+- token 用量和 provider 返回的 cached token 用量。
 
-Diagnostics must not include:
+诊断禁止包含：
 
-- API keys.
-- Bearer tokens.
-- URL userinfo.
-- Raw large file contents.
-- Raw base64 image/file payloads.
+- API key。
+- Bearer token。
+- URL userinfo。
+- 原始大文件内容。
+- 原始 base64 图片/文件 payload。
 
-### 12. Verification Plan
+## 验证计划
 
-Tests are part of the design, not cleanup work.
+测试是设计的一部分，不是事后补丁。
 
-Adapter contract tests:
+Adapter contract 测试：
 
-- Every built-in preset has a normalized adapter profile.
-- Every adapter has a safe parameter allow-list.
-- Unsupported params are dropped before fetch.
-- Custom conservative adapter forwards only minimal safe fields.
+- 每个内置预设都有标准化 adapter profile。
+- 每个 adapter 都有参数安全白名单。
+- fetch 前会丢弃不支持参数。
+- 自定义保守 adapter 只转发最小安全字段。
 
-Conversation rendering tests:
+Conversation rendering 测试：
 
-- Large canonical history renders differently for small and large models without mutating canonical state.
-- Stable prefix remains byte-identical across repeated same-provider turns when history does not change.
-- Tool-call pairs remain paired or flatten with safe headers.
-- MCP names survive round trip.
-- Current user input is always preserved.
+- 大 canonical history 对小模型和大模型渲染不同，但不会修改 canonical state。
+- 同 provider 重复请求时，稳定 prefix 在 history 未变化时 byte-identical。
+- 工具调用配对能保持配对，或用安全 header flatten。
+- MCP 名称往返不丢失。
+- 当前用户输入永远保留。
 
-Attachment tests:
+附件测试：
 
-- Oversized data image becomes placeholder.
-- Text-only model does not receive image payload.
-- Unsupported file is not forwarded to chat provider.
-- Native image route receives image content when within limits.
-- Mixed image/file/text turns remain coherent.
+- 超大 data image 变成占位文本。
+- 纯文本模型不会收到 image payload。
+- 不支持文件的 chat provider 不接收文件数据。
+- 原生 image route 在限制内接收图片内容。
+- 混合 image/file/text 轮次保持语义清楚。
 
-Compression tests:
+压缩测试：
 
-- Global summary is inserted before older raw turns.
-- Per-model view cannot overwrite global state.
-- Compression failure does not discard canonical history.
-- Tool ledger survives compression.
+- 全局摘要插入在旧原始轮次之前。
+- 每模型视图不能覆盖全局状态。
+- 压缩失败不能丢 canonical history。
+- 工具 ledger 在压缩后保留。
 
-Watchdog tests:
+Watchdog 测试：
 
-- Client disconnect aborts upstream.
-- Upstream timeout stops request.
-- Identical tool call repeats stop locally.
-- Repeated provider error short-circuits without upstream call.
-- Tool-output continuation loop stops without another upstream call.
+- 客户端断开会中止上游。
+- 上游超时会停止请求。
+- 相同工具调用重复会本地停止。
+- 重复 provider error 会短路，不再请求上游。
+- 工具输出续写循环会本地停止，不再请求上游。
 
-End-to-end provider category smoke tests:
+端到端 provider 类别烟测：
 
-- Native Responses text.
-- Generic chat text.
-- DeepSeek-style chat tools.
-- Kimi-style schema.
-- Vision-capable route.
-- Text-only route with image placeholder.
-- Custom conservative route.
+- 原生 Responses 文本。
+- 通用 chat 文本。
+- DeepSeek 风格 chat tools。
+- Kimi 风格 schema。
+- 支持视觉的 route。
+- 纯文本 route 收到图片时使用占位文本。
+- 自定义保守 route。
 
-Packaging gate:
+打包发布闸门：
 
-- `npm run check`.
-- `npm run desktop:smoke`.
-- `npm run package:win`.
-- `npm run package:win:smoke`.
-- GitHub Actions release run must pass before calling a version released.
+- `npm run check`。
+- `npm run desktop:smoke`。
+- `npm run package:win`。
+- `npm run package:win:smoke`。
+- GitHub Actions release run 通过后，才能称为版本已发布。
 
-## Implementation Phases
+## 实现阶段
 
-### Phase 1: Contract Lock
+### 阶段 1：锁定兼容契约
 
-Add adapter profile generation and tests without changing runtime behavior. Lock current behavior for all built-in presets. Add regression tests for unsupported params, model category smoke paths, and custom conservative defaults.
+增加 adapter profile 生成和测试，先不改变运行行为。锁住所有内置预设当前可用行为。补上不支持参数、模型类别 smoke path、自定义保守默认值的回归测试。
 
-### Phase 2: Renderer Boundary
+### 阶段 2：抽出渲染边界
 
-Extract conversation rendering from `responses-to-chat.js` into a bounded renderer that takes canonical state and adapter profile. Keep output equivalent where current tests already pass.
+把 conversation rendering 从 `responses-to-chat.js` 中抽出来，形成接收 canonical state 和 adapter profile 的 renderer。已有测试通过的行为必须保持等价。
 
-### Phase 3: Safety Watchdog
+### 阶段 3：安全熔断器
 
-Add repeated tool-call detection, repeated error detection, per-user-turn upstream budget, and clearer local stop responses.
+增加重复工具调用检测、重复错误检测、单用户 turn 上游预算、更清楚的本地停止响应。
 
-### Phase 4: Attachment And Compression Policy
+### 阶段 4：附件和压缩策略
 
-Add attachment ledger, global summary representation, compression routing policy, and tests for small/large model switching.
+增加 attachment ledger、全局摘要表示、压缩 route 策略，以及小/大模型切换测试。
 
-### Phase 5: Observability And UI Surfacing
+### 阶段 5：可观测性和 UI 展示
 
-Expose adapter id, dropped params, attachment decisions, watchdog stops, and cache/cached-token signals in diagnostics and usage summaries.
+在诊断和 usage summary 里展示 adapter id、被丢弃参数、附件决策、watchdog 停止原因、cache/cached-token 信号。
 
-## Rollback Strategy
+## 回滚策略
 
-Each phase should be independently shippable. If a phase causes provider regressions:
+每个阶段都要能独立发布。如果某阶段导致 provider 退化：
 
-- Revert the phase commit.
-- Keep any tests that captured the regression when possible.
-- Do not ship a release with known provider-category failures.
+- 回滚该阶段 commit。
+- 尽可能保留捕获退化的测试。
+- 有已知 provider 类别失败时不发版。
 
-Runtime config should include a temporary `compatMode: "legacy"` switch only for emergency support. It should preserve the old conversion path for one release cycle while the new path is fixed. The switch must not disable watchdog protections against loops, disconnects, or repeated upstream failures.
+运行时配置可以临时提供 `compatMode: "legacy"`，仅用于紧急支持。它保留旧转换路径一个发布周期，但不能关闭防循环、断开中止、重复上游失败短路等 watchdog 保护。
 
-## Acceptance Criteria
+## 验收标准
 
-The design is complete when:
+设计实现完成的标准：
 
-- All built-in presets have adapter profiles and compatibility tests.
-- Custom models default to conservative safe behavior.
-- Provider-specific parameter filtering is tested.
-- Canonical history survives small-model rendering, compression, and model switching.
-- Tool, MCP, and tool-output continuation behavior is covered by regression tests.
-- Attachment behavior is explicit and tested.
-- Watchdog stops repeated token-wasting behavior locally.
-- Diagnostics explain capability decisions without leaking secrets or payloads.
-- Full local and packaged verification passes before release.
+- 所有内置预设都有 adapter profile 和兼容性测试。
+- 自定义模型默认进入保守安全行为。
+- provider-specific 参数过滤有测试。
+- canonical history 能跨小模型渲染、压缩和模型切换存活。
+- 工具、MCP、工具输出续写都有回归测试。
+- 附件行为显式且有测试。
+- watchdog 能本地停止重复 token 浪费行为。
+- 诊断能解释能力决策，且不泄露密钥或 payload。
+- 本地完整验证和打包验证都通过后才发版。
