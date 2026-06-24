@@ -112,8 +112,6 @@ export function responseRequestToChatSourceMessages(request, route, history) {
   messages.push(...priorMessages, ...currentMessages);
   const sourceMessages = sanitizeMessagesForRoute(normalizeToolCallPairs(messages, {
     flattenToolCalls: shouldFlattenToolCallHistory(route),
-    flattenToolCallsWithoutReasoningContent:
-      shouldFlattenToolCallsWithoutReasoningContent(route),
   }), route);
   return { messages: sourceMessages, toolContext };
 }
@@ -705,10 +703,6 @@ function shouldFlattenToolCallHistory(route = {}) {
   }
 }
 
-function shouldFlattenToolCallsWithoutReasoningContent(route = {}) {
-  return routeSupportsDeepSeekReasoningContent(route);
-}
-
 function trimMessagesToRouteContext(messages, route = {}) {
   const maxTokens = maxChatContextInputTokens(route);
   if (!maxTokens || estimatedMessagesTokens(messages) <= maxTokens) {
@@ -775,8 +769,6 @@ function trimMessagesToRouteContext(messages, route = {}) {
   ];
   return normalizeToolCallPairs(result, {
     flattenToolCalls: shouldFlattenToolCallHistory(route),
-    flattenToolCallsWithoutReasoningContent:
-      shouldFlattenToolCallsWithoutReasoningContent(route),
   });
 }
 
@@ -934,9 +926,6 @@ function trimTextForContextTokens(text, maxTokens) {
 function normalizeToolCallPairs(messages, options = {}) {
   const normalized = [];
   const flattenToolCalls = Boolean(options.flattenToolCalls);
-  const flattenToolCallsWithoutReasoningContent = Boolean(
-    options.flattenToolCallsWithoutReasoningContent,
-  );
 
   for (let index = 0; index < messages.length;) {
     const message = messages[index];
@@ -961,12 +950,8 @@ function normalizeToolCallPairs(messages, options = {}) {
       const complete =
         expectedIds.size > 0 &&
         [...expectedIds].every((toolCallId) => actualIds.has(toolCallId));
-      const shouldFlattenPair =
-        flattenToolCalls ||
-        (flattenToolCallsWithoutReasoningContent &&
-          !messageHasReasoningContent(message));
 
-      if (complete && shouldFlattenPair) {
+      if (complete && flattenToolCalls) {
         normalized.push(...flattenToolCallPairAsText(message, toolMessages));
       } else if (complete) {
         normalized.push(message, ...toolMessages);
@@ -1041,10 +1026,6 @@ function assistantTextOnlyMessage(message) {
   }
   const { tool_calls, ...textOnly } = message;
   return textOnly;
-}
-
-function messageHasReasoningContent(message) {
-  return typeof message?.reasoning_content === "string" && message.reasoning_content !== "";
 }
 
 function orphanToolOutputsMessage(messages) {

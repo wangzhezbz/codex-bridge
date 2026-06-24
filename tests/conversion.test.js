@@ -861,7 +861,7 @@ test("DeepSeek reasoning_content is replayed only for DeepSeek routes", () => {
   assert.equal("reasoning_content" in kimiAssistant, false);
 });
 
-test("DeepSeek flattens prior tool results without teaching the model fake tool syntax", () => {
+test("DeepSeek preserves prior tool results as native chat tool messages", () => {
   const history = new ResponseHistory();
   history.record("resp_foreign_tool_call", [
     { role: "user", content: "run pwd" },
@@ -909,23 +909,23 @@ test("DeepSeek flattens prior tool results without teaching the model fake tool 
     history,
   );
 
-  assert.equal(
-    converted.body.messages.some((message) => Array.isArray(message.tool_calls)),
-    false,
+  const assistant = converted.body.messages.find((message) =>
+    Array.isArray(message.tool_calls),
   );
-  assert.equal(
-    converted.body.messages.some((message) => message.role === "tool"),
-    false,
-  );
+  const tool = converted.body.messages.find((message) => message.role === "tool");
+  assert.ok(assistant);
+  assert.equal(assistant.tool_calls[0].id, "call_foreign_shell");
+  assert.ok(tool);
+  assert.equal(tool.tool_call_id, "call_foreign_shell");
+  assert.match(tool.content, /F:\\game_code\\router/);
+
   const transcript = converted.body.messages
     .map((message) => String(message.content || ""))
     .join("\n");
-  assert.doesNotMatch(transcript, /Assistant requested tool calls/);
-  assert.doesNotMatch(transcript, /shell_command.*"command":"pwd"/);
-  assert.match(transcript, /F:\\game_code\\router/);
+  assert.doesNotMatch(transcript, /CodexBridge tool result context/);
 });
 
-test("DeepSeek groups flattened multi-tool outputs into one continuation message", () => {
+test("DeepSeek keeps multi-tool outputs paired with their assistant call", () => {
   const history = new ResponseHistory();
   history.record("resp_multi_tool_call", [
     { role: "user", content: "read install script and logs" },
@@ -986,16 +986,22 @@ test("DeepSeek groups flattened multi-tool outputs into one continuation message
     history,
   );
 
-  const resultMessages = converted.body.messages.filter((message) =>
-    String(message.content || "").includes("CodexBridge tool result context"),
+  const assistant = converted.body.messages.find((message) =>
+    Array.isArray(message.tool_calls),
   );
-  assert.equal(resultMessages.length, 1);
-  assert.equal(resultMessages[0].role, "system");
-  assert.match(resultMessages[0].content, /Do not repeat or re-run/);
-  assert.match(resultMessages[0].content, /call_script/);
-  assert.match(resultMessages[0].content, /install script content/);
-  assert.match(resultMessages[0].content, /call_log/);
-  assert.match(resultMessages[0].content, /install log content/);
+  const toolMessages = converted.body.messages.filter((message) => message.role === "tool");
+  assert.ok(assistant);
+  assert.deepEqual(
+    assistant.tool_calls.map((toolCall) => toolCall.id),
+    ["call_script", "call_log"],
+  );
+  assert.equal(toolMessages.length, 2);
+  assert.deepEqual(
+    toolMessages.map((message) => message.tool_call_id),
+    ["call_script", "call_log"],
+  );
+  assert.match(toolMessages[0].content, /install script content/);
+  assert.match(toolMessages[1].content, /install log content/);
 });
 
 test("chat routes group consecutive orphan tool outputs into one continuation message", () => {

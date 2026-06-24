@@ -470,6 +470,164 @@ test("server stops chat tool loops when Codex sends full input without previous_
   }
 });
 
+test("server lets chat models finish tool tasks from full input without previous_response_id", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/chat/completions");
+    upstreamCalls += 1;
+    const chunks = [];
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const sawNativeToolResult = body.messages.some(
+      (message) => message.role === "tool" && message.tool_call_id === "call_write_joke",
+    );
+
+    res.writeHead(200, { "content-type": "application/json" });
+    if (sawNativeToolResult) {
+      res.end(
+        JSON.stringify({
+          id: "chatcmpl_finished_tool_task",
+          object: "chat.completion",
+          choices: [
+            {
+              message: {
+                role: "assistant",
+                content: "文件已写入笑话并删除，任务完成。",
+              },
+            },
+          ],
+          usage: {
+            prompt_tokens: 250,
+            completion_tokens: 12,
+            total_tokens: 262,
+          },
+        }),
+      );
+      return;
+    }
+
+    res.end(
+      JSON.stringify({
+        id: "chatcmpl_write_joke",
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: null,
+              tool_calls: [
+                {
+                  id: "call_write_joke",
+                  type: "function",
+                  function: {
+                    name: "shell_command",
+                    arguments: JSON.stringify({
+                      command:
+                        "Set-Content -Path joke.txt -Value '为什么程序员喜欢黑咖啡？因为它没有 Java。'; Remove-Item joke.txt",
+                    }),
+                  },
+                },
+              ],
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 220,
+          completion_tokens: 20,
+          total_tokens: 240,
+        },
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const upstreamUrl = serverUrl(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        api: "chat_completions",
+        baseUrl: `${upstreamUrl}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const baseUrl = serverUrl(router);
+  const tools = [
+    {
+      type: "function",
+      name: "shell_command",
+      description: "Run shell.",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string" },
+        },
+        required: ["command"],
+      },
+    },
+  ];
+  const originalUserInput = "create a file, write a joke, then delete it";
+
+  try {
+    const first = await fetchJson(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        input: originalUserInput,
+        tools,
+      }),
+    });
+    const firstCall = first.output.find((item) => item.type === "function_call");
+    assert.equal(firstCall?.call_id, "call_write_joke");
+
+    const second = await fetchJson(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        input: [
+          originalUserInput,
+          firstCall,
+          {
+            type: "function_call_output",
+            call_id: firstCall.call_id,
+            output: "joke file created and deleted",
+          },
+        ],
+        tools,
+      }),
+    });
+
+    assert.equal(
+      second.output.some((item) => item.type === "function_call"),
+      false,
+    );
+    assert.match(second.output_text, /任务完成/);
+    assert.equal(upstreamCalls, 2);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
 test("server suppresses unexpected Node REPL tool calls from chat providers", async () => {
   const chatBodies = [];
   const upstream = http.createServer(async (req, res) => {
@@ -2888,7 +3046,7 @@ test("responses route history is available after switching to a chat-completions
   assert.match(chatText, /what did GPT say/);
 });
 
-test("responses route flattens GPT tool calls before switching tool output to DeepSeek", async () => {
+test("responses route preserves GPT tool calls before switching tool output to DeepSeek", async () => {
   const chatBodies = [];
   const upstream = http.createServer(async (req, res) => {
     const chunks = [];
@@ -2935,10 +3093,11 @@ test("responses route flattens GPT tool calls before switching tool output to De
       );
       const transcript = JSON.stringify(body.messages);
       if (
-        hasStructuredToolCalls ||
-        hasToolRoleMessage ||
+        !hasStructuredToolCalls ||
+        !hasToolRoleMessage ||
         transcript.includes("Assistant requested tool calls") ||
-        (transcript.includes("shell_command") && transcript.includes("\\\"command\\\":\\\"pwd\\\"")) ||
+        !transcript.includes("shell_command") ||
+        !transcript.includes("\\\"command\\\":\\\"pwd\\\"") ||
         !transcript.includes("F:\\\\game_code\\\\router")
       ) {
         res.writeHead(400, { "content-type": "application/json" });
@@ -2946,7 +3105,7 @@ test("responses route flattens GPT tool calls before switching tool output to De
           JSON.stringify({
             error: {
               message:
-                "GPT tool call history was not flattened for DeepSeek",
+                "GPT tool call history was not preserved for DeepSeek",
             },
           }),
         );
