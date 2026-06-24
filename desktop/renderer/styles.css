@@ -407,6 +407,7 @@ h3 {
 }
 
 .health-card,
+.update-status-card,
 .option-toggle {
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -419,6 +420,45 @@ h3 {
   color: var(--muted);
   font-size: 13px;
   line-height: 1.45;
+}
+
+.update-status-card {
+  padding: 14px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.update-status-card strong {
+  display: block;
+  margin-top: 4px;
+  color: var(--text);
+  font-size: 22px;
+}
+
+.update-status-card.ok {
+  border-color: #b7ded8;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.update-status-card.ready {
+  border-color: #d9bf78;
+  background: #fff8e5;
+  color: #7a5311;
+}
+
+.update-status-card.bad {
+  border-color: #ffd0ca;
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.update-grid {
+  margin-top: 16px;
+}
+
+.update-actions {
+  margin-top: 16px;
 }
 
 .health-card.ok {

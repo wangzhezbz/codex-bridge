@@ -19,6 +19,8 @@ contextBridge.exposeInMainWorld("codexBridge", {
   startRouter: () => ipcRenderer.invoke("router:start"),
   stopRouter: () => ipcRenderer.invoke("router:stop"),
   copyDiagnostics: () => ipcRenderer.invoke("diagnostics:copy"),
+  checkForUpdates: () => ipcRenderer.invoke("updates:check"),
+  installUpdate: () => ipcRenderer.invoke("updates:install"),
   openFolder: (target) => ipcRenderer.invoke("folder:open", target),
   openExternal: (url) => ipcRenderer.invoke("external:open", url),
   openGitHub: () => ipcRenderer.invoke("github:open"),

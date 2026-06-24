@@ -2,6 +2,8 @@ const { app, BrowserWindow, Menu, Tray, clipboard, dialog, ipcMain, shell } = re
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
+const { Readable } = require("node:stream");
+const { pipeline } = require("node:stream/promises");
 const {
   legacyPortableDataCandidates,
   migrateLegacyPortableData,
@@ -37,6 +39,7 @@ const legacyDataMigration = app.isPackaged && !process.env.CODEXBRIDGE_DATA_DIR
 const runtimeLogPath = path.join(dataRootDir, "logs", "desktop-runtime.log");
 const usageEventsPath = path.join(dataRootDir, "logs", "usage.local.json");
 let settingsPromise;
+let updaterPromise;
 let mainWindow;
 let routerProcess = null;
 let logLines = [];
@@ -103,6 +106,13 @@ function loadSettings() {
     settingsPromise = import("./settings.mjs");
   }
   return settingsPromise;
+}
+
+function loadUpdater() {
+  if (!updaterPromise) {
+    updaterPromise = import("./updater.mjs");
+  }
+  return updaterPromise;
 }
 
 async function loadRouterHealth() {
@@ -229,6 +239,7 @@ ipcMain.handle("state:get", async () => {
   return {
     rootDir: dataRootDir,
     appRootDir,
+    appVersion: app.getVersion(),
     packaged: app.isPackaged,
     mode,
     routerRunning: Boolean(routerProcess),
@@ -537,6 +548,60 @@ ipcMain.handle("diagnostics:copy", async () => {
   return diagnostics.summary;
 });
 
+ipcMain.handle("updates:check", async () => {
+  const updater = await loadUpdater();
+  const release = await updater.fetchLatestRelease();
+  const plan = updater.planReleaseUpdate({
+    currentVersion: app.getVersion(),
+    platform: process.platform,
+    arch: process.arch,
+    release,
+  });
+  appendLog(`Update check: ${plan.message}`);
+  broadcastState();
+  return {
+    ...plan,
+    currentVersion: app.getVersion(),
+    packaged: app.isPackaged,
+  };
+});
+
+ipcMain.handle("updates:install", async () => {
+  if (!app.isPackaged) {
+    throw new Error("开发模式不能直接替换程序目录，请使用打包版测试更新。");
+  }
+  const updater = await loadUpdater();
+  const release = await updater.fetchLatestRelease();
+  const plan = updater.planReleaseUpdate({
+    currentVersion: app.getVersion(),
+    platform: process.platform,
+    arch: process.arch,
+    release,
+  });
+  if (!plan.ok) {
+    throw new Error(plan.message || "当前平台无法更新。");
+  }
+  if (!plan.updateAvailable) {
+    throw new Error("当前已经是最新版本。");
+  }
+  const prepared = await preparePortableUpdate(updater, plan);
+  appendLog(`Update package downloaded: ${prepared.downloadPath}`);
+  appendLog(`Starting updater script: ${prepared.scriptPath}`);
+  setTimeout(() => {
+    launchPortableUpdater(prepared.scriptPath);
+    isQuitting = true;
+    stopRouter({ silent: true });
+    app.quit();
+  }, 500);
+  return {
+    ok: true,
+    message: `已下载 ${plan.latestVersion}，CodexBridge 将退出、替换程序目录并自动重启。`,
+    latestVersion: plan.latestVersion,
+    downloadPath: prepared.downloadPath,
+    scriptPath: prepared.scriptPath,
+  };
+});
+
 ipcMain.handle("folder:open", async (_event, target) => {
   const settings = await loadSettings();
   const folder =
@@ -544,6 +609,8 @@ ipcMain.handle("folder:open", async (_event, target) => {
       ? path.dirname(settings.codexConfigPath())
       : target === "config"
         ? path.join(dataRootDir, "config")
+        : target === "updates"
+          ? path.join(dataRootDir, "updates")
         : dataRootDir;
   await shell.openPath(folder);
   return { ok: true };
@@ -576,6 +643,97 @@ function stopRouter(options = {}) {
   }
   routerProcess.kill();
   routerProcess = null;
+}
+
+async function preparePortableUpdate(updater, plan) {
+  const updatesDir = path.join(dataRootDir, "updates");
+  const downloadsDir = path.join(updatesDir, "downloads");
+  const logsDir = path.join(dataRootDir, "logs");
+  fs.mkdirSync(downloadsDir, { recursive: true });
+  fs.mkdirSync(logsDir, { recursive: true });
+  const stamp = new Date()
+    .toISOString()
+    .replaceAll(":", "")
+    .replaceAll(".", "")
+    .replace("T", "-")
+    .replace("Z", "");
+  const downloadPath = path.join(downloadsDir, `${stamp}-${plan.asset.name}`);
+  await downloadFile(plan.asset.downloadUrl, downloadPath);
+
+  const logPath = path.join(logsDir, "update.log");
+  if (process.platform === "win32") {
+    const scriptFile = path.join(updatesDir, `apply-update-${stamp}.ps1`);
+    const script = updater.generateWindowsPortableUpdateScript({
+      parentPid: process.pid,
+      zipPath: downloadPath,
+      currentAppDir: path.dirname(process.execPath),
+      exeName: path.basename(process.execPath),
+      workDir: updatesDir,
+      logPath,
+    });
+    fs.writeFileSync(scriptFile, script, "utf8");
+    return { downloadPath, scriptPath: scriptFile };
+  }
+  if (process.platform === "darwin") {
+    const scriptFile = path.join(updatesDir, `apply-update-${stamp}.sh`);
+    const script = updater.generateMacPortableUpdateScript({
+      parentPid: process.pid,
+      zipPath: downloadPath,
+      currentAppBundle: currentMacAppBundle(),
+      workDir: updatesDir,
+      logPath,
+    });
+    fs.writeFileSync(scriptFile, script, { encoding: "utf8", mode: 0o755 });
+    return { downloadPath, scriptPath: scriptFile };
+  }
+  throw new Error(`当前系统暂不支持应用内更新：${process.platform} ${process.arch}`);
+}
+
+async function downloadFile(url, targetPath) {
+  const response = await fetch(url, {
+    headers: {
+      "user-agent": "CodexBridge",
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`更新包下载失败：HTTP ${response.status}`);
+  }
+  if (!response.body) {
+    throw new Error("更新包下载失败：响应体为空。");
+  }
+  await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(targetPath));
+}
+
+function launchPortableUpdater(scriptFile) {
+  const child = process.platform === "win32"
+    ? spawn("powershell.exe", [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        scriptFile,
+      ], {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      })
+    : spawn("/bin/sh", [scriptFile], {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      });
+  child.unref();
+}
+
+function currentMacAppBundle() {
+  let current = process.execPath;
+  while (current && current !== path.dirname(current)) {
+    if (current.endsWith(".app")) {
+      return current;
+    }
+    current = path.dirname(current);
+  }
+  throw new Error("无法定位当前 CodexBridge.app。");
 }
 
 async function runNodeScript(args) {
@@ -776,6 +934,7 @@ async function getStatePayload(settings) {
   return {
     rootDir: dataRootDir,
     appRootDir,
+    appVersion: app.getVersion(),
     packaged: app.isPackaged,
     mode,
     routerRunning: Boolean(routerProcess),
@@ -858,7 +1017,10 @@ async function runDesktopSmokeChecks() {
           "#providerGrid",
           "#stats",
           "#usageChart",
-          "#copyDiagnostics"
+          "#copyDiagnostics",
+          "#updates",
+          "#checkUpdates",
+          "#installUpdate"
         ];
         for (const selector of required) {
           if (!document.querySelector(selector)) {
@@ -893,6 +1055,10 @@ async function runDesktopSmokeChecks() {
         document.querySelector('[data-section="stats"]').click();
         if (document.querySelector("#stats").classList.contains("hidden")) {
           throw new Error("Stats nav did not activate");
+        }
+        document.querySelector('[data-section="updates"]').click();
+        if (document.querySelector("#updates").classList.contains("hidden")) {
+          throw new Error("Updates nav did not activate");
         }
         return {
           providers: document.querySelectorAll(".provider-card").length,
