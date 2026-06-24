@@ -3724,18 +3724,22 @@ test("responses route inlines legacy chat-completions history when response meta
   assert.match(inputText, /continue with GPT/);
 });
 
-test("server filters unsupported chat params before upstream fetch", async () => {
+test("server filters unsupported chat params before chat completions upstream fetch", async () => {
   let upstreamBody;
   const upstream = http.createServer(async (req, res) => {
-    assert.equal(req.url, "/v1/responses");
+    assert.equal(req.url, "/v1/chat/completions");
     upstreamBody = await readJson(req);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
-      id: "resp_param_filter",
-      object: "response",
-      status: "completed",
-      output: [],
-      output_text: "ok",
+      id: "chatcmpl_param_filter",
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: "ok",
+          },
+        },
+      ],
       usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
     }));
   });
@@ -3750,10 +3754,11 @@ test("server filters unsupported chat params before upstream fetch", async () =>
       id: "deepseek-v4-pro",
       provider: "deepseek",
       displayName: "DeepSeek V4 Pro",
-      api: "responses",
+      api: "chat_completions",
       baseUrl: `${serverUrl(upstream)}/v1`,
       model: "deepseek-v4-pro",
       apiKey: "upstream-key",
+      dropParams: ["response_format", "parallel_tool_calls"],
     }],
   });
 
@@ -3769,18 +3774,18 @@ test("server filters unsupported chat params before upstream fetch", async () =>
         model: "deepseek-v4-pro",
         input: "hello",
         response_format: { type: "json_object" },
-        max_tokens: 42,
-        metadata: { safe: true },
+        parallel_tool_calls: true,
+        metadata: { unsafe: true },
         store: true,
       }),
     });
 
     assert.equal(response.output_text, "ok");
     assert.equal(upstreamBody.response_format, undefined);
-    assert.equal(upstreamBody.max_tokens, undefined);
-    assert.deepEqual(upstreamBody.metadata, { safe: true });
-    assert.equal(upstreamBody.store, true);
-    assert.equal(upstreamBody.input, "hello");
+    assert.equal(upstreamBody.parallel_tool_calls, undefined);
+    assert.equal(upstreamBody.metadata, undefined);
+    assert.equal(upstreamBody.store, undefined);
+    assert.deepEqual(upstreamBody.messages.at(-1), { role: "user", content: "hello" });
   } finally {
     await close(router);
     await close(upstream);
