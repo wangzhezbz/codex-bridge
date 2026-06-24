@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { MODEL_PRESETS } from "../desktop/presets.mjs";
 import {
   adapterIdForRoute,
   filterPayloadForAdapter,
@@ -79,8 +80,52 @@ test("custom chat routes default to conservative text-only behavior", () => {
   assert.equal(profile.adapterId, "custom-conservative");
   assert.equal(profile.customConservative, true);
   assert.equal(profile.supportsImages, "none");
-  assert.equal(profile.supportsFiles, "text-placeholder");
+  assert.equal(profile.supportsFiles, "none");
   assert.deepEqual(profile.dropParams, ["parallel_tool_calls", "response_format"]);
+});
+
+test("all built-in presets normalize to complete adapter profiles", () => {
+  const seenAdapterIds = new Set();
+  const seenProviderFamilies = new Set();
+
+  for (const route of MODEL_PRESETS) {
+    const profile = normalizeAdapterProfile(route);
+
+    assert.equal(typeof profile.adapterId, "string");
+    assert.notEqual(profile.adapterId.length, 0);
+    assert.equal(typeof profile.providerFamily, "string");
+    assert.notEqual(profile.providerFamily.length, 0);
+    assert.ok(Array.isArray(profile.safeParams));
+    assert.ok(profile.safeParams.length > 0);
+    assert.equal(profile.customConservative, false);
+    assert.ok(profile.supportsFiles === "native" || profile.supportsFiles === "text-placeholder");
+
+    seenAdapterIds.add(profile.adapterId);
+    seenProviderFamilies.add(profile.providerFamily);
+  }
+
+  for (const adapterId of [
+    "responses-native",
+    "chat-deepseek",
+    "chat-kimi",
+    "chat-minimax",
+    "chat-doubao",
+    "chat-qwen",
+    "chat-openai-compatible",
+  ]) {
+    assert.ok(seenAdapterIds.has(adapterId), `missing adapter category: ${adapterId}`);
+  }
+
+  for (const providerFamily of [
+    "openai",
+    "deepseek",
+    "kimi",
+    "minimax",
+    "doubao",
+    "qwen",
+  ]) {
+    assert.ok(seenProviderFamilies.has(providerFamily), `missing provider family: ${providerFamily}`);
+  }
 });
 
 test("payload filtering keeps only adapter-safe chat parameters", () => {

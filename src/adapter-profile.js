@@ -71,7 +71,12 @@ export function normalizeAdapterProfile(route = {}) {
     supportsTools: api === "responses" ? "native" : "chat-functions",
     supportsMcpNamespaces: api === "responses" || !customConservative,
     supportsImages,
-    supportsFiles: api === "responses" ? "native" : "text-placeholder",
+    supportsFiles:
+      api === "responses"
+        ? "native"
+        : customConservative
+          ? "none"
+          : "text-placeholder",
     supportsResponsePreviousId: api === "responses",
     supportsPromptCaching: route.supportsPromptCaching || "unknown",
     safeParams: api === "responses" ? RESPONSES_SAFE_PARAMS : CHAT_SAFE_PARAMS,
