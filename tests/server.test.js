@@ -3724,6 +3724,69 @@ test("responses route inlines legacy chat-completions history when response meta
   assert.match(inputText, /continue with GPT/);
 });
 
+test("server filters unsupported chat params before upstream fetch", async () => {
+  let upstreamBody;
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/responses");
+    upstreamBody = await readJson(req);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      id: "resp_param_filter",
+      object: "response",
+      status: "completed",
+      output: [],
+      output_text: "ok",
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    }));
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [{
+      id: "deepseek-v4-pro",
+      provider: "deepseek",
+      displayName: "DeepSeek V4 Pro",
+      api: "responses",
+      baseUrl: `${serverUrl(upstream)}/v1`,
+      model: "deepseek-v4-pro",
+      apiKey: "upstream-key",
+    }],
+  });
+
+  await listen(router);
+  try {
+    const response = await fetchJson(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        input: "hello",
+        response_format: { type: "json_object" },
+        max_tokens: 42,
+        metadata: { safe: true },
+        store: true,
+      }),
+    });
+
+    assert.equal(response.output_text, "ok");
+    assert.equal(upstreamBody.response_format, undefined);
+    assert.equal(upstreamBody.max_tokens, undefined);
+    assert.deepEqual(upstreamBody.metadata, { safe: true });
+    assert.equal(upstreamBody.store, true);
+    assert.equal(upstreamBody.input, "hello");
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
 test("streaming responses without object field are recorded for later chat-completions switches", async () => {
   const chatBodies = [];
   const upstream = http.createServer(async (req, res) => {
@@ -4244,4 +4307,12 @@ async function fetchJson(url, init) {
   const text = await response.text();
   assert.equal(response.ok, true, text);
   return JSON.parse(text);
+}
+
+async function readJson(req) {
+  const chunks = [];
+  for await (const chunk of req) {
+    chunks.push(chunk);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }

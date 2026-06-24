@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { buildModelCatalog } from "../src/model-catalog.js";
 import { authModeForRoute, validateConfig } from "../src/config.js";
 import { ResponseHistory } from "../src/history.js";
+import { filterPayloadForAdapter } from "../src/adapter-profile.js";
 import { responsesToChatRequest } from "../src/responses-to-chat.js";
 import {
   assistantHistoryMessageFromChat,
@@ -255,6 +256,35 @@ test("chat conversion keeps file inputs visible when chat provider cannot forwar
     converted.body.messages.at(-1).content,
     "summarize this file\n[file input not forwarded to chat provider: brief.pdf]",
   );
+});
+
+test("chat conversion output can be filtered by adapter safe params", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "hello",
+      response_format: { type: "json_object" },
+      parallel_tool_calls: true,
+      metadata: { unsafe: true },
+      store: true,
+    },
+    {
+      ...route,
+      provider: "deepseek",
+      dropParams: ["response_format", "parallel_tool_calls"],
+    },
+    new ResponseHistory(),
+  );
+  const filtered = filterPayloadForAdapter(converted.body, {
+    ...route,
+    provider: "deepseek",
+    dropParams: ["response_format", "parallel_tool_calls"],
+  });
+
+  assert.equal(filtered.response_format, undefined);
+  assert.equal(filtered.parallel_tool_calls, undefined);
+  assert.equal(filtered.metadata, undefined);
+  assert.equal(filtered.store, undefined);
+  assert.equal(filtered.messages.at(-1).content, "hello");
 });
 
 test("chat conversion trims old history to fit the upstream model context window", () => {

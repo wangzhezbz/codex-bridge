@@ -2,6 +2,10 @@ import { createHash } from "node:crypto";
 import { cloneJson, jsonResponse, openAiError, stringifyJson, tryParseJson } from "./json.js";
 import { authModeForRoute, joinUpstreamUrl, requireApiKey } from "./config.js";
 import {
+  filterPayloadForAdapter,
+  normalizeAdapterProfile,
+} from "./adapter-profile.js";
+import {
   contentToText,
   interactiveNodeReplToolNameForRequest,
   interactivePluginKindForRequest,
@@ -164,20 +168,25 @@ export async function proxyResponsesApi(
     inlineLocalHistoryForResponsesPayload(payload, sourceMessages);
   }
 
+  const upstreamPayload = filterPayloadForAdapter(
+    payload,
+    normalizeAdapterProfile(route),
+    { api: "responses" },
+  );
   const upstreamUrl = joinUpstreamUrl(responsesBaseUrlForRoute(route), "/responses");
-  throwIfRecentUpstreamFailure(route, upstreamUrl, payload, context);
+  throwIfRecentUpstreamFailure(route, upstreamUrl, upstreamPayload, context);
   logRoute(context, route, upstreamUrl);
   let upstream;
   try {
     upstream = await fetchUpstream(upstreamUrl, {
       method: "POST",
       headers: upstreamHeaders(route, context, {
-        acceptEventStream: Boolean(payload.stream),
+        acceptEventStream: Boolean(upstreamPayload.stream),
       }),
-      body: JSON.stringify(payload),
+      body: JSON.stringify(upstreamPayload),
     }, context, route);
   } catch (error) {
-    rememberUpstreamFailure(route, upstreamUrl, payload, error);
+    rememberUpstreamFailure(route, upstreamUrl, upstreamPayload, error);
     throw error;
   }
   logStatus(context, route, upstream.status);
@@ -185,7 +194,7 @@ export async function proxyResponsesApi(
   if (!upstream.ok) {
     const bodyText = await upstream.text();
     const error = new UpstreamHttpError(upstream.status, bodyText, upstreamUrl, route);
-    rememberUpstreamFailure(route, upstreamUrl, payload, error);
+    rememberUpstreamFailure(route, upstreamUrl, upstreamPayload, error);
     throw error;
   }
 
@@ -917,22 +926,26 @@ export async function callJsonUpstream(
   context = {},
   options = {},
 ) {
-  throwIfRecentUpstreamFailure(route, upstreamUrl, payload, context);
+  const upstreamPayload =
+    route?.api === "responses" || route?.api === "chat_completions"
+      ? filterPayloadForAdapter(payload, route)
+      : payload;
+  throwIfRecentUpstreamFailure(route, upstreamUrl, upstreamPayload, context);
   let upstream;
   try {
     upstream = await fetchUpstream(upstreamUrl, {
       method: "POST",
       headers: upstreamHeaders(route, context),
-      body: JSON.stringify(payload),
+      body: JSON.stringify(upstreamPayload),
     }, context, route, options);
   } catch (error) {
-    rememberUpstreamFailure(route, upstreamUrl, payload, error, options);
+    rememberUpstreamFailure(route, upstreamUrl, upstreamPayload, error, options);
     throw error;
   }
   const text = await upstream.text();
   if (!upstream.ok) {
     const error = new UpstreamHttpError(upstream.status, text, upstreamUrl, route);
-    rememberUpstreamFailure(route, upstreamUrl, payload, error, options);
+    rememberUpstreamFailure(route, upstreamUrl, upstreamPayload, error, options);
     throw error;
   }
   const parsed = tryParseJson(text);
@@ -943,7 +956,7 @@ export async function callJsonUpstream(
       upstreamUrl,
       route,
     );
-    rememberUpstreamFailure(route, upstreamUrl, payload, error, options);
+    rememberUpstreamFailure(route, upstreamUrl, upstreamPayload, error, options);
     throw error;
   }
   return parsed;
