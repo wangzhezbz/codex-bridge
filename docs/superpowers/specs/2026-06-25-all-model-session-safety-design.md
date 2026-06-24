@@ -387,6 +387,13 @@ Watchdog 测试：
 
 增加 adapter profile 生成和测试，先不改变运行行为。锁住所有内置预设当前可用行为。补上不支持参数、模型类别 smoke path、自定义保守默认值的回归测试。
 
+阶段 1 完成后，仓库必须至少包含：
+
+- `src/adapter-profile.js`：标准化 route 能力和参数白名单。
+- `tests/adapter-profile.test.js`：覆盖所有内置预设和自定义保守模式。
+- server 层参数过滤测试：证明不支持参数不会发到上游。
+- provider 类别 smoke 测试：覆盖 native Responses、DeepSeek、Kimi、MiniMax、Doubao、Qwen、generic chat、自定义保守模式。
+
 ### 阶段 2：抽出渲染边界
 
 把 conversation rendering 从 `responses-to-chat.js` 中抽出来，形成接收 canonical state 和 adapter profile 的 renderer。已有测试通过的行为必须保持等价。
