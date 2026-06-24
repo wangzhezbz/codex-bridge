@@ -128,6 +128,20 @@ export function readJsonIfExists(filePath, fallback = null) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
 }
 
+function writeTextAtomic(target, text) {
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const temp = path.join(
+    path.dirname(target),
+    `.${path.basename(target)}.${process.pid}.${Date.now()}.tmp`,
+  );
+  fs.writeFileSync(temp, text, "utf8");
+  fs.renameSync(temp, target);
+}
+
+function writeJsonAtomic(target, value) {
+  writeTextAtomic(target, `${JSON.stringify(value, null, 2)}\n`);
+}
+
 export function readRouterConfig(rootDir) {
   return readJsonIfExists(routerConfigPath(rootDir), null);
 }
@@ -317,7 +331,7 @@ export function supportDiagnostics(rootDir, {
     ...(selectedRoutes.length
       ? selectedRoutes.map(
           (route) =>
-            `- ${route.id}: ${route.displayName} -> ${route.model} (${route.api}, ${route.authMode || "api_key"}) ${route.baseUrl}`,
+            `- ${route.id}: ${route.displayName} -> ${route.model} (${route.api}, ${route.authMode || "api_key"}) ${redactSecretText(route.baseUrl)}`,
         )
       : ["- none"]),
     "",
@@ -723,6 +737,7 @@ export function saveCustomModel(rootDir, input) {
   );
   models.push(model);
   writeCustomModels(rootDir, models);
+  refreshRouterConfigIfPresent(rootDir);
   return model;
 }
 
@@ -733,15 +748,23 @@ export function removeCustomModel(rootDir, presetId) {
   writeCustomModels(rootDir, models);
   const selection = readSelection(rootDir).filter((id) => id !== presetId);
   saveSelection(rootDir, selection.length ? selection : defaultSelectedModelIds(MODE_HYBRID));
+  refreshRouterConfigIfPresent(rootDir);
   return models;
 }
 
 export function writeRouterConfigFromSelection(rootDir, mode = MODE_HYBRID) {
   const config = buildRouterConfigFromSelection(rootDir, mode);
   const target = routerConfigPath(rootDir);
-  fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.writeFileSync(target, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+  writeJsonAtomic(target, config);
   return config;
+}
+
+function refreshRouterConfigIfPresent(rootDir) {
+  const current = readRouterConfig(rootDir);
+  if (!current) {
+    return null;
+  }
+  return writeRouterConfigFromSelection(rootDir, detectModeFromConfig(current));
 }
 
 export function buildRouterConfigFromSelection(rootDir, mode = MODE_HYBRID) {
@@ -1981,10 +2004,17 @@ function routeForSelectedModel(model, slot, priority, imageGenerationOverrides =
     "supportedReasoningLevels",
     "additionalSpeedTiers",
     "serviceTiers",
+    "maxToolContinuationTurns",
+    "max_tool_continuation_turns",
+    "upstreamTimeoutMs",
+    "upstream_timeout_ms",
   ]) {
     if (model[key] !== undefined) {
       route[key] = model[key];
     }
+  }
+  if (route.api === "chat_completions" && route.maxToolContinuationTurns === undefined) {
+    route.maxToolContinuationTurns = 2;
   }
   if (model.custom && route.inputModalities === undefined) {
     route.inputModalities = normalizeInputModalities(model.inputModalities);
@@ -2099,8 +2129,7 @@ function normalizeCustomModel(input = {}) {
 
 function writeCustomModels(rootDir, models) {
   const target = customModelsPath(rootDir);
-  fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.writeFileSync(target, `${JSON.stringify(models, null, 2)}\n`, "utf8");
+  writeJsonAtomic(target, models);
 }
 
 function slugify(value) {
@@ -2171,6 +2200,11 @@ function StringLines(lines) {
 
 function redactSecretText(value) {
   return String(value || "")
+    .replace(/:\/\/[^/?#\s]+@/g, "://[REDACTED]@")
+    .replace(
+      /([?&](?:api[_-]?key|token|access_token|secret|key)=)[^&#\s]+/gi,
+      "$1[REDACTED]",
+    )
     .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
     .replace(/\bsk-[A-Za-z0-9._-]{8,}\b/g, "sk-[REDACTED]")
     .replace(/(api[_-]?key["'\s:=]+)[A-Za-z0-9._-]{8,}/gi, "$1[REDACTED]")

@@ -27,7 +27,8 @@ const FAILURE_CACHE_MAX_ENTRIES = 200;
 const FAILURE_CACHE_DEFAULT_TTL_MS = 30_000;
 const FAILURE_CACHE_FATAL_TTL_MS = 120_000;
 const FAILURE_CACHE_TRANSIENT_TTL_MS = 15_000;
-const DEFAULT_CHAT_TOOL_CONTINUATION_TURNS = 3;
+const DEFAULT_CHAT_TOOL_CONTINUATION_TURNS = 2;
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 300_000;
 
 const recentUpstreamFailures = new Map();
 
@@ -81,6 +82,36 @@ export class UpstreamNetworkError extends Error {
       model: route.model || "",
       api: route.api || "",
     };
+  }
+}
+
+export class UpstreamTimeoutError extends Error {
+  constructor(timeoutMs, upstreamUrl, route = {}) {
+    super(
+      `CodexBridge upstream request timed out after ${timeoutMs}ms` +
+        (route.displayName || route.id ? ` from ${route.displayName || route.id}` : "") +
+        `. url=${safeUrl(upstreamUrl)}`,
+    );
+    this.name = "UpstreamTimeoutError";
+    this.statusCode = 504;
+    this.code = "upstream_timeout";
+    this.timeoutMs = timeoutMs;
+    this.upstreamUrl = upstreamUrl;
+    this.route = {
+      id: route.id || "",
+      displayName: route.displayName || "",
+      model: route.model || "",
+      api: route.api || "",
+    };
+  }
+}
+
+export class ClientClosedRequestError extends Error {
+  constructor() {
+    super("CodexBridge client connection closed before the upstream response completed.");
+    this.name = "ClientClosedRequestError";
+    this.statusCode = 499;
+    this.code = "client_closed_request";
   }
 }
 
@@ -1159,6 +1190,7 @@ function rememberUpstreamFailure(route, upstreamUrl, payload, error, options = {
   if (
     options.cacheFailures === false ||
     error?.cachedUpstreamFailure ||
+    error?.code === "client_closed_request" ||
     error?.code === "provider_rate_limited"
   ) {
     return;
@@ -1253,7 +1285,7 @@ async function fetchUpstream(upstreamUrl, init, context = {}, route = {}, option
   const usedProxy = Boolean(proxiedInit.dispatcher);
   const proxyLabel = proxyLogLabel(upstreamUrl);
   try {
-    return await fetchAndTrackRateLimit(upstreamUrl, proxiedInit, route, options);
+    return await fetchAndTrackRateLimit(upstreamUrl, proxiedInit, route, options, context);
   } catch (error) {
     if (!usedProxy || !isNetworkFetchFailure(error)) {
       throw isNetworkFetchFailure(error)
@@ -1262,7 +1294,7 @@ async function fetchUpstream(upstreamUrl, init, context = {}, route = {}, option
     }
     logProxyFallback(context, route, error);
     try {
-      return await fetchAndTrackRateLimit(upstreamUrl, init, route, options);
+      return await fetchAndTrackRateLimit(upstreamUrl, init, route, options, context);
     } catch (directError) {
       throw isNetworkFetchFailure(directError)
         ? new UpstreamNetworkError(directError, upstreamUrl, route, proxyLabel)
@@ -1271,12 +1303,100 @@ async function fetchUpstream(upstreamUrl, init, context = {}, route = {}, option
   }
 }
 
-async function fetchAndTrackRateLimit(upstreamUrl, init, route, options = {}) {
-  const response = await fetch(upstreamUrl, init);
-  if (response.status === 429 && options.trackRateLimit !== false) {
-    markRouteRateLimited(route, response.headers);
+async function fetchAndTrackRateLimit(upstreamUrl, init, route, options = {}, context = {}) {
+  const abortable = abortableFetchInit(init, upstreamUrl, route, options, context);
+  try {
+    const response = await fetch(upstreamUrl, abortable.init);
+    if (response.status === 429 && options.trackRateLimit !== false) {
+      markRouteRateLimited(route, response.headers);
+    }
+    return response;
+  } catch (error) {
+    if (abortable.clientAborted()) {
+      throw new ClientClosedRequestError();
+    }
+    if (abortable.timedOut()) {
+      throw new UpstreamTimeoutError(abortable.timeoutMs, upstreamUrl, route);
+    }
+    throw error;
+  } finally {
+    abortable.cleanup();
   }
-  return response;
+}
+
+function abortableFetchInit(init = {}, upstreamUrl, route = {}, options = {}, context = {}) {
+  const controller = new AbortController();
+  const cleanup = [];
+  let timeoutTriggered = false;
+  let clientTriggered = Boolean(context.clientSignal?.aborted);
+  const timeoutMs = upstreamTimeoutMs(route, options);
+
+  const abort = (reason) => {
+    if (!controller.signal.aborted) {
+      controller.abort(reason);
+    }
+  };
+
+  if (init.signal) {
+    if (init.signal.aborted) {
+      abort(init.signal.reason);
+    } else {
+      const onAbort = () => abort(init.signal.reason);
+      init.signal.addEventListener("abort", onAbort, { once: true });
+      cleanup.push(() => init.signal.removeEventListener("abort", onAbort));
+    }
+  }
+
+  if (context.clientSignal) {
+    if (context.clientSignal.aborted) {
+      clientTriggered = true;
+      abort(context.clientSignal.reason);
+    } else {
+      const onClientAbort = () => {
+        clientTriggered = true;
+        abort(context.clientSignal.reason);
+      };
+      context.clientSignal.addEventListener("abort", onClientAbort, { once: true });
+      cleanup.push(() => context.clientSignal.removeEventListener("abort", onClientAbort));
+    }
+  }
+
+  if (timeoutMs > 0) {
+    const timeout = setTimeout(() => {
+      timeoutTriggered = true;
+      abort(new Error(`upstream timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+    cleanup.push(() => clearTimeout(timeout));
+  }
+
+  return {
+    init: {
+      ...init,
+      signal: controller.signal,
+    },
+    timeoutMs,
+    clientAborted: () => clientTriggered || Boolean(context.clientSignal?.aborted),
+    timedOut: () => timeoutTriggered,
+    cleanup: () => {
+      for (const fn of cleanup.splice(0)) {
+        fn();
+      }
+    },
+  };
+}
+
+function upstreamTimeoutMs(route = {}, options = {}) {
+  const value = Number(
+    options.timeoutMs ??
+      route.upstreamTimeoutMs ??
+      route.upstream_timeout_ms ??
+      route.requestTimeoutMs ??
+      route.request_timeout_ms,
+  );
+  if (Number.isFinite(value) && value >= 0) {
+    return Math.floor(value);
+  }
+  return DEFAULT_UPSTREAM_TIMEOUT_MS;
 }
 
 function logProxyFallback(context, route, error) {

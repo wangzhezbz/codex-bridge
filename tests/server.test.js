@@ -470,6 +470,282 @@ test("server stops chat tool loops when Codex sends full input without previous_
   }
 });
 
+test("server aborts upstream chat request when the Codex client disconnects", async () => {
+  let upstreamHitResolve;
+  let upstreamClosedResolve;
+  const upstreamHit = new Promise((resolve) => {
+    upstreamHitResolve = resolve;
+  });
+  const upstreamClosed = new Promise((resolve) => {
+    upstreamClosedResolve = resolve;
+  });
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/chat/completions");
+    upstreamHitResolve();
+    res.on("close", () => upstreamClosedResolve());
+  });
+
+  await listen(upstream);
+  const upstreamUrl = serverUrl(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        api: "chat_completions",
+        baseUrl: `${upstreamUrl}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+        upstreamTimeoutMs: 5000,
+      },
+    ],
+  });
+
+  await listen(router);
+  const baseUrl = serverUrl(router);
+  const controller = new AbortController();
+  const clientRequest = fetch(`${baseUrl}/v1/responses`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer router-token",
+    },
+    signal: controller.signal,
+    body: JSON.stringify({
+      model: "deepseek-v4-pro",
+      input: "start a slow tool-planning turn",
+    }),
+  }).catch((error) => error);
+
+  try {
+    await upstreamHit;
+    controller.abort();
+    const closed = await Promise.race([
+      upstreamClosed.then(() => true),
+      delay(400).then(() => false),
+    ]);
+    assert.equal(closed, true);
+    const result = await clientRequest;
+    assert.match(String(result?.name || result?.message || ""), /abort|cancel/i);
+  } finally {
+    router.closeAllConnections?.();
+    upstream.closeAllConnections?.();
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("server times out hung upstream chat requests", async () => {
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/chat/completions");
+  });
+
+  await listen(upstream);
+  const upstreamUrl = serverUrl(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        api: "chat_completions",
+        baseUrl: `${upstreamUrl}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+        upstreamTimeoutMs: 30,
+      },
+    ],
+  });
+
+  await listen(router);
+  const baseUrl = serverUrl(router);
+
+  try {
+    const result = await Promise.race([
+      fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer router-token",
+        },
+        body: JSON.stringify({
+          model: "deepseek-v4-pro",
+          input: "this upstream will hang",
+        }),
+      }).then(async (response) => ({
+        status: response.status,
+        text: await response.text(),
+      })),
+      delay(500).then(() => null),
+    ]);
+    assert.ok(result, "router should return before the test timeout");
+    assert.equal(result.status, 504);
+    assert.match(result.text, /timed out/i);
+  } finally {
+    router.closeAllConnections?.();
+    upstream.closeAllConnections?.();
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("server default chat tool guard stops after three consecutive tool calls", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/chat/completions");
+    upstreamCalls += 1;
+
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: `chatcmpl_default_loop_${upstreamCalls}`,
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: "I will keep using tools.",
+              tool_calls: [
+                {
+                  id: `call_default_loop_${upstreamCalls}`,
+                  type: "function",
+                  function: {
+                    name: "shell_command",
+                    arguments: JSON.stringify({
+                      command: `echo default-loop ${upstreamCalls}`,
+                    }),
+                  },
+                },
+              ],
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 300 + upstreamCalls,
+          completion_tokens: 10,
+          total_tokens: 310 + upstreamCalls,
+        },
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const upstreamUrl = serverUrl(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        api: "chat_completions",
+        baseUrl: `${upstreamUrl}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const baseUrl = serverUrl(router);
+  const tools = [
+    {
+      type: "function",
+      name: "shell_command",
+      description: "Run shell.",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string" },
+        },
+        required: ["command"],
+      },
+    },
+  ];
+
+  try {
+    const first = await fetchJson(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        input: "run a short shell sequence",
+        tools,
+      }),
+    });
+    const firstCall = first.output.find((item) => item.type === "function_call");
+    assert.ok(firstCall);
+
+    const second = await fetchJson(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        previous_response_id: first.id,
+        input: [{ type: "function_call_output", call_id: firstCall.call_id, output: "one" }],
+        tools,
+      }),
+    });
+    const secondCall = second.output.find((item) => item.type === "function_call");
+    assert.ok(secondCall);
+
+    const third = await fetchJson(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        previous_response_id: second.id,
+        input: [{ type: "function_call_output", call_id: secondCall.call_id, output: "two" }],
+        tools,
+      }),
+    });
+    const thirdCall = third.output.find((item) => item.type === "function_call");
+    assert.ok(thirdCall);
+
+    const fourth = await fetchJson(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        previous_response_id: third.id,
+        input: [{ type: "function_call_output", call_id: thirdCall.call_id, output: "three" }],
+        tools,
+      }),
+    });
+
+    assert.equal(
+      fourth.output.some((item) => item.type === "function_call"),
+      false,
+    );
+    assert.match(fourth.output_text, /stopped.*tool loop/i);
+    assert.equal(upstreamCalls, 4);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
 test("server lets chat models finish tool tasks from full input without previous_response_id", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer(async (req, res) => {
@@ -3952,6 +4228,10 @@ function close(server) {
   return new Promise((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()));
   });
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function serverUrl(server) {

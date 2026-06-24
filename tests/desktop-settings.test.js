@@ -16,9 +16,12 @@ import {
   loadDesktopOptions,
   providerCatalog,
   prepareRouterStartConfig,
+  readRouterConfig,
   readCustomModels,
   recoverCodexHistoryAccess,
+  removeCustomModel,
   restoreCodexConfig,
+  routerConfigPath,
   routerConfigDiagnostics,
   routerRuntimeEnv,
   readModelImageGenerationOverrides,
@@ -32,6 +35,7 @@ import {
   secretStatus,
   supportDiagnostics,
   syncCodexBridgeConversationProviders,
+  writeRouterConfigFromSelection,
 } from "../desktop/settings.mjs";
 
 test("detectModeFromConfig distinguishes all-api and hybrid", () => {
@@ -276,7 +280,7 @@ test("supportDiagnostics redacts keys and summarizes current config", () => {
           id: "gpt-5.2",
           displayName: "Kimi K2.7 Code",
           api: "chat_completions",
-          baseUrl: "https://api.moonshot.cn/v1",
+          baseUrl: "https://user:pass@api.moonshot.cn/v1?token=secret-token-123456",
           model: "kimi-k2.7-code",
           authMode: "api_key",
           apiKeyEnv: "MOONSHOT_API_KEY",
@@ -307,6 +311,9 @@ test("supportDiagnostics redacts keys and summarizes current config", () => {
   assert.match(diagnostics.text, /UND_ERR_CONNECT_TIMEOUT/);
   assert.doesNotMatch(diagnostics.text, /sk-secret-value/);
   assert.doesNotMatch(diagnostics.text, /sk-sensitive-token/);
+  assert.doesNotMatch(diagnostics.text, /user:pass/);
+  assert.doesNotMatch(diagnostics.text, /secret-token-123456/);
+  assert.match(diagnostics.text, /api\.moonshot\.cn/);
 });
 
 test("secretValue returns only known provider secrets", () => {
@@ -457,6 +464,18 @@ test("buildRouterConfigFromSelection preserves native GPT speed tiers", () => {
   assert.deepEqual(config.models[1].additionalSpeedTiers, ["fast"]);
   assert.equal(config.models[0].id, "gpt-5.5");
   assert.equal(config.models[1].id, "gpt-5.4");
+});
+
+test("chat completion routes get a conservative default tool guard", () => {
+  const rootDir = makeTempProject();
+  saveSelection(rootDir, ["deepseek-v4-pro", "kimi-k2-7-code"], MODE_HYBRID);
+
+  const config = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
+
+  assert.equal(config.models[0].api, "chat_completions");
+  assert.equal(config.models[0].maxToolContinuationTurns, 2);
+  assert.equal(config.models[1].api, "chat_completions");
+  assert.equal(config.models[1].maxToolContinuationTurns, 2);
 });
 
 test("domestic model presets route with their own provider keys", () => {
@@ -728,6 +747,72 @@ test("ensureRouterConfig can copy bundled templates into a separate data directo
 
   assert.equal(target, path.join(dataRootDir, "config", "router.config.json"));
   assert.equal(copied.models[0].id, "hybrid");
+});
+
+test("writeRouterConfigFromSelection commits config with atomic rename", () => {
+  const rootDir = makeTempProject();
+  saveSelection(rootDir, ["deepseek-v4-pro"], MODE_HYBRID);
+  let renameCalls = 0;
+  const originalRenameSync = fs.renameSync;
+  fs.renameSync = function renameSyncSpy(...args) {
+    renameCalls += 1;
+    return originalRenameSync.apply(this, args);
+  };
+
+  try {
+    writeRouterConfigFromSelection(rootDir, MODE_HYBRID);
+  } finally {
+    fs.renameSync = originalRenameSync;
+  }
+
+  assert.equal(renameCalls, 1);
+  assert.doesNotThrow(() => JSON.parse(fs.readFileSync(routerConfigPath(rootDir), "utf8")));
+});
+
+test("saving a selected custom model refreshes router config", () => {
+  const rootDir = makeTempProject();
+  const custom = saveCustomModel(rootDir, {
+    providerName: "Original Provider",
+    displayName: "Original Coder",
+    model: "original-coder-v1",
+    baseUrl: "https://api.original.example/v1",
+    api: "chat_completions",
+  });
+  saveSelection(rootDir, [custom.presetId], MODE_HYBRID);
+  writeRouterConfigFromSelection(rootDir, MODE_HYBRID);
+
+  saveCustomModel(rootDir, {
+    presetId: custom.presetId,
+    providerName: "Renamed Provider",
+    displayName: "Renamed Coder",
+    model: "renamed-coder-v2",
+    baseUrl: "https://api.renamed.example/v1",
+    api: "responses",
+  });
+
+  const config = readRouterConfig(rootDir);
+  assert.equal(config.models[0].displayName, "Renamed Coder");
+  assert.equal(config.models[0].model, "renamed-coder-v2");
+  assert.equal(config.models[0].api, "responses");
+});
+
+test("removing a selected custom model refreshes router config and selection", () => {
+  const rootDir = makeTempProject();
+  const custom = saveCustomModel(rootDir, {
+    providerName: "Temporary Provider",
+    displayName: "Temporary Coder",
+    model: "temporary-coder-v1",
+    baseUrl: "https://api.temporary.example/v1",
+    api: "chat_completions",
+  });
+  saveSelection(rootDir, [custom.presetId, "deepseek-v4-pro"], MODE_HYBRID);
+  writeRouterConfigFromSelection(rootDir, MODE_HYBRID);
+
+  removeCustomModel(rootDir, custom.presetId);
+
+  const config = readRouterConfig(rootDir);
+  assert.equal(config.models.length, 1);
+  assert.equal(config.models[0].sourcePresetId, "deepseek-v4-pro");
 });
 
 test("applyCodexConfig writes config and creates backup", () => {

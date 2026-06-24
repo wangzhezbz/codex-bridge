@@ -119,6 +119,7 @@ export function createRouterServer(config = loadConfig()) {
           return;
         }
         const requestId = makeRequestId();
+        const clientAbort = clientAbortContext(req, res);
         console.log(
           `[${new Date().toISOString()}] ${requestId} <- /v1/responses ` +
             `model=${body.model || "(default)"} route=${route.id} ` +
@@ -131,10 +132,21 @@ export function createRouterServer(config = loadConfig()) {
             requestId,
             clientAuth,
             clientHeaders: req.headers,
+            clientSignal: clientAbort.signal,
           });
         } catch (error) {
+          if (error?.code === "client_closed_request") {
+            console.warn(
+              `[${new Date().toISOString()}] ${requestId} !! client closed request before upstream completed`,
+            );
+            return;
+          }
           console.error(requestErrorLine(requestId, route, error));
-          sendUpstreamError(res, error);
+          if (!res.destroyed && !res.writableEnded) {
+            sendUpstreamError(res, error);
+          }
+        } finally {
+          clientAbort.cleanup();
         }
         return;
       }
@@ -144,7 +156,9 @@ export function createRouterServer(config = loadConfig()) {
       console.error(
         `[${new Date().toISOString()}] router error: ${error.stack || error.message}`,
       );
-      sendUpstreamError(res, error);
+      if (!res.destroyed && !res.writableEnded) {
+        sendUpstreamError(res, error);
+      }
     }
   });
 }
@@ -202,6 +216,24 @@ function bearerTokenFromHeader(value) {
   }
   const match = value.match(/^Bearer\s+(.+)$/i);
   return match ? match[1].trim() : "";
+}
+
+function clientAbortContext(req, res) {
+  const controller = new AbortController();
+  const abort = () => {
+    if (!res.writableEnded && !controller.signal.aborted) {
+      controller.abort(new Error("client connection closed"));
+    }
+  };
+  req.once("aborted", abort);
+  res.once("close", abort);
+  return {
+    signal: controller.signal,
+    cleanup() {
+      req.off("aborted", abort);
+      res.off("close", abort);
+    },
+  };
 }
 
 function writeCors(res) {
