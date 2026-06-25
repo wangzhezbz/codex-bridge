@@ -41,8 +41,8 @@ const TOOL_OUTPUT_CONTINUATION_GUIDANCE =
   "If those results satisfy the user's request, return a final concise answer now. " +
   "Do not repeat the same command, restart the same task, or call another tool unless a clearly missing next step remains.";
 const ATTACHMENT_GUIDANCE =
-  "CodexBridge attachment guidance: Chat-routed providers cannot read native Codex file attachments unless CodexBridge forwards an explicit chat file part or extracts text into this request. " +
-  "Use only the attachment text or file parts already included here. " +
+  "CodexBridge attachment guidance: Chat-routed providers cannot read native Codex file or audio attachments unless CodexBridge forwards an explicit chat part or extracts text into this request. " +
+  "Use only the attachment text, audio parts, or file parts already included here. " +
   "Do not call shell, browser, MCP, or local file tools to retrieve unsupported attachments. " +
   "If needed content is missing, ask the user to switch to a GPT/Responses model or provide text/OCR output.";
 const MAX_EXTRACTABLE_FILE_BYTES = 5_000_000;
@@ -265,6 +265,10 @@ export function contentToChatContent(content, route = {}) {
     if (imagePart) {
       return [imagePart];
     }
+    const audioPart = audioPartToChat(content, route);
+    if (audioPart) {
+      return [audioPart];
+    }
     if (isFilePart(content)) {
       const filePart = filePartToChat(content, route);
       return filePart.chatPart ? [filePart.chatPart] : filePart.text;
@@ -292,6 +296,17 @@ export function contentToChatContent(content, route = {}) {
     if (imagePart) {
       hasNonTextPart = true;
       chatParts.push(imagePart);
+      continue;
+    }
+
+    const audioPart = audioPartToChat(part, route);
+    if (audioPart) {
+      if (audioPart.type !== "text") {
+        hasNonTextPart = true;
+      } else {
+        textParts.push(audioPart.text);
+      }
+      chatParts.push(audioPart);
       continue;
     }
 
@@ -344,6 +359,9 @@ export function contentToText(content) {
     if (isImagePart(content)) {
       return "[image input not forwarded in text-only context]";
     }
+    if (isAudioPart(content)) {
+      return unavailableAudioText(content);
+    }
     if (isFilePart(content)) {
       return filePartToChat(content).text;
     }
@@ -364,6 +382,8 @@ export function contentToText(content) {
       parts.push(text);
     } else if (isImagePart(part)) {
       parts.push("[image input not forwarded in text-only context]");
+    } else if (isAudioPart(part)) {
+      parts.push(unavailableAudioText(part));
     } else if (isFilePart(part)) {
       parts.push(filePartToChat(part).text);
     } else if (part.type && Object.keys(part).length > 0) {
@@ -430,6 +450,81 @@ function isOversizedDataImageUrl(value) {
 function isImagePart(part) {
   const type = String(part?.type || "").toLowerCase();
   return type === "image_url" || type.includes("image");
+}
+
+function audioPartToChat(part, route = {}) {
+  if (!isAudioPart(part)) {
+    return null;
+  }
+  if (!shouldForwardAudioToChat(route)) {
+    return { type: "text", text: unavailableAudioText(part) };
+  }
+  const inputAudio = normalizedInputAudio(part);
+  if (!inputAudio.data) {
+    return { type: "text", text: "[audio input missing data]" };
+  }
+  return {
+    type: "input_audio",
+    input_audio: inputAudio,
+  };
+}
+
+function shouldForwardAudioToChat(route = {}) {
+  if (route?.api === "responses") {
+    return true;
+  }
+  const modalities = Array.isArray(route?.inputModalities)
+    ? route.inputModalities.map((item) => String(item || "").toLowerCase())
+    : [];
+  return modalities.includes("audio");
+}
+
+function isAudioPart(part) {
+  if (!part || typeof part !== "object") {
+    return false;
+  }
+  const type = String(part.type || "").toLowerCase();
+  return (
+    type === "input_audio" ||
+    type === "audio" ||
+    type.includes("audio") ||
+    Boolean(part.input_audio) ||
+    Boolean(part.inputAudio)
+  );
+}
+
+function normalizedInputAudio(part) {
+  const raw =
+    (part.input_audio && typeof part.input_audio === "object" ? part.input_audio : null) ||
+    (part.inputAudio && typeof part.inputAudio === "object" ? part.inputAudio : null) ||
+    (part.audio && typeof part.audio === "object" ? part.audio : null) ||
+    part;
+  const data = raw.data || raw.audio_data || raw.audioData || "";
+  const format = raw.format || part.format || audioFormatFromMime(raw.mime_type || raw.mimeType || part.mime_type || part.mimeType);
+  const inputAudio = {};
+  if (typeof data === "string" && data) {
+    inputAudio.data = data;
+  }
+  if (typeof format === "string" && format) {
+    inputAudio.format = format;
+  }
+  return inputAudio;
+}
+
+function unavailableAudioText(part) {
+  const inputAudio = normalizedInputAudio(part);
+  const description = inputAudio.format ? `${inputAudio.format} audio` : "audio";
+  return `[audio input not forwarded to this chat provider: ${description}. Switch to an audio-capable GPT/Responses or chat route, or provide a transcript.]`;
+}
+
+function audioFormatFromMime(mime) {
+  const value = String(mime || "").toLowerCase();
+  if (value.includes("wav")) return "wav";
+  if (value.includes("mpeg") || value.includes("mp3")) return "mp3";
+  if (value.includes("ogg")) return "ogg";
+  if (value.includes("webm")) return "webm";
+  if (value.includes("mp4") || value.includes("m4a")) return "mp4";
+  return "";
 }
 
 function isFilePart(part) {
@@ -680,23 +775,25 @@ function unavailableFileText(part) {
 }
 
 function attachmentGuidanceFromRequest(request = {}) {
-  return requestHasFileInput(request.messages ?? request.input) ? ATTACHMENT_GUIDANCE : "";
+  return requestHasAttachmentInput(request.messages ?? request.input)
+    ? ATTACHMENT_GUIDANCE
+    : "";
 }
 
-function requestHasFileInput(input) {
+function requestHasAttachmentInput(input) {
   if (input === undefined || input === null) {
     return false;
   }
   if (Array.isArray(input)) {
-    return input.some(requestHasFileInput);
+    return input.some(requestHasAttachmentInput);
   }
   if (typeof input !== "object") {
     return false;
   }
-  if (isFilePart(input)) {
+  if (isFilePart(input) || isAudioPart(input)) {
     return true;
   }
-  return requestHasFileInput(input.content ?? input.input ?? input.output);
+  return requestHasAttachmentInput(input.content ?? input.input ?? input.output);
 }
 
 function systemInstructionsFromRequest(request) {

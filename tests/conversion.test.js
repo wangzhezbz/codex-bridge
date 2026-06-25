@@ -264,6 +264,80 @@ test("chat conversion replaces oversized data images with text placeholders", ()
   ]);
 });
 
+test("chat conversion forwards audio only for explicit chat audio-capable routes", () => {
+  const audioRoute = {
+    ...route,
+    provider: "custom",
+    custom: true,
+    inputModalities: ["text", "audio"],
+  };
+  const converted = responsesToChatRequest(
+    {
+      input: [
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: "transcribe this clip" },
+            {
+              type: "input_audio",
+              input_audio: {
+                data: "UklGRgAAAAA=",
+                format: "wav",
+              },
+            },
+          ],
+        },
+      ],
+    },
+    audioRoute,
+    new ResponseHistory(),
+  );
+
+  assert.deepEqual(converted.body.messages.at(-1).content, [
+    { type: "text", text: "transcribe this clip" },
+    {
+      type: "input_audio",
+      input_audio: {
+        data: "UklGRgAAAAA=",
+        format: "wav",
+      },
+    },
+  ]);
+});
+
+test("chat conversion turns unsupported audio into a clear placeholder", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: [
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: "transcribe this clip" },
+            {
+              type: "input_audio",
+              input_audio: {
+                data: "UklGRgAAAAA=",
+                format: "wav",
+              },
+            },
+          ],
+        },
+      ],
+    },
+    route,
+    new ResponseHistory(),
+  );
+
+  const payload = JSON.stringify(converted.body.messages);
+  assert.match(payload, /CodexBridge attachment guidance/);
+  assert.equal(
+    converted.body.messages.at(-1).content,
+    "transcribe this clip\n[audio input not forwarded to this chat provider: wav audio. Switch to an audio-capable GPT/Responses or chat route, or provide a transcript.]",
+  );
+  assert.doesNotMatch(payload, /UklGRgAAAAA=/);
+  assert.doesNotMatch(payload, /input_audio/);
+});
+
 test("chat conversion keeps file inputs visible when chat provider cannot forward them", () => {
   const converted = responsesToChatRequest(
     {
