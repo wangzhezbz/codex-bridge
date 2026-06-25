@@ -43,16 +43,11 @@ const CHAT_SAFE_PARAMS = [
 
 const CUSTOM_CONSERVATIVE_CHAT_SAFE_PARAMS = CHAT_SAFE_PARAMS.filter(
   (param) =>
-    !["tools", "tool_choice", "parallel_tool_calls", "response_format"].includes(param),
+    !["parallel_tool_calls", "response_format"].includes(param),
 );
 
 const DEFAULT_CHAT_DROP_PARAMS = ["parallel_tool_calls", "response_format"];
-const CUSTOM_CONSERVATIVE_CHAT_DROP_PARAMS = [
-  "parallel_tool_calls",
-  "response_format",
-  "tool_choice",
-  "tools",
-];
+const CUSTOM_CONSERVATIVE_CHAT_DROP_PARAMS = DEFAULT_CHAT_DROP_PARAMS;
 
 export function normalizeAdapterProfile(route = {}) {
   const providerFamily = providerFamilyForRoute(route);
@@ -81,10 +76,8 @@ export function normalizeAdapterProfile(route = {}) {
     ),
     supportsTools: api === "responses"
       ? "native"
-      : customConservative
-        ? "none"
-        : "chat-functions",
-    supportsMcpNamespaces: api === "responses" || !customConservative,
+      : "chat-functions",
+    supportsMcpNamespaces: true,
     supportsImages,
     supportsFiles:
       api === "responses"

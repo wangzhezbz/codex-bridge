@@ -456,7 +456,20 @@ export async function proxyChatCompletions(
     },
   );
   let localFallback = "";
-  if (shouldStopChatToolContinuation(response, route, toolContinuationTurns)) {
+  const toolCallSignatures = responseToolCallSignatures(response);
+  const repeatsPreviousToolCall = responseRepeatsPreviousToolCall(
+    toolCallSignatures,
+    requestBody,
+    history,
+  );
+  if (
+    shouldStopChatToolContinuation(
+      response,
+      route,
+      toolContinuationTurns,
+      repeatsPreviousToolCall,
+    )
+  ) {
     console.warn(
       `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
         `!! tool-loop-guard route=${route.id} turns=${toolContinuationTurns} ` +
@@ -484,6 +497,9 @@ export async function proxyChatCompletions(
     toolContinuationTurns: responseHasRunnableToolCall(response)
       ? toolContinuationTurns
       : 0,
+    toolCallSignatures: responseHasRunnableToolCall(response)
+      ? toolCallSignatures
+      : [],
     ...(localFallback ? { localFallback } : {}),
   });
 
@@ -543,10 +559,16 @@ function responseInputItems(input) {
   return Array.isArray(input) ? input : [input];
 }
 
-function shouldStopChatToolContinuation(response, route, toolContinuationTurns) {
+function shouldStopChatToolContinuation(
+  response,
+  route,
+  toolContinuationTurns,
+  repeatsPreviousToolCall,
+) {
   return (
     toolContinuationTurns > maxChatToolContinuationTurns(route) &&
-    responseHasRunnableToolCall(response)
+    responseHasRunnableToolCall(response) &&
+    repeatsPreviousToolCall
   );
 }
 
@@ -562,6 +584,80 @@ function maxChatToolContinuationTurns(route = {}) {
 
 function responseHasRunnableToolCall(response) {
   return Array.isArray(response?.output) && response.output.some(isResponseToolCallItem);
+}
+
+function responseRepeatsPreviousToolCall(signatures, requestBody, history) {
+  if (!Array.isArray(signatures) || signatures.length === 0) {
+    return false;
+  }
+  const previousMeta = history?.getResponseMeta?.(requestBody?.previous_response_id) || {};
+  const previousSignatures = Array.isArray(previousMeta.toolCallSignatures)
+    ? previousMeta.toolCallSignatures
+    : latestToolCallSignaturesFromInput(requestBody?.messages ?? requestBody?.input);
+  return sameStringArray(signatures, previousSignatures);
+}
+
+function latestToolCallSignaturesFromInput(input) {
+  let latest = [];
+  let currentGroup = [];
+  for (const item of responseInputItems(input)) {
+    const signature = toolCallSignature(item);
+    if (signature) {
+      currentGroup.push(signature);
+      latest = [...currentGroup].sort();
+      continue;
+    }
+    currentGroup = [];
+  }
+  return latest;
+}
+
+function responseToolCallSignatures(response) {
+  if (!Array.isArray(response?.output)) {
+    return [];
+  }
+  return response.output
+    .map((item) => toolCallSignature(item))
+    .filter(Boolean)
+    .sort();
+}
+
+function toolCallSignature(item) {
+  if (!item || typeof item !== "object") {
+    return "";
+  }
+  if (isResponseToolCallItem(item)) {
+    return `${item.type || "tool"}:${item.name || ""}:${canonicalToolArguments(
+      item.arguments ?? item.input ?? item.action ?? "",
+    )}`;
+  }
+  const toolCalls = Array.isArray(item.tool_calls) ? item.tool_calls : [];
+  if (toolCalls.length === 0) {
+    return "";
+  }
+  return toolCalls
+    .map((toolCall) => {
+      const name = toolCall?.function?.name || toolCall?.name || "";
+      const args = toolCall?.function?.arguments ?? toolCall?.arguments ?? "";
+      return `chat:${name}:${canonicalToolArguments(args)}`;
+    })
+    .sort()
+    .join("|");
+}
+
+function canonicalToolArguments(value) {
+  if (typeof value === "string") {
+    const parsed = tryParseJson(value, undefined);
+    return stringifyJson(parsed === undefined ? value : parsed);
+  }
+  return stringifyJson(value ?? "");
+}
+
+function sameStringArray(left, right) {
+  if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+    return false;
+  }
+  return left.every((value, index) => value === right[index]);
 }
 
 function localToolLoopGuardChat(route, toolContinuationTurns) {

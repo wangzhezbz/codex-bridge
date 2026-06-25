@@ -87,19 +87,17 @@ test("custom chat routes default to conservative text-only behavior", () => {
 
   assert.equal(profile.adapterId, "custom-conservative");
   assert.equal(profile.customConservative, true);
-  assert.equal(profile.supportsTools, "none");
-  assert.equal(profile.supportsMcpNamespaces, false);
+  assert.equal(profile.supportsTools, "chat-functions");
+  assert.equal(profile.supportsMcpNamespaces, true);
   assert.equal(profile.supportsImages, "none");
   assert.equal(profile.supportsFiles, "none");
-  assert.ok(!profile.safeParams.includes("tools"));
-  assert.ok(!profile.safeParams.includes("tool_choice"));
+  assert.ok(profile.safeParams.includes("tools"));
+  assert.ok(profile.safeParams.includes("tool_choice"));
   assert.ok(!profile.safeParams.includes("parallel_tool_calls"));
   assert.ok(!profile.safeParams.includes("response_format"));
   assert.deepEqual(profile.dropParams, [
     "parallel_tool_calls",
     "response_format",
-    "tool_choice",
-    "tools",
   ]);
 });
 
@@ -117,18 +115,16 @@ test("custom chat routes preserve explicit image input in the adapter profile", 
 
   assert.equal(profile.customConservative, true);
   assert.equal(profile.supportsImages, "chat-image-url");
-  assert.equal(profile.supportsTools, "none");
-  assert.equal(profile.supportsMcpNamespaces, false);
+  assert.equal(profile.supportsTools, "chat-functions");
+  assert.equal(profile.supportsMcpNamespaces, true);
   assert.equal(profile.supportsFiles, "none");
-  assert.ok(!profile.safeParams.includes("tools"));
-  assert.ok(!profile.safeParams.includes("tool_choice"));
+  assert.ok(profile.safeParams.includes("tools"));
+  assert.ok(profile.safeParams.includes("tool_choice"));
   assert.ok(!profile.safeParams.includes("parallel_tool_calls"));
   assert.ok(!profile.safeParams.includes("response_format"));
   assert.deepEqual(profile.dropParams, [
     "parallel_tool_calls",
     "response_format",
-    "tool_choice",
-    "tools",
   ]);
 });
 
@@ -190,17 +186,15 @@ test("custom model generated route remains conservative until image input is ena
   assert.equal(route.providerFamily, "custom");
   assert.deepEqual(route.inputModalities, ["text"]);
   assert.equal(profile.adapterId, "custom-conservative");
-  assert.equal(profile.supportsTools, "none");
-  assert.equal(profile.supportsMcpNamespaces, false);
+  assert.equal(profile.supportsTools, "chat-functions");
+  assert.equal(profile.supportsMcpNamespaces, true);
   assert.equal(profile.supportsImages, "none");
-  assert.ok(!profile.safeParams.includes("tools"));
-  assert.ok(!profile.safeParams.includes("tool_choice"));
+  assert.ok(profile.safeParams.includes("tools"));
+  assert.ok(profile.safeParams.includes("tool_choice"));
   assert.ok(!profile.safeParams.includes("response_format"));
   assert.ok(!profile.safeParams.includes("parallel_tool_calls"));
   assert.ok(profile.dropParams.includes("response_format"));
   assert.ok(profile.dropParams.includes("parallel_tool_calls"));
-  assert.ok(profile.dropParams.includes("tool_choice"));
-  assert.ok(profile.dropParams.includes("tools"));
 });
 
 const BUILT_IN_PROVIDER_CONTRACTS = {
@@ -417,7 +411,7 @@ test("payload filtering keeps only adapter-safe chat parameters", () => {
   assert.equal(filtered.store, undefined);
 });
 
-test("custom conservative routes drop tools and tool_choice during filtering", () => {
+test("custom conservative routes still pass through tools and tool_choice during filtering", () => {
   const payload = {
     model: "custom-model",
     messages: [{ role: "user", content: "hello" }],
@@ -434,8 +428,8 @@ test("custom conservative routes drop tools and tool_choice during filtering", (
     model: "custom-model",
   });
 
-  assert.equal(filtered.tools, undefined);
-  assert.equal(filtered.tool_choice, undefined);
+  assert.deepEqual(filtered.tools, payload.tools);
+  assert.deepEqual(filtered.tool_choice, payload.tool_choice);
   assert.equal(filtered.parallel_tool_calls, undefined);
   assert.equal(filtered.response_format, undefined);
   assert.deepEqual(filtered.messages, [{ role: "user", content: "hello" }]);
