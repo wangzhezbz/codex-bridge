@@ -316,6 +316,102 @@ test("supportDiagnostics redacts keys and summarizes current config", () => {
   assert.match(diagnostics.text, /api\.moonshot\.cn/);
 });
 
+test("supportDiagnostics includes route health, usage, proxy, and update paths without secrets", () => {
+  const rootDir = makeTempProject();
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-bridge-home-"));
+  const updateDir = path.join(rootDir, "updates");
+  saveDesktopOptions(rootDir, { bypassSystemProxy: true });
+
+  const diagnostics = supportDiagnostics(rootDir, {
+    appVersion: "0.1.101",
+    routerRunning: true,
+    updateDir,
+    proxyEnv: {
+      HTTPS_PROXY: "http://user:pass@127.0.0.1:7890",
+      NO_PROXY: "localhost,127.0.0.1",
+    },
+    lastHealth: {
+      ok: true,
+      models: ["gpt-5.5", "deepseek-v4-pro"],
+      unhealthyRoutes: 1,
+      routes: [
+        {
+          id: "gpt-5.5",
+          status: "healthy",
+          api: "responses",
+          model: "gpt-5.5",
+        },
+        {
+          id: "deepseek-v4-pro",
+          status: "rate_limited",
+          api: "chat_completions",
+          model: "deepseek-v4-pro",
+          lastStatus: 429,
+          lastErrorType: "rate_limit",
+          cooldownRemainingMs: 12000,
+          lastError: "Too Many Requests sk-sensitive-token",
+        },
+      ],
+    },
+    usageSummary: {
+      totalCalls: 2,
+      totalTokens: 321,
+      statusCounts: { 200: 1, 429: 1 },
+      latest: {
+        route: "deepseek-v4-pro",
+        status: 429,
+        errorType: "rate_limit",
+        error: "Too Many Requests sk-usage-secret",
+      },
+      byModel: [
+        {
+          route: "deepseek-v4-pro",
+          calls: 2,
+          errors: 1,
+          lastStatus: 429,
+          lastErrorType: "rate_limit",
+          totalTokens: 321,
+        },
+      ],
+    },
+    config: {
+      port: 15722,
+      models: [
+        {
+          id: "deepseek-v4-pro",
+          displayName: "DeepSeek V4 Pro",
+          api: "chat_completions",
+          baseUrl: "https://api.deepseek.com/v1",
+          model: "deepseek-v4-pro",
+          authMode: "api_key",
+          apiKeyEnv: "DEEPSEEK_API_KEY",
+        },
+      ],
+    },
+    logs: [],
+    homeDir,
+  });
+
+  assert.match(diagnostics.text, /Router route health/);
+  assert.match(diagnostics.text, /deepseek-v4-pro: rate_limited/);
+  assert.match(diagnostics.text, /lastErrorType=rate_limit/);
+  assert.match(diagnostics.text, /cooldownMs=12000/);
+  assert.match(diagnostics.text, /Usage diagnostics/);
+  assert.match(diagnostics.text, /totalCalls: 2/);
+  assert.match(diagnostics.text, /latest: deepseek-v4-pro status=429 errorType=rate_limit/);
+  assert.match(diagnostics.text, /Proxy diagnostics/);
+  assert.match(diagnostics.text, /HTTPS_PROXY: set http:\/\/127\.0\.0\.1:7890/);
+  assert.match(diagnostics.text, /NO_PROXY: set localhost,127\.0\.0\.1/);
+  assert.match(diagnostics.text, /Update diagnostics/);
+  assert.match(diagnostics.text, new RegExp(escapeRegExp(updateDir)));
+  assert.equal(diagnostics.summary.unhealthyRoutes, 1);
+  assert.equal(diagnostics.summary.usage.totalCalls, 2);
+  assert.equal(diagnostics.summary.proxy.HTTPS_PROXY, "set");
+  assert.doesNotMatch(diagnostics.text, /user:pass/);
+  assert.doesNotMatch(diagnostics.text, /sk-sensitive-token/);
+  assert.doesNotMatch(diagnostics.text, /sk-usage-secret/);
+});
+
 test("supportDiagnostics reports stale Codex plugin runtime without mutating it", () => {
   const rootDir = makeTempProject();
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-bridge-home-"));

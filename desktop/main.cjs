@@ -552,6 +552,9 @@ ipcMain.handle("diagnostics:copy", async () => {
     appVersion: app.getVersion(),
     routerRunning: Boolean(routerProcess),
     lastHealth,
+    usageSummary: usageStore?.summary() || emptyUsageSummary(),
+    updateDir: portableUpdatesDir(),
+    proxyEnv: process.env,
     config,
     logs: logLines,
   });

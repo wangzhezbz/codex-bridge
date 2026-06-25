@@ -296,6 +296,9 @@ export function supportDiagnostics(rootDir, {
   appVersion = "",
   routerRunning = false,
   lastHealth = null,
+  usageSummary = null,
+  updateDir = path.join(rootDir, "updates"),
+  proxyEnv = process.env,
   config = readRouterConfig(rootDir),
   logs = [],
   platform = process.platform,
@@ -330,6 +333,7 @@ export function supportDiagnostics(rootDir, {
     `routerPort: ${config?.port || 15722}`,
     `bypassSystemProxy: ${Boolean(options.bypassSystemProxy)}`,
     `health: ${lastHealth?.ok ? "ok" : lastHealth?.message || "unknown"}`,
+    `unhealthyRoutes: ${routeHealthSummary(lastHealth).unhealthyRoutes}`,
     "",
     "Selected models:",
     ...(selectedRoutes.length
@@ -349,6 +353,18 @@ export function supportDiagnostics(rootDir, {
     `- missingApiKeys: ${routeDiagnostics.missingApiKeys.map((item) => `${item.displayName || item.id}:${item.apiKeyEnv || "API Key"}`).join(", ") || "none"}`,
     `- invalidBaseUrls: ${routeDiagnostics.invalidBaseUrls.map((item) => `${item.displayName || item.id}:${item.baseUrl || "(empty)"}`).join(", ") || "none"}`,
     "",
+    "Router route health:",
+    ...routeHealthSummary(lastHealth).lines,
+    "",
+    "Usage diagnostics:",
+    ...usageDiagnosticsLines(usageSummary),
+    "",
+    "Proxy diagnostics:",
+    ...proxyDiagnosticsLines(proxyEnv, options),
+    "",
+    "Update diagnostics:",
+    ...updateDiagnosticsLines(updateDir),
+    "",
     "Codex history diagnostics:",
     ...historyDiagnostics.lines,
     "",
@@ -361,15 +377,169 @@ export function supportDiagnostics(rootDir, {
 
   return {
     summary: {
-      ok: routeDiagnostics.ok && pluginDiagnostics.summary.ok && Boolean(lastHealth?.ok || !routerRunning),
+      ok:
+        routeDiagnostics.ok &&
+        pluginDiagnostics.summary.ok &&
+        routeHealthSummary(lastHealth).unhealthyRoutes === 0 &&
+        Boolean(lastHealth?.ok || !routerRunning),
       missingApiKeys: routeDiagnostics.missingApiKeys,
       invalidBaseUrls: routeDiagnostics.invalidBaseUrls,
       errorCount: errorLines.length,
+      unhealthyRoutes: routeHealthSummary(lastHealth).unhealthyRoutes,
+      usage: usageDiagnosticsSummary(usageSummary),
+      proxy: proxyDiagnosticsSummary(proxyEnv),
+      update: {
+        updateDir,
+        updateDirExists: safeExists(updateDir),
+      },
       history: historyDiagnostics.summary,
       codexPlugins: pluginDiagnostics.summary,
     },
     text: lines.join("\n"),
   };
+}
+
+function routeHealthSummary(lastHealth) {
+  const routes = Array.isArray(lastHealth?.routes) ? lastHealth.routes : [];
+  const unhealthyRoutes = Number.isFinite(Number(lastHealth?.unhealthyRoutes))
+    ? Number(lastHealth.unhealthyRoutes)
+    : routes.filter((route) => route?.status === "degraded" || route?.status === "rate_limited").length;
+  return {
+    unhealthyRoutes,
+    lines: routes.length
+      ? routes.map((route) => {
+          const parts = [
+            `- ${redactSecretText(route.id || route.model || "unknown")}: ${redactSecretText(route.status || "unknown")}`,
+            `api=${redactSecretText(route.api || "")}`,
+            `model=${redactSecretText(route.model || "")}`,
+          ];
+          if (route.lastStatus !== null && route.lastStatus !== undefined) {
+            parts.push(`lastStatus=${Number(route.lastStatus)}`);
+          }
+          if (route.lastErrorType) {
+            parts.push(`lastErrorType=${redactSecretText(route.lastErrorType)}`);
+          }
+          const cooldownMs = Number(route.cooldownRemainingMs || route.rateLimit?.cooldownRemainingMs || 0);
+          if (Number.isFinite(cooldownMs) && cooldownMs > 0) {
+            parts.push(`cooldownMs=${Math.ceil(cooldownMs)}`);
+          }
+          if (route.lastError) {
+            parts.push(`lastError=${redactSecretText(route.lastError).slice(0, 160)}`);
+          }
+          return parts.filter((part) => !part.endsWith("=")).join(" ");
+        })
+      : ["- no route health snapshot"],
+  };
+}
+
+function usageDiagnosticsSummary(usageSummary = null) {
+  return {
+    totalCalls: Number(usageSummary?.totalCalls || 0),
+    totalTokens: Number(usageSummary?.totalTokens || 0),
+    statusCounts: usageSummary?.statusCounts || {},
+    latestStatus: Number.isFinite(Number(usageSummary?.latest?.status))
+      ? Number(usageSummary.latest.status)
+      : null,
+    latestErrorType: String(usageSummary?.latest?.errorType || ""),
+  };
+}
+
+function usageDiagnosticsLines(usageSummary = null) {
+  if (!usageSummary) {
+    return ["- no usage summary"];
+  }
+  const lines = [
+    `- totalCalls: ${Number(usageSummary.totalCalls || 0)}`,
+    `- totalTokens: ${Number(usageSummary.totalTokens || 0)}`,
+    `- statusCounts: ${formatStatusCounts(usageSummary.statusCounts)}`,
+  ];
+  const latest = usageSummary.latest;
+  if (latest) {
+    lines.push(
+      `- latest: ${redactSecretText(latest.route || latest.codexModel || latest.upstreamModel || "unknown")} ` +
+        `status=${Number.isFinite(Number(latest.status)) ? Number(latest.status) : "unknown"} ` +
+        `errorType=${redactSecretText(latest.errorType || "")}` +
+        (latest.error ? ` error=${redactSecretText(latest.error).slice(0, 160)}` : ""),
+    );
+  } else {
+    lines.push("- latest: none");
+  }
+  const byModel = Array.isArray(usageSummary.byModel) ? usageSummary.byModel.slice(0, 5) : [];
+  if (byModel.length) {
+    lines.push("- byModel:");
+    for (const item of byModel) {
+      lines.push(
+        `  - ${redactSecretText(item.route || item.codexModel || item.upstreamModel || "unknown")} ` +
+          `calls=${Number(item.calls || 0)} errors=${Number(item.errors || 0)} ` +
+          `lastStatus=${Number.isFinite(Number(item.lastStatus)) ? Number(item.lastStatus) : "unknown"} ` +
+          `lastErrorType=${redactSecretText(item.lastErrorType || "")} ` +
+          `totalTokens=${Number(item.totalTokens || 0)}`,
+      );
+    }
+  }
+  return lines;
+}
+
+function proxyDiagnosticsSummary(proxyEnv = {}) {
+  const summary = {};
+  for (const key of proxyDiagnosticKeys()) {
+    summary[key] = proxyEnvValue(proxyEnv, key) ? "set" : "unset";
+  }
+  return summary;
+}
+
+function proxyDiagnosticsLines(proxyEnv = {}, options = {}) {
+  const lines = [`- bypassSystemProxy: ${Boolean(options.bypassSystemProxy)}`];
+  for (const key of proxyDiagnosticKeys()) {
+    const value = proxyEnvValue(proxyEnv, key);
+    lines.push(`- ${key}: ${value ? `set ${redactProxyValue(value)}` : "unset"}`);
+  }
+  return lines;
+}
+
+function updateDiagnosticsLines(updateDir) {
+  return [
+    `- updateDir: ${redactSecretText(updateDir || "")}`,
+    `- updateDirExists: ${safeExists(updateDir)}`,
+  ];
+}
+
+function formatStatusCounts(statusCounts = {}) {
+  const entries = Object.entries(statusCounts || {})
+    .map(([status, count]) => `${redactSecretText(status)}=${Number(count || 0)}`)
+    .sort();
+  return entries.join(", ") || "none";
+}
+
+function proxyDiagnosticKeys() {
+  return ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY"];
+}
+
+function proxyEnvValue(proxyEnv = {}, key) {
+  return proxyEnv[key] || proxyEnv[key.toLowerCase()] || "";
+}
+
+function redactProxyValue(value) {
+  const text = String(value || "");
+  if (!text) {
+    return "";
+  }
+  try {
+    const url = new URL(text);
+    url.username = "";
+    url.password = "";
+    return redactSecretText(url.toString().replace("://@", "://"));
+  } catch {
+    return redactSecretText(text.replace(/\/\/[^/@\s]+@/g, "//"));
+  }
+}
+
+function safeExists(targetPath) {
+  try {
+    return Boolean(targetPath && fs.existsSync(targetPath));
+  } catch {
+    return false;
+  }
 }
 
 function codexPluginRuntimeDiagnostics({ homeDir = os.homedir() } = {}) {
@@ -561,7 +731,7 @@ function codexHistoryDiagnostics({ homeDir = os.homedir() } = {}) {
       for (const row of item.recentThreads) {
         lines.push(
           `  - ${row.id} provider=${row.model_provider} source=${row.source} threadSource=${row.thread_source} ` +
-            `archived=${row.archived} hasUserEvent=${row.has_user_event} title=${row.title}`,
+            `archived=${row.archived} hasUserEvent=${row.has_user_event}`,
         );
       }
     }
@@ -676,7 +846,6 @@ function sqliteGroupedCounts(db, tableName, columnName) {
 function recentThreadDiagnostics(db, columns) {
   const selectedColumns = [
     "id",
-    "title",
     "model_provider",
     "source",
     "thread_source",
@@ -710,7 +879,6 @@ function normalizeRecentThreadDiagnostic(row) {
     thread_source: redactSecretText(row.thread_source || "(missing)"),
     archived: row.archived ?? "(missing)",
     has_user_event: row.has_user_event ?? "(missing)",
-    title: redactSecretText(row.title || "(untitled)").slice(0, 80),
   };
 }
 
