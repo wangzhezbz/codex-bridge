@@ -53,6 +53,15 @@ test("desktop updater keeps downloaded package visible in the update folder", ()
   assert.doesNotMatch(main, /path\.join\(updatesDir, "downloads"\)/);
 });
 
+test("desktop opens local folders only after ensuring they exist", () => {
+  const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
+
+  assert.match(main, /function ensureFolderForOpen/);
+  assert.match(main, /fs\.mkdirSync\(resolvedFolder,\s*\{\s*recursive:\s*true\s*\}\)/);
+  assert.match(main, /const openError = await shell\.openPath\(folder\)/);
+  assert.match(main, /if \(openError\)/);
+});
+
 test("Windows release archive uses formal portable package naming", () => {
   const workflow = fs.readFileSync(
     path.join(process.cwd(), ".github", "workflows", "desktop-portable.yml"),

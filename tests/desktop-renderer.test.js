@@ -32,7 +32,7 @@ test("desktop renderer exposes update from sidebar without a dedicated page", ()
   assert.doesNotMatch(htmlSource, /id="installUpdate"/);
   assert.match(preloadSource, /checkForUpdates: \(\) => ipcRenderer\.invoke\("updates:check"\)/);
   assert.match(preloadSource, /installUpdate: \(\) => ipcRenderer\.invoke\("updates:install"\)/);
-  assert.match(rendererSource, /api\.openFolder\("updates"\)/);
+  assert.match(rendererSource, /bindFolderButton\("#openUpdateFolder", "updates"\)/);
   assert.match(preloadSource, /onUpdateProgress: \(callback\) =>/);
   assert.match(rendererSource, /api\.checkForUpdates\(\)/);
   assert.match(rendererSource, /api\.installUpdate\(\)/);
@@ -44,4 +44,12 @@ test("desktop renderer exposes update from sidebar without a dedicated page", ()
   assert.match(rendererSource, /els\.appVersion\.textContent = `v\$\{state\.appVersion \|\| "-"\}`;/);
   assert.match(rendererSource, /showUpdateDialog/);
   assert.doesNotMatch(rendererSource, /window\.confirm/);
+});
+
+test("desktop renderer opens folder buttons through the shared action handler", () => {
+  assert.match(rendererSource, /bindFolderButton\("#openConfigFolder", "config"\)/);
+  assert.match(rendererSource, /bindFolderButton\("#openCodexFolder", "codex"\)/);
+  assert.match(rendererSource, /bindFolderButton\("#openUpdateFolder", "updates"\)/);
+  assert.match(rendererSource, /function bindFolderButton/);
+  assert.match(rendererSource, /runAction\(button, async \(\) =>/);
 });

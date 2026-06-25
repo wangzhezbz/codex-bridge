@@ -182,9 +182,9 @@ els.customModelForm.addEventListener("submit", (event) => {
 
 els.cancelCustomEdit.addEventListener("click", () => resetCustomModelForm());
 
-document.querySelector("#openConfigFolder").addEventListener("click", () => api.openFolder("config"));
-document.querySelector("#openCodexFolder").addEventListener("click", () => api.openFolder("codex"));
-document.querySelector("#openUpdateFolder").addEventListener("click", () => api.openFolder("updates"));
+bindFolderButton("#openConfigFolder", "config");
+bindFolderButton("#openCodexFolder", "codex");
+bindFolderButton("#openUpdateFolder", "updates");
 document.querySelector("#openGitHub").addEventListener("click", () => api.openGitHub());
 els.checkUpdates.addEventListener("click", () =>
   runAction(els.checkUpdates, async () => {
@@ -972,6 +972,18 @@ async function runAction(button, fn) {
       button.classList.remove("loading");
     }
   }
+}
+
+function bindFolderButton(selector, target) {
+  const button = document.querySelector(selector);
+  button.addEventListener("click", () =>
+    runAction(button, async () => {
+      const result = await api.openFolder(target);
+      if (!result?.ok) {
+        throw new Error(result?.message || "打开目录失败。");
+      }
+    }),
+  );
 }
 
 function keySummaryInfo() {

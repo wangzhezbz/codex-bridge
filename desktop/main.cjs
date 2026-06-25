@@ -614,17 +614,27 @@ ipcMain.handle("updates:install", async () => {
 
 ipcMain.handle("folder:open", async (_event, target) => {
   const settings = await loadSettings();
-  const folder =
+  const folder = ensureFolderForOpen(
     target === "codex"
       ? path.dirname(settings.codexConfigPath())
       : target === "config"
         ? path.join(dataRootDir, "config")
         : target === "updates"
           ? portableUpdatesDir()
-        : dataRootDir;
-  await shell.openPath(folder);
-  return { ok: true };
+        : dataRootDir,
+  );
+  const openError = await shell.openPath(folder);
+  if (openError) {
+    throw new Error(`Unable to open folder: ${folder}. ${openError}`);
+  }
+  return { ok: true, folder };
 });
+
+function ensureFolderForOpen(folder) {
+  const resolvedFolder = path.resolve(folder);
+  fs.mkdirSync(resolvedFolder, { recursive: true });
+  return resolvedFolder;
+}
 
 ipcMain.handle("github:open", async () => {
   await shell.openExternal("https://github.com/wangzhezbz/codex-bridge");
