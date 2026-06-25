@@ -56,29 +56,47 @@ export function normalizeAdapterProfile(route = {}) {
     customConservative,
   );
   const dropParams = normalizedDropParams(route);
+  const contextWindow = positiveNumber(route.contextWindow, 258400);
+  const catalogContextWindow = positiveNumber(
+    route.catalogContextWindow,
+    contextWindow,
+  );
+  const supportsTools = api === "responses" ? "native" : "chat-functions";
+  const supportsMcpNamespaces = true;
+  const supportsFiles = api === "responses"
+    ? "native"
+    : customConservative
+      ? "none"
+      : "text-placeholder";
+  const supportsResponsePreviousId = api === "responses";
+  const supportsPromptCaching = route.supportsPromptCaching || "unknown";
 
   return {
     adapterId,
     providerFamily,
     api,
-    contextWindow: positiveNumber(route.contextWindow, 258400),
-    catalogContextWindow: positiveNumber(
-      route.catalogContextWindow,
-      positiveNumber(route.contextWindow, 258400),
-    ),
-    supportsTools: api === "responses"
-      ? "native"
-      : "chat-functions",
-    supportsMcpNamespaces: true,
+    contextWindow,
+    catalogContextWindow,
+    supportsTools,
+    supportsMcpNamespaces,
     supportsImages,
-    supportsFiles:
-      api === "responses"
-        ? "native"
-        : customConservative
-          ? "none"
-          : "text-placeholder",
-    supportsResponsePreviousId: api === "responses",
-    supportsPromptCaching: route.supportsPromptCaching || "unknown",
+    supportsFiles,
+    supportsResponsePreviousId,
+    supportsPromptCaching,
+    capabilities: capabilitiesForRoute(route, {
+      api,
+      providerFamily,
+      contextWindow,
+      catalogContextWindow,
+      supportsTools,
+      supportsMcpNamespaces,
+      supportsImages,
+      supportsFiles,
+      supportsResponsePreviousId,
+      supportsPromptCaching,
+      inputModalities,
+      customConservative,
+    }),
     safeParams: api === "responses"
       ? RESPONSES_SAFE_PARAMS
       : CHAT_SAFE_PARAMS,
@@ -92,6 +110,37 @@ export function normalizeAdapterProfile(route = {}) {
       DEFAULT_TIMEOUT_MS,
     ),
     customConservative,
+  };
+}
+
+function capabilitiesForRoute(route, profile) {
+  return {
+    api: profile.api,
+    providerFamily: profile.providerFamily,
+    tools: profile.supportsTools,
+    mcpNamespaces: profile.supportsMcpNamespaces,
+    images: profile.supportsImages,
+    files: profile.supportsFiles,
+    audio: audioSupportForRoute(
+      profile.api,
+      profile.providerFamily,
+      profile.inputModalities,
+    ),
+    reasoning: reasoningCapabilityForRoute(
+      profile.api,
+      profile.providerFamily,
+      profile.customConservative,
+    ),
+    compact: compactCapabilityForRoute(route, profile.api),
+    promptCache: profile.supportsPromptCaching,
+    contextWindow: profile.contextWindow,
+    catalogContextWindow: profile.catalogContextWindow,
+    previousResponseId: profile.supportsResponsePreviousId,
+    parameters: parameterCapabilityForRoute(
+      profile.api,
+      profile.providerFamily,
+      profile.customConservative,
+    ),
   };
 }
 
@@ -163,6 +212,61 @@ function imageSupportForRoute(route, api, inputModalities, customConservative) {
     return "native";
   }
   return "chat-image-url";
+}
+
+function audioSupportForRoute(api, providerFamily, inputModalities) {
+  if (!inputModalities.includes("audio")) {
+    return "none";
+  }
+  if (api === "responses") {
+    return "native";
+  }
+  if (providerFamily === "custom" || providerFamily === "openai-compatible") {
+    return "chat-input-audio";
+  }
+  return "none";
+}
+
+function reasoningCapabilityForRoute(api, providerFamily, customConservative) {
+  if (api === "responses") {
+    return { mode: "responses-native" };
+  }
+  if (providerFamily === "deepseek") {
+    return { mode: "deepseek-reasoning-content" };
+  }
+  if (providerFamily === "minimax") {
+    return { mode: "minimax-reasoning-split" };
+  }
+  if (customConservative) {
+    return { mode: "openai-compatible-passthrough" };
+  }
+  return { mode: "openai-compatible" };
+}
+
+function compactCapabilityForRoute(route, api) {
+  if (api === "responses") {
+    return {
+      mode: "responses-native",
+      requiresStream: route.authMode === "codex_openai",
+    };
+  }
+  return {
+    mode: "chat-summary",
+    requiresStream: false,
+  };
+}
+
+function parameterCapabilityForRoute(api, providerFamily, customConservative) {
+  if (api === "responses") {
+    return { mode: "responses-native" };
+  }
+  if (customConservative) {
+    return { mode: "openai-compatible-passthrough" };
+  }
+  if (providerFamily === "openai-compatible") {
+    return { mode: "openai-compatible" };
+  }
+  return { mode: "route-specific-safe-list" };
 }
 
 function normalizedDropParams(route) {

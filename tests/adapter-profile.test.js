@@ -122,6 +122,82 @@ test("custom chat routes preserve explicit image input in the adapter profile", 
   assert.deepEqual(profile.dropParams, []);
 });
 
+test("adapter profiles expose a unified capability matrix for native responses routes", () => {
+  const profile = normalizeAdapterProfile({
+    id: "gpt-5.5",
+    provider: "codex",
+    api: "responses",
+    model: "gpt-5.5",
+    baseUrl: "https://chatgpt.com/backend-api/codex",
+    authMode: "codex_openai",
+    contextWindow: 258400,
+    catalogContextWindow: 200000,
+    inputModalities: ["text", "image", "file", "audio"],
+    supportsPromptCaching: "native",
+  });
+
+  assert.equal(profile.capabilities.api, "responses");
+  assert.equal(profile.capabilities.providerFamily, "openai");
+  assert.equal(profile.capabilities.tools, profile.supportsTools);
+  assert.equal(profile.capabilities.mcpNamespaces, profile.supportsMcpNamespaces);
+  assert.equal(profile.capabilities.images, profile.supportsImages);
+  assert.equal(profile.capabilities.files, profile.supportsFiles);
+  assert.equal(profile.capabilities.audio, "native");
+  assert.equal(profile.capabilities.reasoning.mode, "responses-native");
+  assert.equal(profile.capabilities.compact.mode, "responses-native");
+  assert.equal(profile.capabilities.compact.requiresStream, true);
+  assert.equal(profile.capabilities.previousResponseId, true);
+  assert.equal(profile.capabilities.promptCache, "native");
+  assert.equal(profile.capabilities.contextWindow, 258400);
+  assert.equal(profile.capabilities.catalogContextWindow, 200000);
+});
+
+test("adapter profiles expose route-specific chat capabilities without weakening custom models", () => {
+  const deepseek = normalizeAdapterProfile({
+    id: "deepseek-v4-pro",
+    provider: "deepseek",
+    api: "chat_completions",
+    model: "deepseek-v4-pro",
+    contextWindow: 1000000,
+    inputModalities: ["text"],
+    dropParams: ["response_format"],
+  });
+
+  assert.equal(deepseek.capabilities.api, "chat_completions");
+  assert.equal(deepseek.capabilities.providerFamily, "deepseek");
+  assert.equal(deepseek.capabilities.tools, "chat-functions");
+  assert.equal(deepseek.capabilities.mcpNamespaces, true);
+  assert.equal(deepseek.capabilities.images, "none");
+  assert.equal(deepseek.capabilities.files, "text-placeholder");
+  assert.equal(deepseek.capabilities.audio, "none");
+  assert.equal(deepseek.capabilities.reasoning.mode, "deepseek-reasoning-content");
+  assert.equal(deepseek.capabilities.compact.mode, "chat-summary");
+  assert.equal(deepseek.capabilities.compact.requiresStream, false);
+  assert.equal(deepseek.capabilities.promptCache, "unknown");
+  assert.equal(deepseek.capabilities.contextWindow, 1000000);
+
+  const custom = normalizeAdapterProfile({
+    id: "custom-model",
+    provider: "custom",
+    custom: true,
+    api: "chat_completions",
+    model: "custom-model",
+    inputModalities: ["text", "image", "audio"],
+  });
+
+  assert.equal(custom.capabilities.providerFamily, "custom");
+  assert.equal(custom.capabilities.tools, "chat-functions");
+  assert.equal(custom.capabilities.images, "chat-image-url");
+  assert.equal(custom.capabilities.files, "none");
+  assert.equal(custom.capabilities.audio, "chat-input-audio");
+  assert.equal(custom.capabilities.reasoning.mode, "openai-compatible-passthrough");
+  assert.equal(custom.capabilities.parameters.mode, "openai-compatible-passthrough");
+  assert.ok(custom.safeParams.includes("tools"));
+  assert.ok(custom.safeParams.includes("tool_choice"));
+  assert.ok(custom.safeParams.includes("parallel_tool_calls"));
+  assert.ok(custom.safeParams.includes("response_format"));
+});
+
 test("every built-in preset has an adapter profile", () => {
   const missing = [];
   for (const preset of MODEL_PRESETS) {
@@ -366,6 +442,14 @@ for (const [providerId, expected] of Object.entries(BUILT_IN_PROVIDER_CONTRACTS)
       assert.equal(profile.supportsFiles, expected.supportsFiles, `${route.presetId} supportsFiles`);
       assert.equal(profile.supportsResponsePreviousId, expected.supportsResponsePreviousId, `${route.presetId} supportsResponsePreviousId`);
       assert.equal(profile.supportsImages, expectedImageSupport(profile.api, route.inputModalities), `${route.presetId} supportsImages`);
+      assert.equal(profile.capabilities.providerFamily, expected.providerFamily, `${route.presetId} capabilities.providerFamily`);
+      assert.equal(profile.capabilities.api, expected.api, `${route.presetId} capabilities.api`);
+      assert.equal(profile.capabilities.tools, expected.supportsTools, `${route.presetId} capabilities.tools`);
+      assert.equal(profile.capabilities.files, expected.supportsFiles, `${route.presetId} capabilities.files`);
+      assert.equal(profile.capabilities.previousResponseId, expected.supportsResponsePreviousId, `${route.presetId} capabilities.previousResponseId`);
+      assert.equal(profile.capabilities.images, expectedImageSupport(profile.api, route.inputModalities), `${route.presetId} capabilities.images`);
+      assert.equal(profile.capabilities.contextWindow, profile.contextWindow, `${route.presetId} capabilities.contextWindow`);
+      assert.equal(profile.capabilities.catalogContextWindow, profile.catalogContextWindow, `${route.presetId} capabilities.catalogContextWindow`);
       assert.equal(profile.customConservative, false, `${route.presetId} customConservative`);
       assert.ok(Array.isArray(profile.safeParams), `${route.presetId} safeParams`);
       assert.ok(profile.safeParams.length > 0, `${route.presetId} safeParams length`);
