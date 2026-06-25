@@ -303,6 +303,7 @@ export function supportDiagnostics(rootDir, {
   const options = loadDesktopOptions(rootDir);
   const routeDiagnostics = routerConfigDiagnostics(rootDir, config);
   const historyDiagnostics = codexHistoryDiagnostics({ homeDir });
+  const pluginDiagnostics = codexPluginRuntimeDiagnostics({ homeDir });
   const secretMap = loadSecrets(rootDir);
   const selectedRoutes = Array.isArray(config?.models) ? config.models : [];
   const selectedKeyEnvs = [
@@ -348,20 +349,148 @@ export function supportDiagnostics(rootDir, {
     "Codex history diagnostics:",
     ...historyDiagnostics.lines,
     "",
+    "Codex plugin diagnostics:",
+    ...pluginDiagnostics.lines,
+    "",
     "Recent errors:",
     ...(errorLines.length ? errorLines.map((line) => `- ${line}`) : ["- none"]),
   ];
 
   return {
     summary: {
-      ok: routeDiagnostics.ok && Boolean(lastHealth?.ok || !routerRunning),
+      ok: routeDiagnostics.ok && pluginDiagnostics.summary.ok && Boolean(lastHealth?.ok || !routerRunning),
       missingApiKeys: routeDiagnostics.missingApiKeys,
       invalidBaseUrls: routeDiagnostics.invalidBaseUrls,
       errorCount: errorLines.length,
       history: historyDiagnostics.summary,
+      codexPlugins: pluginDiagnostics.summary,
     },
     text: lines.join("\n"),
   };
+}
+
+function codexPluginRuntimeDiagnostics({ homeDir = os.homedir() } = {}) {
+  const configPath = codexConfigPath(homeDir);
+  const summary = {
+    ok: true,
+    reason: "",
+    configPath,
+    plugins: {},
+    nodeRepl: {},
+    skyRuntime: {},
+    notifyHooks: [],
+  };
+
+  if (!fs.existsSync(configPath)) {
+    summary.reason = "config_missing";
+    return {
+      summary,
+      lines: ["- config.toml not found"],
+    };
+  }
+
+  let content;
+  try {
+    content = fs.readFileSync(configPath, "utf8");
+  } catch (error) {
+    summary.ok = false;
+    summary.reason = "config_unreadable";
+    return {
+      summary,
+      lines: [`- config.toml unreadable: ${redactSecretText(error.message)}`],
+    };
+  }
+
+  const pluginIds = ["browser", "chrome", "computer-use"];
+  const enabledPlugins = new Set();
+  const pluginLines = [];
+  const nodeReplCommand = readTomlStringInTable(content, "mcp_servers.node_repl", "command");
+  const nodeReplEnv = {
+    CODEX_CLI_PATH: readTomlStringInTable(content, "mcp_servers.node_repl.env", "CODEX_CLI_PATH"),
+    NODE_REPL_NODE_PATH: readTomlStringInTable(content, "mcp_servers.node_repl.env", "NODE_REPL_NODE_PATH"),
+    NODE_REPL_NODE_MODULE_DIRS: readTomlStringInTable(content, "mcp_servers.node_repl.env", "NODE_REPL_NODE_MODULE_DIRS"),
+  };
+  const resourceDirs = codexResourceDirsFromConfig({ nodeReplCommand, codexCliPath: nodeReplEnv.CODEX_CLI_PATH });
+
+  for (const pluginId of pluginIds) {
+    const tableName = `plugins."${pluginId}@openai-bundled"`;
+    const tableExists = hasTomlTable(content, tableName);
+    const enabled = tableExists ? readTomlBooleanInTable(content, tableName, "enabled") !== false : false;
+    if (enabled) {
+      enabledPlugins.add(pluginId);
+    }
+    const cachedVersions = openAiBundledCachedPluginVersions(homeDir, pluginId);
+    const cached = latestVersion(cachedVersions);
+    const bundled = latestVersion(resourceDirs.map((resourceDir) => bundledOpenAiPluginVersion(resourceDir, pluginId)).filter(Boolean));
+    const stale = Boolean(cached && bundled && compareVersionStrings(cached, bundled) < 0);
+    const pluginSummary = {
+      enabled,
+      cached,
+      bundled,
+      stale,
+    };
+    summary.plugins[pluginId] = pluginSummary;
+    if (stale && enabled) {
+      summary.ok = false;
+      summary.reason ||= "stale_openai_bundled_plugin_cache";
+    }
+    if (enabled || cached || bundled) {
+      pluginLines.push(
+        `- ${pluginId}: enabled=${enabled}, cached=${cached || "missing"}, bundled=${bundled || "missing"}, stale=${stale}`,
+      );
+    }
+  }
+
+  const nodeReplExists = Boolean(nodeReplCommand && fs.existsSync(nodeReplCommand));
+  const nodePathExists = Boolean(nodeReplEnv.NODE_REPL_NODE_PATH && fs.existsSync(nodeReplEnv.NODE_REPL_NODE_PATH));
+  const moduleDirs = splitPathList(nodeReplEnv.NODE_REPL_NODE_MODULE_DIRS);
+  const moduleDirExists = moduleDirs.some((dir) => fs.existsSync(dir));
+  const codexCliExists = Boolean(nodeReplEnv.CODEX_CLI_PATH && fs.existsSync(nodeReplEnv.CODEX_CLI_PATH));
+  summary.nodeRepl = {
+    command: nodeReplCommand || "",
+    commandExists: nodeReplExists,
+    nodePathExists,
+    moduleDirExists,
+    codexCliExists,
+  };
+
+  const nativePluginEnabled = enabledPlugins.size > 0;
+  if (nativePluginEnabled && (!nodeReplExists || !nodePathExists || !moduleDirExists || !codexCliExists)) {
+    summary.ok = false;
+    summary.reason ||= "node_repl_runtime_missing";
+  }
+
+  const skyRuntime = findSkyRuntime(moduleDirs);
+  summary.skyRuntime = skyRuntime;
+  if (nativePluginEnabled && !skyRuntime.ok) {
+    summary.ok = false;
+    summary.reason ||= "sky_runtime_missing";
+  }
+
+  const notifyHooks = readTopLevelTomlArrayStrings(content, "notify")
+    .filter((value) => looksLikeExecutablePath(value))
+    .map((value) => ({
+      path: value,
+      exists: fs.existsSync(value),
+    }));
+  summary.notifyHooks = notifyHooks;
+  const missingNotifyHooks = notifyHooks.filter((item) => !item.exists);
+  if (missingNotifyHooks.length) {
+    summary.ok = false;
+    summary.reason ||= "notify_hook_missing";
+  }
+
+  const lines = [
+    ...pluginLines,
+    `- node_repl command: ${nodeReplExists ? "ok" : nodeReplCommand ? "missing" : "not configured"}${nodeReplCommand ? ` ${redactSecretText(nodeReplCommand)}` : ""}`,
+    `- node_repl env: node=${nodePathExists ? "ok" : nodeReplEnv.NODE_REPL_NODE_PATH ? "missing" : "not configured"}, modules=${moduleDirExists ? "ok" : nodeReplEnv.NODE_REPL_NODE_MODULE_DIRS ? "missing" : "not configured"}, codex=${codexCliExists ? "ok" : nodeReplEnv.CODEX_CLI_PATH ? "missing" : "not configured"}`,
+    `- sky runtime: ${skyRuntime.ok ? `ok ${redactSecretText(skyRuntime.kind)}` : "missing"}`,
+    ...(notifyHooks.length
+      ? notifyHooks.map((item) => `- notify hook: ${item.exists ? "ok" : "missing"} ${redactSecretText(item.path)}`)
+      : ["- notify hook: not configured"]),
+  ];
+
+  return { summary, lines };
 }
 
 function codexHistoryDiagnostics({ homeDir = os.homedir() } = {}) {
@@ -1756,6 +1885,245 @@ function readTopLevelTomlString(content, key) {
     }
   }
   return null;
+}
+
+function readTopLevelTomlArrayStrings(content, key) {
+  const escapedKey = escapeRegex(key);
+  const startPattern = new RegExp(`^\\s*${escapedKey}\\s*=\\s*\\[`);
+  const lines = [];
+  let collecting = false;
+  for (const line of String(content || "").split(/\r?\n/)) {
+    if (!collecting && isTomlTableHeader(line)) {
+      break;
+    }
+    if (!collecting && !startPattern.test(line)) {
+      continue;
+    }
+    collecting = true;
+    lines.push(line);
+    if (line.includes("]")) {
+      break;
+    }
+  }
+  return extractTomlQuotedStrings(lines.join("\n"));
+}
+
+function readTomlStringInTable(content, tableName, key) {
+  const keyPattern = new RegExp(`^\\s*${escapeRegex(key)}\\s*=\\s*('[^']*'|"[^"\\\\]*(?:\\\\.[^"\\\\]*)*")`);
+  for (const line of tomlTableLines(content, tableName)) {
+    const match = line.match(keyPattern);
+    if (match) {
+      return unquoteTomlString(match[1]);
+    }
+  }
+  return null;
+}
+
+function readTomlBooleanInTable(content, tableName, key) {
+  const keyPattern = new RegExp(`^\\s*${escapeRegex(key)}\\s*=\\s*(true|false)\\b`, "i");
+  for (const line of tomlTableLines(content, tableName)) {
+    const match = line.match(keyPattern);
+    if (match) {
+      return match[1].toLowerCase() === "true";
+    }
+  }
+  return null;
+}
+
+function hasTomlTable(content, tableName) {
+  return tomlTableLines(content, tableName).length > 0 || String(content || "")
+    .split(/\r?\n/)
+    .some((line) => tomlHeaderName(line) === tableName);
+}
+
+function tomlTableLines(content, tableName) {
+  const output = [];
+  let collecting = false;
+  for (const line of String(content || "").split(/\r?\n/)) {
+    const headerName = tomlHeaderName(line);
+    if (headerName) {
+      if (collecting) {
+        break;
+      }
+      collecting = headerName === tableName;
+      continue;
+    }
+    if (collecting) {
+      output.push(line);
+    }
+  }
+  return output;
+}
+
+function tomlHeaderName(line) {
+  const match = String(line || "").match(/^\s*\[\s*(.+?)\s*]\s*(?:#.*)?$/);
+  return match ? match[1].trim() : "";
+}
+
+function extractTomlQuotedStrings(value) {
+  const strings = [];
+  const pattern = /'([^']*)'|"([^"\\]*(?:\\.[^"\\]*)*)"/g;
+  let match;
+  while ((match = pattern.exec(String(value || "")))) {
+    strings.push(unquoteTomlString(match[0]));
+  }
+  return strings;
+}
+
+function unquoteTomlString(value) {
+  const text = String(value || "");
+  if (text.startsWith("'") && text.endsWith("'")) {
+    return text.slice(1, -1);
+  }
+  if (text.startsWith('"') && text.endsWith('"')) {
+    return text
+      .slice(1, -1)
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, "\\");
+  }
+  return text;
+}
+
+function codexResourceDirsFromConfig({ nodeReplCommand, codexCliPath } = {}) {
+  const dirs = [];
+  if (codexCliPath && path.basename(codexCliPath).toLowerCase() === "codex.exe") {
+    dirs.push(path.dirname(codexCliPath));
+  }
+  if (nodeReplCommand && path.basename(nodeReplCommand).toLowerCase() === "node_repl.exe") {
+    dirs.push(path.resolve(path.dirname(nodeReplCommand), "..", ".."));
+  }
+  return uniqueExistingParents(dirs);
+}
+
+function uniqueExistingParents(paths) {
+  const seen = new Set();
+  const output = [];
+  for (const item of paths) {
+    const normalized = path.normalize(item || "");
+    const key = process.platform === "win32" ? normalized.toLowerCase() : normalized;
+    if (!normalized || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    output.push(normalized);
+  }
+  return output;
+}
+
+function bundledOpenAiPluginVersion(resourcesDir, pluginId) {
+  if (!resourcesDir) {
+    return "";
+  }
+  return pluginVersionFromDir(path.join(resourcesDir, "plugins", "openai-bundled", "plugins", pluginId));
+}
+
+function openAiBundledCachedPluginVersions(homeDir, pluginId) {
+  const pluginRoot = path.join(homeDir, ".codex", "plugins", "cache", "openai-bundled", pluginId);
+  if (!fs.existsSync(pluginRoot)) {
+    return [];
+  }
+  try {
+    return fs
+      .readdirSync(pluginRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => pluginVersionFromDir(path.join(pluginRoot, entry.name)) || entry.name)
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function pluginVersionFromDir(pluginDir) {
+  for (const manifestPath of [
+    path.join(pluginDir, ".codex-plugin", "plugin.json"),
+    path.join(pluginDir, "plugin.json"),
+  ]) {
+    try {
+      if (!fs.existsSync(manifestPath)) {
+        continue;
+      }
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+      return String(manifest.version || "").trim();
+    } catch {
+      return "";
+    }
+  }
+  return "";
+}
+
+function latestVersion(versions) {
+  return [...new Set((versions || []).filter(Boolean))]
+    .sort(compareVersionStrings)
+    .at(-1) || "";
+}
+
+function compareVersionStrings(left, right) {
+  const leftParts = versionParts(left);
+  const rightParts = versionParts(right);
+  const length = Math.max(leftParts.length, rightParts.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftPart = leftParts[index] || 0;
+    const rightPart = rightParts[index] || 0;
+    if (leftPart !== rightPart) {
+      return leftPart - rightPart;
+    }
+  }
+  return String(left || "").localeCompare(String(right || ""));
+}
+
+function versionParts(version) {
+  return String(version || "")
+    .split(/[^0-9]+/)
+    .filter(Boolean)
+    .map((part) => Number(part));
+}
+
+function splitPathList(value) {
+  return String(value || "")
+    .split(path.delimiter)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function findSkyRuntime(moduleDirs) {
+  for (const moduleDir of moduleDirs || []) {
+    for (const packageDir of ["@oai", "%40oai"]) {
+      const clientPath = path.join(
+        moduleDir,
+        packageDir,
+        "sky",
+        "dist",
+        "project",
+        "cua",
+        "sky_js",
+        "src",
+        "targets",
+        "windows",
+        "internal",
+        "computer_use_client_base.js",
+      );
+      if (fs.existsSync(clientPath)) {
+        return {
+          ok: true,
+          kind: `(${packageDir}/sky)`,
+          path: clientPath,
+        };
+      }
+    }
+  }
+  return {
+    ok: false,
+    kind: "",
+    path: "",
+  };
+}
+
+function looksLikeExecutablePath(value) {
+  return /\.exe$/i.test(String(value || "")) || /[\\/]/.test(String(value || ""));
+}
+
+function escapeRegex(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function stripCodexBridgeConfig(content) {

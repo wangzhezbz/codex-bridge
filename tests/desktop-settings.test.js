@@ -316,6 +316,99 @@ test("supportDiagnostics redacts keys and summarizes current config", () => {
   assert.match(diagnostics.text, /api\.moonshot\.cn/);
 });
 
+test("supportDiagnostics reports stale Codex plugin runtime without mutating it", () => {
+  const rootDir = makeTempProject();
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-bridge-home-"));
+  const codexDir = path.join(homeDir, ".codex");
+  const installRoot = path.join(homeDir, "OpenAI.Codex_26.616.3767.0_x64");
+  const resourcesDir = path.join(installRoot, "app", "resources");
+  const nodeBinDir = path.join(resourcesDir, "cua_node", "bin");
+  const nodeModuleDir = path.join(nodeBinDir, "node_modules");
+  const nodeReplPath = path.join(nodeBinDir, "node_repl.exe");
+  const nodePath = path.join(nodeBinDir, "node.exe");
+  const codexCliPath = path.join(resourcesDir, "codex.exe");
+  const skyBasePath = path.join(nodeModuleDir, "%40oai", "sky");
+  const skyClientPath = path.join(
+    skyBasePath,
+    "dist",
+    "project",
+    "cua",
+    "sky_js",
+    "src",
+    "targets",
+    "windows",
+    "internal",
+    "computer_use_client_base.js",
+  );
+  const bundledManifest = path.join(
+    resourcesDir,
+    "plugins",
+    "openai-bundled",
+    "plugins",
+    "computer-use",
+    ".codex-plugin",
+    "plugin.json",
+  );
+  const cachedManifest = path.join(
+    codexDir,
+    "plugins",
+    "cache",
+    "openai-bundled",
+    "computer-use",
+    "26.611.62324",
+    ".codex-plugin",
+    "plugin.json",
+  );
+
+  for (const filePath of [nodeReplPath, nodePath, codexCliPath, skyClientPath, bundledManifest, cachedManifest]) {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(
+      filePath,
+      filePath.endsWith("plugin.json")
+        ? JSON.stringify({ version: filePath === bundledManifest ? "26.616.31447" : "26.611.62324" })
+        : "",
+      "utf8",
+    );
+  }
+
+  fs.writeFileSync(
+    path.join(codexDir, "config.toml"),
+    [
+      `notify = ["${toFixtureTomlPath(path.join(installRoot, "missing", "codex-computer-use.exe"))}", "turn-ended"]`,
+      "",
+      '[plugins."computer-use@openai-bundled"]',
+      "enabled = true",
+      "",
+      '[plugins."chrome@openai-bundled"]',
+      "enabled = true",
+      "",
+      "[mcp_servers.node_repl]",
+      `command = "${toFixtureTomlPath(nodeReplPath)}"`,
+      "",
+      "[mcp_servers.node_repl.env]",
+      `CODEX_CLI_PATH = "${toFixtureTomlPath(codexCliPath)}"`,
+      `NODE_REPL_NODE_PATH = "${toFixtureTomlPath(nodePath)}"`,
+      `NODE_REPL_NODE_MODULE_DIRS = "${toFixtureTomlPath(nodeModuleDir)}"`,
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const diagnostics = supportDiagnostics(rootDir, {
+    lastHealth: { ok: true },
+    config: { port: 15722, models: [] },
+    homeDir,
+  });
+
+  assert.equal(diagnostics.summary.codexPlugins.ok, false);
+  assert.match(diagnostics.text, /Codex plugin diagnostics/);
+  assert.match(diagnostics.text, /computer-use: enabled=true, cached=26\.611\.62324, bundled=26\.616\.31447, stale=true/);
+  assert.match(diagnostics.text, /chrome: enabled=true/);
+  assert.match(diagnostics.text, /node_repl command: ok/);
+  assert.match(diagnostics.text, /sky runtime: ok/);
+  assert.match(diagnostics.text, /notify hook: missing/);
+});
+
 test("secretValue returns only known provider secrets", () => {
   const rootDir = makeTempProject();
   saveSecrets(rootDir, {
@@ -901,6 +994,7 @@ test("applyCodexConfig preserves existing Codex user settings while adding Codex
     [
       'sandbox_mode = "danger-full-access"',
       'approval_policy = "never"',
+      'notify = ["C:/Codex/openai-bundled/computer-use/codex-computer-use.exe", "turn-ended"]',
       "",
       "[history]",
       'persistence = "save-all"',
@@ -910,6 +1004,19 @@ test("applyCodexConfig preserves existing Codex user settings while adding Codex
       "",
       "[projects.'f:\\game_code\\demo']",
       'trust_level = "trusted"',
+      "",
+      '[plugins."computer-use@openai-bundled"]',
+      "enabled = true",
+      "",
+      "[mcp_servers.node_repl]",
+      'command = "C:/Codex/node_repl.exe"',
+      "",
+      "[mcp_servers.node_repl.env]",
+      'NODE_REPL_NODE_PATH = "C:/Codex/node.exe"',
+      'NODE_REPL_NODE_MODULE_DIRS = "C:/Codex/node_modules"',
+      "",
+      "[hooks.state]",
+      'notify = ["C:/Codex/hook.exe"]',
       "",
     ].join("\n"),
     "utf8",
@@ -925,6 +1032,11 @@ test("applyCodexConfig preserves existing Codex user settings while adding Codex
   assert.match(written, /\[history]\s+persistence = "save-all"/);
   assert.match(written, /\[desktop]\s+appearanceTheme = "dark"/);
   assert.match(written, /\[projects\.'f:\\game_code\\demo']\s+trust_level = "trusted"/);
+  assert.match(written, /notify = \["C:\/Codex\/openai-bundled\/computer-use\/codex-computer-use\.exe", "turn-ended"]/);
+  assert.match(written, /\[plugins\."computer-use@openai-bundled"]\s+enabled = true/);
+  assert.match(written, /\[mcp_servers\.node_repl]\s+command = "C:\/Codex\/node_repl\.exe"/);
+  assert.match(written, /\[mcp_servers\.node_repl\.env]\s+NODE_REPL_NODE_PATH = "C:\/Codex\/node\.exe"\s+NODE_REPL_NODE_MODULE_DIRS = "C:\/Codex\/node_modules"/);
+  assert.match(written, /\[hooks\.state]\s+notify = \["C:\/Codex\/hook\.exe"]/);
 });
 
 test("applyCodexConfig writes stable sandbox defaults when Codex has none", () => {
@@ -1519,6 +1631,10 @@ test("syncCodexBridgeConversationProviders marks existing OpenAI user threads as
 
 function makeTempProject() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "codex-bridge-test-"));
+}
+
+function toFixtureTomlPath(filePath) {
+  return filePath.replaceAll("\\", "/");
 }
 
 function createCodexStateDb(codexDir, rows, dbPath = path.join(codexDir, "state_5.sqlite"), options = {}) {
