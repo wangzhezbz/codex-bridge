@@ -23,6 +23,7 @@ import {
   buildCompactResponsesRequest,
   compactKindForResponsesRequest,
   compactResponseFromChat,
+  compactResponseFromLocalFallback,
   compactResponseFromResponses,
   compactResponseToSse,
 } from "./compact.js";
@@ -573,10 +574,29 @@ async function proxyChatCompact(requestBody, route, history, res, context = {}) 
   const converted = buildCompactChatRequest(requestBody, route, history);
   const upstreamUrl = joinUpstreamUrl(route.baseUrl, "/chat/completions");
   logRoute(context, route, upstreamUrl);
-  const upstream = await callJsonUpstream(upstreamUrl, route, converted.body, context);
-  logUsage(context, route, upstream.usage);
-
-  const response = compactResponseFromChat(upstream, requestBody.model || route.id);
+  let upstream = null;
+  let response = null;
+  let localFallback = "";
+  try {
+    upstream = await callJsonUpstream(upstreamUrl, route, converted.body, context);
+    logUsage(context, route, upstream.usage);
+    response = compactResponseFromChat(upstream, requestBody.model || route.id, {
+      messages: converted.messagesForHistory,
+      requestBody,
+    });
+  } catch (error) {
+    localFallback = "compact_local_fallback";
+    console.warn(
+      `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+        `!! compact-local-fallback route=${route.id} reason=${safeText(compactFallbackReason(error), 300)}`,
+    );
+    logUsage(context, route, null);
+    response = compactResponseFromLocalFallback(requestBody.model || route.id, {
+      messages: converted.messagesForHistory,
+      requestBody,
+      reason: compactFallbackReason(error),
+    });
+  }
   history.record(response.id, [
     ...converted.messagesForHistory,
     {
@@ -589,7 +609,7 @@ async function proxyChatCompact(requestBody, route, history, res, context = {}) 
     routeId: route.id || "",
     upstreamModel: route.model || "",
     upstreamKnown: false,
-    localFallback: "compact",
+    localFallback: localFallback || "compact",
   });
 
   if (context.compactKind === "v2") {
@@ -621,33 +641,56 @@ async function proxyResponsesCompact(requestBody, route, history, res, context =
 
   const upstreamUrl = joinUpstreamUrl(responsesBaseUrlForRoute(route), "/responses");
   logRoute(context, route, upstreamUrl);
-  let upstream;
+  let upstream = null;
+  let compactFallbackReasonText = "";
   try {
     upstream = await callResponsesCompactUpstream(upstreamUrl, route, compactBody, context);
   } catch (error) {
     if (compactBody.stream || !isStreamRequiredError(error)) {
-      throw error;
+      compactFallbackReasonText = compactFallbackReason(error);
+      console.warn(
+        `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+          `!! compact-local-fallback route=${route.id} reason=${safeText(compactFallbackReasonText, 300)}`,
+      );
+    } else {
+      const streamCompactBody = buildCompactResponsesRequest(requestBody, { stream: true });
+      streamCompactBody.model = route.model;
+      if (shouldInlineLocalHistoryForResponses(streamCompactBody, history)) {
+        inlineLocalHistoryForResponsesPayload(streamCompactBody, sourceMessages);
+      }
+      console.warn(
+        `[${new Date().toISOString()}] ${context.requestId || "req"} !! upstream ` +
+          `route=${route.id} compact requires stream=true; retrying compact request as event stream`,
+      );
+      try {
+        upstream = await callResponsesCompactUpstream(
+          upstreamUrl,
+          route,
+          streamCompactBody,
+          context,
+          { cacheFailures: false },
+        );
+      } catch (retryError) {
+        compactFallbackReasonText = compactFallbackReason(retryError);
+        console.warn(
+          `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+            `!! compact-local-fallback route=${route.id} reason=${safeText(compactFallbackReasonText, 300)}`,
+        );
+      }
     }
-    const streamCompactBody = buildCompactResponsesRequest(requestBody, { stream: true });
-    streamCompactBody.model = route.model;
-    if (shouldInlineLocalHistoryForResponses(streamCompactBody, history)) {
-      inlineLocalHistoryForResponsesPayload(streamCompactBody, sourceMessages);
-    }
-    console.warn(
-      `[${new Date().toISOString()}] ${context.requestId || "req"} !! upstream ` +
-        `route=${route.id} compact requires stream=true; retrying compact request as event stream`,
-    );
-    upstream = await callResponsesCompactUpstream(
-      upstreamUrl,
-      route,
-      streamCompactBody,
-      context,
-      { cacheFailures: false },
-    );
   }
   logUsage(context, route, extractUsageObject(upstream));
 
-  const response = compactResponseFromResponses(upstream, requestBody.model || route.id);
+  const response = upstream
+    ? compactResponseFromResponses(upstream, requestBody.model || route.id, {
+        messages: sourceMessages,
+        requestBody,
+      })
+    : compactResponseFromLocalFallback(requestBody.model || route.id, {
+        messages: sourceMessages,
+        requestBody,
+        reason: compactFallbackReasonText,
+      });
   history.record(response.id, [
     ...sourceMessages,
     {
@@ -660,7 +703,7 @@ async function proxyResponsesCompact(requestBody, route, history, res, context =
     routeId: route.id || "",
     upstreamModel: route.model || "",
     upstreamKnown: false,
-    localFallback: "compact",
+    localFallback: upstream ? "compact" : "compact_local_fallback",
   });
 
   if (context.compactKind === "v2") {
@@ -740,6 +783,14 @@ function isStreamRequiredError(error) {
     .filter(Boolean)
     .join(" ");
   return /stream\b.*\btrue/i.test(message);
+}
+
+function compactFallbackReason(error) {
+  if (error instanceof UpstreamHttpError) {
+    return upstreamBodyMessage(error.bodyText, tryParseJson(error.bodyText)) ||
+      `HTTP ${error.statusCode}`;
+  }
+  return error?.message || String(error || "remote compact failed");
 }
 
 function chatToolContinuationTurns(requestBody, history) {

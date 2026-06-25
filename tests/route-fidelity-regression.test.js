@@ -362,6 +362,45 @@ test("route fidelity compaction strips tools from upstream summarization and rep
   assert.equal(replay[1].content, "continue after compact");
 });
 
+test("route fidelity compaction uses chat-summary requests for Kimi and custom routes", () => {
+  for (const route of [kimiRoute, customRoute]) {
+    const compact = buildCompactChatRequest(
+      {
+        model: route.id,
+        stream: true,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: `${route.id} should compact without tools`,
+          },
+          { type: "compaction_trigger" },
+        ],
+        tools: [
+          {
+            type: "function",
+            name: "shell_command",
+            description: "Run shell.",
+            parameters: { type: "object" },
+          },
+        ],
+        tool_choice: { type: "function", name: "shell_command" },
+        parallel_tool_calls: true,
+      },
+      route,
+      new ResponseHistory(),
+    );
+
+    assert.equal(compact.body.stream, false, route.id);
+    assert.equal(compact.body.stream_options, undefined, route.id);
+    assert.equal(compact.body.tools, undefined, route.id);
+    assert.equal(compact.body.tool_choice, undefined, route.id);
+    assert.equal(compact.body.parallel_tool_calls, undefined, route.id);
+    assert.match(JSON.stringify(compact.body.messages), /CONTEXT CHECKPOINT COMPACTION/);
+    assert.doesNotMatch(JSON.stringify(compact.body.messages), /compaction_trigger/);
+  }
+});
+
 test("route fidelity preserves prior tool history before switching chat models", () => {
   const history = new ResponseHistory();
   const first = responsesToChatRequest(

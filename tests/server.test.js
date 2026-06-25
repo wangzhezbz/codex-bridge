@@ -4867,6 +4867,70 @@ test("chat-routed remote compact v2 returns a single compaction SSE item", async
   }
 });
 
+test("chat-routed remote compact v2 falls back locally when upstream compaction fails", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/chat/completions");
+    upstreamCalls += 1;
+    await readJson(req);
+    res.writeHead(503, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "compact upstream unavailable" } }));
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "kimi-k2-code",
+    models: [
+      {
+        id: "kimi-k2-code",
+        displayName: "Kimi K2 Code",
+        provider: "kimi",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "kimi-k2-code",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+
+  try {
+    const response = await fetch(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "kimi-k2-code",
+        stream: true,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: "latest Kimi compact fallback detail must survive",
+          },
+          { type: "compaction_trigger" },
+        ],
+      }),
+    });
+    const text = await response.text();
+    assert.equal(response.ok, true, text);
+    assert.equal(upstreamCalls, 1);
+    assert.equal((text.match(/"type":"compaction"/g) || []).length, 3);
+    assert.match(text, /CodexBridge local compact fallback/);
+    assert.match(text, /compact upstream unavailable/);
+    assert.match(text, /latest Kimi compact fallback detail must survive/);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
 test("responses-routed remote compact v2 wraps ordinary upstream output as one compaction SSE item", async () => {
   let upstreamBody;
   const upstream = http.createServer(async (req, res) => {
@@ -4962,6 +5026,75 @@ test("responses-routed remote compact v2 wraps ordinary upstream output as one c
     assert.equal(upstreamBody.tools, undefined);
     assert.doesNotMatch(JSON.stringify(upstreamBody), /compaction_trigger/);
     assert.match(JSON.stringify(upstreamBody.input), /CONTEXT CHECKPOINT COMPACTION/);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("responses-routed remote compact v2 uses local summary context when upstream returns no text", async () => {
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/responses");
+    await readJson(req);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: "resp_empty_compact_summary",
+        object: "response",
+        status: "completed",
+        model: "gpt-5.5",
+        output: [],
+        output_text: "",
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "gpt-5.5",
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        api: "responses",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "gpt-5.5",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+
+  try {
+    const response = await fetch(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        stream: true,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: "latest GPT compact fallback detail must survive",
+          },
+          { type: "compaction_trigger" },
+        ],
+      }),
+    });
+    const text = await response.text();
+    assert.equal(response.ok, true, text);
+    assert.equal((text.match(/"type":"compaction"/g) || []).length, 3);
+    assert.match(text, /CodexBridge local compact fallback/);
+    assert.match(text, /upstream model returned no summary text/);
+    assert.match(text, /latest GPT compact fallback detail must survive/);
   } finally {
     await close(router);
     await close(upstream);

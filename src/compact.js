@@ -22,6 +22,7 @@ const COMPACT_SUMMARIZATION_PROMPT =
 const COMPACT_MAX_OUTPUT_TOKENS = 20_000;
 const COMPACT_CHAT_MESSAGES_MAX_BYTES = 120 * 1024;
 const COMPACT_MESSAGE_MAX_CHARS = 8_000;
+const LOCAL_COMPACT_FALLBACK_MAX_CHARS = 60_000;
 
 export function isResponsesCompactPath(pathname) {
   return /^\/(?:v1\/)?responses\/compact$/.test(String(pathname || ""));
@@ -56,18 +57,45 @@ export function buildCompactResponsesRequest(requestBody, options = {}) {
   return compactRequestBody(requestBody, options);
 }
 
-export function compactResponseFromChat(chat, requestedModel) {
+export function compactResponseFromChat(chat, requestedModel, fallbackContext = {}) {
   const id = responseIdFromCompactUpstream(chat?.id);
-  const summary = extractChatSummaryText(chat) ||
-    "Summary unavailable: the upstream model returned no summary text during context compaction.";
+  const summary = extractChatSummaryText(chat);
+  if (!summary) {
+    return compactResponseFromLocalFallback(requestedModel, {
+      ...fallbackContext,
+      id,
+      reason:
+        fallbackContext.reason ||
+        "upstream model returned no summary text during context compaction.",
+      usage: responseUsage(chat?.usage),
+    });
+  }
   return compactResponseFromSummary(id, summary, requestedModel, responseUsage(chat?.usage));
 }
 
-export function compactResponseFromResponses(response, requestedModel) {
+export function compactResponseFromResponses(response, requestedModel, fallbackContext = {}) {
   const id = responseIdFromCompactUpstream(response?.id);
-  const summary = extractResponsesSummaryText(response) ||
-    "Summary unavailable: the upstream model returned no summary text during context compaction.";
+  const summary = extractResponsesSummaryText(response);
+  if (!summary) {
+    return compactResponseFromLocalFallback(requestedModel, {
+      ...fallbackContext,
+      id,
+      reason:
+        fallbackContext.reason ||
+        "upstream model returned no summary text during context compaction.",
+      usage: responseUsage(response?.usage),
+    });
+  }
   return compactResponseFromSummary(id, summary, requestedModel, responseUsage(response?.usage));
+}
+
+export function compactResponseFromLocalFallback(requestedModel, options = {}) {
+  return compactResponseFromSummary(
+    options.id || `resp_compact_local_${randomUUID()}`,
+    localCompactFallbackSummary(options),
+    requestedModel,
+    options.usage || null,
+  );
 }
 
 function compactResponseFromSummary(id, summary, requestedModel, usage) {
@@ -211,6 +239,61 @@ function trimNotice() {
     content:
       "Earlier conversation history was omitted by CodexBridge during context compaction to fit the upstream model context window.",
   };
+}
+
+function localCompactFallbackSummary(options = {}) {
+  const reason = safeCompactText(
+    options.reason || "remote compaction did not return a usable summary",
+    1_000,
+  );
+  const context = localCompactContextText(options);
+  return [
+    "CodexBridge local compact fallback: remote context compaction did not return a usable summary.",
+    `Reason: ${reason}`,
+    "Recent context excerpt:",
+    context || "[no compactable conversation text was available]",
+  ].join("\n\n");
+}
+
+function localCompactContextText(options = {}) {
+  const messages = Array.isArray(options.messages) ? options.messages : [];
+  const parts = messages
+    .map(localCompactMessageText)
+    .filter(Boolean);
+  if (parts.length === 0) {
+    parts.push(...responseItems(options.requestBody?.messages ?? options.requestBody?.input)
+      .map(localCompactResponseItemText)
+      .filter(Boolean));
+  }
+  return middleExcerpt(parts.join("\n\n"), LOCAL_COMPACT_FALLBACK_MAX_CHARS);
+}
+
+function localCompactMessageText(message) {
+  if (!message || typeof message !== "object") {
+    return "";
+  }
+  const text = contentToText(message.content ?? message.text ?? message.output ?? "").trim();
+  if (!text || /CONTEXT CHECKPOINT COMPACTION/.test(text)) {
+    return "";
+  }
+  return `${message.role || "message"}: ${safeCompactText(text, COMPACT_MESSAGE_MAX_CHARS)}`;
+}
+
+function localCompactResponseItemText(item) {
+  if (!item || typeof item !== "object" || item.type === "compaction_trigger") {
+    return "";
+  }
+  const role = item.role || item.type || "item";
+  const text = contentToText(item.content ?? item.text ?? item.output ?? "").trim();
+  if (!text || /CONTEXT CHECKPOINT COMPACTION/.test(text)) {
+    return "";
+  }
+  return `${role}: ${safeCompactText(text, COMPACT_MESSAGE_MAX_CHARS)}`;
+}
+
+function safeCompactText(value, maxChars) {
+  const text = String(value || "");
+  return middleExcerpt(text, maxChars);
 }
 
 function middleExcerpt(text, maxChars) {

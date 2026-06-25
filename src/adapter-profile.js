@@ -351,14 +351,21 @@ function reasoningCapabilityForRoute(route, api, providerFamily, customConservat
 
 function compactCapabilityForRoute(route, api) {
   if (api === "responses") {
+    const requiresStream = route.authMode === "codex_openai";
     return {
       mode: "responses-native",
-      requiresStream: route.authMode === "codex_openai",
+      strategy: requiresStream ? "responses-stream" : "responses-json",
+      requiresStream,
+      retryWithStream: !requiresStream,
+      fallback: "local-summary",
     };
   }
   return {
     mode: "chat-summary",
+    strategy: "chat-json",
     requiresStream: false,
+    retryWithStream: false,
+    fallback: "local-summary",
   };
 }
 

@@ -194,7 +194,10 @@ test("adapter profiles expose a unified capability matrix for native responses r
   assert.equal(profile.capabilities.audio, "native");
   assert.equal(profile.capabilities.reasoning.mode, "responses-native");
   assert.equal(profile.capabilities.compact.mode, "responses-native");
+  assert.equal(profile.capabilities.compact.strategy, "responses-stream");
   assert.equal(profile.capabilities.compact.requiresStream, true);
+  assert.equal(profile.capabilities.compact.retryWithStream, false);
+  assert.equal(profile.capabilities.compact.fallback, "local-summary");
   assert.equal(profile.capabilities.previousResponseId, true);
   assert.equal(profile.capabilities.promptCache, "native");
   assert.equal(profile.capabilities.contextWindow, 258400);
@@ -221,7 +224,9 @@ test("adapter profiles expose route-specific chat capabilities without weakening
   assert.equal(deepseek.capabilities.audio, "none");
   assert.equal(deepseek.capabilities.reasoning.mode, "deepseek-thinking");
   assert.equal(deepseek.capabilities.compact.mode, "chat-summary");
+  assert.equal(deepseek.capabilities.compact.strategy, "chat-json");
   assert.equal(deepseek.capabilities.compact.requiresStream, false);
+  assert.equal(deepseek.capabilities.compact.fallback, "local-summary");
   assert.equal(deepseek.capabilities.promptCache, "unknown");
   assert.equal(deepseek.capabilities.contextWindow, 1000000);
 
@@ -240,6 +245,8 @@ test("adapter profiles expose route-specific chat capabilities without weakening
   assert.equal(custom.capabilities.files, "none");
   assert.equal(custom.capabilities.audio, "chat-input-audio");
   assert.equal(custom.capabilities.reasoning.mode, "openai-compatible-passthrough");
+  assert.equal(custom.capabilities.compact.strategy, "chat-json");
+  assert.equal(custom.capabilities.compact.fallback, "local-summary");
   assert.equal(custom.capabilities.parameters.mode, "openai-compatible-passthrough");
   assert.ok(custom.safeParams.includes("tools"));
   assert.ok(custom.safeParams.includes("tool_choice"));
