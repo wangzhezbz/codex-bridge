@@ -48,6 +48,7 @@ let usageStore = null;
 let lastHealth = null;
 let tray = null;
 let isQuitting = false;
+const launchedAfterUpdate = process.argv.includes("--updated");
 
 function shouldDisableChromiumSandbox() {
   if (process.env.CODEXBRIDGE_CHROMIUM_SANDBOX === "1") {
@@ -168,6 +169,18 @@ app.whenReady().then(() => {
     createTray();
   }
   createWindow();
+  if (launchedAfterUpdate && process.env.CODEXBRIDGE_DESKTOP_SMOKE !== "1") {
+    mainWindow.webContents.once("did-finish-load", () => {
+      showMainWindow();
+      appendLog(`Updated CodexBridge launched: v${app.getVersion()}`);
+      dialog.showMessageBox(mainWindow, {
+        type: "info",
+        title: "CodexBridge 更新完成",
+        message: `CodexBridge 已更新到 v${app.getVersion()}`,
+        detail: "窗口已重新打开，配置、密钥和模型选择仍保存在用户数据目录。",
+      }).catch((error) => appendRuntimeLog(formatError("updateNotice", error)));
+    });
+  }
   if (process.env.CODEXBRIDGE_DESKTOP_SMOKE === "1") {
     const timeout = setTimeout(() => {
       console.error("Desktop smoke test timed out.");

@@ -159,6 +159,9 @@ test("Windows portable updater script replaces and restarts without batch deleti
   assert.match(script, /Update package: \$ZIP_PATH/);
   assert.match(script, /Update work directory: \$WORK_DIR/);
   assert.match(script, /\$EXE_NAME = 'CodexBridge\.exe'/);
+  assert.match(script, /function Show-UpdateNotice/);
+  assert.match(script, /WScript\.Shell/);
+  assert.match(script, /CodexBridge is installing the update/);
   assert.match(script, /Invoke-UpdateStep "Renaming current app directory"/);
   assert.match(script, /Invoke-UpdateStep "Moving new app directory into place"/);
   assert.match(script, /Show-UpdateFailure \$failureMessage/);
@@ -166,7 +169,9 @@ test("Windows portable updater script replaces and restarts without batch deleti
   assert.match(script, /Update failed; old app directory was restored and left closed/);
   assert.doesNotMatch(script, /Starting existing CodexBridge after failed update/);
   assert.match(script, /resources\\app\\package\.json/);
-  assert.match(script, /-WorkingDirectory \$CURRENT_APP_DIR/);
+  assert.match(script, /-ArgumentList "--updated"/);
+  assert.match(script, /-WorkingDirectory \$CURRENT_APP_DIR -PassThru/);
+  assert.match(script, /Updated CodexBridge exited immediately after launch/);
   assert.match(script, /\$\{EXE_NAME\}: \$AppDir/);
   assert.doesNotMatch(script, /\$EXE_NAME:/);
   assert.match(script, /\$WAIT_PIDS = @\(1234, 5678\)/);

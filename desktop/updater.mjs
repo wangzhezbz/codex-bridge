@@ -258,6 +258,15 @@ function Show-UpdateFailure([string]$Message) {
   }
 }
 
+function Show-UpdateNotice([string]$Message, [int]$Seconds = 2) {
+  try {
+    $shell = New-Object -ComObject WScript.Shell
+    $shell.Popup($Message, $Seconds, "CodexBridge update", 64) | Out-Null
+  } catch {
+    Write-UpdateLog ("Could not show update notice: " + $_.Exception.Message)
+  }
+}
+
 function Open-UpdateFolder() {
   try {
     Start-Process -FilePath "explorer.exe" -ArgumentList $WORK_DIR
@@ -309,6 +318,7 @@ try {
   Write-UpdateLog "Current app directory: $CURRENT_APP_DIR"
   Write-UpdateLog "Update package: $ZIP_PATH"
   Write-UpdateLog "Update work directory: $WORK_DIR"
+  Show-UpdateNotice "CodexBridge is installing the update. The new version will open automatically."
   foreach ($waitPid in $WAIT_PIDS) {
     Wait-UpdateProcessExit $waitPid
   }
@@ -343,7 +353,11 @@ try {
   $nextExe = Join-Path $CURRENT_APP_DIR $EXE_NAME
   Assert-CodexBridgeAppDir $CURRENT_APP_DIR
   Write-UpdateLog "Starting updated CodexBridge: $nextExe"
-  Start-Process -FilePath $nextExe -WorkingDirectory $CURRENT_APP_DIR
+  $startedProcess = Start-Process -FilePath $nextExe -ArgumentList "--updated" -WorkingDirectory $CURRENT_APP_DIR -PassThru
+  Start-Sleep -Seconds 2
+  if (-not (Get-Process -Id $startedProcess.Id -ErrorAction SilentlyContinue)) {
+    throw "Updated CodexBridge exited immediately after launch: $nextExe"
+  }
   Write-UpdateLog "Update completed. Previous version kept at $backupDir."
 } catch {
   $failureMessage = $_.Exception.Message

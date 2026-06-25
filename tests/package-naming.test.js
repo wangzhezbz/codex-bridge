@@ -36,6 +36,7 @@ test("desktop updater waits for router child process before replacing portable f
 test("desktop portable update exits the tray process before file replacement", () => {
   const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
 
+  assert.match(main, /const launchedAfterUpdate = process\.argv\.includes\("--updated"\)/);
   assert.match(main, /function exitForPortableUpdate/);
   assert.match(main, /tray\.destroy\(\)/);
   assert.match(main, /mainWindow\.destroy\(\)/);
@@ -45,6 +46,8 @@ test("desktop portable update exits the tray process before file replacement", (
   assert.match(main, /onSpawn:\s*\(\) => exitForPortableUpdate\(\)/);
   assert.match(main, /onError:\s*\(error\) =>/);
   assert.match(main, /shell\.showItemInFolder\(prepared\.scriptPath\)/);
+  assert.match(main, /CodexBridge 已更新到 v\$\{app\.getVersion\(\)\}/);
+  assert.match(main, /Updated CodexBridge launched/);
 });
 
 test("desktop launches the Windows updater through detached PowerShell directly", () => {
