@@ -158,6 +158,7 @@ test("Windows portable updater script replaces and restarts without batch deleti
   assert.match(script, /Current app directory: \$CURRENT_APP_DIR/);
   assert.match(script, /Update package: \$ZIP_PATH/);
   assert.match(script, /Update work directory: \$WORK_DIR/);
+  assert.match(script, /\$EXE_NAME = 'CodexBridge\.exe'/);
   assert.match(script, /Invoke-UpdateStep "Renaming current app directory"/);
   assert.match(script, /Invoke-UpdateStep "Moving new app directory into place"/);
   assert.match(script, /Show-UpdateFailure \$failureMessage/);
@@ -171,6 +172,18 @@ test("Windows portable updater script replaces and restarts without batch deleti
   assert.match(script, /\$WAIT_PIDS = @\(1234, 5678\)/);
   assert.match(script, /Waiting for process \$TargetPid to exit/);
   assert.doesNotMatch(script, /Remove-Item\s+-Recurse|rm\s+-rf|rmdir\s+\/s|rd\s+\/s|del\s+\/s/i);
+});
+
+test("Windows portable updater defaults to the CodexBridge executable name", () => {
+  const script = generateWindowsPortableUpdateScript({
+    zipPath: "C:\\updates\\CodexBridge.zip",
+    currentAppDir: "C:\\Tools\\CodexBridge-win32-x64",
+    workDir: "C:\\updates",
+    logPath: "C:\\updates\\update.log",
+  });
+
+  assert.match(script, /\$EXE_NAME = 'CodexBridge\.exe'/);
+  assert.doesNotMatch(script, /\$EXE_NAME = ''/);
 });
 
 test("Windows portable updater script parses in PowerShell", { skip: process.platform !== "win32" }, () => {

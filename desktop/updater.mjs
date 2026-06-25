@@ -117,7 +117,7 @@ export function generateWindowsPortableUpdateScript({
   blockingPids = [],
   zipPath,
   currentAppDir,
-  exeName,
+  exeName = "CodexBridge.exe",
   workDir,
   logPath,
 }) {

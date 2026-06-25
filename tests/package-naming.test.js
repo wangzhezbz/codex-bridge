@@ -91,6 +91,10 @@ test("Windows release archive uses formal portable package naming", () => {
 
   assert.match(workflow, /CodexBridge-Windows-x64-Portable\.zip/);
   assert.match(workflow, /releases\/latest\/download\/CodexBridge-Windows-x64-Portable\.zip/);
+  assert.match(workflow, /Smoke test Windows release archive/);
+  assert.match(workflow, /CodexBridge\.exe/);
+  assert.match(workflow, /Join-Path \$appPath\.FullName "\*"/);
+  assert.doesNotMatch(workflow, /Compress-Archive -Path "release\/\*"/);
   assert.match(workflow, /prerelease: false/);
   assert.doesNotMatch(workflow, /CodexBridge-windows-portable/);
   assert.match(packager, /CODEXBRIDGE_RELEASE_VERSION/);

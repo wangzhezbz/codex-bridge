@@ -80,7 +80,30 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path "dist-artifacts" | Out-Null
-          Compress-Archive -Path "release/*" -DestinationPath "dist-artifacts/CodexBridge-Windows-x64-Portable.zip" -Force
+          $appPath = Get-ChildItem -Path "release" -Directory -Recurse |
+            Where-Object { $_.Name -eq "CodexBridge-win32-x64" } |
+            Select-Object -First 1
+          if (-not $appPath) {
+            throw "Could not find packaged CodexBridge-win32-x64 directory."
+          }
+          Compress-Archive -Path (Join-Path $appPath.FullName "*") -DestinationPath "dist-artifacts/CodexBridge-Windows-x64-Portable.zip" -Force
+
+      - name: Smoke test Windows release archive
+        shell: pwsh
+        run: |
+          $extractPath = Join-Path $env:RUNNER_TEMP "codexbridge-release-archive-smoke"
+          New-Item -ItemType Directory -Force -Path $extractPath | Out-Null
+          Expand-Archive -LiteralPath "dist-artifacts/CodexBridge-Windows-x64-Portable.zip" -DestinationPath $extractPath -Force
+          $exe = Get-ChildItem -LiteralPath $extractPath -Filter "CodexBridge.exe" -File -Recurse | Select-Object -First 1
+          if (-not $exe) {
+            throw "Release archive does not contain CodexBridge.exe."
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $exe.Directory.FullName "resources\app\package.json"))) {
+            throw "Release archive does not contain resources\app\package.json beside CodexBridge.exe."
+          }
+          $env:CODEXBRIDGE_DESKTOP_SMOKE = "1"
+          $env:CODEXBRIDGE_DATA_DIR = Join-Path $env:RUNNER_TEMP "codexbridge-release-archive-data"
+          & $exe.FullName
 
       - name: Upload Windows portable app
         uses: actions/upload-artifact@v4
