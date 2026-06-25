@@ -22,6 +22,11 @@ const route = {
   dropParams: ["response_format", "parallel_tool_calls"],
 };
 
+const imageRoute = {
+  ...route,
+  inputModalities: ["text", "image"],
+};
+
 test("model catalog keeps Codex tool capability fields", () => {
   const catalog = buildModelCatalog({
     models: [
@@ -212,7 +217,7 @@ test("chat conversion preserves image_url content arrays", () => {
         },
       ],
     },
-    route,
+    imageRoute,
     new ResponseHistory(),
   );
 
@@ -246,7 +251,7 @@ test("chat conversion replaces oversized data images with text placeholders", ()
         },
       ],
     },
-    route,
+    imageRoute,
     new ResponseHistory(),
   );
 

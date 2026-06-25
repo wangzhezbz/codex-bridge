@@ -98,6 +98,7 @@ export function responseRequestToChatSourceMessages(request, route, history) {
   const currentMessages = responseInputToChatMessages(
     request.messages ?? request.input,
     toolContext,
+    route,
   );
 
   const messages = [];
@@ -116,7 +117,7 @@ export function responseRequestToChatSourceMessages(request, route, history) {
   return { messages: sourceMessages, toolContext };
 }
 
-export function responseInputToChatMessages(input, toolContext) {
+export function responseInputToChatMessages(input, toolContext, route = {}) {
   if (input === undefined || input === null) {
     return [];
   }
@@ -176,7 +177,7 @@ export function responseInputToChatMessages(input, toolContext) {
       continue;
     }
 
-    const message = responseMessageToChatMessage(item);
+    const message = responseMessageToChatMessage(item, route);
     if (message) {
       messages.push(message);
     }
@@ -205,7 +206,7 @@ function shouldOmitResponseToolCallFromChatHistory(item, toolContext) {
   return !toolContext.responseNameToChatName.has(responseName);
 }
 
-export function responseMessageToChatMessage(item) {
+export function responseMessageToChatMessage(item, route = {}) {
   if (typeof item === "string") {
     return { role: "user", content: item };
   }
@@ -224,7 +225,7 @@ export function responseMessageToChatMessage(item) {
 
   const message = {
     role,
-    content: contentToChatContent(item.content ?? item.text ?? item.output ?? ""),
+    content: contentToChatContent(item.content ?? item.text ?? item.output ?? "", route),
   };
 
   if (Array.isArray(item.tool_calls)) {
@@ -237,7 +238,7 @@ export function responseMessageToChatMessage(item) {
   return message;
 }
 
-export function contentToChatContent(content) {
+export function contentToChatContent(content, route = {}) {
   if (content === undefined || content === null) {
     return "";
   }
@@ -245,7 +246,7 @@ export function contentToChatContent(content) {
     return content;
   }
   if (!Array.isArray(content)) {
-    const imagePart = imagePartToChat(content);
+    const imagePart = imagePartToChat(content, route);
     if (imagePart) {
       return [imagePart];
     }
@@ -268,7 +269,7 @@ export function contentToChatContent(content) {
       continue;
     }
 
-    const imagePart = imagePartToChat(part);
+    const imagePart = imagePartToChat(part, route);
     if (imagePart) {
       hasImage = true;
       chatParts.push(imagePart);
@@ -356,9 +357,12 @@ function textFromContentPart(part) {
   return "";
 }
 
-function imagePartToChat(part) {
+function imagePartToChat(part, route = {}) {
   if (!isImagePart(part)) {
     return null;
+  }
+  if (!shouldForwardImagesToChat(route)) {
+    return { type: "text", text: "[image input not forwarded in text-only context]" };
   }
   const rawImageUrl = part.image_url ?? part.imageUrl ?? part.url;
   const url =
@@ -377,6 +381,16 @@ function imagePartToChat(part) {
     imageUrl.detail = detail;
   }
   return { type: "image_url", image_url: imageUrl };
+}
+
+function shouldForwardImagesToChat(route = {}) {
+  if (!route || Object.keys(route).length === 0) {
+    return true;
+  }
+  if (route.api === "responses") {
+    return true;
+  }
+  return Array.isArray(route.inputModalities) && route.inputModalities.includes("image");
 }
 
 function isOversizedDataImageUrl(value) {

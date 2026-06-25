@@ -229,6 +229,32 @@ test("route fidelity degrades images and files intentionally for chat routes", (
   assert.doesNotMatch(JSON.stringify(content), /data:text\/plain;base64/);
 });
 
+test("route fidelity does not forward images to text-only chat routes", () => {
+  const request = {
+    input: [
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: "describe this screenshot" },
+          {
+            type: "input_image",
+            image_url: "data:image/png;base64,abc123",
+            detail: "high",
+          },
+        ],
+      },
+    ],
+  };
+
+  const textOnly = responsesToChatRequest(request, deepseekRoute, new ResponseHistory());
+  const textOnlyPayload = JSON.stringify(textOnly.body.messages);
+  assert.doesNotMatch(textOnlyPayload, /"image_url"/);
+  assert.match(textOnlyPayload, /image input not forwarded/);
+
+  const imageCapable = responsesToChatRequest(request, kimiRoute, new ResponseHistory());
+  assert.match(JSON.stringify(imageCapable.body.messages), /"image_url"/);
+});
+
 test("route fidelity keeps unified history when switching between small and large chat models", () => {
   const history = new ResponseHistory();
   const criticalDetail = "critical cache key and route decision must survive. ";
