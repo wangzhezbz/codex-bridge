@@ -27,8 +27,14 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run checks
-        run: npm run check
+      - name: Run syntax checks
+        run: npm run check:syntax
+
+      - name: Run router tests
+        run: npm run test:router
+
+      - name: Run desktop tests
+        run: npm run test:desktop
 
       - name: Package Windows portable app
         env:
