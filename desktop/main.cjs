@@ -620,7 +620,7 @@ ipcMain.handle("folder:open", async (_event, target) => {
       : target === "config"
         ? path.join(dataRootDir, "config")
         : target === "updates"
-          ? path.join(dataRootDir, "updates")
+          ? portableUpdatesDir()
         : dataRootDir;
   await shell.openPath(folder);
   return { ok: true };
@@ -656,18 +656,15 @@ function stopRouter(options = {}) {
 }
 
 async function preparePortableUpdate(updater, plan, onProgress) {
-  const updatesDir = path.join(dataRootDir, "updates");
-  const downloadsDir = path.join(updatesDir, "downloads");
-  const logsDir = path.join(dataRootDir, "logs");
-  fs.mkdirSync(downloadsDir, { recursive: true });
-  fs.mkdirSync(logsDir, { recursive: true });
+  const updatesDir = portableUpdatesDir();
+  fs.mkdirSync(updatesDir, { recursive: true });
   const stamp = new Date()
     .toISOString()
     .replaceAll(":", "")
     .replaceAll(".", "")
     .replace("T", "-")
     .replace("Z", "");
-  const downloadPath = path.join(downloadsDir, `${stamp}-${plan.asset.name}`);
+  const downloadPath = path.join(updatesDir, `${stamp}-${plan.asset.name}`);
   const proxyLabel = updater.updateDownloadProxyLabel?.(plan.asset.downloadUrl) || "";
   appendLog(
     proxyLabel
@@ -680,20 +677,29 @@ async function preparePortableUpdate(updater, plan, onProgress) {
     onProgress,
   });
 
-  const logPath = path.join(logsDir, "update.log");
+  const currentAppDir = path.dirname(process.execPath);
+  const manualNotePath = path.join(updatesDir, `manual-update-${stamp}.txt`);
+  writeManualUpdateInstructions({
+    manualNotePath,
+    packagePath: downloadPath,
+    currentAppDir,
+    platform: process.platform,
+  });
+
+  const logPath = path.join(updatesDir, "update.log");
   if (process.platform === "win32") {
     const scriptFile = path.join(updatesDir, `apply-update-${stamp}.ps1`);
     const script = updater.generateWindowsPortableUpdateScript({
       parentPid: process.pid,
       blockingPids: [routerProcess?.pid].filter(Boolean),
       zipPath: downloadPath,
-      currentAppDir: path.dirname(process.execPath),
+      currentAppDir,
       exeName: path.basename(process.execPath),
       workDir: updatesDir,
       logPath,
     });
     fs.writeFileSync(scriptFile, script, "utf8");
-    return { downloadPath, scriptPath: scriptFile };
+    return { downloadPath, scriptPath: scriptFile, manualNotePath };
   }
   if (process.platform === "darwin") {
     const scriptFile = path.join(updatesDir, `apply-update-${stamp}.sh`);
@@ -706,9 +712,57 @@ async function preparePortableUpdate(updater, plan, onProgress) {
       logPath,
     });
     fs.writeFileSync(scriptFile, script, { encoding: "utf8", mode: 0o755 });
-    return { downloadPath, scriptPath: scriptFile };
+    return { downloadPath, scriptPath: scriptFile, manualNotePath };
   }
   throw new Error(`当前系统暂不支持应用内更新：${process.platform} ${process.arch}`);
+}
+
+function portableUpdatesDir() {
+  if (app.isPackaged && process.platform === "win32") {
+    return path.resolve(path.dirname(process.execPath), "..", "updates");
+  }
+  if (app.isPackaged && process.platform === "darwin") {
+    return path.join(path.dirname(currentMacAppBundle()), "updates");
+  }
+  return path.join(dataRootDir, "updates");
+}
+
+function writeManualUpdateInstructions({
+  manualNotePath,
+  packagePath,
+  currentAppDir,
+  platform,
+}) {
+  const lines = [
+    "CodexBridge manual update fallback",
+    "",
+    `Downloaded package: ${packagePath}`,
+    `Current app directory: ${currentAppDir}`,
+    "",
+  ];
+  if (platform === "win32") {
+    lines.push(
+      "If automatic update does not restart into the new version:",
+      "1. Fully exit CodexBridge from the tray icon.",
+      "2. Unzip the downloaded package in this folder.",
+      "3. Open the extracted CodexBridge-win32-x64 folder.",
+      "4. Run CodexBridge.exe.",
+      "",
+      "The automatic updater normally backs up the old app directory and replaces the same path after CodexBridge exits.",
+    );
+  } else if (platform === "darwin") {
+    lines.push(
+      "If automatic update does not restart into the new version:",
+      "1. Fully quit CodexBridge.",
+      "2. Unzip the downloaded package in this folder.",
+      "3. Open the extracted CodexBridge.app.",
+      "",
+      "The automatic updater normally backs up the old app bundle and replaces the same path after CodexBridge exits.",
+    );
+  } else {
+    lines.push("Automatic update is not supported on this platform.");
+  }
+  fs.writeFileSync(manualNotePath, `${lines.join("\n")}\n`, "utf8");
 }
 
 async function downloadFile(url, targetPath, {
@@ -781,12 +835,11 @@ async function downloadFile(url, targetPath, {
 
 function launchPortableUpdater(scriptFile) {
   const child = process.platform === "win32"
-    ? spawn("powershell.exe", [
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        scriptFile,
+    ? spawn("cmd.exe", [
+        "/d",
+        "/s",
+        "/c",
+        `start "" /min powershell.exe -NoProfile -ExecutionPolicy Bypass -File ${cmdQuote(scriptFile)}`,
       ], {
         detached: true,
         stdio: "ignore",
@@ -798,6 +851,10 @@ function launchPortableUpdater(scriptFile) {
         windowsHide: true,
       });
   child.unref();
+}
+
+function cmdQuote(value) {
+  return `"${String(value || "").replaceAll('"', '""')}"`;
 }
 
 function exitForPortableUpdate() {
@@ -1113,7 +1170,8 @@ async function runDesktopSmokeChecks() {
           "#stats",
           "#usageChart",
           "#copyDiagnostics",
-          "#checkUpdates"
+          "#checkUpdates",
+          "#openUpdateFolder"
         ];
         for (const selector of required) {
           if (!document.querySelector(selector)) {

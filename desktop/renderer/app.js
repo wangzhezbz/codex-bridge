@@ -184,6 +184,7 @@ els.cancelCustomEdit.addEventListener("click", () => resetCustomModelForm());
 
 document.querySelector("#openConfigFolder").addEventListener("click", () => api.openFolder("config"));
 document.querySelector("#openCodexFolder").addEventListener("click", () => api.openFolder("codex"));
+document.querySelector("#openUpdateFolder").addEventListener("click", () => api.openFolder("updates"));
 document.querySelector("#openGitHub").addEventListener("click", () => api.openGitHub());
 els.checkUpdates.addEventListener("click", () =>
   runAction(els.checkUpdates, async () => {

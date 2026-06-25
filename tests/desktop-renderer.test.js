@@ -23,6 +23,7 @@ test("desktop renderer exposes update from sidebar without a dedicated page", ()
   assert.doesNotMatch(htmlSource, /id="updates"/);
   assert.match(htmlSource, /id="appVersion"/);
   assert.match(htmlSource, /id="checkUpdates"/);
+  assert.match(htmlSource, /id="openUpdateFolder"/);
   assert.match(htmlSource, /id="updateDialog"/);
   assert.match(htmlSource, /id="confirmUpdate"/);
   assert.match(htmlSource, /id="cancelUpdate"/);
@@ -31,6 +32,7 @@ test("desktop renderer exposes update from sidebar without a dedicated page", ()
   assert.doesNotMatch(htmlSource, /id="installUpdate"/);
   assert.match(preloadSource, /checkForUpdates: \(\) => ipcRenderer\.invoke\("updates:check"\)/);
   assert.match(preloadSource, /installUpdate: \(\) => ipcRenderer\.invoke\("updates:install"\)/);
+  assert.match(rendererSource, /api\.openFolder\("updates"\)/);
   assert.match(preloadSource, /onUpdateProgress: \(callback\) =>/);
   assert.match(rendererSource, /api\.checkForUpdates\(\)/);
   assert.match(rendererSource, /api\.installUpdate\(\)/);

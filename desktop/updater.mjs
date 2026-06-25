@@ -194,7 +194,7 @@ function Get-AppDirectoryProcessIds([string]$AppDir) {
 }
 
 function Wait-AppDirectoryProcessesExit([string]$AppDir) {
-  $deadline = (Get-Date).AddSeconds(120)
+  $deadline = (Get-Date).AddSeconds(8)
   $lastLogAt = (Get-Date).AddSeconds(-10)
   while ($true) {
     $runningPids = @(Get-AppDirectoryProcessIds $AppDir)
@@ -202,7 +202,21 @@ function Wait-AppDirectoryProcessesExit([string]$AppDir) {
       return
     }
     if ((Get-Date) -gt $deadline) {
-      throw ("Process(es) still running from current app directory: " + ($runningPids -join ", "))
+      Write-UpdateLog ("Stopping lingering app directory process(es): " + ($runningPids -join ", "))
+      foreach ($runningPid in $runningPids) {
+        Stop-Process -Id $runningPid -Force -ErrorAction SilentlyContinue
+      }
+      $stopDeadline = (Get-Date).AddSeconds(20)
+      while ($true) {
+        $remainingPids = @(Get-AppDirectoryProcessIds $AppDir)
+        if ($remainingPids.Count -eq 0) {
+          return
+        }
+        if ((Get-Date) -gt $stopDeadline) {
+          throw ("Process(es) still running from current app directory after stop: " + ($remainingPids -join ", "))
+        }
+        Start-Sleep -Milliseconds 500
+      }
     }
     if ((Get-Date) -gt $lastLogAt.AddSeconds(2)) {
       Write-UpdateLog ("Waiting for app directory process(es) to exit: " + ($runningPids -join ", "))
@@ -283,6 +297,7 @@ function Assert-CodexBridgeAppDir([string]$AppDir) {
 }
 
 try {
+  Write-UpdateLog "Updater script started."
   foreach ($waitPid in $WAIT_PIDS) {
     Wait-UpdateProcessExit $waitPid
   }

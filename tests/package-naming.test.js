@@ -43,6 +43,16 @@ test("desktop portable update exits the tray process before file replacement", (
   assert.match(main, /launchPortableUpdater\(prepared\.scriptPath\);\s*exitForPortableUpdate\(\);/);
 });
 
+test("desktop updater keeps downloaded package visible in the update folder", () => {
+  const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
+
+  assert.match(main, /const updatesDir = portableUpdatesDir\(\)/);
+  assert.match(main, /path\.resolve\(path\.dirname\(process\.execPath\), "\.\.", "updates"\)/);
+  assert.match(main, /const downloadPath = path\.join\(updatesDir, `\$\{stamp\}-\$\{plan\.asset\.name\}`\)/);
+  assert.match(main, /function writeManualUpdateInstructions/);
+  assert.doesNotMatch(main, /path\.join\(updatesDir, "downloads"\)/);
+});
+
 test("Windows release archive uses formal portable package naming", () => {
   const workflow = fs.readFileSync(
     path.join(process.cwd(), ".github", "workflows", "desktop-portable.yml"),

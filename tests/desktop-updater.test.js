@@ -153,6 +153,8 @@ test("Windows portable updater script replaces and restarts without batch deleti
   assert.match(script, /function Find-CodexBridgeAppDir/);
   assert.match(script, /function Wait-AppDirectoryProcessesExit/);
   assert.match(script, /Get-CimInstance Win32_Process/);
+  assert.match(script, /Stop-Process -Id \$runningPid -Force/);
+  assert.match(script, /Updater script started/);
   assert.match(script, /Invoke-UpdateStep "Renaming current app directory"/);
   assert.match(script, /Invoke-UpdateStep "Moving new app directory into place"/);
   assert.match(script, /Show-UpdateFailure \$failureMessage/);
