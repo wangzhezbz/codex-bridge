@@ -9,7 +9,7 @@ import { loadConfig } from "../src/config.js";
 import { ResponseHistory } from "../src/history.js";
 import { shouldUseImageGenerationFallback } from "../src/image-generation.js";
 import { createRouterServer } from "../src/server.js";
-import { proxyResponsesApi } from "../src/upstream.js";
+import { callJsonUpstream, proxyResponsesApi } from "../src/upstream.js";
 
 test("server exposes health, models, catalog, and converted responses", async () => {
   const upstream = http.createServer(async (req, res) => {
@@ -4256,6 +4256,76 @@ test("server filters unsupported chat params before chat completions upstream fe
     assert.deepEqual(upstreamBody.messages.at(-1), { role: "user", content: "hello" });
   } finally {
     await close(router);
+    await close(upstream);
+  }
+});
+
+test("upstream requests log adapter payload drops with route-specific reasons", async () => {
+  let upstreamBody;
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (line) => logs.push(String(line));
+  const upstream = http.createServer(async (req, res) => {
+    upstreamBody = await readJson(req);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      id: "chatcmpl_drop_log",
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: "ok",
+          },
+        },
+      ],
+    }));
+  });
+
+  await listen(upstream);
+  try {
+    const response = await callJsonUpstream(
+      `${serverUrl(upstream)}/v1/chat/completions`,
+      {
+        id: "deepseek-v4-pro",
+        provider: "deepseek",
+        api: "chat_completions",
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+        dropParams: ["response_format", "parallel_tool_calls"],
+      },
+      {
+        model: "deepseek-v4-pro",
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "hello", unsafe: () => "nope" },
+            ],
+          },
+        ],
+        response_format: { type: "json_object" },
+        parallel_tool_calls: true,
+        metadata: { request: "debug" },
+      },
+      { requestId: "req_drop_log" },
+    );
+
+    assert.equal(response.choices[0].message.content, "ok");
+    assert.equal(upstreamBody.response_format, undefined);
+    assert.equal(upstreamBody.parallel_tool_calls, undefined);
+    assert.equal(upstreamBody.metadata, undefined);
+    assert.equal(upstreamBody.messages[0].content[0].unsafe, undefined);
+    assert.ok(logs.some((line) =>
+      /payload_drop route=deepseek-v4-pro path=response_format reason=route_dropped_param/.test(line)
+    ));
+    assert.ok(logs.some((line) =>
+      /payload_drop route=deepseek-v4-pro path=metadata reason=unsupported_top_level_param/.test(line)
+    ));
+    assert.ok(logs.some((line) =>
+      /payload_drop route=deepseek-v4-pro path=messages\[0\]\.content\[0\]\.unsafe reason=non_json_value/.test(line)
+    ));
+  } finally {
+    console.log = originalLog;
     await close(upstream);
   }
 });

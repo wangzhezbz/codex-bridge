@@ -57,6 +57,8 @@ const CHAT_REASONING_PARAMS = [
   "extra_body",
 ];
 
+const OMIT_VALUE = Symbol("codexbridge_omit_payload_value");
+
 export function normalizeAdapterProfile(route = {}) {
   const providerFamily = providerFamilyForRoute(route);
   const api = route.api === "responses" ? "responses" : "chat_completions";
@@ -190,15 +192,118 @@ export function filterPayloadForAdapter(payload = {}, profileOrRoute = {}, optio
   const allowed = new Set(profile.safeParams || []);
   const dropped = new Set(profile.dropParams || []);
   const result = {};
+  const onDrop = typeof options.onDrop === "function" ? options.onDrop : null;
 
   for (const [key, value] of Object.entries(payload || {})) {
-    if (allowed.has(key) && !dropped.has(key)) {
-      result[key] = value;
+    if (!allowed.has(key)) {
+      reportPayloadDrop(onDrop, key, "unsupported_top_level_param", profile, key);
+      continue;
+    }
+    if (dropped.has(key)) {
+      reportPayloadDrop(onDrop, key, "route_dropped_param", profile, key);
+      continue;
+    }
+    const sanitized = sanitizePayloadValue(value, {
+      path: key,
+      key,
+      onDrop,
+      profile,
+    });
+    if (sanitized !== OMIT_VALUE) {
+      result[key] = sanitized;
     }
   }
 
   applyRouteSpecificPayloadDefaults(result, profile, dropped);
   return result;
+}
+
+function sanitizePayloadValue(value, context) {
+  const valueType = typeof value;
+  if (
+    value === undefined ||
+    valueType === "function" ||
+    valueType === "symbol" ||
+    valueType === "bigint"
+  ) {
+    reportPayloadDrop(
+      context.onDrop,
+      context.path,
+      "non_json_value",
+      context.profile,
+      context.key,
+    );
+    return OMIT_VALUE;
+  }
+  if (value === null || valueType === "string" || valueType === "boolean") {
+    return value;
+  }
+  if (valueType === "number") {
+    if (Number.isFinite(value)) {
+      return value;
+    }
+    reportPayloadDrop(
+      context.onDrop,
+      context.path,
+      "non_json_value",
+      context.profile,
+      context.key,
+    );
+    return OMIT_VALUE;
+  }
+  if (Array.isArray(value)) {
+    const result = [];
+    for (let index = 0; index < value.length; index += 1) {
+      const sanitized = sanitizePayloadValue(value[index], {
+        ...context,
+        path: `${context.path}[${index}]`,
+        key: String(index),
+      });
+      if (sanitized !== OMIT_VALUE) {
+        result.push(sanitized);
+      }
+    }
+    return result;
+  }
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+  if (valueType === "object") {
+    const result = {};
+    for (const [key, child] of Object.entries(value)) {
+      const sanitized = sanitizePayloadValue(child, {
+        ...context,
+        path: appendPayloadPath(context.path, key),
+        key,
+      });
+      if (sanitized !== OMIT_VALUE) {
+        result[key] = sanitized;
+      }
+    }
+    return result;
+  }
+  return value;
+}
+
+function appendPayloadPath(parent, key) {
+  if (/^[A-Za-z_$][\w$]*$/.test(key)) {
+    return parent ? `${parent}.${key}` : key;
+  }
+  return `${parent || ""}[${JSON.stringify(key)}]`;
+}
+
+function reportPayloadDrop(onDrop, path, reason, profile, key) {
+  if (!onDrop) {
+    return;
+  }
+  onDrop({
+    path,
+    key,
+    reason,
+    adapterId: profile.adapterId,
+    api: profile.api,
+    providerFamily: profile.providerFamily,
+  });
 }
 
 function applyRouteSpecificPayloadDefaults(payload, profile, dropped) {

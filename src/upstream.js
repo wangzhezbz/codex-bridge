@@ -3,7 +3,6 @@ import { cloneJson, jsonResponse, openAiError, stringifyJson, tryParseJson } fro
 import { authModeForRoute, joinUpstreamUrl, requireApiKey } from "./config.js";
 import {
   filterPayloadForAdapter,
-  normalizeAdapterProfile,
 } from "./adapter-profile.js";
 import {
   contentToText,
@@ -197,9 +196,10 @@ export async function proxyResponsesApi(
     inlineLocalHistoryForResponsesPayload(payload, sourceMessages);
   }
 
-  const upstreamPayload = filterPayloadForAdapter(
+  const upstreamPayload = filterPayloadForUpstream(
     payload,
-    normalizeAdapterProfile(route),
+    route,
+    context,
     { api: "responses" },
   );
   const upstreamPath = context.compactKind === "v1" ? "/responses/compact" : "/responses";
@@ -726,7 +726,7 @@ async function callResponsesCompactUpstream(
   context = {},
   options = {},
 ) {
-  const upstreamPayload = filterPayloadForAdapter(payload, route);
+  const upstreamPayload = filterPayloadForUpstream(payload, route, context);
   throwIfRecentUpstreamFailure(route, upstreamUrl, upstreamPayload, context);
   let upstream;
   try {
@@ -1371,7 +1371,7 @@ export async function callJsonUpstream(
 ) {
   const upstreamPayload =
     route?.api === "responses" || route?.api === "chat_completions"
-      ? filterPayloadForAdapter(payload, route)
+      ? filterPayloadForUpstream(payload, route, context)
       : payload;
   throwIfRecentUpstreamFailure(route, upstreamUrl, upstreamPayload, context);
   let upstream;
@@ -1573,6 +1573,40 @@ function headerValue(headers, name) {
     return value.find(Boolean) || "";
   }
   return typeof value === "string" ? value : "";
+}
+
+function filterPayloadForUpstream(payload, route, context = {}, options = {}) {
+  const drops = [];
+  const upstreamPayload = filterPayloadForAdapter(payload, route, {
+    ...options,
+    onDrop: (drop) => drops.push(drop),
+  });
+  logPayloadDrops(context, route, drops);
+  return upstreamPayload;
+}
+
+function logPayloadDrops(context, route, drops) {
+  if (!drops.length) {
+    return;
+  }
+  const requestId = context.requestId || "req";
+  const routeId = route.id || route.model || route.adapterId || "unknown";
+  for (const drop of drops) {
+    console.log(
+      `[${new Date().toISOString()}] ${requestId} !! payload_drop ` +
+        `route=${safeLogValue(routeId)} path=${safeLogValue(drop.path)} ` +
+        `reason=${safeLogValue(drop.reason)}`,
+    );
+  }
+}
+
+function safeLogValue(value) {
+  return String(value || "")
+    .replaceAll("\r", " ")
+    .replaceAll("\n", " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240);
 }
 
 function logRoute(context, route, upstreamUrl) {

@@ -671,6 +671,87 @@ test("custom routes honor explicitly configured dropped params", () => {
   assert.deepEqual(filtered.response_format, { type: "json_object" });
 });
 
+test("payload filtering recursively drops non-json values without damaging tool schemas", () => {
+  const drops = [];
+  const payload = {
+    model: "custom-model",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "hello", debug: undefined },
+          { type: "text", text: "world", unsafe: () => "nope" },
+        ],
+      },
+    ],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "select_body_parts",
+          description: "Select body parts.",
+          parameters: {
+            type: "object",
+            properties: {
+              excludedBodyParts: {
+                type: "array",
+                items: { $ref: "#/$defs/BodyPart" },
+              },
+              metadata: {
+                type: "object",
+                properties: {
+                  source: { type: "string" },
+                },
+              },
+            },
+            $defs: {
+              BodyPart: {
+                type: "string",
+                enum: ["head", "arm", "leg"],
+              },
+            },
+            definitions: {
+              LegacyPart: {
+                type: "string",
+                enum: ["tail"],
+              },
+            },
+          },
+        },
+      },
+    ],
+    metadata: {
+      ok: true,
+      skipMe: Symbol("skip"),
+    },
+  };
+
+  const filtered = filterPayloadForAdapter(payload, {
+    provider: "custom",
+    custom: true,
+    api: "chat_completions",
+    model: "custom-model",
+  }, {
+    onDrop: (drop) => drops.push(drop),
+  });
+
+  assert.equal(filtered.messages[0].content[0].debug, undefined);
+  assert.equal(filtered.messages[0].content[1].unsafe, undefined);
+  assert.equal(filtered.metadata, undefined);
+  assert.equal(filtered.tools[0].function.parameters.properties.metadata.properties.source.type, "string");
+  assert.equal(filtered.tools[0].function.parameters.properties.excludedBodyParts.items.$ref, "#/$defs/BodyPart");
+  assert.deepEqual(filtered.tools[0].function.parameters.$defs.BodyPart.enum, ["head", "arm", "leg"]);
+  assert.deepEqual(filtered.tools[0].function.parameters.definitions.LegacyPart.enum, ["tail"]);
+  assert.deepEqual(
+    drops.map((drop) => `${drop.path}:${drop.reason}`).sort(),
+    [
+      "messages[0].content[0].debug:non_json_value",
+      "messages[0].content[1].unsafe:non_json_value",
+      "metadata:unsupported_top_level_param",
+    ],
+  );
+});
+
 test("adapterIdForRoute is stable for known provider families", () => {
   assert.equal(adapterIdForRoute({ provider: "minimax", api: "chat_completions" }), "chat-minimax");
   assert.equal(adapterIdForRoute({ provider: "volcengine", api: "chat_completions" }), "chat-doubao");
