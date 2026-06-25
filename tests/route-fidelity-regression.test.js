@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { filterPayloadForAdapter } from "../src/adapter-profile.js";
-import { buildCompactChatRequest, compactResponseFromChat } from "../src/compact.js";
+import {
+  buildCompactChatRequest,
+  buildCompactResponsesRequest,
+  compactResponseFromChat,
+} from "../src/compact.js";
 import {
   assistantHistoryMessageFromChat,
   chatResponseToResponse,
@@ -58,6 +62,85 @@ const customRoute = {
   inputModalities: ["text", "image"],
 };
 
+const minimaxRoute = {
+  id: "minimax-m3",
+  displayName: "MiniMax M3",
+  provider: "minimax",
+  api: "chat_completions",
+  baseUrl: "https://api.minimaxi.com/v1",
+  model: "MiniMax-M3",
+  apiKey: "minimax-key",
+  dropParams: ["response_format", "parallel_tool_calls"],
+};
+
+const doubaoRoute = {
+  id: "doubao-seed-1-8",
+  displayName: "Doubao Seed 1.8",
+  provider: "volcengine",
+  api: "chat_completions",
+  baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
+  model: "doubao-seed-1-8-251228",
+  apiKey: "doubao-key",
+  dropParams: ["response_format", "parallel_tool_calls"],
+};
+
+const qwenRoute = {
+  id: "qwen3-coder-plus",
+  displayName: "Qwen3 Coder Plus",
+  provider: "qwen",
+  api: "chat_completions",
+  baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  model: "qwen3-coder-plus",
+  apiKey: "qwen-key",
+  dropParams: ["parallel_tool_calls"],
+};
+
+const zhipuRoute = {
+  id: "glm-4-6",
+  displayName: "GLM-4.6",
+  provider: "zhipu",
+  api: "chat_completions",
+  baseUrl: "https://open.bigmodel.cn/api/paas/v4",
+  model: "glm-4.6",
+  apiKey: "zhipu-key",
+  dropParams: ["parallel_tool_calls"],
+};
+
+const openrouterRoute = {
+  id: "openrouter-sonnet",
+  displayName: "OpenRouter Claude Sonnet",
+  provider: "openrouter",
+  api: "chat_completions",
+  baseUrl: "https://openrouter.ai/api/v1",
+  model: "anthropic/claude-sonnet-4.5",
+  apiKey: "openrouter-key",
+  inputModalities: ["text", "image"],
+  dropParams: ["parallel_tool_calls"],
+};
+
+const siliconflowRoute = {
+  id: "siliconflow-qwen3-coder",
+  displayName: "SiliconFlow Qwen3 Coder",
+  provider: "siliconflow",
+  api: "chat_completions",
+  baseUrl: "https://api.siliconflow.cn/v1",
+  model: "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+  apiKey: "siliconflow-key",
+  dropParams: ["parallel_tool_calls"],
+};
+
+const chatMainChainRoutes = [
+  deepseekRoute,
+  kimiRoute,
+  minimaxRoute,
+  doubaoRoute,
+  qwenRoute,
+  zhipuRoute,
+  openrouterRoute,
+  siliconflowRoute,
+  customRoute,
+];
+
 test("route fidelity catalog keeps Codex tool capability across native, chat, and custom models", () => {
   const catalog = buildModelCatalog({
     models: [gptRoute, deepseekRoute, kimiRoute, customRoute],
@@ -78,6 +161,157 @@ test("route fidelity catalog keeps Codex tool capability across native, chat, an
   assert.deepEqual(catalog.models[1].input_modalities, ["text"]);
   assert.deepEqual(catalog.models[2].input_modalities, ["text", "image"]);
   assert.deepEqual(catalog.models[3].input_modalities, ["text", "image"]);
+});
+
+test("route fidelity matrix covers provider main-chain chat contracts", () => {
+  for (const route of chatMainChainRoutes) {
+    const converted = responsesToChatRequest(
+      {
+        input: [
+          {
+            role: "user",
+            content: [
+              { type: "input_text", text: `matrix text for ${route.id}` },
+              {
+                type: "input_image",
+                image_url: "data:image/png;base64,abc123",
+                detail: "high",
+              },
+              {
+                type: "input_file",
+                filename: "report.csv",
+                file_data: "data:text/csv;base64,Y29sCnZhbHVl",
+              },
+            ],
+          },
+        ],
+        response_format: { type: "json_object" },
+        parallel_tool_calls: true,
+        tools: matrixTools(),
+        tool_choice: { type: "function", name: "shell_command" },
+      },
+      route,
+      new ResponseHistory(),
+    );
+    const filtered = filterPayloadForAdapter(converted.body, route);
+    const payload = JSON.stringify(filtered);
+
+    assert.equal(filtered.model, route.model, route.id);
+    assert.match(payload, new RegExp(`matrix text for ${escapeRegExp(route.id)}`), route.id);
+    assert.match(payload, /report\.csv/, route.id);
+    assert.doesNotMatch(payload, /data:text\/csv/, route.id);
+    assert.deepEqual(
+      filtered.tools.map((tool) => tool.function.name),
+      ["shell_command", "mcp__filesystem__read_file"],
+      route.id,
+    );
+    assert.deepEqual(
+      filtered.tool_choice,
+      { type: "function", function: { name: "shell_command" } },
+      route.id,
+    );
+
+    if ((route.inputModalities || []).includes("image")) {
+      assert.match(payload, /"image_url"/, route.id);
+    } else {
+      assert.doesNotMatch(payload, /"image_url"/, route.id);
+      assert.match(payload, /image input not forwarded/, route.id);
+    }
+
+    if ((route.dropParams || []).includes("response_format")) {
+      assert.equal(filtered.response_format, undefined, route.id);
+    } else {
+      assert.deepEqual(filtered.response_format, { type: "json_object" }, route.id);
+    }
+    if ((route.dropParams || []).includes("parallel_tool_calls")) {
+      assert.equal(filtered.parallel_tool_calls, undefined, route.id);
+    } else {
+      assert.equal(filtered.parallel_tool_calls, true, route.id);
+    }
+
+    const history = new ResponseHistory();
+    history.record(`resp_matrix_${route.id}`, [
+      { role: "user", content: `prior matrix context for ${route.id}` },
+      { role: "assistant", content: "prior matrix answer" },
+    ]);
+    const followUp = responsesToChatRequest(
+      {
+        previous_response_id: `resp_matrix_${route.id}`,
+        input: "continue matrix task",
+      },
+      route,
+      history,
+    );
+    const followUpPayload = JSON.stringify(followUp.body.messages);
+    assert.match(followUpPayload, new RegExp(`prior matrix context for ${escapeRegExp(route.id)}`), route.id);
+    assert.match(followUpPayload, /continue matrix task/, route.id);
+
+    const compact = buildCompactChatRequest(
+      {
+        model: route.id,
+        stream: true,
+        input: [
+          { type: "message", role: "user", content: `compact ${route.id}` },
+          { type: "compaction_trigger" },
+        ],
+        tools: matrixTools(),
+        tool_choice: { type: "function", name: "shell_command" },
+        parallel_tool_calls: true,
+      },
+      route,
+      new ResponseHistory(),
+    );
+    assert.equal(compact.body.stream, false, route.id);
+    assert.equal(compact.body.tools, undefined, route.id);
+    assert.equal(compact.body.tool_choice, undefined, route.id);
+    assert.equal(compact.body.parallel_tool_calls, undefined, route.id);
+    assert.match(JSON.stringify(compact.body.messages), /CONTEXT CHECKPOINT COMPACTION/, route.id);
+  }
+});
+
+test("route fidelity matrix keeps native GPT Responses contracts separate", () => {
+  const catalog = buildModelCatalog({
+    models: [gptRoute, ...chatMainChainRoutes],
+  });
+  const gpt = catalog.models.find((model) => model.slug === gptRoute.id);
+  assert.deepEqual(gpt.input_modalities, ["text", "image"]);
+  assert.equal(gpt.shell_type, "shell_command");
+  assert.equal(gpt.apply_patch_tool_type, "freeform");
+
+  const filtered = filterPayloadForAdapter(
+    {
+      model: gptRoute.model,
+      input: "native responses text",
+      metadata: { trace: "ok" },
+      store: true,
+      response_format: { type: "json_object" },
+    },
+    gptRoute,
+  );
+  assert.deepEqual(filtered.metadata, { trace: "ok" });
+  assert.equal(filtered.store, true);
+  assert.equal(filtered.response_format, undefined);
+
+  const compact = buildCompactResponsesRequest({
+    model: gptRoute.id,
+    stream: false,
+    input: [
+      { type: "message", role: "user", content: "native compact text" },
+      { type: "compaction_trigger" },
+    ],
+    tools: matrixTools(),
+    tool_choice: { type: "function", name: "shell_command" },
+    parallel_tool_calls: true,
+    response_format: { type: "json_object" },
+  }, { stream: true });
+
+  assert.equal(compact.stream, true);
+  assert.equal(compact.tools, undefined);
+  assert.equal(compact.tool_choice, undefined);
+  assert.equal(compact.parallel_tool_calls, undefined);
+  assert.equal(compact.response_format, undefined);
+  assert.match(JSON.stringify(compact.input), /CONTEXT CHECKPOINT COMPACTION/);
+  assert.doesNotMatch(JSON.stringify(compact.input), /compaction_trigger/);
 });
 
 test("route fidelity preserves custom OpenAI-compatible params while honoring provider drops", () => {
@@ -637,4 +871,39 @@ test("route fidelity treats generated file tool outputs by call pairing, not fil
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function matrixTools() {
+  return [
+    {
+      type: "function",
+      name: "shell_command",
+      description: "Run shell.",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string" },
+        },
+        required: ["command"],
+      },
+    },
+    {
+      type: "namespace",
+      name: "mcp__filesystem__",
+      tools: [
+        {
+          type: "function",
+          name: "read_file",
+          description: "Read a file.",
+          parameters: {
+            type: "object",
+            properties: {
+              path: { type: "string" },
+            },
+            required: ["path"],
+          },
+        },
+      ],
+    },
+  ];
 }

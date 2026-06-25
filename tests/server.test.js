@@ -4364,9 +4364,21 @@ test("chat provider categories complete text requests without unsafe params", as
       dropParams: ["parallel_tool_calls"],
     },
     {
+      id: "zhipu-smoke",
+      provider: "zhipu",
+      model: "glm-4.6",
+      dropParams: ["parallel_tool_calls"],
+    },
+    {
       id: "generic-smoke",
       provider: "openrouter",
       model: "anthropic/claude-sonnet-4.5",
+      dropParams: ["parallel_tool_calls"],
+    },
+    {
+      id: "siliconflow-smoke",
+      provider: "siliconflow",
+      model: "Qwen/Qwen3-Coder-480B-A35B-Instruct",
       dropParams: ["parallel_tool_calls"],
     },
   ]) {
