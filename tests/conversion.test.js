@@ -1178,6 +1178,76 @@ test("DeepSeek preserves prior tool results as native chat tool messages", () =>
   assert.doesNotMatch(transcript, /CodexBridge tool result context/);
 });
 
+test("chat routes never forward malformed extra tool outputs as native tool messages", () => {
+  const history = new ResponseHistory();
+  history.record("resp_ppt_tool_call", [
+    { role: "user", content: "create a presentation" },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        {
+          id: "call_create_ppt",
+          type: "function",
+          function: {
+            name: "shell_command",
+            arguments: '{"command":"New-Item deck.pptx"}',
+          },
+        },
+      ],
+    },
+  ]);
+
+  const converted = responsesToChatRequest(
+    {
+      model: "deepseek-v4-pro",
+      previous_response_id: "resp_ppt_tool_call",
+      input: [
+        {
+          type: "function_call_output",
+          call_id: "call_create_ppt",
+          output: "created deck.pptx",
+        },
+        {
+          type: "function_call_output",
+          output: "presentation export finished without a call id",
+        },
+      ],
+      tools: [
+        {
+          type: "function",
+          name: "shell_command",
+          description: "Run command",
+          parameters: {
+            type: "object",
+            properties: { command: { type: "string" } },
+            required: ["command"],
+          },
+        },
+      ],
+    },
+    { ...route, provider: "deepseek" },
+    history,
+  );
+
+  const toolMessages = converted.body.messages.filter((message) => message.role === "tool");
+  assert.equal(toolMessages.length, 1);
+  assert.equal(toolMessages[0].tool_call_id, "call_create_ppt");
+  assert.equal(
+    converted.body.messages.some(
+      (message) => message.role === "tool" && !message.tool_call_id,
+    ),
+    false,
+  );
+
+  const transcript = converted.body.messages
+    .map((message) => String(message.content || ""))
+    .join("\n");
+  assert.match(transcript, /created deck\.pptx/);
+  assert.match(transcript, /presentation export finished without a call id/);
+  assert.match(transcript, /CodexBridge tool result context/);
+});
+
 test("DeepSeek keeps multi-tool outputs paired with their assistant call", () => {
   const history = new ResponseHistory();
   history.record("resp_multi_tool_call", [

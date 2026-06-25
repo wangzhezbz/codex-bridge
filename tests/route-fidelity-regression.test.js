@@ -435,3 +435,81 @@ test("route fidelity preserves prior tool history before switching chat models",
   assert.equal(second.body.messages.at(-1).role, "tool");
   assert.equal(second.body.messages.at(-1).tool_call_id, "call_shell");
 });
+
+test("route fidelity prevents malformed tool outputs from reaching chat upstreams", () => {
+  for (const route of [deepseekRoute, kimiRoute, customRoute]) {
+    const history = new ResponseHistory();
+    history.record(`resp_ppt_${route.id}`, [
+      { role: "user", content: "create a ppt" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "call_create_ppt",
+            type: "function",
+            function: {
+              name: "shell_command",
+              arguments: '{"command":"New-Item deck.pptx"}',
+            },
+          },
+        ],
+      },
+    ]);
+
+    const converted = responsesToChatRequest(
+      {
+        model: route.id,
+        previous_response_id: `resp_ppt_${route.id}`,
+        input: [
+          {
+            type: "function_call_output",
+            call_id: "call_create_ppt",
+            output: "created deck.pptx",
+          },
+          {
+            type: "function_call_output",
+            output: "ppt export finished without a call id",
+          },
+          {
+            type: "function_call_output",
+            call_id: "call_unmatched_export",
+            output: "extra ppt export result from a stale tool call",
+          },
+        ],
+        tools: [
+          {
+            type: "function",
+            name: "shell_command",
+            description: "Run shell.",
+            parameters: {
+              type: "object",
+              properties: {
+                command: { type: "string" },
+              },
+              required: ["command"],
+            },
+          },
+        ],
+      },
+      route,
+      history,
+    );
+
+    const toolMessages = converted.body.messages.filter((message) => message.role === "tool");
+    assert.deepEqual(
+      toolMessages.map((message) => message.tool_call_id),
+      ["call_create_ppt"],
+    );
+    assert.equal(
+      toolMessages.some((message) => !message.tool_call_id),
+      false,
+    );
+
+    const transcript = JSON.stringify(converted.body.messages);
+    assert.match(transcript, /created deck\.pptx/);
+    assert.match(transcript, /ppt export finished without a call id/);
+    assert.match(transcript, /extra ppt export result from a stale tool call/);
+    assert.match(transcript, /CodexBridge tool result context/);
+  }
+});

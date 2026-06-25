@@ -1264,18 +1264,42 @@ function normalizeToolCallPairs(messages, options = {}) {
           .map((toolMessage) => toolMessage.tool_call_id)
           .filter(Boolean),
       );
+      const matchedToolMessages = [];
+      const extraToolMessages = [];
+      const matchedIds = new Set();
+      for (const toolMessage of toolMessages) {
+        const toolCallId = toolMessage?.tool_call_id;
+        if (toolCallId && expectedIds.has(toolCallId) && !matchedIds.has(toolCallId)) {
+          matchedToolMessages.push(toolMessage);
+          matchedIds.add(toolCallId);
+        } else {
+          extraToolMessages.push(toolMessage);
+        }
+      }
       const complete =
         expectedIds.size > 0 &&
         [...expectedIds].every((toolCallId) => actualIds.has(toolCallId));
 
       if (complete && flattenToolCalls) {
-        normalized.push(...flattenToolCallPairAsText(message, toolMessages));
+        normalized.push(...flattenToolCallPairAsText(message, matchedToolMessages));
+        const extraToolOutput = orphanToolOutputsMessage(extraToolMessages);
+        if (extraToolOutput) {
+          normalized.push(extraToolOutput);
+        }
       } else if (complete) {
-        normalized.push(message, ...toolMessages);
+        normalized.push(message, ...matchedToolMessages);
+        const extraToolOutput = orphanToolOutputsMessage(extraToolMessages);
+        if (extraToolOutput) {
+          normalized.push(extraToolOutput);
+        }
       } else {
         const textOnly = assistantTextOnlyMessage(message);
         if (textOnly) {
           normalized.push(textOnly);
+        }
+        const orphanToolOutput = orphanToolOutputsMessage(toolMessages);
+        if (orphanToolOutput) {
+          normalized.push(orphanToolOutput);
         }
       }
       index = nextIndex;
