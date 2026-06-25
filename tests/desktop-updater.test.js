@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import {
   assetNameForPlatform,
   fetchLatestRelease,
@@ -150,6 +151,11 @@ test("Windows portable updater script replaces and restarts without batch deleti
   assert.match(script, /Move-Item/);
   assert.match(script, /Start-Process/);
   assert.match(script, /function Find-CodexBridgeAppDir/);
+  assert.match(script, /function Wait-AppDirectoryProcessesExit/);
+  assert.match(script, /Get-CimInstance Win32_Process/);
+  assert.match(script, /Invoke-UpdateStep "Renaming current app directory"/);
+  assert.match(script, /Invoke-UpdateStep "Moving new app directory into place"/);
+  assert.match(script, /Show-UpdateFailure \$failureMessage/);
   assert.match(script, /resources\\app\\package\.json/);
   assert.match(script, /-WorkingDirectory \$CURRENT_APP_DIR/);
   assert.match(script, /-WorkingDirectory \(Split-Path -Parent \$fallbackExe\)/);
@@ -158,6 +164,31 @@ test("Windows portable updater script replaces and restarts without batch deleti
   assert.match(script, /\$WAIT_PIDS = @\(1234, 5678\)/);
   assert.match(script, /Waiting for process \$TargetPid to exit/);
   assert.doesNotMatch(script, /Remove-Item\s+-Recurse|rm\s+-rf|rmdir\s+\/s|rd\s+\/s|del\s+\/s/i);
+});
+
+test("Windows portable updater script parses in PowerShell", { skip: process.platform !== "win32" }, () => {
+  const script = generateWindowsPortableUpdateScript({
+    parentPid: 1234,
+    blockingPids: [5678],
+    zipPath: "C:\\Users\\me\\AppData\\Roaming\\CodexBridge\\updates\\CodexBridge.zip",
+    currentAppDir: "C:\\Tools\\CodexBridge-win32-x64",
+    exeName: "CodexBridge.exe",
+    workDir: "C:\\Users\\me\\AppData\\Roaming\\CodexBridge\\updates",
+    logPath: "C:\\Users\\me\\AppData\\Roaming\\CodexBridge\\logs\\update.log",
+  });
+
+  execFileSync(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-Command",
+      "$script = [Console]::In.ReadToEnd(); [scriptblock]::Create($script) | Out-Null",
+    ],
+    {
+      input: script,
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
 });
 
 test("macOS portable updater script replaces the app bundle without recursive delete", () => {

@@ -153,6 +153,97 @@ function Wait-UpdateProcessExit([int]$TargetPid) {
   }
 }
 
+function Normalize-UpdatePath([string]$PathValue) {
+  if (-not $PathValue) {
+    return ""
+  }
+  try {
+    return [System.IO.Path]::GetFullPath($PathValue).TrimEnd([char[]]@("\\", "/"))
+  } catch {
+    return $PathValue.TrimEnd([char[]]@("\\", "/"))
+  }
+}
+
+function Test-UpdatePathInside([string]$Candidate, [string]$Root) {
+  $candidatePath = Normalize-UpdatePath $Candidate
+  $rootPath = Normalize-UpdatePath $Root
+  if (-not $candidatePath -or -not $rootPath) {
+    return $false
+  }
+  if ($candidatePath.Equals($rootPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+    return $true
+  }
+  $prefix = $rootPath + [System.IO.Path]::DirectorySeparatorChar
+  return $candidatePath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-AppDirectoryProcessIds([string]$AppDir) {
+  $matches = @()
+  try {
+    $processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+  } catch {
+    Write-UpdateLog ("Could not inspect running processes: " + $_.Exception.Message)
+    return $matches
+  }
+  foreach ($process in $processes) {
+    if ($process.ExecutablePath -and (Test-UpdatePathInside $process.ExecutablePath $AppDir)) {
+      $matches += [int]$process.ProcessId
+    }
+  }
+  return $matches
+}
+
+function Wait-AppDirectoryProcessesExit([string]$AppDir) {
+  $deadline = (Get-Date).AddSeconds(120)
+  $lastLogAt = (Get-Date).AddSeconds(-10)
+  while ($true) {
+    $runningPids = @(Get-AppDirectoryProcessIds $AppDir)
+    if ($runningPids.Count -eq 0) {
+      return
+    }
+    if ((Get-Date) -gt $deadline) {
+      throw ("Process(es) still running from current app directory: " + ($runningPids -join ", "))
+    }
+    if ((Get-Date) -gt $lastLogAt.AddSeconds(2)) {
+      Write-UpdateLog ("Waiting for app directory process(es) to exit: " + ($runningPids -join ", "))
+      $lastLogAt = Get-Date
+    }
+    Start-Sleep -Milliseconds 500
+  }
+}
+
+function Invoke-UpdateStep([string]$Description, [scriptblock]$Action) {
+  $deadline = (Get-Date).AddSeconds(120)
+  $attempt = 0
+  while ($true) {
+    try {
+      & $Action
+      return
+    } catch {
+      $attempt += 1
+      $message = $_.Exception.Message
+      if ((Get-Date) -gt $deadline) {
+        throw ($Description + " failed after " + $attempt + " attempt(s): " + $message)
+      }
+      Write-UpdateLog ($Description + " failed on attempt " + $attempt + ": " + $message)
+      Start-Sleep -Milliseconds 750
+    }
+  }
+}
+
+function Show-UpdateFailure([string]$Message) {
+  try {
+    Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
+    [System.Windows.MessageBox]::Show(
+      ("CodexBridge update failed. The old version was kept. Log: " + $LOG_PATH + [Environment]::NewLine + [Environment]::NewLine + $Message),
+      "CodexBridge update failed",
+      "OK",
+      "Error"
+    ) | Out-Null
+  } catch {
+  }
+}
+
 function Find-CodexBridgeAppDir([string]$Root) {
   $matches = @()
   $exeFiles = Get-ChildItem -LiteralPath $Root -Filter $EXE_NAME -File -Recurse
@@ -195,6 +286,7 @@ try {
   foreach ($waitPid in $WAIT_PIDS) {
     Wait-UpdateProcessExit $waitPid
   }
+  Wait-AppDirectoryProcessesExit $CURRENT_APP_DIR
 
   New-Item -ItemType Directory -Force -Path $WORK_DIR | Out-Null
   $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -213,27 +305,36 @@ try {
   Write-UpdateLog "Resolved new app directory: $newAppDir"
 
   Write-UpdateLog "Renaming current app directory to $backupLeaf."
-  Rename-Item -LiteralPath $CURRENT_APP_DIR -NewName $backupLeaf
+  Invoke-UpdateStep "Renaming current app directory" {
+    Rename-Item -LiteralPath $CURRENT_APP_DIR -NewName $backupLeaf
+  }
 
   Write-UpdateLog "Moving new app directory into place."
-  Move-Item -LiteralPath $newAppDir -Destination $CURRENT_APP_DIR
+  Invoke-UpdateStep "Moving new app directory into place" {
+    Move-Item -LiteralPath $newAppDir -Destination $CURRENT_APP_DIR
+  }
 
   $nextExe = Join-Path $CURRENT_APP_DIR $EXE_NAME
+  Assert-CodexBridgeAppDir $CURRENT_APP_DIR
   Write-UpdateLog "Starting updated CodexBridge: $nextExe"
   Start-Process -FilePath $nextExe -WorkingDirectory $CURRENT_APP_DIR
   Write-UpdateLog "Update completed. Previous version kept at $backupDir."
 } catch {
-  Write-UpdateLog ("Update failed: " + $_.Exception.Message)
+  $failureMessage = $_.Exception.Message
+  Write-UpdateLog ("Update failed: " + $failureMessage)
   $appParent = Split-Path -Parent $CURRENT_APP_DIR
   $appLeaf = Split-Path -Leaf $CURRENT_APP_DIR
   if ($backupDir -and (Test-Path -LiteralPath $backupDir) -and -not (Test-Path -LiteralPath $CURRENT_APP_DIR)) {
-    Rename-Item -LiteralPath $backupDir -NewName $appLeaf
+    Invoke-UpdateStep "Restoring previous app directory" {
+      Rename-Item -LiteralPath $backupDir -NewName $appLeaf
+    }
   }
   $fallbackExe = Join-Path $CURRENT_APP_DIR $EXE_NAME
   if (Test-Path -LiteralPath $fallbackExe) {
     Write-UpdateLog "Starting existing CodexBridge after failed update: $fallbackExe"
     Start-Process -FilePath $fallbackExe -WorkingDirectory (Split-Path -Parent $fallbackExe)
   }
+  Show-UpdateFailure $failureMessage
 }
 `;
 }
