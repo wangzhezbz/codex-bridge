@@ -513,3 +513,89 @@ test("route fidelity prevents malformed tool outputs from reaching chat upstream
     assert.match(transcript, /CodexBridge tool result context/);
   }
 });
+
+test("route fidelity treats generated file tool outputs by call pairing, not file extension", () => {
+  const generatedFiles = [
+    "deck.pptx",
+    "brief.pdf",
+    "notes.docx",
+    "table.xlsx",
+    "archive.zip",
+  ];
+
+  for (const route of [deepseekRoute, kimiRoute, customRoute]) {
+    for (const fileName of generatedFiles) {
+      const history = new ResponseHistory();
+      history.record(`resp_file_${route.id}_${fileName}`, [
+        { role: "user", content: `create ${fileName}` },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "call_create_file",
+              type: "function",
+              function: {
+                name: "shell_command",
+                arguments: `{"command":"New-Item ${fileName}"}`,
+              },
+            },
+          ],
+        },
+      ]);
+
+      const converted = responsesToChatRequest(
+        {
+          model: route.id,
+          previous_response_id: `resp_file_${route.id}_${fileName}`,
+          input: [
+            {
+              type: "function_call_output",
+              call_id: "call_create_file",
+              output: `created ${fileName}`,
+            },
+            {
+              type: "function_call_output",
+              output: `post-processing finished for ${fileName}`,
+            },
+          ],
+          tools: [
+            {
+              type: "function",
+              name: "shell_command",
+              description: "Run shell.",
+              parameters: {
+                type: "object",
+                properties: {
+                  command: { type: "string" },
+                },
+                required: ["command"],
+              },
+            },
+          ],
+        },
+        route,
+        history,
+      );
+
+      const toolMessages = converted.body.messages.filter((message) => message.role === "tool");
+      assert.deepEqual(
+        toolMessages.map((message) => message.tool_call_id),
+        ["call_create_file"],
+      );
+      assert.equal(
+        toolMessages.some((message) => !message.tool_call_id),
+        false,
+      );
+
+      const transcript = JSON.stringify(converted.body.messages);
+      assert.match(transcript, new RegExp(`created ${escapeRegExp(fileName)}`));
+      assert.match(transcript, new RegExp(`post-processing finished for ${escapeRegExp(fileName)}`));
+      assert.match(transcript, /CodexBridge tool result context/);
+    }
+  }
+});
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}

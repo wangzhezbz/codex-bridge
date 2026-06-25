@@ -396,6 +396,58 @@ test("chat conversion tells chat models not to tool-loop for unavailable PDFs", 
   assert.match(converted.body.messages.at(-1).content, /switch to a GPT\/Responses model/);
 });
 
+test("chat conversion keeps Office attachments as explicit unavailable file context", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: [
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: "summarize these files" },
+            {
+              type: "input_file",
+              filename: "deck.pptx",
+              file_data: "data:application/vnd.openxmlformats-officedocument.presentationml.presentation;base64,UEsDBAo=",
+            },
+            {
+              type: "input_file",
+              filename: "brief.docx",
+              file_data: "data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,UEsDBAo=",
+            },
+            {
+              type: "input_file",
+              filename: "table.xlsx",
+              file_data: "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,UEsDBAo=",
+            },
+          ],
+        },
+      ],
+      tools: [
+        {
+          type: "function",
+          name: "shell_command",
+          description: "Run shell.",
+          parameters: {
+            type: "object",
+            properties: { command: { type: "string" } },
+            required: ["command"],
+          },
+        },
+      ],
+    },
+    route,
+    new ResponseHistory(),
+  );
+
+  const payload = JSON.stringify(converted.body.messages);
+  assert.match(payload, /CodexBridge attachment guidance/);
+  assert.match(converted.body.messages.at(-1).content, /File attachment unavailable to this chat provider: deck\.pptx/);
+  assert.match(converted.body.messages.at(-1).content, /File attachment unavailable to this chat provider: brief\.docx/);
+  assert.match(converted.body.messages.at(-1).content, /File attachment unavailable to this chat provider: table\.xlsx/);
+  assert.doesNotMatch(payload, /application\/vnd\.openxmlformats/);
+  assert.doesNotMatch(payload, /UEsDBAo=/);
+});
+
 test("chat conversion refuses oversized file data instead of forwarding or decoding it", () => {
   const converted = responsesToChatRequest(
     {
