@@ -170,7 +170,7 @@ test("adapter profiles expose route-specific chat capabilities without weakening
   assert.equal(deepseek.capabilities.images, "none");
   assert.equal(deepseek.capabilities.files, "text-placeholder");
   assert.equal(deepseek.capabilities.audio, "none");
-  assert.equal(deepseek.capabilities.reasoning.mode, "deepseek-reasoning-content");
+  assert.equal(deepseek.capabilities.reasoning.mode, "deepseek-thinking");
   assert.equal(deepseek.capabilities.compact.mode, "chat-summary");
   assert.equal(deepseek.capabilities.compact.requiresStream, false);
   assert.equal(deepseek.capabilities.promptCache, "unknown");
@@ -196,6 +196,89 @@ test("adapter profiles expose route-specific chat capabilities without weakening
   assert.ok(custom.safeParams.includes("tool_choice"));
   assert.ok(custom.safeParams.includes("parallel_tool_calls"));
   assert.ok(custom.safeParams.includes("response_format"));
+});
+
+test("adapter profiles keep reasoning parameters route-specific and preserve custom passthrough", () => {
+  const deepseekV4 = normalizeAdapterProfile({
+    provider: "deepseek",
+    api: "chat_completions",
+    model: "deepseek-v4-pro",
+  });
+  assert.equal(deepseekV4.dropParams.includes("reasoning"), true);
+  assert.equal(deepseekV4.dropParams.includes("enable_thinking"), true);
+  assert.equal(deepseekV4.dropParams.includes("reasoning_effort"), false);
+  assert.equal(deepseekV4.dropParams.includes("thinking"), false);
+  assert.deepEqual(deepseekV4.capabilities.reasoning.params, [
+    "reasoning_effort",
+    "thinking",
+  ]);
+
+  const deepseekReasoner = normalizeAdapterProfile({
+    provider: "deepseek",
+    api: "chat_completions",
+    model: "deepseek-reasoner",
+  });
+  assert.equal(deepseekReasoner.dropParams.includes("reasoning_effort"), true);
+  assert.equal(deepseekReasoner.dropParams.includes("thinking"), true);
+
+  const kimi27 = normalizeAdapterProfile({
+    provider: "kimi",
+    api: "chat_completions",
+    model: "kimi-k2.7-code",
+  });
+  assert.equal(kimi27.dropParams.includes("thinking"), true);
+  assert.deepEqual(kimi27.capabilities.reasoning.params, []);
+
+  const kimi26 = normalizeAdapterProfile({
+    provider: "kimi",
+    api: "chat_completions",
+    model: "kimi-k2.6",
+  });
+  assert.equal(kimi26.dropParams.includes("thinking"), false);
+  assert.deepEqual(kimi26.capabilities.reasoning.params, ["thinking"]);
+
+  const qwen = normalizeAdapterProfile({
+    provider: "qwen",
+    api: "chat_completions",
+    model: "qwen3-coder-plus",
+  });
+  assert.equal(qwen.dropParams.includes("reasoning"), true);
+  assert.equal(qwen.dropParams.includes("enable_thinking"), false);
+  assert.deepEqual(qwen.capabilities.reasoning.params, [
+    "enable_thinking",
+    "thinking_budget",
+  ]);
+
+  const openrouter = normalizeAdapterProfile({
+    provider: "openrouter",
+    api: "chat_completions",
+    model: "anthropic/claude-sonnet-4.5",
+  });
+  assert.equal(openrouter.providerFamily, "openrouter");
+  assert.equal(openrouter.dropParams.includes("reasoning"), false);
+  assert.equal(openrouter.dropParams.includes("enable_thinking"), true);
+  assert.deepEqual(openrouter.capabilities.reasoning.params, [
+    "reasoning",
+    "reasoning_effort",
+  ]);
+
+  const custom = normalizeAdapterProfile({
+    provider: "custom",
+    custom: true,
+    api: "chat_completions",
+    model: "custom-model",
+  });
+  for (const param of [
+    "reasoning",
+    "reasoning_effort",
+    "thinking",
+    "enable_thinking",
+    "thinking_budget",
+    "extra_body",
+  ]) {
+    assert.equal(custom.safeParams.includes(param), true, param);
+    assert.equal(custom.dropParams.includes(param), false, param);
+  }
 });
 
 test("every built-in preset has an adapter profile", () => {
@@ -356,7 +439,7 @@ const BUILT_IN_PROVIDER_CONTRACTS = {
     supportsResponsePreviousId: false,
   },
   zhipu: {
-    providerFamily: "openai-compatible",
+    providerFamily: "zhipu",
     adapterId: "chat-openai-compatible",
     api: "chat_completions",
     supportsTools: "chat-functions",
@@ -364,7 +447,7 @@ const BUILT_IN_PROVIDER_CONTRACTS = {
     supportsResponsePreviousId: false,
   },
   openrouter: {
-    providerFamily: "openai-compatible",
+    providerFamily: "openrouter",
     adapterId: "chat-openai-compatible",
     api: "chat_completions",
     supportsTools: "chat-functions",
@@ -372,7 +455,7 @@ const BUILT_IN_PROVIDER_CONTRACTS = {
     supportsResponsePreviousId: false,
   },
   siliconflow: {
-    providerFamily: "openai-compatible",
+    providerFamily: "siliconflow",
     adapterId: "chat-openai-compatible",
     api: "chat_completions",
     supportsTools: "chat-functions",

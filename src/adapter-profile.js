@@ -39,6 +39,21 @@ const CHAT_SAFE_PARAMS = [
   "stop",
   "response_format",
   "reasoning_split",
+  "reasoning",
+  "reasoning_effort",
+  "thinking",
+  "enable_thinking",
+  "thinking_budget",
+  "extra_body",
+];
+
+const CHAT_REASONING_PARAMS = [
+  "reasoning",
+  "reasoning_effort",
+  "thinking",
+  "enable_thinking",
+  "thinking_budget",
+  "extra_body",
 ];
 
 export function normalizeAdapterProfile(route = {}) {
@@ -55,7 +70,6 @@ export function normalizeAdapterProfile(route = {}) {
     inputModalities,
     customConservative,
   );
-  const dropParams = normalizedDropParams(route);
   const contextWindow = positiveNumber(route.contextWindow, 258400);
   const catalogContextWindow = positiveNumber(
     route.catalogContextWindow,
@@ -70,6 +84,11 @@ export function normalizeAdapterProfile(route = {}) {
       : "text-placeholder";
   const supportsResponsePreviousId = api === "responses";
   const supportsPromptCaching = route.supportsPromptCaching || "unknown";
+  const dropParams = normalizedDropParams(route, {
+    api,
+    providerFamily,
+    customConservative,
+  });
 
   return {
     adapterId,
@@ -127,6 +146,7 @@ function capabilitiesForRoute(route, profile) {
       profile.inputModalities,
     ),
     reasoning: reasoningCapabilityForRoute(
+      route,
       profile.api,
       profile.providerFamily,
       profile.customConservative,
@@ -179,6 +199,43 @@ export function filterPayloadForAdapter(payload = {}, profileOrRoute = {}, optio
   return result;
 }
 
+export function reasoningParamsForAdapter(request = {}, route = {}, options = {}) {
+  const profile = normalizeAdapterProfile(route);
+  if (profile.api !== "chat_completions" || !hasReasoningControls(request)) {
+    return {};
+  }
+  if (profile.customConservative) {
+    return rawReasoningParams(request);
+  }
+
+  const hasTools = Boolean(
+    options.hasTools ??
+      (Array.isArray(request.tools) && request.tools.length > 0),
+  );
+
+  if (supportsDeepSeekThinkingParams(route, profile.providerFamily)) {
+    return deepSeekReasoningParams(request);
+  }
+  if (supportsKimiThinkingParams(route, profile.providerFamily)) {
+    return kimiReasoningParams(request);
+  }
+  if (profile.providerFamily === "qwen" || profile.providerFamily === "zhipu") {
+    return enableThinkingParams(request, { hasTools });
+  }
+  if (profile.providerFamily === "openrouter") {
+    return openRouterReasoningParams(request);
+  }
+  if (profile.providerFamily === "siliconflow") {
+    if (siliconFlowUsesDeepSeekThinking(route)) {
+      return deepSeekReasoningParams(request);
+    }
+    if (siliconFlowUsesEnableThinking(route)) {
+      return enableThinkingParams(request, { hasTools });
+    }
+  }
+  return {};
+}
+
 function providerFamilyForRoute(route = {}) {
   const raw = String(
     route.providerFamily ||
@@ -199,6 +256,9 @@ function providerFamilyForRoute(route = {}) {
   if (raw.includes("minimax")) return "minimax";
   if (raw.includes("volc") || raw.includes("doubao") || raw.includes("ark.cn")) return "doubao";
   if (raw.includes("qwen") || raw.includes("dashscope")) return "qwen";
+  if (raw.includes("zhipu") || raw.includes("bigmodel") || raw.includes("glm-")) return "zhipu";
+  if (raw.includes("openrouter")) return "openrouter";
+  if (raw.includes("siliconflow")) return "siliconflow";
   if (raw.includes("gemini") || raw.includes("google")) return "gemini";
   if (raw.includes("baidu") || raw.includes("qianfan")) return "baidu";
   return "openai-compatible";
@@ -227,20 +287,46 @@ function audioSupportForRoute(api, providerFamily, inputModalities) {
   return "none";
 }
 
-function reasoningCapabilityForRoute(api, providerFamily, customConservative) {
+function reasoningCapabilityForRoute(route, api, providerFamily, customConservative) {
+  const params = reasoningParameterAllowList(route, {
+    api,
+    providerFamily,
+    customConservative,
+  });
   if (api === "responses") {
-    return { mode: "responses-native" };
+    return { mode: "responses-native", params };
+  }
+  if (supportsDeepSeekThinkingParams(route, providerFamily)) {
+    return { mode: "deepseek-thinking", params };
   }
   if (providerFamily === "deepseek") {
-    return { mode: "deepseek-reasoning-content" };
+    return { mode: "deepseek-reasoner-no-replay", params };
+  }
+  if (supportsKimiThinkingParams(route, providerFamily)) {
+    return { mode: "kimi-thinking-request", params };
+  }
+  if (providerFamily === "kimi") {
+    return { mode: "kimi-preserved-thinking", params };
   }
   if (providerFamily === "minimax") {
-    return { mode: "minimax-reasoning-split" };
+    return { mode: "minimax-reasoning-split", params };
+  }
+  if (providerFamily === "qwen") {
+    return { mode: "dashscope-enable-thinking", params };
+  }
+  if (providerFamily === "zhipu") {
+    return { mode: "zhipu-enable-thinking", params };
+  }
+  if (providerFamily === "openrouter") {
+    return { mode: "openrouter-reasoning", params };
+  }
+  if (providerFamily === "siliconflow") {
+    return { mode: "siliconflow-reasoning", params };
   }
   if (customConservative) {
-    return { mode: "openai-compatible-passthrough" };
+    return { mode: "openai-compatible-passthrough", params };
   }
-  return { mode: "openai-compatible" };
+  return { mode: "openai-compatible", params };
 }
 
 function compactCapabilityForRoute(route, api) {
@@ -269,9 +355,188 @@ function parameterCapabilityForRoute(api, providerFamily, customConservative) {
   return { mode: "route-specific-safe-list" };
 }
 
-function normalizedDropParams(route) {
+function normalizedDropParams(route, context = {}) {
   const configured = Array.isArray(route.dropParams) ? route.dropParams : [];
-  return [...new Set(configured)].sort();
+  const allowedReasoningParams = new Set(reasoningParameterAllowList(route, context));
+  const unsupportedReasoningParams = context.api === "chat_completions"
+    ? CHAT_REASONING_PARAMS.filter((param) => !allowedReasoningParams.has(param))
+    : [];
+  return [...new Set([...configured, ...unsupportedReasoningParams])].sort();
+}
+
+function reasoningParameterAllowList(route, context = {}) {
+  if (context.api === "responses") {
+    return ["reasoning"];
+  }
+  if (context.customConservative) {
+    return CHAT_REASONING_PARAMS;
+  }
+  if (supportsDeepSeekThinkingParams(route, context.providerFamily)) {
+    return ["reasoning_effort", "thinking"];
+  }
+  if (supportsKimiThinkingParams(route, context.providerFamily)) {
+    return ["thinking"];
+  }
+  if (context.providerFamily === "qwen" || context.providerFamily === "zhipu") {
+    return ["enable_thinking", "thinking_budget"];
+  }
+  if (context.providerFamily === "openrouter") {
+    return ["reasoning", "reasoning_effort"];
+  }
+  if (context.providerFamily === "siliconflow") {
+    if (siliconFlowUsesDeepSeekThinking(route)) {
+      return ["reasoning_effort", "thinking"];
+    }
+    if (siliconFlowUsesEnableThinking(route)) {
+      return ["enable_thinking", "thinking_budget"];
+    }
+  }
+  return [];
+}
+
+function rawReasoningParams(request) {
+  const result = {};
+  copyIfPresent(request, result, "reasoning");
+  copyIfPresent(request, result, "reasoning_effort");
+  copyIfPresent(request, result, "thinking");
+  copyIfPresent(request, result, "enable_thinking");
+  copyIfPresent(request, result, "thinking_budget");
+  copyIfPresent(request, result, "extra_body");
+  return result;
+}
+
+function deepSeekReasoningParams(request) {
+  const result = {};
+  const effort = deepSeekReasoningEffort(request);
+  if (effort) {
+    result.reasoning_effort = effort;
+  }
+  if (reasoningWantsThinking(request)) {
+    result.thinking = { type: "enabled" };
+  }
+  return result;
+}
+
+function kimiReasoningParams(request) {
+  if (!reasoningWantsThinking(request)) {
+    return {};
+  }
+  return { thinking: { type: "enabled", keep: "all" } };
+}
+
+function enableThinkingParams(request, options = {}) {
+  const shouldEnable = !options.hasTools && reasoningWantsThinking(request);
+  const result = { enable_thinking: shouldEnable };
+  const budget = reasoningBudget(request);
+  if (shouldEnable && budget) {
+    result.thinking_budget = budget;
+  }
+  return result;
+}
+
+function openRouterReasoningParams(request) {
+  const reasoning = {};
+  const effort = openRouterReasoningEffort(request);
+  if (effort) {
+    reasoning.effort = effort;
+  }
+  const budget = reasoningBudget(request);
+  if (budget) {
+    reasoning.max_tokens = budget;
+  }
+  const rawReasoning = request.reasoning;
+  if (rawReasoning && typeof rawReasoning === "object") {
+    if (typeof rawReasoning.exclude === "boolean") {
+      reasoning.exclude = rawReasoning.exclude;
+    }
+    if (typeof rawReasoning.enabled === "boolean") {
+      reasoning.enabled = rawReasoning.enabled;
+    }
+  }
+  return Object.keys(reasoning).length > 0 ? { reasoning } : {};
+}
+
+function hasReasoningControls(request) {
+  return CHAT_REASONING_PARAMS.some((param) => request[param] !== undefined) ||
+    request.model_reasoning_effort !== undefined;
+}
+
+function reasoningWantsThinking(request) {
+  const effort = reasoningEffort(request);
+  if (!effort && request.reasoning === undefined && request.thinking === undefined) {
+    return false;
+  }
+  return !["none", "off", "disabled", "minimal"].includes(effort);
+}
+
+function reasoningEffort(request) {
+  const value =
+    request.reasoning_effort ??
+    request.model_reasoning_effort ??
+    (request.reasoning && typeof request.reasoning === "object"
+      ? request.reasoning.effort
+      : undefined);
+  return String(value || "").trim().toLowerCase();
+}
+
+function deepSeekReasoningEffort(request) {
+  const effort = reasoningEffort(request);
+  if (["xhigh", "max", "maximum"].includes(effort)) {
+    return "max";
+  }
+  if (["low", "medium", "high"].includes(effort)) {
+    return "high";
+  }
+  return "";
+}
+
+function openRouterReasoningEffort(request) {
+  const effort = reasoningEffort(request);
+  if (["low", "medium", "high"].includes(effort)) {
+    return effort;
+  }
+  if (["xhigh", "max", "maximum"].includes(effort)) {
+    return "high";
+  }
+  return "";
+}
+
+function reasoningBudget(request) {
+  const value =
+    request.thinking_budget ??
+    (request.reasoning && typeof request.reasoning === "object"
+      ? request.reasoning.max_tokens ?? request.reasoning.budget_tokens
+      : undefined);
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? Math.floor(number) : 0;
+}
+
+function supportsDeepSeekThinkingParams(route, providerFamily) {
+  if (providerFamily !== "deepseek") {
+    return false;
+  }
+  return /deepseek-v4/i.test(String(route.model || route.id || ""));
+}
+
+function supportsKimiThinkingParams(route, providerFamily) {
+  if (providerFamily !== "kimi") {
+    return false;
+  }
+  return /kimi-k2\.[56]/i.test(String(route.model || route.id || ""));
+}
+
+function siliconFlowUsesDeepSeekThinking(route) {
+  return /deepseek-v4/i.test(String(route.model || route.id || ""));
+}
+
+function siliconFlowUsesEnableThinking(route) {
+  return /(qwen|glm)/i.test(String(route.model || route.id || ""));
+}
+
+function copyIfPresent(source, target, key) {
+  if (source[key] !== undefined) {
+    target[key] = source[key];
+  }
 }
 
 function positiveNumber(value, fallback) {

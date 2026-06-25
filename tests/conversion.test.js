@@ -562,6 +562,132 @@ test("chat conversion output can be filtered by adapter safe params", () => {
   assert.equal(filtered.messages.at(-1).content, "hello");
 });
 
+test("chat conversion adapts Codex reasoning requests by provider", () => {
+  const request = {
+    input: "solve this carefully",
+    reasoning: {
+      effort: "xhigh",
+      summary: "auto",
+      max_tokens: 2048,
+    },
+  };
+
+  const deepseekV4 = responsesToChatRequest(
+    request,
+    { ...route, provider: "deepseek", model: "deepseek-v4-pro" },
+    new ResponseHistory(),
+  );
+  assert.equal(deepseekV4.body.reasoning_effort, "max");
+  assert.deepEqual(deepseekV4.body.thinking, { type: "enabled" });
+  assert.equal(deepseekV4.body.reasoning, undefined);
+
+  const deepseekReasoner = responsesToChatRequest(
+    request,
+    { ...route, provider: "deepseek", model: "deepseek-reasoner" },
+    new ResponseHistory(),
+  );
+  assert.equal(deepseekReasoner.body.reasoning_effort, undefined);
+  assert.equal(deepseekReasoner.body.thinking, undefined);
+
+  const kimi27 = responsesToChatRequest(
+    request,
+    { ...route, provider: "kimi", model: "kimi-k2.7-code" },
+    new ResponseHistory(),
+  );
+  assert.equal(kimi27.body.thinking, undefined);
+  assert.equal(kimi27.body.reasoning, undefined);
+  assert.equal(kimi27.body.reasoning_effort, undefined);
+
+  const kimi26 = responsesToChatRequest(
+    request,
+    { ...route, provider: "kimi", model: "kimi-k2.6" },
+    new ResponseHistory(),
+  );
+  assert.deepEqual(kimi26.body.thinking, { type: "enabled", keep: "all" });
+
+  const minimax = responsesToChatRequest(
+    request,
+    { ...route, provider: "minimax", model: "MiniMax-M3" },
+    new ResponseHistory(),
+  );
+  assert.equal(minimax.body.reasoning_split, true);
+  assert.equal(minimax.body.reasoning, undefined);
+  assert.equal(minimax.body.thinking, undefined);
+
+  const qwen = responsesToChatRequest(
+    request,
+    { ...route, provider: "qwen", model: "qwen3-coder-plus" },
+    new ResponseHistory(),
+  );
+  assert.equal(qwen.body.enable_thinking, true);
+  assert.equal(qwen.body.thinking_budget, 2048);
+  assert.equal(qwen.body.reasoning, undefined);
+
+  const qwenWithTools = responsesToChatRequest(
+    {
+      ...request,
+      tools: [
+        {
+          type: "function",
+          name: "lookup",
+          description: "Lookup a value.",
+          parameters: { type: "object", properties: {} },
+        },
+      ],
+    },
+    { ...route, provider: "qwen", model: "qwen3-coder-plus" },
+    new ResponseHistory(),
+  );
+  assert.equal(qwenWithTools.body.enable_thinking, false);
+  assert.equal(qwenWithTools.body.thinking_budget, undefined);
+
+  const zhipu = responsesToChatRequest(
+    request,
+    { ...route, provider: "zhipu", model: "glm-4.6" },
+    new ResponseHistory(),
+  );
+  assert.equal(zhipu.body.enable_thinking, true);
+
+  const openrouter = responsesToChatRequest(
+    request,
+    { ...route, provider: "openrouter", model: "anthropic/claude-sonnet-4.5" },
+    new ResponseHistory(),
+  );
+  assert.deepEqual(openrouter.body.reasoning, {
+    effort: "high",
+    max_tokens: 2048,
+  });
+  assert.equal(openrouter.body.reasoning_effort, undefined);
+
+  const siliconflowQwen = responsesToChatRequest(
+    request,
+    { ...route, provider: "siliconflow", model: "Qwen/Qwen3-Coder-480B-A35B-Instruct" },
+    new ResponseHistory(),
+  );
+  assert.equal(siliconflowQwen.body.enable_thinking, true);
+  assert.equal(siliconflowQwen.body.thinking_budget, 2048);
+
+  const custom = responsesToChatRequest(
+    {
+      input: "solve with custom controls",
+      reasoning: { effort: "high", summary: "auto" },
+      reasoning_effort: "medium",
+      thinking: { type: "enabled", keep: "all" },
+      enable_thinking: true,
+      thinking_budget: 1024,
+      extra_body: { enable_thinking: true },
+    },
+    { ...route, provider: "custom", custom: true, model: "custom-model" },
+    new ResponseHistory(),
+  );
+  assert.deepEqual(custom.body.reasoning, { effort: "high", summary: "auto" });
+  assert.equal(custom.body.reasoning_effort, "medium");
+  assert.deepEqual(custom.body.thinking, { type: "enabled", keep: "all" });
+  assert.equal(custom.body.enable_thinking, true);
+  assert.equal(custom.body.thinking_budget, 1024);
+  assert.deepEqual(custom.body.extra_body, { enable_thinking: true });
+});
+
 test("chat conversion trims old history to fit the upstream model context window", () => {
   const history = new ResponseHistory();
   history.record("resp_long", [
@@ -1120,9 +1246,9 @@ test("interactive plugin detection ignores older prompts during tool-output turn
   assert.equal(converted.body.tool_choice, undefined);
 });
 
-test("DeepSeek reasoning_content is replayed only for DeepSeek routes", () => {
+test("reasoning_content is replayed only for chat providers that support it", () => {
   const history = new ResponseHistory();
-  history.record("resp_deepseek_reasoning", [
+  history.record("resp_reasoning_content", [
     { role: "user", content: "think" },
     assistantHistoryMessageFromChat({
       choices: [
@@ -1140,10 +1266,10 @@ test("DeepSeek reasoning_content is replayed only for DeepSeek routes", () => {
   const deepseek = responsesToChatRequest(
     {
       model: "deepseek-v4-pro",
-      previous_response_id: "resp_deepseek_reasoning",
+      previous_response_id: "resp_reasoning_content",
       input: "continue",
     },
-    { ...route, provider: "deepseek" },
+    { ...route, provider: "deepseek", model: "deepseek-v4-pro" },
     history,
   );
   const deepseekAssistant = deepseek.body.messages.find(
@@ -1151,10 +1277,24 @@ test("DeepSeek reasoning_content is replayed only for DeepSeek routes", () => {
   );
   assert.equal(deepseekAssistant.reasoning_content, "private chain state");
 
+  const deepseekReasoner = responsesToChatRequest(
+    {
+      model: "deepseek-reasoner",
+      previous_response_id: "resp_reasoning_content",
+      input: "continue",
+    },
+    { ...route, provider: "deepseek", model: "deepseek-reasoner" },
+    history,
+  );
+  const reasonerAssistant = deepseekReasoner.body.messages.find(
+    (message) => message.role === "assistant",
+  );
+  assert.equal("reasoning_content" in reasonerAssistant, false);
+
   const kimi = responsesToChatRequest(
     {
       model: "kimi-k2.7-code",
-      previous_response_id: "resp_deepseek_reasoning",
+      previous_response_id: "resp_reasoning_content",
       input: "continue",
     },
     { ...route, provider: "moonshot", model: "kimi-k2.7-code" },
@@ -1163,7 +1303,21 @@ test("DeepSeek reasoning_content is replayed only for DeepSeek routes", () => {
   const kimiAssistant = kimi.body.messages.find(
     (message) => message.role === "assistant",
   );
-  assert.equal("reasoning_content" in kimiAssistant, false);
+  assert.equal(kimiAssistant.reasoning_content, "private chain state");
+
+  const generic = responsesToChatRequest(
+    {
+      model: "generic",
+      previous_response_id: "resp_reasoning_content",
+      input: "continue",
+    },
+    { ...route, provider: "openrouter", model: "anthropic/claude-sonnet-4.5" },
+    history,
+  );
+  const genericAssistant = generic.body.messages.find(
+    (message) => message.role === "assistant",
+  );
+  assert.equal("reasoning_content" in genericAssistant, false);
 });
 
 test("DeepSeek preserves prior tool results as native chat tool messages", () => {

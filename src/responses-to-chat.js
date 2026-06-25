@@ -1,4 +1,5 @@
 import { asArray, stringifyJson } from "./json.js";
+import { reasoningParamsForAdapter } from "./adapter-profile.js";
 import {
   buildToolContext,
   chatMessageFromToolOutput,
@@ -90,6 +91,9 @@ export function responsesToChatRequest(request, route, history) {
   if (request.response_format !== undefined && !shouldDrop(route, "response_format")) {
     body.response_format = request.response_format;
   }
+  Object.assign(body, reasoningParamsForAdapter(request, route, {
+    hasTools: toolContext.chatTools.length > 0,
+  }));
 
   return {
     body,
@@ -947,7 +951,7 @@ export function interactivePluginKindForRequest(request = {}) {
 }
 
 function sanitizeMessagesForRoute(messages, route = {}) {
-  if (routeSupportsDeepSeekReasoningContent(route)) {
+  if (routeSupportsReasoningContent(route)) {
     return messages;
   }
   return messages.map((message) => {
@@ -959,17 +963,24 @@ function sanitizeMessagesForRoute(messages, route = {}) {
   });
 }
 
-function routeSupportsDeepSeekReasoningContent(route = {}) {
+function routeSupportsReasoningContent(route = {}) {
   const provider = String(route.provider || route.providerId || "").toLowerCase();
-  if (provider.includes("deepseek")) {
+  const model = String(route.model || route.id || "").toLowerCase();
+  if (
+    (provider.includes("kimi") || provider.includes("moonshot")) &&
+    /^kimi-k2\.[67]/i.test(model)
+  ) {
     return true;
   }
-  const model = String(route.model || route.id || "").toLowerCase();
-  if (model.includes("deepseek")) {
+  if (provider.includes("deepseek") && /deepseek-v4/i.test(model)) {
     return true;
   }
   try {
-    return new URL(route.baseUrl || "").hostname.toLowerCase().includes("deepseek");
+    const hostname = new URL(route.baseUrl || "").hostname.toLowerCase();
+    if (hostname.includes("moonshot") && /^kimi-k2\.[67]/i.test(model)) {
+      return true;
+    }
+    return hostname.includes("deepseek") && /deepseek-v4/i.test(model);
   } catch {
     return false;
   }
