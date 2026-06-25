@@ -1,5 +1,5 @@
 import { asArray, stringifyJson } from "./json.js";
-import { reasoningParamsForAdapter } from "./adapter-profile.js";
+import { normalizeAdapterProfile, reasoningParamsForAdapter } from "./adapter-profile.js";
 import {
   buildToolContext,
   chatMessageFromToolOutput,
@@ -47,6 +47,8 @@ const ATTACHMENT_GUIDANCE =
   "If needed content is missing, ask the user to switch to a GPT/Responses model or provide text/OCR output.";
 const MAX_EXTRACTABLE_FILE_BYTES = 5_000_000;
 const MAX_EXTRACTED_FILE_TEXT_CHARS = 120_000;
+const CHAT_PROMPT_CACHE_CONTROL = { type: "ephemeral" };
+const MAX_PROMPT_CACHE_BREAKPOINTS = 4;
 
 export function responsesToChatRequest(request, route, history) {
   const { messages: sourceMessages, toolContext } =
@@ -94,6 +96,7 @@ export function responsesToChatRequest(request, route, history) {
   Object.assign(body, reasoningParamsForAdapter(request, route, {
     hasTools: toolContext.chatTools.length > 0,
   }));
+  applyPromptCacheHints(body, route);
 
   return {
     body,
@@ -1085,6 +1088,157 @@ function routeSupportsReasoningContent(route = {}) {
 
 function shouldDrop(route, param) {
   return Array.isArray(route.dropParams) && route.dropParams.includes(param);
+}
+
+function applyPromptCacheHints(body, route = {}) {
+  if (!shouldInjectChatCacheControl(route)) {
+    return;
+  }
+  let breakpoints = 0;
+  const mark = (target) => {
+    if (breakpoints >= MAX_PROMPT_CACHE_BREAKPOINTS || !target) {
+      return false;
+    }
+    if (markCacheTarget(target)) {
+      breakpoints += 1;
+      return true;
+    }
+    return false;
+  };
+
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    mark(body.tools.at(-1));
+  }
+
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const systemIndex = findLastIndex(messages, (message) => message?.role === "system");
+  if (systemIndex >= 0) {
+    mark(messages[systemIndex]);
+  }
+
+  const latestConversationIndex = findLastIndex(
+    messages,
+    (message) => message?.role !== "system",
+  );
+  for (let index = latestConversationIndex - 1; index >= 0; index -= 1) {
+    if (breakpoints >= MAX_PROMPT_CACHE_BREAKPOINTS) {
+      break;
+    }
+    if (isCacheableHistoryMessage(messages[index])) {
+      mark(messages[index]);
+    }
+  }
+}
+
+function shouldInjectChatCacheControl(route = {}) {
+  const profile = normalizeAdapterProfile(route);
+  if (profile.api !== "chat_completions") {
+    return false;
+  }
+  const mode = String(profile.capabilities?.promptCache || "").toLowerCase();
+  return ["cache_control", "cache-control", "anthropic", "anthropic-ephemeral", "ephemeral"].includes(mode);
+}
+
+function markCacheTarget(target) {
+  if (!target || typeof target !== "object" || target.cache_control) {
+    return false;
+  }
+  if (target.function) {
+    target.cache_control = { ...CHAT_PROMPT_CACHE_CONTROL };
+    return true;
+  }
+  if (canMarkMessageContent(target)) {
+    const nextContent = contentWithCacheControl(target.content);
+    if (nextContent !== target.content) {
+      target.content = nextContent;
+      return true;
+    }
+  }
+  if (isCacheableHistoryMessage(target)) {
+    target.cache_control = { ...CHAT_PROMPT_CACHE_CONTROL };
+    return true;
+  }
+  return false;
+}
+
+function canMarkMessageContent(message) {
+  return (
+    message?.role === "system" &&
+    message.content !== undefined &&
+    !message.reasoning_content
+  );
+}
+
+function contentWithCacheControl(content) {
+  if (typeof content === "string") {
+    return [
+      {
+        type: "text",
+        text: content,
+        cache_control: { ...CHAT_PROMPT_CACHE_CONTROL },
+      },
+    ];
+  }
+  if (!Array.isArray(content)) {
+    return content;
+  }
+  const result = content.map((part) =>
+    part && typeof part === "object" ? { ...part } : part,
+  );
+  for (let index = result.length - 1; index >= 0; index -= 1) {
+    const part = result[index];
+    if (isCacheableContentPart(part)) {
+      result[index] = {
+        ...part,
+        cache_control: { ...CHAT_PROMPT_CACHE_CONTROL },
+      };
+      return result;
+    }
+  }
+  return content;
+}
+
+function isCacheableContentPart(part) {
+  if (!part || typeof part !== "object" || part.cache_control) {
+    return false;
+  }
+  const type = String(part.type || "").toLowerCase();
+  return (
+    (!type || type === "text" || type === "input_text") &&
+    !["reasoning", "thinking", "reasoning_content"].includes(type)
+  );
+}
+
+function isCacheableHistoryMessage(message) {
+  return (
+    message &&
+    typeof message === "object" &&
+    (message.role === "user" || message.role === "assistant") &&
+    !message.reasoning_content &&
+    !Array.isArray(message.tool_calls) &&
+    message.content !== undefined &&
+    !containsReasoningContentPart(message.content) &&
+    !message.cache_control
+  );
+}
+
+function containsReasoningContentPart(content) {
+  if (!Array.isArray(content)) {
+    return false;
+  }
+  return content.some((part) => {
+    const type = String(part?.type || "").toLowerCase();
+    return ["reasoning", "thinking", "reasoning_content"].includes(type);
+  });
+}
+
+function findLastIndex(items, predicate) {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    if (predicate(items[index], index)) {
+      return index;
+    }
+  }
+  return -1;
 }
 
 function copyScalar(source, target, key) {

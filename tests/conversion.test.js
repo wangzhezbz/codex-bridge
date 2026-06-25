@@ -1840,8 +1840,69 @@ test("namespace tools keep unique names so MCP tools are not dropped", () => {
 
   assert.deepEqual(
     converted.body.tools.map((tool) => tool.function.name),
-    ["mcp__filesystem__read", "mcp__browser__read"],
+    ["mcp__browser__read", "mcp__filesystem__read"],
   );
+});
+
+test("chat conversion orders tools stably to improve cache reuse", () => {
+  const requestA = {
+    input: "use stable tools",
+    tools: stableToolSet(["shell_command", "mcp__filesystem__", "lookup"]),
+  };
+  const requestB = {
+    input: "use stable tools",
+    tools: stableToolSet(["lookup", "shell_command", "mcp__filesystem__"]),
+  };
+
+  const convertedA = responsesToChatRequest(requestA, route, new ResponseHistory());
+  const convertedB = responsesToChatRequest(requestB, route, new ResponseHistory());
+
+  const namesA = convertedA.body.tools.map((tool) => tool.function.name);
+  const namesB = convertedB.body.tools.map((tool) => tool.function.name);
+  assert.deepEqual(namesA, ["lookup", "mcp__filesystem__read_file", "shell_command"]);
+  assert.deepEqual(namesB, namesA);
+});
+
+test("chat conversion adds prompt cache hints only for explicit cache-control routes", () => {
+  const history = new ResponseHistory();
+  history.record("resp_cache_history", [
+    { role: "user", content: "older stable request" },
+    {
+      role: "assistant",
+      content: "older stable answer",
+      reasoning_content: "private reasoning must not receive cache hints",
+    },
+  ]);
+  const request = {
+    previous_response_id: "resp_cache_history",
+    instructions: "Follow project instructions.",
+    input: "current uncached request",
+    tools: stableToolSet(["shell_command", "lookup"]),
+  };
+
+  const withoutCache = responsesToChatRequest(request, route, history);
+  assert.equal(countCacheControlBlocks(withoutCache.body), 0);
+
+  const withCache = responsesToChatRequest(
+    request,
+    { ...route, supportsPromptCaching: "cache_control" },
+    history,
+  );
+
+  assert.ok(countCacheControlBlocks(withCache.body) > 0);
+  assert.ok(countCacheControlBlocks(withCache.body) <= 4);
+  assert.deepEqual(withCache.body.tools.at(-1).cache_control, { type: "ephemeral" });
+  assert.deepEqual(
+    withCache.body.messages.find((message) => message.role === "system").content.at(-1).cache_control,
+    { type: "ephemeral" },
+  );
+  assert.deepEqual(
+    withCache.body.messages.find((message) => message.content === "older stable request").cache_control,
+    { type: "ephemeral" },
+  );
+  assert.equal(withCache.body.messages.at(-1).content, "current uncached request");
+  assert.equal(withCache.body.messages.at(-1).cache_control, undefined);
+  assert.doesNotMatch(JSON.stringify(withCache.body), /private reasoning/);
 });
 
 test("chat namespace tool calls are returned with full Codex tool names", () => {
@@ -2643,7 +2704,7 @@ test("chat conversion deduplicates exact tool names while keeping namespaced too
 
   assert.deepEqual(
     converted.body.tools.map((tool) => tool.function.name),
-    ["shell_command", "mcp__duplicate__shell_command", "apply_patch"],
+    ["apply_patch", "mcp__duplicate__shell_command", "shell_command"],
   );
 });
 
@@ -2739,6 +2800,65 @@ test("kimi chat conversion inlines local property refs that Moonshot rejects", (
     "leg",
   ]);
 });
+
+function stableToolSet(order) {
+  const tools = {
+    shell_command: {
+      type: "function",
+      name: "shell_command",
+      description: "Run a shell command.",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string" },
+        },
+        required: ["command"],
+      },
+    },
+    lookup: {
+      type: "function",
+      name: "lookup",
+      description: "Look up context.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+        },
+        required: ["query"],
+      },
+    },
+    "mcp__filesystem__": {
+      type: "namespace",
+      name: "mcp__filesystem__",
+      tools: [
+        {
+          type: "function",
+          name: "read_file",
+          description: "Read a file.",
+          parameters: {
+            type: "object",
+            properties: {
+              path: { type: "string" },
+            },
+            required: ["path"],
+          },
+        },
+      ],
+    },
+  };
+  return order.map((name) => tools[name]);
+}
+
+function countCacheControlBlocks(value) {
+  if (!value || typeof value !== "object") {
+    return 0;
+  }
+  let count = Object.prototype.hasOwnProperty.call(value, "cache_control") ? 1 : 0;
+  for (const child of Object.values(value)) {
+    count += countCacheControlBlocks(child);
+  }
+  return count;
+}
 
 test("minimax chat routes request separated reasoning output", () => {
   const converted = responsesToChatRequest(

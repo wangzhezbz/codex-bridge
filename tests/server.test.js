@@ -4413,6 +4413,50 @@ test("custom chat route completes text and preserves OpenAI-compatible params by
   assert.equal(upstreamBody.messages.at(-1).content, "smoke text");
 });
 
+test("chat route prompt cache hints are explicit opt-in and survive payload filtering", async () => {
+  const requestOverrides = {
+    instructions: "Stable system instructions.",
+    tools: [
+      {
+        type: "function",
+        name: "shell_command",
+        description: "Run shell.",
+        parameters: {
+          type: "object",
+          properties: {
+            command: { type: "string" },
+          },
+          required: ["command"],
+        },
+      },
+    ],
+  };
+  const disabled = await exerciseChatRoute({
+    id: "cache-disabled",
+    provider: "custom",
+    custom: true,
+    model: "custom-model",
+  }, requestOverrides);
+  assert.equal(countCacheControlBlocks(disabled.upstreamBody), 0);
+
+  const enabled = await exerciseChatRoute({
+    id: "cache-enabled",
+    provider: "custom",
+    custom: true,
+    model: "custom-model",
+    supportsPromptCaching: "cache_control",
+  }, requestOverrides);
+  assert.ok(countCacheControlBlocks(enabled.upstreamBody) > 0);
+  assert.ok(countCacheControlBlocks(enabled.upstreamBody) <= 4);
+  assert.deepEqual(enabled.upstreamBody.tools.at(-1).cache_control, { type: "ephemeral" });
+  assert.deepEqual(
+    enabled.upstreamBody.messages.find((message) => message.role === "system").content.at(-1).cache_control,
+    { type: "ephemeral" },
+  );
+  assert.equal(enabled.upstreamBody.messages.at(-1).content, "smoke text");
+  assert.equal(enabled.upstreamBody.messages.at(-1).cache_control, undefined);
+});
+
 test("streaming responses without object field are recorded for later chat-completions switches", async () => {
   const chatBodies = [];
   const upstream = http.createServer(async (req, res) => {
@@ -5710,4 +5754,15 @@ async function readJson(req) {
     chunks.push(chunk);
   }
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+function countCacheControlBlocks(value) {
+  if (!value || typeof value !== "object") {
+    return 0;
+  }
+  let count = Object.prototype.hasOwnProperty.call(value, "cache_control") ? 1 : 0;
+  for (const child of Object.values(value)) {
+    count += countCacheControlBlocks(child);
+  }
+  return count;
 }

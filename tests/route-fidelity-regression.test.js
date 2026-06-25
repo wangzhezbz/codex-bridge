@@ -202,9 +202,10 @@ test("route fidelity matrix covers provider main-chain chat contracts", () => {
     assert.doesNotMatch(payload, /data:text\/csv/, route.id);
     assert.deepEqual(
       filtered.tools.map((tool) => tool.function.name),
-      ["shell_command", "mcp__filesystem__read_file"],
+      ["mcp__filesystem__read_file", "shell_command"],
       route.id,
     );
+    assert.equal(JSON.stringify(filtered).includes("cache_control"), false, route.id);
     assert.deepEqual(
       filtered.tool_choice,
       { type: "function", function: { name: "shell_command" } },

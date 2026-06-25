@@ -25,6 +25,7 @@ export function buildToolContext(responseTools = [], options = {}) {
     appendResponseTool(context, tool);
   }
 
+  sortChatTools(context);
   return context;
 }
 
@@ -271,6 +272,16 @@ function appendChatTool(context, chatName, chatTool) {
   }
   context.chatToolNames.add(chatName);
   context.chatTools.push(chatTool);
+}
+
+function sortChatTools(context) {
+  context.chatTools.sort((a, b) => {
+    const left = String(a?.function?.name || "");
+    const right = String(b?.function?.name || "");
+    if (left < right) return -1;
+    if (left > right) return 1;
+    return 0;
+  });
 }
 
 function namespaceToolPrefix(value) {
