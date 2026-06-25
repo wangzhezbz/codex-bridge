@@ -2,10 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   assetNameForPlatform,
+  fetchLatestRelease,
+  fetchInitForUpdateDownload,
   generateMacPortableUpdateScript,
   generateWindowsPortableUpdateScript,
   isNewerVersion,
   planReleaseUpdate,
+  updateDownloadProxyLabel,
 } from "../desktop/updater.mjs";
 
 const release = {
@@ -85,6 +88,52 @@ test("updater reports current and unsupported states clearly", () => {
   assert.match(unsupported.message, /暂不支持/);
 });
 
+test("updater downloads use configured proxy settings", () => {
+  const original = snapshotProxyEnv();
+  try {
+    clearProxyEnv();
+    process.env.HTTPS_PROXY = "http://user:secret@127.0.0.1:7890";
+
+    const init = fetchInitForUpdateDownload(
+      "https://github.com/wangzhezbz/codex-bridge/releases/download/v0.1.77/CodexBridge-Windows-x64-Portable.zip",
+      { headers: { "user-agent": "CodexBridge" } },
+    );
+    const label = updateDownloadProxyLabel(
+      "https://github.com/wangzhezbz/codex-bridge/releases/download/v0.1.77/package.zip",
+    );
+
+    assert.ok(init.dispatcher, "expected updater download to use proxy dispatcher");
+    assert.match(label, /^env:/);
+    assert.doesNotMatch(label, /secret/);
+  } finally {
+    restoreProxyEnv(original);
+  }
+});
+
+test("updater release checks use configured proxy settings", async () => {
+  const original = snapshotProxyEnv();
+  let seenInit = null;
+  try {
+    clearProxyEnv();
+    process.env.HTTPS_PROXY = "http://127.0.0.1:7890";
+
+    await fetchLatestRelease({
+      releaseUrl: "https://api.github.com/repos/wangzhezbz/codex-bridge/releases/latest",
+      fetchImpl: async (_url, init) => {
+        seenInit = init;
+        return new Response(JSON.stringify(release), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+
+    assert.ok(seenInit?.dispatcher, "expected update check to use proxy dispatcher");
+  } finally {
+    restoreProxyEnv(original);
+  }
+});
+
 test("Windows portable updater script replaces and restarts without batch deletion", () => {
   const script = generateWindowsPortableUpdateScript({
     parentPid: 1234,
@@ -125,3 +174,42 @@ test("macOS portable updater script replaces the app bundle without recursive de
   assert.match(script, /open "\$CURRENT_APP_BUNDLE"/);
   assert.doesNotMatch(script, /rm\s+-rf|Remove-Item\s+-Recurse|rmdir\s+\/s|rd\s+\/s|del\s+\/s/i);
 });
+
+function snapshotProxyEnv() {
+  const snapshot = {};
+  for (const key of proxyEnvKeys()) {
+    snapshot[key] = process.env[key];
+  }
+  return snapshot;
+}
+
+function restoreProxyEnv(snapshot) {
+  clearProxyEnv();
+  for (const [key, value] of Object.entries(snapshot)) {
+    if (value !== undefined) {
+      process.env[key] = value;
+    }
+  }
+}
+
+function clearProxyEnv() {
+  for (const key of proxyEnvKeys()) {
+    delete process.env[key];
+  }
+}
+
+function proxyEnvKeys() {
+  return [
+    "CODEXBRIDGE_HTTPS_PROXY",
+    "CODEXBRIDGE_HTTP_PROXY",
+    "CODEXBRIDGE_ALL_PROXY",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "ALL_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+  ];
+}

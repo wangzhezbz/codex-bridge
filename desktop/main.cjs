@@ -668,8 +668,15 @@ async function preparePortableUpdate(updater, plan, onProgress) {
     .replace("T", "-")
     .replace("Z", "");
   const downloadPath = path.join(downloadsDir, `${stamp}-${plan.asset.name}`);
+  const proxyLabel = updater.updateDownloadProxyLabel?.(plan.asset.downloadUrl) || "";
+  appendLog(
+    proxyLabel
+      ? `Update download using proxy ${proxyLabel}.`
+      : "Update download using direct GitHub connection.",
+  );
   await downloadFile(plan.asset.downloadUrl, downloadPath, {
     expectedBytes: plan.asset.size,
+    fetchInitForDownload: updater.fetchInitForUpdateDownload,
     onProgress,
   });
 
@@ -706,13 +713,20 @@ async function preparePortableUpdate(updater, plan, onProgress) {
 
 async function downloadFile(url, targetPath, {
   expectedBytes = 0,
+  fetchInitForDownload,
   onProgress,
 } = {}) {
-  const response = await fetch(url, {
+  const baseInit = {
     headers: {
       "user-agent": "CodexBridge",
     },
-  });
+  };
+  const response = await fetch(
+    url,
+    typeof fetchInitForDownload === "function"
+      ? fetchInitForDownload(url, baseInit)
+      : baseInit,
+  );
   if (!response.ok) {
     throw new Error(`更新包下载失败：HTTP ${response.status}`);
   }
@@ -724,6 +738,7 @@ async function downloadFile(url, targetPath, {
     ? contentLength
     : Number(expectedBytes || 0);
   let downloadedBytes = 0;
+  const startedAt = Date.now();
   let lastEmitAt = 0;
   let lastPercent = -1;
   const emit = (force = false) => {
@@ -739,11 +754,13 @@ async function downloadFile(url, targetPath, {
     }
     lastEmitAt = now;
     lastPercent = percent;
+    const elapsedSeconds = Math.max(0.001, (now - startedAt) / 1000);
     onProgress({
       phase: "downloading",
       downloadedBytes,
       totalBytes,
       percent,
+      bytesPerSecond: Math.floor(downloadedBytes / elapsedSeconds),
     });
   };
   emit(true);

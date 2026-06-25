@@ -36,6 +36,9 @@ test("desktop renderer exposes update from sidebar without a dedicated page", ()
   assert.match(rendererSource, /api\.installUpdate\(\)/);
   assert.match(rendererSource, /api\.onUpdateProgress\?\.\(\(progress\) => renderUpdateProgress\(progress\)\)/);
   assert.match(rendererSource, /function renderUpdateProgress/);
+  assert.match(rendererSource, /bytesPerSecond/);
+  assert.match(rendererSource, /formatBytes\(details\.bytesPerSecond\)/);
+  assert.match(rendererSource, /\}\/s`/);
   assert.match(rendererSource, /els\.appVersion\.textContent = `v\$\{state\.appVersion \|\| "-"\}`;/);
   assert.match(rendererSource, /showUpdateDialog/);
   assert.doesNotMatch(rendererSource, /window\.confirm/);

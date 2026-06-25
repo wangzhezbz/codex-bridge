@@ -1,3 +1,5 @@
+import { fetchInitWithProxy, proxyLogLabel } from "../src/proxy.js";
+
 export const GITHUB_LATEST_RELEASE_URL =
   "https://api.github.com/repos/wangzhezbz/codex-bridge/releases/latest";
 
@@ -90,16 +92,24 @@ export async function fetchLatestRelease({
   if (typeof fetchImpl !== "function") {
     throw new Error("当前运行环境没有可用的 fetch，无法检查更新。");
   }
-  const response = await fetchImpl(releaseUrl, {
+  const response = await fetchImpl(releaseUrl, fetchInitWithProxy(releaseUrl, {
     headers: {
       accept: "application/vnd.github+json",
       "user-agent": "CodexBridge",
     },
-  });
+  }));
   if (!response.ok) {
     throw new Error(`检查更新失败：GitHub 返回 HTTP ${response.status}`);
   }
   return response.json();
+}
+
+export function fetchInitForUpdateDownload(targetUrl, init = {}) {
+  return fetchInitWithProxy(targetUrl, init);
+}
+
+export function updateDownloadProxyLabel(targetUrl) {
+  return proxyLogLabel(targetUrl);
 }
 
 export function generateWindowsPortableUpdateScript({

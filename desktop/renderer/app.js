@@ -1122,6 +1122,7 @@ function renderUpdateProgress(progress = {}) {
       ? Math.max(0, Math.min(100, Math.floor((downloadedBytes / totalBytes) * 100)))
       : 0;
   const hasKnownSize = totalBytes > 0;
+  const bytesPerSecond = Number(progress.bytesPerSecond || 0);
   const isIndeterminate = !hasKnownSize && progress.phase !== "error" && progress.phase !== "restarting";
   els.updateProgressTrack.classList.toggle("indeterminate", isIndeterminate);
   els.updateProgressBar.style.width = isIndeterminate ? "45%" : `${percent}%`;
@@ -1130,6 +1131,7 @@ function renderUpdateProgress(progress = {}) {
     downloadedBytes,
     totalBytes,
     percent,
+    bytesPerSecond,
   });
 }
 
@@ -1138,9 +1140,10 @@ function updateProgressText(phase, details) {
     return "正在确认最新版本...";
   }
   if (phase === "downloading") {
+    const speedText = details.bytesPerSecond > 0 ? ` · ${formatBytes(details.bytesPerSecond)}/s` : "";
     return details.totalBytes > 0
-      ? `正在下载 ${formatBytes(details.downloadedBytes)} / ${formatBytes(details.totalBytes)}`
-      : "正在下载更新包...";
+      ? `正在下载 ${formatBytes(details.downloadedBytes)} / ${formatBytes(details.totalBytes)}${speedText}`
+      : `正在下载更新包...${speedText}`;
   }
   if (phase === "restarting") {
     return "下载完成，正在重启并替换程序...";

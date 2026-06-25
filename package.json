@@ -1,6 +1,6 @@
 {
   "name": "codex-bridge",
-  "version": "0.1.77",
+  "version": "0.1.78",
   "private": true,
   "type": "module",
   "main": "desktop/main.cjs",
