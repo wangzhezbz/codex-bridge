@@ -2261,9 +2261,22 @@ function codexBridgeBackups(targetDir) {
     .filter((name) => /^config\.toml\.codexbridge\..+\.bak$/.test(name))
     .map((name) => {
       const fullPath = path.join(targetDir, name);
-      return { fullPath, mtimeMs: fs.statSync(fullPath).mtimeMs };
+      return {
+        fullPath,
+        name,
+        stamp: codexBridgeBackupStamp(name),
+        mtimeMs: fs.statSync(fullPath).mtimeMs,
+      };
     })
-    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    .sort((a, b) =>
+      b.stamp.localeCompare(a.stamp) ||
+      b.mtimeMs - a.mtimeMs ||
+      b.name.localeCompare(a.name)
+    );
+}
+
+function codexBridgeBackupStamp(name) {
+  return String(name || "").match(/^config\.toml\.codexbridge\.(.+)\.bak$/)?.[1] || "";
 }
 
 function preferredRestoreBackup(backups) {

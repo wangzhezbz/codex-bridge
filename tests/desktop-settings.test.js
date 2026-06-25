@@ -1193,6 +1193,8 @@ test("restoreCodexConfig restores the latest CodexBridge backup", () => {
   fs.writeFileSync(target, 'model = "manual-after"\n', "utf8");
   const second = applyCodexConfig({ rootDir, mode: MODE_ALL_API, homeDir });
   assert.notEqual(first.backup, second.backup);
+  fs.utimesSync(first.backup, new Date(Date.now() + 30_000), new Date(Date.now() + 30_000));
+  fs.utimesSync(second.backup, new Date(Date.now() - 30_000), new Date(Date.now() - 30_000));
 
   const restored = restoreCodexConfig({ homeDir });
 

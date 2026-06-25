@@ -15,6 +15,9 @@ jobs:
   windows:
     name: Windows x64
     runs-on: windows-latest
+    env:
+      TEMP: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
 
     steps:
       - name: Checkout
