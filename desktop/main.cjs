@@ -600,8 +600,27 @@ ipcMain.handle("updates:install", async () => {
     percent: 100,
   });
   setTimeout(() => {
-    launchPortableUpdater(prepared.scriptPath);
-    exitForPortableUpdate();
+    launchPortableUpdater(prepared.scriptPath, {
+      onSpawn: () => exitForPortableUpdate(),
+      onError: (error) => {
+        const message = formatError("updateLaunch", error);
+        appendRuntimeLog(message);
+        appendLog(`Update launcher failed: ${message}`);
+        try {
+          shell.showItemInFolder(prepared.scriptPath);
+        } catch {
+          // Opening the update folder is best-effort; the old app must stay usable.
+        }
+        try {
+          dialog.showErrorBox(
+            "CodexBridge update failed",
+            `无法启动更新脚本，旧版本已保留。\n\n${message}\n\n更新文件位置：${prepared.scriptPath}`,
+          );
+        } catch {
+          // The app may be shutting down or unable to show dialogs.
+        }
+      },
+    });
   }, 500);
   return {
     ok: true,
@@ -843,13 +862,14 @@ async function downloadFile(url, targetPath, {
   emit(true);
 }
 
-function launchPortableUpdater(scriptFile) {
+function launchPortableUpdater(scriptFile, { onSpawn, onError } = {}) {
   const child = process.platform === "win32"
-    ? spawn("cmd.exe", [
-        "/d",
-        "/s",
-        "/c",
-        `start "" /min powershell.exe -NoProfile -ExecutionPolicy Bypass -File ${cmdQuote(scriptFile)}`,
+    ? spawn("powershell.exe", [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        scriptFile,
       ], {
         detached: true,
         stdio: "ignore",
@@ -860,11 +880,20 @@ function launchPortableUpdater(scriptFile) {
         stdio: "ignore",
         windowsHide: true,
       });
+  child.once("spawn", () => {
+    if (typeof onSpawn === "function") {
+      onSpawn();
+    }
+  });
+  child.once("error", (error) => {
+    if (typeof onError === "function") {
+      onError(error);
+    } else {
+      appendRuntimeLog(formatError("updateLaunch", error));
+    }
+  });
   child.unref();
-}
-
-function cmdQuote(value) {
-  return `"${String(value || "").replaceAll('"', '""')}"`;
+  return child;
 }
 
 function exitForPortableUpdate() {

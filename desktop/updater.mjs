@@ -298,6 +298,9 @@ function Assert-CodexBridgeAppDir([string]$AppDir) {
 
 try {
   Write-UpdateLog "Updater script started."
+  Write-UpdateLog "Current app directory: $CURRENT_APP_DIR"
+  Write-UpdateLog "Update package: $ZIP_PATH"
+  Write-UpdateLog "Update work directory: $WORK_DIR"
   foreach ($waitPid in $WAIT_PIDS) {
     Wait-UpdateProcessExit $waitPid
   }

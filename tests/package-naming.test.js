@@ -40,7 +40,21 @@ test("desktop portable update exits the tray process before file replacement", (
   assert.match(main, /tray\.destroy\(\)/);
   assert.match(main, /mainWindow\.destroy\(\)/);
   assert.match(main, /app\.exit\(0\)/);
-  assert.match(main, /launchPortableUpdater\(prepared\.scriptPath\);\s*exitForPortableUpdate\(\);/);
+  assert.match(main, /launchPortableUpdater\(prepared\.scriptPath,\s*\{/);
+  assert.match(main, /onSpawn:\s*\(\) => exitForPortableUpdate\(\)/);
+  assert.match(main, /onError:\s*\(error\) =>/);
+  assert.match(main, /shell\.showItemInFolder\(prepared\.scriptPath\)/);
+});
+
+test("desktop launches the Windows updater through detached PowerShell directly", () => {
+  const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
+
+  assert.match(main, /spawn\("powershell\.exe",\s*\[/);
+  assert.match(main, /"-ExecutionPolicy",\s*"Bypass"/);
+  assert.match(main, /"-File",\s*scriptFile/);
+  assert.match(main, /detached:\s*true/);
+  assert.doesNotMatch(main, /spawn\("cmd\.exe"/);
+  assert.doesNotMatch(main, /start "" \/min powershell\.exe/);
 });
 
 test("desktop updater keeps downloaded package visible in the update folder", () => {

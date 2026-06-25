@@ -155,6 +155,9 @@ test("Windows portable updater script replaces and restarts without batch deleti
   assert.match(script, /Get-CimInstance Win32_Process/);
   assert.match(script, /Stop-Process -Id \$runningPid -Force/);
   assert.match(script, /Updater script started/);
+  assert.match(script, /Current app directory: \$CURRENT_APP_DIR/);
+  assert.match(script, /Update package: \$ZIP_PATH/);
+  assert.match(script, /Update work directory: \$WORK_DIR/);
   assert.match(script, /Invoke-UpdateStep "Renaming current app directory"/);
   assert.match(script, /Invoke-UpdateStep "Moving new app directory into place"/);
   assert.match(script, /Show-UpdateFailure \$failureMessage/);
