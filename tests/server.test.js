@@ -4651,6 +4651,160 @@ test("streaming chat image rejection is isolated for later conversation turns", 
   assert.match(JSON.stringify(chatBodies[2].messages), /continue after streamed image failure/);
 });
 
+test("chat-routed remote compact v2 returns a single compaction SSE item", async () => {
+  let upstreamBody;
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/chat/completions");
+    upstreamBody = await readJson(req);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: "chatcmpl_compact_v2",
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: "Summary: keep the latest user request and route decisions.",
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 12,
+          completion_tokens: 8,
+          total_tokens: 20,
+        },
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+
+  try {
+    const response = await fetch(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        stream: true,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: "long task history",
+          },
+          { type: "compaction_trigger" },
+        ],
+        tools: [
+          {
+            type: "function",
+            name: "shell_command",
+            description: "Run shell",
+            parameters: { type: "object" },
+          },
+        ],
+      }),
+    });
+    const text = await response.text();
+    assert.equal(response.ok, true, text);
+    assert.match(text, /event: response\.output_item\.done/);
+    assert.equal((text.match(/"type":"compaction"/g) || []).length, 2);
+    assert.doesNotMatch(text, /"type":"message"/);
+    assert.match(text, /Another language model started to solve this problem/);
+    assert.match(text, /Summary: keep the latest user request/);
+
+    assert.equal(upstreamBody.stream, false);
+    assert.equal(upstreamBody.tools, undefined);
+    assert.equal(upstreamBody.tool_choice, undefined);
+    assert.doesNotMatch(JSON.stringify(upstreamBody), /compaction_trigger/);
+    assert.match(JSON.stringify(upstreamBody.messages), /CONTEXT CHECKPOINT COMPACTION/);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("chat-routed responses compact endpoint returns compaction JSON", async () => {
+  const upstream = http.createServer(async (_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: "chatcmpl_compact_v1",
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: "Summary: compact endpoint result.",
+            },
+          },
+        ],
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+
+  try {
+    const response = await fetchJson(`${serverUrl(router)}/v1/responses/compact`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        input: "compact this history",
+      }),
+    });
+    assert.equal(response.object, "response");
+    assert.equal(response.output[0].type, "compaction");
+    assert.match(response.output[0].encrypted_content, /Summary: compact endpoint result/);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
 function snapshotEnv(keys) {
   return Object.fromEntries(keys.map((key) => [key, process.env[key]]));
 }

@@ -164,6 +164,18 @@ export function responseInputToChatMessages(input, toolContext) {
       continue;
     }
 
+    if (isCompactionItem(item)) {
+      const summary = compactionText(item);
+      if (summary) {
+        messages.push({ role: "user", content: summary });
+      }
+      continue;
+    }
+
+    if (item?.type === "compaction_trigger") {
+      continue;
+    }
+
     const message = responseMessageToChatMessage(item);
     if (message) {
       messages.push(message);
@@ -172,6 +184,17 @@ export function responseInputToChatMessages(input, toolContext) {
 
   flushToolCalls();
   return messages;
+}
+
+function isCompactionItem(item) {
+  return item?.type === "compaction" || item?.type === "context_compaction";
+}
+
+function compactionText(item) {
+  if (typeof item?.encrypted_content === "string") {
+    return item.encrypted_content;
+  }
+  return contentToText(item?.content ?? item?.text ?? item?.output ?? "");
 }
 
 function shouldOmitResponseToolCallFromChatHistory(item, toolContext) {

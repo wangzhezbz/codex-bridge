@@ -19,6 +19,12 @@ import {
   responseToSse,
 } from "./chat-to-responses.js";
 import {
+  buildCompactChatRequest,
+  compactKindForResponsesRequest,
+  compactResponseFromChat,
+  compactResponseToSse,
+} from "./compact.js";
+import {
   proxyImageGenerationFallback,
   shouldUseImageGenerationFallback,
 } from "./image-generation.js";
@@ -127,6 +133,13 @@ export async function handleResponsesRequest(
   res,
   context = {},
 ) {
+  const compactKind = compactKindForResponsesRequest(requestBody, context);
+  if (compactKind && route.api === "chat_completions") {
+    return proxyChatCompact(requestBody, route, history, res, {
+      ...context,
+      compactKind,
+    });
+  }
   if (shouldUseImageGenerationFallback(requestBody, route)) {
     return proxyImageGenerationFallback(
       requestBody,
@@ -174,7 +187,8 @@ export async function proxyResponsesApi(
     normalizeAdapterProfile(route),
     { api: "responses" },
   );
-  const upstreamUrl = joinUpstreamUrl(responsesBaseUrlForRoute(route), "/responses");
+  const upstreamPath = context.compactKind === "v1" ? "/responses/compact" : "/responses";
+  const upstreamUrl = joinUpstreamUrl(responsesBaseUrlForRoute(route), upstreamPath);
   throwIfRecentUpstreamFailure(route, upstreamUrl, upstreamPayload, context);
   logRoute(context, route, upstreamUrl);
   let upstream;
@@ -522,6 +536,42 @@ export async function proxyChatCompletions(
       connection: "keep-alive",
     });
     res.end(payload);
+    return;
+  }
+
+  jsonResponse(res, 200, response);
+}
+
+async function proxyChatCompact(requestBody, route, history, res, context = {}) {
+  const converted = buildCompactChatRequest(requestBody, route, history);
+  const upstreamUrl = joinUpstreamUrl(route.baseUrl, "/chat/completions");
+  logRoute(context, route, upstreamUrl);
+  const upstream = await callJsonUpstream(upstreamUrl, route, converted.body, context);
+  logUsage(context, route, upstream.usage);
+
+  const response = compactResponseFromChat(upstream, requestBody.model || route.id);
+  history.record(response.id, [
+    ...converted.messagesForHistory,
+    {
+      role: "assistant",
+      content: response.output[0]?.encrypted_content || null,
+    },
+  ]);
+  history.recordResponse(response, {
+    api: "chat_completions",
+    routeId: route.id || "",
+    upstreamModel: route.model || "",
+    upstreamKnown: false,
+    localFallback: "compact",
+  });
+
+  if (context.compactKind === "v2") {
+    res.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    });
+    res.end(compactResponseToSse(response));
     return;
   }
 

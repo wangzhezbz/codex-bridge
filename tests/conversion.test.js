@@ -4,7 +4,10 @@ import { buildModelCatalog } from "../src/model-catalog.js";
 import { authModeForRoute, validateConfig } from "../src/config.js";
 import { ResponseHistory } from "../src/history.js";
 import { filterPayloadForAdapter } from "../src/adapter-profile.js";
-import { responsesToChatRequest } from "../src/responses-to-chat.js";
+import {
+  responseInputToChatMessages,
+  responsesToChatRequest,
+} from "../src/responses-to-chat.js";
 import {
   assistantHistoryMessageFromChat,
   chatResponseToResponse,
@@ -281,6 +284,25 @@ test("chat conversion keeps file inputs visible when chat provider cannot forwar
     converted.body.messages.at(-1).content,
     "summarize this file\n[file input not forwarded to chat provider: brief.pdf]",
   );
+});
+
+test("chat conversion preserves compacted context summaries as user context", () => {
+  const messages = responseInputToChatMessages([
+    {
+      type: "compaction",
+      encrypted_content:
+        "Another language model started to solve this problem and produced a summary.\nImportant context: route compact output must stay available.",
+    },
+    {
+      type: "message",
+      role: "user",
+      content: "continue from the summary",
+    },
+  ]);
+
+  assert.equal(messages[0].role, "user");
+  assert.match(messages[0].content, /Important context/);
+  assert.equal(messages[1].content, "continue from the summary");
 });
 
 test("chat conversion output can be filtered by adapter safe params", () => {

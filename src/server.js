@@ -9,6 +9,7 @@ import {
   readJsonRequest,
 } from "./json.js";
 import { buildModelCatalog, openAiModelsList } from "./model-catalog.js";
+import { isResponsesCompactPath } from "./compact.js";
 import {
   handleResponsesRequest,
   sendUpstreamError,
@@ -101,7 +102,7 @@ export function createRouterServer(config = loadConfig()) {
 
       if (
         req.method === "POST" &&
-        ["/v1/responses", "/responses"].includes(url.pathname)
+        isResponsesPostPath(url.pathname)
       ) {
         const body = await readJsonRequest(req);
         const route = routeForModel(activeConfig, body.model);
@@ -124,6 +125,7 @@ export function createRouterServer(config = loadConfig()) {
           `[${new Date().toISOString()}] ${requestId} <- /v1/responses ` +
             `model=${body.model || "(default)"} route=${route.id} ` +
             `api=${route.api} upstream_model=${route.model} stream=${Boolean(body.stream)} ` +
+            `compact=${compactKindForPath(url.pathname) || "-"} ` +
             `previous_response_id=${body.previous_response_id || "-"} ` +
             `client_auth=${clientAuth.kind} upstream_auth=${authModeForRoute(route)}`,
         );
@@ -133,6 +135,7 @@ export function createRouterServer(config = loadConfig()) {
             clientAuth,
             clientHeaders: req.headers,
             clientSignal: clientAbort.signal,
+            compactKind: compactKindForPath(url.pathname),
           });
         } catch (error) {
           if (error?.code === "client_closed_request") {
@@ -247,6 +250,14 @@ function writeCors(res) {
 
 function isResponsesCollection(pathname) {
   return ["/v1/responses", "/responses"].includes(pathname);
+}
+
+function isResponsesPostPath(pathname) {
+  return isResponsesCollection(pathname) || isResponsesCompactPath(pathname);
+}
+
+function compactKindForPath(pathname) {
+  return isResponsesCompactPath(pathname) ? "v1" : "";
 }
 
 function isModelSettingsPath(pathname) {
