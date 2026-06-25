@@ -3,6 +3,8 @@ name: Desktop Portable Build
 on:
   workflow_dispatch:
   push:
+    branches:
+      - "codex/all-model-contract-lock"
     tags:
       - "v*"
 
@@ -33,8 +35,32 @@ jobs:
       - name: Run router tests
         run: npm run test:router
 
-      - name: Run desktop tests
-        run: npm run test:desktop -- --test-concurrency=1
+      - name: Run desktop CSS tests
+        run: node --test tests/desktop-css.test.js
+
+      - name: Run desktop data-dir tests
+        run: node --test tests/desktop-data-dir.test.js
+
+      - name: Run desktop renderer tests
+        run: node --test tests/desktop-renderer.test.js
+
+      - name: Run desktop settings tests
+        run: node --test tests/desktop-settings.test.js
+
+      - name: Run desktop updater tests
+        run: node --test tests/desktop-updater.test.js
+
+      - name: Run desktop usage tests
+        run: node --test tests/desktop-usage.test.js
+
+      - name: Run documentation link tests
+        run: node --test tests/documentation-links.test.js
+
+      - name: Run package naming tests
+        run: node --test tests/package-naming.test.js
+
+      - name: Run router health tests
+        run: node --test tests/router-health.test.js
 
       - name: Package Windows portable app
         env:
