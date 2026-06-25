@@ -910,6 +910,168 @@ test("server lets chat models continue distinct tool chains beyond the default l
   }
 });
 
+test("server records only runnable chat tool calls so suppressed calls do not poison continuation", async () => {
+  const upstreamBodies = [];
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/chat/completions");
+    upstreamCalls += 1;
+    upstreamBodies.push(await readJson(req));
+
+    res.writeHead(200, { "content-type": "application/json" });
+    if (upstreamCalls === 1) {
+      res.end(
+        JSON.stringify({
+          id: "chatcmpl_mixed_tool_calls",
+          object: "chat.completion",
+          choices: [
+            {
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    id: "call_shell",
+                    type: "function",
+                    function: {
+                      name: "shell_command",
+                      arguments: JSON.stringify({ command: "echo ok" }),
+                    },
+                  },
+                  {
+                    id: "call_unknown",
+                    type: "function",
+                    function: {
+                      name: "mcp__node_repl__js",
+                      arguments: JSON.stringify({ code: "nodeRepl.write('skip')" }),
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+          usage: { prompt_tokens: 20, completion_tokens: 5, total_tokens: 25 },
+        }),
+      );
+      return;
+    }
+
+    res.end(
+      JSON.stringify({
+        id: "chatcmpl_after_shell",
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: "shell result accepted",
+            },
+          },
+        ],
+        usage: { prompt_tokens: 30, completion_tokens: 5, total_tokens: 35 },
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const upstreamUrl = serverUrl(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        api: "chat_completions",
+        baseUrl: `${upstreamUrl}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const baseUrl = serverUrl(router);
+  const tools = [
+    {
+      type: "function",
+      name: "shell_command",
+      description: "Run shell.",
+      parameters: {
+        type: "object",
+        properties: { command: { type: "string" } },
+        required: ["command"],
+      },
+    },
+  ];
+
+  try {
+    const first = await fetchJson(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        input: "run the shell command",
+        tools,
+      }),
+    });
+    const shellCall = first.output.find((item) => item.call_id === "call_shell");
+    assert.equal(shellCall?.type, "function_call");
+    assert.equal(
+      first.output.some((item) => item.call_id === "call_unknown"),
+      false,
+    );
+
+    const second = await fetchJson(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        previous_response_id: first.id,
+        input: [
+          {
+            type: "function_call_output",
+            call_id: shellCall.call_id,
+            output: "ok",
+          },
+        ],
+        tools,
+      }),
+    });
+
+    assert.equal(second.output_text, "shell result accepted");
+    const continuationMessages = upstreamBodies[1].messages;
+    const assistant = continuationMessages.find(
+      (message) => Array.isArray(message.tool_calls),
+    );
+    assert.ok(assistant, "continuation should preserve the runnable assistant tool call");
+    assert.deepEqual(
+      assistant.tool_calls.map((toolCall) => toolCall.id),
+      ["call_shell"],
+    );
+    assert.ok(
+      continuationMessages.some(
+        (message) =>
+          message.role === "tool" &&
+          message.tool_call_id === "call_shell" &&
+          message.content === "ok",
+      ),
+    );
+    assert.equal(JSON.stringify(continuationMessages).includes("call_unknown"), false);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
 test("server lets repeated chat tool calls continue while tool results change", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer(async (req, res) => {

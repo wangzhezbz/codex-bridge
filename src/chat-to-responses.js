@@ -199,14 +199,19 @@ function isInteractiveDiagnosticText(text) {
   );
 }
 
-export function assistantHistoryMessageFromChat(chat) {
+export function assistantHistoryMessageFromChat(chat, toolContext = null) {
   const message = chat?.choices?.[0]?.message || {};
   const history = {
     role: "assistant",
     content: messageText(message) || null,
   };
   if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
-    history.tool_calls = message.tool_calls;
+    const toolCalls = toolContext
+      ? message.tool_calls.filter((toolCall) => !isSuppressedToolCall(toolCall, toolContext))
+      : message.tool_calls;
+    if (toolCalls.length > 0) {
+      history.tool_calls = toolCalls;
+    }
   }
   if (typeof message.reasoning_content === "string" && message.reasoning_content) {
     history.reasoning_content = message.reasoning_content;

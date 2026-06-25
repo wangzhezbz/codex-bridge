@@ -539,7 +539,7 @@ export async function proxyChatCompletions(
 
   history.record(response.id, [
     ...messagesForHistory,
-    assistantHistoryMessageFromChat(chatForHistory),
+    assistantHistoryMessageFromChat(chatForHistory, converted.toolContext),
   ]);
   history.recordResponse(response, {
     api: "chat_completions",
