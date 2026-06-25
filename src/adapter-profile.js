@@ -38,6 +38,7 @@ const CHAT_SAFE_PARAMS = [
   "max_completion_tokens",
   "stop",
   "response_format",
+  "stream_options",
   "reasoning_split",
   "reasoning",
   "reasoning_effort",
@@ -196,7 +197,26 @@ export function filterPayloadForAdapter(payload = {}, profileOrRoute = {}, optio
     }
   }
 
+  applyRouteSpecificPayloadDefaults(result, profile, dropped);
   return result;
+}
+
+function applyRouteSpecificPayloadDefaults(payload, profile, dropped) {
+  if (
+    profile.api !== "chat_completions" ||
+    payload.stream !== true ||
+    dropped.has("stream_options")
+  ) {
+    return;
+  }
+  const streamOptions =
+    payload.stream_options && typeof payload.stream_options === "object"
+      ? payload.stream_options
+      : {};
+  payload.stream_options = {
+    ...streamOptions,
+    include_usage: true,
+  };
 }
 
 export function reasoningParamsForAdapter(request = {}, route = {}, options = {}) {

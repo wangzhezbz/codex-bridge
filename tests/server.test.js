@@ -4298,6 +4298,127 @@ test("streaming responses without object field are recorded for later chat-compl
   assert.match(chatText, /what did streaming GPT say/);
 });
 
+test("truncated native responses streams end with a bridge failure event and do not poison history", async () => {
+  const chatBodies = [];
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+    const bodyText = Buffer.concat(chunks).toString("utf8");
+
+    if (req.url === "/v1/responses") {
+      res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+      res.end(
+        [
+          "event: response.output_text.delta",
+          `data: ${JSON.stringify({
+            type: "response.output_text.delta",
+            delta: "partial text",
+          })}`,
+          "",
+        ].join("\n"),
+      );
+      return;
+    }
+
+    if (req.url === "/v1/chat/completions") {
+      const body = JSON.parse(bodyText);
+      chatBodies.push(body);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          id: "chatcmpl_after_truncated_stream",
+          choices: [
+            {
+              message: {
+                role: "assistant",
+                content: "chat model should not see partial GPT text",
+              },
+            },
+          ],
+        }),
+      );
+      return;
+    }
+
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "unexpected path" }));
+  });
+
+  await listen(upstream);
+  const upstreamUrl = serverUrl(upstream);
+
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "gpt-5.5",
+    clientAuth: { allowOpenAiBearer: true },
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        api: "responses",
+        baseUrl: `${upstreamUrl}/v1`,
+        model: "gpt-5.5",
+        authMode: "codex_openai",
+      },
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        api: "chat_completions",
+        baseUrl: `${upstreamUrl}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const baseUrl = serverUrl(router);
+
+  try {
+    const firstResponse = await fetch(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer codex-openai-token",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        stream: true,
+        input: "this stream will truncate",
+      }),
+    });
+    const firstText = await firstResponse.text();
+    assert.equal(firstResponse.ok, true, firstText);
+    assert.match(firstText, /response\.failed/);
+    assert.match(firstText, /upstream_stream_truncated/);
+    assert.match(firstText, /data: \[DONE\]/);
+
+    await fetchJson(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        previous_response_id: "resp_missing_from_truncated_stream",
+        input: "continue after truncated stream",
+      }),
+    });
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+
+  assert.equal(chatBodies.length, 1);
+  const chatText = JSON.stringify(chatBodies[0].messages);
+  assert.doesNotMatch(chatText, /partial text/);
+});
+
 test("chat route image rejection is retried without poisoning later conversation turns", async () => {
   const chatBodies = [];
   const upstream = http.createServer(async (req, res) => {

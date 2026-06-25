@@ -74,6 +74,55 @@ test("adapter profiles classify Kimi chat routes with image-url support", () => 
   assert.equal(profile.supportsFiles, "text-placeholder");
 });
 
+test("chat stream payloads request usage only for real streaming requests", () => {
+  const route = {
+    id: "custom-stream",
+    custom: true,
+    api: "chat_completions",
+    model: "custom-stream",
+  };
+
+  assert.deepEqual(
+    filterPayloadForAdapter({
+      model: "custom-stream",
+      messages: [],
+      stream: true,
+    }, route),
+    {
+      model: "custom-stream",
+      messages: [],
+      stream: true,
+      stream_options: { include_usage: true },
+    },
+  );
+
+  assert.deepEqual(
+    filterPayloadForAdapter({
+      model: "custom-stream",
+      messages: [],
+      stream: false,
+    }, route),
+    {
+      model: "custom-stream",
+      messages: [],
+      stream: false,
+    },
+  );
+
+  assert.equal(
+    filterPayloadForAdapter(
+      {
+        model: "custom-stream",
+        messages: [],
+        stream: true,
+        stream_options: { include_usage: false, vendor_flag: true },
+      },
+      { ...route, dropParams: ["stream_options"] },
+    ).stream_options,
+    undefined,
+  );
+});
+
 test("custom chat routes default to text-only input while preserving OpenAI-compatible params", () => {
   const profile = normalizeAdapterProfile({
     id: "custom-model",

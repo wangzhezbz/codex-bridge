@@ -32,6 +32,12 @@ import {
 } from "./image-generation.js";
 import { fetchInitWithProxy, proxyLogLabel } from "./proxy.js";
 import { markRouteRateLimited, waitForRouteCapacity } from "./rate-limit.js";
+import {
+  buildResponsesStreamErrorSse,
+  extractResponseObjectFromSse,
+  extractUsageFromSse,
+  responsesSseStreamComplete,
+} from "./sse.js";
 import { isResponseToolCallItem, isResponseToolOutputItem } from "./tools.js";
 
 const CHATGPT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
@@ -238,14 +244,27 @@ export async function proxyResponsesApi(
     res.write(buffer);
   }
   responseTail += decoder.decode();
-  res.end();
   const completedResponse = extractResponsesObject(responseTail);
+  const usage = extractUsageObject(completedResponse) || extractResponsesUsage(responseTail);
+  if (upstreamPayload.stream && !responsesSseStreamComplete(responseTail)) {
+    const message =
+      `CodexBridge upstream stream from ${route.displayName || route.id || route.model || "route"} ` +
+      "ended before response.completed or [DONE].";
+    console.warn(
+      `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+        `!! upstream route=${route.id} truncated responses stream`,
+    );
+    res.write(buildResponsesStreamErrorSse(message, {
+      model: requestBody.model || route.id || route.model || null,
+    }));
+    res.end();
+    logUsage(context, route, usage);
+    return;
+  }
+
+  res.end();
   recordResponsesHistory(history, completedResponse, sourceMessages, toolContext);
-  logUsage(
-    context,
-    route,
-    extractUsageObject(completedResponse) || extractResponsesUsage(responseTail),
-  );
+  logUsage(context, route, usage);
 }
 
 function shouldInlineLocalHistoryForResponses(requestBody, history) {
@@ -1833,59 +1852,11 @@ function networkErrorMessage(cause, upstreamUrl, route = {}, proxyLabel = "") {
 }
 
 function extractResponsesUsage(text) {
-  const direct = extractUsageObject(tryParseJson(text));
-  if (direct) {
-    return direct;
-  }
-
-  let latest = null;
-  for (const line of String(text || "").split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("data:")) {
-      continue;
-    }
-    const data = trimmed.slice(5).trim();
-    if (!data || data === "[DONE]") {
-      continue;
-    }
-    const parsed = tryParseJson(data);
-    const usage = extractUsageObject(parsed);
-    if (usage) {
-      latest = usage;
-    }
-  }
-  return latest;
+  return extractUsageFromSse(text);
 }
 
 function extractResponsesObject(text) {
-  const direct = tryParseJson(text);
-  const directResponse = normalizeResponsesObject(direct);
-  if (directResponse) {
-    return directResponse;
-  }
-
-  let latest = null;
-  for (const line of String(text || "").split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("data:")) {
-      continue;
-    }
-    const data = trimmed.slice(5).trim();
-    if (!data || data === "[DONE]") {
-      continue;
-    }
-    const parsed = tryParseJson(data);
-    const parsedResponse = normalizeResponsesObject(parsed);
-    if (parsedResponse) {
-      latest = parsedResponse;
-      continue;
-    }
-    const nestedResponse = normalizeResponsesObject(parsed?.response);
-    if (nestedResponse) {
-      latest = nestedResponse;
-    }
-  }
-  return latest;
+  return extractResponseObjectFromSse(text);
 }
 
 function isResponsesObject(value) {
