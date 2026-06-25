@@ -9,7 +9,7 @@ const NO_USAGE_RE =
 const STATUS_RE =
   /\[(?<iso>\d{4}-\d\d-\d\dT[^\]]+)] (?<requestId>req_[a-z0-9]+) <- upstream route=(?<route>\S+) status=(?<status>\d+)/i;
 const ERROR_RE =
-  /\[(?<iso>\d{4}-\d\d-\d\dT[^\]]+)] (?<requestId>req_[a-z0-9]+) !! upstream route=(?<route>\S+) status=(?<status>\d+) error=(?<error>.*?)(?: cause=(?<cause>.*))?$/i;
+  /\[(?<iso>\d{4}-\d\d-\d\dT[^\]]+)] (?<requestId>req_[a-z0-9]+) !! upstream route=(?<route>\S+) status=(?<status>\d+) error=(?<error>.*?)(?: error_type=(?<errorType>\S+))?(?: cause=(?<cause>.*?))?(?: body=.*)?$/i;
 
 export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
   const pending = new Map();
@@ -36,6 +36,7 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
         completionTokens: 0,
         totalTokens: 0,
         error: "",
+        errorType: "",
         errorCause: "",
         source: "router",
       });
@@ -89,6 +90,7 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
       item.finishedAt = error.iso;
       item.status = Number(error.status || 599);
       item.error = error.error || "Unknown upstream error";
+      item.errorType = error.errorType || "";
       item.errorCause = error.cause || "";
       finalize(item);
     }
@@ -125,6 +127,7 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
           completionTokens: 0,
           errors: 0,
           lastError: "",
+          lastErrorType: "",
           lastErrorCause: "",
           lastAt: "",
           lastStatus: null,
@@ -137,6 +140,7 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
       item.completionTokens += event.completionTokens || 0;
       item.errors += event.status && event.status >= 400 ? 1 : 0;
       item.lastError = event.error || item.lastError;
+      item.lastErrorType = event.errorType || item.lastErrorType;
       item.lastErrorCause = event.errorCause || item.lastErrorCause;
       item.lastAt = event.finishedAt || event.startedAt || item.lastAt;
       item.lastStatus = event.status || item.lastStatus;
@@ -180,6 +184,7 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
         completionTokens: 0,
         totalTokens: 0,
         error: "",
+        errorType: "",
         errorCause: "",
         source: "router",
       });
@@ -225,6 +230,7 @@ function normalizeEvent(event) {
     totalTokens: Number(event.totalTokens || 0),
     durationMs: Number.isFinite(Number(event.durationMs)) ? Number(event.durationMs) : null,
     error: String(event.error || ""),
+    errorType: String(event.errorType || ""),
     errorCause: String(event.errorCause || ""),
     source: String(event.source || "router"),
   };

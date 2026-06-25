@@ -10,6 +10,7 @@ import { ResponseHistory } from "../src/history.js";
 import { shouldUseImageGenerationFallback } from "../src/image-generation.js";
 import { createRouterServer } from "../src/server.js";
 import { callJsonUpstream, proxyResponsesApi } from "../src/upstream.js";
+import { __resetRateLimiterForTests } from "../src/rate-limit.js";
 
 test("server exposes health, models, catalog, and converted responses", async () => {
   const upstream = http.createServer(async (req, res) => {
@@ -161,6 +162,135 @@ test("server returns a local rate-limit response without retrying the provider",
     assert.match(first.output_text, /rate limited|token waste/i);
     assert.match(second.output_text, /rate limited|token waste/i);
     assert.equal(upstreamCalls, 1);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("server health reports upstream rate-limit route state without switching models", async () => {
+  __resetRateLimiterForTests();
+  const upstream = http.createServer(async (_req, res) => {
+    res.writeHead(429, {
+      "content-type": "application/json",
+      "retry-after": "30",
+    });
+    res.end(JSON.stringify({ error: { message: "Too Many Requests" } }));
+  });
+
+  await listen(upstream);
+  const upstreamUrl = serverUrl(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "gpt-5.5",
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        api: "responses",
+        baseUrl: `${upstreamUrl}/v1`,
+        model: "gpt-5.5",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const baseUrl = serverUrl(router);
+
+  try {
+    const response = await fetch(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        input: "hello",
+      }),
+    });
+    const body = await response.json();
+    assert.equal(response.status, 429);
+    assert.equal(body.error.code, "upstream_rate_limit");
+
+    const health = await fetchJson(`${baseUrl}/health`);
+    assert.equal(health.ok, true);
+    assert.equal(health.unhealthyRoutes, 1);
+    assert.equal(health.routes.length, 1);
+    assert.equal(health.routes[0].id, "gpt-5.5");
+    assert.equal(health.routes[0].status, "rate_limited");
+    assert.equal(health.routes[0].lastErrorType, "rate_limit");
+    assert.equal(health.routes[0].lastStatus, 429);
+    assert.ok(health.routes[0].cooldownRemainingMs > 0);
+    assert.match(health.routes[0].lastError, /Too Many Requests|HTTP 429/);
+  } finally {
+    await close(router);
+    await close(upstream);
+    __resetRateLimiterForTests();
+  }
+});
+
+test("server health separates parameter errors from generic provider failures", async () => {
+  const upstream = http.createServer(async (_req, res) => {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        error: {
+          message: "Stream must be set to true",
+          type: "invalid_request_error",
+          code: "invalid_request_error",
+        },
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const upstreamUrl = serverUrl(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "gpt-5.5",
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        api: "responses",
+        baseUrl: `${upstreamUrl}/v1`,
+        model: "gpt-5.5",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const baseUrl = serverUrl(router);
+
+  try {
+    const response = await fetch(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        input: "hello",
+      }),
+    });
+    const body = await response.json();
+    assert.equal(response.status, 400);
+    assert.equal(body.error.code, "upstream_parameter_error");
+
+    const health = await fetchJson(`${baseUrl}/health`);
+    assert.equal(health.unhealthyRoutes, 1);
+    assert.equal(health.routes[0].status, "degraded");
+    assert.equal(health.routes[0].lastErrorType, "parameter_error");
+    assert.equal(health.routes[0].lastStatus, 400);
+    assert.equal(health.routes[0].cooldownRemainingMs, 0);
   } finally {
     await close(router);
     await close(upstream);

@@ -312,8 +312,10 @@ function renderHealthStatus() {
     els.healthStatus.textContent = `Router 正在启动，等待健康检查${checkedAt}`;
     return;
   }
+  const unhealthyRoutes = Number(health.unhealthyRoutes || 0);
+  const routeAttention = unhealthyRoutes > 0 ? `，${unhealthyRoutes} 条上游需关注` : "";
   els.healthStatus.textContent = health.ok
-    ? `Router 健康检查通过：${health.models?.length || 0} 个模型已加载${checkedAt}`
+    ? `Router 健康检查通过：${health.models?.length || 0} 个模型已加载${routeAttention}${checkedAt}`
     : `Router 健康检查失败：${health.message || "未知错误"}${checkedAt}`;
 }
 

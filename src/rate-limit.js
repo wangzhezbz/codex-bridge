@@ -50,6 +50,21 @@ export function markRouteRateLimited(route = {}, headers) {
   state.cooldownUntil = Math.max(state.cooldownUntil || 0, cooldownUntil);
 }
 
+export function routeRateLimitStatus(route = {}) {
+  const state = states.get(rateLimitKey(route));
+  if (!state) {
+    return {
+      cooldownRemainingMs: 0,
+      nextAfterMs: 0,
+    };
+  }
+  const now = clock.now();
+  return {
+    cooldownRemainingMs: Math.max(0, Number(state.cooldownUntil || 0) - now),
+    nextAfterMs: Math.max(0, Number(state.nextAt || 0) - now),
+  };
+}
+
 export function __setRateLimitClockForTests(nextClock) {
   clock = {
     now: nextClock?.now || clock.now,

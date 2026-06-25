@@ -15,9 +15,11 @@ import {
   sendUpstreamError,
   upstreamErrorLogPreview,
 } from "./upstream.js";
+import { classifyUpstreamError, createRouteHealthStore } from "./route-health.js";
 
 export function createRouterServer(config = loadConfig()) {
   const history = new ResponseHistory();
+  const routeHealth = createRouteHealthStore();
 
   return http.createServer(async (req, res) => {
     try {
@@ -31,10 +33,13 @@ export function createRouterServer(config = loadConfig()) {
       }
 
       if (req.method === "GET" && url.pathname === "/health") {
+        const health = routeHealth.snapshot(activeConfig);
         jsonResponse(res, 200, {
           ok: true,
           config: activeConfig.__path || null,
           models: activeConfig.models.map((model) => model.id),
+          routes: health.routes,
+          unhealthyRoutes: health.unhealthyRoutes,
         });
         return;
       }
@@ -138,6 +143,7 @@ export function createRouterServer(config = loadConfig()) {
             clientSignal: clientAbort.signal,
             compactKind,
           });
+          routeHealth.recordSuccess(route);
         } catch (error) {
           if (error?.code === "client_closed_request") {
             console.warn(
@@ -145,7 +151,8 @@ export function createRouterServer(config = loadConfig()) {
             );
             return;
           }
-          console.error(requestErrorLine(requestId, route, error));
+          routeHealth.recordError(route, error, { compactKind });
+          console.error(requestErrorLine(requestId, route, error, { compactKind }));
           if (!res.destroyed && !res.writableEnded) {
             sendUpstreamError(res, error);
           }
@@ -302,12 +309,14 @@ function makeRequestId() {
   return `req_${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function requestErrorLine(requestId, route, error) {
+function requestErrorLine(requestId, route, error, context = {}) {
   const status = error?.statusCode || 599;
   const cause = error?.cause?.code || error?.cause?.message || "";
+  const classification = classifyUpstreamError(error, { route, ...context });
   return (
     `[${new Date().toISOString()}] ${requestId} !! upstream ` +
     `route=${route.id} status=${status} error=${safeLogValue(error?.message || String(error))}` +
+    ` error_type=${classification.type}` +
     (cause ? ` cause=${safeLogValue(cause)}` : "") +
     upstreamErrorLogPreview(error)
   );

@@ -71,6 +71,21 @@ test("usage store records request-scoped upstream errors", () => {
   assert.equal(usage.summary().byModel[0].errors, 1);
 });
 
+test("usage store records upstream error categories from router logs", () => {
+  const usage = createUsageStore();
+
+  usage.recordLine("[06:06:54] [2026-06-20T22:06:54.426Z] req_limit42 <- /v1/responses model=deepseek-v4-pro route=deepseek-v4-pro api=chat_completions upstream_model=deepseek-v4-pro stream=true previous_response_id=- client_auth=local upstream_auth=api_key");
+  usage.recordLine("[06:06:55] [2026-06-20T22:06:55.960Z] req_limit42 !! upstream route=deepseek-v4-pro status=429 error=Upstream returned HTTP 429 error_type=rate_limit cause=provider_rate_limited");
+
+  const events = usage.events();
+  assert.equal(events.length, 1);
+  assert.equal(events[0].status, 429);
+  assert.equal(events[0].error, "Upstream returned HTTP 429");
+  assert.equal(events[0].errorType, "rate_limit");
+  assert.equal(events[0].errorCause, "provider_rate_limited");
+  assert.equal(usage.summary().byModel[0].lastErrorType, "rate_limit");
+});
+
 test("usage store keeps response route metadata when status arrives before usage", () => {
   const usage = createUsageStore();
 

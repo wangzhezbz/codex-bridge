@@ -21,6 +21,40 @@ test("probeRouterHealth reports healthy router model list", async () => {
   assert.match(result.message, /2 models/);
 });
 
+test("probeRouterHealth preserves upstream route health diagnostics", async () => {
+  const result = await probeRouterHealth({
+    origin: "http://127.0.0.1:15722",
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        models: ["gpt-5.5", "deepseek-v4-pro"],
+        unhealthyRoutes: 1,
+        routes: [
+          {
+            id: "gpt-5.5",
+            status: "healthy",
+            lastErrorType: "",
+          },
+          {
+            id: "deepseek-v4-pro",
+            status: "rate_limited",
+            lastErrorType: "rate_limit",
+            cooldownRemainingMs: 12000,
+          },
+        ],
+      }),
+    }),
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.unhealthyRoutes, 1);
+  assert.equal(result.routes.length, 2);
+  assert.equal(result.routes[1].status, "rate_limited");
+  assert.match(result.message, /1 route/);
+});
+
 test("probeRouterHealth reports failed router health with concrete reason", async () => {
   const result = await probeRouterHealth({
     origin: "http://127.0.0.1:15722",

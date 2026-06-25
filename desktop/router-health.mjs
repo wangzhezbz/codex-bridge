@@ -14,11 +14,19 @@ export async function probeRouterHealth({
     const response = await fetchImpl(target, controller ? { signal: controller.signal } : {});
     const body = await response.json().catch(() => ({}));
     const models = Array.isArray(body?.models) ? body.models.map(String) : [];
+    const routes = Array.isArray(body?.routes) ? body.routes : [];
+    const unhealthyRoutes = Number.isFinite(Number(body?.unhealthyRoutes))
+      ? Number(body.unhealthyRoutes)
+      : routes.filter((route) =>
+          route?.status === "degraded" || route?.status === "rate_limited"
+        ).length;
     if (!response.ok || body?.ok === false) {
       return {
         ok: false,
         status: Number(response.status || 0),
         models,
+        routes,
+        unhealthyRoutes,
         message: `Router health returned HTTP ${response.status || 0}`,
         checkedAt: new Date().toISOString(),
       };
@@ -27,7 +35,9 @@ export async function probeRouterHealth({
       ok: true,
       status: Number(response.status || 200),
       models,
-      message: `Router health OK: ${models.length} models loaded`,
+      routes,
+      unhealthyRoutes,
+      message: healthyMessage(models.length, unhealthyRoutes),
       checkedAt: new Date().toISOString(),
     };
   } catch (error) {
@@ -35,6 +45,8 @@ export async function probeRouterHealth({
       ok: false,
       status: 0,
       models: [],
+      routes: [],
+      unhealthyRoutes: 0,
       message: healthErrorMessage(error),
       checkedAt: new Date().toISOString(),
     };
@@ -86,6 +98,13 @@ function healthErrorMessage(error) {
     ? "Router health check timed out"
     : error?.message || String(error || "unknown error");
   return cause ? `${message} (${cause})` : message;
+}
+
+function healthyMessage(modelCount, unhealthyRoutes) {
+  if (unhealthyRoutes > 0) {
+    return `Router health OK: ${modelCount} models loaded, ${unhealthyRoutes} route(s) need attention`;
+  }
+  return `Router health OK: ${modelCount} models loaded`;
 }
 
 function delay(ms) {

@@ -32,6 +32,7 @@ import {
 } from "./image-generation.js";
 import { fetchInitWithProxy, proxyLogLabel } from "./proxy.js";
 import { markRouteRateLimited, waitForRouteCapacity } from "./rate-limit.js";
+import { classifyUpstreamError } from "./route-health.js";
 import {
   buildResponsesStreamErrorSse,
   extractResponseObjectFromSse,
@@ -1411,16 +1412,18 @@ export function __resetUpstreamFailureCacheForTests() {
 
 export function sendUpstreamError(res, error) {
   if (error instanceof UpstreamNetworkError) {
+    const classification = classifyUpstreamError(error);
     jsonResponse(
       res,
       error.statusCode,
-      openAiError(error.message, error.statusCode, error.code),
+      openAiError(error.message, error.statusCode, classification.code),
     );
     return;
   }
 
   if (error instanceof UpstreamHttpError) {
     const parsed = tryParseJson(error.bodyText);
+    const classification = classifyUpstreamError(error);
     if (isMissingResponsesWriteScope(parsed, error.bodyText)) {
       jsonResponse(
         res,
@@ -1439,7 +1442,7 @@ export function sendUpstreamError(res, error) {
       openAiError(
         clientUpstreamErrorMessage(error, parsed),
         error.statusCode,
-        "upstream_error",
+        classification.code,
       ),
     );
     return;
