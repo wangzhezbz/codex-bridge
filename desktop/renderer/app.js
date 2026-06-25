@@ -7,6 +7,7 @@ let editingCustomPresetId = null;
 const els = {
   routerStatus: document.querySelector("#routerStatus"),
   modeStatus: document.querySelector("#modeStatus"),
+  appVersion: document.querySelector("#appVersion"),
   rootDir: document.querySelector("#rootDir"),
   selectedCount: document.querySelector("#selectedCount"),
   maxModels: document.querySelector("#maxModels"),
@@ -236,6 +237,7 @@ function render() {
   els.routerStatus.classList.toggle("muted", !state.routerRunning);
   els.modeStatus.textContent = state.mode === "hybrid" ? "混合模式" : "全部 API";
   els.modeStatus.classList.toggle("muted", false);
+  els.appVersion.textContent = `v${state.appVersion || "-"}`;
   els.rootDir.textContent = state.rootDir;
   els.selectedCount.textContent = String(draftSelection.length);
   els.maxModels.textContent = String(state.maxModels || 5);

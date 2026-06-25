@@ -100,6 +100,12 @@ test("Windows portable updater script replaces and restarts without batch deleti
   assert.match(script, /Expand-Archive/);
   assert.match(script, /Move-Item/);
   assert.match(script, /Start-Process/);
+  assert.match(script, /function Find-CodexBridgeAppDir/);
+  assert.match(script, /resources\\app\\package\.json/);
+  assert.match(script, /-WorkingDirectory \$CURRENT_APP_DIR/);
+  assert.match(script, /-WorkingDirectory \(Split-Path -Parent \$fallbackExe\)/);
+  assert.match(script, /\$\{EXE_NAME\}: \$AppDir/);
+  assert.doesNotMatch(script, /\$EXE_NAME:/);
   assert.match(script, /\$WAIT_PIDS = @\(1234, 5678\)/);
   assert.match(script, /Waiting for process \$TargetPid to exit/);
   assert.doesNotMatch(script, /Remove-Item\s+-Recurse|rm\s+-rf|rmdir\s+\/s|rd\s+\/s|del\s+\/s/i);

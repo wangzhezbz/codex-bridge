@@ -143,6 +143,44 @@ function Wait-UpdateProcessExit([int]$TargetPid) {
   }
 }
 
+function Find-CodexBridgeAppDir([string]$Root) {
+  $matches = @()
+  $exeFiles = Get-ChildItem -LiteralPath $Root -Filter $EXE_NAME -File -Recurse
+  foreach ($exe in $exeFiles) {
+    $candidateDir = $exe.Directory.FullName
+    $packageJson = Join-Path $candidateDir "resources\\app\\package.json"
+    if (Test-Path -LiteralPath $packageJson) {
+      $matches += $candidateDir
+    }
+  }
+
+  if ($matches.Count -eq 0) {
+    throw "The update package does not contain a valid CodexBridge portable app directory."
+  }
+
+  $preferred = $matches | Where-Object { (Split-Path -Leaf $_) -eq "CodexBridge-win32-x64" } | Select-Object -First 1
+  if ($preferred) {
+    return $preferred
+  }
+
+  if ($matches.Count -eq 1) {
+    return $matches[0]
+  }
+
+  throw ("The update package contains multiple CodexBridge app directories: " + ($matches -join "; "))
+}
+
+function Assert-CodexBridgeAppDir([string]$AppDir) {
+  $exePath = Join-Path $AppDir $EXE_NAME
+  $packageJson = Join-Path $AppDir "resources\\app\\package.json"
+  if (-not (Test-Path -LiteralPath $exePath)) {
+    throw "Current app directory is missing \${EXE_NAME}: $AppDir"
+  }
+  if (-not (Test-Path -LiteralPath $packageJson)) {
+    throw "Current app directory is missing resources\\app\\package.json: $AppDir"
+  }
+}
+
 try {
   foreach ($waitPid in $WAIT_PIDS) {
     Wait-UpdateProcessExit $waitPid
@@ -160,11 +198,9 @@ try {
   New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
   Expand-Archive -LiteralPath $ZIP_PATH -DestinationPath $extractDir -Force
 
-  $newExe = Get-ChildItem -LiteralPath $extractDir -Filter $EXE_NAME -File -Recurse | Select-Object -First 1
-  if (-not $newExe) {
-    throw "The update package does not contain $EXE_NAME."
-  }
-  $newAppDir = $newExe.Directory.FullName
+  Assert-CodexBridgeAppDir $CURRENT_APP_DIR
+  $newAppDir = Find-CodexBridgeAppDir $extractDir
+  Write-UpdateLog "Resolved new app directory: $newAppDir"
 
   Write-UpdateLog "Renaming current app directory to $backupLeaf."
   Rename-Item -LiteralPath $CURRENT_APP_DIR -NewName $backupLeaf
@@ -174,7 +210,7 @@ try {
 
   $nextExe = Join-Path $CURRENT_APP_DIR $EXE_NAME
   Write-UpdateLog "Starting updated CodexBridge: $nextExe"
-  Start-Process -FilePath $nextExe
+  Start-Process -FilePath $nextExe -WorkingDirectory $CURRENT_APP_DIR
   Write-UpdateLog "Update completed. Previous version kept at $backupDir."
 } catch {
   Write-UpdateLog ("Update failed: " + $_.Exception.Message)
@@ -185,7 +221,8 @@ try {
   }
   $fallbackExe = Join-Path $CURRENT_APP_DIR $EXE_NAME
   if (Test-Path -LiteralPath $fallbackExe) {
-    Start-Process -FilePath $fallbackExe
+    Write-UpdateLog "Starting existing CodexBridge after failed update: $fallbackExe"
+    Start-Process -FilePath $fallbackExe -WorkingDirectory (Split-Path -Parent $fallbackExe)
   }
 }
 `;
