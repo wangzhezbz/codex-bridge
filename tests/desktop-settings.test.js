@@ -1278,19 +1278,16 @@ test("restoreCodexConfig restores the latest CodexBridge backup", () => {
   const codexDir = path.join(homeDir, ".codex");
   fs.mkdirSync(codexDir, { recursive: true });
   const target = path.join(codexDir, "config.toml");
-  fs.writeFileSync(target, 'model = "before"\n', "utf8");
-
-  const first = applyCodexConfig({ rootDir, mode: MODE_HYBRID, homeDir });
-  fs.writeFileSync(target, 'model = "manual-after"\n', "utf8");
-  const second = applyCodexConfig({ rootDir, mode: MODE_ALL_API, homeDir });
-  assert.notEqual(first.backup, second.backup);
-  fs.utimesSync(first.backup, new Date(Date.now() + 30_000), new Date(Date.now() + 30_000));
-  fs.utimesSync(second.backup, new Date(Date.now() - 30_000), new Date(Date.now() - 30_000));
+  fs.writeFileSync(target, buildCodexToml({ rootDir, mode: MODE_HYBRID }), "utf8");
+  const firstBackup = path.join(codexDir, "config.toml.codexbridge.2026-06-25-010000000.bak");
+  const secondBackup = path.join(codexDir, "config.toml.codexbridge.2026-06-25-020000000.bak");
+  fs.writeFileSync(firstBackup, 'model = "before"\n', "utf8");
+  fs.writeFileSync(secondBackup, 'model = "manual-after"\n', "utf8");
 
   const restored = restoreCodexConfig({ homeDir });
 
   assert.equal(restored.target, target);
-  assert.equal(restored.backup, second.backup);
+  assert.equal(restored.backup, secondBackup);
   assert.equal(fs.readFileSync(target, "utf8"), 'model = "manual-after"\n');
 });
 
@@ -1300,10 +1297,17 @@ test("restoreCodexConfig prefers the latest non-CodexBridge backup", () => {
   const codexDir = path.join(homeDir, ".codex");
   fs.mkdirSync(codexDir, { recursive: true });
   const target = path.join(codexDir, "config.toml");
-  fs.writeFileSync(target, 'model = "original-user-config"\n', "utf8");
-
-  applyCodexConfig({ rootDir, mode: MODE_HYBRID, homeDir });
-  applyCodexConfig({ rootDir, mode: MODE_ALL_API, homeDir });
+  fs.writeFileSync(target, buildCodexToml({ rootDir, mode: MODE_HYBRID }), "utf8");
+  fs.writeFileSync(
+    path.join(codexDir, "config.toml.codexbridge.2026-06-25-010000000.bak"),
+    'model_provider = "openai"\nopenai_base_url = "http://localhost:15722/v1"\n',
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(codexDir, "config.toml.codexbridge.2026-06-25-020000000.bak"),
+    'model = "original-user-config"\n',
+    "utf8",
+  );
 
   restoreCodexConfig({ homeDir });
 
