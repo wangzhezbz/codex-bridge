@@ -96,6 +96,10 @@ export function modelCapabilitiesPath(rootDir) {
   return path.join(rootDir, "config", "model-capabilities.json");
 }
 
+export function modelDirectoryPath(rootDir) {
+  return path.join(rootDir, "config", "model-directory.local.json");
+}
+
 export function modelImageGenerationPath(rootDir) {
   return path.join(rootDir, "config", "model-image-generation.json");
 }
@@ -343,6 +347,12 @@ export function supportDiagnostics(rootDir, {
         )
       : ["- none"]),
     "",
+    "Model capability overrides:",
+    ...modelCapabilityDiagnosticsLines(rootDir),
+    "",
+    "Provider model directory:",
+    ...modelDirectoryDiagnosticsLines(rootDir),
+    "",
     "API keys:",
     ...(selectedKeyEnvs.length
       ? selectedKeyEnvs.map((keyEnv) => `- ${keyEnv}: ${secretMap[keyEnv] || process.env[keyEnv] ? "saved" : "missing"}`)
@@ -392,6 +402,8 @@ export function supportDiagnostics(rootDir, {
         updateDir,
         updateDirExists: safeExists(updateDir),
       },
+      modelCapabilityOverrides: Object.keys(readModelCapabilityOverrides(rootDir)).length,
+      modelDirectory: modelDirectoryDiagnosticsSummary(rootDir),
       history: historyDiagnostics.summary,
       codexPlugins: pluginDiagnostics.summary,
     },
@@ -442,6 +454,61 @@ function usageDiagnosticsSummary(usageSummary = null) {
       : null,
     latestErrorType: String(usageSummary?.latest?.errorType || ""),
   };
+}
+
+function modelCapabilityDiagnosticsLines(rootDir) {
+  const overrides = readModelCapabilityOverrides(rootDir);
+  const entries = Object.entries(overrides);
+  if (!entries.length) {
+    return ["- none"];
+  }
+  return entries.map(([presetId, override]) => {
+    const parts = [`- ${redactSecretText(presetId)}`];
+    if (override.inputModalities) {
+      parts.push(`modalities=${override.inputModalities.join(",")}`);
+    }
+    if (override.contextWindow) {
+      parts.push(`contextWindow=${override.contextWindow}`);
+    }
+    if (override.reasoning?.mode) {
+      parts.push(`reasoning=${redactSecretText(override.reasoning.mode)}`);
+    }
+    if (override.updatedAt) {
+      parts.push(`updatedAt=${redactSecretText(override.updatedAt)}`);
+    }
+    return parts.join(" ");
+  });
+}
+
+function modelDirectoryDiagnosticsLines(rootDir) {
+  const directory = readModelDirectory(rootDir);
+  const entries = Object.values(directory.providers || {});
+  if (!entries.length) {
+    return ["- offline presets only"];
+  }
+  return entries.map((entry) =>
+    `- ${redactSecretText(entry.providerId)} models=${entry.models?.length || 0} fetchedAt=${redactSecretText(entry.fetchedAt || "unknown")} baseUrl=${redactSecretText(entry.baseUrl || "")}`,
+  );
+}
+
+function modelDirectoryDiagnosticsSummary(rootDir) {
+  const directory = readModelDirectory(rootDir);
+  const entries = Object.values(directory.providers || {});
+  return {
+    providerCount: entries.length,
+    modelCount: entries.reduce((total, entry) => total + Number(entry.models?.length || 0), 0),
+    staleProviders: entries
+      .filter((entry) => modelDirectoryEntryIsStale(entry.fetchedAt))
+      .map((entry) => entry.providerId),
+  };
+}
+
+function modelDirectoryEntryIsStale(fetchedAt) {
+  const date = new Date(fetchedAt || "");
+  if (Number.isNaN(date.getTime())) {
+    return true;
+  }
+  return Date.now() - date.getTime() > 7 * 24 * 60 * 60 * 1000;
 }
 
 function usageDiagnosticsLines(usageSummary = null) {
@@ -912,10 +979,12 @@ export function providerCatalog(rootDir) {
 }
 
 export function modelCatalog(rootDir) {
-  const overrides = readModelImageInputOverrides(rootDir);
+  const imageInputOverrides = readModelImageInputOverrides(rootDir);
+  const capabilityOverrides = readModelCapabilityOverrides(rootDir);
   return [...MODEL_PRESETS, ...readCustomModels(rootDir)]
     .map((model) => modelWithDefaultCapabilities(model))
-    .map((model) => applyModelImageInputOverride(model, overrides));
+    .map((model) => applyModelImageInputOverride(model, imageInputOverrides))
+    .map((model) => applyModelCapabilityOverride(model, capabilityOverrides));
 }
 
 export function readSelection(rootDir, mode = MODE_HYBRID) {
@@ -944,7 +1013,11 @@ export function readCustomModels(rootDir) {
 }
 
 export function readModelImageInputOverrides(rootDir) {
-  const saved = readJsonIfExists(modelCapabilitiesPath(rootDir), {});
+  const saved = readModelCapabilitiesFile(rootDir);
+  return imageInputOverridesFromCapabilities(saved);
+}
+
+function imageInputOverridesFromCapabilities(saved) {
   const source = saved?.imageInput && typeof saved.imageInput === "object"
     ? saved.imageInput
     : saved;
@@ -964,21 +1037,138 @@ export function readModelImageInputOverrides(rootDir) {
   return overrides;
 }
 
+export function readModelCapabilityOverrides(rootDir) {
+  const saved = readModelCapabilitiesFile(rootDir);
+  const source = saved?.overrides && typeof saved.overrides === "object"
+    ? saved.overrides
+    : saved?.capabilityOverrides && typeof saved.capabilityOverrides === "object"
+      ? saved.capabilityOverrides
+      : {};
+  const overrides = {};
+  for (const [presetId, value] of Object.entries(source || {})) {
+    const normalized = normalizeModelCapabilityOverride(value, { keepUpdatedAt: true });
+    if (normalized) {
+      overrides[presetId] = normalized;
+    }
+  }
+  return overrides;
+}
+
 export function saveModelImageInputOverride(rootDir, presetId, enabled) {
   const id = String(presetId || "").trim();
   if (!id) {
     throw new Error("Model id is required.");
   }
-  const overrides = readModelImageInputOverrides(rootDir);
-  overrides[id] = Boolean(enabled);
-  const target = modelCapabilitiesPath(rootDir);
-  fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.writeFileSync(
-    target,
-    `${JSON.stringify({ version: 2, imageInput: overrides }, null, 2)}\n`,
-    "utf8",
-  );
-  return { presetId: id, imageInput: overrides[id] };
+  const imageInput = readModelImageInputOverrides(rootDir);
+  const capabilityOverrides = readModelCapabilityOverrides(rootDir);
+  imageInput[id] = Boolean(enabled);
+  if (Array.isArray(capabilityOverrides[id]?.inputModalities)) {
+    capabilityOverrides[id] = {
+      ...capabilityOverrides[id],
+      inputModalities: toggleInputModality(
+        capabilityOverrides[id].inputModalities,
+        "image",
+        Boolean(enabled),
+      ),
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  writeModelCapabilities(rootDir, { imageInput, overrides: capabilityOverrides });
+  return { presetId: id, imageInput: imageInput[id] };
+}
+
+export function saveModelCapabilityOverride(rootDir, presetId, override = {}, options = {}) {
+  const id = String(presetId || "").trim();
+  if (!id) {
+    throw new Error("Model id is required.");
+  }
+  const normalized = normalizeModelCapabilityOverride(override);
+  if (!normalized) {
+    throw new Error("At least one model capability override is required.");
+  }
+  const imageInput = readModelImageInputOverrides(rootDir);
+  const overrides = readModelCapabilityOverrides(rootDir);
+  const updatedAt = typeof options.now === "function"
+    ? String(options.now())
+    : new Date().toISOString();
+  const saved = {
+    ...normalized,
+    updatedAt,
+  };
+  overrides[id] = saved;
+  if (Array.isArray(saved.inputModalities)) {
+    imageInput[id] = saved.inputModalities.includes("image");
+  }
+  writeModelCapabilities(rootDir, { imageInput, overrides });
+  refreshRouterConfigIfPresent(rootDir);
+  return saved;
+}
+
+export function readModelDirectory(rootDir) {
+  return normalizeModelDirectory(readJsonIfExists(modelDirectoryPath(rootDir), {}));
+}
+
+export async function refreshProviderModelDirectory(rootDir, providerId, {
+  fetchImpl = globalThis.fetch,
+  now = () => new Date().toISOString(),
+} = {}) {
+  const id = String(providerId || "").trim();
+  const provider = providerCatalog(rootDir).find((item) => item.id === id);
+  const existing = readModelDirectory(rootDir).providers[id] || null;
+  if (!provider) {
+    return modelDirectoryRefreshFailure(id, `Unknown provider: ${id}`, existing);
+  }
+  if ((provider.authMode || "api_key") === "codex_openai") {
+    return modelDirectoryRefreshFailure(id, "Codex subscription providers use offline presets.", existing);
+  }
+  if (typeof fetchImpl !== "function") {
+    return modelDirectoryRefreshFailure(id, "fetch is not available in this runtime", existing);
+  }
+  const endpoint = modelDirectoryEndpointForProvider(provider);
+  if (!endpoint) {
+    return modelDirectoryRefreshFailure(id, "Provider does not expose a model directory endpoint.", existing);
+  }
+  const keyEnv = provider.keyEnv || provider.apiKeyEnv || "";
+  const apiKey = keyEnv ? (loadSecrets(rootDir)[keyEnv] || process.env[keyEnv] || "") : "";
+  if ((provider.authMode || "api_key") === "api_key" && keyEnv && !apiKey) {
+    return modelDirectoryRefreshFailure(id, `Missing API key: ${keyEnv}`, existing);
+  }
+
+  try {
+    const headers = { Accept: "application/json" };
+    if (apiKey) {
+      headers.Authorization = `Bearer ${apiKey}`;
+    }
+    const response = await fetchImpl(endpoint, {
+      method: "GET",
+      headers,
+    });
+    if (!response?.ok) {
+      const text = typeof response?.text === "function" ? await response.text() : "";
+      throw new Error(`HTTP ${response?.status || 0}${text ? ` ${String(text).slice(0, 160)}` : ""}`);
+    }
+    const body = typeof response.json === "function" ? await response.json() : {};
+    const models = normalizeProviderModelList(body);
+    const directory = readModelDirectory(rootDir);
+    const entry = {
+      providerId: id,
+      providerName: provider.name || id,
+      baseUrl: String(provider.baseUrl || "").trim().replace(/\/+$/, ""),
+      endpoint,
+      source: "remote",
+      fetchedAt: String(now()),
+      models,
+    };
+    directory.providers[id] = entry;
+    writeJsonAtomic(modelDirectoryPath(rootDir), directory);
+    return {
+      ok: true,
+      ...entry,
+      count: models.length,
+    };
+  } catch (error) {
+    return modelDirectoryRefreshFailure(id, error.message || String(error), existing);
+  }
 }
 
 export function readModelImageGenerationOverrides(rootDir) {
@@ -2526,6 +2716,31 @@ function applyModelImageInputOverride(model, overrides) {
   };
 }
 
+function applyModelCapabilityOverride(model, overrides) {
+  const override = overrides[model.presetId];
+  if (!override) {
+    return model;
+  }
+  const next = {
+    ...model,
+    capabilityOverrides: override,
+    capabilityOverrideSource: "manual",
+  };
+  if (override.updatedAt) {
+    next.capabilityOverrideUpdatedAt = override.updatedAt;
+  }
+  if (Array.isArray(override.inputModalities)) {
+    next.inputModalities = override.inputModalities;
+  }
+  if (override.contextWindow) {
+    next.contextWindow = override.contextWindow;
+  }
+  if (override.reasoning) {
+    next.reasoningCapabilityOverride = override.reasoning;
+  }
+  return next;
+}
+
 function builtInVisionPresetIds() {
   return new Set(
     MODEL_PRESETS
@@ -2579,6 +2794,10 @@ function routeForSelectedModel(model, slot, priority, imageGenerationOverrides =
     "max_tool_continuation_turns",
     "upstreamTimeoutMs",
     "upstream_timeout_ms",
+    "capabilityOverrides",
+    "capabilityOverrideSource",
+    "capabilityOverrideUpdatedAt",
+    "reasoningCapabilityOverride",
   ]) {
     if (model[key] !== undefined) {
       route[key] = model[key];
@@ -2769,6 +2988,189 @@ function writeCustomModels(rootDir, models) {
   writeJsonAtomic(target, models);
 }
 
+function readModelCapabilitiesFile(rootDir) {
+  const saved = readJsonIfExists(modelCapabilitiesPath(rootDir), {});
+  return saved && typeof saved === "object" && !Array.isArray(saved) ? saved : {};
+}
+
+function writeModelCapabilities(rootDir, { imageInput = {}, overrides = {} } = {}) {
+  const target = modelCapabilitiesPath(rootDir);
+  writeJsonAtomic(target, {
+    version: 3,
+    imageInput,
+    overrides,
+  });
+}
+
+function normalizeModelCapabilityOverride(value, { keepUpdatedAt = false } = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const result = {};
+  const inputModalities = normalizeCapabilityInputModalities(value);
+  if (inputModalities) {
+    result.inputModalities = inputModalities;
+  }
+  const contextWindow = Number(value.contextWindow);
+  if (Number.isFinite(contextWindow) && contextWindow > 0) {
+    result.contextWindow = Math.floor(contextWindow);
+  }
+  const reasoning = normalizeReasoningCapabilityOverride(value.reasoning ?? value.reasoningMode);
+  if (reasoning) {
+    result.reasoning = reasoning;
+  }
+  if (keepUpdatedAt && typeof value.updatedAt === "string" && value.updatedAt.trim()) {
+    result.updatedAt = value.updatedAt.trim();
+  }
+  return Object.keys(result).length ? result : null;
+}
+
+function normalizeCapabilityInputModalities(value = {}) {
+  const hasInputModalities = Array.isArray(value.inputModalities);
+  const hasBooleanOverrides = ["imageInput", "fileInput", "audioInput"].some(
+    (key) => Object.prototype.hasOwnProperty.call(value, key),
+  );
+  if (!hasInputModalities && !hasBooleanOverrides) {
+    return null;
+  }
+  const base = normalizeInputModalities(
+    hasInputModalities ? value.inputModalities : ["text"],
+    ["text"],
+  );
+  const set = new Set(base);
+  for (const [key, modality] of [
+    ["imageInput", "image"],
+    ["fileInput", "file"],
+    ["audioInput", "audio"],
+  ]) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) {
+      continue;
+    }
+    if (value[key]) {
+      set.add(modality);
+    } else {
+      set.delete(modality);
+    }
+  }
+  set.add("text");
+  return orderInputModalities([...set]);
+}
+
+function normalizeReasoningCapabilityOverride(value) {
+  if (!value) {
+    return null;
+  }
+  if (typeof value === "string") {
+    const mode = value.trim();
+    return mode ? { mode } : null;
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const mode = String(value.mode || value.status || "").trim();
+  if (!mode) {
+    return null;
+  }
+  const result = { mode };
+  if (typeof value.note === "string" && value.note.trim()) {
+    result.note = value.note.trim().slice(0, 200);
+  }
+  return result;
+}
+
+function toggleInputModality(inputModalities, modality, enabled) {
+  const set = new Set(normalizeInputModalities(inputModalities, ["text"]));
+  if (enabled) {
+    set.add(modality);
+  } else {
+    set.delete(modality);
+  }
+  set.add("text");
+  return orderInputModalities([...set]);
+}
+
+function orderInputModalities(inputModalities) {
+  const set = new Set(inputModalities);
+  return ["text", "image", "file", "audio"].filter((modality) => set.has(modality));
+}
+
+function normalizeModelDirectory(saved) {
+  const providers = {};
+  const source = saved?.providers && typeof saved.providers === "object"
+    ? saved.providers
+    : {};
+  for (const [providerId, entry] of Object.entries(source)) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      continue;
+    }
+    providers[providerId] = {
+      providerId,
+      providerName: String(entry.providerName || providerId).trim(),
+      baseUrl: String(entry.baseUrl || "").trim(),
+      endpoint: String(entry.endpoint || "").trim(),
+      source: String(entry.source || "remote").trim(),
+      fetchedAt: String(entry.fetchedAt || "").trim(),
+      models: normalizeProviderModelList({ data: entry.models || [] }),
+    };
+  }
+  return {
+    version: 1,
+    providers,
+  };
+}
+
+function modelDirectoryEndpointForProvider(provider = {}) {
+  const baseUrl = String(provider.baseUrl || "").trim().replace(/\/+$/, "");
+  if (!baseUrl || !isValidHttpUrl(baseUrl)) {
+    return "";
+  }
+  return `${baseUrl}/models`;
+}
+
+function normalizeProviderModelList(body) {
+  const rawModels = Array.isArray(body?.data)
+    ? body.data
+    : Array.isArray(body?.models)
+      ? body.models
+      : Array.isArray(body)
+        ? body
+        : [];
+  const seen = new Set();
+  const models = [];
+  for (const item of rawModels) {
+    const id = typeof item === "string" ? item : String(item?.id || item?.name || "").trim();
+    if (!id || seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    const model = { id };
+    if (item && typeof item === "object" && !Array.isArray(item)) {
+      if (item.object) {
+        model.object = String(item.object);
+      }
+      if (item.owned_by) {
+        model.ownedBy = String(item.owned_by);
+      }
+      if (Number.isFinite(Number(item.created))) {
+        model.created = Number(item.created);
+      }
+    }
+    models.push(model);
+  }
+  return models;
+}
+
+function modelDirectoryRefreshFailure(providerId, error, existing) {
+  return {
+    ok: false,
+    providerId,
+    error: String(error || "Unknown model directory refresh error."),
+    cached: Boolean(existing),
+    stale: Boolean(existing),
+    models: existing?.models || [],
+  };
+}
+
 function slugify(value) {
   return String(value)
     .trim()
@@ -2791,7 +3193,7 @@ function normalizeInputModalities(value, defaultModalities = ["text", "image"]) 
   const requested = Array.isArray(value) && value.length ? value : defaultModalities;
   const normalized = [];
   for (const modality of requested) {
-    if (!["text", "image"].includes(modality) || normalized.includes(modality)) {
+    if (!["text", "image", "file", "audio"].includes(modality) || normalized.includes(modality)) {
       continue;
     }
     normalized.push(modality);

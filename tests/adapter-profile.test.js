@@ -254,6 +254,34 @@ test("adapter profiles expose route-specific chat capabilities without weakening
   assert.ok(custom.safeParams.includes("response_format"));
 });
 
+test("adapter profiles report manual capability overrides without changing reasoning params", () => {
+  const profile = normalizeAdapterProfile({
+    id: "deepseek-v4-pro",
+    provider: "deepseek",
+    api: "chat_completions",
+    model: "deepseek-v4-pro",
+    inputModalities: ["text", "image", "file", "audio"],
+    contextWindow: 123456,
+    capabilityOverrides: {
+      reasoning: { mode: "unknown", note: "manual verification pending" },
+    },
+    dropParams: ["response_format", "parallel_tool_calls"],
+  });
+
+  assert.equal(profile.supportsImages, "chat-image-url");
+  assert.equal(profile.capabilities.audio, "none");
+  assert.equal(profile.capabilities.contextWindow, 123456);
+  assert.equal(profile.capabilities.reasoning.mode, "unknown");
+  assert.equal(profile.capabilities.reasoning.manualOverride, true);
+  assert.deepEqual(profile.capabilities.reasoning.params, [
+    "reasoning_effort",
+    "thinking",
+  ]);
+  assert.equal(profile.dropParams.includes("response_format"), true);
+  assert.equal(profile.dropParams.includes("parallel_tool_calls"), true);
+  assert.equal(profile.dropParams.includes("reasoning"), true);
+});
+
 test("adapter profiles keep reasoning parameters route-specific and preserve custom passthrough", () => {
   const deepseekV4 = normalizeAdapterProfile({
     provider: "deepseek",

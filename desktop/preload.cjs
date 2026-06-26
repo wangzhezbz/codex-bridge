@@ -9,6 +9,8 @@ contextBridge.exposeInMainWorld("codexBridge", {
   saveModelSelection: (selectedModelIds) => ipcRenderer.invoke("models:saveSelection", selectedModelIds),
   saveModelImageInput: (payload) => ipcRenderer.invoke("models:saveImageInput", payload),
   saveModelImageGeneration: (payload) => ipcRenderer.invoke("models:saveImageGeneration", payload),
+  saveModelCapabilities: (payload) => ipcRenderer.invoke("models:saveCapabilities", payload),
+  refreshProviderModels: (providerId) => ipcRenderer.invoke("providers:refreshModels", providerId),
   saveCustomModel: (model) => ipcRenderer.invoke("customModel:save", model),
   removeCustomModel: (presetId) => ipcRenderer.invoke("customModel:remove", presetId),
   generateCatalog: () => ipcRenderer.invoke("catalog:generate"),

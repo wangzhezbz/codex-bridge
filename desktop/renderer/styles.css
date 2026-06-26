@@ -880,6 +880,15 @@ h3 {
   font-weight: 650;
 }
 
+.model-capability-summary {
+  display: block;
+  margin-top: 8px;
+  color: #526776;
+  font-size: 11px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
 .model-card-actions {
   display: flex;
   gap: 10px;
@@ -916,6 +925,73 @@ h3 {
 
 .capability-toggle.enabled strong {
   color: var(--accent-strong);
+}
+
+.capability-override {
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.capability-override summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+  color: #526776;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.capability-override summary strong {
+  color: var(--accent-strong);
+  font-size: 12px;
+}
+
+.capability-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto minmax(0, 1fr);
+  gap: 8px;
+  margin-top: 10px;
+  align-items: end;
+}
+
+.capability-fields label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.capability-fields span {
+  color: #526776;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.capability-fields input[type="number"],
+.capability-fields select {
+  min-height: 34px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.checkbox-field.compact {
+  align-self: end;
+  min-height: 34px;
+  padding: 7px 9px;
+}
+
+.capability-note,
+.provider-model-directory {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .image-generation-panel {
@@ -1401,6 +1477,7 @@ code {
   .mode-grid,
   .provider-grid,
   .custom-form,
+  .capability-fields,
   .model-card-grid,
   .selection-strip {
     grid-template-columns: 1fr;

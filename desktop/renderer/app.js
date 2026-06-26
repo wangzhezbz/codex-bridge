@@ -330,6 +330,7 @@ function renderProviders() {
   const cards = state.providers.map((provider) => {
     const saved = provider.keyEnv ? Boolean(state.secretStatus?.[provider.keyEnv]) : true;
     const status = provider.keyEnv ? (saved ? "已保存" : "未保存") : "无需 Key";
+    const directoryInfo = providerModelDirectoryInfo(provider.id);
     const keyControl = provider.keyEnv
       ? `
         <label>
@@ -347,6 +348,9 @@ function renderProviders() {
     const keyButton = provider.keyUrl
       ? `<button class="plain-button small" data-open-url="${escapeHtml(provider.keyUrl)}">获取 API Key</button>`
       : "";
+    const refreshButton = provider.baseUrl && provider.authMode !== "codex_openai"
+      ? `<button class="ghost-button light small" data-refresh-provider-models="${escapeHtml(provider.id)}">刷新模型</button>`
+      : "";
     return `
       <article class="provider-card" data-provider-id="${escapeHtml(provider.id)}">
         <div class="provider-head">
@@ -356,10 +360,12 @@ function renderProviders() {
           </div>
           <span class="tag ${saved ? "ok" : ""}">${status}</span>
         </div>
+        <p class="provider-model-directory">${escapeHtml(directoryInfo)}</p>
         ${keyControl}
         <div class="provider-actions">
           ${saveButton}
           ${keyButton}
+          ${refreshButton}
           ${provider.docsUrl ? `<button class="ghost-button light small" data-open-url="${escapeHtml(provider.docsUrl)}">文档</button>` : ""}
         </div>
       </article>
@@ -388,6 +394,23 @@ function renderProviders() {
   });
   els.providerGrid.querySelectorAll("[data-save-provider]").forEach((button) => {
     button.addEventListener("click", () => saveProviderSecret(button));
+  });
+  els.providerGrid.querySelectorAll("[data-refresh-provider-models]").forEach((button) => {
+    button.addEventListener("click", () =>
+      runAction(button, async () => {
+        const response = await api.refreshProviderModels(button.dataset.refreshProviderModels);
+        state = response?.state || await api.getState();
+        draftSelection = [...state.selectedModelIds];
+        render();
+        const result = response?.result || {};
+        showToast(
+          result.ok
+            ? `模型列表已刷新：${result.count || 0} 个`
+            : `模型列表刷新失败：${result.error || "unknown error"}`,
+          result.ok ? "success" : "error",
+        );
+      }),
+    );
   });
 }
 
@@ -533,6 +556,12 @@ function renderModelPool() {
       });
     });
   });
+  els.modelPool.querySelectorAll("[data-capability-save]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      saveModelCapabilitySettings(button);
+    });
+  });
   els.modelPool.querySelectorAll("[data-edit-custom]").forEach((button) => {
     button.addEventListener("click", () => startCustomModelEdit(button.dataset.editCustom));
   });
@@ -567,6 +596,7 @@ function modelCard(model, selected, max) {
       <button class="model-card ${isSelected ? "selected" : ""}" data-model-id="${escapeHtml(model.presetId)}" ${disabled ? "disabled" : ""}>
         <span class="model-title">${escapeHtml(model.displayName)}</span>
         <span class="model-meta">${escapeHtml(model.model)} · ${escapeHtml(model.api)}</span>
+        <span class="model-capability-summary">${escapeHtml(modelCapabilitySummary(model))}</span>
         <span class="model-foot">${escapeHtml(reason)}</span>
       </button>
       <button
@@ -579,6 +609,7 @@ function modelCard(model, selected, max) {
         <span>图片上传</span>
         <strong>${supportsImage ? "开" : "关"}</strong>
       </button>
+      ${capabilityOverrideControl(model)}
       ${imageGenerationControl(model)}
       ${
         model.custom
@@ -743,8 +774,109 @@ function imageGenerationPayload(panel) {
   };
 }
 
+function capabilityOverrideControl(model) {
+  const modalities = new Set(inputModalitiesForModel(model));
+  const manual = model.capabilityOverrideSource === "manual";
+  const reasoningMode = model.reasoningCapabilityOverride?.mode || "";
+  return `
+    <details class="capability-override" data-capability-config data-preset-id="${escapeHtml(model.presetId)}">
+      <summary>
+        <span>能力覆盖</span>
+        <strong>${manual ? "手动" : "默认"}</strong>
+      </summary>
+      <div class="capability-fields">
+        <label>
+          <span>Context</span>
+          <input type="number" min="1" step="1" data-cap-context value="${escapeHtml(String(model.contextWindow || 258400))}" />
+        </label>
+        <label class="checkbox-field compact">
+          <input type="checkbox" data-cap-file ${modalities.has("file") ? "checked" : ""} />
+          <span>文件</span>
+        </label>
+        <label class="checkbox-field compact">
+          <input type="checkbox" data-cap-audio ${modalities.has("audio") ? "checked" : ""} />
+          <span>音频</span>
+        </label>
+        <label>
+          <span>Reasoning</span>
+          <select data-cap-reasoning>
+            ${capabilityReasoningOption("", "自动", reasoningMode)}
+            ${capabilityReasoningOption("unknown", "未知", reasoningMode)}
+            ${capabilityReasoningOption("supported", "支持", reasoningMode)}
+            ${capabilityReasoningOption("unsupported", "不支持", reasoningMode)}
+          </select>
+        </label>
+        <button class="ghost-button light small" type="button" data-capability-save>保存能力</button>
+      </div>
+      <p class="capability-note">只影响这个模型的能力声明和目录，不改 API Key、tools 或 MCP。</p>
+    </details>
+  `;
+}
+
+function capabilityReasoningOption(value, label, selected) {
+  return `<option value="${escapeHtml(value)}" ${value === selected ? "selected" : ""}>${escapeHtml(label)}</option>`;
+}
+
+function saveModelCapabilitySettings(button) {
+  return runAction(button, async () => {
+    const panel = button.closest("[data-capability-config]");
+    const presetId = panel.dataset.presetId;
+    const model = modelMap().get(presetId);
+    const inputModalities = ["text"];
+    if (modelSupportsImage(model)) {
+      inputModalities.push("image");
+    }
+    if (panel.querySelector("[data-cap-file]")?.checked) {
+      inputModalities.push("file");
+    }
+    if (panel.querySelector("[data-cap-audio]")?.checked) {
+      inputModalities.push("audio");
+    }
+    const contextWindow = Number(panel.querySelector("[data-cap-context]")?.value || 0);
+    const reasoningMode = panel.querySelector("[data-cap-reasoning]")?.value || "";
+    const response = await api.saveModelCapabilities({
+      presetId,
+      capabilities: {
+        inputModalities,
+        contextWindow,
+        reasoning: reasoningMode ? { mode: reasoningMode } : undefined,
+      },
+    });
+    state = response?.state || await api.getState();
+    draftSelection = [...state.selectedModelIds];
+    render();
+    showToast("模型能力覆盖已保存。");
+  });
+}
+
+function modelCapabilitySummary(model) {
+  const modalities = new Set(inputModalitiesForModel(model));
+  const parts = [
+    `Context ${formatNumber(model.contextWindow || 258400)}`,
+    `图片${modalities.has("image") ? "开" : "关"}`,
+    `文件${modalities.has("file") ? "开" : "默认"}`,
+  ];
+  if (modalities.has("audio")) {
+    parts.push("音频开");
+  }
+  if (model.reasoningCapabilityOverride?.mode) {
+    parts.push(`Reasoning ${model.reasoningCapabilityOverride.mode}`);
+  }
+  if (model.capabilityOverrideSource === "manual") {
+    parts.push("手动");
+  }
+  return parts.join(" · ");
+}
+
 function modelSupportsImage(model) {
   return Array.isArray(model?.inputModalities) && model.inputModalities.includes("image");
+}
+
+function inputModalitiesForModel(model) {
+  if (Array.isArray(model?.inputModalities) && model.inputModalities.length) {
+    return model.inputModalities;
+  }
+  return model?.api === "responses" ? ["text", "image"] : ["text"];
 }
 
 function toggleModel(presetId) {
@@ -1214,6 +1346,35 @@ function groupByProvider(models) {
     groups.get(model.providerId).push(model);
   }
   return [...groups.entries()];
+}
+
+function providerModelDirectoryInfo(providerId) {
+  const entry = state.modelDirectory?.providers?.[providerId];
+  if (!entry) {
+    return "模型目录：离线 preset，可手动刷新";
+  }
+  const age = modelDirectoryAgeLabel(entry.fetchedAt);
+  const stale = modelDirectoryIsStale(entry.fetchedAt);
+  return `模型目录：${entry.models?.length || 0} 个 · ${age}${stale ? " · 可能过期" : ""}`;
+}
+
+function modelDirectoryAgeLabel(value) {
+  if (!value) {
+    return "未知时间";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return formatTime(value);
+}
+
+function modelDirectoryIsStale(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return true;
+  }
+  return Date.now() - date.getTime() > 7 * 24 * 60 * 60 * 1000;
 }
 
 function providerFor(providerId) {

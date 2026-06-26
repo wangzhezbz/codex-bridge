@@ -136,6 +136,12 @@ export function normalizeAdapterProfile(route = {}) {
 }
 
 function capabilitiesForRoute(route, profile) {
+  const reasoning = reasoningCapabilityForRoute(
+    route,
+    profile.api,
+    profile.providerFamily,
+    profile.customConservative,
+  );
   return {
     api: profile.api,
     providerFamily: profile.providerFamily,
@@ -148,12 +154,7 @@ function capabilitiesForRoute(route, profile) {
       profile.providerFamily,
       profile.inputModalities,
     ),
-    reasoning: reasoningCapabilityForRoute(
-      route,
-      profile.api,
-      profile.providerFamily,
-      profile.customConservative,
-    ),
+    reasoning: applyManualReasoningCapabilityOverride(route, reasoning),
     compact: compactCapabilityForRoute(route, profile.api),
     promptCache: profile.supportsPromptCaching,
     contextWindow: profile.contextWindow,
@@ -164,6 +165,24 @@ function capabilitiesForRoute(route, profile) {
       profile.providerFamily,
       profile.customConservative,
     ),
+  };
+}
+
+function applyManualReasoningCapabilityOverride(route = {}, reasoning = {}) {
+  const manual = route.capabilityOverrides?.reasoning || route.reasoningCapabilityOverride;
+  const mode = typeof manual === "string"
+    ? manual.trim()
+    : typeof manual?.mode === "string"
+      ? manual.mode.trim()
+      : "";
+  if (!mode) {
+    return reasoning;
+  }
+  return {
+    ...reasoning,
+    mode,
+    manualOverride: true,
+    note: typeof manual?.note === "string" ? manual.note : undefined,
   };
 }
 

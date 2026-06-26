@@ -260,6 +260,8 @@ ipcMain.handle("state:get", async () => {
     models: config?.models || [],
     providers: settings.providerCatalog(dataRootDir),
     modelPresets: settings.modelCatalog(dataRootDir),
+    modelDirectory: settings.readModelDirectory(dataRootDir),
+    modelCapabilityOverrides: settings.readModelCapabilityOverrides(dataRootDir),
     selectedModelIds: settings.readSelection(dataRootDir, mode),
     maxModels: settings.CODEX_MODEL_SLOTS?.length || 5,
     modelSlots: settings.CODEX_MODEL_SLOTS || [],
@@ -358,6 +360,47 @@ ipcMain.handle("models:saveImageGeneration", async (_event, payload) => {
   );
   broadcastState();
   return getStatePayload(settings);
+});
+
+ipcMain.handle("models:saveCapabilities", async (_event, payload) => {
+  const settings = await loadSettings();
+  const presetId = String(payload?.presetId || "");
+  const saved = settings.saveModelCapabilityOverride(
+    dataRootDir,
+    presetId,
+    payload?.capabilities || {},
+  );
+  const config = settings.readRouterConfig(dataRootDir);
+  const mode = settings.detectModeFromConfig(config);
+  settings.writeRouterConfigFromSelection(dataRootDir, mode);
+  const catalogResult = await runNodeScript([
+    scriptPath("scripts/generate-catalog.js"),
+    settings.catalogPath(dataRootDir),
+  ]);
+  if (!catalogResult.ok) {
+    throw new Error(catalogResult.output || "Failed to generate model catalog.");
+  }
+  appendLog(`Updated model capabilities: ${presetId}.`);
+  broadcastState();
+  return {
+    saved,
+    state: await getStatePayload(settings),
+  };
+});
+
+ipcMain.handle("providers:refreshModels", async (_event, providerId) => {
+  const settings = await loadSettings();
+  const result = await settings.refreshProviderModelDirectory(dataRootDir, String(providerId || ""));
+  appendLog(
+    result.ok
+      ? `Refreshed model directory: ${result.providerId} (${result.count || 0} models).`
+      : `Model directory refresh failed: ${result.providerId} ${result.error || "unknown error"}.`,
+  );
+  broadcastState();
+  return {
+    result,
+    state: await getStatePayload(settings),
+  };
 });
 
 ipcMain.handle("customModel:save", async (_event, model) => {
@@ -1150,6 +1193,8 @@ async function getStatePayload(settings) {
     models: config?.models || [],
     providers: settings.providerCatalog(dataRootDir),
     modelPresets: settings.modelCatalog(dataRootDir),
+    modelDirectory: settings.readModelDirectory(dataRootDir),
+    modelCapabilityOverrides: settings.readModelCapabilityOverrides(dataRootDir),
     selectedModelIds: settings.readSelection(dataRootDir, mode),
     maxModels: settings.CODEX_MODEL_SLOTS?.length || 5,
     modelSlots: settings.CODEX_MODEL_SLOTS || [],

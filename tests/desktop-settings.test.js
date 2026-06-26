@@ -14,10 +14,14 @@ import {
   detectModeFromConfig,
   ensureRouterConfig,
   loadDesktopOptions,
+  modelCatalog,
   providerCatalog,
   prepareRouterStartConfig,
+  readModelCapabilityOverrides,
+  readModelDirectory,
   readRouterConfig,
   readCustomModels,
+  refreshProviderModelDirectory,
   recoverCodexHistoryAccess,
   removeCustomModel,
   restoreCodexConfig,
@@ -26,6 +30,7 @@ import {
   routerRuntimeEnv,
   readModelImageGenerationOverrides,
   saveModelImageInputOverride,
+  saveModelCapabilityOverride,
   saveModelImageGenerationOverride,
   saveCustomModel,
   saveDesktopOptions,
@@ -937,6 +942,117 @@ test("legacy false image overrides do not disable built-in vision presets", () =
   saveModelImageInputOverride(rootDir, "codex-gpt-5-5", false);
   const explicitConfig = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
   assert.deepEqual(explicitConfig.models[0].inputModalities, ["text"]);
+});
+
+test("provider model directory refresh caches model ids without saving secrets", async () => {
+  const rootDir = makeTempProject();
+  saveSecrets(rootDir, { DEEPSEEK_API_KEY: "deepseek-secret" });
+
+  const result = await refreshProviderModelDirectory(rootDir, "deepseek", {
+    now: () => "2026-06-26T01:02:03.000Z",
+    fetchImpl: async (url, options) => {
+      assert.equal(url, "https://api.deepseek.com/v1/models");
+      assert.equal(options.method, "GET");
+      assert.equal(options.headers.Authorization, "Bearer deepseek-secret");
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          data: [
+            { id: "deepseek-v4-pro", object: "model", owned_by: "deepseek" },
+            { id: "deepseek-reasoner", created: 123 },
+          ],
+        }),
+      };
+    },
+  });
+
+  const directory = readModelDirectory(rootDir);
+  const cached = directory.providers.deepseek;
+
+  assert.equal(result.ok, true);
+  assert.equal(result.providerId, "deepseek");
+  assert.deepEqual(result.models.map((model) => model.id), [
+    "deepseek-v4-pro",
+    "deepseek-reasoner",
+  ]);
+  assert.equal(cached.fetchedAt, "2026-06-26T01:02:03.000Z");
+  assert.equal(cached.baseUrl, "https://api.deepseek.com/v1");
+  assert.deepEqual(cached.models.map((model) => model.id), [
+    "deepseek-v4-pro",
+    "deepseek-reasoner",
+  ]);
+  assert.equal(JSON.stringify(directory).includes("deepseek-secret"), false);
+});
+
+test("provider model directory refresh failure keeps presets and router config intact", async () => {
+  const rootDir = makeTempProject();
+  saveSecrets(rootDir, { DEEPSEEK_API_KEY: "deepseek-secret" });
+  saveSelection(rootDir, ["codex-gpt-5-5", "deepseek-v4-pro"]);
+  const before = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
+
+  const result = await refreshProviderModelDirectory(rootDir, "deepseek", {
+    fetchImpl: async () => ({
+      ok: false,
+      status: 503,
+      text: async () => "temporarily unavailable",
+    }),
+  });
+
+  const after = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
+  const catalogIds = new Set(modelCatalog(rootDir).map((model) => model.presetId));
+
+  assert.equal(result.ok, false);
+  assert.match(result.error, /HTTP 503/);
+  assert.deepEqual(after, before);
+  assert.equal(catalogIds.has("codex-gpt-5-5"), true);
+  assert.equal(catalogIds.has("deepseek-v4-pro"), true);
+});
+
+test("subscription provider model directory refresh stays on offline presets", async () => {
+  const rootDir = makeTempProject();
+  let fetched = false;
+
+  const result = await refreshProviderModelDirectory(rootDir, "codex", {
+    fetchImpl: async () => {
+      fetched = true;
+      return { ok: true, status: 200, json: async () => ({ data: [] }) };
+    },
+  });
+  const catalogIds = new Set(modelCatalog(rootDir).map((model) => model.presetId));
+
+  assert.equal(result.ok, false);
+  assert.match(result.error, /offline presets/);
+  assert.equal(fetched, false);
+  assert.equal(catalogIds.has("codex-gpt-5-5"), true);
+});
+
+test("manual capability overrides apply to one route without changing route-specific parameters", () => {
+  const rootDir = makeTempProject();
+  saveSelection(rootDir, ["deepseek-v4-pro", "kimi-k2-7-code"]);
+
+  const saved = saveModelCapabilityOverride(rootDir, "deepseek-v4-pro", {
+    inputModalities: ["text", "image", "file", "audio"],
+    contextWindow: 123456,
+    reasoning: { mode: "unknown", note: "manual verification pending" },
+  });
+  const overrides = readModelCapabilityOverrides(rootDir);
+  const deepseek = modelCatalog(rootDir).find((model) => model.presetId === "deepseek-v4-pro");
+  const config = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
+
+  assert.deepEqual(saved.inputModalities, ["text", "image", "file", "audio"]);
+  assert.equal(saved.contextWindow, 123456);
+  assert.equal(saved.reasoning.mode, "unknown");
+  assert.deepEqual(overrides["deepseek-v4-pro"].inputModalities, ["text", "image", "file", "audio"]);
+  assert.equal(deepseek.capabilityOverrideSource, "manual");
+  assert.deepEqual(deepseek.inputModalities, ["text", "image", "file", "audio"]);
+  assert.equal(deepseek.contextWindow, 123456);
+  assert.deepEqual(config.models[0].inputModalities, ["text", "image", "file", "audio"]);
+  assert.equal(config.models[0].contextWindow, 123456);
+  assert.equal(config.models[0].capabilityOverrides.reasoning.mode, "unknown");
+  assert.deepEqual(config.models[0].dropParams, ["response_format", "parallel_tool_calls"]);
+  assert.equal(config.models[1].sourcePresetId, "kimi-k2-7-code");
+  assert.equal(config.models[1].contextWindow, 258400);
 });
 
 test("custom models can disable image upload support", () => {
