@@ -74,6 +74,16 @@ test("macOS portable docs explain stable user data storage and first launch", ()
   assert.match(text, /Control-click/);
 });
 
+test("README documents the three Moonshot / Kimi endpoints and the override file", () => {
+  const text = fs.readFileSync(path.join(process.cwd(), "README.md"), "utf8");
+  assert.match(text, /Moonshot\s*\/\s*Kimi Endpoints|Moonshot\s*\/\s*Kimi 端点/);
+  assert.match(text, /https:\/\/api\.moonshot\.cn\/v1/);
+  assert.match(text, /https:\/\/api\.moonshot\.ai\/v1/);
+  assert.match(text, /https:\/\/api\.kimi\.com\/coding\/v1/);
+  assert.match(text, /provider-overrides\.json/);
+  assert.match(text, /Anthropic[\s\S]{0,40}暂不支持|not yet supported/);
+});
+
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

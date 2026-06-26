@@ -242,6 +242,22 @@ Default local endpoint:
 http://127.0.0.1:15722
 ```
 
+## Moonshot / Kimi Endpoints / Moonshot / Kimi 端点
+
+The Kimi / Moonshot provider defaults to the domestic Open Platform endpoint. Switch the Base URL in the desktop app's Kimi provider card (or edit `config/provider-overrides.json`) when you need an international or Kimi Code endpoint.
+
+Kimi / Moonshot provider 默认走国内开放平台端点。如果需要国际版或 Kimi Code 端点，在桌面端 Kimi 服务商卡片里改 Base URL（或直接编辑 `config/provider-overrides.json`）。
+
+Common endpoints / 常见端点：
+
+- Domestic (default) / 国内（默认）：`https://api.moonshot.cn/v1`
+- International / 国际版：`https://api.moonshot.ai/v1`
+- Kimi Code (OpenAI-compatible) / Kimi Code（OpenAI 兼容）：`https://api.kimi.com/coding/v1`
+
+The Anthropic-compatible endpoint at `/coding/v1/messages` is **not yet supported** by CodexBridge. Use the OpenAI-compatible path above; Anthropic-format requests are out of scope for this release.
+
+CodexBridge **暂不支持** `/coding/v1/messages` 这样的 Anthropic 兼容端点，请使用上面的 OpenAI 兼容路径；Anthropic 格式请求不在本次发布范围内。
+
 ## Codex Config / Codex 配置
 
 Edit:

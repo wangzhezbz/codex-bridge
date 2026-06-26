@@ -97,6 +97,10 @@ export function modelImageGenerationPath(rootDir) {
   return path.join(rootDir, "config", "model-image-generation.json");
 }
 
+export function providerOverridesPath(rootDir) {
+  return path.join(rootDir, "config", "provider-overrides.json");
+}
+
 export function desktopOptionsPath(rootDir) {
   return path.join(rootDir, "config", "desktop-options.json");
 }
@@ -587,6 +591,7 @@ function formatCountGroups(groups) {
 }
 
 export function providerCatalog(rootDir) {
+  const overrides = readProviderOverrides(rootDir);
   const customProviders = new Map();
   for (const model of readCustomModels(rootDir)) {
     if (!model.providerId || !model.keyEnv) {
@@ -608,13 +613,26 @@ export function providerCatalog(rootDir) {
       });
     }
   }
-  return [...PROVIDERS, ...customProviders.values()];
+  const merged = PROVIDERS.map((provider) => {
+    const override = overrides[provider.id];
+    if (!override) {
+      return provider;
+    }
+    return {
+      ...provider,
+      baseUrl: override.baseUrl,
+      baseUrlOverride: override.baseUrl,
+    };
+  });
+  return [...merged, ...customProviders.values()];
 }
 
 export function modelCatalog(rootDir) {
   const overrides = readModelImageInputOverrides(rootDir);
+  const providerBaseUrlOverrides = readProviderOverrides(rootDir);
   return [...MODEL_PRESETS, ...readCustomModels(rootDir)]
     .map((model) => modelWithDefaultCapabilities(model))
+    .map((model) => applyProviderBaseUrlOverride(model, providerBaseUrlOverrides))
     .map((model) => applyModelImageInputOverride(model, overrides));
 }
 
@@ -718,6 +736,97 @@ export function saveModelImageGenerationOverride(rootDir, presetId, settings) {
     "utf8",
   );
   return { presetId: id, imageGeneration: overrides[id] };
+}
+
+export function readProviderOverrides(rootDir) {
+  const saved = readJsonIfExists(providerOverridesPath(rootDir), {});
+  const source = saved?.providers && typeof saved.providers === "object"
+    ? saved.providers
+    : saved;
+  if (!source || typeof source !== "object" || Array.isArray(source)) {
+    return {};
+  }
+  const overrides = {};
+  for (const [providerId, value] of Object.entries(source)) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      continue;
+    }
+    const baseUrl = typeof value.baseUrl === "string" ? value.baseUrl.trim().replace(/\/+$/, "") : "";
+    if (!baseUrl || !isValidHttpUrl(baseUrl)) {
+      continue;
+    }
+    overrides[String(providerId)] = { baseUrl };
+  }
+  return overrides;
+}
+
+export function writeProviderOverrides(rootDir, overrides) {
+  const clean = {};
+  for (const [providerId, value] of Object.entries(overrides || {})) {
+    if (!value || typeof value !== "object" || !value.baseUrl) {
+      continue;
+    }
+    const baseUrl = String(value.baseUrl).trim().replace(/\/+$/, "");
+    if (!isValidHttpUrl(baseUrl)) {
+      continue;
+    }
+    clean[String(providerId)] = { baseUrl };
+  }
+  const target = providerOverridesPath(rootDir);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(
+    target,
+    `${JSON.stringify({ version: 1, providers: clean }, null, 2)}\n`,
+    "utf8",
+  );
+  return clean;
+}
+
+export function getProviderBaseUrl(rootDir, providerId) {
+  const id = String(providerId || "").trim();
+  if (!id) {
+    return "";
+  }
+  const builtIn = providerById(id)?.baseUrl || "";
+  const override = readProviderOverrides(rootDir)[id];
+  if (override?.baseUrl) {
+    return override.baseUrl;
+  }
+  return builtIn;
+}
+
+export function setProviderBaseUrlOverride(rootDir, providerId, baseUrl) {
+  const id = String(providerId || "").trim();
+  if (!id) {
+    throw new Error("Provider id is required.");
+  }
+  const cleaned = String(baseUrl || "").trim().replace(/\/+$/, "");
+  if (!cleaned) {
+    throw new Error("Base URL cannot be empty. Use the reset button to clear an override.");
+  }
+  if (!isValidHttpUrl(cleaned)) {
+    throw new Error("Base URL must be a valid http(s) URL.");
+  }
+  const overrides = readProviderOverrides(rootDir);
+  overrides[id] = { baseUrl: cleaned };
+  writeProviderOverrides(rootDir, overrides);
+  refreshRouterConfigIfPresent(rootDir);
+  return { providerId: id, baseUrl: cleaned };
+}
+
+export function resetProviderBaseUrlOverride(rootDir, providerId) {
+  const id = String(providerId || "").trim();
+  if (!id) {
+    throw new Error("Provider id is required.");
+  }
+  const overrides = readProviderOverrides(rootDir);
+  if (!overrides[id]) {
+    return { providerId: id, baseUrl: providerById(id)?.baseUrl || "" };
+  }
+  delete overrides[id];
+  writeProviderOverrides(rootDir, overrides);
+  refreshRouterConfigIfPresent(rootDir);
+  return { providerId: id, baseUrl: providerById(id)?.baseUrl || "" };
 }
 
 export function saveCustomModel(rootDir, input) {
@@ -1964,6 +2073,20 @@ function applyModelImageInputOverride(model, overrides) {
   };
 }
 
+function applyProviderBaseUrlOverride(model, overrides) {
+  if (!model?.providerId) {
+    return model;
+  }
+  const override = overrides[model.providerId];
+  if (!override?.baseUrl) {
+    return model;
+  }
+  return {
+    ...model,
+    baseUrl: override.baseUrl,
+  };
+}
+
 function builtInVisionPresetIds() {
   return new Set(
     MODEL_PRESETS
@@ -2211,11 +2334,14 @@ function redactSecretText(value) {
     .slice(0, 1000);
 }
 
+let timestampCounter = 0;
 function timestamp(date = new Date()) {
-  return date
+  const base = date
     .toISOString()
     .replaceAll(":", "")
     .replaceAll(".", "")
     .replace("T", "-")
     .replace("Z", "");
+  timestampCounter = (timestampCounter + 1) % 1000;
+  return `${base}-${String(timestampCounter).padStart(3, "0")}`;
 }

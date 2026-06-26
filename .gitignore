@@ -22,6 +22,7 @@ model-catalog.json
 .env.*
 !.env.example
 config/router.config.json
+config/provider-overrides.json
 config/secrets.local.json
 *.pem
 *.key
