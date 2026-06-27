@@ -4348,6 +4348,41 @@ test("server accepts Codex Desktop response probes without an upstream call", as
   }
 });
 
+test("server does not reject non-response probes with an upgrade connection token", async () => {
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    defaultModel: "gpt-5.5",
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        api: "responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        model: "gpt-5.5",
+        authMode: "codex_openai",
+      },
+    ],
+  });
+
+  await listen(router);
+  const baseUrl = serverUrl(router);
+
+  try {
+    const response = await requestText(`${baseUrl}/health`, {
+      method: "GET",
+      headers: {
+        connection: "keep-alive, Upgrade",
+      },
+    });
+
+    assert.equal(response.statusCode, 200);
+    assert.match(response.body, /"ok":true/);
+  } finally {
+    await close(router);
+  }
+});
+
 test("server rejects websocket response probes without returning a Responses list", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer((_req, res) => {

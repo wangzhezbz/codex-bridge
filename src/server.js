@@ -36,7 +36,7 @@ export function createRouterServer(config = loadConfig()) {
         return;
       }
 
-      if (isUpgradeRequest(req)) {
+      if (isUpgradeRequest(req) && isResponsesCollection(url.pathname)) {
         jsonResponse(
           res,
           426,
