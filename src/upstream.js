@@ -627,18 +627,23 @@ export async function proxyChatCompletions(
     requestBody,
     history,
   );
+  const noProgressToolLoopTurns = repeatedNoProgressToolLoopTurns(
+    requestBody,
+    history,
+    repeatsPreviousToolCall,
+    toolResultHasNoProgress,
+  );
   if (
     shouldStopChatToolContinuation(
       response,
       route,
-      toolContinuationTurns,
-      repeatsPreviousToolCall,
-      toolResultHasNoProgress,
+      noProgressToolLoopTurns,
     )
   ) {
     console.warn(
       `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
         `!! tool-loop-guard route=${route.id} turns=${toolContinuationTurns} ` +
+        `repeat_no_progress=${noProgressToolLoopTurns} ` +
         `max=${maxChatToolContinuationTurns(route)}`,
     );
     chatForHistory = localToolLoopGuardChat(route, toolContinuationTurns);
@@ -662,6 +667,9 @@ export async function proxyChatCompletions(
     upstreamKnown: false,
     toolContinuationTurns: responseHasRunnableToolCall(response)
       ? toolContinuationTurns
+      : 0,
+    noProgressToolLoopTurns: responseHasRunnableToolCall(response)
+      ? noProgressToolLoopTurns
       : 0,
     toolCallSignatures: responseHasRunnableToolCall(response)
       ? toolCallSignatures
@@ -1052,15 +1060,12 @@ function responseInputItems(input) {
 function shouldStopChatToolContinuation(
   response,
   route,
-  toolContinuationTurns,
-  repeatsPreviousToolCall,
-  toolResultHasNoProgress,
+  noProgressToolLoopTurns,
 ) {
   return (
-    toolContinuationTurns > maxChatToolContinuationTurns(route) &&
     responseHasRunnableToolCall(response) &&
-    repeatsPreviousToolCall &&
-    toolResultHasNoProgress
+    noProgressToolLoopTurns > 0 &&
+    noProgressToolLoopTurns >= maxChatToolContinuationTurns(route)
   );
 }
 
@@ -1098,6 +1103,27 @@ function repeatedToolResultHasNoProgress(signatures, requestBody, history) {
     ? previousMeta.toolResultSignatures
     : previousToolResultSignaturesFromInput(requestBody?.messages ?? requestBody?.input);
   return sameStringArray(signatures, previousSignatures);
+}
+
+function repeatedNoProgressToolLoopTurns(
+  requestBody,
+  history,
+  repeatsPreviousToolCall,
+  toolResultHasNoProgress,
+) {
+  if (!repeatsPreviousToolCall || !toolResultHasNoProgress) {
+    return 0;
+  }
+  const previousMeta = history?.getResponseMeta?.(requestBody?.previous_response_id) || {};
+  const previousTurns = Number(previousMeta.noProgressToolLoopTurns || 0);
+  if (Number.isFinite(previousTurns) && previousTurns > 0) {
+    return previousTurns + 1;
+  }
+
+  const inputTurns = responseToolOutputContinuationGroups(
+    requestBody?.messages ?? requestBody?.input,
+  );
+  return Math.max(1, inputTurns - 1);
 }
 
 function latestToolCallSignaturesFromInput(input) {
