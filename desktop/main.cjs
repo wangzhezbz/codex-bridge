@@ -669,11 +669,19 @@ ipcMain.handle("updates:install", async () => {
       }
       throw new Error(`Unable to launch update installer: ${openError}`);
     }
+    try {
+      shell.showItemInFolder(prepared.installerPath);
+    } catch (error) {
+      appendRuntimeLog(formatError("showUpdateInstallerAfterLaunch", error));
+    }
     return {
       ok: true,
-      message: `Downloaded CodexBridge ${plan.latestVersion} installer. Follow the installer to finish updating; the current app may stay open until the installer launches the new version.`,
+      message: `Downloaded CodexBridge ${plan.latestVersion} installer.`,
+      nextStep: `Windows Setup has been saved to ${prepared.installerPath}. If the installer window did not open, open the updates folder and run that installer manually. The current app stays available until setup launches the new version.`,
       latestVersion: plan.latestVersion,
       installerPath: prepared.installerPath,
+      installerNotePath: prepared.installerNotePath,
+      updateFolder: prepared.updatesDir,
     };
   }
   const prepared = await preparePortableUpdate(updater, plan, emitUpdateProgress);
@@ -699,10 +707,12 @@ ipcMain.handle("updates:install", async () => {
   return {
     ok: true,
     message: `已下载 ${plan.latestVersion}，更新包已放到 updates 目录。当前程序不会自动退出；如需立即升级，请退出 CodexBridge 后从 updates 目录打开新版。`,
+    nextStep: `Portable fallback is ready in ${path.dirname(prepared.downloadPath)}. Fully exit CodexBridge, unzip the package there, and open the extracted CodexBridge app. The current app will not auto-replace itself.`,
     latestVersion: plan.latestVersion,
     downloadPath: prepared.downloadPath,
     manualNotePath: prepared.manualNotePath,
     scriptPath: prepared.scriptPath,
+    updateFolder: path.dirname(prepared.downloadPath),
   };
 });
 
@@ -780,7 +790,13 @@ async function prepareInstallerUpdate(updater, plan, onProgress) {
     fetchInitForDownload: updater.fetchInitForUpdateDownload,
     onProgress,
   });
-  return { installerPath };
+  const installerNotePath = path.join(updatesDir, `install-update-${stamp}.txt`);
+  writeInstallerUpdateInstructions({
+    installerNotePath,
+    installerPath,
+    updatesDir,
+  });
+  return { installerPath, installerNotePath, updatesDir };
 }
 
 async function preparePortableUpdate(updater, plan, onProgress) {
@@ -853,6 +869,28 @@ function portableUpdatesDir() {
     return path.join(path.dirname(currentMacAppBundle()), "updates");
   }
   return path.join(dataRootDir, "updates");
+}
+
+function writeInstallerUpdateInstructions({
+  installerNotePath,
+  installerPath,
+  updatesDir,
+}) {
+  const lines = [
+    "CodexBridge Windows Setup installer update",
+    "",
+    `Downloaded installer: ${installerPath}`,
+    `Updates folder: ${updatesDir}`,
+    "",
+    "What happens next:",
+    "1. CodexBridge tries to launch this installer after the download finishes.",
+    "2. If Windows blocks or hides the installer window, run the downloaded installer from this folder.",
+    "3. The installer writes a versioned app under the user Programs directory and launches the new CodexBridge.",
+    "4. Your configuration, keys, model selection, statistics, and logs are stored in the user data directory.",
+    "",
+    "The current app is not silently replaced while it is running.",
+  ];
+  fs.writeFileSync(installerNotePath, `${lines.join("\n")}\n`, "utf8");
 }
 
 function writeManualUpdateInstructions({

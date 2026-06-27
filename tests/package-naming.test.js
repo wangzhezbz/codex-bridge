@@ -40,12 +40,17 @@ test("desktop update launches installers and keeps portable downloads as manual 
   assert.match(main, /shell\.openPath\(prepared\.installerPath\)/);
   assert.match(main, /phase:\s*"launching"/);
   assert.match(main, /installerPath:\s*prepared\.installerPath/);
+  assert.match(main, /installerNotePath:\s*prepared\.installerNotePath/);
+  assert.match(main, /updateFolder:\s*prepared\.updatesDir/);
+  assert.match(main, /nextStep:/);
   assert.match(main, /preparePortableUpdate/);
   assert.match(main, /Update package ready for manual install/);
   assert.match(main, /phase:\s*"ready"/);
   assert.match(main, /shell\.showItemInFolder\(prepared\.downloadPath\)/);
   assert.match(main, /downloadPath:\s*prepared\.downloadPath/);
   assert.match(main, /manualNotePath:\s*prepared\.manualNotePath/);
+  assert.match(main, /writeInstallerUpdateInstructions/);
+  assert.match(main, /Windows Setup installer update/);
   assert.doesNotMatch(main, /onSpawn:\s*\(\) => exitForPortableUpdate\(\)/);
   assert.doesNotMatch(main, /phase:\s*"restarting"/);
 });

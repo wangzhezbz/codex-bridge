@@ -221,10 +221,10 @@ els.checkUpdates.addEventListener("click", () =>
         downloadedBytes: updatePlan.asset?.size || 0,
         totalBytes: updatePlan.asset?.size || 0,
         percent: 100,
-        message: result.message,
+        message: result.nextStep || result.message,
       });
       setUpdateDialogBusy(false);
-      showToast(result.message || "更新包已下载，当前程序保持运行。");
+      showToast(result.nextStep || result.message || "更新包已下载，当前程序保持运行。");
     } catch (error) {
       setUpdateDialogBusy(false);
       renderUpdateProgress({
@@ -1276,6 +1276,9 @@ function showUpdateDialog(updatePlan) {
     if (installerUpdate) {
       els.updateDialogMessage.textContent =
         "下载完成后会启动 Windows 安装器；安装器会安装到用户程序目录并启动新版。";
+    }
+    if (updatePlan.nextStep) {
+      els.updateDialogMessage.textContent = updatePlan.nextStep;
     }
     els.updateDialogAsset.textContent = updatePlan.asset
       ? `${updatePlan.asset.name} · ${formatBytes(updatePlan.asset.size)}`

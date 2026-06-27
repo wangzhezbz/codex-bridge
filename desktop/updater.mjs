@@ -83,6 +83,86 @@ export function planReleaseUpdate({
       message: "没有读取到可用的 GitHub Release。",
     };
   }
+
+  const releaseAssets = release.assets || [];
+  const candidate = assetCandidates.find((assetInfo) =>
+    releaseAssets.some((item) => item?.name === assetInfo.name && item?.browser_download_url),
+  );
+  const asset = releaseAssets.find((item) => item?.name === candidate?.name);
+  if (!asset?.browser_download_url) {
+    const expectedNames = assetCandidates.map((item) => item.name).join(", ");
+    return {
+      ok: false,
+      updateAvailable: false,
+      latestVersion,
+      releaseUrl: release.html_url || "",
+      message: `最新版本没有找到当前系统的更新包：${expectedNames}`,
+    };
+  }
+
+  const fallbackCandidate = candidate.kind === "installer"
+    ? assetCandidates.find((assetInfo) =>
+        assetInfo.kind === "portable" &&
+        releaseAssets.some((item) => item?.name === assetInfo.name && item?.browser_download_url),
+      )
+    : null;
+  const fallbackAsset = fallbackCandidate
+    ? releaseAssets.find((item) => item?.name === fallbackCandidate.name)
+    : null;
+  const updateAvailable = isNewerVersion(latestVersion, currentVersion);
+  const installMode = candidate.kind === "installer" ? "windows_setup" : "manual_portable";
+  return {
+    ok: true,
+    updateAvailable,
+    currentVersion: normalizeVersion(currentVersion),
+    latestVersion,
+    releaseUrl: release.html_url || "",
+    releaseNotes: release.body || "",
+    installMode,
+    asset: releaseAssetPayload(asset, candidate),
+    fallbackAsset: fallbackAsset ? releaseAssetPayload(fallbackAsset, fallbackCandidate) : null,
+    nextStep: installMode === "windows_setup"
+      ? "Windows Setup installer will be saved in the updates folder, then launched. If Windows blocks it, open the updates folder and run the downloaded installer manually."
+      : "This is a portable manual fallback. The zip will be saved in the updates folder; the current app will keep running so you can open the extracted new app manually.",
+    message: updateAvailable
+      ? `发现新版本 ${latestVersion}。`
+      : `当前已经是最新版本 ${normalizeVersion(currentVersion)}。`,
+  };
+}
+
+function releaseAssetPayload(asset, assetInfo) {
+  return {
+    name: asset.name,
+    kind: assetInfo.kind,
+    size: Number(asset.size || 0),
+    downloadUrl: asset.browser_download_url,
+  };
+}
+
+function legacyPlanReleaseUpdate({
+  currentVersion,
+  platform = process.platform,
+  arch = process.arch,
+  release,
+} = {}) {
+  const assetCandidates = assetCandidatesForPlatform(platform, arch);
+  const latestVersion = normalizeVersion(release?.tag_name || release?.name || "");
+  if (!assetCandidates.length) {
+    return {
+      ok: false,
+      updateAvailable: false,
+      latestVersion,
+      message: `当前系统暂不支持应用内更新：${platform} ${arch}`,
+    };
+  }
+  if (!release || !latestVersion) {
+    return {
+      ok: false,
+      updateAvailable: false,
+      latestVersion,
+      message: "没有读取到可用的 GitHub Release。",
+    };
+  }
   const releaseAssets = release.assets || [];
   const candidate = assetCandidates.find((assetInfo) =>
     releaseAssets.some((item) => item?.name === assetInfo.name && item?.browser_download_url),

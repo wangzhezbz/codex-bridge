@@ -75,6 +75,22 @@ test("updater plans a direct install from the latest matching release asset", ()
   assert.match(plan.asset.downloadUrl, /v0\.1\.66/);
 });
 
+test("updater marks Windows setup as primary while preserving portable fallback metadata", () => {
+  const plan = planReleaseUpdate({
+    currentVersion: "0.1.65",
+    platform: "win32",
+    arch: "x64",
+    release,
+  });
+
+  assert.equal(plan.installMode, "windows_setup");
+  assert.equal(plan.asset.kind, "installer");
+  assert.equal(plan.fallbackAsset.name, "CodexBridge-Windows-x64-Portable.zip");
+  assert.equal(plan.fallbackAsset.kind, "portable");
+  assert.match(plan.nextStep, /Windows Setup/);
+  assert.match(plan.nextStep, /updates/);
+});
+
 test("updater falls back to the portable asset when no installer is published", () => {
   const portableOnlyRelease = {
     ...release,
@@ -90,6 +106,10 @@ test("updater falls back to the portable asset when no installer is published", 
   assert.equal(plan.ok, true);
   assert.equal(plan.asset.name, "CodexBridge-Windows-x64-Portable.zip");
   assert.equal(plan.asset.kind, "portable");
+  assert.equal(plan.installMode, "manual_portable");
+  assert.equal(plan.fallbackAsset, null);
+  assert.match(plan.nextStep, /manual fallback/);
+  assert.match(plan.nextStep, /updates/);
 });
 
 test("updater reports current and unsupported states clearly", () => {
