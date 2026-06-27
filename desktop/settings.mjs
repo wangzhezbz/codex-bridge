@@ -9,6 +9,7 @@ import {
   defaultSelectedModelIds,
   providerById,
 } from "./presets.mjs";
+import { normalizeAdapterProfile } from "../src/adapter-profile.js";
 
 const require = createRequire(import.meta.url);
 
@@ -343,7 +344,7 @@ export function supportDiagnostics(rootDir, {
     ...(selectedRoutes.length
       ? selectedRoutes.map(
           (route) =>
-            `- ${route.id}: ${route.displayName} -> ${route.model} (${route.api}, ${route.authMode || "api_key"}) ${redactSecretText(route.baseUrl)}`,
+            `- ${route.id}: ${route.displayName} -> ${route.model} (${route.api}, ${route.authMode || "api_key"}) ${redactSecretText(route.baseUrl)} ${routeCapabilityDiagnosticText(route)}`,
         )
       : ["- none"]),
     "",
@@ -984,7 +985,8 @@ export function modelCatalog(rootDir) {
   return [...MODEL_PRESETS, ...readCustomModels(rootDir)]
     .map((model) => modelWithDefaultCapabilities(model))
     .map((model) => applyModelImageInputOverride(model, imageInputOverrides))
-    .map((model) => applyModelCapabilityOverride(model, capabilityOverrides));
+    .map((model) => applyModelCapabilityOverride(model, capabilityOverrides))
+    .map((model) => withCapabilityStatus(model));
 }
 
 export function readSelection(rootDir, mode = MODE_HYBRID) {
@@ -2809,6 +2811,7 @@ function routeForSelectedModel(model, slot, priority, imageGenerationOverrides =
   if (model.custom && route.inputModalities === undefined) {
     route.inputModalities = normalizeInputModalities(model.inputModalities, ["text"]);
   }
+  route.capabilityStatus = routeCapabilityStatus(route);
   return route;
 }
 
@@ -3212,7 +3215,54 @@ function routeDiagnosticItem(route = {}) {
     model: route.model || "",
     api: route.api || "",
     baseUrl: route.baseUrl || "",
+    capabilityStatus: route.capabilityStatus || routeCapabilityStatus(route),
   };
+}
+
+function withCapabilityStatus(model = {}) {
+  return {
+    ...model,
+    capabilityStatus: routeCapabilityStatus({
+      ...model,
+      id: model.presetId || model.id,
+      sourcePresetId: model.presetId || model.sourcePresetId,
+      provider: model.providerId || model.provider,
+    }),
+  };
+}
+
+function routeCapabilityStatus(route = {}) {
+  const profile = normalizeAdapterProfile(route);
+  const capabilities = profile.capabilities || {};
+  const compact = capabilities.compact || {};
+  return {
+    provider: route.provider || route.providerId || profile.providerFamily || "",
+    providerFamily: profile.providerFamily || "",
+    api: profile.api || route.api || "",
+    upstreamModel: route.model || "",
+    tools: capabilities.tools || "unknown",
+    mcpNamespaces: capabilities.mcpNamespaces === true ? "native" : capabilities.mcpNamespaces || "unknown",
+    images: capabilities.images || "unknown",
+    files: capabilities.files || "unknown",
+    audio: capabilities.audio || "none",
+    reasoning: capabilities.reasoning?.mode || "unknown",
+    compact: compact.mode || "unknown",
+    compactStrategy: compact.strategy || "",
+    promptCache: capabilities.promptCache || "unknown",
+    contextWindow: capabilities.contextWindow || route.contextWindow || 0,
+  };
+}
+
+function routeCapabilityDiagnosticText(route = {}) {
+  const status = route.capabilityStatus || routeCapabilityStatus(route);
+  return [
+    `provider=${status.provider || status.providerFamily || "-"}`,
+    `capabilities: tools=${status.tools || "unknown"}`,
+    `images=${status.images || "unknown"}`,
+    `files=${status.files || "unknown"}`,
+    `compact=${status.compact || "unknown"}`,
+    `context=${status.contextWindow || "-"}`,
+  ].join(" ");
 }
 
 function normalizeDesktopOptions(options = {}) {

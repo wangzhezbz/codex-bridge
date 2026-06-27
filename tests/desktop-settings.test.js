@@ -307,6 +307,8 @@ test("supportDiagnostics redacts keys and summarizes current config", () => {
   assert.match(diagnostics.text, /DEEPSEEK_API_KEY: saved/);
   assert.match(diagnostics.text, /MOONSHOT_API_KEY: missing/);
   assert.match(diagnostics.text, /Kimi K2\.7 Code -> kimi-k2\.7-code/);
+  assert.match(diagnostics.text, /DeepSeek V4 Pro -> deepseek-v4-pro .*provider=deepseek/);
+  assert.match(diagnostics.text, /capabilities: tools=chat-functions images=none files=text-placeholder compact=chat-summary/);
   assert.match(diagnostics.text, /Codex history diagnostics/);
   assert.match(diagnostics.text, /state_5\.sqlite: threads=1/);
   assert.match(diagnostics.text, /hiddenCandidates=1/);

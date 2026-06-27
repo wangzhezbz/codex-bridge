@@ -597,6 +597,8 @@ function modelCard(model, selected, max) {
         <span class="model-title">${escapeHtml(model.displayName)}</span>
         <span class="model-meta">${escapeHtml(model.model)} · ${escapeHtml(model.api)}</span>
         <span class="model-capability-summary">${escapeHtml(modelCapabilitySummary(model))}</span>
+        ${modelCapabilityBadges(model)}
+        ${modelCapabilityHints(model)}
         <span class="model-foot">${escapeHtml(reason)}</span>
       </button>
       <button
@@ -850,8 +852,10 @@ function saveModelCapabilitySettings(button) {
 }
 
 function modelCapabilitySummary(model) {
+  const status = modelCapabilityStatus(model);
   const modalities = new Set(inputModalitiesForModel(model));
   const parts = [
+    `上游 ${status.provider || providerName(model.providerId)} / ${status.api || model.api}`,
     `Context ${formatNumber(model.contextWindow || 258400)}`,
     `图片${modalities.has("image") ? "开" : "关"}`,
     `文件${modalities.has("file") ? "开" : "默认"}`,
@@ -866,6 +870,63 @@ function modelCapabilitySummary(model) {
     parts.push("手动");
   }
   return parts.join(" · ");
+}
+
+function modelCapabilityStatus(model) {
+  if (model?.capabilityStatus) {
+    return model.capabilityStatus;
+  }
+  const modalities = new Set(inputModalitiesForModel(model));
+  const api = model?.api === "responses" ? "responses" : "chat_completions";
+  return {
+    provider: model?.providerFamily || model?.providerId || model?.provider || "unknown",
+    api,
+    upstreamModel: model?.model || "",
+    tools: api === "responses" ? "native" : "chat-functions",
+    images: modalities.has("image") ? (api === "responses" ? "native" : "chat-image-url") : "none",
+    files: api === "responses" ? "native" : (model?.custom ? "none" : "text-placeholder"),
+    audio: modalities.has("audio") ? (api === "responses" ? "native" : "chat-input-audio") : "none",
+    compact: api === "responses" ? "responses-native" : "chat-summary",
+    compactStrategy: api === "responses" ? "responses-json" : "chat-json",
+    contextWindow: model?.contextWindow || 258400,
+  };
+}
+
+function modelCapabilityBadges(model) {
+  const status = modelCapabilityStatus(model);
+  const badges = [
+    ["上游", status.provider || providerName(model.providerId)],
+    ["API", status.api || model.api || "-"],
+    ["Tools", status.tools || "unknown"],
+    ["Image", status.images || "unknown"],
+    ["File", status.files || "unknown"],
+    ["Compact", status.compact || "unknown"],
+  ];
+  return `
+    <span class="model-capability-badges" data-capability-badges>
+      ${badges
+        .map(([label, value]) => `<span class="capability-badge"><strong>${escapeHtml(label)}</strong>${escapeHtml(value)}</span>`)
+        .join("")}
+    </span>
+  `;
+}
+
+function modelCapabilityHints(model) {
+  const status = modelCapabilityStatus(model);
+  const hints = [];
+  if (status.images === "none") {
+    hints.push("图片不直传");
+  }
+  if (status.files === "none") {
+    hints.push("文件不直传");
+  }
+  if (status.compact === "unknown" || status.compact === "none") {
+    hints.push("压缩需回退");
+  }
+  if (!hints.length) {
+    return "";
+  }
+  return `<span class="model-capability-hints">${hints.map(escapeHtml).join(" · ")}</span>`;
 }
 
 function modelSupportsImage(model) {
@@ -951,7 +1012,11 @@ function renderOverviewUsage() {
     els.latestUsage.textContent = "暂无";
     return;
   }
-  els.latestUsage.textContent = `${displayRoute(latest.route || latest.codexModel)} · ${latest.status || "unknown"} · ${formatNumber(latest.totalTokens || 0)} token`;
+  const route = latest.route || latest.codexModel;
+  const upstream = latest.upstreamModel ? ` -> ${latest.upstreamModel}` : "";
+  const provider = routeProviderName(route);
+  const api = latest.api ? ` · ${latest.api}` : "";
+  els.latestUsage.textContent = `${displayRoute(route)}${upstream} · 上游 ${provider}${api} · ${latest.status || "unknown"} · ${formatNumber(latest.totalTokens || 0)} token`;
 }
 
 function renderUsageChart(rows) {
@@ -1383,6 +1448,20 @@ function providerFor(providerId) {
 
 function providerName(providerId) {
   return providerFor(providerId)?.shortName || providerFor(providerId)?.name || providerId || "-";
+}
+
+function routeProviderName(routeId) {
+  const configured = (state.models || []).find(
+    (item) => item.id === routeId || item.sourcePresetId === routeId,
+  );
+  if (configured) {
+    return providerName(configured.provider || configured.providerFamily || configured.providerId);
+  }
+  const preset = modelMap().get(routeId);
+  if (preset) {
+    return providerName(preset.providerId || preset.provider || preset.providerFamily);
+  }
+  return "-";
 }
 
 function modelMap() {

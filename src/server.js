@@ -16,6 +16,7 @@ import {
   upstreamErrorLogPreview,
 } from "./upstream.js";
 import { classifyUpstreamError, createRouteHealthStore } from "./route-health.js";
+import { normalizeAdapterProfile } from "./adapter-profile.js";
 
 export function createRouterServer(config = loadConfig()) {
   const history = new ResponseHistory();
@@ -131,6 +132,7 @@ export function createRouterServer(config = loadConfig()) {
           `[${new Date().toISOString()}] ${requestId} <- /v1/responses ` +
             `model=${body.model || "(default)"} route=${route.id} ` +
             `api=${route.api} upstream_model=${route.model} stream=${Boolean(body.stream)} ` +
+            `provider=${providerLogLabel(route)} ` +
             `compact=${compactKind || "-"} ` +
             `previous_response_id=${body.previous_response_id || "-"} ` +
             `client_auth=${clientAuth.kind} upstream_auth=${authModeForRoute(route)}`,
@@ -320,6 +322,23 @@ function requestErrorLine(requestId, route, error, context = {}) {
     (cause ? ` cause=${safeLogValue(cause)}` : "") +
     upstreamErrorLogPreview(error)
   );
+}
+
+function providerLogLabel(route = {}) {
+  const explicitProvider = route.provider || route.providerFamily || route.providerId;
+  if (explicitProvider) {
+    return explicitProvider;
+  }
+  try {
+    const profile = normalizeAdapterProfile({
+      ...route,
+      baseUrl: "",
+      provider: route.model || route.sourcePresetId || route.id || route.baseUrl,
+    });
+    return profile.providerFamily || "-";
+  } catch {
+    return "-";
+  }
 }
 
 function safeLogValue(value) {

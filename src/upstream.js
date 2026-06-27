@@ -3,6 +3,7 @@ import { cloneJson, jsonResponse, openAiError, stringifyJson, tryParseJson } fro
 import { authModeForRoute, joinUpstreamUrl, requireApiKey } from "./config.js";
 import {
   filterPayloadForAdapter,
+  normalizeAdapterProfile,
 } from "./adapter-profile.js";
 import {
   contentToText,
@@ -1612,13 +1613,30 @@ function safeLogValue(value) {
     .slice(0, 240);
 }
 
+function providerLogLabel(route = {}) {
+  const explicitProvider = route.provider || route.providerFamily || route.providerId;
+  if (explicitProvider) {
+    return explicitProvider;
+  }
+  try {
+    const profile = normalizeAdapterProfile({
+      ...route,
+      baseUrl: "",
+      provider: route.model || route.sourcePresetId || route.id || route.baseUrl,
+    });
+    return profile.providerFamily || "-";
+  } catch {
+    return "-";
+  }
+}
+
 function logRoute(context, route, upstreamUrl) {
   const requestId = context.requestId || "req";
   const proxy = proxyLogLabel(upstreamUrl);
   console.log(
     `[${new Date().toISOString()}] ${requestId} -> upstream ` +
       `route=${route.id} api=${route.api} upstream_model=${route.model} ` +
-      `url=${safeUrl(upstreamUrl)}` +
+      `url=${safeUrl(upstreamUrl)} provider=${providerLogLabel(route)}` +
       (proxy ? ` proxy=${proxy}` : ""),
   );
 }

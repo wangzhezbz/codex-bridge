@@ -3281,6 +3281,72 @@ test("server logs request-scoped upstream network errors", async () => {
   }
 });
 
+test("server logs final upstream provider and model for routed requests", async () => {
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (line) => logs.push(String(line));
+  const upstream = http.createServer(async (_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      id: "chatcmpl_provider_log",
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: "ok",
+          },
+        },
+      ],
+    }));
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "deepseek-v4-pro",
+        authMode: "api_key",
+        apiKey: "deepseek-provider-key",
+      },
+    ],
+  });
+  await listen(router);
+
+  try {
+    await fetchJson(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        input: "hello",
+      }),
+    });
+
+    assert.ok(logs.some((line) =>
+      /<- \/v1\/responses .*route=deepseek-v4-pro .*upstream_model=deepseek-v4-pro .*provider=deepseek/.test(line)
+    ));
+    assert.ok(logs.some((line) =>
+      /-> upstream .*route=deepseek-v4-pro .*upstream_model=deepseek-v4-pro .*provider=deepseek/.test(line)
+    ));
+  } finally {
+    console.log = originalLog;
+    await close(router);
+    await close(upstream);
+  }
+});
+
 test("subscription scope errors explain that Codex login is not an API key", async () => {
   const upstream = http.createServer(async (_req, res) => {
     res.writeHead(401, { "content-type": "application/json" });

@@ -889,6 +889,41 @@ h3 {
   overflow-wrap: anywhere;
 }
 
+.model-capability-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 9px;
+}
+
+.capability-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 3px 6px;
+  border: 1px solid #d8e3e8;
+  border-radius: 6px;
+  background: #f8fafb;
+  color: #526776;
+  font-size: 10px;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+.capability-badge strong {
+  color: #1d3342;
+  font-weight: 750;
+}
+
+.model-capability-hints {
+  display: block;
+  margin-top: 7px;
+  color: #8a5a00;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
 .model-card-actions {
   display: flex;
   gap: 10px;

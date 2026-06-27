@@ -59,3 +59,15 @@ test("desktop renderer opens folder buttons through the shared action handler", 
   assert.match(rendererSource, /function bindFolderButton/);
   assert.match(rendererSource, /runAction\(button, async \(\) =>/);
 });
+
+test("desktop renderer surfaces route capabilities and real upstream status", () => {
+  assert.match(rendererSource, /data-capability-badges/);
+  assert.match(rendererSource, /function modelCapabilityBadges/);
+  assert.match(rendererSource, /function modelCapabilityHints/);
+  assert.match(rendererSource, /Tools/);
+  assert.match(rendererSource, /Compact/);
+  assert.match(rendererSource, /上游/);
+  assert.match(rendererSource, /latest\.upstreamModel/);
+  assert.match(rendererSource, /routeProviderName/);
+  assert.match(rendererSource, /latest\.api/);
+});
