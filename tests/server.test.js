@@ -5,7 +5,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import zlib from "node:zlib";
-import { loadConfig } from "../src/config.js";
+import { loadConfig, routeForModel } from "../src/config.js";
 import { ResponseHistory } from "../src/history.js";
 import { shouldUseImageGenerationFallback } from "../src/image-generation.js";
 import { createRouterServer } from "../src/server.js";
@@ -99,6 +99,32 @@ test("server exposes health, models, catalog, and converted responses", async ()
     await close(router);
     await close(upstream);
   }
+});
+
+test("routeForModel prioritizes Codex slot ids over upstream model aliases", () => {
+  const config = {
+    defaultModel: "gpt-5.5",
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.4 as first slot",
+        api: "chat_completions",
+        baseUrl: "https://api.example.com/v1",
+        model: "gpt-5.4",
+      },
+      {
+        id: "gpt-5.4",
+        displayName: "DeepSeek V4 Pro",
+        api: "chat_completions",
+        baseUrl: "https://api.deepseek.com/v1",
+        model: "deepseek-v4-pro",
+      },
+    ],
+  };
+
+  assert.equal(routeForModel(config, "gpt-5.4").id, "gpt-5.4");
+  assert.equal(routeForModel(config, "GPT 5.4").id, "gpt-5.4");
+  assert.equal(routeForModel(config, "GPT-5.4 as first slot").id, "gpt-5.5");
 });
 
 test("server reports upstream 413 as a request size problem with recovery guidance", async () => {

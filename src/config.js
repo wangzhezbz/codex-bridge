@@ -57,8 +57,16 @@ export function routeForModel(config, requestedModel) {
   }
   const requested = String(requestedModel || "").trim();
   const normalized = normalizeModelName(requested);
+
+  const slotRoute = config.models.find((model) =>
+    modelSlotAliases(model).some((alias) => alias === normalized),
+  );
+  if (slotRoute) {
+    return slotRoute;
+  }
+
   const route = config.models.find((model) =>
-    modelNameAliases(model).some((alias) => alias === normalized),
+    modelFallbackAliases(model).some((alias) => alias === normalized),
   );
   if (route) {
     return route;
@@ -82,13 +90,22 @@ function defaultRoute(config) {
   );
 }
 
-function modelNameAliases(model) {
-  return [
-    model.id,
+function modelSlotAliases(model) {
+  return normalizedAliases([model.id]);
+}
+
+function modelFallbackAliases(model) {
+  return normalizedAliases([
     model.displayName,
     model.model,
     model.slotLabel,
     model.sourcePresetId,
+  ]);
+}
+
+function normalizedAliases(values) {
+  return [
+    ...values,
   ]
     .filter(Boolean)
     .flatMap((value) => [

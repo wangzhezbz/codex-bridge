@@ -1246,7 +1246,7 @@ async function getStatePayload(settings) {
     diagnostics,
     lastHealth,
     usageEvents: usageStore?.events() || [],
-    usageSummary: usageStore?.summary() || emptyUsageSummary(),
+    usageSummary: usageStore?.summary({ routes: config?.models || [] }) || emptyUsageSummary(),
     legacyDataMigration,
     logs: logLines,
   };
