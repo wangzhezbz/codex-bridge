@@ -44,9 +44,7 @@ import { isResponseToolCallItem, isResponseToolOutputItem } from "./tools.js";
 
 const CHATGPT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const FAILURE_CACHE_MAX_ENTRIES = 200;
-const FAILURE_CACHE_DEFAULT_TTL_MS = 30_000;
 const FAILURE_CACHE_FATAL_TTL_MS = 120_000;
-const FAILURE_CACHE_TRANSIENT_TTL_MS = 15_000;
 const DEFAULT_CHAT_TOOL_CONTINUATION_TURNS = 5;
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 300_000;
 const INVALID_JSON_VALUE = Symbol("invalid_json_value");
@@ -1890,20 +1888,11 @@ function rememberUpstreamFailure(route, upstreamUrl, payload, error, options = {
 }
 
 function upstreamFailureTtlMs(statusCode, route = {}) {
-  if (statusCode === 401) {
+  if (statusCode === 401 || statusCode === 429) {
     return 0;
   }
-  if (statusCode === 429) {
-    return Math.max(
-      Number(route.cooldownMs || 0),
-      FAILURE_CACHE_DEFAULT_TTL_MS,
-    );
-  }
-  if ([400, 403, 413, 415, 422].includes(statusCode)) {
+  if ([400, 413, 415, 422].includes(statusCode)) {
     return FAILURE_CACHE_FATAL_TTL_MS;
-  }
-  if ([408, 409, 425, 500, 502, 503, 504, 599].includes(statusCode)) {
-    return FAILURE_CACHE_TRANSIENT_TTL_MS;
   }
   return 0;
 }

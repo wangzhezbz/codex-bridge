@@ -391,6 +391,78 @@ test("upstream retry-after cooldown is capped to avoid long local lockouts", asy
   }
 });
 
+test("upstream 429 cache does not extend retry-after cooldown for the same payload", async () => {
+  const originalFetch = globalThis.fetch;
+  let now = 0;
+  let calls = 0;
+
+  globalThis.fetch = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return new Response(JSON.stringify({ error: { message: "Too Many Requests" } }), {
+        status: 429,
+        headers: {
+          "content-type": "application/json",
+          "retry-after": "2",
+        },
+      });
+    }
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  __resetUpstreamFailureCacheForTests();
+  __resetRateLimiterForTests();
+  __setRateLimitClockForTests({
+    now: () => now,
+    sleep: async (ms) => {
+      now += ms;
+    },
+  });
+
+  try {
+    const route = {
+      id: "deepseek-v4-pro",
+      provider: "deepseek",
+      api: "chat_completions",
+      baseUrl: "https://api.deepseek.com/v1",
+      model: "deepseek-v4-pro",
+      apiKey: "test-key",
+    };
+    const payload = {
+      model: "deepseek-v4-pro",
+      messages: [{ role: "user", content: "same retryable turn" }],
+    };
+
+    await assert.rejects(
+      callJsonUpstream(
+        "https://api.deepseek.com/v1/chat/completions",
+        route,
+        payload,
+        {},
+      ),
+      /Upstream returned HTTP 429/,
+    );
+
+    now = 2000;
+    const response = await callJsonUpstream(
+      "https://api.deepseek.com/v1/chat/completions",
+      route,
+      payload,
+      {},
+    );
+
+    assert.equal(calls, 2);
+    assert.deepEqual(response, { ok: true });
+  } finally {
+    globalThis.fetch = originalFetch;
+    __resetUpstreamFailureCacheForTests();
+    __resetRateLimiterForTests();
+  }
+});
+
 test("upstream 429 fail-fast cooldown is shared by routes using the same provider key", async () => {
   const originalFetch = globalThis.fetch;
   const sleeps = [];
@@ -480,14 +552,75 @@ test("upstream 429 fail-fast cooldown is shared by routes using the same provide
   }
 });
 
-test("identical upstream failures are short-circuited without another provider call", async () => {
+test("transient upstream 503 failures are not cached for identical retries", async () => {
   const originalFetch = globalThis.fetch;
   let calls = 0;
 
   globalThis.fetch = async () => {
     calls += 1;
-    return new Response(JSON.stringify({ error: { message: "Too Many Requests" } }), {
-      status: 429,
+    if (calls === 1) {
+      return new Response(JSON.stringify({ error: { message: "temporary overload" } }), {
+        status: 503,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  __resetUpstreamFailureCacheForTests();
+  __resetRateLimiterForTests();
+
+  try {
+    const route = {
+      id: "agnes-flash",
+      provider: "openrouter",
+      api: "chat_completions",
+      baseUrl: "https://openrouter.ai/api/v1",
+      model: "agnes-2.0-flash",
+      apiKey: "test-key",
+    };
+    const payload = {
+      model: "agnes-2.0-flash",
+      messages: [{ role: "user", content: "same transient turn" }],
+    };
+
+    await assert.rejects(
+      callJsonUpstream(
+        "https://openrouter.ai/api/v1/chat/completions",
+        route,
+        payload,
+        {},
+      ),
+      /Upstream returned HTTP 503/,
+    );
+
+    const response = await callJsonUpstream(
+      "https://openrouter.ai/api/v1/chat/completions",
+      route,
+      payload,
+      {},
+    );
+
+    assert.equal(calls, 2);
+    assert.deepEqual(response, { ok: true });
+  } finally {
+    globalThis.fetch = originalFetch;
+    __resetUpstreamFailureCacheForTests();
+    __resetRateLimiterForTests();
+  }
+});
+
+test("identical fatal upstream failures are short-circuited without another provider call", async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+
+  globalThis.fetch = async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ error: { message: "invalid parameter" } }), {
+      status: 400,
       headers: { "content-type": "application/json" },
     });
   };
@@ -517,7 +650,7 @@ test("identical upstream failures are short-circuited without another provider c
         payload,
         { requestId: "req_first" },
       ),
-      /Upstream returned HTTP 429/,
+      /Upstream returned HTTP 400/,
     );
 
     await assert.rejects(
@@ -527,7 +660,7 @@ test("identical upstream failures are short-circuited without another provider c
         payload,
         { requestId: "req_retry" },
       ),
-      /Upstream returned HTTP 429/,
+      /Upstream returned HTTP 400/,
     );
 
     assert.equal(calls, 1);
