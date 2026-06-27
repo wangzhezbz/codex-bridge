@@ -3401,6 +3401,85 @@ test("chat routes retry root OpenAI-compatible base URLs with /v1 when HTML is r
   }
 });
 
+test("responses routes retry root OpenAI-compatible base URLs with /v1 when HTML is returned", async () => {
+  const paths = [];
+  const upstream = http.createServer(async (req, res) => {
+    paths.push(req.url);
+    if (req.url === "/responses") {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.end("<!doctype html><html><body>provider portal</body></html>");
+      return;
+    }
+    if (req.url === "/v1/responses") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        id: "resp_root_retry",
+        object: "response",
+        status: "completed",
+        model: "gpt-5.5",
+        output: [
+          {
+            id: "msg_root_retry",
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [
+              {
+                type: "output_text",
+                text: "connected responses through v1",
+                annotations: [],
+              },
+            ],
+          },
+        ],
+        output_text: "connected responses through v1",
+      }));
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: `unexpected ${req.url}` } }));
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "gpt-5.5",
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        api: "responses",
+        baseUrl: serverUrl(upstream),
+        model: "gpt-5.5",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+  await listen(router);
+
+  try {
+    const response = await fetchJson(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        input: "hello",
+      }),
+    });
+
+    assert.equal(response.output_text, "connected responses through v1");
+    assert.deepEqual(paths, ["/responses", "/v1/responses"]);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
 test("subscription scope errors explain that Codex login is not an API key", async () => {
   const upstream = http.createServer(async (_req, res) => {
     res.writeHead(401, { "content-type": "application/json" });

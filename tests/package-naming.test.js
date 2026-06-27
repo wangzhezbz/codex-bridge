@@ -172,8 +172,11 @@ test("macOS release archives are extracted and checked for Electron Framework", 
   assert.match(workflow, /Smoke test macOS release archive/);
   assert.match(workflow, /ditto -x -k "dist-artifacts\/CodexBridge-macOS-\$\{\{ matrix\.arch \}\}-Portable\.zip"/);
   assert.match(workflow, /Electron Framework\.framework\/Electron Framework/);
+  assert.match(workflow, /Electron Framework\.framework\/Versions\/A\/Electron Framework/);
   assert.match(smoke, /Electron Framework\.framework/);
+  assert.match(smoke, /Versions",\s*"A",\s*"Electron Framework"/);
   assert.match(smoke, /missing packaged Electron Framework/);
+  assert.match(smoke, /missing packaged Electron Framework target/);
 });
 
 test("desktop packages include native app icon assets", () => {

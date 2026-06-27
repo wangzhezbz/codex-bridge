@@ -18,6 +18,15 @@ const electronFrameworkPath = path.join(
   "Electron Framework.framework",
   "Electron Framework",
 );
+const electronFrameworkTargetPath = path.join(
+  appPath,
+  "Contents",
+  "Frameworks",
+  "Electron Framework.framework",
+  "Versions",
+  "A",
+  "Electron Framework",
+);
 const appRoot = path.join(appPath, "Contents", "Resources", "app");
 
 assert.ok(fs.existsSync(appPath), `missing packaged app: ${appPath}`);
@@ -25,6 +34,10 @@ assert.ok(fs.existsSync(executablePath), `missing packaged executable: ${executa
 assert.ok(
   fs.existsSync(electronFrameworkPath),
   `missing packaged Electron Framework: ${electronFrameworkPath}`,
+);
+assert.ok(
+  fs.existsSync(electronFrameworkTargetPath),
+  `missing packaged Electron Framework target: ${electronFrameworkTargetPath}`,
 );
 assert.ok(fs.existsSync(path.join(appRoot, "src", "server.js")), "missing packaged router script");
 

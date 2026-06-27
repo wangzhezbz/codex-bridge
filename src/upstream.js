@@ -242,27 +242,43 @@ export async function proxyResponsesApi(
   );
   const upstreamPath = context.compactKind === "v1" ? "/responses/compact" : "/responses";
   const upstreamUrl = joinUpstreamUrl(responsesBaseUrlForRoute(route), upstreamPath);
+  let activeUpstreamUrl = upstreamUrl;
   throwIfRecentUpstreamFailure(route, upstreamUrl, upstreamPayload, context);
   logRoute(context, route, upstreamUrl);
   let upstream;
   try {
-    upstream = await fetchUpstream(upstreamUrl, {
+    const upstreamInit = {
       method: "POST",
       headers: upstreamHeaders(route, context, {
         acceptEventStream: Boolean(upstreamPayload.stream),
       }),
       body: JSON.stringify(upstreamPayload),
-    }, context, route);
+    };
+    upstream = await fetchUpstream(activeUpstreamUrl, upstreamInit, context, route);
+    logStatus(context, route, upstream.status);
+    const fallbackUrl = responsesV1FallbackUrl(route, activeUpstreamUrl, upstreamPath);
+    if (fallbackUrl && upstreamResponseLooksHtml(upstream)) {
+      console.warn(
+        `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+          `!! upstream route=${route.id} returned HTML at root responses endpoint; ` +
+          `retrying ${safeUrl(fallbackUrl)}`,
+      );
+      activeUpstreamUrl = fallbackUrl;
+      logRoute(context, route, activeUpstreamUrl);
+      upstream = await fetchUpstream(activeUpstreamUrl, upstreamInit, context, route, {
+        cacheFailures: false,
+      });
+      logStatus(context, route, upstream.status);
+    }
   } catch (error) {
-    rememberUpstreamFailure(route, upstreamUrl, upstreamPayload, error);
+    rememberUpstreamFailure(route, activeUpstreamUrl, upstreamPayload, error);
     throw error;
   }
-  logStatus(context, route, upstream.status);
 
   if (!upstream.ok) {
     const bodyText = await upstream.text();
-    const error = new UpstreamHttpError(upstream.status, bodyText, upstreamUrl, route);
-    rememberUpstreamFailure(route, upstreamUrl, upstreamPayload, error);
+    const error = new UpstreamHttpError(upstream.status, bodyText, activeUpstreamUrl, route);
+    rememberUpstreamFailure(route, activeUpstreamUrl, upstreamPayload, error);
     throw error;
   }
 
@@ -310,7 +326,7 @@ export async function proxyResponsesApi(
       res.end();
     }
     logUsage(context, route, usage);
-    throw new UpstreamStreamError(message, upstreamUrl, route, "upstream_stream_error");
+    throw new UpstreamStreamError(message, activeUpstreamUrl, route, "upstream_stream_error");
   }
   if (upstreamPayload.stream && !responsesSseStreamComplete(responseTail)) {
     const message =
@@ -325,7 +341,7 @@ export async function proxyResponsesApi(
     }));
     res.end();
     logUsage(context, route, usage);
-    throw new UpstreamStreamError(message, upstreamUrl, route, "upstream_stream_truncated");
+    throw new UpstreamStreamError(message, activeUpstreamUrl, route, "upstream_stream_truncated");
   }
 
   res.end();
@@ -760,6 +776,24 @@ function chatCompletionsV1FallbackUrl(route, upstreamUrl, error) {
   }
   const fallbackUrl = joinUpstreamUrl(fallbackBaseUrl, "/chat/completions");
   return fallbackUrl === upstreamUrl ? "" : fallbackUrl;
+}
+
+function responsesV1FallbackUrl(route, upstreamUrl, upstreamPath = "/responses") {
+  if (!isRootBaseUrl(route?.baseUrl)) {
+    return "";
+  }
+  const fallbackBaseUrl = baseUrlWithV1Path(route.baseUrl);
+  if (!fallbackBaseUrl) {
+    return "";
+  }
+  const fallbackUrl = joinUpstreamUrl(fallbackBaseUrl, upstreamPath);
+  return fallbackUrl === upstreamUrl ? "" : fallbackUrl;
+}
+
+function upstreamResponseLooksHtml(response) {
+  return /(?:^|;|\s)text\/html(?:;|\s|$)/i.test(
+    response?.headers?.get?.("content-type") || "",
+  );
 }
 
 function isHtmlNonJsonError(error) {

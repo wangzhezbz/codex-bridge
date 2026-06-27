@@ -188,8 +188,10 @@ jobs:
           ditto -x -k "dist-artifacts/CodexBridge-macOS-${{ matrix.arch }}-Portable.zip" "$smoke_dir"
           test -f "$smoke_dir/CodexBridge.app/Contents/MacOS/CodexBridge"
           test -f "$smoke_dir/CodexBridge.app/Contents/Frameworks/Electron Framework.framework/Electron Framework"
+          test -f "$smoke_dir/CodexBridge.app/Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework"
           test -x "$smoke_dir/CodexBridge.app/Contents/MacOS/CodexBridge"
           test -x "$smoke_dir/CodexBridge.app/Contents/Frameworks/Electron Framework.framework/Electron Framework"
+          test -x "$smoke_dir/CodexBridge.app/Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework"
 
       - name: Upload macOS portable app
         uses: actions/upload-artifact@v4
