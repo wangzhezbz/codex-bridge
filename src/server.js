@@ -264,11 +264,13 @@ function clientAbortContext(req, res) {
   };
   req.once("aborted", abort);
   res.once("close", abort);
+  req.socket?.once?.("close", abort);
   return {
     signal: controller.signal,
     cleanup() {
       req.off("aborted", abort);
       res.off("close", abort);
+      req.socket?.off?.("close", abort);
     },
   };
 }

@@ -197,6 +197,9 @@ export async function handleResponsesRequest(
       compactKind,
     });
   }
+  if (shouldServeIdleResumeLocally(requestBody, route)) {
+    return sendIdleResumeResponse(requestBody, route, history, res, context);
+  }
   if (shouldUseImageGenerationFallback(requestBody, route)) {
     return proxyImageGenerationFallback(
       requestBody,
@@ -214,6 +217,104 @@ export async function handleResponsesRequest(
     return proxyChatCompletions(requestBody, route, history, res, context);
   }
   jsonResponse(res, 500, openAiError(`Unsupported route api: ${route.api}`));
+}
+
+function shouldServeIdleResumeLocally(requestBody = {}, route = {}) {
+  return (
+    ["chat_completions", "responses"].includes(route.api) &&
+    Boolean(requestBody.previous_response_id) &&
+    !requestHasFreshInput(requestBody)
+  );
+}
+
+function requestHasFreshInput(requestBody = {}) {
+  return hasFreshInputValue(requestBody.messages) || hasFreshInputValue(requestBody.input);
+}
+
+function hasFreshInputValue(value) {
+  if (value === undefined || value === null) {
+    return false;
+  }
+  if (typeof value === "string") {
+    return value.trim().length > 0;
+  }
+  if (Array.isArray(value)) {
+    return value.some(hasFreshInputValue);
+  }
+  if (typeof value !== "object") {
+    return Boolean(value);
+  }
+  if (value.type === "compaction_trigger") {
+    return false;
+  }
+  const text = contentToText(value.content ?? value.text ?? value.output ?? "");
+  if (text.trim()) {
+    return true;
+  }
+  return Boolean(
+    isResponseToolCallItem(value) ||
+      isResponseToolOutputItem(value) ||
+      value.role ||
+      value.type,
+  );
+}
+
+function sendIdleResumeResponse(requestBody, route, history, res, context = {}) {
+  const previousId = requestBody.previous_response_id;
+  const stored = history?.getResponse?.(previousId);
+  const response = stored && !responseHasRunnableToolCall(stored)
+    ? stored
+    : idleResumeNoopResponse(requestBody.model || route.id || route.model);
+  console.warn(
+    `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+      `!! idle-resume-guard route=${route.id || "-"} previous_response_id=${previousId}`,
+  );
+  if (requestBody.stream) {
+    res.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    });
+    res.end(responseToSse(response));
+    return;
+  }
+  jsonResponse(res, 200, response);
+}
+
+function idleResumeNoopResponse(model) {
+  const id = `resp_idle_resume_${Date.now().toString(36)}_${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
+  const text =
+    "CodexBridge stopped an automatic resume request with no new input to avoid unintended token usage. " +
+    "Send a new message to continue this task.";
+  return {
+    id,
+    object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    status: "completed",
+    model: model || null,
+    output: [
+      {
+        id: `msg_${id}`,
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        content: [
+          {
+            type: "output_text",
+            text,
+            annotations: [],
+          },
+        ],
+      },
+    ],
+    output_text: text,
+    parallel_tool_calls: true,
+    error: null,
+    incomplete_details: null,
+    usage: null,
+  };
 }
 
 export async function proxyResponsesApi(
@@ -997,7 +1098,7 @@ async function callResponsesCompactUpstream(
     rememberUpstreamFailure(route, upstreamUrl, upstreamPayload, error, options);
     throw error;
   }
-  const text = await upstream.text();
+  const text = await readUpstreamText(upstream, context);
   if (!upstream.ok) {
     const error = new UpstreamHttpError(upstream.status, text, upstreamUrl, route);
     rememberUpstreamFailure(route, upstreamUrl, upstreamPayload, error, options);
@@ -1663,7 +1764,7 @@ export async function callJsonUpstream(
     rememberUpstreamFailure(route, upstreamUrl, upstreamPayload, error, options);
     throw error;
   }
-  const text = await upstream.text();
+  const text = await readUpstreamText(upstream, context);
   if (!upstream.ok) {
     const error = new UpstreamHttpError(upstream.status, text, upstreamUrl, route);
     rememberUpstreamFailure(route, upstreamUrl, upstreamPayload, error, options);
@@ -1681,6 +1782,46 @@ export async function callJsonUpstream(
     throw error;
   }
   return parsed;
+}
+
+async function readUpstreamText(upstream, context = {}) {
+  if (!context.clientSignal || !upstream?.body) {
+    return upstream.text();
+  }
+  if (context.clientSignal.aborted) {
+    throw new ClientClosedRequestError();
+  }
+
+  const reader = upstream.body.getReader();
+  const chunks = [];
+  let abortHandler;
+  const abortPromise = new Promise((_, reject) => {
+    abortHandler = () => {
+      reader.cancel(context.clientSignal.reason).catch(() => {});
+      reject(new ClientClosedRequestError());
+    };
+    context.clientSignal.addEventListener("abort", abortHandler, { once: true });
+  });
+  try {
+    while (true) {
+      const result = await Promise.race([reader.read(), abortPromise]);
+      if (result.done) {
+        break;
+      }
+      chunks.push(Buffer.from(result.value));
+    }
+    return Buffer.concat(chunks).toString("utf8");
+  } catch (error) {
+    if (context.clientSignal.aborted || error?.code === "client_closed_request") {
+      throw new ClientClosedRequestError();
+    }
+    throw error;
+  } finally {
+    if (abortHandler) {
+      context.clientSignal.removeEventListener("abort", abortHandler);
+    }
+    reader.releaseLock();
+  }
 }
 
 export function __resetUpstreamFailureCacheForTests() {

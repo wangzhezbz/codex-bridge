@@ -225,6 +225,16 @@ function trimMessagesToCompactBudget(messages) {
 function shortenCompactMessage(message) {
   const text = contentToText(message?.content);
   const shortened = middleExcerpt(text, COMPACT_MESSAGE_MAX_CHARS);
+  if (message?.role === "tool") {
+    const id = message.tool_call_id ? ` ${message.tool_call_id}` : "";
+    return {
+      role: "system",
+      content:
+        "CodexBridge compacted a historical tool result so it can be used as context " +
+        `without replaying a native tool message.\n\nResult${id}:\n` +
+        (shortened || "[tool result omitted during context compaction]"),
+    };
+  }
   const result = {
     role: message?.role || "user",
     content: shortened || "[message omitted during context compaction]",
