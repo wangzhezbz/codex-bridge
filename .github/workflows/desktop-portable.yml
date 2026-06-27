@@ -181,6 +181,16 @@ jobs:
           test -n "$app_path"
           ditto -c -k --keepParent "$app_path" "dist-artifacts/CodexBridge-macOS-${{ matrix.arch }}-Portable.zip"
 
+      - name: Smoke test macOS release archive
+        run: |
+          smoke_dir="$RUNNER_TEMP/codexbridge-macos-release-archive-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          mkdir -p "$smoke_dir"
+          ditto -x -k "dist-artifacts/CodexBridge-macOS-${{ matrix.arch }}-Portable.zip" "$smoke_dir"
+          test -f "$smoke_dir/CodexBridge.app/Contents/MacOS/CodexBridge"
+          test -f "$smoke_dir/CodexBridge.app/Contents/Frameworks/Electron Framework.framework/Electron Framework"
+          test -x "$smoke_dir/CodexBridge.app/Contents/MacOS/CodexBridge"
+          test -x "$smoke_dir/CodexBridge.app/Contents/Frameworks/Electron Framework.framework/Electron Framework"
+
       - name: Upload macOS portable app
         uses: actions/upload-artifact@v4
         with:

@@ -1458,6 +1458,61 @@ test("DeepSeek preserves prior tool results as native chat tool messages", () =>
   assert.doesNotMatch(transcript, /CodexBridge tool result context/);
 });
 
+test("chat conversion preserves raw chat-style tool messages when paired", () => {
+  const converted = responsesToChatRequest(
+    {
+      model: "deepseek-v4-pro",
+      input: [
+        { role: "user", content: "create a presentation" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "call_create_ppt",
+              type: "function",
+              function: {
+                name: "shell_command",
+                arguments: '{"command":"New-Item deck.pptx"}',
+              },
+            },
+          ],
+        },
+        {
+          role: "tool",
+          tool_call_id: "call_create_ppt",
+          content: "created deck.pptx",
+        },
+        { role: "user", content: "continue" },
+      ],
+      tools: [
+        {
+          type: "function",
+          name: "shell_command",
+          description: "Run command",
+          parameters: {
+            type: "object",
+            properties: { command: { type: "string" } },
+            required: ["command"],
+          },
+        },
+      ],
+    },
+    { ...route, provider: "deepseek" },
+    new ResponseHistory(),
+  );
+
+  const assistant = converted.body.messages.find((message) =>
+    Array.isArray(message.tool_calls),
+  );
+  const tool = converted.body.messages.find((message) => message.role === "tool");
+  assert.ok(assistant);
+  assert.equal(assistant.tool_calls[0].id, "call_create_ppt");
+  assert.ok(tool);
+  assert.equal(tool.tool_call_id, "call_create_ppt");
+  assert.match(tool.content, /created deck\.pptx/);
+});
+
 test("chat routes never forward malformed extra tool outputs as native tool messages", () => {
   const history = new ResponseHistory();
   history.record("resp_ppt_tool_call", [

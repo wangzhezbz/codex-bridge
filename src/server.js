@@ -156,7 +156,10 @@ export function createRouterServer(config = loadConfig()) {
           routeHealth.recordError(route, error, { compactKind });
           console.error(requestErrorLine(requestId, route, error, { compactKind }));
           if (!res.destroyed && !res.writableEnded) {
-            sendUpstreamError(res, error);
+            sendUpstreamError(res, error, {
+              asResponsesStream: Boolean(body.stream),
+              model: body.model || route.id || route.model || null,
+            });
           }
         } finally {
           clientAbort.cleanup();

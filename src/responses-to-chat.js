@@ -252,6 +252,12 @@ export function responseMessageToChatMessage(item, route = {}) {
       message.content = null;
     }
   }
+  if (role === "tool") {
+    const toolCallId = item.tool_call_id || item.call_id || item.id;
+    if (toolCallId) {
+      message.tool_call_id = toolCallId;
+    }
+  }
 
   return message;
 }

@@ -47,7 +47,7 @@ const FAILURE_CACHE_MAX_ENTRIES = 200;
 const FAILURE_CACHE_DEFAULT_TTL_MS = 30_000;
 const FAILURE_CACHE_FATAL_TTL_MS = 120_000;
 const FAILURE_CACHE_TRANSIENT_TTL_MS = 15_000;
-const DEFAULT_CHAT_TOOL_CONTINUATION_TURNS = 2;
+const DEFAULT_CHAT_TOOL_CONTINUATION_TURNS = 5;
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 300_000;
 const INVALID_JSON_VALUE = Symbol("invalid_json_value");
 
@@ -238,17 +238,40 @@ export async function proxyResponsesApi(
   }
   const decoder = new TextDecoder();
   let responseTail = "";
-  for await (const chunk of upstream.body) {
-    const buffer = Buffer.from(chunk);
-    responseTail += decoder.decode(buffer, { stream: true });
-    if (responseTail.length > 2_000_000) {
-      responseTail = responseTail.slice(-2_000_000);
+  let streamError = null;
+  try {
+    for await (const chunk of upstream.body) {
+      const buffer = Buffer.from(chunk);
+      responseTail += decoder.decode(buffer, { stream: true });
+      if (responseTail.length > 2_000_000) {
+        responseTail = responseTail.slice(-2_000_000);
+      }
+      res.write(buffer);
     }
-    res.write(buffer);
+  } catch (error) {
+    streamError = error;
   }
   responseTail += decoder.decode();
   const completedResponse = extractResponsesObject(responseTail);
   const usage = extractUsageObject(completedResponse) || extractResponsesUsage(responseTail);
+  if (streamError) {
+    if (!upstreamPayload.stream) {
+      throw streamError;
+    }
+    const message = responsesStreamFailureMessage(route, streamError);
+    console.warn(
+      `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+        `!! upstream route=${route.id} errored responses stream: ${safeText(streamError.message || streamError, 240)}`,
+    );
+    if (!res.destroyed && !res.writableEnded) {
+      res.write(buildResponsesStreamErrorSse(message, {
+        model: requestBody.model || route.id || route.model || null,
+      }));
+      res.end();
+    }
+    logUsage(context, route, usage);
+    return;
+  }
   if (upstreamPayload.stream && !responsesSseStreamComplete(responseTail)) {
     const message =
       `CodexBridge upstream stream from ${route.displayName || route.id || route.model || "route"} ` +
@@ -268,6 +291,13 @@ export async function proxyResponsesApi(
   res.end();
   recordResponsesHistory(history, completedResponse, sourceMessages, toolContext);
   logUsage(context, route, usage);
+}
+
+function responsesStreamFailureMessage(route = {}, error) {
+  return (
+    `CodexBridge upstream stream from ${route.displayName || route.id || route.model || "route"} ` +
+    `disconnected before response.completed. ${safeText(error?.message || error || "", 300)}`
+  ).trim();
 }
 
 function shouldInlineLocalHistoryForResponses(requestBody, history) {
@@ -438,7 +468,12 @@ export async function proxyChatCompletions(
   let messagesForHistory = converted.messagesForHistory;
   let upstream;
   try {
-    upstream = await callJsonUpstream(upstreamUrl, route, converted.body, context);
+    upstream = await callChatCompletionsUpstream(
+      upstreamUrl,
+      route,
+      converted.body,
+      context,
+    );
   } catch (error) {
     if (isRateLimitError(error)) {
       return sendLocalRateLimitedResponse({
@@ -461,11 +496,14 @@ export async function proxyChatCompletions(
     );
     const textOnlyBody = chatBodyWithoutImages(converted.body);
     messagesForHistory = chatMessagesWithoutImages(converted.messagesForHistory);
-    logRoute(context, route, upstreamUrl);
     try {
-      upstream = await callJsonUpstream(upstreamUrl, route, textOnlyBody, context, {
-        trackRateLimit: false,
-      });
+      upstream = await callChatCompletionsUpstream(
+        upstreamUrl,
+        route,
+        textOnlyBody,
+        context,
+        { trackRateLimit: false },
+      );
     } catch (retryError) {
       console.warn(
         `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
@@ -580,7 +618,12 @@ async function proxyChatCompact(requestBody, route, history, res, context = {}) 
   let response = null;
   let localFallback = "";
   try {
-    upstream = await callJsonUpstream(upstreamUrl, route, converted.body, context);
+    upstream = await callChatCompletionsUpstream(
+      upstreamUrl,
+      route,
+      converted.body,
+      context,
+    );
     logUsage(context, route, upstream.usage);
     response = compactResponseFromChat(upstream, requestBody.model || route.id, {
       messages: converted.messagesForHistory,
@@ -627,9 +670,79 @@ async function proxyChatCompact(requestBody, route, history, res, context = {}) 
   jsonResponse(res, 200, response);
 }
 
+async function callChatCompletionsUpstream(
+  upstreamUrl,
+  route,
+  payload,
+  context = {},
+  options = {},
+) {
+  try {
+    return await callJsonUpstream(upstreamUrl, route, payload, context, options);
+  } catch (error) {
+    const fallbackUrl = chatCompletionsV1FallbackUrl(route, upstreamUrl, error);
+    if (!fallbackUrl) {
+      throw error;
+    }
+    console.warn(
+      `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+        `!! upstream route=${route.id} returned HTML at root chat endpoint; ` +
+        `retrying ${safeUrl(fallbackUrl)}`,
+    );
+    logRoute(context, route, fallbackUrl);
+    return callJsonUpstream(fallbackUrl, route, payload, context, {
+      ...options,
+      cacheFailures: false,
+    });
+  }
+}
+
+function chatCompletionsV1FallbackUrl(route, upstreamUrl, error) {
+  if (!isHtmlNonJsonError(error) || !isRootBaseUrl(route?.baseUrl)) {
+    return "";
+  }
+  const fallbackBaseUrl = baseUrlWithV1Path(route.baseUrl);
+  if (!fallbackBaseUrl) {
+    return "";
+  }
+  const fallbackUrl = joinUpstreamUrl(fallbackBaseUrl, "/chat/completions");
+  return fallbackUrl === upstreamUrl ? "" : fallbackUrl;
+}
+
+function isHtmlNonJsonError(error) {
+  return (
+    error instanceof UpstreamHttpError &&
+    error.statusCode === 502 &&
+    /Upstream returned non-JSON body:/i.test(error.bodyText || "") &&
+    /<(!doctype\s+html|html|head|body)(\s|>|$)/i.test(error.bodyText || "")
+  );
+}
+
+function isRootBaseUrl(baseUrl) {
+  try {
+    const parsed = new URL(baseUrl);
+    return parsed.pathname === "" || parsed.pathname === "/";
+  } catch {
+    return false;
+  }
+}
+
+function baseUrlWithV1Path(baseUrl) {
+  try {
+    const parsed = new URL(baseUrl);
+    parsed.pathname = "/v1";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    return "";
+  }
+}
+
 async function proxyResponsesCompact(requestBody, route, history, res, context = {}) {
   const compactBody = buildCompactResponsesRequest(requestBody, {
     stream: shouldStreamResponsesCompact(route),
+    omitMaxOutputTokens: shouldOmitResponsesCompactMaxOutputTokens(route),
   });
   compactBody.model = route.model;
   const { messages: sourceMessages, toolContext } = responseRequestToChatSourceMessages(
@@ -655,7 +768,10 @@ async function proxyResponsesCompact(requestBody, route, history, res, context =
           `!! compact-local-fallback route=${route.id} reason=${safeText(compactFallbackReasonText, 300)}`,
       );
     } else {
-      const streamCompactBody = buildCompactResponsesRequest(requestBody, { stream: true });
+      const streamCompactBody = buildCompactResponsesRequest(requestBody, {
+        stream: true,
+        omitMaxOutputTokens: shouldOmitResponsesCompactMaxOutputTokens(route),
+      });
       streamCompactBody.model = route.model;
       if (shouldInlineLocalHistoryForResponses(streamCompactBody, history)) {
         inlineLocalHistoryForResponsesPayload(streamCompactBody, sourceMessages);
@@ -768,6 +884,10 @@ async function callResponsesCompactUpstream(
 }
 
 function shouldStreamResponsesCompact(route = {}) {
+  return authModeForRoute(route) === "codex_openai";
+}
+
+function shouldOmitResponsesCompactMaxOutputTokens(route = {}) {
   return authModeForRoute(route) === "codex_openai";
 }
 
@@ -1411,7 +1531,19 @@ export function __resetUpstreamFailureCacheForTests() {
   recentUpstreamFailures.clear();
 }
 
-export function sendUpstreamError(res, error) {
+export function sendUpstreamError(res, error, options = {}) {
+  if (options.asResponsesStream) {
+    sendResponsesStreamFailure(res, streamErrorMessage(error), {
+      model: options.model || error?.route?.model || null,
+    });
+    return;
+  }
+
+  if (res.headersSent) {
+    res.end();
+    return;
+  }
+
   if (error instanceof UpstreamNetworkError) {
     const classification = classifyUpstreamError(error);
     jsonResponse(
@@ -1451,6 +1583,27 @@ export function sendUpstreamError(res, error) {
 
   const statusCode = error.statusCode || 500;
   jsonResponse(res, statusCode, openAiError(error.message, statusCode, error.code || "router_error"));
+}
+
+function sendResponsesStreamFailure(res, message, options = {}) {
+  if (!res.headersSent) {
+    res.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    });
+  }
+  if (!res.writableEnded) {
+    res.end(buildResponsesStreamErrorSse(message, options));
+  }
+}
+
+function streamErrorMessage(error) {
+  if (error instanceof UpstreamHttpError) {
+    const parsed = tryParseJson(error.bodyText);
+    return clientUpstreamErrorMessage(error, parsed);
+  }
+  return error?.message || String(error || "Upstream stream failed.");
 }
 
 function isMissingResponsesWriteScope(parsedBody, rawBody) {

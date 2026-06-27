@@ -714,6 +714,66 @@ test("responses stream logs token usage from completed SSE event", async () => {
   }
 });
 
+test("responses stream body errors are converted to terminal SSE for Codex clients", async () => {
+  const originalFetch = globalThis.fetch;
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(
+        new TextEncoder().encode(
+          [
+            "event: response.output_text.delta",
+            `data: ${JSON.stringify({
+              type: "response.output_text.delta",
+              delta: "partial before socket error",
+            })}`,
+            "",
+          ].join("\n"),
+        ),
+      );
+      controller.error(new Error("socket closed while streaming"));
+    },
+  });
+
+  globalThis.fetch = async () =>
+    new Response(stream, {
+      status: 200,
+      headers: { "content-type": "text/event-stream; charset=utf-8" },
+    });
+
+  try {
+    const res = collectResponse();
+    await proxyResponsesApi(
+      {
+        model: "gpt-5.5",
+        input: "hello",
+        stream: true,
+      },
+      {
+        id: "gpt-5.5",
+        api: "responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        model: "gpt-5.5",
+        authMode: "codex_openai",
+      },
+      res,
+      {
+        requestId: "req_body_error",
+        clientAuth: {
+          kind: "codex_openai",
+          bearerToken: "codex-openai-token",
+        },
+      },
+    );
+
+    const text = res.body();
+    assert.match(text, /response\.failed/);
+    assert.match(text, /upstream_stream_truncated/);
+    assert.match(text, /data: \[DONE\]/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 function snapshotProxyEnv() {
   const keys = proxyEnvKeys();
   return Object.fromEntries(keys.map((key) => [key, process.env[key]]));

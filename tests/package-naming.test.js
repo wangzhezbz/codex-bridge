@@ -159,6 +159,23 @@ test("macOS release archives use formal x64 and arm64 package naming", () => {
   assert.match(packager, /codexbridge-icon\.icns/);
 });
 
+test("macOS release archives are extracted and checked for Electron Framework", () => {
+  const workflow = fs.readFileSync(
+    path.join(process.cwd(), ".github", "workflows", "desktop-portable.yml"),
+    "utf8",
+  );
+  const smoke = fs.readFileSync(
+    path.join(process.cwd(), "scripts", "smoke-packaged-macos.mjs"),
+    "utf8",
+  );
+
+  assert.match(workflow, /Smoke test macOS release archive/);
+  assert.match(workflow, /ditto -x -k "dist-artifacts\/CodexBridge-macOS-\$\{\{ matrix\.arch \}\}-Portable\.zip"/);
+  assert.match(workflow, /Electron Framework\.framework\/Electron Framework/);
+  assert.match(smoke, /Electron Framework\.framework/);
+  assert.match(smoke, /missing packaged Electron Framework/);
+});
+
 test("desktop packages include native app icon assets", () => {
   const assetsDir = path.join(process.cwd(), "desktop", "assets");
   const png = fs.readFileSync(path.join(assetsDir, "codexbridge-icon.png"));

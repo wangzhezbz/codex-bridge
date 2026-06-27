@@ -11,10 +11,21 @@ const targetArch = process.env.CODEXBRIDGE_MAC_ARCH || process.arch;
 const appDir = newestPackagedAppDir(targetArch);
 const appPath = path.join(appDir, "CodexBridge.app");
 const executablePath = path.join(appPath, "Contents", "MacOS", "CodexBridge");
+const electronFrameworkPath = path.join(
+  appPath,
+  "Contents",
+  "Frameworks",
+  "Electron Framework.framework",
+  "Electron Framework",
+);
 const appRoot = path.join(appPath, "Contents", "Resources", "app");
 
 assert.ok(fs.existsSync(appPath), `missing packaged app: ${appPath}`);
 assert.ok(fs.existsSync(executablePath), `missing packaged executable: ${executablePath}`);
+assert.ok(
+  fs.existsSync(electronFrameworkPath),
+  `missing packaged Electron Framework: ${electronFrameworkPath}`,
+);
 assert.ok(fs.existsSync(path.join(appRoot, "src", "server.js")), "missing packaged router script");
 
 if (process.platform === "darwin") {

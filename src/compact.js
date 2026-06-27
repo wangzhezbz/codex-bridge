@@ -161,7 +161,9 @@ function compactRequestBody(requestBody, options = {}) {
     body.messages = appendCompactPrompt(stripCompactionTrigger(body.messages));
   }
   body.stream = Boolean(options.stream);
-  body.max_output_tokens = COMPACT_MAX_OUTPUT_TOKENS;
+  if (!options.omitMaxOutputTokens) {
+    body.max_output_tokens = COMPACT_MAX_OUTPUT_TOKENS;
+  }
   delete body.instructions;
   delete body.tools;
   delete body.tool_choice;

@@ -818,29 +818,34 @@ test("server default chat tool guard stops repeated no-progress tool calls", asy
     const firstCall = first.output.find((item) => item.type === "function_call");
     assert.ok(firstCall);
 
-    const second = await fetchJson(`${baseUrl}/v1/responses`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: "Bearer router-token",
-      },
-      body: JSON.stringify({
-        model: "deepseek-v4-pro",
-        previous_response_id: first.id,
-        input: [
-          {
-            type: "function_call_output",
-            call_id: firstCall.call_id,
-            output: "same stalled result",
-          },
-        ],
-        tools,
-      }),
-    });
-    const secondCall = second.output.find((item) => item.type === "function_call");
-    assert.ok(secondCall);
+    let previousResponseId = first.id;
+    let previousCall = firstCall;
+    for (let step = 1; step <= 5; step += 1) {
+      const response = await fetchJson(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer router-token",
+        },
+        body: JSON.stringify({
+          model: "deepseek-v4-pro",
+          previous_response_id: previousResponseId,
+          input: [
+            {
+              type: "function_call_output",
+              call_id: previousCall.call_id,
+              output: "same stalled result",
+            },
+          ],
+          tools,
+        }),
+      });
+      previousResponseId = response.id;
+      previousCall = response.output.find((item) => item.type === "function_call");
+      assert.ok(previousCall, `stalled step ${step} should still be allowed`);
+    }
 
-    const third = await fetchJson(`${baseUrl}/v1/responses`, {
+    const stopped = await fetchJson(`${baseUrl}/v1/responses`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -848,33 +853,11 @@ test("server default chat tool guard stops repeated no-progress tool calls", asy
       },
       body: JSON.stringify({
         model: "deepseek-v4-pro",
-        previous_response_id: second.id,
+        previous_response_id: previousResponseId,
         input: [
           {
             type: "function_call_output",
-            call_id: secondCall.call_id,
-            output: "same stalled result",
-          },
-        ],
-        tools,
-      }),
-    });
-    const thirdCall = third.output.find((item) => item.type === "function_call");
-    assert.ok(thirdCall);
-
-    const fourth = await fetchJson(`${baseUrl}/v1/responses`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: "Bearer router-token",
-      },
-      body: JSON.stringify({
-        model: "deepseek-v4-pro",
-        previous_response_id: third.id,
-        input: [
-          {
-            type: "function_call_output",
-            call_id: thirdCall.call_id,
+            call_id: previousCall.call_id,
             output: "same stalled result",
           },
         ],
@@ -883,11 +866,11 @@ test("server default chat tool guard stops repeated no-progress tool calls", asy
     });
 
     assert.equal(
-      fourth.output.some((item) => item.type === "function_call"),
+      stopped.output.some((item) => item.type === "function_call"),
       false,
     );
-    assert.match(fourth.output_text, /stopped.*tool loop/i);
-    assert.equal(upstreamCalls, 4);
+    assert.match(stopped.output_text, /stopped.*tool loop/i);
+    assert.equal(upstreamCalls, 7);
   } finally {
     await close(router);
     await close(upstream);
@@ -3347,6 +3330,77 @@ test("server logs final upstream provider and model for routed requests", async 
   }
 });
 
+test("chat routes retry root OpenAI-compatible base URLs with /v1 when HTML is returned", async () => {
+  const paths = [];
+  const upstream = http.createServer(async (req, res) => {
+    paths.push(req.url);
+    if (req.url === "/chat/completions") {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.end("<!doctype html><html><body>provider portal</body></html>");
+      return;
+    }
+    if (req.url === "/v1/chat/completions") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        id: "chatcmpl_root_retry",
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: "connected through v1",
+            },
+          },
+        ],
+      }));
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: `unexpected ${req.url}` } }));
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: serverUrl(upstream),
+        model: "deepseek-v4-pro",
+        authMode: "api_key",
+        apiKey: "deepseek-provider-key",
+      },
+    ],
+  });
+  await listen(router);
+
+  try {
+    const response = await fetchJson(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        input: "hello",
+      }),
+    });
+
+    assert.equal(response.output_text, "connected through v1");
+    assert.deepEqual(paths, ["/chat/completions", "/v1/chat/completions"]);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
 test("subscription scope errors explain that Codex login is not an API key", async () => {
   const upstream = http.createServer(async (_req, res) => {
     res.writeHead(401, { "content-type": "application/json" });
@@ -4903,6 +4957,73 @@ test("truncated native responses streams end with a bridge failure event and do 
   assert.doesNotMatch(chatText, /partial text/);
 });
 
+test("native responses stream transport errors end with a bridge failure event", async () => {
+  const upstream = http.createServer(async (req, res) => {
+    if (req.url === "/v1/responses") {
+      res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+      res.write(
+        [
+          "event: response.output_text.delta",
+          `data: ${JSON.stringify({
+            type: "response.output_text.delta",
+            delta: "partial subscription text",
+          })}`,
+          "",
+        ].join("\n"),
+      );
+      res.destroy(new Error("subscription stream transport closed"));
+      return;
+    }
+
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "unexpected path" }));
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "gpt-5.5",
+    clientAuth: { allowOpenAiBearer: true },
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        api: "responses",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "gpt-5.5",
+        authMode: "codex_openai",
+      },
+    ],
+  });
+
+  await listen(router);
+
+  try {
+    const response = await fetch(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer codex-openai-token",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        stream: true,
+        input: "stream can disconnect on the wire",
+      }),
+    });
+    const text = await response.text();
+    assert.equal(response.ok, true, text);
+    assert.match(text, /response\.failed/);
+    assert.match(text, /upstream_stream_truncated/);
+    assert.match(text, /data: \[DONE\]/);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
 test("chat route image rejection is retried without poisoning later conversation turns", async () => {
   const chatBodies = [];
   const upstream = http.createServer(async (req, res) => {
@@ -5351,6 +5472,83 @@ test("chat-routed remote compact v2 returns a single compaction SSE item", async
   }
 });
 
+test("chat-routed compact retries root OpenAI-compatible base URLs with /v1 when HTML is returned", async () => {
+  const paths = [];
+  const upstream = http.createServer(async (req, res) => {
+    paths.push(req.url);
+    if (req.url === "/chat/completions") {
+      await readJson(req);
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.end("<!doctype html><html><body>provider portal</body></html>");
+      return;
+    }
+    if (req.url === "/v1/chat/completions") {
+      await readJson(req);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        id: "chatcmpl_compact_root_retry",
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: "Summary: compact connected through v1.",
+            },
+          },
+        ],
+      }));
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: `unexpected ${req.url}` } }));
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        api: "chat_completions",
+        baseUrl: serverUrl(upstream),
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+
+  try {
+    const response = await fetch(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        stream: true,
+        input: [
+          { type: "message", role: "user", content: "long task history" },
+          { type: "compaction_trigger" },
+        ],
+      }),
+    });
+    const text = await response.text();
+    assert.equal(response.ok, true, text);
+    assert.match(text, /Summary: compact connected through v1/);
+    assert.deepEqual(paths, ["/chat/completions", "/v1/chat/completions"]);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
 test("chat-routed remote compact v2 falls back locally when upstream compaction fails", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer(async (req, res) => {
@@ -5675,6 +5873,7 @@ test("responses-routed remote compact v2 keeps upstream stream enabled when requ
     assert.equal(response.ok, true, text);
     assert.equal(upstreamCalls, 1);
     assert.equal(upstreamBody.stream, true);
+    assert.equal(upstreamBody.max_output_tokens, undefined);
     assert.match(text, /Summary: streamed compact response works/);
     assert.equal((text.match(/"type":"compaction"/g) || []).length, 3);
   } finally {
