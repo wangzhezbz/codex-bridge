@@ -6061,6 +6061,76 @@ test("chat-routed remote compact v2 falls back locally when upstream compaction 
   }
 });
 
+test("chat-routed remote compact v2 falls back locally when upstream returns 413", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/chat/completions");
+    upstreamCalls += 1;
+    await readJson(req);
+    res.writeHead(413, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        error: {
+          message: "Payload Too Large: nginx client_max_body_size exceeded",
+        },
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-flash",
+    models: [
+      {
+        id: "deepseek-v4-flash",
+        displayName: "DeepSeek V4 Flash",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "deepseek-v4-flash",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+
+  try {
+    const response = await fetch(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-flash",
+        stream: true,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: "latest DeepSeek compact fallback detail must survive 413",
+          },
+          { type: "compaction_trigger" },
+        ],
+      }),
+    });
+    const text = await response.text();
+    assert.equal(response.status, 200, text);
+    assert.equal(upstreamCalls, 1);
+    assert.equal((text.match(/"type":"compaction"/g) || []).length, 3);
+    assert.match(text, /CodexBridge local compact fallback/);
+    assert.match(text, /Payload Too Large/);
+    assert.match(text, /latest DeepSeek compact fallback detail must survive 413/);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
 test("responses-routed remote compact v2 wraps ordinary upstream output as one compaction SSE item", async () => {
   let upstreamBody;
   const upstream = http.createServer(async (req, res) => {
@@ -6156,6 +6226,75 @@ test("responses-routed remote compact v2 wraps ordinary upstream output as one c
     assert.equal(upstreamBody.tools, undefined);
     assert.doesNotMatch(JSON.stringify(upstreamBody), /compaction_trigger/);
     assert.match(JSON.stringify(upstreamBody.input), /CONTEXT CHECKPOINT COMPACTION/);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("responses-routed remote compact v2 falls back locally when upstream returns 413", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/responses");
+    upstreamCalls += 1;
+    await readJson(req);
+    res.writeHead(413, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        error: {
+          message: "Payload Too Large: upstream request body limit exceeded",
+        },
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "gpt-5.5",
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        api: "responses",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "gpt-5.5",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+
+  try {
+    const response = await fetch(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        stream: true,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: "latest GPT compact fallback detail must survive 413",
+          },
+          { type: "compaction_trigger" },
+        ],
+      }),
+    });
+    const text = await response.text();
+    assert.equal(response.status, 200, text);
+    assert.equal(upstreamCalls, 1);
+    assert.equal((text.match(/"type":"compaction"/g) || []).length, 3);
+    assert.match(text, /CodexBridge local compact fallback/);
+    assert.match(text, /Payload Too Large/);
+    assert.match(text, /latest GPT compact fallback detail must survive 413/);
   } finally {
     await close(router);
     await close(upstream);
