@@ -5017,57 +5017,7 @@ test("upstream requests log adapter payload drops with route-specific reasons", 
 });
 
 test("chat provider categories complete text requests without unsafe params", async () => {
-  for (const route of [
-    {
-      id: "deepseek-smoke",
-      provider: "deepseek",
-      model: "deepseek-v4-pro",
-      dropParams: ["response_format", "parallel_tool_calls"],
-    },
-    {
-      id: "kimi-smoke",
-      provider: "kimi",
-      model: "kimi-k2.7-code",
-      inputModalities: ["text", "image"],
-      dropParams: ["response_format", "parallel_tool_calls"],
-    },
-    {
-      id: "minimax-smoke",
-      provider: "minimax",
-      model: "MiniMax-M3",
-      dropParams: ["response_format", "parallel_tool_calls"],
-    },
-    {
-      id: "doubao-smoke",
-      provider: "volcengine",
-      model: "doubao-seed-1-8-251228",
-      dropParams: ["response_format", "parallel_tool_calls"],
-    },
-    {
-      id: "qwen-smoke",
-      provider: "qwen",
-      model: "qwen3-coder-plus",
-      dropParams: ["parallel_tool_calls"],
-    },
-    {
-      id: "zhipu-smoke",
-      provider: "zhipu",
-      model: "glm-4.6",
-      dropParams: ["parallel_tool_calls"],
-    },
-    {
-      id: "generic-smoke",
-      provider: "openrouter",
-      model: "anthropic/claude-sonnet-4.5",
-      dropParams: ["parallel_tool_calls"],
-    },
-    {
-      id: "siliconflow-smoke",
-      provider: "siliconflow",
-      model: "Qwen/Qwen3-Coder-480B-A35B-Instruct",
-      dropParams: ["parallel_tool_calls"],
-    },
-  ]) {
+  for (const route of mainChatProviderSmokeRoutes()) {
     const { response, upstreamBody } = await exerciseChatRoute(route);
     assert.equal(response.output_text, "smoke ok", route.id);
     assert.equal(upstreamBody.parallel_tool_calls, undefined, route.id);
@@ -6131,6 +6081,24 @@ test("chat-routed remote compact v2 falls back locally when upstream returns 413
   }
 });
 
+test("chat-routed remote compact v2 falls back locally on upstream 413 across provider matrix", async () => {
+  for (const route of mainChatProviderSmokeRoutes({ includeCustom: true })) {
+    const { response, text, upstreamBody, upstreamCalls } = await exerciseChatCompact413Route(route);
+    assert.equal(response.status, 200, `${route.id}: ${text}`);
+    assert.equal(upstreamCalls, 1, route.id);
+    assert.equal(upstreamBody.model, route.model, route.id);
+    assert.equal(upstreamBody.stream, false, route.id);
+    assert.equal(upstreamBody.tools, undefined, route.id);
+    assert.equal(upstreamBody.tool_choice, undefined, route.id);
+    assert.equal(upstreamBody.parallel_tool_calls, undefined, route.id);
+    assert.equal(upstreamBody.response_format, undefined, route.id);
+    assert.equal((text.match(/"type":"compaction"/g) || []).length, 3, route.id);
+    assert.match(text, /CodexBridge local compact fallback/, route.id);
+    assert.match(text, /Payload Too Large/, route.id);
+    assert.match(text, new RegExp(`latest compact fallback detail for ${escapeRegExp(route.id)}`), route.id);
+  }
+});
+
 test("responses-routed remote compact v2 wraps ordinary upstream output as one compaction SSE item", async () => {
   let upstreamBody;
   const upstream = http.createServer(async (req, res) => {
@@ -6660,6 +6628,73 @@ async function fetchJson(url, init) {
   return JSON.parse(text);
 }
 
+function mainChatProviderSmokeRoutes(options = {}) {
+  const routes = [
+    {
+      id: "deepseek-smoke",
+      provider: "deepseek",
+      model: "deepseek-v4-pro",
+      dropParams: ["response_format", "parallel_tool_calls"],
+    },
+    {
+      id: "kimi-smoke",
+      provider: "kimi",
+      model: "kimi-k2.7-code",
+      inputModalities: ["text", "image"],
+      dropParams: ["response_format", "parallel_tool_calls"],
+    },
+    {
+      id: "minimax-smoke",
+      provider: "minimax",
+      model: "MiniMax-M3",
+      dropParams: ["response_format", "parallel_tool_calls"],
+    },
+    {
+      id: "doubao-smoke",
+      provider: "volcengine",
+      model: "doubao-seed-1-8-251228",
+      dropParams: ["response_format", "parallel_tool_calls"],
+    },
+    {
+      id: "qwen-smoke",
+      provider: "qwen",
+      model: "qwen3-coder-plus",
+      dropParams: ["parallel_tool_calls"],
+    },
+    {
+      id: "zhipu-smoke",
+      provider: "zhipu",
+      model: "glm-4.6",
+      dropParams: ["parallel_tool_calls"],
+    },
+    {
+      id: "generic-smoke",
+      provider: "openrouter",
+      model: "anthropic/claude-sonnet-4.5",
+      dropParams: ["parallel_tool_calls"],
+    },
+    {
+      id: "siliconflow-smoke",
+      provider: "siliconflow",
+      model: "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+      dropParams: ["parallel_tool_calls"],
+    },
+  ];
+
+  if (options.includeCustom) {
+    routes.push({
+      id: "custom-smoke",
+      provider: "custom",
+      custom: true,
+      model: "custom-model",
+      inputModalities: ["text", "image"],
+      dropParams: [],
+    });
+  }
+
+  return routes;
+}
+
 async function exerciseChatRoute(routeOverrides = {}, requestOverrides = {}) {
   let upstreamBody;
   const upstream = http.createServer(async (req, res) => {
@@ -6730,12 +6765,100 @@ async function exerciseChatRoute(routeOverrides = {}, requestOverrides = {}) {
   }
 }
 
+async function exerciseChatCompact413Route(routeOverrides = {}) {
+  let upstreamBody;
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/chat/completions");
+    upstreamCalls += 1;
+    upstreamBody = await readJson(req);
+    res.writeHead(413, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        error: {
+          message: `Payload Too Large for ${routeOverrides.id}`,
+        },
+      }),
+    );
+  });
+
+  await listen(upstream);
+
+  const route = {
+    id: routeOverrides.id || "smoke-model",
+    provider: routeOverrides.provider || "custom",
+    displayName: routeOverrides.displayName || "Smoke Model",
+    api: "chat_completions",
+    baseUrl: `${serverUrl(upstream)}/v1`,
+    model: routeOverrides.model || "smoke-model",
+    apiKey: "upstream-key",
+    ...routeOverrides,
+  };
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: route.id,
+    models: [route],
+  });
+
+  await listen(router);
+
+  try {
+    const response = await fetch(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: route.id,
+        stream: true,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: `latest compact fallback detail for ${route.id}`,
+          },
+          { type: "compaction_trigger" },
+        ],
+        response_format: { type: "json_object" },
+        tools: [
+          {
+            type: "function",
+            name: "lookup",
+            description: "Lookup test data.",
+            parameters: {
+              type: "object",
+              properties: {
+                query: { type: "string" },
+              },
+              required: ["query"],
+            },
+          },
+        ],
+        tool_choice: { type: "function", name: "lookup" },
+        parallel_tool_calls: true,
+      }),
+    });
+    const text = await response.text();
+    return { response, text, upstreamBody, upstreamCalls };
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+}
+
 async function readJson(req) {
   const chunks = [];
   for await (const chunk of req) {
     chunks.push(chunk);
   }
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function countCacheControlBlocks(value) {
