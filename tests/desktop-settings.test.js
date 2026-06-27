@@ -71,6 +71,19 @@ test("buildCodexToml uses built-in OpenAI provider in all-api mode", () => {
   assert.match(toml, new RegExp(`model_catalog_json = "${escapeRegExp(expectedCatalogPath)}"`));
 });
 
+test("buildCodexToml wraps CodexBridge-owned settings in managed markers", () => {
+  const rootDir = path.join(os.tmpdir(), "codex-bridge-router");
+  const toml = buildCodexToml({
+    rootDir,
+    mode: MODE_HYBRID,
+  });
+
+  assert.match(toml, /# >>> CodexBridge managed config/);
+  assert.match(toml, /# <<< CodexBridge managed config/);
+  assert.ok(toml.indexOf("# >>> CodexBridge managed config") < toml.indexOf("openai_base_url"));
+  assert.ok(toml.indexOf("openai_base_url") < toml.indexOf("# <<< CodexBridge managed config"));
+});
+
 test("buildCodexToml keeps the built-in OpenAI provider in hybrid mode", () => {
   const toml = buildCodexToml({
     rootDir: path.join(os.tmpdir(), "codex-bridge-router"),
@@ -1300,6 +1313,8 @@ test("applyCodexConfig preserves existing Codex user settings while adding Codex
   const written = fs.readFileSync(target, "utf8");
 
   assert.match(written, /model_provider = "openai"/);
+  assert.match(written, /# >>> CodexBridge managed config/);
+  assert.match(written, /# <<< CodexBridge managed config/);
   assert.match(written, /openai_base_url = "http:\/\/localhost:15722\/v1"/);
   assert.doesNotMatch(written, /\[model_providers\.codex-bridge]/);
   assert.match(written, /sandbox_mode = "danger-full-access"/);
@@ -1311,6 +1326,37 @@ test("applyCodexConfig preserves existing Codex user settings while adding Codex
   assert.match(written, /\[mcp_servers\.node_repl]\s+command = "C:\/Codex\/node_repl\.exe"/);
   assert.match(written, /\[mcp_servers\.node_repl\.env]\s+NODE_REPL_NODE_PATH = "C:\/Codex\/node\.exe"\s+NODE_REPL_NODE_MODULE_DIRS = "C:\/Codex\/node_modules"/);
   assert.match(written, /\[hooks\.state]\s+notify = \["C:\/Codex\/hook\.exe"]/);
+});
+
+test("applyCodexConfig rolls back when written CodexBridge config fails validation", () => {
+  const rootDir = makeTempProject();
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
+  const codexDir = path.join(homeDir, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  const target = path.join(codexDir, "config.toml");
+  const original = [
+    'model = "user-model"',
+    "",
+    "[mcp_servers.node_repl]",
+    'command = "C:/Codex/node_repl.exe"',
+    "",
+  ].join("\n");
+  fs.writeFileSync(target, original, "utf8");
+
+  assert.throws(
+    () => applyCodexConfig({
+      rootDir,
+      mode: MODE_HYBRID,
+      homeDir,
+      validateWrittenConfig: () => {
+        throw new Error("synthetic validation failure");
+      },
+    }),
+    /synthetic validation failure/,
+  );
+
+  assert.equal(fs.readFileSync(target, "utf8"), original);
+  assert.equal(fs.readdirSync(codexDir).some((name) => /^config\.toml\.codexbridge\..+\.bak$/.test(name)), true);
 });
 
 test("applyCodexConfig writes stable sandbox defaults when Codex has none", () => {
@@ -1551,6 +1597,50 @@ test("restoreCodexConfig explains when no backup exists", () => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
 
   assert.throws(() => restoreCodexConfig({ homeDir }), /没有找到 CodexBridge 写入前的备份/);
+});
+
+test("restoreCodexConfig can remove only the managed CodexBridge block when no backup exists", () => {
+  const rootDir = makeTempProject();
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
+  const codexDir = path.join(homeDir, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  const target = path.join(codexDir, "config.toml");
+  fs.writeFileSync(
+    target,
+    [
+      'notify = ["C:/Codex/openai-bundled/computer-use/codex-computer-use.exe", "turn-ended"]',
+      "",
+      buildCodexToml({ rootDir, mode: MODE_HYBRID }).trimEnd(),
+      "",
+      "[history]",
+      'persistence = "save-all"',
+      "",
+      '[plugins."computer-use@openai-bundled"]',
+      "enabled = true",
+      "",
+      "[mcp_servers.node_repl]",
+      'command = "C:/Codex/node_repl.exe"',
+      "",
+      "[hooks.state]",
+      'notify = ["C:/Codex/hook.exe"]',
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const restored = restoreCodexConfig({ homeDir });
+  const written = fs.readFileSync(target, "utf8");
+
+  assert.equal(restored.action, "strip_managed_block");
+  assert.equal(restored.backup, null);
+  assert.ok(restored.currentBackup);
+  assert.doesNotMatch(written, /# >>> CodexBridge managed config/);
+  assert.doesNotMatch(written, /openai_base_url = "http:\/\/localhost:15722\/v1"/);
+  assert.match(written, /notify = \["C:\/Codex\/openai-bundled\/computer-use\/codex-computer-use\.exe", "turn-ended"]/);
+  assert.match(written, /\[history]\s+persistence = "save-all"/);
+  assert.match(written, /\[plugins\."computer-use@openai-bundled"]\s+enabled = true/);
+  assert.match(written, /\[mcp_servers\.node_repl]\s+command = "C:\/Codex\/node_repl\.exe"/);
+  assert.match(written, /\[hooks\.state]\s+notify = \["C:\/Codex\/hook\.exe"]/);
 });
 
 test("recoverCodexHistoryAccess keeps CodexBridge config and only enables history storage", () => {

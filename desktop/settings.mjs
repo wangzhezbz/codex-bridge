@@ -38,6 +38,8 @@ const CODEX_BRIDGE_TOP_LEVEL_KEYS = new Set([
   "openai_base_url",
   "windows_wsl_setup_acknowledged",
 ]);
+const CODEX_BRIDGE_MANAGED_START = "# >>> CodexBridge managed config";
+const CODEX_BRIDGE_MANAGED_END = "# <<< CodexBridge managed config";
 
 const CODEX_MODEL_SLOT_IDS = new Set(CODEX_MODEL_SLOTS.map((slot) => slot.id));
 const CODEX_REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh"]);
@@ -1334,6 +1336,7 @@ export function buildCodexToml({
   const normalizedCatalogPath = toTomlPath(catalogPath(rootDir));
 
   return [
+    CODEX_BRIDGE_MANAGED_START,
     'model_provider = "openai"',
     `model = "${model}"`,
     `model_catalog_json = "${normalizedCatalogPath}"`,
@@ -1344,6 +1347,7 @@ export function buildCodexToml({
     'network_access = "enabled"',
     `openai_base_url = "http://localhost:${port}/v1"`,
     "windows_wsl_setup_acknowledged = true",
+    CODEX_BRIDGE_MANAGED_END,
     "",
   ].join("\n");
 }
@@ -1353,6 +1357,7 @@ export function applyCodexConfig({
   mode,
   port = 15722,
   homeDir = os.homedir(),
+  validateWrittenConfig = validateCodexBridgeWrittenConfig,
 }) {
   const target = codexConfigPath(homeDir);
   const targetDir = path.dirname(target);
@@ -1361,9 +1366,9 @@ export function applyCodexConfig({
   const currentSettings = currentCodexModelSettings(existingContent);
   const bridgeContent = buildCodexToml({ rootDir, mode, port, ...currentSettings });
   const content = mergeCodexBridgeConfig(existingContent, bridgeContent);
-  const historySync = syncCodexBridgeConversationProviders({ homeDir });
 
   if (fs.existsSync(target) && existingContent === content) {
+    const historySync = syncCodexBridgeConversationProviders({ homeDir });
     return { target, backup: null, unchanged: true, historySync };
   }
 
@@ -1373,7 +1378,18 @@ export function applyCodexConfig({
     fs.copyFileSync(target, backup);
   }
 
-  fs.writeFileSync(target, content, "utf8");
+  try {
+    fs.writeFileSync(target, content, "utf8");
+    validateWrittenConfig({ target, content, rootDir, mode, port });
+  } catch (error) {
+    if (backup && fs.existsSync(backup)) {
+      fs.copyFileSync(backup, target);
+    } else {
+      fs.writeFileSync(target, existingContent, "utf8");
+    }
+    throw error;
+  }
+  const historySync = syncCodexBridgeConversationProviders({ homeDir });
   return { target, backup, unchanged: false, historySync };
 }
 
@@ -1387,6 +1403,10 @@ export function restoreCodexConfig({ homeDir = os.homedir() } = {}) {
   const backups = codexBridgeBackups(targetDir);
 
   if (!backups.length) {
+    const stripped = restoreByStrippingManagedCodexBridgeBlock(target);
+    if (stripped) {
+      return stripped;
+    }
     throw new Error("没有找到 CodexBridge 写入前的备份，无法自动恢复 Codex 配置。");
   }
   const restoreFrom = preferredRestoreBackup(backups);
@@ -1401,6 +1421,26 @@ export function restoreCodexConfig({ homeDir = os.homedir() } = {}) {
   return {
     target,
     backup: restoreFrom.fullPath,
+    currentBackup,
+  };
+}
+
+function restoreByStrippingManagedCodexBridgeBlock(target) {
+  if (!fs.existsSync(target)) {
+    return null;
+  }
+  const current = fs.readFileSync(target, "utf8");
+  if (!hasCodexBridgeManagedBlock(current)) {
+    return null;
+  }
+  const currentBackup = `${target}.before-restore.${timestamp()}.bak`;
+  fs.copyFileSync(target, currentBackup);
+  const stripped = stripCodexBridgeConfig(current);
+  fs.writeFileSync(target, stripped.trim() ? `${stripped.trimEnd()}\n` : "", "utf8");
+  return {
+    action: "strip_managed_block",
+    target,
+    backup: null,
     currentBackup,
   };
 }
@@ -2198,16 +2238,54 @@ function backupCodexStateDatabase(dbPath) {
 }
 
 function mergeCodexBridgeConfig(baseContent, bridgeContent) {
-  const bridge = extractCodexBridgeConfig(bridgeContent);
+  const bridgeBlock = codexBridgeManagedBlock(bridgeContent);
   const cleanedBase = stripCodexBridgeConfig(baseContent || "");
   const { preamble, tables } = splitTomlPreamble(cleanedBase);
   const sections = [
     preamble.join("\n"),
-    bridge.topLevelLines.join("\n"),
-    bridge.providerLines.join("\n"),
+    bridgeBlock,
     tables.join("\n"),
   ].filter((section) => section.trim());
   return `${sections.join("\n\n")}\n`;
+}
+
+function codexBridgeManagedBlock(content) {
+  const managed = extractCodexBridgeManagedBlock(content);
+  if (managed.length) {
+    return trimBlankLines(managed).join("\n");
+  }
+  const bridge = extractCodexBridgeConfig(content);
+  const legacyLines = trimBlankLines([
+    ...bridge.topLevelLines,
+    ...(bridge.providerLines.length ? ["", ...bridge.providerLines] : []),
+  ]);
+  return [
+    CODEX_BRIDGE_MANAGED_START,
+    ...legacyLines,
+    CODEX_BRIDGE_MANAGED_END,
+  ].join("\n");
+}
+
+function validateCodexBridgeWrittenConfig({ target, content, port = 15722 } = {}) {
+  const written = content ?? (target && fs.existsSync(target) ? fs.readFileSync(target, "utf8") : "");
+  if (!hasCodexBridgeManagedBlock(written)) {
+    throw new Error("CodexBridge config validation failed: managed block marker missing.");
+  }
+  if (readTopLevelTomlString(written, "model_provider") !== "openai") {
+    throw new Error("CodexBridge config validation failed: model_provider is not openai.");
+  }
+  if (!readTopLevelTomlString(written, "model_catalog_json")) {
+    throw new Error("CodexBridge config validation failed: model_catalog_json is missing.");
+  }
+  const baseUrl = readTopLevelTomlString(written, "openai_base_url");
+  const expected = new RegExp(`^http://(?:localhost|127\\.0\\.0\\.1):${Number(port || 15722)}/v1$`);
+  if (!expected.test(baseUrl || "")) {
+    throw new Error("CodexBridge config validation failed: openai_base_url does not point to the local router.");
+  }
+  if (hasTomlTable(written, "model_providers.codex-bridge")) {
+    throw new Error("CodexBridge config validation failed: legacy codex-bridge provider table remains.");
+  }
+  return true;
 }
 
 function currentCodexModelSettings(content) {
@@ -2500,6 +2578,10 @@ function escapeRegex(value) {
 }
 
 function stripCodexBridgeConfig(content) {
+  if (hasCodexBridgeManagedBlock(content)) {
+    return stripCodexBridgeManagedBlocks(content);
+  }
+
   const lines = content.split(/\r?\n/);
   const output = [];
   let inTable = false;
@@ -2529,6 +2611,47 @@ function stripCodexBridgeConfig(content) {
       continue;
     }
 
+    output.push(line);
+  }
+
+  return trimBlankLines(output).join("\n");
+}
+
+function hasCodexBridgeManagedBlock(content) {
+  const text = String(content || "");
+  return text.includes(CODEX_BRIDGE_MANAGED_START) && text.includes(CODEX_BRIDGE_MANAGED_END);
+}
+
+function extractCodexBridgeManagedBlock(content) {
+  const lines = String(content || "").split(/\r?\n/);
+  const start = lines.findIndex((line) => line.trim() === CODEX_BRIDGE_MANAGED_START);
+  if (start < 0) {
+    return [];
+  }
+  const endOffset = lines.slice(start + 1).findIndex((line) => line.trim() === CODEX_BRIDGE_MANAGED_END);
+  if (endOffset < 0) {
+    return [];
+  }
+  const end = start + 1 + endOffset;
+  return lines.slice(start, end + 1);
+}
+
+function stripCodexBridgeManagedBlocks(content) {
+  const lines = String(content || "").split(/\r?\n/);
+  const output = [];
+  let skipping = false;
+
+  for (const line of lines) {
+    if (line.trim() === CODEX_BRIDGE_MANAGED_START) {
+      skipping = true;
+      continue;
+    }
+    if (skipping) {
+      if (line.trim() === CODEX_BRIDGE_MANAGED_END) {
+        skipping = false;
+      }
+      continue;
+    }
     output.push(line);
   }
 
