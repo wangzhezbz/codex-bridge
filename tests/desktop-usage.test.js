@@ -126,6 +126,19 @@ test("usage store records upstream error categories from router logs", () => {
   assert.equal(usage.summary().byModel[0].lastErrorType, "rate_limit");
 });
 
+test("usage summary flags zero-token fast failures separately from token usage", () => {
+  const usage = createUsageStore();
+
+  usage.recordLine("[10:20:11] [2026-06-27T15:27:32.000Z] req_fast503 <- /v1/responses model=gpt-5.5 route=gpt-5.5 api=responses upstream_model=gpt-5.5 stream=true previous_response_id=- client_auth=codex_openai upstream_auth=codex_openai");
+  usage.recordLine("[10:20:11] [2026-06-27T15:27:32.006Z] req_fast503 !! upstream route=gpt-5.5 status=503 error=Upstream returned HTTP 503 error_type=provider_unavailable cause=no_available_channel");
+
+  const summary = usage.summary();
+  assert.equal(summary.totalCalls, 1);
+  assert.equal(summary.totalTokens, 0);
+  assert.equal(summary.byModel[0].errors, 1);
+  assert.equal(summary.byModel[0].fastZeroTokenErrors, 1);
+});
+
 test("usage store keeps response route metadata when status arrives before usage", () => {
   const usage = createUsageStore();
 

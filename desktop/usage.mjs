@@ -131,6 +131,7 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
           promptTokens: 0,
           completionTokens: 0,
           errors: 0,
+          fastZeroTokenErrors: 0,
           lastError: "",
           lastErrorType: "",
           lastErrorCause: "",
@@ -144,6 +145,7 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
       item.promptTokens += event.promptTokens || 0;
       item.completionTokens += event.completionTokens || 0;
       item.errors += event.status && event.status >= 400 ? 1 : 0;
+      item.fastZeroTokenErrors += isFastZeroTokenError(event) ? 1 : 0;
       item.lastError = event.error || item.lastError;
       item.lastErrorType = event.errorType || item.lastErrorType;
       item.lastErrorCause = event.errorCause || item.lastErrorCause;
@@ -287,4 +289,13 @@ function durationMs(startedAt, finishedAt) {
     return null;
   }
   return Math.max(0, finish - start);
+}
+
+function isFastZeroTokenError(event = {}) {
+  return (
+    Number(event.status || 0) >= 400 &&
+    Number(event.totalTokens || 0) === 0 &&
+    Number.isFinite(Number(event.durationMs)) &&
+    Number(event.durationMs) < 1000
+  );
 }

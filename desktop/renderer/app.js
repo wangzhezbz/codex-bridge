@@ -1058,10 +1058,35 @@ function usageRouteState(row) {
 
 function usageStatusText(row) {
   const stateLabel = usageRouteState(row);
-  const status = row.errors
-    ? `${row.errors} 错误：${row.lastError || row.lastStatus || ""}`
-    : row.lastStatus || "-";
+  const status = usageErrorStatusText(row);
   return stateLabel ? `${stateLabel} · ${status}` : String(status);
+}
+
+function usageErrorStatusText(row) {
+  if (!row?.errors) {
+    return row?.lastStatus || "-";
+  }
+  const fastZero = Number(row.fastZeroTokenErrors || 0);
+  const errorDetail = row.lastError || row.lastStatus || "";
+  if (fastZero > 0 && fastZero === Number(row.errors || 0)) {
+    return `${row.errors} 次 0 token 快速失败：${errorDetail}`;
+  }
+  if (fastZero > 0) {
+    return `${row.errors} 错误（${fastZero} 次 0 token 快速失败）：${errorDetail}`;
+  }
+  return `${row.errors} 错误：${errorDetail}`;
+}
+
+function usageEventStatusText(event) {
+  if (!(event?.status && event.status >= 400)) {
+    return event?.status || "-";
+  }
+  const fastZero =
+    Number(event.totalTokens || 0) === 0 &&
+    Number.isFinite(Number(event.durationMs)) &&
+    Number(event.durationMs) < 1000;
+  const prefix = fastZero ? `${event.status} 0 token 快速失败` : String(event.status);
+  return `${prefix}${event.error ? `：${event.error}` : ""}`;
 }
 
 function renderUsageTable(rows, events) {
@@ -1093,7 +1118,7 @@ function renderUsageTable(rows, events) {
               <span>${escapeHtml(displayRoute(event.route))}</span>
               <span>${escapeHtml(event.upstreamModel || "-")}</span>
               <span>${escapeHtml(event.api || "-")}</span>
-              <span>${event.status && event.status >= 400 ? `${event.status} ${escapeHtml(event.error || "")}` : event.status || "-"}</span>
+              <span>${escapeHtml(usageEventStatusText(event))}</span>
               <span>${formatNumber(event.promptTokens)}</span>
               <span>${formatNumber(event.completionTokens)}</span>
               <span>${formatNumber(event.totalTokens)}</span>
@@ -1147,7 +1172,7 @@ function renderUsageTableStable(rows, events) {
               <span>${escapeHtml(displayRoute(event.route))}</span>
               <span>${escapeHtml(event.upstreamModel || "-")}</span>
               <span>${escapeHtml(event.api || "-")}</span>
-              <span>${event.status && event.status >= 400 ? `${event.status} ${escapeHtml(event.error || "")}` : event.status || "-"}</span>
+              <span>${escapeHtml(usageEventStatusText(event))}</span>
               <span>${formatNumber(event.promptTokens)}</span>
               <span>${formatNumber(event.completionTokens)}</span>
               <span>${formatNumber(event.totalTokens)}</span>

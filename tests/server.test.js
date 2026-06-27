@@ -4348,6 +4348,57 @@ test("server accepts Codex Desktop response probes without an upstream call", as
   }
 });
 
+test("server rejects websocket response probes without returning a Responses list", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamCalls += 1;
+    res.writeHead(500, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "unexpected upstream call" }));
+  });
+
+  await listen(upstream);
+  const upstreamUrl = serverUrl(upstream);
+
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "gpt-5.5",
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        api: "responses",
+        baseUrl: `${upstreamUrl}/v1`,
+        model: "gpt-5.5",
+        authMode: "codex_openai",
+      },
+    ],
+  });
+
+  await listen(router);
+  const baseUrl = serverUrl(router);
+
+  try {
+    const response = await requestText(`${baseUrl}/v1/responses`, {
+      method: "GET",
+      headers: {
+        authorization: "Bearer router-token",
+        connection: "Upgrade",
+        upgrade: "websocket",
+      },
+    });
+
+    assert.equal(response.statusCode, 426);
+    assert.match(response.body, /websocket_not_supported/);
+    assert.doesNotMatch(response.body, /"object":"list"/);
+    assert.equal(upstreamCalls, 0);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
 test("server accepts Codex Desktop response item probes without an upstream call", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer((_req, res) => {
@@ -7227,6 +7278,27 @@ async function fetchJson(url, init) {
   const text = await response.text();
   assert.equal(response.ok, true, text);
   return JSON.parse(text);
+}
+
+function requestText(url, init = {}) {
+  return new Promise((resolve, reject) => {
+    const request = http.request(url, init, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => {
+        resolve({
+          statusCode: response.statusCode,
+          headers: response.headers,
+          body: Buffer.concat(chunks).toString("utf8"),
+        });
+      });
+    });
+    request.on("error", reject);
+    if (init.body) {
+      request.write(init.body);
+    }
+    request.end();
+  });
 }
 
 function mainChatProviderSmokeRoutes(options = {}) {

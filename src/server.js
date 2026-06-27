@@ -25,7 +25,7 @@ export function createRouterServer(config = loadConfig()) {
   const history = new ResponseHistory();
   const routeHealth = createRouteHealthStore();
 
-  return http.createServer(async (req, res) => {
+  const server = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url || "/", "http://127.0.0.1");
       logAccess(req, url);
@@ -33,6 +33,19 @@ export function createRouterServer(config = loadConfig()) {
 
       if (req.method === "OPTIONS") {
         writeCors(res);
+        return;
+      }
+
+      if (isUpgradeRequest(req)) {
+        jsonResponse(
+          res,
+          426,
+          openAiError(
+            `CodexBridge Router does not support WebSocket on ${url.pathname}. Use HTTP streaming for Responses requests.`,
+            426,
+            "websocket_not_supported",
+          ),
+        );
         return;
       }
 
@@ -180,6 +193,15 @@ export function createRouterServer(config = loadConfig()) {
       }
     }
   });
+  server.on("upgrade", (req, socket) => {
+    const url = new URL(req.url || "/", "http://127.0.0.1");
+    if (isResponsesCollection(url.pathname)) {
+      writeUpgradeRejected(socket, url.pathname);
+      return;
+    }
+    socket.destroy();
+  });
+  return server;
 }
 
 function requestBodyLimitBytes(config = {}, pathname = "") {
@@ -282,6 +304,38 @@ function writeCors(res) {
     "access-control-allow-headers": "authorization,content-type",
   });
   res.end();
+}
+
+function isUpgradeRequest(req) {
+  const connectionTokens = String(req.headers.connection || "")
+    .toLowerCase()
+    .split(",")
+    .map((item) => item.trim());
+  return (
+    String(req.headers.upgrade || "").toLowerCase() === "websocket" ||
+    connectionTokens.includes("upgrade")
+  );
+}
+
+function writeUpgradeRejected(socket, pathname) {
+  const body = JSON.stringify(
+    openAiError(
+      `CodexBridge Router does not support WebSocket on ${pathname}. Use HTTP streaming for Responses requests.`,
+      426,
+      "websocket_not_supported",
+    ),
+  );
+  socket.write(
+    [
+      "HTTP/1.1 426 Upgrade Required",
+      "Connection: close",
+      "Content-Type: application/json; charset=utf-8",
+      `Content-Length: ${Buffer.byteLength(body)}`,
+      "",
+      body,
+    ].join("\r\n"),
+  );
+  socket.end();
 }
 
 function isResponsesCollection(pathname) {
