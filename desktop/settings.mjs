@@ -41,6 +41,7 @@ const CODEX_BRIDGE_TOP_LEVEL_KEYS = new Set([
 ]);
 const CODEX_BRIDGE_MANAGED_START = "# >>> CodexBridge managed config";
 const CODEX_BRIDGE_MANAGED_END = "# <<< CodexBridge managed config";
+const DEFAULT_CHAT_TOOL_CONTINUATION_TURNS = 5;
 
 const CODEX_MODEL_SLOT_IDS = new Set(CODEX_MODEL_SLOTS.map((slot) => slot.id));
 const CODEX_REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh"]);
@@ -2972,7 +2973,7 @@ function routeForSelectedModel(model, slot, priority, imageGenerationOverrides =
     }
   }
   if (route.api === "chat_completions" && route.maxToolContinuationTurns === undefined) {
-    route.maxToolContinuationTurns = 2;
+    route.maxToolContinuationTurns = DEFAULT_CHAT_TOOL_CONTINUATION_TURNS;
   }
   if (model.custom && route.inputModalities === undefined) {
     route.inputModalities = normalizeInputModalities(model.inputModalities, ["text"]);

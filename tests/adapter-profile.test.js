@@ -52,7 +52,7 @@ test("adapter profiles classify DeepSeek chat routes", () => {
   assert.equal(profile.supportsTools, "chat-functions");
   assert.equal(profile.supportsMcpNamespaces, true);
   assert.equal(profile.supportsImages, "none");
-  assert.equal(profile.maxToolContinuationTurns, 2);
+  assert.equal(profile.maxToolContinuationTurns, 5);
   assert.ok(profile.dropParams.includes("response_format"));
 });
 

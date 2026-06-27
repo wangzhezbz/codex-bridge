@@ -823,9 +823,9 @@ test("chat completion routes get a conservative default tool guard", () => {
   const config = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
 
   assert.equal(config.models[0].api, "chat_completions");
-  assert.equal(config.models[0].maxToolContinuationTurns, 2);
+  assert.equal(config.models[0].maxToolContinuationTurns, 5);
   assert.equal(config.models[1].api, "chat_completions");
-  assert.equal(config.models[1].maxToolContinuationTurns, 2);
+  assert.equal(config.models[1].maxToolContinuationTurns, 5);
 });
 
 test("domestic model presets route with their own provider keys", () => {
