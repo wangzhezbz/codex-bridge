@@ -101,6 +101,64 @@ test("server exposes health, models, catalog, and converted responses", async ()
   }
 });
 
+test("server reports upstream 413 as a request size problem with recovery guidance", async () => {
+  const upstream = http.createServer(async (_req, res) => {
+    res.writeHead(413, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        error: {
+          message: "Payload Too Large: nginx client_max_body_size exceeded",
+        },
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const upstreamUrl = serverUrl(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-flash",
+    models: [
+      {
+        id: "deepseek-v4-flash",
+        displayName: "DeepSeek V4 Flash",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: `${upstreamUrl}/v1`,
+        model: "deepseek-v4-flash",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const baseUrl = serverUrl(router);
+
+  try {
+    const response = await fetch(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-flash",
+        input: "large pasted log",
+      }),
+    });
+    const body = await response.json();
+    assert.equal(response.status, 413);
+    assert.equal(body.error.code, "upstream_payload_too_large");
+    assert.match(body.error.message, /request is too large/i);
+    assert.match(body.error.message, /\/compact|large pasted logs|inline images/i);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
 test("server returns a local rate-limit response without retrying the provider", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer(async (_req, res) => {

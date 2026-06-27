@@ -50,6 +50,16 @@ test("classifyUpstreamError separates common upstream failure categories", () =>
     }).code,
     "upstream_provider_unavailable",
   );
+  const payloadTooLarge = classifyUpstreamError({
+    statusCode: 413,
+    bodyText: JSON.stringify({
+      error: {
+        message: "Payload Too Large: nginx client_max_body_size exceeded",
+      },
+    }),
+  });
+  assert.equal(payloadTooLarge.type, "payload_too_large");
+  assert.equal(payloadTooLarge.code, "upstream_payload_too_large");
 });
 
 test("route health snapshot reports degraded routes and recovers after success", () => {

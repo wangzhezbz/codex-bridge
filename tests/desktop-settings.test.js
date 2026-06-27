@@ -63,7 +63,7 @@ test("buildCodexToml uses built-in OpenAI provider in all-api mode", () => {
 
   const expectedCatalogPath = path.resolve(rootDir, "model-catalog.json").replaceAll("\\", "/");
   assert.match(toml, /model_provider = "openai"/);
-  assert.match(toml, /openai_base_url = "http:\/\/localhost:15722\/v1"/);
+  assert.match(toml, /openai_base_url = "http:\/\/127\.0\.0\.1:15722\/v1"/);
   assert.doesNotMatch(toml, /experimental_bearer_token/);
   assert.doesNotMatch(toml, /requires_openai_auth/);
   assert.doesNotMatch(toml, /supports_websockets/);
@@ -92,7 +92,7 @@ test("buildCodexToml keeps the built-in OpenAI provider in hybrid mode", () => {
   });
 
   assert.match(toml, /model_provider = "openai"/);
-  assert.match(toml, /openai_base_url = "http:\/\/localhost:15722\/v1"/);
+  assert.match(toml, /openai_base_url = "http:\/\/127\.0\.0\.1:15722\/v1"/);
   assert.doesNotMatch(toml, /requires_openai_auth/);
   assert.doesNotMatch(toml, /supports_websockets/);
   assert.doesNotMatch(toml, /\[model_providers\.codex-bridge]/);
@@ -1345,7 +1345,7 @@ test("applyCodexConfig writes config and creates backup", () => {
 
   const written = fs.readFileSync(target, "utf8");
   assert.match(written, /model_provider = "openai"/);
-  assert.match(written, /openai_base_url = "http:\/\/localhost:15722\/v1"/);
+  assert.match(written, /openai_base_url = "http:\/\/127\.0\.0\.1:15722\/v1"/);
   assert.doesNotMatch(written, /\[model_providers\.codex-bridge]/);
   assert.equal(result.target, target);
   assert.equal(fs.existsSync(result.backup), true);
@@ -1396,7 +1396,7 @@ test("applyCodexConfig preserves existing Codex user settings while adding Codex
   assert.match(written, /model_provider = "openai"/);
   assert.match(written, /# >>> CodexBridge managed config/);
   assert.match(written, /# <<< CodexBridge managed config/);
-  assert.match(written, /openai_base_url = "http:\/\/localhost:15722\/v1"/);
+  assert.match(written, /openai_base_url = "http:\/\/127\.0\.0\.1:15722\/v1"/);
   assert.doesNotMatch(written, /\[model_providers\.codex-bridge]/);
   assert.match(written, /sandbox_mode = "danger-full-access"/);
   assert.match(written, /\[history]\s+persistence = "save-all"/);
@@ -1536,7 +1536,7 @@ test("applyCodexConfig preserves the current Codex model selection", () => {
   assert.match(written, /model_provider = "openai"/);
   assert.match(written, /model = "gpt-5\.2"/);
   assert.match(written, /model_reasoning_effort = "high"/);
-  assert.match(written, /openai_base_url = "http:\/\/localhost:15722\/v1"/);
+  assert.match(written, /openai_base_url = "http:\/\/127\.0\.0\.1:15722\/v1"/);
   assert.match(written, /\[history]\s+persistence = "save-all"/);
 });
 
@@ -1608,9 +1608,8 @@ test("prepareRouterStartConfig refreshes stale Codex local endpoint before route
   const written = fs.readFileSync(target, "utf8");
   assert.equal(result.config.defaultModel, "gpt-5.5");
   assert.match(written, /model_provider = "openai"/);
-  assert.match(written, /openai_base_url = "http:\/\/localhost:15722\/v1"/);
+  assert.match(written, /openai_base_url = "http:\/\/127\.0\.0\.1:15722\/v1"/);
   assert.doesNotMatch(written, /\[model_providers\.codex-bridge]/);
-  assert.doesNotMatch(written, /http:\/\/127\.0\.0\.1:15722\/v1/);
 });
 
 test("restoreCodexConfig restores the latest CodexBridge backup", () => {
@@ -1716,7 +1715,7 @@ test("restoreCodexConfig can remove only the managed CodexBridge block when no b
   assert.equal(restored.backup, null);
   assert.ok(restored.currentBackup);
   assert.doesNotMatch(written, /# >>> CodexBridge managed config/);
-  assert.doesNotMatch(written, /openai_base_url = "http:\/\/localhost:15722\/v1"/);
+  assert.doesNotMatch(written, /openai_base_url = "http:\/\/127\.0\.0\.1:15722\/v1"/);
   assert.match(written, /notify = \["C:\/Codex\/openai-bundled\/computer-use\/codex-computer-use\.exe", "turn-ended"]/);
   assert.match(written, /\[history]\s+persistence = "save-all"/);
   assert.match(written, /\[plugins\."computer-use@openai-bundled"]\s+enabled = true/);
@@ -1743,7 +1742,7 @@ test("recoverCodexHistoryAccess keeps CodexBridge config and only enables histor
   assert.equal(recovered.action, "recover_history_access");
   assert.equal(recovered.target, target);
   assert.match(written, /model_provider = "openai"/);
-  assert.match(written, /openai_base_url = "http:\/\/localhost:15722\/v1"/);
+  assert.match(written, /openai_base_url = "http:\/\/127\.0\.0\.1:15722\/v1"/);
   assert.match(written, /disable_response_storage = false/);
   assert.doesNotMatch(written, /original-history-view/);
   assert.match(recovered.message, /历史对话/);
@@ -1781,7 +1780,7 @@ test("recoverCodexHistoryAccess does not roll current CodexBridge config back to
   assert.ok(applied.backup);
   assert.equal(recovered.action, "recover_history_access");
   assert.match(written, /model_provider = "openai"/);
-  assert.match(written, /openai_base_url = "http:\/\/localhost:15722\/v1"/);
+  assert.match(written, /openai_base_url = "http:\/\/127\.0\.0\.1:15722\/v1"/);
   assert.doesNotMatch(written, /\[model_providers\.codex-bridge]/);
   assert.doesNotMatch(written, /\[history]\s+persistence = "save-all"/);
   assert.doesNotMatch(written, /\[desktop]\s+appearanceTheme = "dark"/);

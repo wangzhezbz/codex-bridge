@@ -129,7 +129,7 @@ model_catalog_json = "F:/game_code/router/model-catalog.json"
 model_reasoning_effort = "medium"
 disable_response_storage = false
 network_access = "enabled"
-openai_base_url = "http://localhost:15722/v1"
+openai_base_url = "http://127.0.0.1:15722/v1"
 windows_wsl_setup_acknowledged = true
 ```
 
@@ -205,10 +205,10 @@ Open the CodexBridge log page first.
 
 - No `access POST /v1/responses`: Codex did not reach Router. Start Router again from CodexBridge, then restart Codex.
 - Has `access POST /v1/responses`: the request reached Router. Read the next `req_... -> upstream` and `req_... !! upstream` lines to see the real provider, model, proxy, status, and upstream message.
-- All models fail with 502 and there is no access log: usually stale Codex config or a Windows proxy/VPN intercepting local traffic. Current releases write `http://localhost:15722/v1` when Router starts.
+- All models fail with 502 and there is no access log: usually stale Codex config or a Windows proxy/VPN intercepting local traffic. Current releases write `http://127.0.0.1:15722/v1` when Router starts.
 - `Missing API key ... Set MOONSHOT_API_KEY`: save the Kimi / Moonshot key in the API Key page. The visible Codex slot can be `gpt-5.2` even when the real upstream model is Kimi.
 
 - 没有 `access POST /v1/responses`：Codex 没有打到 Router。请从 CodexBridge 重新启动 Router，然后重启 Codex。
 - 有 `access POST /v1/responses`：请求已经进 Router。继续看后面的 `req_... -> upstream` 和 `req_... !! upstream`，确认真实 provider、真实模型、代理、状态码和上游错误。
-- 所有模型都 502 且没有 access 日志：通常是 Codex 配置仍是旧的，或 Windows 代理/VPN 接管了本地流量。当前版本启动 Router 时会写入 `http://localhost:15722/v1`。
+- 所有模型都 502 且没有 access 日志：通常是 Codex 配置仍是旧的，或 Windows 代理/VPN 接管了本地流量。当前版本启动 Router 时会写入 `http://127.0.0.1:15722/v1`。
 - `Missing API key ... Set MOONSHOT_API_KEY`：去“密钥”页保存 Kimi / Moonshot 的 Key。Codex 里显示的槽位可能是 `gpt-5.2`，但真实上游模型是 Kimi。

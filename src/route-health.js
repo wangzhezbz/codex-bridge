@@ -18,6 +18,10 @@ const ERROR_TYPES = {
     type: "network_error",
     code: "upstream_network_error",
   },
+  payload: {
+    type: "payload_too_large",
+    code: "upstream_payload_too_large",
+  },
   parameter: {
     type: "parameter_error",
     code: "upstream_parameter_error",
@@ -163,6 +167,9 @@ function classifyBase({ error, statusCode, haystack, context }) {
   if (isCompactError(statusCode, haystack, context)) {
     return ERROR_TYPES.compact;
   }
+  if (isPayloadTooLargeError(statusCode, haystack)) {
+    return ERROR_TYPES.payload;
+  }
   if (isMediaError(statusCode, haystack)) {
     return ERROR_TYPES.media;
   }
@@ -194,6 +201,13 @@ function isCompactError(statusCode, haystack, context = {}) {
   return (
     [400, 404, 409, 422].includes(statusCode) ||
     /compact|compaction|stream.*true|output item/.test(haystack)
+  );
+}
+
+function isPayloadTooLargeError(statusCode, haystack) {
+  return (
+    statusCode === 413 ||
+    /payload too large|request body|entity too large|body size|client_max_body_size|max body|content length/i.test(haystack)
   );
 }
 

@@ -56,6 +56,24 @@ test("usage summary keeps latest event per model and aggregates errors", () => {
   assert.equal(summary.byModel.find((item) => item.route === "gpt-5.2").totalTokens, 15);
 });
 
+test("usage summary separates the same Codex slot when upstream model changes", () => {
+  const usage = createUsageStore();
+
+  usage.recordLine("[10:30:00] [2026-06-27T02:30:00.000Z] req_old <- /v1/responses model=gpt-5.5 route=gpt-5.5 api=chat_completions upstream_model=mimo-v2.5 stream=true previous_response_id=- client_auth=codex_openai upstream_auth=api_key");
+  usage.recordLine("[10:30:04] [2026-06-27T02:30:04.000Z] req_old <- upstream route=gpt-5.5 usage prompt=10 completion=2 total=12");
+  usage.recordLine("[10:31:00] [2026-06-27T02:31:00.000Z] req_new <- /v1/responses model=gpt-5.5 route=gpt-5.5 api=chat_completions upstream_model=mimo-v2.5-pro stream=true previous_response_id=- client_auth=codex_openai upstream_auth=api_key");
+  usage.recordLine("[10:31:03] [2026-06-27T02:31:03.000Z] req_new <- upstream route=gpt-5.5 usage prompt=20 completion=4 total=24");
+
+  const summary = usage.summary();
+  assert.equal(summary.byModel.length, 2);
+  assert.deepEqual(
+    summary.byModel.map((item) => item.upstreamModel).sort(),
+    ["mimo-v2.5", "mimo-v2.5-pro"],
+  );
+  assert.equal(summary.byModel.find((item) => item.upstreamModel === "mimo-v2.5")?.calls, 1);
+  assert.equal(summary.byModel.find((item) => item.upstreamModel === "mimo-v2.5-pro")?.calls, 1);
+});
+
 test("usage store records request-scoped upstream errors", () => {
   const usage = createUsageStore();
 

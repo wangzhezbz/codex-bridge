@@ -1389,7 +1389,7 @@ export function buildCodexToml({
     `approval_policy = "${approvalPolicy}"`,
     "disable_response_storage = false",
     'network_access = "enabled"',
-    `openai_base_url = "http://localhost:${port}/v1"`,
+    `openai_base_url = "http://127.0.0.1:${port}/v1"`,
     "windows_wsl_setup_acknowledged = true",
     CODEX_BRIDGE_MANAGED_END,
     "",

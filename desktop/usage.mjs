@@ -114,10 +114,13 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
       const statusKey = String(event.status || "unknown");
       statusCounts[statusKey] = (statusCounts[statusKey] || 0) + 1;
 
-      const key = event.route || event.codexModel || event.upstreamModel || "unknown";
+      const routeKey = event.route || event.codexModel || event.upstreamModel || "unknown";
+      const upstreamKey = event.upstreamModel || "";
+      const apiKey = event.api || "";
+      const key = [routeKey, upstreamKey, apiKey].join("\u0000");
       if (!byModelMap.has(key)) {
         byModelMap.set(key, {
-          route: event.route || key,
+          route: event.route || routeKey,
           codexModel: event.codexModel || "",
           upstreamModel: event.upstreamModel || "",
           api: event.api || "",

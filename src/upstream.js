@@ -1742,11 +1742,38 @@ function clientUpstreamErrorMessage(error, parsedBody) {
   const model = error.route?.model ? ` upstream_model=${error.route.model}` : "";
   const api = error.route?.api ? ` api=${error.route.api}` : "";
   const upstreamMessage = upstreamBodyMessage(error.bodyText, parsedBody);
+  if (Number(error.statusCode) === 413) {
+    return payloadTooLargeClientMessage({
+      routeLabel,
+      model,
+      api,
+      statusCode: error.statusCode,
+      upstreamMessage,
+    });
+  }
   return (
     `CodexBridge upstream error` +
     (routeLabel ? ` from ${routeLabel}` : "") +
     `${model}${api}: HTTP ${error.statusCode}` +
     (upstreamMessage ? ` - ${upstreamMessage}` : "")
+  );
+}
+
+function payloadTooLargeClientMessage({
+  routeLabel,
+  model,
+  api,
+  statusCode,
+  upstreamMessage,
+}) {
+  return (
+    `CodexBridge upstream request is too large` +
+    (routeLabel ? ` from ${routeLabel}` : "") +
+    `${model}${api}: HTTP ${statusCode}. ` +
+    "The upstream provider rejected the request body. " +
+    "Recover by running /compact, starting a new thread, removing large pasted logs/files/inline images, " +
+    "or asking the provider to raise its request body limit." +
+    (upstreamMessage ? ` Upstream detail: ${upstreamMessage}` : "")
   );
 }
 
