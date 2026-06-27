@@ -26,6 +26,10 @@ const ERROR_TYPES = {
     type: "provider_error",
     code: "upstream_error",
   },
+  providerUnavailable: {
+    type: "provider_unavailable",
+    code: "upstream_provider_unavailable",
+  },
   rateLimit: {
     type: "rate_limit",
     code: "upstream_rate_limit",
@@ -165,6 +169,9 @@ function classifyBase({ error, statusCode, haystack, context }) {
   if (statusCode === 401 || statusCode === 403 || /unauthori[sz]ed|invalid api key|api key|forbidden|permission/.test(haystack)) {
     return ERROR_TYPES.authentication;
   }
+  if (isProviderUnavailableError(statusCode, haystack)) {
+    return ERROR_TYPES.providerUnavailable;
+  }
   if (statusCode === 400 || statusCode === 404 || statusCode === 409 || statusCode === 422 || /invalid_request|invalid request|bad request|missing field|unknown parameter|unsupported parameter|must be set/.test(haystack)) {
     return ERROR_TYPES.parameter;
   }
@@ -194,6 +201,13 @@ function isMediaError(statusCode, haystack) {
   return (
     [400, 413, 415, 422].includes(statusCode) &&
     /image|vision|multi.?modal|input_image|image_url|audio|input_audio|file|input_file|unsupported media|media type|payload too large/.test(haystack)
+  );
+}
+
+function isProviderUnavailableError(statusCode, haystack) {
+  return (
+    statusCode === 503 ||
+    /no available (channel|provider)|service unavailable|temporarily unavailable|capacity|overloaded|upstream unavailable|model unavailable|distributor/.test(haystack)
   );
 }
 

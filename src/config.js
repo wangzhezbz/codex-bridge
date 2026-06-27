@@ -158,6 +158,97 @@ export function joinUpstreamUrl(baseUrl, endpoint) {
   return `${cleanBase}${endpoint}`;
 }
 
+const OPENAI_ENDPOINT_SUFFIXES = [
+  { path: "/v1/responses/compact", family: "responses_compact", versioned: true },
+  { path: "/responses/compact", family: "responses_compact", versioned: false },
+  { path: "/v1/chat/completions", family: "chat_completions", versioned: true },
+  { path: "/chat/completions", family: "chat_completions", versioned: false },
+  { path: "/v1/responses", family: "responses", versioned: true },
+  { path: "/responses", family: "responses", versioned: false },
+];
+
+export function joinOpenAiEndpointUrl(baseUrl, endpoint) {
+  const cleanEndpoint = String(endpoint || "").startsWith("/")
+    ? String(endpoint || "")
+    : `/${endpoint || ""}`;
+  const cleanBase = String(baseUrl || "").trim().replace(/\/+$/, "");
+  if (!cleanBase) {
+    return cleanEndpoint;
+  }
+
+  const normalized = replaceOpenAiEndpointSuffix(cleanBase, cleanEndpoint);
+  if (normalized) {
+    return normalized;
+  }
+  return collapseDuplicateV1(joinUpstreamUrl(cleanBase, cleanEndpoint));
+}
+
+function replaceOpenAiEndpointSuffix(baseUrl, endpoint) {
+  const requested = openAiEndpointFamily(endpoint);
+  if (!requested) {
+    return "";
+  }
+
+  try {
+    const parsed = new URL(baseUrl);
+    const pathname = parsed.pathname.replace(/\/+$/, "") || "";
+    const matched = matchingOpenAiEndpointSuffix(pathname);
+    if (!matched) {
+      return "";
+    }
+    const prefix = pathname.slice(0, -matched.path.length).replace(/\/+$/, "");
+    parsed.pathname = `${prefix}${openAiEndpointPathForFamily(requested, matched.versioned)}`;
+    parsed.search = "";
+    parsed.hash = "";
+    return collapseDuplicateV1(parsed.toString());
+  } catch {
+    const matched = matchingOpenAiEndpointSuffix(baseUrl);
+    if (!matched) {
+      return "";
+    }
+    const prefix = baseUrl.slice(0, -matched.path.length).replace(/\/+$/, "");
+    return collapseDuplicateV1(`${prefix}${openAiEndpointPathForFamily(requested, matched.versioned)}`);
+  }
+}
+
+function openAiEndpointFamily(endpoint) {
+  const normalized = String(endpoint || "").toLowerCase().replace(/\/+$/, "");
+  if (normalized.endsWith("/responses/compact")) {
+    return "responses_compact";
+  }
+  if (normalized.endsWith("/chat/completions")) {
+    return "chat_completions";
+  }
+  if (normalized.endsWith("/responses")) {
+    return "responses";
+  }
+  return "";
+}
+
+function matchingOpenAiEndpointSuffix(value) {
+  const normalized = String(value || "").toLowerCase().replace(/\/+$/, "");
+  return OPENAI_ENDPOINT_SUFFIXES.find((suffix) => normalized.endsWith(suffix.path)) || null;
+}
+
+function openAiEndpointPathForFamily(family, versioned) {
+  const prefix = versioned ? "/v1" : "";
+  if (family === "responses_compact") {
+    return `${prefix}/responses/compact`;
+  }
+  if (family === "responses") {
+    return `${prefix}/responses`;
+  }
+  return `${prefix}/chat/completions`;
+}
+
+function collapseDuplicateV1(value) {
+  let result = String(value || "");
+  while (result.includes("/v1/v1/")) {
+    result = result.replace("/v1/v1/", "/v1/");
+  }
+  return result.replace(/\/v1\/v1$/, "/v1");
+}
+
 export function routerOrigin(config) {
   return `http://${config.host || "127.0.0.1"}:${config.port || 15722}`;
 }

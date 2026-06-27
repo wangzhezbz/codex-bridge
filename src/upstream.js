@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
 import { cloneJson, jsonResponse, openAiError, stringifyJson, tryParseJson } from "./json.js";
-import { authModeForRoute, joinUpstreamUrl, requireApiKey } from "./config.js";
+import {
+  authModeForRoute,
+  joinOpenAiEndpointUrl,
+  joinUpstreamUrl,
+  requireApiKey,
+} from "./config.js";
 import {
   filterPayloadForAdapter,
   normalizeAdapterProfile,
@@ -241,7 +246,7 @@ export async function proxyResponsesApi(
     { api: "responses" },
   );
   const upstreamPath = context.compactKind === "v1" ? "/responses/compact" : "/responses";
-  const upstreamUrl = joinUpstreamUrl(responsesBaseUrlForRoute(route), upstreamPath);
+  const upstreamUrl = joinOpenAiEndpointUrl(responsesBaseUrlForRoute(route), upstreamPath);
   let activeUpstreamUrl = upstreamUrl;
   throwIfRecentUpstreamFailure(route, upstreamUrl, upstreamPayload, context);
   logRoute(context, route, upstreamUrl);
@@ -532,7 +537,7 @@ export async function proxyChatCompletions(
 ) {
   const converted = responsesToChatRequest(requestBody, route, history);
   const toolContinuationTurns = chatToolContinuationTurns(requestBody, history);
-  const upstreamUrl = joinUpstreamUrl(route.baseUrl, "/chat/completions");
+  const upstreamUrl = joinOpenAiEndpointUrl(route.baseUrl, "/chat/completions");
   logRoute(context, route, upstreamUrl);
   let messagesForHistory = converted.messagesForHistory;
   let upstream;
@@ -681,7 +686,7 @@ export async function proxyChatCompletions(
 
 async function proxyChatCompact(requestBody, route, history, res, context = {}) {
   const converted = buildCompactChatRequest(requestBody, route, history);
-  const upstreamUrl = joinUpstreamUrl(route.baseUrl, "/chat/completions");
+  const upstreamUrl = joinOpenAiEndpointUrl(route.baseUrl, "/chat/completions");
   logRoute(context, route, upstreamUrl);
   let upstream = null;
   let response = null;
@@ -841,7 +846,7 @@ async function proxyResponsesCompact(requestBody, route, history, res, context =
     inlineLocalHistoryForResponsesPayload(compactBody, sourceMessages);
   }
 
-  const upstreamUrl = joinUpstreamUrl(responsesBaseUrlForRoute(route), "/responses");
+  const upstreamUrl = joinOpenAiEndpointUrl(responsesBaseUrlForRoute(route), "/responses");
   logRoute(context, route, upstreamUrl);
   let upstream = null;
   let compactFallbackReasonText = "";

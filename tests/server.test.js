@@ -3480,6 +3480,148 @@ test("responses routes retry root OpenAI-compatible base URLs with /v1 when HTML
   }
 });
 
+test("chat routes normalize full Responses endpoint base URLs to chat completions", async () => {
+  const paths = [];
+  const upstream = http.createServer(async (req, res) => {
+    paths.push(req.url);
+    if (req.url === "/v1/chat/completions") {
+      await readJson(req);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        id: "chatcmpl_full_responses_endpoint",
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: "chat endpoint normalized",
+            },
+          },
+        ],
+      }));
+      return;
+    }
+    res.writeHead(502, { "content-type": "text/html; charset=utf-8" });
+    res.end("<!doctype html><html><body>wrong endpoint</body></html>");
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1/responses`,
+        model: "deepseek-v4-pro",
+        authMode: "api_key",
+        apiKey: "deepseek-provider-key",
+      },
+    ],
+  });
+  await listen(router);
+
+  try {
+    const response = await fetchJson(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        input: "hello",
+      }),
+    });
+
+    assert.equal(response.output_text, "chat endpoint normalized");
+    assert.deepEqual(paths, ["/v1/chat/completions"]);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("responses routes normalize full chat completions endpoint base URLs to Responses", async () => {
+  const paths = [];
+  const upstream = http.createServer(async (req, res) => {
+    paths.push(req.url);
+    if (req.url === "/v1/responses") {
+      await readJson(req);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        id: "resp_full_chat_endpoint",
+        object: "response",
+        status: "completed",
+        model: "gpt-5.5",
+        output: [
+          {
+            id: "msg_full_chat_endpoint",
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [
+              {
+                type: "output_text",
+                text: "responses endpoint normalized",
+                annotations: [],
+              },
+            ],
+          },
+        ],
+        output_text: "responses endpoint normalized",
+      }));
+      return;
+    }
+    res.writeHead(502, { "content-type": "text/html; charset=utf-8" });
+    res.end("<!doctype html><html><body>wrong endpoint</body></html>");
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "gpt-5.5",
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        api: "responses",
+        baseUrl: `${serverUrl(upstream)}/v1/chat/completions`,
+        model: "gpt-5.5",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+  await listen(router);
+
+  try {
+    const response = await fetchJson(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        input: "hello",
+      }),
+    });
+
+    assert.equal(response.output_text, "responses endpoint normalized");
+    assert.deepEqual(paths, ["/v1/responses"]);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
 test("subscription scope errors explain that Codex login is not an API key", async () => {
   const upstream = http.createServer(async (_req, res) => {
     res.writeHead(401, { "content-type": "application/json" });

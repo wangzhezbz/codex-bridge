@@ -39,6 +39,17 @@ test("classifyUpstreamError separates common upstream failure categories", () =>
     }).code,
     "upstream_network_error",
   );
+  assert.equal(
+    classifyUpstreamError({
+      statusCode: 503,
+      bodyText: JSON.stringify({
+        error: {
+          message: "No available channel for model Agnes 2.0 Flash under group default (distributor)",
+        },
+      }),
+    }).code,
+    "upstream_provider_unavailable",
+  );
 });
 
 test("route health snapshot reports degraded routes and recovers after success", () => {
