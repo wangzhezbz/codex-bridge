@@ -6475,6 +6475,193 @@ test("responses routes do not resume upstream when previous_response_id has no n
   assert.equal(upstreamCalls, 1);
 });
 
+test("server serves duplicate initial Codex desktop request locally without replaying upstream", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    upstreamCalls += 1;
+    const body = await readJson(req);
+    assert.equal(body.model, "deepseek-v4-pro");
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: `chatcmpl_duplicate_initial_${upstreamCalls}`,
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: `answer ${upstreamCalls}`,
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 1000,
+          completion_tokens: 10,
+          total_tokens: 1010,
+        },
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const payload = JSON.stringify({
+    model: "deepseek-v4-pro",
+    stream: true,
+    input: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: "This exact request must not be replayed upstream.",
+          },
+        ],
+      },
+    ],
+  });
+  const requestInit = {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer router-token",
+      "user-agent": "Codex Desktop/0.142.3",
+      "x-codex-thread-id": "thread_duplicate_initial",
+    },
+    body: payload,
+  };
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /answer 1/);
+    assert.equal(upstreamCalls, 1);
+
+    const second = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
+    assert.equal(second.statusCode, 200);
+    assert.match(second.body, /answer 1/);
+    assert.equal(upstreamCalls, 1);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("server stops duplicate initial Codex desktop replay while the first request is pending", async () => {
+  let upstreamCalls = 0;
+  let releaseUpstream;
+  let resolveUpstreamEntered;
+  const upstreamEntered = new Promise((resolve) => {
+    resolveUpstreamEntered = resolve;
+  });
+  const upstream = http.createServer(async (req, res) => {
+    upstreamCalls += 1;
+    const body = await readJson(req);
+    assert.equal(body.model, "deepseek-v4-pro");
+    resolveUpstreamEntered();
+    await new Promise((release) => {
+      releaseUpstream = release;
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: "chatcmpl_duplicate_pending",
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: "finished after pending duplicate",
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 1000,
+          completion_tokens: 10,
+          total_tokens: 1010,
+        },
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const payload = JSON.stringify({
+    model: "deepseek-v4-pro",
+    stream: true,
+    input: "This pending request must not open a second upstream call.",
+  });
+  const requestInit = {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer router-token",
+      "user-agent": "Codex Desktop/0.142.3",
+      "x-codex-thread-id": "thread_duplicate_pending",
+    },
+    body: payload,
+  };
+
+  try {
+    const firstPromise = requestText(`${serverUrl(router)}/v1/responses`, requestInit);
+    await upstreamEntered;
+    assert.equal(upstreamCalls, 1);
+
+    const second = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
+    assert.equal(second.statusCode, 200);
+    assert.match(second.body, /duplicate automatic request replay/);
+    assert.equal(upstreamCalls, 1);
+
+    releaseUpstream();
+    const first = await firstPromise;
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /finished after pending duplicate/);
+    assert.equal(upstreamCalls, 1);
+  } finally {
+    if (releaseUpstream) {
+      releaseUpstream();
+    }
+    await close(router);
+    await close(upstream);
+  }
+});
+
 test("idle resume guard does not replay stored tool calls", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer(async (_req, res) => {

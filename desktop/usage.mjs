@@ -10,6 +10,8 @@ const STATUS_RE =
   /\[(?<iso>\d{4}-\d\d-\d\dT[^\]]+)] (?<requestId>req_[a-z0-9]+) <- upstream route=(?<route>\S+) status=(?<status>\d+)/i;
 const ERROR_RE =
   /\[(?<iso>\d{4}-\d\d-\d\dT[^\]]+)] (?<requestId>req_[a-z0-9]+) !! upstream route=(?<route>\S+) status=(?<status>\d+) error=(?<error>.*?)(?: error_type=(?<errorType>\S+))?(?: cause=(?<cause>.*?))?(?: body=.*)?$/i;
+const LOCAL_GUARD_RE =
+  /\[(?<iso>\d{4}-\d\d-\d\dT[^\]]+)] (?<requestId>req_[a-z0-9]+) !! (?:duplicate-request-guard|idle-resume-guard) route=(?<route>\S+)/i;
 
 export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
   const pending = new Map();
@@ -93,6 +95,12 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
       item.errorType = error.errorType || "";
       item.errorCause = error.cause || "";
       finalize(item);
+      return;
+    }
+
+    const localGuard = LOCAL_GUARD_RE.exec(text)?.groups;
+    if (localGuard) {
+      pending.delete(localGuard.requestId);
     }
   }
 

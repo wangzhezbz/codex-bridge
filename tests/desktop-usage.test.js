@@ -41,6 +41,19 @@ test("usage store records status-only responses for responses api routes", () =>
   assert.equal(usage.summary().statusCounts["200"], 1);
 });
 
+test("usage store ignores local replay guards instead of counting them as model calls", () => {
+  const usage = createUsageStore();
+
+  usage.recordLine("[10:20:11] [2026-06-27T18:20:11.250Z] req_dup123 <- /v1/responses model=deepseek-v4-pro route=deepseek-v4-pro api=chat_completions upstream_model=deepseek-v4-pro stream=true previous_response_id=- client_auth=local upstream_auth=api_key");
+  usage.recordLine("[10:20:11] [2026-06-27T18:20:11.251Z] req_dup123 !! duplicate-request-guard route=deepseek-v4-pro reason=pending");
+  usage.recordLine("[10:20:12] [2026-06-27T18:20:12.250Z] req_idle45 <- /v1/responses model=deepseek-v4-pro route=deepseek-v4-pro api=chat_completions upstream_model=deepseek-v4-pro stream=true previous_response_id=resp_1 client_auth=local upstream_auth=api_key");
+  usage.recordLine("[10:20:12] [2026-06-27T18:20:12.251Z] req_idle45 !! idle-resume-guard route=deepseek-v4-pro previous_response_id=resp_1");
+
+  assert.equal(usage.events().length, 0);
+  assert.equal(usage.summary().totalCalls, 0);
+  assert.equal(usage.summary().totalTokens, 0);
+});
+
 test("usage summary keeps latest event per model and aggregates errors", () => {
   const usage = createUsageStore();
 

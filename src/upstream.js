@@ -50,11 +50,15 @@ import { isResponseToolCallItem, isResponseToolOutputItem } from "./tools.js";
 const CHATGPT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const FAILURE_CACHE_MAX_ENTRIES = 200;
 const FAILURE_CACHE_FATAL_TTL_MS = 120_000;
+const DUPLICATE_INITIAL_REQUEST_TTL_MS = 120_000;
+const DUPLICATE_INITIAL_REQUEST_PENDING_TTL_MS = 60_000;
+const DUPLICATE_INITIAL_REQUEST_MAX_ENTRIES = 200;
 const DEFAULT_CHAT_TOOL_CONTINUATION_TURNS = 5;
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 300_000;
 const INVALID_JSON_VALUE = Symbol("invalid_json_value");
 
 const recentUpstreamFailures = new Map();
+const recentInitialRequests = new Map();
 
 const CODEX_EXACT_PASSTHROUGH_HEADERS = [
   "user-agent",
@@ -210,11 +214,29 @@ export async function handleResponsesRequest(
       callJsonUpstream,
     );
   }
-  if (route.api === "responses") {
-    return proxyResponsesApi(requestBody, route, history, res, context);
+
+  const duplicateGuard = beginDuplicateInitialRequestGuard(
+    requestBody,
+    route,
+    res,
+    context,
+  );
+  if (duplicateGuard.served) {
+    return;
   }
-  if (route.api === "chat_completions") {
-    return proxyChatCompletions(requestBody, route, history, res, context);
+  const guardedContext = duplicateGuard.key
+    ? { ...context, duplicateInitialRequestKey: duplicateGuard.key }
+    : context;
+  try {
+    if (route.api === "responses") {
+      return await proxyResponsesApi(requestBody, route, history, res, guardedContext);
+    }
+    if (route.api === "chat_completions") {
+      return await proxyChatCompletions(requestBody, route, history, res, guardedContext);
+    }
+  } catch (error) {
+    clearDuplicateInitialRequestGuard(guardedContext);
+    throw error;
   }
   jsonResponse(res, 500, openAiError(`Unsupported route api: ${route.api}`));
 }
@@ -317,6 +339,186 @@ function idleResumeNoopResponse(model) {
   };
 }
 
+function beginDuplicateInitialRequestGuard(
+  requestBody = {},
+  route = {},
+  res,
+  context = {},
+) {
+  const key = duplicateInitialRequestKey(requestBody, route, context);
+  if (!key) {
+    return { key: "", served: false };
+  }
+  trimDuplicateInitialRequestCache();
+  const existing = recentInitialRequests.get(key);
+  const now = Date.now();
+  if (existing?.expiresAt > now && existing.status === "completed" && existing.response) {
+    existing.expiresAt = now + DUPLICATE_INITIAL_REQUEST_TTL_MS;
+    serveDuplicateInitialResponse(existing.response, requestBody, route, res, context, "completed");
+    return { key, served: true };
+  }
+  if (existing?.expiresAt > now && existing.status === "pending") {
+    existing.expiresAt = now + DUPLICATE_INITIAL_REQUEST_PENDING_TTL_MS;
+    serveDuplicateInitialResponse(
+      duplicateInitialRequestNoopResponse(requestBody.model || route.id || route.model),
+      requestBody,
+      route,
+      res,
+      context,
+      "pending",
+    );
+    return { key, served: true };
+  }
+  recentInitialRequests.set(key, {
+    status: "pending",
+    response: null,
+    expiresAt: now + DUPLICATE_INITIAL_REQUEST_PENDING_TTL_MS,
+  });
+  return { key, served: false };
+}
+
+function finishDuplicateInitialRequestGuard(context = {}, route = {}, response = null) {
+  const key = context.duplicateInitialRequestKey;
+  if (!key || !recentInitialRequests.has(key)) {
+    return;
+  }
+  const safeResponse = responseHasRunnableToolCall(response)
+    ? duplicateInitialRequestNoopResponse(response?.model || route.id || route.model)
+    : duplicateInitialResponse(response);
+  if (!safeResponse) {
+    recentInitialRequests.delete(key);
+    return;
+  }
+  recentInitialRequests.set(key, {
+    status: "completed",
+    response: safeResponse,
+    expiresAt: Date.now() + DUPLICATE_INITIAL_REQUEST_TTL_MS,
+  });
+}
+
+function clearDuplicateInitialRequestGuard(context = {}) {
+  const key = context.duplicateInitialRequestKey;
+  if (!key) {
+    return;
+  }
+  const existing = recentInitialRequests.get(key);
+  if (existing?.status === "pending") {
+    recentInitialRequests.delete(key);
+  }
+}
+
+function serveDuplicateInitialResponse(response, requestBody, route, res, context = {}, reason = "duplicate") {
+  console.warn(
+    `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+      `!! duplicate-request-guard route=${route.id || "-"} reason=${reason}`,
+  );
+  if (requestBody.stream) {
+    res.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    });
+    res.end(responseToSse(response));
+    return;
+  }
+  jsonResponse(res, 200, response);
+}
+
+function duplicateInitialResponse(response) {
+  if (!response || typeof response !== "object") {
+    return null;
+  }
+  const cloned = cloneJson(response);
+  cloned.usage = null;
+  return cloned;
+}
+
+function duplicateInitialRequestNoopResponse(model) {
+  const id = `resp_duplicate_request_${Date.now().toString(36)}_${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
+  const text =
+    "CodexBridge stopped a duplicate automatic request replay to avoid unintended token usage. " +
+    "Send a new message to continue this task.";
+  return {
+    id,
+    object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    status: "completed",
+    model: model || null,
+    output: [
+      {
+        id: `msg_${id}`,
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        content: [
+          {
+            type: "output_text",
+            text,
+            annotations: [],
+          },
+        ],
+      },
+    ],
+    output_text: text,
+    parallel_tool_calls: true,
+    error: null,
+    incomplete_details: null,
+    usage: null,
+  };
+}
+
+function duplicateInitialRequestKey(requestBody = {}, route = {}, context = {}) {
+  if (
+    !["chat_completions", "responses"].includes(route.api) ||
+    !isCodexClientRequest(context) ||
+    requestBody.previous_response_id ||
+    context.compactKind
+  ) {
+    return "";
+  }
+  if (!requestHasFreshInput(requestBody)) {
+    return "";
+  }
+  const headers = context.clientHeaders || {};
+  const material = stableStringify({
+    route: {
+      id: route.id || "",
+      provider: route.provider || route.providerId || "",
+      api: route.api || "",
+      model: route.model || "",
+      baseUrl: route.baseUrl || "",
+      authMode: authModeForRoute(route),
+    },
+    client: {
+      threadId: headerValue(headers, "x-codex-thread-id") || headerValue(headers, "thread-id"),
+      windowId: headerValue(headers, "x-codex-window-id"),
+      parentThreadId: headerValue(headers, "x-codex-parent-thread-id"),
+    },
+    body: requestBody,
+  });
+  return createHash("sha256").update(material).digest("hex");
+}
+
+function isCodexClientRequest(context = {}) {
+  const userAgent = headerValue(context.clientHeaders || {}, "user-agent");
+  return /codex/i.test(userAgent);
+}
+
+function trimDuplicateInitialRequestCache() {
+  const now = Date.now();
+  for (const [key, value] of recentInitialRequests) {
+    if (value.expiresAt <= now) {
+      recentInitialRequests.delete(key);
+    }
+  }
+  while (recentInitialRequests.size >= DUPLICATE_INITIAL_REQUEST_MAX_ENTRIES) {
+    const oldestKey = recentInitialRequests.keys().next().value;
+    recentInitialRequests.delete(oldestKey);
+  }
+}
+
 export async function proxyResponsesApi(
   requestBody,
   route,
@@ -407,6 +609,7 @@ export async function proxyResponsesApi(
       );
     }
     recordResponsesHistory(history, completedResponse, sourceMessages, toolContext);
+    finishDuplicateInitialRequestGuard(context, route, completedResponse);
     logUsage(context, route, extractUsageObject(completedResponse) || extractResponsesUsage(responseText));
     jsonResponse(res, upstream.status, completedResponse);
     return;
@@ -476,6 +679,7 @@ export async function proxyResponsesApi(
 
   res.end();
   recordResponsesHistory(history, completedResponse, sourceMessages, toolContext);
+  finishDuplicateInitialRequestGuard(context, route, completedResponse);
   logUsage(context, route, usage);
 }
 
@@ -816,6 +1020,7 @@ export async function proxyChatCompletions(
     toolResultSignatures,
     ...(localFallback ? { localFallback } : {}),
   });
+  finishDuplicateInitialRequestGuard(context, route, response);
 
   if (converted.wantsStream) {
     const payload = responseToSse(response);
