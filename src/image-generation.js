@@ -104,10 +104,11 @@ export async function proxyImageGenerationFallback(
       connection: "keep-alive",
     });
     res.end(responseToSse(response));
-    return;
+    return response;
   }
 
   jsonResponse(res, 200, response);
+  return response;
 }
 
 function validateImageGenerationSettings(settings) {

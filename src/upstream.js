@@ -189,45 +189,42 @@ export async function handleResponsesRequest(
   context = {},
 ) {
   const compactKind = compactKindForResponsesRequest(requestBody, context);
-  if (compactKind && route.api === "chat_completions") {
-    return proxyChatCompact(requestBody, route, history, res, {
-      ...context,
-      compactKind,
-    });
-  }
-  if (compactKind && route.api === "responses") {
-    return proxyResponsesCompact(requestBody, route, history, res, {
-      ...context,
-      compactKind,
-    });
-  }
   if (shouldServeIdleResumeLocally(requestBody, route)) {
     return sendIdleResumeResponse(requestBody, route, history, res, context);
   }
-  if (shouldUseImageGenerationFallback(requestBody, route)) {
-    return proxyImageGenerationFallback(
-      requestBody,
-      route,
-      history,
-      res,
-      context,
-      callJsonUpstream,
-    );
-  }
+  const duplicateContext = compactKind ? { ...context, compactKind } : context;
 
   const duplicateGuard = beginDuplicateInitialRequestGuard(
     requestBody,
     route,
     res,
-    context,
+    duplicateContext,
   );
   if (duplicateGuard.served) {
     return;
   }
   const guardedContext = duplicateGuard.key
-    ? { ...context, duplicateInitialRequestKey: duplicateGuard.key }
-    : context;
+    ? { ...duplicateContext, duplicateInitialRequestKey: duplicateGuard.key }
+    : duplicateContext;
   try {
+    if (compactKind && route.api === "chat_completions") {
+      return await proxyChatCompact(requestBody, route, history, res, guardedContext);
+    }
+    if (compactKind && route.api === "responses") {
+      return await proxyResponsesCompact(requestBody, route, history, res, guardedContext);
+    }
+    if (shouldUseImageGenerationFallback(requestBody, route)) {
+      const response = await proxyImageGenerationFallback(
+        requestBody,
+        route,
+        history,
+        res,
+        guardedContext,
+        callJsonUpstream,
+      );
+      finishDuplicateInitialRequestGuard(guardedContext, route, response);
+      return response;
+    }
     if (route.api === "responses") {
       return await proxyResponsesApi(requestBody, route, history, res, guardedContext);
     }
@@ -360,7 +357,7 @@ function beginDuplicateInitialRequestGuard(
   if (existing?.expiresAt > now && existing.status === "pending") {
     existing.expiresAt = now + DUPLICATE_INITIAL_REQUEST_PENDING_TTL_MS;
     serveDuplicateInitialResponse(
-      duplicateInitialRequestNoopResponse(requestBody.model || route.id || route.model),
+      duplicateInitialRequestPendingResponse(requestBody, route, context),
       requestBody,
       route,
       res,
@@ -418,7 +415,11 @@ function serveDuplicateInitialResponse(response, requestBody, route, res, contex
       "cache-control": "no-cache",
       connection: "keep-alive",
     });
-    res.end(responseToSse(response));
+    res.end(
+      context.compactKind === "v2"
+        ? compactResponseToSse(response)
+        : responseToSse(response),
+    );
     return;
   }
   jsonResponse(res, 200, response);
@@ -469,12 +470,21 @@ function duplicateInitialRequestNoopResponse(model) {
   };
 }
 
+function duplicateInitialRequestPendingResponse(requestBody = {}, route = {}, context = {}) {
+  if (context.compactKind) {
+    return compactResponseFromLocalFallback(requestBody.model || route.id || route.model, {
+      requestBody,
+      reason:
+        "CodexBridge stopped a duplicate automatic compact replay while the first compact request is still pending.",
+    });
+  }
+  return duplicateInitialRequestNoopResponse(requestBody.model || route.id || route.model);
+}
+
 function duplicateInitialRequestKey(requestBody = {}, route = {}, context = {}) {
   if (
     !["chat_completions", "responses"].includes(route.api) ||
-    !isCodexClientRequest(context) ||
-    requestBody.previous_response_id ||
-    context.compactKind
+    !isCodexClientRequest(context)
   ) {
     return "";
   }
@@ -1082,6 +1092,7 @@ async function proxyChatCompact(requestBody, route, history, res, context = {}) 
     upstreamKnown: false,
     localFallback: localFallback || "compact",
   });
+  finishDuplicateInitialRequestGuard(context, route, response);
 
   if (context.compactKind === "v2") {
     res.writeHead(200, {
@@ -1267,6 +1278,7 @@ async function proxyResponsesCompact(requestBody, route, history, res, context =
     upstreamKnown: false,
     localFallback: upstream ? "compact" : "compact_local_fallback",
   });
+  finishDuplicateInitialRequestGuard(context, route, response);
 
   if (context.compactKind === "v2") {
     res.writeHead(200, {

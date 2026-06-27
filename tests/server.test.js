@@ -2498,6 +2498,90 @@ test("chat routes can use a per-route custom image generation provider", async (
   }
 });
 
+test("server serves duplicate image generation fallback request locally", async () => {
+  const previousEnv = snapshotEnv(["CUSTOM_IMAGE_API_KEY"]);
+  process.env.CUSTOM_IMAGE_API_KEY = "custom-image-key";
+
+  let imageCalls = 0;
+  const imageUpstream = http.createServer(async (req, res) => {
+    imageCalls += 1;
+    assert.equal(req.url, "/compatible/images/generations");
+    assert.equal(req.headers.authorization, "Bearer custom-image-key");
+    const body = await readJson(req);
+    assert.equal(body.model, "custom-image-v1");
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        data: [{ url: `https://images.example/duplicate-${imageCalls}.png` }],
+        usage: { prompt_tokens: 9, completion_tokens: 0, total_tokens: 9 },
+      }),
+    );
+  });
+
+  await listen(imageUpstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        api: "chat_completions",
+        baseUrl: "http://127.0.0.1:1/v1",
+        model: "deepseek-v4-pro",
+        apiKey: "deepseek-key",
+        imageGeneration: {
+          enabled: true,
+          mode: "custom",
+          displayName: "Custom Image API",
+          baseUrl: `${serverUrl(imageUpstream)}/compatible`,
+          endpoint: "/images/generations",
+          model: "custom-image-v1",
+          size: "768x768",
+          apiKeyEnv: "CUSTOM_IMAGE_API_KEY",
+        },
+      },
+    ],
+  });
+
+  await listen(router);
+  const payload = JSON.stringify({
+    model: "deepseek-v4-pro",
+    stream: true,
+    input: "generate an image of a small app icon once",
+    tools: [{ type: "image_generation" }],
+    tool_choice: { type: "image_generation" },
+  });
+  const requestInit = {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer router-token",
+      "user-agent": "Codex Desktop/0.142.3",
+      "x-codex-thread-id": "thread_duplicate_image_generation",
+    },
+    body: payload,
+  };
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /duplicate-1\.png/);
+    assert.equal(imageCalls, 1);
+
+    const second = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
+    assert.equal(second.statusCode, 200);
+    assert.match(second.body, /duplicate-1\.png/);
+    assert.equal(imageCalls, 1);
+  } finally {
+    restoreEnv(previousEnv);
+    await close(router);
+    await close(imageUpstream);
+  }
+});
+
 test("responses routes can override native image generation with a custom provider", async () => {
   const previousEnv = snapshotEnv(["CUSTOM_IMAGE_API_KEY"]);
   process.env.CUSTOM_IMAGE_API_KEY = "custom-image-key";
@@ -6657,6 +6741,185 @@ test("server stops duplicate initial Codex desktop replay while the first reques
     if (releaseUpstream) {
       releaseUpstream();
     }
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("server serves duplicate Codex desktop request with previous_response_id locally", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    upstreamCalls += 1;
+    const body = await readJson(req);
+    assert.equal(body.model, "deepseek-v4-pro");
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: `chatcmpl_duplicate_previous_${upstreamCalls}`,
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: `previous response answer ${upstreamCalls}`,
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 1000,
+          completion_tokens: 10,
+          total_tokens: 1010,
+        },
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const payload = JSON.stringify({
+    model: "deepseek-v4-pro",
+    stream: true,
+    previous_response_id: "resp_prior_turn",
+    input: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: "This exact continuation replay must not run upstream twice.",
+          },
+        ],
+      },
+    ],
+  });
+  const requestInit = {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer router-token",
+      "user-agent": "Codex Desktop/0.142.3",
+      "x-codex-thread-id": "thread_duplicate_previous",
+    },
+    body: payload,
+  };
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /previous response answer 1/);
+    assert.equal(upstreamCalls, 1);
+
+    const second = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
+    assert.equal(second.statusCode, 200);
+    assert.match(second.body, /previous response answer 1/);
+    assert.equal(upstreamCalls, 1);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("server serves duplicate compact Codex desktop request locally", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    upstreamCalls += 1;
+    const body = await readJson(req);
+    assert.equal(req.url, "/v1/chat/completions");
+    assert.equal(body.model, "deepseek-v4-pro");
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: `chatcmpl_duplicate_compact_${upstreamCalls}`,
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: `Summary: compact answer ${upstreamCalls}.`,
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 1000,
+          completion_tokens: 10,
+          total_tokens: 1010,
+        },
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const payload = JSON.stringify({
+    model: "deepseek-v4-pro",
+    stream: true,
+    input: [
+      {
+        type: "message",
+        role: "user",
+        content: "long context that needs compacting",
+      },
+      { type: "compaction_trigger" },
+    ],
+  });
+  const requestInit = {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer router-token",
+      "user-agent": "Codex Desktop/0.142.3",
+      "x-codex-thread-id": "thread_duplicate_compact",
+    },
+    body: payload,
+  };
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /Summary: compact answer 1/);
+    assert.equal(upstreamCalls, 1);
+
+    const second = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
+    assert.equal(second.statusCode, 200);
+    assert.match(second.body, /Summary: compact answer 1/);
+    assert.equal(upstreamCalls, 1);
+  } finally {
     await close(router);
     await close(upstream);
   }
