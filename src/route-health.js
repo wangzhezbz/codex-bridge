@@ -38,6 +38,10 @@ const ERROR_TYPES = {
     type: "router_error",
     code: "router_error",
   },
+  stream: {
+    type: "stream_error",
+    code: "upstream_stream_error",
+  },
 };
 
 export function createRouteHealthStore({
@@ -140,6 +144,17 @@ function classifyBase({ error, statusCode, haystack, context }) {
   }
   if (error?.code === "upstream_timeout" || error?.name === "UpstreamTimeoutError" || /timed out|timeout/.test(haystack)) {
     return ERROR_TYPES.timeout;
+  }
+  if (
+    error?.name === "UpstreamStreamError" ||
+    error?.code === "upstream_stream_error" ||
+    error?.code === "upstream_stream_truncated" ||
+    /stream.*(truncated|disconnected|closed|ended before response\.completed)/.test(haystack)
+  ) {
+    return {
+      ...ERROR_TYPES.stream,
+      code: String(error?.code || ERROR_TYPES.stream.code),
+    };
   }
   if (isCompactError(statusCode, haystack, context)) {
     return ERROR_TYPES.compact;

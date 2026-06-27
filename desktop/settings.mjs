@@ -10,6 +10,7 @@ import {
   providerById,
 } from "./presets.mjs";
 import { normalizeAdapterProfile } from "../src/adapter-profile.js";
+import { proxySettingsForUrl } from "../src/proxy.js";
 
 const require = createRequire(import.meta.url);
 
@@ -306,6 +307,7 @@ export function supportDiagnostics(rootDir, {
   usageSummary = null,
   updateDir = path.join(rootDir, "updates"),
   proxyEnv = process.env,
+  proxySettingsOptions = {},
   config = readRouterConfig(rootDir),
   logs = [],
   platform = process.platform,
@@ -317,6 +319,7 @@ export function supportDiagnostics(rootDir, {
   const routeDiagnostics = routerConfigDiagnostics(rootDir, config);
   const historyDiagnostics = codexHistoryDiagnostics({ homeDir });
   const pluginDiagnostics = codexPluginRuntimeDiagnostics({ homeDir });
+  const effectiveProxyEnv = proxyEnvWithDesktopOptions(proxyEnv, options);
   const secretMap = loadSecrets(rootDir);
   const selectedRoutes = Array.isArray(config?.models) ? config.models : [];
   const selectedKeyEnvs = [
@@ -375,6 +378,9 @@ export function supportDiagnostics(rootDir, {
     "Proxy diagnostics:",
     ...proxyDiagnosticsLines(proxyEnv, options),
     "",
+    "Effective upstream proxy:",
+    ...effectiveUpstreamProxyLines(selectedRoutes, effectiveProxyEnv, proxySettingsOptions),
+    "",
     "Update diagnostics:",
     ...updateDiagnosticsLines(updateDir),
     "",
@@ -401,6 +407,7 @@ export function supportDiagnostics(rootDir, {
       unhealthyRoutes: routeHealthSummary(lastHealth).unhealthyRoutes,
       usage: usageDiagnosticsSummary(usageSummary),
       proxy: proxyDiagnosticsSummary(proxyEnv),
+      effectiveProxyRoutes: effectiveUpstreamProxySummary(selectedRoutes, effectiveProxyEnv, proxySettingsOptions),
       update: {
         updateDir,
         updateDirExists: safeExists(updateDir),
@@ -565,6 +572,42 @@ function proxyDiagnosticsLines(proxyEnv = {}, options = {}) {
     lines.push(`- ${key}: ${value ? `set ${redactProxyValue(value)}` : "unset"}`);
   }
   return lines;
+}
+
+function proxyEnvWithDesktopOptions(proxyEnv = {}, options = {}) {
+  if (!options.bypassSystemProxy) {
+    return proxyEnv;
+  }
+  return {
+    ...proxyEnv,
+    CODEXBRIDGE_DISABLE_SYSTEM_PROXY: "1",
+  };
+}
+
+function effectiveUpstreamProxyLines(routes = [], proxyEnv = {}, proxySettingsOptions = {}) {
+  if (!routes.length) {
+    return ["- no selected routes"];
+  }
+  return routes.slice(0, 12).map((route) => {
+    const proxy = proxySettingsForUrl(route.baseUrl || "", proxyEnv, proxySettingsOptions);
+    const label = proxy?.url
+      ? `${proxy.source}:${redactProxyValue(proxy.url).replace(/\/$/, "")}`
+      : "direct";
+    return `- ${redactSecretText(route.id || route.model || "unknown")}: ${label}`;
+  });
+}
+
+function effectiveUpstreamProxySummary(routes = [], proxyEnv = {}, proxySettingsOptions = {}) {
+  let direct = 0;
+  let proxied = 0;
+  for (const route of routes) {
+    if (proxySettingsForUrl(route.baseUrl || "", proxyEnv, proxySettingsOptions)?.url) {
+      proxied += 1;
+    } else {
+      direct += 1;
+    }
+  }
+  return { direct, proxied };
 }
 
 function updateDiagnosticsLines(updateDir) {

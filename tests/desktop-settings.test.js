@@ -432,6 +432,87 @@ test("supportDiagnostics includes route health, usage, proxy, and update paths w
   assert.doesNotMatch(diagnostics.text, /sk-usage-secret/);
 });
 
+test("supportDiagnostics reports effective upstream proxy per selected route", () => {
+  const rootDir = makeTempProject();
+  const diagnostics = supportDiagnostics(rootDir, {
+    appVersion: "0.1.101",
+    routerRunning: true,
+    proxyEnv: {
+      HTTPS_PROXY: "http://user:pass@127.0.0.1:7890",
+      NO_PROXY: "localhost,127.0.0.1",
+    },
+    lastHealth: {
+      ok: true,
+      routes: [],
+    },
+    config: {
+      port: 15722,
+      models: [
+        {
+          id: "gpt-5.5",
+          displayName: "GPT-5.5",
+          api: "responses",
+          baseUrl: "https://api.openai.com/v1",
+          model: "gpt-5.5",
+          authMode: "codex_openai",
+        },
+        {
+          id: "local-test",
+          displayName: "Local Test",
+          api: "chat_completions",
+          baseUrl: "http://localhost:9999/v1",
+          model: "local-model",
+          authMode: "api_key",
+          apiKey: "inline-key",
+        },
+      ],
+    },
+    logs: [],
+  });
+
+  assert.match(diagnostics.text, /Effective upstream proxy/);
+  assert.match(diagnostics.text, /gpt-5\.5: env:http:\/\/127\.0\.0\.1:7890/);
+  assert.match(diagnostics.text, /local-test: direct/);
+  assert.doesNotMatch(diagnostics.text, /user:pass/);
+});
+
+test("supportDiagnostics effective upstream proxy honors system proxy bypass", () => {
+  const rootDir = makeTempProject();
+  saveDesktopOptions(rootDir, { bypassSystemProxy: true });
+
+  const diagnostics = supportDiagnostics(rootDir, {
+    proxyEnv: {},
+    proxySettingsOptions: {
+      platform: "darwin",
+      macosProxySettings: {
+        httpsEnable: true,
+        httpsProxy: "127.0.0.1",
+        httpsPort: 7890,
+        exceptions: [],
+      },
+    },
+    lastHealth: { ok: true, routes: [] },
+    config: {
+      port: 15722,
+      models: [
+        {
+          id: "gpt-5.5",
+          displayName: "GPT-5.5",
+          api: "responses",
+          baseUrl: "https://api.openai.com/v1",
+          model: "gpt-5.5",
+          authMode: "codex_openai",
+        },
+      ],
+    },
+  });
+
+  assert.match(diagnostics.text, /bypassSystemProxy: true/);
+  assert.match(diagnostics.text, /gpt-5\.5: direct/);
+  assert.equal(diagnostics.summary.effectiveProxyRoutes.direct, 1);
+  assert.equal(diagnostics.summary.effectiveProxyRoutes.proxied, 0);
+});
+
 test("supportDiagnostics reports stale Codex plugin runtime without mutating it", () => {
   const rootDir = makeTempProject();
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-bridge-home-"));

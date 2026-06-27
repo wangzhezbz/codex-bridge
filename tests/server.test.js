@@ -4935,6 +4935,12 @@ test("truncated native responses streams end with a bridge failure event and do 
     assert.match(firstText, /upstream_stream_truncated/);
     assert.match(firstText, /data: \[DONE\]/);
 
+    const health = await fetchJson(`${baseUrl}/health`);
+    assert.equal(health.unhealthyRoutes, 1);
+    assert.equal(health.routes[0].status, "degraded");
+    assert.equal(health.routes[0].lastErrorCode, "upstream_stream_truncated");
+    assert.match(health.routes[0].lastError, /ended before response\.completed/);
+
     await fetchJson(`${baseUrl}/v1/responses`, {
       method: "POST",
       headers: {
@@ -5018,6 +5024,12 @@ test("native responses stream transport errors end with a bridge failure event",
     assert.match(text, /response\.failed/);
     assert.match(text, /upstream_stream_truncated/);
     assert.match(text, /data: \[DONE\]/);
+
+    const health = await fetchJson(`${serverUrl(router)}/health`);
+    assert.equal(health.unhealthyRoutes, 1);
+    assert.equal(health.routes[0].lastErrorType, "network_error");
+    assert.equal(health.routes[0].lastErrorCode, "upstream_network_error");
+    assert.match(health.routes[0].lastError, /Check network, provider Base URL, API proxy\/VPN/);
   } finally {
     await close(router);
     await close(upstream);

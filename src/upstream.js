@@ -127,6 +127,22 @@ export class UpstreamTimeoutError extends Error {
   }
 }
 
+export class UpstreamStreamError extends Error {
+  constructor(message, upstreamUrl, route = {}, code = "upstream_stream_error") {
+    super(message);
+    this.name = "UpstreamStreamError";
+    this.statusCode = 502;
+    this.code = code;
+    this.upstreamUrl = upstreamUrl;
+    this.route = {
+      id: route.id || "",
+      displayName: route.displayName || "",
+      model: route.model || "",
+      api: route.api || "",
+    };
+  }
+}
+
 export class ClientClosedRequestError extends Error {
   constructor() {
     super("CodexBridge client connection closed before the upstream response completed.");
@@ -270,7 +286,7 @@ export async function proxyResponsesApi(
       res.end();
     }
     logUsage(context, route, usage);
-    return;
+    throw new UpstreamStreamError(message, upstreamUrl, route, "upstream_stream_error");
   }
   if (upstreamPayload.stream && !responsesSseStreamComplete(responseTail)) {
     const message =
@@ -285,7 +301,7 @@ export async function proxyResponsesApi(
     }));
     res.end();
     logUsage(context, route, usage);
-    return;
+    throw new UpstreamStreamError(message, upstreamUrl, route, "upstream_stream_truncated");
   }
 
   res.end();

@@ -3,6 +3,7 @@ import { ProxyAgent } from "undici";
 
 const proxyAgents = new Map();
 let cachedWindowsProxySettings;
+let cachedMacosProxySettings;
 
 export function fetchInitWithProxy(targetUrl, init = {}) {
   if (init.dispatcher) {
@@ -26,11 +27,12 @@ export function proxyLogLabel(targetUrl) {
   return `${proxy.source}:${redactProxyUrl(proxy.url)}`;
 }
 
-export function proxySettingsForUrl(targetUrl, env = process.env) {
+export function proxySettingsForUrl(targetUrl, env = process.env, options = {}) {
   const parsed = safeUrl(targetUrl);
   if (!parsed || isLocalHost(parsed.hostname)) {
     return null;
   }
+  const platform = options.platform || process.platform;
 
   const noProxy = env.NO_PROXY || env.no_proxy || "";
   if (noProxyMatches(parsed.hostname, noProxy)) {
@@ -42,9 +44,14 @@ export function proxySettingsForUrl(targetUrl, env = process.env) {
     return { source: "env", url: normalizeProxyUrl(envProxy) };
   }
 
-  const windowsProxy = windowsProxyForUrl(parsed, env);
+  const windowsProxy = windowsProxyForUrl(parsed, env, platform);
   if (windowsProxy) {
     return { source: "windows", url: normalizeProxyUrl(windowsProxy) };
+  }
+
+  const macosProxy = macosProxyForUrl(parsed, env, platform, options);
+  if (macosProxy) {
+    return { source: "macos", url: normalizeProxyUrl(macosProxy) };
   }
 
   return null;
@@ -88,8 +95,8 @@ function envProxyForProtocol(protocol, env) {
   return "";
 }
 
-function windowsProxyForUrl(parsedUrl, env) {
-  if (env.CODEXBRIDGE_DISABLE_SYSTEM_PROXY === "1" || process.platform !== "win32") {
+function windowsProxyForUrl(parsedUrl, env, platform = process.platform) {
+  if (env.CODEXBRIDGE_DISABLE_SYSTEM_PROXY === "1" || platform !== "win32") {
     return "";
   }
   const settings = readWindowsProxySettings();
@@ -100,6 +107,26 @@ function windowsProxyForUrl(parsedUrl, env) {
     return "";
   }
   return proxyFromWindowsServer(settings.server, parsedUrl.protocol);
+}
+
+function macosProxyForUrl(parsedUrl, env, platform = process.platform, options = {}) {
+  if (env.CODEXBRIDGE_DISABLE_SYSTEM_PROXY === "1" || platform !== "darwin") {
+    return "";
+  }
+  const settings = options.macosProxySettings || readMacosProxySettings();
+  if (!settings) {
+    return "";
+  }
+  if (noProxyMatches(parsedUrl.hostname, settings.exceptions?.join(",") || "")) {
+    return "";
+  }
+  if (parsedUrl.protocol === "https:" && settings.httpsEnable && settings.httpsProxy) {
+    return proxyFromHostPort(settings.httpsProxy, settings.httpsPort);
+  }
+  if (parsedUrl.protocol === "http:" && settings.httpEnable && settings.httpProxy) {
+    return proxyFromHostPort(settings.httpProxy, settings.httpPort);
+  }
+  return "";
 }
 
 function readWindowsProxySettings() {
@@ -131,6 +158,75 @@ function readWindowsProxySettings() {
   }
 }
 
+function readMacosProxySettings() {
+  if (cachedMacosProxySettings) {
+    return cachedMacosProxySettings;
+  }
+  try {
+    const output = execFileSync("scutil", ["--proxy"], {
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    cachedMacosProxySettings = parseMacosProxySettings(output);
+    return cachedMacosProxySettings;
+  } catch {
+    cachedMacosProxySettings = {
+      httpEnable: false,
+      httpProxy: "",
+      httpPort: 0,
+      httpsEnable: false,
+      httpsProxy: "",
+      httpsPort: 0,
+      exceptions: [],
+    };
+    return cachedMacosProxySettings;
+  }
+}
+
+function parseMacosProxySettings(output) {
+  const text = String(output || "");
+  return {
+    httpEnable: readScutilBoolean(text, "HTTPEnable"),
+    httpProxy: readScutilValue(text, "HTTPProxy"),
+    httpPort: readScutilInteger(text, "HTTPPort"),
+    httpsEnable: readScutilBoolean(text, "HTTPSEnable"),
+    httpsProxy: readScutilValue(text, "HTTPSProxy"),
+    httpsPort: readScutilInteger(text, "HTTPSPort"),
+    exceptions: readScutilExceptions(text),
+  };
+}
+
+function readScutilValue(output, name) {
+  const pattern = new RegExp(`^\\s*${name}\\s*:\\s*(.+?)\\s*$`, "im");
+  const match = output.match(pattern);
+  return match ? match[1].trim() : "";
+}
+
+function readScutilInteger(output, name) {
+  return Number(readScutilValue(output, name) || 0) || 0;
+}
+
+function readScutilBoolean(output, name) {
+  return readScutilInteger(output, name) === 1;
+}
+
+function readScutilExceptions(output) {
+  const exceptions = [];
+  const block = String(output || "").match(/ExceptionsList\s*:\s*<array>\s*\{([\s\S]*?)^\s*\}/m);
+  if (block) {
+    for (const line of block[1].split(/\r?\n/)) {
+      const match = line.match(/^\s*\d+\s*:\s*(.+?)\s*$/);
+      if (match?.[1]) {
+        exceptions.push(match[1].trim());
+      }
+    }
+  }
+  if (readScutilBoolean(output, "ExcludeSimpleHostnames")) {
+    exceptions.push("<local>");
+  }
+  return exceptions;
+}
+
 function readRegValue(output, name) {
   const pattern = new RegExp(`^\\s*${name}\\s+REG_\\w+\\s+(.+?)\\s*$`, "im");
   const match = output.match(pattern);
@@ -160,6 +256,18 @@ function proxyFromWindowsServer(proxyServer, protocol) {
   }
   const protocolKey = protocol === "https:" ? "https" : "http";
   return entries.get(protocolKey) || entries.get("http") || "";
+}
+
+function proxyFromHostPort(host, port) {
+  const cleanHost = String(host || "").trim();
+  const cleanPort = Number(port || 0);
+  if (!cleanHost) {
+    return "";
+  }
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(cleanHost)) {
+    return cleanHost;
+  }
+  return cleanPort > 0 ? `${cleanHost}:${cleanPort}` : cleanHost;
 }
 
 function normalizeProxyUrl(value) {

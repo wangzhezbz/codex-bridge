@@ -10,6 +10,9 @@ import {
   __resetRateLimiterForTests,
   __setRateLimitClockForTests,
 } from "../src/rate-limit.js";
+import {
+  proxySettingsForUrl,
+} from "../src/proxy.js";
 
 test("upstream requests use HTTPS proxy dispatcher when configured", async () => {
   const originalFetch = globalThis.fetch;
@@ -123,6 +126,42 @@ test("upstream requests ignore unsupported SOCKS proxy URLs", async () => {
     globalThis.fetch = originalFetch;
     restoreProxyEnv(originalEnv);
   }
+});
+
+test("proxySettingsForUrl reads macOS HTTPS system proxy settings", () => {
+  const result = proxySettingsForUrl(
+    "https://api.openai.com/v1/responses",
+    {},
+    {
+      platform: "darwin",
+      macosProxySettings: {
+        httpEnable: false,
+        httpProxy: "",
+        httpPort: 0,
+        httpsEnable: true,
+        httpsProxy: "127.0.0.1",
+        httpsPort: 7890,
+        exceptions: ["localhost", "127.0.0.1", "*.local"],
+      },
+    },
+  );
+
+  assert.deepEqual(result, {
+    source: "macos",
+    url: "http://127.0.0.1:7890",
+  });
+  assert.equal(
+    proxySettingsForUrl("https://localhost/v1/responses", {}, {
+      platform: "darwin",
+      macosProxySettings: {
+        httpsEnable: true,
+        httpsProxy: "127.0.0.1",
+        httpsPort: 7890,
+        exceptions: ["localhost"],
+      },
+    }),
+    null,
+  );
 });
 
 test("upstream requests honor per-route rpm before calling providers", async () => {
@@ -576,17 +615,27 @@ test("codex_openai responses use ChatGPT Codex backend and forward Codex headers
       headers: req.headers,
       body: Buffer.concat(chunks).toString("utf8"),
     };
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(
-      JSON.stringify({
-        id: "resp_subscription",
-        object: "response",
-        status: "completed",
-        model: "gpt-5.5",
-        output: [],
-        output_text: "hello from subscription",
-      }),
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    res.write("event: response.output_text.delta\n");
+    res.write(
+      `data: ${JSON.stringify({
+        type: "response.output_text.delta",
+        delta: "hello from subscription",
+      })}\n\n`,
     );
+    res.write("event: response.completed\n");
+    res.write(
+      `data: ${JSON.stringify({
+        type: "response.completed",
+        response: {
+          id: "resp_subscription",
+          status: "completed",
+          model: "gpt-5.5",
+          output: [],
+        },
+      })}\n\n`,
+    );
+    res.end("data: [DONE]\n\n");
   });
 
   try {
@@ -742,27 +791,30 @@ test("responses stream body errors are converted to terminal SSE for Codex clien
 
   try {
     const res = collectResponse();
-    await proxyResponsesApi(
-      {
-        model: "gpt-5.5",
-        input: "hello",
-        stream: true,
-      },
-      {
-        id: "gpt-5.5",
-        api: "responses",
-        baseUrl: "https://chatgpt.com/backend-api/codex",
-        model: "gpt-5.5",
-        authMode: "codex_openai",
-      },
-      res,
-      {
-        requestId: "req_body_error",
-        clientAuth: {
-          kind: "codex_openai",
-          bearerToken: "codex-openai-token",
+    await assert.rejects(
+      proxyResponsesApi(
+        {
+          model: "gpt-5.5",
+          input: "hello",
+          stream: true,
         },
-      },
+        {
+          id: "gpt-5.5",
+          api: "responses",
+          baseUrl: "https://chatgpt.com/backend-api/codex",
+          model: "gpt-5.5",
+          authMode: "codex_openai",
+        },
+        res,
+        {
+          requestId: "req_body_error",
+          clientAuth: {
+            kind: "codex_openai",
+            bearerToken: "codex-openai-token",
+          },
+        },
+      ),
+      (error) => error?.name === "UpstreamStreamError" && error?.code === "upstream_stream_error",
     );
 
     const text = res.body();
