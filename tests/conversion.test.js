@@ -935,6 +935,26 @@ test("invalid auth modes fail config validation", () => {
   );
 });
 
+test("router config rejects model baseUrl pointing back to CodexBridge itself", () => {
+  assert.throws(
+    () =>
+      validateConfig({
+        host: "127.0.0.1",
+        port: 15722,
+        models: [
+          {
+            id: "gpt-5.5",
+            displayName: "GPT-5.5",
+            api: "responses",
+            baseUrl: "http://localhost:15722/v1",
+            model: "gpt-5.5",
+          },
+        ],
+      }),
+    /points back to CodexBridge Router itself/,
+  );
+});
+
 test("custom apply_patch maps to chat function and back to custom_tool_call", () => {
   const converted = responsesToChatRequest(
     {

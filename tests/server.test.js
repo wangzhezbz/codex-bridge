@@ -6746,6 +6746,282 @@ test("server stops duplicate initial Codex desktop replay while the first reques
   }
 });
 
+test("server stops duplicate Codex desktop retry after retryable upstream 503", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    upstreamCalls += 1;
+    const body = await readJson(req);
+    assert.equal(body.model, "deepseek-v4-pro");
+    res.writeHead(503, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        error: {
+          message:
+            "No available channel for model deepseek-v4-pro under group default (distributor)",
+        },
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const payload = JSON.stringify({
+    model: "deepseek-v4-pro",
+    stream: true,
+    input: "This failed request must not be replayed upstream by automatic retries.",
+  });
+  const requestInit = {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer router-token",
+      "user-agent": "Codex Desktop/0.142.3",
+      "x-codex-thread-id": "thread_duplicate_503",
+    },
+    body: payload,
+  };
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /response\.failed/);
+    assert.match(first.body, /No available channel/);
+    assert.equal(upstreamCalls, 1);
+
+    const second = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
+    assert.equal(second.statusCode, 200);
+    assert.match(second.body, /response\.completed/);
+    assert.match(second.body, /stopped an automatic retry/);
+    assert.equal(upstreamCalls, 1);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("server stops duplicate Codex desktop retry after oversized upstream 413", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    upstreamCalls += 1;
+    await readJson(req);
+    res.writeHead(413, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        error: {
+          message: "request body exceeds upstream gateway size limit",
+        },
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-flash",
+    models: [
+      {
+        id: "deepseek-v4-flash",
+        displayName: "DeepSeek V4 Flash",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "deepseek-v4-flash",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const payload = JSON.stringify({
+    model: "deepseek-v4-flash",
+    stream: true,
+    input: "This oversized request must not be replayed upstream by automatic retries.",
+  });
+  const requestInit = {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer router-token",
+      "user-agent": "Codex Desktop/0.142.3",
+      "x-codex-thread-id": "thread_duplicate_413",
+    },
+    body: payload,
+  };
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /response\.failed/);
+    assert.match(first.body, /HTTP 413/);
+    assert.equal(upstreamCalls, 1);
+
+    const second = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
+    assert.equal(second.statusCode, 200);
+    assert.match(second.body, /response\.completed/);
+    assert.match(second.body, /stopped an automatic retry/);
+    assert.equal(upstreamCalls, 1);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("server stops duplicate Codex desktop retry after retryable upstream 502", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    upstreamCalls += 1;
+    await readJson(req);
+    res.writeHead(502, { "content-type": "text/html; charset=utf-8" });
+    res.end("<!doctype html><html><body>provider gateway unavailable</body></html>");
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "kr-claude-opus-4-6",
+    models: [
+      {
+        id: "kr-claude-opus-4-6",
+        displayName: "KR Claude Opus 4.6",
+        provider: "openai-compatible",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "kr-claude-opus-4-6",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const payload = JSON.stringify({
+    model: "kr-claude-opus-4-6",
+    stream: true,
+    input: "This 502 request must not be replayed upstream by automatic retries.",
+  });
+  const requestInit = {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer router-token",
+      "user-agent": "Codex Desktop/0.142.3",
+      "x-codex-thread-id": "thread_duplicate_502",
+    },
+    body: payload,
+  };
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /response\.failed/);
+    assert.match(first.body, /HTTP 502/);
+    assert.equal(upstreamCalls, 1);
+
+    const second = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
+    assert.equal(second.statusCode, 200);
+    assert.match(second.body, /response\.completed/);
+    assert.match(second.body, /stopped an automatic retry/);
+    assert.equal(upstreamCalls, 1);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("server stops duplicate Codex desktop retry after truncated responses stream", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    upstreamCalls += 1;
+    await readJson(req);
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    res.end(
+      [
+        "event: response.output_text.delta",
+        `data: ${JSON.stringify({
+          type: "response.output_text.delta",
+          delta: "partial text before disconnect",
+        })}`,
+        "",
+      ].join("\n"),
+    );
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "gpt-5.5",
+    clientAuth: { allowOpenAiBearer: true },
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        provider: "openai",
+        api: "responses",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "gpt-5.5",
+        authMode: "codex_openai",
+      },
+    ],
+  });
+
+  await listen(router);
+  const payload = JSON.stringify({
+    model: "gpt-5.5",
+    stream: true,
+    input: "This truncated stream must not be replayed upstream.",
+  });
+  const requestInit = {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer codex-openai-token",
+      "user-agent": "Codex Desktop/0.142.3",
+      "x-codex-thread-id": "thread_duplicate_stream_truncated",
+    },
+    body: payload,
+  };
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /response\.failed/);
+    assert.match(first.body, /upstream_stream_truncated/);
+    assert.equal(upstreamCalls, 1);
+
+    const second = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
+    assert.equal(second.statusCode, 200);
+    assert.match(second.body, /response\.completed/);
+    assert.match(second.body, /stopped an automatic retry/);
+    assert.equal(upstreamCalls, 1);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
 test("server serves duplicate Codex desktop request with previous_response_id locally", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer(async (req, res) => {

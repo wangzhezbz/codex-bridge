@@ -47,6 +47,12 @@ export function validateConfig(config) {
     ) {
       throw new Error(`model ${model.id} has unsupported authMode ${model.authMode}`);
     }
+    if (baseUrlPointsBackToRouter(model.baseUrl, config)) {
+      throw new Error(
+        `model ${model.id} baseUrl points back to CodexBridge Router itself: ${model.baseUrl}. ` +
+          "Use the real upstream provider Base URL instead.",
+      );
+    }
     seen.add(model.id);
   }
 }
@@ -268,4 +274,35 @@ function collapseDuplicateV1(value) {
 
 export function routerOrigin(config) {
   return `http://${config.host || "127.0.0.1"}:${config.port || 15722}`;
+}
+
+function baseUrlPointsBackToRouter(baseUrl, config = {}) {
+  const routerPort = Number(config.port || 15722);
+  if (!Number.isFinite(routerPort) || routerPort <= 0) {
+    return false;
+  }
+  try {
+    const parsed = new URL(baseUrl);
+    const targetPort = Number(parsed.port || (parsed.protocol === "https:" ? 443 : 80));
+    if (targetPort !== routerPort) {
+      return false;
+    }
+    return isLocalRouterHost(parsed.hostname) && isLocalRouterHost(config.host || "127.0.0.1");
+  } catch {
+    return false;
+  }
+}
+
+function isLocalRouterHost(value) {
+  const host = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "");
+  return (
+    host === "localhost" ||
+    host === "::" ||
+    host === "::1" ||
+    host === "0.0.0.0" ||
+    host.startsWith("127.")
+  );
 }

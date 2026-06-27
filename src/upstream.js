@@ -52,6 +52,7 @@ const FAILURE_CACHE_MAX_ENTRIES = 200;
 const FAILURE_CACHE_FATAL_TTL_MS = 120_000;
 const DUPLICATE_INITIAL_REQUEST_TTL_MS = 120_000;
 const DUPLICATE_INITIAL_REQUEST_PENDING_TTL_MS = 60_000;
+const DUPLICATE_INITIAL_REQUEST_ERROR_TTL_MS = 30_000;
 const DUPLICATE_INITIAL_REQUEST_MAX_ENTRIES = 200;
 const DEFAULT_CHAT_TOOL_CONTINUATION_TURNS = 5;
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 300_000;
@@ -232,7 +233,7 @@ export async function handleResponsesRequest(
       return await proxyChatCompletions(requestBody, route, history, res, guardedContext);
     }
   } catch (error) {
-    clearDuplicateInitialRequestGuard(guardedContext);
+    finishDuplicateInitialRequestGuardWithError(guardedContext, route, requestBody, error);
     throw error;
   }
   jsonResponse(res, 500, openAiError(`Unsupported route api: ${route.api}`));
@@ -351,7 +352,14 @@ function beginDuplicateInitialRequestGuard(
   const now = Date.now();
   if (existing?.expiresAt > now && existing.status === "completed" && existing.response) {
     existing.expiresAt = now + DUPLICATE_INITIAL_REQUEST_TTL_MS;
-    serveDuplicateInitialResponse(existing.response, requestBody, route, res, context, "completed");
+    serveDuplicateInitialResponse(
+      existing.response,
+      requestBody,
+      route,
+      res,
+      context,
+      existing.reason || "completed",
+    );
     return { key, served: true };
   }
   if (existing?.expiresAt > now && existing.status === "pending") {
@@ -390,18 +398,35 @@ function finishDuplicateInitialRequestGuard(context = {}, route = {}, response =
     status: "completed",
     response: safeResponse,
     expiresAt: Date.now() + DUPLICATE_INITIAL_REQUEST_TTL_MS,
+    reason: "completed",
   });
 }
 
-function clearDuplicateInitialRequestGuard(context = {}) {
+function finishDuplicateInitialRequestGuardWithError(
+  context = {},
+  route = {},
+  requestBody = {},
+  error,
+) {
   const key = context.duplicateInitialRequestKey;
   if (!key) {
     return;
   }
   const existing = recentInitialRequests.get(key);
-  if (existing?.status === "pending") {
-    recentInitialRequests.delete(key);
+  if (existing?.status !== "pending") {
+    return;
   }
+  if (!shouldStopDuplicateRetryAfterError(error)) {
+    recentInitialRequests.delete(key);
+    return;
+  }
+  const response = duplicateInitialRequestErrorResponse(requestBody, route, error, context);
+  recentInitialRequests.set(key, {
+    status: "completed",
+    response,
+    expiresAt: Date.now() + DUPLICATE_INITIAL_REQUEST_ERROR_TTL_MS,
+    reason: "retry_error",
+  });
 }
 
 function serveDuplicateInitialResponse(response, requestBody, route, res, context = {}, reason = "duplicate") {
@@ -434,11 +459,11 @@ function duplicateInitialResponse(response) {
   return cloned;
 }
 
-function duplicateInitialRequestNoopResponse(model) {
+function duplicateInitialRequestNoopResponse(model, text) {
   const id = `resp_duplicate_request_${Date.now().toString(36)}_${Math.random()
     .toString(36)
     .slice(2, 8)}`;
-  const text =
+  const outputText = text ||
     "CodexBridge stopped a duplicate automatic request replay to avoid unintended token usage. " +
     "Send a new message to continue this task.";
   return {
@@ -456,18 +481,58 @@ function duplicateInitialRequestNoopResponse(model) {
         content: [
           {
             type: "output_text",
-            text,
+            text: outputText,
             annotations: [],
           },
         ],
       },
     ],
-    output_text: text,
+    output_text: outputText,
     parallel_tool_calls: true,
     error: null,
     incomplete_details: null,
     usage: null,
   };
+}
+
+function duplicateInitialRequestErrorResponse(requestBody = {}, route = {}, error, context = {}) {
+  const detail = retryableErrorDetail(error);
+  const reason =
+    "CodexBridge stopped an automatic retry of the same failed request to avoid repeated upstream calls and token usage. " +
+    "The latest upstream error was kept in the previous message. Send a new message to retry after the provider is ready." +
+    (detail ? ` Latest error: ${detail}` : "");
+  if (context.compactKind) {
+    return compactResponseFromLocalFallback(requestBody.model || route.id || route.model, {
+      requestBody,
+      reason,
+    });
+  }
+  return duplicateInitialRequestNoopResponse(requestBody.model || route.id || route.model, reason);
+}
+
+function shouldStopDuplicateRetryAfterError(error) {
+  if (error?.code === "client_closed_request") {
+    return false;
+  }
+  if (
+    error instanceof UpstreamNetworkError ||
+    error instanceof UpstreamTimeoutError ||
+    error instanceof UpstreamStreamError
+  ) {
+    return true;
+  }
+  const statusCode = Number(error?.statusCode || 0);
+  return [413, 502, 503, 504].includes(statusCode);
+}
+
+function retryableErrorDetail(error) {
+  if (!error) {
+    return "";
+  }
+  if (error instanceof UpstreamHttpError) {
+    return safeText(clientUpstreamErrorMessage(error, tryParseJson(error.bodyText)), 500);
+  }
+  return safeText(error.message || String(error), 500);
 }
 
 function duplicateInitialRequestPendingResponse(requestBody = {}, route = {}, context = {}) {
