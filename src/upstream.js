@@ -287,6 +287,30 @@ export async function proxyResponsesApi(
     throw error;
   }
 
+  if (shouldAggregateForcedResponsesStream(requestBody, upstreamPayload, route)) {
+    const responseText = upstream.body ? await upstream.text() : "";
+    const completedResponse = extractResponsesObject(responseText);
+    if (!responsesSseStreamComplete(responseText) && looksLikeSseResponse(responseText)) {
+      const message =
+        `CodexBridge upstream stream from ${route.displayName || route.id || route.model || "route"} ` +
+        "ended before response.completed or [DONE].";
+      logUsage(context, route, extractResponsesUsage(responseText));
+      throw new UpstreamStreamError(message, activeUpstreamUrl, route, "upstream_stream_truncated");
+    }
+    if (!completedResponse) {
+      throw new UpstreamHttpError(
+        502,
+        `Upstream returned a forced stream without a response object: ${responseText.slice(0, 500)}`,
+        activeUpstreamUrl,
+        route,
+      );
+    }
+    recordResponsesHistory(history, completedResponse, sourceMessages, toolContext);
+    logUsage(context, route, extractUsageObject(completedResponse) || extractResponsesUsage(responseText));
+    jsonResponse(res, upstream.status, completedResponse);
+    return;
+  }
+
   res.writeHead(upstream.status, filteredHeaders(upstream.headers));
   if (!upstream.body) {
     logUsage(context, route, null);
@@ -352,6 +376,20 @@ export async function proxyResponsesApi(
   res.end();
   recordResponsesHistory(history, completedResponse, sourceMessages, toolContext);
   logUsage(context, route, usage);
+}
+
+function shouldAggregateForcedResponsesStream(requestBody = {}, upstreamPayload = {}, route = {}) {
+  return (
+    route.api === "responses" &&
+    authModeForRoute(route) === "codex_openai" &&
+    requestBody.stream !== true &&
+    upstreamPayload.stream === true
+  );
+}
+
+function looksLikeSseResponse(text = "") {
+  const trimmed = String(text || "").trimStart();
+  return trimmed.startsWith("data:") || trimmed.startsWith("event:") || /\n(?:data|event):/.test(trimmed);
 }
 
 function responsesStreamFailureMessage(route = {}, error) {
@@ -1672,6 +1710,23 @@ export function sendUpstreamError(res, error, options = {}) {
     return;
   }
 
+  if (error?.code === "request_body_too_large") {
+    const limitMb = bytesToMegabytes(error.limitBytes);
+    const actualMb = bytesToMegabytes(error.actualBytes);
+    jsonResponse(
+      res,
+      error.statusCode || 413,
+      openAiError(
+        `CodexBridge local request body is too large${actualMb ? ` (${actualMb} MB)` : ""}. ` +
+          `The local router limit is ${limitMb || "configured"} MB. ` +
+          "Run /compact, remove large pasted logs or inline images, or raise requestBodyLimitBytes if you intentionally need a larger local request.",
+        error.statusCode || 413,
+        "request_body_too_large",
+      ),
+    );
+    return;
+  }
+
   if (error instanceof UpstreamHttpError) {
     const parsed = tryParseJson(error.bodyText);
     const classification = classifyUpstreamError(error);
@@ -1701,6 +1756,14 @@ export function sendUpstreamError(res, error, options = {}) {
 
   const statusCode = error.statusCode || 500;
   jsonResponse(res, statusCode, openAiError(error.message, statusCode, error.code || "router_error"));
+}
+
+function bytesToMegabytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "";
+  }
+  return (bytes / 1024 / 1024).toFixed(bytes >= 1024 * 1024 ? 1 : 3);
 }
 
 function sendResponsesStreamFailure(res, message, options = {}) {

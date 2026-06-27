@@ -376,6 +376,9 @@ export function supportDiagnostics(rootDir, {
     "Usage diagnostics:",
     ...usageDiagnosticsLines(usageSummary),
     "",
+    "Request limits:",
+    ...requestLimitDiagnosticsLines(config),
+    "",
     "Proxy diagnostics:",
     ...proxyDiagnosticsLines(proxyEnv, options),
     "",
@@ -407,6 +410,7 @@ export function supportDiagnostics(rootDir, {
       errorCount: errorLines.length,
       unhealthyRoutes: routeHealthSummary(lastHealth).unhealthyRoutes,
       usage: usageDiagnosticsSummary(usageSummary),
+      requestLimits: requestLimitDiagnosticsSummary(config),
       proxy: proxyDiagnosticsSummary(proxyEnv),
       effectiveProxyRoutes: effectiveUpstreamProxySummary(selectedRoutes, effectiveProxyEnv, proxySettingsOptions),
       update: {
@@ -441,6 +445,9 @@ function routeHealthSummary(lastHealth) {
           }
           if (route.lastErrorType) {
             parts.push(`lastErrorType=${redactSecretText(route.lastErrorType)}`);
+          }
+          if (route.proxy) {
+            parts.push(`proxy=${redactSecretText(route.proxy)}`);
           }
           const cooldownMs = Number(route.cooldownRemainingMs || route.rateLimit?.cooldownRemainingMs || 0);
           if (Number.isFinite(cooldownMs) && cooldownMs > 0) {
@@ -556,6 +563,47 @@ function usageDiagnosticsLines(usageSummary = null) {
     }
   }
   return lines;
+}
+
+function requestLimitDiagnosticsSummary(config = {}) {
+  const configuredRequestLimit = configuredRequestLimitBytes(config, "requestBodyLimitBytes");
+  const configuredResponsesLimit = configuredRequestLimitBytes(config, "responsesRequestBodyLimitBytes");
+  const requestBodyLimitBytes = configuredRequestLimit || 25 * 1024 * 1024;
+  return {
+    requestBodyLimitBytes,
+    responsesRequestBodyLimitBytes: configuredResponsesLimit || configuredRequestLimit || 100 * 1024 * 1024,
+  };
+}
+
+function requestLimitDiagnosticsLines(config = {}) {
+  const summary = requestLimitDiagnosticsSummary(config);
+  return [
+    `- requestBodyLimitBytes: ${formatBytes(summary.requestBodyLimitBytes)}`,
+    `- responsesRequestBodyLimitBytes: ${formatBytes(summary.responsesRequestBodyLimitBytes)}`,
+  ];
+}
+
+function configuredRequestLimitBytes(config = {}, camelKey) {
+  const snakeKey = camelKey.replace(/[A-Z]/g, (match) => `_${match.toLowerCase()}`);
+  const value = Number(config?.[camelKey] ?? config?.[snakeKey] ?? 0);
+  if (Number.isFinite(value) && value > 0) {
+    return Math.floor(value);
+  }
+  return 0;
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "unknown";
+  }
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  }
+  if (bytes >= 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${bytes} B`;
 }
 
 function proxyDiagnosticsSummary(proxyEnv = {}) {

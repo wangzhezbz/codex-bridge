@@ -1032,17 +1032,36 @@ function renderUsageChart(rows) {
       const max = maxTokens > 0 ? maxTokens : maxCalls;
       const width = Math.max(5, Math.ceil(((value / max) * 100) / 5) * 5);
       const label = maxTokens > 0 ? `${formatNumber(row.totalTokens)} token` : `${formatNumber(row.calls)} 次`;
+      const stateLabel = usageRouteState(row);
       return `
         <div class="usage-bar">
           <div class="usage-bar-head">
             <strong>${escapeHtml(displayRoute(row.route))}</strong>
-            <span>${escapeHtml(row.upstreamModel || "-")} · ${label}</span>
+            <span>${escapeHtml(row.upstreamModel || "-")}${stateLabel ? ` · ${stateLabel}` : ""} · ${label}</span>
           </div>
           <div class="bar-track"><span class="w-${width}"></span></div>
         </div>
       `;
     })
     .join("");
+}
+
+function usageRouteState(row) {
+  if (row?.isCurrentRoute === true) {
+    return "current";
+  }
+  if (row?.isCurrentRoute === false) {
+    return "history";
+  }
+  return "";
+}
+
+function usageStatusText(row) {
+  const stateLabel = usageRouteState(row);
+  const status = row.errors
+    ? `${row.errors} 错误：${row.lastError || row.lastStatus || ""}`
+    : row.lastStatus || "-";
+  return stateLabel ? `${stateLabel} · ${status}` : String(status);
 }
 
 function renderUsageTable(rows, events) {
@@ -1058,7 +1077,7 @@ function renderUsageTable(rows, events) {
               <span>${formatNumber(row.promptTokens)}</span>
               <span>${formatNumber(row.completionTokens)}</span>
               <span>${formatNumber(row.totalTokens)}</span>
-              <span>${row.errors ? `${row.errors} 错误：${escapeHtml(row.lastError || row.lastStatus || "")}` : row.lastStatus || "-"}</span>
+              <span>${escapeHtml(usageStatusText(row))}</span>
               <span>${formatTime(row.lastAt)}</span>
             </div>
           `,
@@ -1112,7 +1131,7 @@ function renderUsageTableStable(rows, events) {
               <span>${formatNumber(row.promptTokens)}</span>
               <span>${formatNumber(row.completionTokens)}</span>
               <span>${formatNumber(row.totalTokens)}</span>
-              <span>${row.errors ? `${row.errors} 错误：${escapeHtml(row.lastError || row.lastStatus || "")}` : row.lastStatus || "-"}</span>
+              <span>${escapeHtml(usageStatusText(row))}</span>
               <span>${formatTime(row.lastAt)}</span>
             </div>
           `,

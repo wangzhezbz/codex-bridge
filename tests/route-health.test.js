@@ -94,3 +94,66 @@ test("route health snapshot reports degraded routes and recovers after success",
   assert.equal(snapshot.routes[0].status, "healthy");
   assert.equal(snapshot.routes[0].lastErrorType, "parameter_error");
 });
+
+test("route health snapshot includes effective upstream proxy label", () => {
+  const original = captureProxyEnv();
+  process.env.CODEXBRIDGE_HTTPS_PROXY = "http://user:pass@127.0.0.1:7890";
+  process.env.NO_PROXY = "";
+  process.env.no_proxy = "";
+
+  try {
+    const store = createRouteHealthStore({
+      rateLimitStatus: () => ({
+        cooldownRemainingMs: 0,
+        nextAfterMs: 0,
+      }),
+    });
+    const snapshot = store.snapshot({
+      models: [
+        {
+          id: "gpt-5.5",
+          api: "responses",
+          model: "gpt-5.5",
+          baseUrl: "https://api.openai.com/v1",
+        },
+      ],
+    });
+
+    assert.match(snapshot.routes[0].proxy, /env:http:\/\/\*\*\*:\*\*\*@127\.0\.0\.1:7890/);
+    assert.doesNotMatch(snapshot.routes[0].proxy, /user:pass/);
+  } finally {
+    restoreProxyEnv(original);
+  }
+});
+
+function captureProxyEnv() {
+  const keys = [
+    "CODEXBRIDGE_HTTPS_PROXY",
+    "CODEXBRIDGE_HTTP_PROXY",
+    "CODEXBRIDGE_ALL_PROXY",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "ALL_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+  ];
+  const values = {};
+  for (const key of keys) {
+    values[key] = process.env[key];
+    delete process.env[key];
+  }
+  return values;
+}
+
+function restoreProxyEnv(values) {
+  for (const [key, value] of Object.entries(values)) {
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+}

@@ -159,6 +159,158 @@ test("server reports upstream 413 as a request size problem with recovery guidan
   }
 });
 
+test("codex_openai responses routes force upstream streaming but preserve non-stream client shape", async () => {
+  let upstreamBody;
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/responses");
+    upstreamBody = await readJson(req);
+    if (upstreamBody.stream !== true) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ detail: "Stream must be set to true" }));
+      return;
+    }
+    if (upstreamBody.max_output_tokens !== undefined) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ detail: "Unsupported parameter: max_output_tokens" }));
+      return;
+    }
+
+    const response = {
+      id: "resp_codex_oauth_contract",
+      object: "response",
+      status: "completed",
+      model: "gpt-5.5",
+      output: [
+        {
+          id: "msg_codex_oauth_contract",
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [
+            {
+              type: "output_text",
+              text: "contract ok",
+              annotations: [],
+            },
+          ],
+        },
+      ],
+      output_text: "contract ok",
+      usage: {
+        input_tokens: 3,
+        output_tokens: 2,
+        total_tokens: 5,
+      },
+    };
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    res.write(`event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response })}\n\n`);
+    res.end("data: [DONE]\n\n");
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    clientAuth: { allowOpenAiBearer: true },
+    defaultModel: "gpt-5.5",
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        api: "responses",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "gpt-5.5",
+        authMode: "codex_openai",
+      },
+    ],
+  });
+
+  await listen(router);
+  try {
+    const response = await fetchJson(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer codex-token",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        input: "hello",
+        stream: false,
+        max_output_tokens: 4096,
+        temperature: 0.2,
+        top_p: 0.8,
+        store: true,
+      }),
+    });
+
+    assert.equal(response.output_text, "contract ok");
+    assert.equal(upstreamBody.stream, true);
+    assert.equal(upstreamBody.store, false);
+    assert.equal(upstreamBody.max_output_tokens, undefined);
+    assert.equal(upstreamBody.temperature, undefined);
+    assert.equal(upstreamBody.top_p, undefined);
+    assert.ok(upstreamBody.include.includes("reasoning.encrypted_content"));
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("server reports local request body limit with compact guidance", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (_req, res) => {
+    upstreamCalls += 1;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ id: "chatcmpl_unused", choices: [] }));
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    requestBodyLimitBytes: 512,
+    defaultModel: "deepseek-v4-flash",
+    models: [
+      {
+        id: "deepseek-v4-flash",
+        displayName: "DeepSeek V4 Flash",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "deepseek-v4-flash",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  try {
+    const response = await fetch(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-flash",
+        input: "x".repeat(2000),
+      }),
+    });
+    const body = await response.json();
+    assert.equal(response.status, 413);
+    assert.equal(body.error.code, "request_body_too_large");
+    assert.match(body.error.message, /CodexBridge local request body is too large/i);
+    assert.match(body.error.message, /compact|inline images|large pasted/i);
+    assert.equal(upstreamCalls, 0);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
 test("server returns a local rate-limit response without retrying the provider", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer(async (_req, res) => {

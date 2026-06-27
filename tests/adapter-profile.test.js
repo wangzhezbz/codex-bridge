@@ -36,6 +36,36 @@ test("adapter profiles classify native responses routes", () => {
   assert.ok(profile.safeParams.includes("previous_response_id"));
 });
 
+test("codex_openai responses routes enforce ChatGPT backend request contract", () => {
+  const filtered = filterPayloadForAdapter(
+    {
+      model: "gpt-5.5",
+      input: "hello",
+      stream: false,
+      max_output_tokens: 4096,
+      temperature: 0.4,
+      top_p: 0.9,
+      store: true,
+      include: ["output_text"],
+    },
+    {
+      id: "gpt-5.5",
+      provider: "codex",
+      api: "responses",
+      model: "gpt-5.5",
+      baseUrl: "https://chatgpt.com/backend-api/codex",
+      authMode: "codex_openai",
+    },
+  );
+
+  assert.equal(filtered.stream, true);
+  assert.equal(filtered.store, false);
+  assert.equal(filtered.max_output_tokens, undefined);
+  assert.equal(filtered.temperature, undefined);
+  assert.equal(filtered.top_p, undefined);
+  assert.deepEqual(filtered.include, ["output_text", "reasoning.encrypted_content"]);
+});
+
 test("adapter profiles classify DeepSeek chat routes", () => {
   const profile = normalizeAdapterProfile({
     id: "gpt-5.4-mini",

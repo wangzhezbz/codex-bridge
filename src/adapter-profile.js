@@ -14,6 +14,7 @@ const RESPONSES_SAFE_PARAMS = [
   "temperature",
   "top_p",
   "max_output_tokens",
+  "include",
   "metadata",
   "store",
   "reasoning",
@@ -62,6 +63,7 @@ const OMIT_VALUE = Symbol("codexbridge_omit_payload_value");
 export function normalizeAdapterProfile(route = {}) {
   const providerFamily = providerFamilyForRoute(route);
   const api = route.api === "responses" ? "responses" : "chat_completions";
+  const authMode = String(route.authMode || route.auth_mode || "");
   const adapterId = adapterIdForRoute({ ...route, providerFamily, api });
   const customConservative = Boolean(route.custom) || providerFamily === "custom";
   const inputModalities = Array.isArray(route.inputModalities)
@@ -97,6 +99,7 @@ export function normalizeAdapterProfile(route = {}) {
     adapterId,
     providerFamily,
     api,
+    authMode,
     contextWindow,
     catalogContextWindow,
     supportsTools,
@@ -331,6 +334,7 @@ function applyRouteSpecificPayloadDefaults(payload, profile, dropped) {
     payload.stream !== true ||
     dropped.has("stream_options")
   ) {
+    applyCodexOpenAiResponsesContract(payload, profile);
     return;
   }
   const streamOptions =
@@ -341,6 +345,25 @@ function applyRouteSpecificPayloadDefaults(payload, profile, dropped) {
     ...streamOptions,
     include_usage: true,
   };
+  applyCodexOpenAiResponsesContract(payload, profile);
+}
+
+function applyCodexOpenAiResponsesContract(payload, profile) {
+  if (profile.api !== "responses" || profile.authMode !== "codex_openai") {
+    return;
+  }
+
+  payload.stream = true;
+  payload.store = false;
+  delete payload.max_output_tokens;
+  delete payload.temperature;
+  delete payload.top_p;
+
+  const include = Array.isArray(payload.include) ? payload.include : [];
+  if (!include.includes("reasoning.encrypted_content")) {
+    include.push("reasoning.encrypted_content");
+  }
+  payload.include = include;
 }
 
 export function reasoningParamsForAdapter(request = {}, route = {}, options = {}) {

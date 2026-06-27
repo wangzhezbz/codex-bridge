@@ -74,6 +74,28 @@ test("usage summary separates the same Codex slot when upstream model changes", 
   assert.equal(summary.byModel.find((item) => item.upstreamModel === "mimo-v2.5-pro")?.calls, 1);
 });
 
+test("usage summary marks whether an upstream row is still the current route", () => {
+  const usage = createUsageStore();
+
+  usage.recordLine("[10:30:00] [2026-06-27T02:30:00.000Z] req_old <- /v1/responses model=gpt-5.5 route=gpt-5.5 api=chat_completions upstream_model=mimo-v2.5 stream=true previous_response_id=- client_auth=codex_openai upstream_auth=api_key");
+  usage.recordLine("[10:30:04] [2026-06-27T02:30:04.000Z] req_old <- upstream route=gpt-5.5 usage prompt=10 completion=2 total=12");
+  usage.recordLine("[10:31:00] [2026-06-27T02:31:00.000Z] req_new <- /v1/responses model=gpt-5.5 route=gpt-5.5 api=chat_completions upstream_model=mimo-v2.5-pro stream=true previous_response_id=- client_auth=codex_openai upstream_auth=api_key");
+  usage.recordLine("[10:31:03] [2026-06-27T02:31:03.000Z] req_new <- upstream route=gpt-5.5 usage prompt=20 completion=4 total=24");
+
+  const summary = usage.summary({
+    routes: [
+      {
+        id: "gpt-5.5",
+        api: "chat_completions",
+        model: "mimo-v2.5-pro",
+      },
+    ],
+  });
+
+  assert.equal(summary.byModel.find((item) => item.upstreamModel === "mimo-v2.5-pro")?.isCurrentRoute, true);
+  assert.equal(summary.byModel.find((item) => item.upstreamModel === "mimo-v2.5")?.isCurrentRoute, false);
+});
+
 test("usage store records request-scoped upstream errors", () => {
   const usage = createUsageStore();
 

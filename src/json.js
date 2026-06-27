@@ -38,6 +38,8 @@ export async function readJsonRequest(req, limitBytes = 25 * 1024 * 1024) {
       const error = new Error(`Request body exceeds ${limitBytes} bytes`);
       error.statusCode = 413;
       error.code = "request_body_too_large";
+      error.limitBytes = limitBytes;
+      error.actualBytes = size;
       throw error;
     }
     chunks.push(chunk);
@@ -49,6 +51,8 @@ export async function readJsonRequest(req, limitBytes = 25 * 1024 * 1024) {
     const error = new Error(`Request body exceeds ${limitBytes} bytes`);
     error.statusCode = 413;
     error.code = "request_body_too_large";
+    error.limitBytes = limitBytes;
+    error.actualBytes = decodedBody.length;
     throw error;
   }
 

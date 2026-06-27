@@ -45,6 +45,7 @@ let routerProcess = null;
 let logLines = [];
 let smokeErrors = [];
 let usageStore = null;
+let usageRoutes = [];
 let lastHealth = null;
 let tray = null;
 let isQuitting = false;
@@ -247,6 +248,7 @@ function showMainWindow() {
 ipcMain.handle("state:get", async () => {
   const settings = await loadSettings();
   const config = settings.readRouterConfig(dataRootDir);
+  usageRoutes = config?.models || [];
   const mode = settings.detectModeFromConfig(config);
   const diagnostics = settings.routerConfigDiagnostics(dataRootDir, config);
   return {
@@ -272,7 +274,7 @@ ipcMain.handle("state:get", async () => {
     diagnostics,
     lastHealth,
     usageEvents: usageStore?.events() || [],
-    usageSummary: usageStore?.summary() || emptyUsageSummary(),
+    usageSummary: usageStore?.summary({ routes: config?.models || [] }) || emptyUsageSummary(),
     legacyDataMigration,
     logs: logLines,
   };
@@ -595,7 +597,7 @@ ipcMain.handle("diagnostics:copy", async () => {
     appVersion: app.getVersion(),
     routerRunning: Boolean(routerProcess),
     lastHealth,
-    usageSummary: usageStore?.summary() || emptyUsageSummary(),
+    usageSummary: usageStore?.summary({ routes: config?.models || [] }) || emptyUsageSummary(),
     updateDir: portableUpdatesDir(),
     proxyEnv: process.env,
     config,
@@ -1218,6 +1220,7 @@ async function broadcastState() {
 
 async function getStatePayload(settings) {
   const config = settings.readRouterConfig(dataRootDir);
+  usageRoutes = config?.models || [];
   const mode = settings.detectModeFromConfig(config);
   const diagnostics = settings.routerConfigDiagnostics(dataRootDir, config);
   return {
@@ -1277,7 +1280,7 @@ function delay(ms) {
 function usagePayload() {
   return {
     usageEvents: usageStore?.events() || [],
-    usageSummary: usageStore?.summary() || emptyUsageSummary(),
+    usageSummary: usageStore?.summary({ routes: usageRoutes }) || emptyUsageSummary(),
   };
 }
 

@@ -283,15 +283,43 @@ test("route fidelity matrix keeps native GPT Responses contracts separate", () =
     {
       model: gptRoute.model,
       input: "native responses text",
+      stream: false,
       metadata: { trace: "ok" },
       store: true,
+      max_output_tokens: 1024,
+      include: ["output_text"],
       response_format: { type: "json_object" },
     },
     gptRoute,
   );
   assert.deepEqual(filtered.metadata, { trace: "ok" });
-  assert.equal(filtered.store, true);
+  assert.equal(filtered.stream, true);
+  assert.equal(filtered.store, false);
+  assert.equal(filtered.max_output_tokens, undefined);
+  assert.deepEqual(filtered.include, ["output_text", "reasoning.encrypted_content"]);
   assert.equal(filtered.response_format, undefined);
+
+  const apiKeyResponses = filterPayloadForAdapter(
+    {
+      model: "gpt-5.5",
+      input: "api responses text",
+      stream: false,
+      metadata: { trace: "api" },
+      store: true,
+      max_output_tokens: 1024,
+      response_format: { type: "json_object" },
+    },
+    {
+      ...gptRoute,
+      id: "gpt-5.5-api",
+      baseUrl: "https://api.openai.com/v1",
+      authMode: "api_key",
+    },
+  );
+  assert.equal(apiKeyResponses.stream, false);
+  assert.equal(apiKeyResponses.store, true);
+  assert.equal(apiKeyResponses.max_output_tokens, 1024);
+  assert.equal(apiKeyResponses.response_format, undefined);
 
   const compact = buildCompactResponsesRequest({
     model: gptRoute.id,

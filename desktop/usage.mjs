@@ -100,7 +100,9 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
     return records.slice().reverse();
   }
 
-  function summary() {
+  function summary(options = {}) {
+    const activeRoutes = activeRouteMap(options.routes || options.models || []);
+    const hasActiveRoutes = activeRoutes.size > 0;
     const byModelMap = new Map();
     const statusCounts = {};
     let totalTokens = 0;
@@ -152,7 +154,25 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
       item.api = event.api || item.api;
     }
 
-    const byModel = [...byModelMap.values()].sort((a, b) => {
+    const byModel = [...byModelMap.values()].map((item) => {
+      const active = activeRoutes.get(item.route) || activeRoutes.get(item.codexModel);
+      const routeMatches =
+        !hasActiveRoutes ||
+        Boolean(
+          active &&
+            (!active.model || active.model === item.upstreamModel) &&
+            (!active.api || active.api === item.api),
+        );
+      return {
+        ...item,
+        isCurrentRoute: hasActiveRoutes ? routeMatches : null,
+        currentUpstreamModel: active?.model || "",
+        currentApi: active?.api || "",
+      };
+    }).sort((a, b) => {
+      if (a.isCurrentRoute !== b.isCurrentRoute) {
+        return a.isCurrentRoute === true ? -1 : 1;
+      }
       if (b.totalTokens !== a.totalTokens) {
         return b.totalTokens - a.totalTokens;
       }
@@ -211,6 +231,27 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
     events,
     summary,
   };
+}
+
+function activeRouteMap(routes = []) {
+  const result = new Map();
+  if (!Array.isArray(routes)) {
+    return result;
+  }
+  for (const route of routes) {
+    if (!route || typeof route !== "object") {
+      continue;
+    }
+    const item = {
+      id: String(route.id || route.model || ""),
+      model: String(route.model || ""),
+      api: String(route.api || ""),
+    };
+    if (item.id) {
+      result.set(item.id, item);
+    }
+  }
+  return result;
 }
 
 function normalizeEvent(event) {

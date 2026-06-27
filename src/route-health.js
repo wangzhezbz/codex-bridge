@@ -1,4 +1,5 @@
 import { tryParseJson } from "./json.js";
+import { proxyLogLabel } from "./proxy.js";
 import { routeRateLimitStatus } from "./rate-limit.js";
 
 const ERROR_TYPES = {
@@ -248,6 +249,7 @@ function routeSnapshot(route = {}, record = {}, rateLimitStatus) {
     provider: String(route.provider || route.providerId || "custom"),
     api: String(route.api || ""),
     model: String(route.model || ""),
+    proxy: proxyLogLabel(route.baseUrl || ""),
     status,
     lastStatus: Number.isFinite(Number(record?.lastStatus)) ? Number(record.lastStatus) : null,
     lastOkAt: String(record?.lastOkAt || ""),

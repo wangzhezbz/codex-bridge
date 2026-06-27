@@ -18,6 +18,9 @@ import {
 import { classifyUpstreamError, createRouteHealthStore } from "./route-health.js";
 import { normalizeAdapterProfile } from "./adapter-profile.js";
 
+const DEFAULT_JSON_BODY_LIMIT_BYTES = 25 * 1024 * 1024;
+const DEFAULT_RESPONSES_BODY_LIMIT_BYTES = 100 * 1024 * 1024;
+
 export function createRouterServer(config = loadConfig()) {
   const history = new ResponseHistory();
   const routeHealth = createRouteHealthStore();
@@ -95,7 +98,7 @@ export function createRouterServer(config = loadConfig()) {
         ["PATCH", "PUT"].includes(req.method || "") &&
         isModelSettingsPath(url.pathname)
       ) {
-        const body = await readJsonRequest(req);
+        const body = await readJsonRequest(req, requestBodyLimitBytes(activeConfig, url.pathname));
         jsonResponse(res, 200, {
           ok: true,
           object: "codexbridge.model_settings",
@@ -110,7 +113,7 @@ export function createRouterServer(config = loadConfig()) {
         req.method === "POST" &&
         isResponsesPostPath(url.pathname)
       ) {
-        const body = await readJsonRequest(req);
+        const body = await readJsonRequest(req, requestBodyLimitBytes(activeConfig, url.pathname));
         const route = routeForModel(activeConfig, body.model);
         const clientAuth = authorizeClient(req, activeConfig, route);
         if (!clientAuth.ok) {
@@ -177,6 +180,24 @@ export function createRouterServer(config = loadConfig()) {
       }
     }
   });
+}
+
+function requestBodyLimitBytes(config = {}, pathname = "") {
+  const configured = isResponsesPostPath(pathname)
+    ? Number(
+        config.responsesRequestBodyLimitBytes ??
+          config.responses_request_body_limit_bytes ??
+          config.requestBodyLimitBytes ??
+          config.request_body_limit_bytes,
+      )
+    : Number(config.requestBodyLimitBytes ?? config.request_body_limit_bytes);
+  if (Number.isFinite(configured) && configured > 0) {
+    return Math.floor(configured);
+  }
+  if (isResponsesPostPath(pathname)) {
+    return DEFAULT_RESPONSES_BODY_LIMIT_BYTES;
+  }
+  return DEFAULT_JSON_BODY_LIMIT_BYTES;
 }
 
 export function startServer(config = loadConfig()) {

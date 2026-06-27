@@ -396,6 +396,7 @@ test("supportDiagnostics includes route health, usage, proxy, and update paths w
     },
     config: {
       port: 15722,
+      requestBodyLimitBytes: 1048576,
       models: [
         {
           id: "deepseek-v4-pro",
@@ -419,6 +420,9 @@ test("supportDiagnostics includes route health, usage, proxy, and update paths w
   assert.match(diagnostics.text, /Usage diagnostics/);
   assert.match(diagnostics.text, /totalCalls: 2/);
   assert.match(diagnostics.text, /latest: deepseek-v4-pro status=429 errorType=rate_limit/);
+  assert.match(diagnostics.text, /Request limits/);
+  assert.match(diagnostics.text, /requestBodyLimitBytes: 1\.0 MB/);
+  assert.match(diagnostics.text, /responsesRequestBodyLimitBytes: 1\.0 MB/);
   assert.match(diagnostics.text, /Proxy diagnostics/);
   assert.match(diagnostics.text, /HTTPS_PROXY: set http:\/\/127\.0\.0\.1:7890/);
   assert.match(diagnostics.text, /NO_PROXY: set localhost,127\.0\.0\.1/);
