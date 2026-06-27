@@ -796,11 +796,18 @@ test("codex_openai responses use ChatGPT Codex backend and forward Codex headers
           bearerToken: "codex-openai-token",
         },
         clientHeaders: {
+          "user-agent": "Codex Desktop/0.142.3 (Mac OS 27.0.0; arm64)",
           "chatgpt-account-id": "acct_123",
+          "chatgpt-session-id": "chatgpt_sess_123",
           "session-id": "sess_123",
           "thread-id": "thread_123",
+          "x-openai-client-user-agent": "codex-desktop-test",
+          "x-openai-device-id": "device_123",
+          "x-oai-sentinel": "sentinel_123",
           "x-codex-turn-state": "sticky_123",
           "x-codex-beta-features": "feature-a",
+          "x-codex-new-runtime-header": "runtime_123",
+          "openai-sentinel-chat-requirements-token": "requirements_123",
         },
       },
     );
@@ -808,11 +815,18 @@ test("codex_openai responses use ChatGPT Codex backend and forward Codex headers
     assert.equal(seenRequest.url, "/backend-api/codex/responses");
     assert.equal(seenRequest.headers.authorization, "Bearer codex-openai-token");
     assert.equal(seenRequest.headers.accept, "text/event-stream");
+    assert.equal(seenRequest.headers["user-agent"], "Codex Desktop/0.142.3 (Mac OS 27.0.0; arm64)");
     assert.equal(seenRequest.headers["chatgpt-account-id"], "acct_123");
+    assert.equal(seenRequest.headers["chatgpt-session-id"], "chatgpt_sess_123");
     assert.equal(seenRequest.headers["session-id"], "sess_123");
     assert.equal(seenRequest.headers["thread-id"], "thread_123");
+    assert.equal(seenRequest.headers["x-openai-client-user-agent"], "codex-desktop-test");
+    assert.equal(seenRequest.headers["x-openai-device-id"], "device_123");
+    assert.equal(seenRequest.headers["x-oai-sentinel"], "sentinel_123");
     assert.equal(seenRequest.headers["x-codex-turn-state"], "sticky_123");
     assert.equal(seenRequest.headers["x-codex-beta-features"], "feature-a");
+    assert.equal(seenRequest.headers["x-codex-new-runtime-header"], "runtime_123");
+    assert.equal(seenRequest.headers["openai-sentinel-chat-requirements-token"], "requirements_123");
     assert.equal(JSON.parse(seenRequest.body).model, "gpt-5.5");
     assert.match(res.body(), /hello from subscription/);
   } finally {
@@ -954,6 +968,76 @@ test("responses stream body errors are converted to terminal SSE for Codex clien
     assert.match(text, /response\.failed/);
     assert.match(text, /upstream_stream_truncated/);
     assert.match(text, /data: \[DONE\]/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("responses stream write failures after client close are treated as client cancellation", async () => {
+  const originalFetch = globalThis.fetch;
+  const clientAbort = new AbortController();
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(
+        new TextEncoder().encode(
+          [
+            "event: response.output_text.delta",
+            `data: ${JSON.stringify({
+              type: "response.output_text.delta",
+              delta: "text the local client will not receive",
+            })}`,
+            "",
+          ].join("\n"),
+        ),
+      );
+      controller.close();
+    },
+  });
+
+  globalThis.fetch = async () =>
+    new Response(stream, {
+      status: 200,
+      headers: { "content-type": "text/event-stream; charset=utf-8" },
+    });
+
+  try {
+    const res = collectResponse();
+    res.destroyed = false;
+    res.writableEnded = false;
+    res.write = () => {
+      clientAbort.abort(new Error("client connection closed"));
+      res.destroyed = true;
+      const error = new Error("write after end");
+      error.code = "ERR_STREAM_DESTROYED";
+      throw error;
+    };
+
+    await assert.rejects(
+      proxyResponsesApi(
+        {
+          model: "gpt-5.5",
+          input: "hello",
+          stream: true,
+        },
+        {
+          id: "gpt-5.5",
+          api: "responses",
+          baseUrl: "https://chatgpt.com/backend-api/codex",
+          model: "gpt-5.5",
+          authMode: "codex_openai",
+        },
+        res,
+        {
+          requestId: "req_client_closed",
+          clientSignal: clientAbort.signal,
+          clientAuth: {
+            kind: "codex_openai",
+            bearerToken: "codex-openai-token",
+          },
+        },
+      ),
+      (error) => error?.code === "client_closed_request",
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }

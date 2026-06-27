@@ -51,7 +51,8 @@ const INVALID_JSON_VALUE = Symbol("invalid_json_value");
 
 const recentUpstreamFailures = new Map();
 
-const CODEX_PASSTHROUGH_HEADERS = [
+const CODEX_EXACT_PASSTHROUGH_HEADERS = [
+  "user-agent",
   "chatgpt-account-id",
   "x-openai-fedramp",
   "session-id",
@@ -70,6 +71,27 @@ const CODEX_PASSTHROUGH_HEADERS = [
   "openai-organization",
   "openai-project",
 ];
+const CODEX_PASSTHROUGH_HEADER_PREFIXES = [
+  "chatgpt-",
+  "openai-",
+  "x-codex-",
+  "x-oai-",
+  "x-openai-",
+];
+const CODEX_PASSTHROUGH_BLOCKED_HEADERS = new Set([
+  "accept",
+  "authorization",
+  "connection",
+  "content-encoding",
+  "content-length",
+  "content-type",
+  "host",
+  "keep-alive",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
 
 export class UpstreamHttpError extends Error {
   constructor(statusCode, bodyText, upstreamUrl, route = {}) {
@@ -269,6 +291,10 @@ export async function proxyResponsesApi(
   const completedResponse = extractResponsesObject(responseTail);
   const usage = extractUsageObject(completedResponse) || extractResponsesUsage(responseTail);
   if (streamError) {
+    if (isClientClosedStreamWrite(context, res, streamError)) {
+      logUsage(context, route, usage);
+      throw new ClientClosedRequestError();
+    }
     if (!upstreamPayload.stream) {
       throw streamError;
     }
@@ -312,6 +338,19 @@ function responsesStreamFailureMessage(route = {}, error) {
     `CodexBridge upstream stream from ${route.displayName || route.id || route.model || "route"} ` +
     `disconnected before response.completed. ${safeText(error?.message || error || "", 300)}`
   ).trim();
+}
+
+function isClientClosedStreamWrite(context = {}, res = {}, error) {
+  if (!context.clientSignal?.aborted) {
+    return false;
+  }
+  const code = String(error?.code || "");
+  const message = String(error?.message || error || "");
+  return (
+    Boolean(res.destroyed) ||
+    code === "ERR_STREAM_DESTROYED" ||
+    /write after end|stream.*destroyed|client connection closed/i.test(message)
+  );
 }
 
 function shouldInlineLocalHistoryForResponses(requestBody, history) {
@@ -1727,11 +1766,31 @@ function isPublicOpenAiApiBaseUrl(value) {
 }
 
 function addCodexPassthroughHeaders(target, source) {
-  for (const name of CODEX_PASSTHROUGH_HEADERS) {
-    const value = headerValue(source, name);
-    if (value) {
-      target[name] = value;
+  for (const name of CODEX_EXACT_PASSTHROUGH_HEADERS) {
+    setCodexPassthroughHeader(target, name, headerValue(source, name));
+  }
+  for (const [rawName, rawValue] of Object.entries(source || {})) {
+    const name = String(rawName || "").toLowerCase();
+    if (!shouldPassthroughCodexHeader(name)) {
+      continue;
     }
+    setCodexPassthroughHeader(target, name, headerValue({ [name]: rawValue }, name));
+  }
+}
+
+function shouldPassthroughCodexHeader(name) {
+  return (
+    !CODEX_PASSTHROUGH_BLOCKED_HEADERS.has(name) &&
+    (
+      CODEX_EXACT_PASSTHROUGH_HEADERS.includes(name) ||
+      CODEX_PASSTHROUGH_HEADER_PREFIXES.some((prefix) => name.startsWith(prefix))
+    )
+  );
+}
+
+function setCodexPassthroughHeader(target, name, value) {
+  if (value && !CODEX_PASSTHROUGH_BLOCKED_HEADERS.has(name)) {
+    target[name] = value;
   }
 }
 
