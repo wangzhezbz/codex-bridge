@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -53,6 +54,40 @@ test("router handles client socket parser errors without crashing", () => {
   assert.equal(handled, true);
   assert.equal(destroyed, true);
   assert.equal(ended, false);
+});
+
+test("router handles late client socket errors without crashing", () => {
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        provider: "deepseek",
+        api: "chat_completions",
+        model: "deepseek-v4-pro",
+        baseUrl: "https://api.deepseek.com/v1",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+  const socket = new EventEmitter();
+  socket.writable = false;
+  socket.destroyed = false;
+  socket.destroy = () => {
+    socket.destroyed = true;
+  };
+
+  router.emit("connection", socket);
+
+  assert.doesNotThrow(() => {
+    socket.emit(
+      "error",
+      Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }),
+    );
+  });
+  assert.equal(socket.destroyed, true);
 });
 
 test("server exposes health, models, catalog, and converted responses", async () => {
@@ -7697,6 +7732,447 @@ test("server lets current Codex desktop tool output reach upstream", async () =>
   }
 });
 
+test("server stops Codex desktop previous_response_id replay from another model slot after GPT success", async () => {
+  let gptCalls = 0;
+  let deepseekCalls = 0;
+  const gptUpstream = http.createServer(async (req, res) => {
+    gptCalls += 1;
+    await readJson(req);
+    const response = {
+        id: "resp_gpt_slot_success",
+        object: "response",
+        created_at: 1,
+        status: "completed",
+        model: "gpt-5.5",
+        output: [
+          {
+            id: "msg_gpt_slot_success",
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [
+              {
+                type: "output_text",
+                text: "GPT answered the selected model slot.",
+                annotations: [],
+              },
+            ],
+          },
+        ],
+        output_text: "GPT answered the selected model slot.",
+        usage: {
+          input_tokens: 16570,
+          output_tokens: 16,
+          total_tokens: 16586,
+        },
+      };
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    writeResponseCompletedSse(res, response);
+  });
+  const deepseekUpstream = http.createServer(async (req, res) => {
+    deepseekCalls += 1;
+    await readJson(req);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: `chatcmpl_slot_replay_${deepseekCalls}`,
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: `DeepSeek should not run for slot replay ${deepseekCalls}`,
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 23000,
+          completion_tokens: 100,
+          total_tokens: 23100,
+        },
+      }),
+    );
+  });
+
+  await listen(gptUpstream);
+  await listen(deepseekUpstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    clientAuth: { allowOpenAiBearer: true },
+    defaultModel: "gpt-5.5",
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        provider: "codex",
+        api: "responses",
+        baseUrl: `${serverUrl(gptUpstream)}/v1`,
+        model: "gpt-5.5",
+        authMode: "codex_openai",
+      },
+      {
+        id: "gpt-5.4",
+        displayName: "DeepSeek V4 Pro",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(deepseekUpstream)}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const headers = {
+    "content-type": "application/json",
+    authorization: "Bearer codex-openai-token",
+    "user-agent": "Codex Desktop/0.140.0-alpha.19",
+    "x-codex-thread-id": "thread_slot_replay_after_gpt_success",
+    "x-codex-window-id": "window_slot_replay_after_gpt_success",
+  };
+  const opaqueInput = [
+    {
+      type: "message",
+      role: "user",
+      encrypted_content: "encrypted-user-turn-hello",
+    },
+  ];
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        stream: true,
+        input: opaqueInput,
+      }),
+    });
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /GPT answered the selected model slot/);
+    assert.equal(gptCalls, 1);
+    assert.equal(deepseekCalls, 0);
+
+    const second = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "gpt-5.4",
+        stream: true,
+        previous_response_id: "resp_gpt_slot_success",
+        input: opaqueInput,
+      }),
+    });
+    assert.equal(second.statusCode, 200);
+    assert.match(second.body, /GPT answered the selected model slot|automatic resume/i);
+    assert.doesNotMatch(second.body, /DeepSeek should not run/);
+    assert.equal(gptCalls, 1);
+    assert.equal(deepseekCalls, 0);
+  } finally {
+    await close(router);
+    await close(gptUpstream);
+    await close(deepseekUpstream);
+  }
+});
+
+test("server stops Codex desktop model-slot replay with longer history after GPT success", async () => {
+  let gptCalls = 0;
+  let deepseekCalls = 0;
+  const gptUpstream = http.createServer(async (req, res) => {
+    gptCalls += 1;
+    await readJson(req);
+    const response = {
+      id: "resp_gpt_slot_success_with_history",
+      object: "response",
+      created_at: 1,
+      status: "completed",
+      model: "gpt-5.5",
+      output: [
+        {
+          id: "msg_gpt_slot_success_with_history",
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [
+            {
+              type: "output_text",
+              text: "GPT answered before longer history replay.",
+              annotations: [],
+            },
+          ],
+        },
+      ],
+      output_text: "GPT answered before longer history replay.",
+      usage: {
+        input_tokens: 16570,
+        output_tokens: 16,
+        total_tokens: 16586,
+      },
+    };
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    writeResponseCompletedSse(res, response);
+  });
+  const deepseekUpstream = http.createServer(async (req, res) => {
+    deepseekCalls += 1;
+    await readJson(req);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: `chatcmpl_longer_history_replay_${deepseekCalls}`,
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: `DeepSeek should not run for longer history replay ${deepseekCalls}`,
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 23000,
+          completion_tokens: 100,
+          total_tokens: 23100,
+        },
+      }),
+    );
+  });
+
+  await listen(gptUpstream);
+  await listen(deepseekUpstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    clientAuth: { allowOpenAiBearer: true },
+    defaultModel: "gpt-5.5",
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        provider: "codex",
+        api: "responses",
+        baseUrl: `${serverUrl(gptUpstream)}/v1`,
+        model: "gpt-5.5",
+        authMode: "codex_openai",
+      },
+      {
+        id: "gpt-5.4",
+        displayName: "DeepSeek V4 Pro",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(deepseekUpstream)}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const headers = {
+    "content-type": "application/json",
+    authorization: "Bearer codex-openai-token",
+    "user-agent": "Codex Desktop/0.140.0-alpha.19",
+    "x-codex-thread-id": "thread_slot_longer_history_replay",
+    "x-codex-window-id": "window_slot_longer_history_replay",
+  };
+  const latestUserTurn = {
+    type: "message",
+    role: "user",
+    encrypted_content: "encrypted-user-turn-hello-longer-history",
+  };
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        stream: true,
+        input: [latestUserTurn],
+      }),
+    });
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /GPT answered before longer history replay/);
+    assert.equal(gptCalls, 1);
+    assert.equal(deepseekCalls, 0);
+
+    const second = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "gpt-5.4",
+        stream: true,
+        previous_response_id: "resp_gpt_slot_success_with_history",
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "older visible user turn" }],
+          },
+          latestUserTurn,
+        ],
+      }),
+    });
+    assert.equal(second.statusCode, 200);
+    assert.match(second.body, /GPT answered before longer history replay|automatic resume/i);
+    assert.doesNotMatch(second.body, /DeepSeek should not run/);
+    assert.equal(gptCalls, 1);
+    assert.equal(deepseekCalls, 0);
+  } finally {
+    await close(router);
+    await close(gptUpstream);
+    await close(deepseekUpstream);
+  }
+});
+
+test("server lets a model-slot switch with an added new user turn reach upstream", async () => {
+  let gptCalls = 0;
+  let deepseekCalls = 0;
+  const gptUpstream = http.createServer(async (req, res) => {
+    gptCalls += 1;
+    await readJson(req);
+    const response = {
+        id: "resp_gpt_slot_before_new_turn",
+        object: "response",
+        created_at: 1,
+        status: "completed",
+        model: "gpt-5.5",
+        output: [
+          {
+            id: "msg_gpt_slot_before_new_turn",
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [
+              {
+                type: "output_text",
+                text: "GPT first turn",
+                annotations: [],
+              },
+            ],
+          },
+        ],
+        output_text: "GPT first turn",
+        usage: null,
+      };
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    writeResponseCompletedSse(res, response);
+  });
+  const deepseekUpstream = http.createServer(async (req, res) => {
+    deepseekCalls += 1;
+    const body = await readJson(req);
+    assert.equal(body.model, "deepseek-v4-pro");
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: `chatcmpl_slot_new_turn_${deepseekCalls}`,
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: `DeepSeek handled a real new user turn ${deepseekCalls}`,
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 100,
+          completion_tokens: 10,
+          total_tokens: 110,
+        },
+      }),
+    );
+  });
+
+  await listen(gptUpstream);
+  await listen(deepseekUpstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    clientAuth: { allowOpenAiBearer: true },
+    defaultModel: "gpt-5.5",
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        provider: "codex",
+        api: "responses",
+        baseUrl: `${serverUrl(gptUpstream)}/v1`,
+        model: "gpt-5.5",
+        authMode: "codex_openai",
+      },
+      {
+        id: "gpt-5.4",
+        displayName: "DeepSeek V4 Pro",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(deepseekUpstream)}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const headers = {
+    "content-type": "application/json",
+    authorization: "Bearer codex-openai-token",
+    "user-agent": "Codex Desktop/0.140.0-alpha.19",
+    "x-codex-thread-id": "thread_slot_switch_new_turn",
+    "x-codex-window-id": "window_slot_switch_new_turn",
+  };
+  const firstUserTurn = {
+    type: "message",
+    role: "user",
+    encrypted_content: "encrypted-user-turn-before-switch",
+  };
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        stream: true,
+        input: [firstUserTurn],
+      }),
+    });
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /GPT first turn/);
+    assert.equal(gptCalls, 1);
+    assert.equal(deepseekCalls, 0);
+
+    const second = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "gpt-5.4",
+        stream: true,
+        previous_response_id: "resp_gpt_slot_before_new_turn",
+        input: [
+          firstUserTurn,
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "this is a real new user turn" }],
+          },
+        ],
+      }),
+    });
+    assert.equal(second.statusCode, 200);
+    assert.match(second.body, /DeepSeek handled a real new user turn 1/);
+    assert.equal(gptCalls, 1);
+    assert.equal(deepseekCalls, 1);
+  } finally {
+    await close(router);
+    await close(gptUpstream);
+    await close(deepseekUpstream);
+  }
+});
+
 test("server stops Codex desktop replay from switching routes after an upstream error", async () => {
   let gptCalls = 0;
   let deepseekCalls = 0;
@@ -9292,6 +9768,14 @@ async function readJson(req) {
     chunks.push(chunk);
   }
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+function writeResponseCompletedSse(res, response) {
+  res.write(`event: response.completed\ndata: ${JSON.stringify({
+    type: "response.completed",
+    response,
+  })}\n\n`);
+  res.end("data: [DONE]\n\n");
 }
 
 function escapeRegExp(text) {

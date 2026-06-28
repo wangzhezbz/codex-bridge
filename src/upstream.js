@@ -192,7 +192,7 @@ export async function handleResponsesRequest(
   context = {},
 ) {
   const compactKind = compactKindForResponsesRequest(requestBody, context);
-  if (shouldServeIdleResumeLocally(requestBody, route)) {
+  if (shouldServeIdleResumeLocally(requestBody, route, history, context)) {
     return sendIdleResumeResponse(requestBody, route, history, res, context);
   }
   const duplicateContext = compactKind ? { ...context, compactKind } : context;
@@ -245,16 +245,67 @@ export async function handleResponsesRequest(
   jsonResponse(res, 500, openAiError(`Unsupported route api: ${route.api}`));
 }
 
-function shouldServeIdleResumeLocally(requestBody = {}, route = {}) {
-  return (
-    ["chat_completions", "responses"].includes(route.api) &&
-    Boolean(requestBody.previous_response_id) &&
-    !requestHasFreshInput(requestBody)
-  );
+function shouldServeIdleResumeLocally(
+  requestBody = {},
+  route = {},
+  history = null,
+  context = {},
+) {
+  if (
+    !["chat_completions", "responses"].includes(route.api) ||
+    !requestBody.previous_response_id
+  ) {
+    return false;
+  }
+  if (!requestHasFreshInput(requestBody)) {
+    return true;
+  }
+  if (!isCodexClientRequest(context)) {
+    return false;
+  }
+  return requestRepeatsPreviousUserContext(requestBody, route, history);
 }
 
 function requestHasFreshInput(requestBody = {}) {
   return hasFreshInputValue(requestBody.messages) || hasFreshInputValue(requestBody.input);
+}
+
+function requestRepeatsPreviousUserContext(requestBody = {}, route = {}, history = null) {
+  if (requestHasToolProtocolInput(requestBody)) {
+    return false;
+  }
+  const previousId = requestBody.previous_response_id;
+  const previousMeta = history?.getResponseMeta?.(previousId) || {};
+  const previousUsers = previousUserInputSignatures(history, previousId, previousMeta);
+  const currentUsers = userInputSignatures(requestBody.messages ?? requestBody.input);
+  if (currentUsers.length === 0) {
+    return true;
+  }
+  if (previousUsers.length === 0) {
+    return false;
+  }
+  if (sameStringArray(currentUsers, previousUsers)) {
+    return true;
+  }
+  const previousRouteId = previousMeta.routeId || "";
+  const routeChanged = Boolean(previousRouteId && route.id && previousRouteId !== route.id);
+  const previousUserCount = Number(previousMeta.userInputCount || previousUsers.length);
+  const currentHasOpaqueUserInput = inputHasOpaqueUserInput(
+    requestBody.messages ?? requestBody.input,
+  );
+  return (
+    routeChanged &&
+    Number.isFinite(previousUserCount) &&
+    currentUsers.length <= previousUserCount &&
+    Boolean(previousMeta.hasOpaqueUserInput || currentHasOpaqueUserInput)
+  );
+}
+
+function previousUserInputSignatures(history, previousId, previousMeta = {}) {
+  if (Array.isArray(previousMeta.userInputSignatures)) {
+    return previousMeta.userInputSignatures.filter(Boolean);
+  }
+  return userInputSignatures(history?.get?.(previousId) || []);
 }
 
 function hasFreshInputValue(value) {
@@ -771,6 +822,12 @@ function latestUserInputSignature(input) {
   return "";
 }
 
+function userInputSignatures(input) {
+  return responseInputItems(input)
+    .map((item) => normalizeUserInputSignature(userInputText(item)))
+    .filter(Boolean);
+}
+
 function latestSemanticUserInputSignature(input) {
   const items = responseInputItems(input);
   for (let index = items.length - 1; index >= 0; index -= 1) {
@@ -801,12 +858,28 @@ function userInputText(item) {
   if (role !== "user" && !(item.type === "message" && role === "user")) {
     return "";
   }
-  return contentToText(item.content ?? item.text ?? item.output ?? "");
+  return contentToText(
+    item.content ?? item.text ?? item.output ?? item.encrypted_content ?? "",
+  );
 }
 
 function normalizeUserInputSignature(value) {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
   return text ? boundedSignatureText(text) : "";
+}
+
+function inputHasOpaqueUserInput(input) {
+  return responseInputItems(input).some((item) => {
+    if (!item || typeof item !== "object") {
+      return false;
+    }
+    const role = String(item.role || "").toLowerCase();
+    return (
+      (role === "user" || (item.type === "message" && role === "user")) &&
+      typeof item.encrypted_content === "string" &&
+      item.encrypted_content.trim().length > 0
+    );
+  });
 }
 
 function isCodexClientRequest(context = {}) {
@@ -917,7 +990,10 @@ export async function proxyResponsesApi(
         route,
       );
     }
-    recordResponsesHistory(history, completedResponse, sourceMessages, toolContext);
+    recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
+      requestBody,
+      route,
+    });
     finishDuplicateInitialRequestGuard(context, route, completedResponse);
     logUsage(context, route, extractUsageObject(completedResponse) || extractResponsesUsage(responseText));
     jsonResponse(res, upstream.status, completedResponse);
@@ -987,7 +1063,10 @@ export async function proxyResponsesApi(
   }
 
   res.end();
-  recordResponsesHistory(history, completedResponse, sourceMessages, toolContext);
+  recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
+    requestBody,
+    route,
+  });
   finishDuplicateInitialRequestGuard(context, route, completedResponse);
   logUsage(context, route, usage);
 }
@@ -1370,6 +1449,7 @@ export async function proxyChatCompletions(
     routeId: route.id || "",
     upstreamModel: route.model || "",
     upstreamKnown: false,
+    ...responseRequestUserMeta(requestBody),
     toolContinuationTurns: responseHasRunnableToolCall(response)
       ? toolContinuationTurns
       : 0,
@@ -1442,6 +1522,7 @@ async function proxyChatCompact(requestBody, route, history, res, context = {}) 
     routeId: route.id || "",
     upstreamModel: route.model || "",
     upstreamKnown: false,
+    ...responseRequestUserMeta(requestBody),
     localFallback: localFallback || "compact",
   });
   finishDuplicateInitialRequestGuard(context, route, response);
@@ -1630,6 +1711,7 @@ async function proxyResponsesCompact(requestBody, route, history, res, context =
     routeId: route.id || "",
     upstreamModel: route.model || "",
     upstreamKnown: false,
+    ...responseRequestUserMeta(requestBody),
     localFallback: upstream ? "compact" : "compact_local_fallback",
   });
   finishDuplicateInitialRequestGuard(context, route, response);
@@ -2106,6 +2188,7 @@ function sendLocalRateLimitedResponse({
     routeId: route.id || "",
     upstreamModel: route.model || "",
     upstreamKnown: false,
+    ...responseRequestUserMeta(requestBody),
     localFallback: "provider_rate_limited",
   });
   logUsage(context, route, null);
@@ -2178,6 +2261,7 @@ function sendLocalImageRejectedResponse({
     routeId: route.id || "",
     upstreamModel: route.model || "",
     upstreamKnown: false,
+    ...responseRequestUserMeta(requestBody),
     localFallback: "image_rejected",
   });
   logUsage(context, route, null);
@@ -3071,7 +3155,13 @@ function normalizeResponsesObject(value) {
   return null;
 }
 
-function recordResponsesHistory(history, response, sourceMessages, toolContext) {
+function recordResponsesHistory(
+  history,
+  response,
+  sourceMessages,
+  toolContext,
+  { requestBody = {}, route = {} } = {},
+) {
   if (!history || !isResponsesObject(response)) {
     return;
   }
@@ -3081,8 +3171,21 @@ function recordResponsesHistory(history, response, sourceMessages, toolContext) 
   ]);
   history.recordResponse(response, {
     api: "responses",
+    routeId: route.id || "",
+    upstreamModel: route.model || "",
     upstreamKnown: true,
+    ...responseRequestUserMeta(requestBody),
   });
+}
+
+function responseRequestUserMeta(requestBody = {}) {
+  const input = requestBody.messages ?? requestBody.input;
+  const signatures = userInputSignatures(input);
+  return {
+    userInputSignatures: signatures,
+    userInputCount: signatures.length,
+    hasOpaqueUserInput: inputHasOpaqueUserInput(input),
+  };
 }
 
 function extractUsageObject(value) {

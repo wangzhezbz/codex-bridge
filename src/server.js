@@ -24,6 +24,7 @@ const DEFAULT_RESPONSES_BODY_LIMIT_BYTES = 100 * 1024 * 1024;
 export function createRouterServer(config = loadConfig()) {
   const history = new ResponseHistory();
   const routeHealth = createRouteHealthStore();
+  const socketsWithErrorHandler = new WeakSet();
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -201,10 +202,23 @@ export function createRouterServer(config = loadConfig()) {
     }
     socket.destroy();
   });
+  server.on("connection", (socket) => {
+    attachClientSocketErrorHandler(socket, socketsWithErrorHandler);
+  });
   server.on("clientError", (error, socket) => {
     handleClientSocketError(error, socket);
   });
   return server;
+}
+
+function attachClientSocketErrorHandler(socket, socketsWithErrorHandler) {
+  if (!socket || socketsWithErrorHandler.has(socket)) {
+    return;
+  }
+  socketsWithErrorHandler.add(socket);
+  socket.on?.("error", (error) => {
+    handleClientSocketError(error, socket);
+  });
 }
 
 function requestBodyLimitBytes(config = {}, pathname = "") {
