@@ -396,6 +396,8 @@ function beginDuplicateInitialRequestGuard(
       expiresAt: now + keyInfo.pendingTtlMs,
       kind: keyInfo.kind,
       ttlMs: keyInfo.ttlMs,
+      recordSuccess: keyInfo.recordSuccess !== false,
+      cacheAnyError: Boolean(keyInfo.cacheAnyError),
     });
   }
   return { key: keys[0].key, keys: keys.map((key) => key.key), served: false };
@@ -419,6 +421,10 @@ function finishDuplicateInitialRequestGuard(context = {}, route = {}, response =
   for (const key of keys) {
     const existing = recentInitialRequests.get(key);
     if (!existing) {
+      continue;
+    }
+    if (existing.recordSuccess === false) {
+      recentInitialRequests.delete(key);
       continue;
     }
     recentInitialRequests.set(key, {
@@ -446,23 +452,24 @@ function finishDuplicateInitialRequestGuardWithError(
   if (pendingKeys.length === 0) {
     return;
   }
-  if (!shouldStopDuplicateRetryAfterError(error)) {
-    for (const key of pendingKeys) {
-      recentInitialRequests.delete(key);
-    }
-    return;
-  }
+  const shouldCacheRetryError = shouldStopDuplicateRetryAfterError(error);
   const response = duplicateInitialRequestErrorResponse(requestBody, route, error, context);
   const now = Date.now();
   for (const key of pendingKeys) {
     const existing = recentInitialRequests.get(key);
+    if (!shouldCacheRetryError && !existing?.cacheAnyError) {
+      recentInitialRequests.delete(key);
+      continue;
+    }
     recentInitialRequests.set(key, {
       status: "completed",
       response,
       expiresAt: now + DUPLICATE_INITIAL_REQUEST_ERROR_TTL_MS,
-      reason: "retry_error",
+      reason: shouldCacheRetryError ? "retry_error" : "turn_error",
       kind: existing?.kind,
       ttlMs: existing?.ttlMs,
+      recordSuccess: existing?.recordSuccess,
+      cacheAnyError: existing?.cacheAnyError,
     });
   }
 }
@@ -606,6 +613,17 @@ function duplicateInitialRequestKeys(requestBody = {}, route = {}, context = {})
       pendingTtlMs: DUPLICATE_INITIAL_REQUEST_PENDING_TTL_MS,
     });
   }
+  const clientTurnKey = duplicateClientTurnRequestKey(requestBody, route, context);
+  if (clientTurnKey) {
+    keys.push({
+      key: `client_turn:${clientTurnKey}`,
+      kind: "client_turn",
+      ttlMs: DUPLICATE_TURN_REQUEST_TTL_MS,
+      pendingTtlMs: DUPLICATE_INITIAL_REQUEST_PENDING_TTL_MS,
+      recordSuccess: false,
+      cacheAnyError: true,
+    });
+  }
   return keys;
 }
 
@@ -672,6 +690,37 @@ function duplicateSemanticTurnRequestKey(requestBody = {}, route = {}, context =
       baseUrl: route.baseUrl || "",
       authMode: authModeForRoute(route),
     },
+    client: {
+      threadId: headerValue(headers, "x-codex-thread-id") || headerValue(headers, "thread-id") || "",
+      windowId: headerValue(headers, "x-codex-window-id") || "",
+      parentThreadId: headerValue(headers, "x-codex-parent-thread-id") || "",
+      installationId: headerValue(headers, "x-codex-installation-id") || "",
+      userAgent: headerValue(headers, "user-agent") || "",
+    },
+    compactKind: context.compactKind || "",
+    latestUser,
+  });
+  return createHash("sha256").update(material).digest("hex");
+}
+
+function duplicateClientTurnRequestKey(requestBody = {}, route = {}, context = {}) {
+  if (
+    !["chat_completions", "responses"].includes(route.api) ||
+    !isCodexClientRequest(context)
+  ) {
+    return "";
+  }
+  if (!requestHasFreshInput(requestBody)) {
+    return "";
+  }
+  const latestUser = latestSemanticUserInputSignature(
+    requestBody.messages ?? requestBody.input,
+  );
+  if (!latestUser) {
+    return "";
+  }
+  const headers = context.clientHeaders || {};
+  const material = stableStringify({
     client: {
       threadId: headerValue(headers, "x-codex-thread-id") || headerValue(headers, "thread-id") || "",
       windowId: headerValue(headers, "x-codex-window-id") || "",

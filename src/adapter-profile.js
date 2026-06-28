@@ -22,6 +22,12 @@ const RESPONSES_SAFE_PARAMS = [
   "user",
 ];
 
+const CODEX_OPENAI_RESPONSES_SAFE_PARAMS = [
+  ...RESPONSES_SAFE_PARAMS,
+  "prompt_cache_key",
+  "client_metadata",
+];
+
 const CHAT_SAFE_PARAMS = [
   "model",
   "messages",
@@ -123,7 +129,9 @@ export function normalizeAdapterProfile(route = {}) {
       customConservative,
     }),
     safeParams: api === "responses"
-      ? RESPONSES_SAFE_PARAMS
+      ? authMode === "codex_openai"
+        ? CODEX_OPENAI_RESPONSES_SAFE_PARAMS
+        : RESPONSES_SAFE_PARAMS
       : CHAT_SAFE_PARAMS,
     dropParams,
     maxToolContinuationTurns: positiveInteger(
