@@ -15,7 +15,6 @@ test("desktop renderer keeps starting health state out of failed styling", () =>
     rendererSource,
     /classList\.toggle\("bad", Boolean\(health && !health\.ok && !isStarting\)\);/,
   );
-  assert.match(rendererSource, /Router 正在启动/);
 });
 
 test("desktop renderer exposes update from sidebar without a dedicated page", () => {
@@ -32,25 +31,24 @@ test("desktop renderer exposes update from sidebar without a dedicated page", ()
   assert.doesNotMatch(htmlSource, /id="installUpdate"/);
   assert.match(preloadSource, /checkForUpdates: \(\) => ipcRenderer\.invoke\("updates:check"\)/);
   assert.match(preloadSource, /installUpdate: \(\) => ipcRenderer\.invoke\("updates:install"\)/);
-  assert.match(rendererSource, /bindFolderButton\("#openUpdateFolder", "updates"\)/);
   assert.match(preloadSource, /onUpdateProgress: \(callback\) =>/);
+  assert.match(preloadSource, /onUpdateFinished: \(callback\) =>/);
+  assert.match(rendererSource, /bindFolderButton\("#openUpdateFolder", "updates"\)/);
   assert.match(rendererSource, /api\.checkForUpdates\(\)/);
   assert.match(rendererSource, /api\.installUpdate\(\)/);
   assert.match(rendererSource, /api\.onUpdateProgress\?\.\(\(progress\) => renderUpdateProgress\(progress\)\)/);
+  assert.match(rendererSource, /api\.onUpdateFinished\?\.\(\(result\) =>/);
   assert.match(rendererSource, /function renderUpdateProgress/);
   assert.match(rendererSource, /result\.installerPath \? "launching" : "ready"/);
   assert.match(rendererSource, /result\.nextStep \|\| result\.message/);
-  assert.match(rendererSource, /安装到用户程序目录/);
-  assert.match(rendererSource, /正在启动安装器/);
-  assert.match(htmlSource, /Windows 安装器会安装到用户程序目录/);
   assert.match(rendererSource, /bytesPerSecond/);
   assert.match(rendererSource, /formatBytes\(details\.bytesPerSecond\)/);
   assert.match(rendererSource, /\}\/s`/);
   assert.match(rendererSource, /els\.appVersion\.textContent = `v\$\{state\.appVersion \|\| "-"\}`;/);
   assert.match(rendererSource, /showUpdateDialog/);
   assert.doesNotMatch(rendererSource, /window\.confirm/);
-  assert.match(rendererSource, /下载更新包/);
-  assert.doesNotMatch(rendererSource, /下载并重启/);
+  assert.doesNotMatch(rendererSource, /Windows Setup installer will be saved|updates folder|manual fallback/);
+  assert.doesNotMatch(htmlSource, /Windows Setup installer will be saved|updates folder|manual fallback/);
 });
 
 test("desktop renderer opens folder buttons through the shared action handler", () => {
@@ -67,15 +65,15 @@ test("desktop renderer surfaces route capabilities and real upstream status", ()
   assert.match(rendererSource, /function modelCapabilityHints/);
   assert.match(rendererSource, /Tools/);
   assert.match(rendererSource, /Compact/);
-  assert.match(rendererSource, /上游/);
   assert.match(rendererSource, /latest\.upstreamModel/);
   assert.match(rendererSource, /routeProviderName/);
   assert.match(rendererSource, /latest\.api/);
 });
 
-test("desktop renderer shows current usage by default and keeps history separate", () => {
+test("desktop renderer shows current usage by default without a history banner", () => {
   assert.match(rendererSource, /const current = summary\.current \|\| summary;/);
   assert.match(rendererSource, /const history = summary\.history \|\| emptyUsageSummary\(\);/);
   assert.match(rendererSource, /renderUsageTableStable\(current\.byModel \|\| \[\], events, history\)/);
-  assert.match(rendererSource, /历史路由已隐藏/);
+  assert.doesNotMatch(rendererSource, /hiddenHistoryNote/);
+  assert.doesNotMatch(rendererSource, /历史路由已隐藏|鍘嗗彶璺敱宸查殣钘?/);
 });

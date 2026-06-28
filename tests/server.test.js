@@ -10,7 +10,10 @@ import { loadConfig, routeForModel } from "../src/config.js";
 import { COMPACT_SUMMARY_PREFIX } from "../src/compact.js";
 import { ResponseHistory } from "../src/history.js";
 import { shouldUseImageGenerationFallback } from "../src/image-generation.js";
-import { createRouterServer } from "../src/server.js";
+import {
+  createRouterServer,
+  isBenignRouterProcessError,
+} from "../src/server.js";
 import { callJsonUpstream, proxyResponsesApi } from "../src/upstream.js";
 import { __resetRateLimiterForTests } from "../src/rate-limit.js";
 
@@ -54,6 +57,14 @@ test("router handles client socket parser errors without crashing", () => {
   assert.equal(handled, true);
   assert.equal(destroyed, true);
   assert.equal(ended, false);
+});
+
+test("router process guard classifies benign socket and undici network errors", () => {
+  assert.equal(isBenignRouterProcessError({ code: "ECONNRESET" }), true);
+  assert.equal(isBenignRouterProcessError({ cause: { code: "UND_ERR_SOCKET" } }), true);
+  assert.equal(isBenignRouterProcessError({ code: "UND_ERR_CONNECT_TIMEOUT" }), true);
+  assert.equal(isBenignRouterProcessError({ code: "ERR_ASSERTION" }), false);
+  assert.equal(isBenignRouterProcessError(new Error("syntax exploded")), false);
 });
 
 test("router handles late client socket errors without crashing", () => {
@@ -205,6 +216,67 @@ test("routeForModel prioritizes Codex slot ids over upstream model aliases", () 
   assert.equal(routeForModel(config, "GPT-5.4 as first slot").id, "gpt-5.5");
 });
 
+test("routeForModel never maps native GPT slot names to independent non-GPT routes", () => {
+  const config = {
+    defaultModel: "cb-gpt-5-5",
+    models: [
+      {
+        id: "cb-gpt-5-5",
+        displayName: "GPT-5.5",
+        api: "responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        model: "gpt-5.5",
+      },
+      {
+        id: "cb-deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        api: "chat_completions",
+        baseUrl: "https://api.deepseek.com/v1",
+        model: "deepseek-v4-pro",
+      },
+    ],
+  };
+
+  assert.throws(
+    () => routeForModel(config, "gpt-5.4"),
+    /Model is not configured in CodexBridge: gpt-5\.4/,
+  );
+  assert.equal(routeForModel(config, "deepseek-v4-pro").id, "cb-deepseek-v4-pro");
+});
+
+test("routeForModel keeps native GPT names only for selected GPT routes", () => {
+  const config = {
+    defaultModel: "cb-gpt-5-5",
+    models: [
+      {
+        id: "cb-gpt-5-5",
+        displayName: "GPT-5.5",
+        api: "responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        model: "gpt-5.5",
+      },
+      {
+        id: "cb-gpt-5-4",
+        displayName: "GPT-5.4",
+        api: "responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        model: "gpt-5.4",
+      },
+    ],
+  };
+
+  assert.equal(routeForModel(config, "gpt-5.4").id, "cb-gpt-5-4");
+  assert.equal(routeForModel(config, "GPT 5.4").id, "cb-gpt-5-4");
+  assert.equal(
+    routeForModel(config, "cb-gpt-5-4", { exactModelIdOnly: true }).id,
+    "cb-gpt-5-4",
+  );
+  assert.throws(
+    () => routeForModel(config, "gpt-5.4", { exactModelIdOnly: true }),
+    /Model is not configured in CodexBridge for Codex client requests: gpt-5\.4/,
+  );
+});
+
 test("server reports upstream 413 as a request size problem with recovery guidance", async () => {
   const upstream = http.createServer(async (_req, res) => {
     res.writeHead(413, { "content-type": "application/json" });
@@ -257,6 +329,77 @@ test("server reports upstream 413 as a request size problem with recovery guidan
     assert.equal(body.error.code, "upstream_payload_too_large");
     assert.match(body.error.message, /request is too large/i);
     assert.match(body.error.message, /\/compact|large pasted logs|inline images/i);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("server completes Codex desktop legacy native model aliases locally without upstream replay", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (_req, res) => {
+    upstreamCalls += 1;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    clientAuth: { allowOpenAiBearer: true },
+    defaultModel: "cb-gpt-5-4",
+    models: [
+      {
+        id: "cb-gpt-5-4",
+        displayName: "GPT-5.4",
+        provider: "codex",
+        api: "responses",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "gpt-5.4",
+        authMode: "codex_openai",
+      },
+    ],
+  });
+
+  await listen(router);
+
+  try {
+    const response = await fetch(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer codex-openai-token",
+        "user-agent": "Codex Desktop/0.140.0-alpha.19",
+        "x-codex-thread-id": "thread_legacy_native_slot",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.4",
+        stream: true,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            encrypted_content: "encrypted-legacy-slot-replay",
+          },
+        ],
+      }),
+    });
+
+    const body = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type") || "", /text\/event-stream/);
+    assert.match(body, /event: response\.completed/);
+    assert.match(
+      body,
+      /CodexBridge 已在本地拦截旧模型槽位请求：gpt-5\.4/,
+    );
+    assert.match(
+      body,
+      /没有请求任何上游 provider，也没有消耗上游模型 token/,
+    );
+    assert.equal(upstreamCalls, 0);
   } finally {
     await close(router);
     await close(upstream);
@@ -351,7 +494,7 @@ test("codex_openai responses routes force upstream streaming but preserve non-st
 
     assert.equal(response.output_text, "contract ok");
     assert.equal(upstreamBody.stream, true);
-    assert.equal(upstreamBody.store, false);
+    assert.equal(upstreamBody.store, true);
     assert.equal(upstreamBody.max_output_tokens, undefined);
     assert.equal(upstreamBody.temperature, undefined);
     assert.equal(upstreamBody.top_p, undefined);
@@ -6825,6 +6968,503 @@ test("server serves duplicate initial Codex desktop request locally without repl
     assert.equal(second.statusCode, 200);
     assert.match(second.body, /answer 1/);
     assert.equal(upstreamCalls, 1);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("server stops Codex desktop startup resume when encrypted input changes without a new visible turn", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    upstreamCalls += 1;
+    const body = await readJson(req);
+    assert.equal(body.model, "gpt-5.4");
+    const response = {
+      id: `resp_startup_resume_${upstreamCalls}`,
+      object: "response",
+      created_at: 1,
+      status: "completed",
+      model: "gpt-5.4",
+      output: [
+        {
+          id: `msg_startup_resume_${upstreamCalls}`,
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [
+            {
+              type: "output_text",
+              text: `startup resume answer ${upstreamCalls}`,
+              annotations: [],
+            },
+          ],
+        },
+      ],
+      output_text: `startup resume answer ${upstreamCalls}`,
+      usage: {
+        input_tokens: 27000,
+        output_tokens: 100,
+        total_tokens: 27100,
+      },
+    };
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    writeResponseCompletedSse(res, response);
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    clientAuth: { allowOpenAiBearer: true },
+    defaultModel: "cb-gpt-5-4",
+    models: [
+      {
+        id: "cb-gpt-5-4",
+        displayName: "GPT-5.4",
+        provider: "codex",
+        api: "responses",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "gpt-5.4",
+        authMode: "codex_openai",
+      },
+    ],
+  });
+
+  await listen(router);
+  const headers = {
+    "content-type": "application/json",
+    authorization: "Bearer codex-openai-token",
+    "user-agent": "Codex Desktop/0.140.0-alpha.19",
+    "x-codex-thread-id": "thread_startup_encrypted_resume",
+    "x-codex-window-id": "window_startup_encrypted_resume",
+  };
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "cb-gpt-5-4",
+        stream: true,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            encrypted_content: "encrypted-user-turn-startup-1",
+          },
+        ],
+      }),
+    });
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /startup resume answer 1/);
+    assert.equal(upstreamCalls, 1);
+
+    const second = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "cb-gpt-5-4",
+        stream: true,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            encrypted_content: "encrypted-user-turn-startup-2",
+          },
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "already shown in Codex" }],
+          },
+        ],
+      }),
+    });
+    assert.equal(second.statusCode, 200);
+    assert.match(second.body, /startup resume answer 1|duplicate automatic request replay/i);
+    assert.doesNotMatch(second.body, /startup resume answer 2/);
+    assert.equal(upstreamCalls, 1);
+
+    const third = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "cb-gpt-5-4",
+        stream: true,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            encrypted_content: "encrypted-user-turn-startup-3",
+          },
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "already shown in Codex" }],
+          },
+        ],
+      }),
+    });
+    assert.equal(third.statusCode, 200);
+    assert.match(third.body, /startup resume answer 1|duplicate automatic request replay/i);
+    assert.doesNotMatch(third.body, /startup resume answer 3/);
+    assert.equal(upstreamCalls, 1);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("server lets a real new encrypted Codex desktop user turn reach upstream", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    upstreamCalls += 1;
+    const body = await readJson(req);
+    assert.equal(body.model, "gpt-5.4");
+    const response = {
+      id: `resp_encrypted_new_turn_${upstreamCalls}`,
+      object: "response",
+      created_at: 1,
+      status: "completed",
+      model: "gpt-5.4",
+      output: [
+        {
+          id: `msg_encrypted_new_turn_${upstreamCalls}`,
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [
+            {
+              type: "output_text",
+              text: `encrypted new turn answer ${upstreamCalls}`,
+              annotations: [],
+            },
+          ],
+        },
+      ],
+      output_text: `encrypted new turn answer ${upstreamCalls}`,
+      usage: {
+        input_tokens: 1000 + upstreamCalls,
+        output_tokens: 10,
+        total_tokens: 1010 + upstreamCalls,
+      },
+    };
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    writeResponseCompletedSse(res, response);
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    clientAuth: { allowOpenAiBearer: true },
+    defaultModel: "cb-gpt-5-4",
+    models: [
+      {
+        id: "cb-gpt-5-4",
+        displayName: "GPT-5.4",
+        provider: "codex",
+        api: "responses",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "gpt-5.4",
+        authMode: "codex_openai",
+      },
+    ],
+  });
+
+  await listen(router);
+  const headers = {
+    "content-type": "application/json",
+    authorization: "Bearer codex-openai-token",
+    "user-agent": "Codex Desktop/0.140.0-alpha.19",
+    "x-codex-thread-id": "thread_real_encrypted_new_turn",
+    "x-codex-window-id": "window_real_encrypted_new_turn",
+  };
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "cb-gpt-5-4",
+        stream: true,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            encrypted_content: "encrypted-first-user-turn",
+          },
+        ],
+      }),
+    });
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /encrypted new turn answer 1/);
+    assert.equal(upstreamCalls, 1);
+
+    const second = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "cb-gpt-5-4",
+        stream: true,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            encrypted_content: "encrypted-first-user-turn",
+          },
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "encrypted new turn answer 1" }],
+          },
+          {
+            type: "message",
+            role: "user",
+            encrypted_content: "encrypted-second-user-turn",
+          },
+        ],
+      }),
+    });
+    assert.equal(second.statusCode, 200);
+    assert.match(second.body, /encrypted new turn answer 2/);
+    assert.equal(upstreamCalls, 2);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("server stops same-turn encrypted GPT-5.5 resume from calling upstream twice", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    upstreamCalls += 1;
+    const body = await readJson(req);
+    assert.equal(body.model, "gpt-5.5");
+    const response = {
+      id: `resp_gpt55_same_turn_${upstreamCalls}`,
+      object: "response",
+      created_at: 1,
+      status: "completed",
+      model: "gpt-5.5",
+      output: [
+        {
+          id: `msg_gpt55_same_turn_${upstreamCalls}`,
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [
+            {
+              type: "output_text",
+              text: `GPT-5.5 same turn answer ${upstreamCalls}`,
+              annotations: [],
+            },
+          ],
+        },
+      ],
+      output_text: `GPT-5.5 same turn answer ${upstreamCalls}`,
+      usage: {
+        input_tokens: 15000 + upstreamCalls,
+        output_tokens: 20,
+        total_tokens: 15020 + upstreamCalls,
+      },
+    };
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    writeResponseCompletedSse(res, response);
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    clientAuth: { allowOpenAiBearer: true },
+    defaultModel: "cb-gpt-5-5",
+    models: [
+      {
+        id: "cb-gpt-5-5",
+        displayName: "GPT-5.5",
+        provider: "codex",
+        api: "responses",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "gpt-5.5",
+        authMode: "codex_openai",
+      },
+    ],
+  });
+
+  await listen(router);
+  const headers = {
+    "content-type": "application/json",
+    authorization: "Bearer codex-openai-token",
+    "user-agent": "Codex Desktop/0.140.0-alpha.19",
+    "x-codex-thread-id": "thread_gpt55_same_turn_resume",
+    "x-codex-window-id": "window_gpt55_same_turn_resume",
+    "x-codex-turn-state": "running",
+    "x-codex-turn-metadata": JSON.stringify({ turn_id: "turn_gpt55_hello" }),
+  };
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "cb-gpt-5-5",
+        stream: true,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            encrypted_content: "encrypted-gpt55-hello-first",
+          },
+        ],
+      }),
+    });
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /GPT-5\.5 same turn answer 1/);
+    assert.equal(upstreamCalls, 1);
+
+    const second = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "cb-gpt-5-5",
+        stream: true,
+        previous_response_id: "resp_gpt55_same_turn_1",
+        input: [
+          {
+            type: "message",
+            role: "user",
+            encrypted_content: "encrypted-gpt55-hello-replayed",
+          },
+        ],
+      }),
+    });
+    assert.equal(second.statusCode, 200);
+    assert.match(second.body, /GPT-5\.5 same turn answer 1|duplicate automatic request replay/i);
+    assert.doesNotMatch(second.body, /GPT-5\.5 same turn answer 2/);
+    assert.equal(upstreamCalls, 1);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("server lets a new encrypted GPT-5.5 turn with a different Codex turn id reach upstream", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    upstreamCalls += 1;
+    const body = await readJson(req);
+    assert.equal(body.model, "gpt-5.5");
+    const response = {
+      id: `resp_gpt55_next_turn_${upstreamCalls}`,
+      object: "response",
+      created_at: 1,
+      status: "completed",
+      model: "gpt-5.5",
+      output: [
+        {
+          id: `msg_gpt55_next_turn_${upstreamCalls}`,
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [
+            {
+              type: "output_text",
+              text: `GPT-5.5 next turn answer ${upstreamCalls}`,
+              annotations: [],
+            },
+          ],
+        },
+      ],
+      output_text: `GPT-5.5 next turn answer ${upstreamCalls}`,
+      usage: {
+        input_tokens: 15000 + upstreamCalls,
+        output_tokens: 20,
+        total_tokens: 15020 + upstreamCalls,
+      },
+    };
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    writeResponseCompletedSse(res, response);
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    clientAuth: { allowOpenAiBearer: true },
+    defaultModel: "cb-gpt-5-5",
+    models: [
+      {
+        id: "cb-gpt-5-5",
+        displayName: "GPT-5.5",
+        provider: "codex",
+        api: "responses",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "gpt-5.5",
+        authMode: "codex_openai",
+      },
+    ],
+  });
+
+  await listen(router);
+  const baseHeaders = {
+    "content-type": "application/json",
+    authorization: "Bearer codex-openai-token",
+    "user-agent": "Codex Desktop/0.140.0-alpha.19",
+    "x-codex-thread-id": "thread_gpt55_next_turn",
+    "x-codex-window-id": "window_gpt55_next_turn",
+    "x-codex-turn-state": "running",
+  };
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        ...baseHeaders,
+        "x-codex-turn-metadata": JSON.stringify({ turn_id: "turn_gpt55_first" }),
+      },
+      body: JSON.stringify({
+        model: "cb-gpt-5-5",
+        stream: true,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            encrypted_content: "encrypted-gpt55-first-turn",
+          },
+        ],
+      }),
+    });
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /GPT-5\.5 next turn answer 1/);
+    assert.equal(upstreamCalls, 1);
+
+    const second = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        ...baseHeaders,
+        "x-codex-turn-metadata": JSON.stringify({ turn_id: "turn_gpt55_second" }),
+      },
+      body: JSON.stringify({
+        model: "cb-gpt-5-5",
+        stream: true,
+        previous_response_id: "resp_gpt55_next_turn_1",
+        input: [
+          {
+            type: "message",
+            role: "user",
+            encrypted_content: "encrypted-gpt55-second-turn",
+          },
+        ],
+      }),
+    });
+    assert.equal(second.statusCode, 200);
+    assert.match(second.body, /GPT-5\.5 next turn answer 2/);
+    assert.equal(upstreamCalls, 2);
   } finally {
     await close(router);
     await close(upstream);

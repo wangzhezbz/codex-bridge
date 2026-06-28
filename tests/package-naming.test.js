@@ -27,6 +27,18 @@ test("desktop quit path does not send renderer updates after the window is destr
   assert.doesNotMatch(main, /mainWindow\?\.webContents\.send/);
 });
 
+test("desktop enforces a single running instance", () => {
+  const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
+  const lockIndex = main.indexOf("requestSingleInstanceLock");
+  const readyIndex = main.indexOf("app.whenReady()");
+
+  assert.notEqual(lockIndex, -1);
+  assert.notEqual(readyIndex, -1);
+  assert.ok(lockIndex < readyIndex, "single instance lock must be acquired before app.whenReady()");
+  assert.match(main, /app\.on\("second-instance"/);
+  assert.match(main, /showMainWindow\(\)/);
+});
+
 test("desktop updater waits for router child process before replacing portable files", () => {
   const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
 
@@ -39,6 +51,7 @@ test("desktop update launches installers and keeps portable downloads as manual 
   assert.match(main, /prepareInstallerUpdate/);
   assert.match(main, /shell\.openPath\(prepared\.installerPath\)/);
   assert.match(main, /phase:\s*"launching"/);
+  assert.match(main, /quitAfterUpdateLaunch\(\)/);
   assert.match(main, /installerPath:\s*prepared\.installerPath/);
   assert.match(main, /installerNotePath:\s*prepared\.installerNotePath/);
   assert.match(main, /updateFolder:\s*prepared\.updatesDir/);
@@ -70,7 +83,9 @@ test("desktop updater keeps downloaded package visible in the update folder", ()
   const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
 
   assert.match(main, /const updatesDir = portableUpdatesDir\(\)/);
-  assert.match(main, /path\.resolve\(path\.dirname\(process\.execPath\), "\.\.", "updates"\)/);
+  assert.match(main, /return path\.join\(dataRootDir,\s*"updates"\)/);
+  assert.doesNotMatch(main, /path\.resolve\(path\.dirname\(process\.execPath\), "\.\.", "updates"\)/);
+  assert.doesNotMatch(main, /path\.join\(path\.dirname\(currentMacAppBundle\(\)\), "updates"\)/);
   assert.match(main, /const downloadPath = path\.join\(updatesDir, `\$\{stamp\}-\$\{plan\.asset\.name\}`\)/);
   assert.match(main, /const finalBytes = fs\.statSync\(targetPath\)\.size/);
   assert.match(main, /更新包下载不完整/);
@@ -80,6 +95,13 @@ test("desktop updater keeps downloaded package visible in the update folder", ()
   assert.doesNotMatch(main, /If automatic update does not restart/);
   assert.doesNotMatch(main, /The automatic updater normally backs up/);
   assert.doesNotMatch(main, /path\.join\(updatesDir, "downloads"\)/);
+});
+
+test("desktop update completion uses in-app notification instead of a native message box", () => {
+  const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
+
+  assert.match(main, /updates:finished/);
+  assert.doesNotMatch(main, /dialog\.showMessageBox\(mainWindow/);
 });
 
 test("desktop opens local folders only after ensuring they exist", () => {

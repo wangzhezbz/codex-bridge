@@ -3,7 +3,6 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import {
-  CODEX_MODEL_SLOTS,
   MODEL_PRESETS,
   PROVIDERS,
   defaultSelectedModelIds,
@@ -15,7 +14,6 @@ import { proxySettingsForUrl } from "../src/proxy.js";
 const require = createRequire(import.meta.url);
 
 export {
-  CODEX_MODEL_SLOTS,
   MODEL_PRESETS,
   PROVIDERS,
   defaultSelectedModelIds,
@@ -41,9 +39,10 @@ const CODEX_BRIDGE_TOP_LEVEL_KEYS = new Set([
 ]);
 const CODEX_BRIDGE_MANAGED_START = "# >>> CodexBridge managed config";
 const CODEX_BRIDGE_MANAGED_END = "# <<< CodexBridge managed config";
+const CODEX_BRIDGE_MODEL_ID_PREFIX = "cb-";
+const DEFAULT_CODEX_BRIDGE_MODEL_ID = "cb-gpt-5-5";
 const DEFAULT_CHAT_TOOL_CONTINUATION_TURNS = 5;
 
-const CODEX_MODEL_SLOT_IDS = new Set(CODEX_MODEL_SLOTS.map((slot) => slot.id));
 const CODEX_REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh"]);
 const CODEX_SANDBOX_MODES = new Set([
   "read-only",
@@ -1366,9 +1365,6 @@ export function buildRouterConfigFromSelection(rootDir, mode = MODE_HYBRID) {
   if (selected.length === 0) {
     throw new Error("Please select at least one model.");
   }
-  if (selected.length > CODEX_MODEL_SLOTS.length) {
-    throw new Error(`Codex can show at most ${CODEX_MODEL_SLOTS.length} models.`);
-  }
   if (
     mode === MODE_ALL_API &&
     selected.some((model) => model.authMode === "codex_openai")
@@ -1378,7 +1374,7 @@ export function buildRouterConfigFromSelection(rootDir, mode = MODE_HYBRID) {
 
   const imageGenerationOverrides = readModelImageGenerationOverrides(rootDir);
   const routes = selected.map((model, index) =>
-    routeForSelectedModel(model, CODEX_MODEL_SLOTS[index], index, imageGenerationOverrides),
+    routeForSelectedModel(model, index, imageGenerationOverrides),
   );
 
   return {
@@ -1412,6 +1408,7 @@ export function prepareRouterStartConfig({
     rootDir,
     mode,
     port: config.port || 15722,
+    model: config.defaultModel,
     homeDir,
   });
   return { config, codex };
@@ -1420,7 +1417,7 @@ export function prepareRouterStartConfig({
 export function buildCodexToml({
   rootDir,
   port = 15722,
-  model = "gpt-5.5",
+  model = DEFAULT_CODEX_BRIDGE_MODEL_ID,
   reasoningEffort = "medium",
   sandboxMode = "danger-full-access",
   approvalPolicy = "never",
@@ -1448,6 +1445,7 @@ export function applyCodexConfig({
   rootDir,
   mode,
   port = 15722,
+  model = null,
   homeDir = os.homedir(),
   validateWrittenConfig = validateCodexBridgeWrittenConfig,
 }) {
@@ -1456,7 +1454,13 @@ export function applyCodexConfig({
   fs.mkdirSync(targetDir, { recursive: true });
   const existingContent = fs.existsSync(target) ? fs.readFileSync(target, "utf8") : "";
   const currentSettings = currentCodexModelSettings(existingContent);
-  const bridgeContent = buildCodexToml({ rootDir, mode, port, ...currentSettings });
+  const bridgeContent = buildCodexToml({
+    rootDir,
+    mode,
+    port,
+    ...currentSettings,
+    model: model || currentSettings.model || DEFAULT_CODEX_BRIDGE_MODEL_ID,
+  });
   const content = mergeCodexBridgeConfig(existingContent, bridgeContent);
 
   if (fs.existsSync(target) && existingContent === content) {
@@ -2383,7 +2387,7 @@ function validateCodexBridgeWrittenConfig({ target, content, port = 15722 } = {}
 function currentCodexModelSettings(content) {
   const settings = {};
   const model = readTopLevelTomlString(content, "model");
-  if (CODEX_MODEL_SLOT_IDS.has(model)) {
+  if (isCodexBridgeModelId(model)) {
     settings.model = model;
   }
 
@@ -2403,6 +2407,10 @@ function currentCodexModelSettings(content) {
   }
 
   return settings;
+}
+
+function isCodexBridgeModelId(value) {
+  return typeof value === "string" && value.startsWith(CODEX_BRIDGE_MODEL_ID_PREFIX);
 }
 
 function readTopLevelTomlString(content, key) {
@@ -2909,7 +2917,7 @@ function normalizeSelection(rootDir, selectedModelIds, mode) {
     }
     unique.push(id);
   }
-  return unique.slice(0, CODEX_MODEL_SLOTS.length);
+  return unique;
 }
 
 function modelWithDefaultCapabilities(model) {
@@ -2969,11 +2977,19 @@ function builtInVisionPresetIds() {
   );
 }
 
-function routeForSelectedModel(model, slot, priority, imageGenerationOverrides = {}) {
+function codexBridgeRouteIdForModel(model = {}) {
+  const upstreamModel = String(model.model || "").trim();
+  if ((model.providerId === "codex" || model.authMode === "codex_openai") && upstreamModel) {
+    return `${CODEX_BRIDGE_MODEL_ID_PREFIX}${slugify(upstreamModel)}`;
+  }
+  const source = model.presetId || upstreamModel || model.displayName || "model";
+  return `${CODEX_BRIDGE_MODEL_ID_PREFIX}${slugify(source)}`;
+}
+
+function routeForSelectedModel(model, priority, imageGenerationOverrides = {}) {
   const provider = providerById(model.providerId);
   const route = {
-    id: slot.id,
-    slotLabel: slot.label,
+    id: codexBridgeRouteIdForModel(model),
     sourcePresetId: model.presetId,
     provider: model.providerId,
     providerFamily: model.providerFamily || providerFamilyForRoute(model, provider),

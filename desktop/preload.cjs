@@ -38,4 +38,7 @@ contextBridge.exposeInMainWorld("codexBridge", {
   onUpdateProgress: (callback) => {
     ipcRenderer.on("updates:progress", (_event, progress) => callback(progress));
   },
+  onUpdateFinished: (callback) => {
+    ipcRenderer.on("updates:finished", (_event, result) => callback(result));
+  },
 });

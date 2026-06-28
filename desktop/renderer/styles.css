@@ -754,7 +754,7 @@ h3 {
 
 .selection-strip {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   gap: 10px;
   margin-bottom: 18px;
 }
@@ -772,6 +772,11 @@ h3 {
   border-color: #b7ded8;
   background: var(--accent-soft);
   cursor: grab;
+}
+
+.slot-card.empty,
+.slot-card.missing {
+  border-style: solid;
 }
 
 .slot-card.dragging {

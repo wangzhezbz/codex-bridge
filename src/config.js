@@ -57,7 +57,7 @@ export function validateConfig(config) {
   }
 }
 
-export function routeForModel(config, requestedModel) {
+export function routeForModel(config, requestedModel, options = {}) {
   if (!requestedModel) {
     return defaultRoute(config);
   }
@@ -70,6 +70,9 @@ export function routeForModel(config, requestedModel) {
   if (slotRoute) {
     return slotRoute;
   }
+  if (options.exactModelIdOnly) {
+    throw createModelNotConfiguredError(config, requested, options);
+  }
 
   const route = config.models.find((model) =>
     modelFallbackAliases(model).some((alias) => alias === normalized),
@@ -77,16 +80,23 @@ export function routeForModel(config, requestedModel) {
   if (route) {
     return route;
   }
-  const available = config.models
-    .flatMap((model) => [model.id, model.displayName, model.model])
-    .filter(Boolean)
-    .join(", ");
+  throw createModelNotConfiguredError(config, requested, options);
+}
+
+function createModelNotConfiguredError(config, requested, options = {}) {
+  const availableValues = options.exactModelIdOnly
+    ? config.models.map((model) => model.id)
+    : config.models.flatMap((model) => [model.id, model.displayName, model.model]);
+  const available = availableValues.filter(Boolean).join(", ");
+  const message = options.exactModelIdOnly
+    ? `Model is not configured in CodexBridge for Codex client requests: ${requested}. Use one of these model ids: ${available}`
+    : `Model is not configured in CodexBridge: ${requested}. Available models: ${available}`;
   const error = new Error(
-    `Model is not configured in CodexBridge: ${requested}. Available models: ${available}`,
+    message,
   );
   error.statusCode = 404;
   error.code = "model_not_configured";
-  throw error;
+  return error;
 }
 
 function defaultRoute(config) {

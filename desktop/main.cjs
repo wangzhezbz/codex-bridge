@@ -15,6 +15,16 @@ if (shouldDisableChromiumSandbox()) {
   app.commandLine.appendSwitch("disable-gpu-sandbox");
 }
 
+const hasSingleInstanceLock = process.env.CODEXBRIDGE_DESKTOP_SMOKE === "1" ||
+  app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    showMainWindow();
+  });
+}
+
 const appRootDir = path.resolve(__dirname, "..");
 const appIconPath = path.join(__dirname, "assets", "codexbridge-icon.png");
 const trayIconPath = process.platform === "win32"
@@ -49,6 +59,11 @@ let usageRoutes = [];
 let lastHealth = null;
 let tray = null;
 let isQuitting = false;
+let routerStopRequested = false;
+let routerRestartTimer = null;
+let routerRestartAttempts = 0;
+const ROUTER_RESTART_MAX_ATTEMPTS = 3;
+const ROUTER_RESTART_BASE_DELAY_MS = 1500;
 const launchedAfterUpdate = process.argv.includes("--updated");
 
 function shouldDisableChromiumSandbox() {
@@ -163,6 +178,9 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  if (!hasSingleInstanceLock) {
+    return;
+  }
   if (process.platform === "win32") {
     app.setAppUserModelId("com.codexbridge.app");
   }
@@ -174,12 +192,10 @@ app.whenReady().then(() => {
     mainWindow.webContents.once("did-finish-load", () => {
       showMainWindow();
       appendLog(`Updated CodexBridge launched: v${app.getVersion()}`);
-      dialog.showMessageBox(mainWindow, {
-        type: "info",
-        title: "CodexBridge 更新完成",
-        message: `CodexBridge 已更新到 v${app.getVersion()}`,
-        detail: "窗口已重新打开，配置、密钥和模型选择仍保存在用户数据目录。",
-      }).catch((error) => appendRuntimeLog(formatError("updateNotice", error)));
+      sendToRenderer("updates:finished", {
+        version: app.getVersion(),
+        message: `CodexBridge 已更新到 v${app.getVersion()}，配置、密钥和模型选择仍保存在用户数据目录。`,
+      });
     });
   }
   if (process.env.CODEXBRIDGE_DESKTOP_SMOKE === "1") {
@@ -265,8 +281,6 @@ ipcMain.handle("state:get", async () => {
     modelDirectory: settings.readModelDirectory(dataRootDir),
     modelCapabilityOverrides: settings.readModelCapabilityOverrides(dataRootDir),
     selectedModelIds: settings.readSelection(dataRootDir, mode),
-    maxModels: settings.CODEX_MODEL_SLOTS?.length || 5,
-    modelSlots: settings.CODEX_MODEL_SLOTS || [],
     customModels: settings.readCustomModels(dataRootDir),
     imageGenerationOverrides: settings.readModelImageGenerationOverrides(dataRootDir),
     secretStatus: settings.secretStatus(dataRootDir),
@@ -443,6 +457,7 @@ ipcMain.handle("codex:apply", async () => {
     rootDir: dataRootDir,
     mode,
     port: config?.port || 15722,
+    model: config?.defaultModel,
   });
   appendLog(`Applied Codex config: ${result.target}`);
   if (result.backup) {
@@ -468,6 +483,7 @@ ipcMain.handle("codex:initialize", async () => {
     rootDir: dataRootDir,
     mode,
     port: config?.port || 15722,
+    model: config?.defaultModel,
   });
   appendLog(`Initialized Codex config: ${codexResult.target}`);
   if (codexResult.backup) {
@@ -506,11 +522,18 @@ ipcMain.handle("codex:recover-history", async () => {
   return result;
 });
 
-ipcMain.handle("router:start", async () => {
+ipcMain.handle("router:start", async () => startRouterProcess());
+
+async function startRouterProcess(options = {}) {
   if (routerProcess) {
     return { ok: true, message: "Router is already running." };
   }
 
+  if (routerRestartTimer) {
+    clearTimeout(routerRestartTimer);
+    routerRestartTimer = null;
+  }
+  routerStopRequested = false;
   const settings = await loadSettings();
   const config = settings.readRouterConfig(dataRootDir);
   const mode = settings.detectModeFromConfig(config);
@@ -546,12 +569,25 @@ ipcMain.handle("router:start", async () => {
   routerProcess.stdout.on("data", (chunk) => appendLog(chunk.toString("utf8").trimEnd()));
   routerProcess.stderr.on("data", (chunk) => appendLog(chunk.toString("utf8").trimEnd()));
   routerProcess.on("exit", (code) => {
+    const stoppedByRequest = routerStopRequested;
     if (isQuitting) {
       routerProcess = null;
       return;
     }
     appendLog(`Router stopped with code ${code ?? "unknown"}.`);
     routerProcess = null;
+    if (stoppedByRequest) {
+      routerStopRequested = false;
+      lastHealth = {
+        ok: false,
+        status: 0,
+        models: [],
+        message: "Router is stopped.",
+        checkedAt: new Date().toISOString(),
+      };
+      broadcastState();
+      return;
+    }
     lastHealth = {
       ok: false,
       status: 0,
@@ -560,6 +596,7 @@ ipcMain.handle("router:start", async () => {
       checkedAt: new Date().toISOString(),
     };
     broadcastState();
+    scheduleRouterRestart(code);
   });
 
   lastHealth = {
@@ -573,8 +610,11 @@ ipcMain.handle("router:start", async () => {
   broadcastState();
   await refreshRouterHealth(prepared.config);
   broadcastState();
-  return { ok: true, message: "Router started." };
-});
+  if (!options.watchdog) {
+    routerRestartAttempts = 0;
+  }
+  return { ok: true, message: options.watchdog ? "Router restarted." : "Router started." };
+}
 
 ipcMain.handle("router:stop", async () => {
   stopRouter();
@@ -616,6 +656,7 @@ ipcMain.handle("updates:check", async () => {
     currentVersion: app.getVersion(),
     platform: process.platform,
     arch: process.arch,
+    installKind: currentInstallKind(),
     release,
   });
   appendLog(`Update check: ${plan.message}`);
@@ -643,6 +684,7 @@ ipcMain.handle("updates:install", async () => {
     currentVersion: app.getVersion(),
     platform: process.platform,
     arch: process.arch,
+    installKind: currentInstallKind(),
     release,
   });
   if (!plan.ok) {
@@ -671,15 +713,11 @@ ipcMain.handle("updates:install", async () => {
       }
       throw new Error(`Unable to launch update installer: ${openError}`);
     }
-    try {
-      shell.showItemInFolder(prepared.installerPath);
-    } catch (error) {
-      appendRuntimeLog(formatError("showUpdateInstallerAfterLaunch", error));
-    }
+    quitAfterUpdateLaunch();
     return {
       ok: true,
       message: `Downloaded CodexBridge ${plan.latestVersion} installer.`,
-      nextStep: `Windows Setup has been saved to ${prepared.installerPath}. If the installer window did not open, open the updates folder and run that installer manually. The current app stays available until setup launches the new version.`,
+      nextStep: `安装器已下载并启动：${prepared.installerPath}。当前 CodexBridge 会退出，安装完成后会打开新版。`,
       latestVersion: plan.latestVersion,
       installerPath: prepared.installerPath,
       installerNotePath: prepared.installerNotePath,
@@ -764,11 +802,61 @@ function stopRouter(options = {}) {
   if (!routerProcess) {
     return;
   }
+  routerStopRequested = true;
+  if (routerRestartTimer) {
+    clearTimeout(routerRestartTimer);
+    routerRestartTimer = null;
+  }
   if (options.silent) {
     routerProcess.removeAllListeners("exit");
   }
   routerProcess.kill();
   routerProcess = null;
+}
+
+function scheduleRouterRestart(exitCode) {
+  if (isQuitting || routerStopRequested || routerRestartTimer) {
+    return;
+  }
+  if (routerRestartAttempts >= ROUTER_RESTART_MAX_ATTEMPTS) {
+    appendLog(`Router watchdog stopped after ${ROUTER_RESTART_MAX_ATTEMPTS} failed restart attempts.`);
+    lastHealth = {
+      ok: false,
+      status: 0,
+      models: [],
+      message: "Router stopped and automatic restart attempts were exhausted.",
+      checkedAt: new Date().toISOString(),
+    };
+    broadcastState();
+    return;
+  }
+  routerRestartAttempts += 1;
+  const delayMs = ROUTER_RESTART_BASE_DELAY_MS * routerRestartAttempts;
+  appendLog(
+    `Router watchdog will restart in ${delayMs} ms ` +
+      `(attempt ${routerRestartAttempts}/${ROUTER_RESTART_MAX_ATTEMPTS}, last code ${exitCode ?? "unknown"}).`,
+  );
+  routerRestartTimer = setTimeout(async () => {
+    routerRestartTimer = null;
+    if (isQuitting || routerStopRequested || routerProcess) {
+      return;
+    }
+    try {
+      appendLog("Router watchdog restarting Router.");
+      await startRouterProcess({ watchdog: true });
+    } catch (error) {
+      appendLog(formatError("routerWatchdog", error));
+      lastHealth = {
+        ok: false,
+        status: 0,
+        models: [],
+        message: `Router watchdog restart failed: ${error?.message || error}`,
+        checkedAt: new Date().toISOString(),
+      };
+      broadcastState();
+      scheduleRouterRestart(exitCode);
+    }
+  }, delayMs);
 }
 
 async function prepareInstallerUpdate(updater, plan, onProgress) {
@@ -798,6 +886,7 @@ async function prepareInstallerUpdate(updater, plan, onProgress) {
     installerPath,
     updatesDir,
   });
+  await updater.cleanupManagedUpdateArtifacts?.(updatesDir, { keepPackages: 2 });
   return { installerPath, installerNotePath, updatesDir };
 }
 
@@ -845,6 +934,7 @@ async function preparePortableUpdate(updater, plan, onProgress) {
       logPath,
     });
     fs.writeFileSync(scriptFile, script, "utf8");
+    await updater.cleanupManagedUpdateArtifacts?.(updatesDir, { keepPackages: 2 });
     return { downloadPath, scriptPath: scriptFile, manualNotePath };
   }
   if (process.platform === "darwin") {
@@ -858,19 +948,47 @@ async function preparePortableUpdate(updater, plan, onProgress) {
       logPath,
     });
     fs.writeFileSync(scriptFile, script, { encoding: "utf8", mode: 0o755 });
+    await updater.cleanupManagedUpdateArtifacts?.(updatesDir, { keepPackages: 2 });
     return { downloadPath, scriptPath: scriptFile, manualNotePath };
   }
   throw new Error(`当前系统暂不支持应用内更新：${process.platform} ${process.arch}`);
 }
 
 function portableUpdatesDir() {
-  if (app.isPackaged && process.platform === "win32") {
-    return path.resolve(path.dirname(process.execPath), "..", "updates");
-  }
-  if (app.isPackaged && process.platform === "darwin") {
-    return path.join(path.dirname(currentMacAppBundle()), "updates");
-  }
   return path.join(dataRootDir, "updates");
+}
+
+function currentInstallKind() {
+  const forced = String(process.env.CODEXBRIDGE_INSTALL_KIND || "").toLowerCase();
+  if (forced === "installed" || forced === "portable") {
+    return forced;
+  }
+  if (!app.isPackaged) {
+    return "portable";
+  }
+  if (process.platform !== "win32") {
+    return "portable";
+  }
+  const localAppData = process.env.LOCALAPPDATA;
+  if (!localAppData) {
+    return "portable";
+  }
+  const installedRoot = path.resolve(localAppData, "Programs", "CodexBridge").toLowerCase();
+  const exePath = path.resolve(process.execPath).toLowerCase();
+  return exePath === installedRoot || exePath.startsWith(`${installedRoot}${path.sep}`)
+    ? "installed"
+    : "portable";
+}
+
+function quitAfterUpdateLaunch() {
+  const timer = setTimeout(() => {
+    isQuitting = true;
+    stopRouter({ silent: true });
+    app.quit();
+    const forceExitTimer = setTimeout(() => app.exit(0), 3000);
+    forceExitTimer.unref?.();
+  }, 700);
+  timer.unref?.();
 }
 
 function writeInstallerUpdateInstructions({
@@ -1237,8 +1355,6 @@ async function getStatePayload(settings) {
     modelDirectory: settings.readModelDirectory(dataRootDir),
     modelCapabilityOverrides: settings.readModelCapabilityOverrides(dataRootDir),
     selectedModelIds: settings.readSelection(dataRootDir, mode),
-    maxModels: settings.CODEX_MODEL_SLOTS?.length || 5,
-    modelSlots: settings.CODEX_MODEL_SLOTS || [],
     customModels: settings.readCustomModels(dataRootDir),
     imageGenerationOverrides: settings.readModelImageGenerationOverrides(dataRootDir),
     secretStatus: settings.secretStatus(dataRootDir),

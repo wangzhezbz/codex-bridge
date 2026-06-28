@@ -10,7 +10,6 @@ const els = {
   appVersion: document.querySelector("#appVersion"),
   rootDir: document.querySelector("#rootDir"),
   selectedCount: document.querySelector("#selectedCount"),
-  maxModels: document.querySelector("#maxModels"),
   keySummary: document.querySelector("#keySummary"),
   keySummaryDetail: document.querySelector("#keySummaryDetail"),
   healthStatus: document.querySelector("#healthStatus"),
@@ -174,7 +173,7 @@ els.customModelForm.addEventListener("submit", (event) => {
     await refresh();
     showToast(
       wasEditing
-        ? "自定义模型已更新，已保留原来的 API Key 槽位。"
+        ? "自定义模型已更新，已保留原来的 API Key 名称。"
         : "自定义模型已添加。去“密钥”页保存它的 API Key，再在模型池里选中它。",
     );
   });
@@ -238,6 +237,9 @@ els.checkUpdates.addEventListener("click", () =>
 
 api.onLogs((logs) => renderLogs(logs));
 api.onUpdateProgress?.((progress) => renderUpdateProgress(progress));
+api.onUpdateFinished?.((result) => {
+  showToast(result?.message || "CodexBridge 已更新完成。");
+});
 api.onUsage((usage) => {
   if (!state) {
     return;
@@ -276,7 +278,6 @@ function render() {
   els.appVersion.textContent = `v${state.appVersion || "-"}`;
   els.rootDir.textContent = state.rootDir;
   els.selectedCount.textContent = String(draftSelection.length);
-  els.maxModels.textContent = String(state.maxModels || 5);
   const keySummary = keySummaryInfo();
   els.keySummary.textContent = keySummary.text;
   els.keySummaryDetail.textContent = keySummary.detail;
@@ -430,14 +431,25 @@ function saveProviderSecret(button) {
 
 function renderSelectedModels() {
   const modelsById = modelMap();
-  els.selectedModels.innerHTML = (state.modelSlots || [])
-    .map((slot, index) => {
-      const model = modelsById.get(draftSelection[index]);
+  if (!draftSelection.length) {
+    els.selectedModels.innerHTML = `
+      <div class="slot-card empty">
+        <span>未选择模型</span>
+        <strong>至少选择一个模型</strong>
+        <small>从下方模型卡片加入，保存后写入 CodexBridge 模型目录。</small>
+      </div>
+    `;
+    return;
+  }
+
+  els.selectedModels.innerHTML = draftSelection
+    .map((presetId, index) => {
+      const model = modelsById.get(presetId);
       return `
-        <div class="slot-card ${model ? "filled" : ""}" draggable="${model ? "true" : "false"}" data-slot-index="${index}">
-          <span>${escapeHtml(slot.label)}</span>
-          <strong>${model ? escapeHtml(model.displayName) : "未选择"}</strong>
-          <small>${model ? escapeHtml(providerName(model.providerId)) : "拖动已选模型到这里可调整顺序"}</small>
+        <div class="slot-card ${model ? "filled" : "missing"}" draggable="true" data-slot-index="${index}">
+          <span>第 ${index + 1} 个模型</span>
+          <strong>${model ? escapeHtml(model.displayName) : "模型不可用"}</strong>
+          <small>${model ? `${escapeHtml(model.model)} · ${escapeHtml(providerName(model.providerId))}` : escapeHtml(presetId)}</small>
         </div>
       `;
     })
@@ -468,7 +480,7 @@ function renderSelectedModels() {
       reorderDraftSelection(dragSlotIndex, targetIndex);
       dragSlotIndex = null;
       render();
-      showToast("顺序已调整，点“保存选择”后写入 Codex 模型栏。");
+      showToast("顺序已调整，点“保存选择”后写入 CodexBridge 模型目录。");
     });
   });
 }
@@ -486,7 +498,6 @@ function reorderDraftSelection(fromIndex, targetSlotIndex) {
 
 function renderModelPool() {
   const selected = new Set(draftSelection);
-  const max = Number(state.maxModels || 5);
   const grouped = groupByProvider(state.modelPresets || []);
   els.modelPool.innerHTML = grouped
     .map(([providerId, models]) => {
@@ -498,7 +509,7 @@ function renderModelPool() {
             <span>${models.length} 个模型</span>
           </div>
           <div class="model-card-grid">
-            ${models.map((model) => modelCard(model, selected, max)).join("")}
+            ${models.map((model) => modelCard(model, selected)).join("")}
           </div>
         </section>
       `;
@@ -580,17 +591,14 @@ function renderModelPool() {
   });
 }
 
-function modelCard(model, selected, max) {
+function modelCard(model, selected) {
   const isSelected = selected.has(model.presetId);
   const supportsImage = modelSupportsImage(model);
   const isNativeDisabled = state.mode === "all_api" && model.authMode === "codex_openai";
-  const isMaxed = !isSelected && draftSelection.length >= max;
-  const disabled = isNativeDisabled || isMaxed;
+  const disabled = isNativeDisabled;
   const reason = isNativeDisabled
     ? "全部 API 模式不能选择订阅模型"
-    : isMaxed
-      ? "已选满 5 个"
-      : providerName(model.providerId);
+    : providerName(model.providerId);
   return `
     <div class="model-card-shell">
       <button class="model-card ${isSelected ? "selected" : ""}" data-model-id="${escapeHtml(model.presetId)}" ${disabled ? "disabled" : ""}>
@@ -941,13 +949,10 @@ function inputModalitiesForModel(model) {
 }
 
 function toggleModel(presetId) {
-  const max = Number(state.maxModels || 5);
   if (draftSelection.includes(presetId)) {
     draftSelection = draftSelection.filter((id) => id !== presetId);
-  } else if (draftSelection.length < max) {
-    draftSelection = [...draftSelection, presetId];
   } else {
-    showToast("Codex 模型栏最多只能显示 5 个。", "error");
+    draftSelection = [...draftSelection, presetId];
   }
   render();
 }
@@ -989,7 +994,7 @@ function renderCustomFormState() {
   const editing = Boolean(editingCustomPresetId);
   els.customFormTitle.textContent = editing ? "编辑自定义模型" : "添加自定义模型";
   els.customFormDescription.textContent = editing
-    ? "修改后会覆盖当前自定义模型，并保留原来的 API Key 槽位。"
+    ? "修改后会覆盖当前自定义模型，并保留原来的 API Key 名称。"
     : "用于接入任何 OpenAI-compatible 服务商。显示名给 Codex 看，真实模型名发给服务商。";
   els.customSubmitButton.textContent = editing ? "保存修改" : "添加模型";
   els.cancelCustomEdit.classList.toggle("hidden", !editing);
@@ -1002,7 +1007,7 @@ function renderUsage() {
   const events = current.events || state.usageEvents || [];
   els.statCalls.textContent = formatNumber(current.totalCalls || 0);
   els.statTokens.textContent = formatNumber(current.totalTokens || 0);
-  els.statPrompt.textContent = formatNumber(current.promptTokens || 0);
+  els.statPrompt.textContent = formatInputTokens(current);
   els.statCompletion.textContent = formatNumber(current.completionTokens || 0);
   renderUsageChart(current.byModel || []);
   renderUsageTableStable(current.byModel || [], events, history);
@@ -1101,7 +1106,7 @@ function renderUsageTable(rows, events) {
               <span>${escapeHtml(row.upstreamModel || "-")}</span>
               <span>${escapeHtml(row.api || "-")}</span>
               <span>${formatNumber(row.calls)}</span>
-              <span>${formatNumber(row.promptTokens)}</span>
+              <span>${formatInputTokens(row)}</span>
               <span>${formatNumber(row.completionTokens)}</span>
               <span>${formatNumber(row.totalTokens)}</span>
               <span>${escapeHtml(usageStatusText(row))}</span>
@@ -1121,7 +1126,7 @@ function renderUsageTable(rows, events) {
               <span>${escapeHtml(event.upstreamModel || "-")}</span>
               <span>${escapeHtml(event.api || "-")}</span>
               <span>${escapeHtml(usageEventStatusText(event))}</span>
-              <span>${formatNumber(event.promptTokens)}</span>
+              <span>${formatInputTokens(event)}</span>
               <span>${formatNumber(event.completionTokens)}</span>
               <span>${formatNumber(event.totalTokens)}</span>
               <span>${formatDuration(event.durationMs)}</span>
@@ -1155,7 +1160,7 @@ function renderUsageTableStable(rows, events, history = {}) {
               <span>${escapeHtml(row.upstreamModel || "-")}</span>
               <span>${escapeHtml(row.api || "-")}</span>
               <span>${formatNumber(row.calls)}</span>
-              <span>${formatNumber(row.promptTokens)}</span>
+              <span>${formatInputTokens(row)}</span>
               <span>${formatNumber(row.completionTokens)}</span>
               <span>${formatNumber(row.totalTokens)}</span>
               <span>${escapeHtml(usageStatusText(row))}</span>
@@ -1175,7 +1180,7 @@ function renderUsageTableStable(rows, events, history = {}) {
               <span>${escapeHtml(event.upstreamModel || "-")}</span>
               <span>${escapeHtml(event.api || "-")}</span>
               <span>${escapeHtml(usageEventStatusText(event))}</span>
-              <span>${formatNumber(event.promptTokens)}</span>
+              <span>${formatInputTokens(event)}</span>
               <span>${formatNumber(event.completionTokens)}</span>
               <span>${formatNumber(event.totalTokens)}</span>
               <span>${formatDuration(event.durationMs)}</span>
@@ -1185,13 +1190,8 @@ function renderUsageTableStable(rows, events, history = {}) {
         )
         .join("")
     : `<div class="empty-state">暂无明细记录。</div>`;
-  const hiddenHistoryNote =
-    Number(history.totalCalls || 0) > 0
-      ? `<div class="empty-state">历史路由已隐藏：${formatNumber(history.totalCalls || 0)} 次调用，${formatNumber(history.totalTokens || 0)} token。当前页只展示正在生效的模型配置，避免旧模型选择误导判断。</div>`
-      : "";
   els.usageTable.innerHTML = `
     <h3>按模型汇总</h3>
-    ${hiddenHistoryNote}
     <div class="usage-table-block">
       <div class="usage-grid">
         <div class="usage-row header">
@@ -1323,13 +1323,10 @@ function showUpdateDialog(updatePlan) {
     const installerUpdate = updatePlan.asset?.kind === "installer";
     els.updateDialogVersion.textContent = `v${updatePlan.latestVersion || ""}`;
     els.updateDialogMessage.textContent =
-      "下载完成后会保存到当前程序旁边的 updates 目录，并打开文件夹。";
+      "下载完成后会保存到更新目录，当前程序保持运行，可手动处理。";
     if (installerUpdate) {
       els.updateDialogMessage.textContent =
-        "下载完成后会启动 Windows 安装器；安装器会安装到用户程序目录并启动新版。";
-    }
-    if (updatePlan.nextStep) {
-      els.updateDialogMessage.textContent = updatePlan.nextStep;
+        "下载完成后会打开安装器，当前窗口会退出，安装完成后会启动新版。";
     }
     els.updateDialogAsset.textContent = updatePlan.asset
       ? `${updatePlan.asset.name} · ${formatBytes(updatePlan.asset.size)}`
@@ -1449,6 +1446,9 @@ function emptyUsageSummary() {
     totalCalls: 0,
     totalTokens: 0,
     promptTokens: 0,
+    freshPromptTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
     completionTokens: 0,
     statusCounts: {},
     byModel: [],
@@ -1457,6 +1457,9 @@ function emptyUsageSummary() {
       totalCalls: 0,
       totalTokens: 0,
       promptTokens: 0,
+      freshPromptTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
       completionTokens: 0,
       statusCounts: {},
       byModel: [],
@@ -1467,6 +1470,9 @@ function emptyUsageSummary() {
       totalCalls: 0,
       totalTokens: 0,
       promptTokens: 0,
+      freshPromptTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
       completionTokens: 0,
       statusCounts: {},
       byModel: [],
@@ -1547,8 +1553,8 @@ function displayRoute(route) {
   if (configured?.displayName) {
     return configured.displayName;
   }
-  const slot = (state.modelSlots || []).find((item) => item.id === route);
-  return slot?.label || route || "-";
+  const preset = modelMap().get(route);
+  return preset?.displayName || route || "-";
 }
 
 function value(selector) {
@@ -1561,6 +1567,15 @@ function setValue(selector, value) {
 
 function formatNumber(value) {
   return Number(value || 0).toLocaleString("zh-CN");
+}
+
+function formatInputTokens(item) {
+  const fresh = Number(item?.freshPromptTokens ?? item?.promptTokens ?? 0);
+  const cacheRead = Number(item?.cacheReadTokens || 0);
+  if (cacheRead > 0) {
+    return `${formatNumber(fresh)}（缓存 ${formatNumber(cacheRead)}）`;
+  }
+  return formatNumber(fresh);
 }
 
 function formatBytes(value) {

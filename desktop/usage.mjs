@@ -3,7 +3,7 @@ const START_RE =
 const UPSTREAM_RE =
   /\[(?<iso>\d{4}-\d\d-\d\dT[^\]]+)] (?<requestId>req_[a-z0-9]+) -> upstream route=(?<route>\S+) api=(?<api>\S+) upstream_model=(?<upstreamModel>\S+) url=(?<url>\S+)/i;
 const USAGE_RE =
-  /\[(?<iso>\d{4}-\d\d-\d\dT[^\]]+)] (?<requestId>req_[a-z0-9]+) <- upstream route=(?<route>\S+) usage prompt=(?<promptTokens>\d+) completion=(?<completionTokens>\d+) total=(?<totalTokens>\d+)/i;
+  /\[(?<iso>\d{4}-\d\d-\d\dT[^\]]+)] (?<requestId>req_[a-z0-9]+) <- upstream route=(?<route>\S+) usage prompt=(?<promptTokens>\d+)(?: cached=(?<cacheReadTokens>\d+) fresh=(?<freshPromptTokens>\d+))?(?: cache_write=(?<cacheCreationTokens>\d+))? completion=(?<completionTokens>\d+) total=(?<totalTokens>\d+)/i;
 const NO_USAGE_RE =
   /\[(?<iso>\d{4}-\d\d-\d\dT[^\]]+)] (?<requestId>req_[a-z0-9]+) <- upstream route=(?<route>\S+) usage=\(none\)/i;
 const STATUS_RE =
@@ -35,6 +35,9 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
         stream: start.stream === "true",
         status: null,
         promptTokens: 0,
+        freshPromptTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
         completionTokens: 0,
         totalTokens: 0,
         error: "",
@@ -60,6 +63,11 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
       item.finishedAt = usage.iso;
       item.status = item.status || 200;
       item.promptTokens = Number(usage.promptTokens || 0);
+      item.cacheReadTokens = Number(usage.cacheReadTokens || 0);
+      item.cacheCreationTokens = Number(usage.cacheCreationTokens || 0);
+      item.freshPromptTokens = Number(
+        usage.freshPromptTokens ?? Math.max(0, item.promptTokens - item.cacheReadTokens),
+      );
       item.completionTokens = Number(usage.completionTokens || 0);
       item.totalTokens = Number(usage.totalTokens || 0);
       finalize(item);
@@ -115,11 +123,17 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
     const statusCounts = {};
     let totalTokens = 0;
     let promptTokens = 0;
+    let freshPromptTokens = 0;
+    let cacheReadTokens = 0;
+    let cacheCreationTokens = 0;
     let completionTokens = 0;
 
     for (const event of records) {
       totalTokens += event.totalTokens || 0;
       promptTokens += event.promptTokens || 0;
+      freshPromptTokens += event.freshPromptTokens ?? event.promptTokens ?? 0;
+      cacheReadTokens += event.cacheReadTokens || 0;
+      cacheCreationTokens += event.cacheCreationTokens || 0;
       completionTokens += event.completionTokens || 0;
       const statusKey = String(event.status || "unknown");
       statusCounts[statusKey] = (statusCounts[statusKey] || 0) + 1;
@@ -137,6 +151,9 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
           calls: 0,
           totalTokens: 0,
           promptTokens: 0,
+          freshPromptTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
           completionTokens: 0,
           errors: 0,
           fastZeroTokenErrors: 0,
@@ -151,6 +168,9 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
       item.calls += 1;
       item.totalTokens += event.totalTokens || 0;
       item.promptTokens += event.promptTokens || 0;
+      item.freshPromptTokens += event.freshPromptTokens ?? event.promptTokens ?? 0;
+      item.cacheReadTokens += event.cacheReadTokens || 0;
+      item.cacheCreationTokens += event.cacheCreationTokens || 0;
       item.completionTokens += event.completionTokens || 0;
       item.errors += event.status && event.status >= 400 ? 1 : 0;
       item.fastZeroTokenErrors += isFastZeroTokenError(event) ? 1 : 0;
@@ -214,6 +234,9 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
       totalCalls: records.length,
       totalTokens,
       promptTokens,
+      freshPromptTokens,
+      cacheReadTokens,
+      cacheCreationTokens,
       completionTokens,
       statusCounts,
       byModel,
@@ -238,6 +261,9 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
         status: null,
         promptTokens: 0,
         completionTokens: 0,
+        freshPromptTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
         totalTokens: 0,
         error: "",
         errorType: "",
@@ -303,6 +329,9 @@ function normalizeEvent(event) {
     stream: Boolean(event.stream),
     status: Number.isFinite(Number(event.status)) ? Number(event.status) : null,
     promptTokens: Number(event.promptTokens || 0),
+    freshPromptTokens: Number(event.freshPromptTokens ?? event.promptTokens ?? 0),
+    cacheReadTokens: Number(event.cacheReadTokens || 0),
+    cacheCreationTokens: Number(event.cacheCreationTokens || 0),
     completionTokens: Number(event.completionTokens || 0),
     totalTokens: Number(event.totalTokens || 0),
     durationMs: Number.isFinite(Number(event.durationMs)) ? Number(event.durationMs) : null,
@@ -329,10 +358,16 @@ function totalsForEvents(events = []) {
   const statusCounts = {};
   let totalTokens = 0;
   let promptTokens = 0;
+  let freshPromptTokens = 0;
+  let cacheReadTokens = 0;
+  let cacheCreationTokens = 0;
   let completionTokens = 0;
   for (const event of events) {
     totalTokens += event.totalTokens || 0;
     promptTokens += event.promptTokens || 0;
+    freshPromptTokens += event.freshPromptTokens ?? event.promptTokens ?? 0;
+    cacheReadTokens += event.cacheReadTokens || 0;
+    cacheCreationTokens += event.cacheCreationTokens || 0;
     completionTokens += event.completionTokens || 0;
     const statusKey = String(event.status || "unknown");
     statusCounts[statusKey] = (statusCounts[statusKey] || 0) + 1;
@@ -341,6 +376,9 @@ function totalsForEvents(events = []) {
     totalCalls: events.length,
     totalTokens,
     promptTokens,
+    freshPromptTokens,
+    cacheReadTokens,
+    cacheCreationTokens,
     completionTokens,
     statusCounts,
     latest: events.at(-1) || null,

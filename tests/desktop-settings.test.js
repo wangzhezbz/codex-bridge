@@ -84,6 +84,17 @@ test("buildCodexToml wraps CodexBridge-owned settings in managed markers", () =>
   assert.ok(toml.indexOf("openai_base_url") < toml.indexOf("# <<< CodexBridge managed config"));
 });
 
+test("buildCodexToml defaults to an independent CodexBridge model id", () => {
+  const rootDir = path.join(os.tmpdir(), "codex-bridge-router");
+  const toml = buildCodexToml({
+    rootDir,
+    mode: MODE_HYBRID,
+  });
+
+  assert.match(toml, /model = "cb-gpt-5-5"/);
+  assert.doesNotMatch(toml, /model = "gpt-5\.5"/);
+});
+
 test("buildCodexToml keeps the built-in OpenAI provider in hybrid mode", () => {
   const toml = buildCodexToml({
     rootDir: path.join(os.tmpdir(), "codex-bridge-router"),
@@ -774,7 +785,7 @@ test("built-in catalog does not recommend the private Fenno GPT provider", () =>
   assert.equal(Array.from(presetIds).some((id) => id.startsWith("fenno-")), false);
 });
 
-test("buildRouterConfigFromSelection maps selected models into five Codex slots", () => {
+test("buildRouterConfigFromSelection exposes selected models with independent CodexBridge ids", () => {
   const rootDir = makeTempProject();
   saveSelection(rootDir, [
     "codex-gpt-5-5",
@@ -789,16 +800,19 @@ test("buildRouterConfigFromSelection maps selected models into five Codex slots"
 
   assert.equal(config.mode, MODE_HYBRID);
   assert.equal(config.clientAuth.allowOpenAiBearer, true);
-  assert.equal(config.models.length, 5);
+  assert.equal(config.models.length, 6);
   assert.deepEqual(config.models.map((model) => model.id), [
-    "gpt-5.5",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.3-codex",
-    "gpt-5.2",
+    "cb-gpt-5-5",
+    "cb-gpt-5-4",
+    "cb-deepseek-v4-pro",
+    "cb-deepseek-v4-flash",
+    "cb-kimi-k2-7-code",
+    "cb-qwen-plus",
   ]);
+  assert.equal(config.defaultModel, "cb-gpt-5-5");
   assert.equal(config.models[2].displayName, "DeepSeek V4 Pro");
   assert.equal(config.models[4].displayName, "Kimi K2.7 Code");
+  assert.equal(config.models[5].displayName, "Qwen Plus");
 });
 
 test("buildRouterConfigFromSelection preserves native GPT speed tiers", () => {
@@ -816,8 +830,10 @@ test("buildRouterConfigFromSelection preserves native GPT speed tiers", () => {
     },
   ]);
   assert.deepEqual(config.models[1].additionalSpeedTiers, ["fast"]);
-  assert.equal(config.models[0].id, "gpt-5.5");
-  assert.equal(config.models[1].id, "gpt-5.4");
+  assert.equal(config.models[0].id, "cb-gpt-5-5");
+  assert.equal(config.models[1].id, "cb-gpt-5-4");
+  assert.equal(config.models[0].model, "gpt-5.5");
+  assert.equal(config.models[1].model, "gpt-5.4");
 });
 
 test("chat completion routes get a conservative default tool guard", () => {
@@ -895,7 +911,7 @@ test("custom models can be saved and routed with their own API key env", () => {
   const config = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
 
   assert.equal(config.models.length, 1);
-  assert.equal(config.models[0].id, "gpt-5.5");
+  assert.equal(config.models[0].id, "cb-custom-my-provider-my-coder-v1");
   assert.equal(config.models[0].displayName, "My Coder");
   assert.equal(config.models[0].apiKeyEnv, "MY_PROVIDER_API_KEY");
   assert.deepEqual(config.models[0].inputModalities, ["text"]);
@@ -1514,7 +1530,7 @@ test("applyCodexConfig removes stale top-level Codex context overrides", () => {
   assert.match(written, /\[mcp_servers\.node_repl]\s+command = "C:\/Codex\/node_repl\.exe"/);
 });
 
-test("applyCodexConfig preserves the current Codex model selection", () => {
+test("applyCodexConfig preserves the current independent CodexBridge model selection", () => {
   const rootDir = makeTempProject();
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
   const codexDir = path.join(homeDir, ".codex");
@@ -1524,7 +1540,7 @@ test("applyCodexConfig preserves the current Codex model selection", () => {
     target,
     [
       'model_provider = "openai"',
-      'model = "gpt-5.2"',
+      'model = "cb-gpt-5-4"',
       'model_reasoning_effort = "high"',
       "",
       "[history]",
@@ -1538,7 +1554,7 @@ test("applyCodexConfig preserves the current Codex model selection", () => {
   const written = fs.readFileSync(target, "utf8");
 
   assert.match(written, /model_provider = "openai"/);
-  assert.match(written, /model = "gpt-5\.2"/);
+  assert.match(written, /model = "cb-gpt-5-4"/);
   assert.match(written, /model_reasoning_effort = "high"/);
   assert.match(written, /openai_base_url = "http:\/\/127\.0\.0\.1:15722\/v1"/);
   assert.match(written, /\[history]\s+persistence = "save-all"/);
@@ -1610,7 +1626,7 @@ test("prepareRouterStartConfig refreshes stale Codex local endpoint before route
   const result = prepareRouterStartConfig({ rootDir, mode: MODE_HYBRID, homeDir });
 
   const written = fs.readFileSync(target, "utf8");
-  assert.equal(result.config.defaultModel, "gpt-5.5");
+  assert.equal(result.config.defaultModel, "cb-gpt-5-5");
   assert.match(written, /model_provider = "openai"/);
   assert.match(written, /openai_base_url = "http:\/\/127\.0\.0\.1:15722\/v1"/);
   assert.doesNotMatch(written, /\[model_providers\.codex-bridge]/);

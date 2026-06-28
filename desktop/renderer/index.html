@@ -59,15 +59,14 @@
             <div class="update-dialog-header">
               <div>
                 <h2 id="updateDialogTitle">发现新版本</h2>
-                <p id="updateDialogMessage">下载完成后会保存到当前程序旁边的 updates 目录，并打开文件夹。</p>
+                <p id="updateDialogMessage">下载完成后会保存到更新目录。</p>
               </div>
               <span class="status-pill" id="updateDialogVersion">-</span>
             </div>
             <div class="update-dialog-body">
               <span class="metric-label">更新包</span>
               <strong id="updateDialogAsset">-</strong>
-              <p>Windows 安装器会安装到用户程序目录；portable 更新包会保存在 updates 目录用于手动处理。配置、密钥、统计和日志仍在用户数据目录。</p>
-              <p>更新前会保留旧程序目录为 previous 备份；配置、密钥、统计和日志仍在用户数据目录。</p>
+              <p>配置、密钥、统计和日志仍保存在用户数据目录。</p>
               <div class="update-progress hidden" id="updateProgress" aria-live="polite">
                 <div class="update-progress-head">
                   <span id="updateProgressText">等待下载</span>
@@ -140,9 +139,9 @@
               <p>这里不是模型地址。配置、密钥、模型选择、统计和日志统一保存在用户目录，更新或重新解压应用不会丢。</p>
             </article>
             <article class="metric">
-              <span class="metric-label">Codex 模型栏</span>
-              <strong><span id="selectedCount">0</span>/<span id="maxModels">5</span></strong>
-              <p>Codex 目前最多显示 5 个模型。</p>
+              <span class="metric-label">已启用模型</span>
+              <strong><span id="selectedCount">0</span></strong>
+              <p>这些模型会写入 CodexBridge 模型目录，按当前顺序展示。</p>
             </article>
             <article class="metric">
               <span class="metric-label">API Key 准备情况</span>
@@ -162,14 +161,14 @@
             <div class="panel-header">
               <div>
                 <h2>模型栏选择</h2>
-                <p>Codex 模型栏最多显示 5 个。拖动上方槽位可调整顺序，下方模型卡片负责加入或移除。</p>
+                <p>选中的模型会写入 CodexBridge 模型目录。拖动上方模型可调整顺序，下方模型卡片负责加入或移除。</p>
               </div>
               <div class="header-actions">
                 <button class="primary-button small" id="saveModelSelectionPanel">保存选择</button>
                 <button class="ghost-button light small" id="openConfigFolder">打开配置目录</button>
               </div>
             </div>
-            <div class="selection-strip" id="selectedModels" aria-label="当前 Codex 模型栏槽位"></div>
+            <div class="selection-strip" id="selectedModels" aria-label="当前已选模型"></div>
             <div class="model-pool" id="modelPool"></div>
           </article>
 
@@ -242,7 +241,7 @@
             <div class="panel-header">
               <div>
                 <h2>当前调用统计</h2>
-                <p>默认只展示当前生效模型栏的请求、状态码、耗时和 token；历史路由只保留为诊断记录，避免旧模型选择误导判断。</p>
+                <p>展示当前生效模型的请求、状态码、耗时和 token。</p>
               </div>
             </div>
             <div class="grid four stat-summary">

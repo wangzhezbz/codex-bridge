@@ -47,6 +47,7 @@ test("codex_openai responses routes enforce ChatGPT backend request contract", (
       top_p: 0.9,
       store: true,
       include: ["output_text"],
+      text: { format: { type: "text" } },
       prompt_cache_key: "codex-cache-key",
       client_metadata: { encrypted_context: "keep" },
     },
@@ -61,13 +62,36 @@ test("codex_openai responses routes enforce ChatGPT backend request contract", (
   );
 
   assert.equal(filtered.stream, true);
-  assert.equal(filtered.store, false);
+  assert.equal(filtered.store, true);
   assert.equal(filtered.max_output_tokens, undefined);
   assert.equal(filtered.temperature, undefined);
   assert.equal(filtered.top_p, undefined);
+  assert.deepEqual(filtered.text, { format: { type: "text" } });
   assert.equal(filtered.prompt_cache_key, "codex-cache-key");
   assert.deepEqual(filtered.client_metadata, { encrypted_context: "keep" });
   assert.deepEqual(filtered.include, ["output_text", "reasoning.encrypted_content"]);
+});
+
+test("codex_openai responses routes default to stored server-side state", () => {
+  const filtered = filterPayloadForAdapter(
+    {
+      model: "gpt-5.5",
+      input: "hello",
+      stream: false,
+    },
+    {
+      id: "gpt-5.5",
+      provider: "codex",
+      api: "responses",
+      model: "gpt-5.5",
+      baseUrl: "https://chatgpt.com/backend-api/codex",
+      authMode: "codex_openai",
+    },
+  );
+
+  assert.equal(filtered.stream, true);
+  assert.equal(filtered.store, true);
+  assert.deepEqual(filtered.include, ["reasoning.encrypted_content"]);
 });
 
 test("adapter profiles classify DeepSeek chat routes", () => {

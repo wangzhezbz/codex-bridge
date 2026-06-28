@@ -29,10 +29,7 @@ export function modelCatalogEntry(model, defaults = {}, index = 0) {
       0,
   );
   const contextWindow = Number(
-    configuredCatalogContextWindow ||
-      (model.api === "chat_completions"
-        ? Math.max(upstreamContextWindow, 1_000_000)
-        : upstreamContextWindow),
+    configuredCatalogContextWindow || upstreamContextWindow,
   );
   const effectiveContextWindowPercent = Number(
     model.effectiveContextWindowPercent ||

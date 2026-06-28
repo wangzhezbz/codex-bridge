@@ -10,6 +10,7 @@ import {
 } from "./json.js";
 import { buildModelCatalog, openAiModelsList } from "./model-catalog.js";
 import { isResponsesCompactPath, requestHasCompactionTrigger } from "./compact.js";
+import { responseToSse } from "./chat-to-responses.js";
 import {
   handleResponsesRequest,
   sendUpstreamError,
@@ -20,6 +21,65 @@ import { normalizeAdapterProfile } from "./adapter-profile.js";
 
 const DEFAULT_JSON_BODY_LIMIT_BYTES = 25 * 1024 * 1024;
 const DEFAULT_RESPONSES_BODY_LIMIT_BYTES = 100 * 1024 * 1024;
+const BENIGN_ROUTER_PROCESS_ERROR_CODES = new Set([
+  "ECONNRESET",
+  "EPIPE",
+  "ECONNABORTED",
+  "ETIMEDOUT",
+  "UND_ERR_ABORTED",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_SOCKET",
+  "ERR_STREAM_DESTROYED",
+  "ERR_STREAM_PREMATURE_CLOSE",
+]);
+let routerProcessGuardsInstalled = false;
+
+export function isBenignRouterProcessError(error) {
+  const candidates = [
+    error?.code,
+    error?.errno,
+    error?.cause?.code,
+    error?.cause?.errno,
+  ]
+    .filter((value) => value !== undefined && value !== null)
+    .map((value) => String(value));
+  if (candidates.some((code) => BENIGN_ROUTER_PROCESS_ERROR_CODES.has(code))) {
+    return true;
+  }
+  const message = String(error?.message || error || "");
+  return [...BENIGN_ROUTER_PROCESS_ERROR_CODES].some((code) => message.includes(code));
+}
+
+export function installRouterProcessGuards(processLike = process) {
+  if (routerProcessGuardsInstalled || !processLike?.on) {
+    return;
+  }
+  routerProcessGuardsInstalled = true;
+  const handleProcessError = (label, error) => {
+    if (isBenignRouterProcessError(error)) {
+      console.warn(
+        `[${new Date().toISOString()}] router ${label}: ignored benign network/socket error: ` +
+          safeLogValue(error?.stack || error?.message || error),
+      );
+      return;
+    }
+    console.error(
+      `[${new Date().toISOString()}] router ${label}: fatal error: ` +
+        (error?.stack || error?.message || error),
+    );
+    processLike.exitCode = 1;
+    if (typeof processLike.exit === "function") {
+      processLike.exit(1);
+    }
+  };
+  processLike.on("uncaughtException", (error) => {
+    handleProcessError("uncaughtException", error);
+  });
+  processLike.on("unhandledRejection", (reason) => {
+    handleProcessError("unhandledRejection", reason);
+  });
+}
 
 export function createRouterServer(config = loadConfig()) {
   const history = new ResponseHistory();
@@ -128,7 +188,25 @@ export function createRouterServer(config = loadConfig()) {
         isResponsesPostPath(url.pathname)
       ) {
         const body = await readJsonRequest(req, requestBodyLimitBytes(activeConfig, url.pathname));
-        const route = routeForModel(activeConfig, body.model);
+        const requestId = makeRequestId();
+        const isCodexClient = isCodexClientRequest(req);
+        const compactKind = compactKindForRequest(url.pathname, body);
+        let route;
+        try {
+          route = routeForModel(activeConfig, body.model, {
+            exactModelIdOnly: isCodexClient,
+          });
+        } catch (error) {
+          if (isCodexClient && error?.code === "model_not_configured") {
+            console.warn(
+              `[${new Date().toISOString()}] ${requestId} !! local-model-guard ` +
+                `model=${body.model || "(default)"} reason=model_not_configured`,
+            );
+            sendLocalCompletedResponse(res, body, modelNotConfiguredLocalResponse(body.model, error));
+            return;
+          }
+          throw error;
+        }
         const clientAuth = authorizeClient(req, activeConfig, route);
         if (!clientAuth.ok) {
           jsonResponse(
@@ -142,9 +220,7 @@ export function createRouterServer(config = loadConfig()) {
           );
           return;
         }
-        const requestId = makeRequestId();
         const clientAbort = clientAbortContext(req, res);
-        const compactKind = compactKindForRequest(url.pathname, body);
         console.log(
           `[${new Date().toISOString()}] ${requestId} <- /v1/responses ` +
             `model=${body.model || "(default)"} route=${route.id} ` +
@@ -209,6 +285,59 @@ export function createRouterServer(config = loadConfig()) {
     handleClientSocketError(error, socket);
   });
   return server;
+}
+
+function sendLocalCompletedResponse(res, requestBody = {}, response) {
+  if (requestBody.stream) {
+    res.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    });
+    res.end(responseToSse(response));
+    return;
+  }
+  jsonResponse(res, 200, response);
+}
+
+function modelNotConfiguredLocalResponse(requestedModel, error) {
+  const id = `resp_model_not_configured_${Date.now().toString(36)}_${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
+  const requested = requestedModel || "(default)";
+  const detail = error?.message ? `\n\n技术细节：${error.message}` : "";
+  const outputText =
+    `CodexBridge 已在本地拦截旧模型槽位请求：${requested}。\n` +
+    "这通常来自旧对话或旧 Codex 模型槽位重放。CodexBridge 没有请求任何上游 provider，也没有消耗上游模型 token。\n" +
+    "请在当前对话的模型下拉里重新选择 CodexBridge 的 cb-* 模型，或点击 CodexBridge「初始化 Codex 配置」后新开会话再继续。" +
+    detail;
+  return {
+    id,
+    object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    status: "completed",
+    model: requestedModel || null,
+    output: [
+      {
+        id: `msg_${id}`,
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        content: [
+          {
+            type: "output_text",
+            text: outputText,
+            annotations: [],
+          },
+        ],
+      },
+    ],
+    output_text: outputText,
+    parallel_tool_calls: true,
+    error: null,
+    incomplete_details: null,
+    usage: null,
+  };
 }
 
 function attachClientSocketErrorHandler(socket, socketsWithErrorHandler) {
@@ -466,6 +595,17 @@ function providerLogLabel(route = {}) {
   }
 }
 
+function isCodexClientRequest(req = {}) {
+  const headers = req.headers || {};
+  const userAgent = String(headers["user-agent"] || "").toLowerCase();
+  return (
+    userAgent.includes("codex") ||
+    Boolean(headers["x-codex-thread-id"]) ||
+    Boolean(headers["x-codex-window-id"]) ||
+    Boolean(headers["x-codex-installation-id"])
+  );
+}
+
 function safeLogValue(value) {
   return String(value || "")
     .replaceAll("\r", " ")
@@ -479,5 +619,6 @@ const thisFile = fileURLToPath(import.meta.url);
 const invokedFile = process.argv[1] ? path.resolve(process.argv[1]) : "";
 
 if (path.resolve(thisFile) === invokedFile) {
+  installRouterProcessGuards();
   startServer();
 }

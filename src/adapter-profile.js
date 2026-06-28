@@ -13,6 +13,7 @@ const RESPONSES_SAFE_PARAMS = [
   "parallel_tool_calls",
   "temperature",
   "top_p",
+  "text",
   "max_output_tokens",
   "include",
   "metadata",
@@ -362,7 +363,7 @@ function applyCodexOpenAiResponsesContract(payload, profile) {
   }
 
   payload.stream = true;
-  payload.store = false;
+  payload.store = payload.store ?? true;
   delete payload.max_output_tokens;
   delete payload.temperature;
   delete payload.top_p;

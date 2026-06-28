@@ -26,6 +26,28 @@ test("usage store records model route and token usage from router logs", () => {
   assert.equal(summary.byModel[0].calls, 1);
 });
 
+test("usage store separates fresh input from cache-read tokens", () => {
+  const usage = createUsageStore();
+
+  usage.recordLine("[10:15:31] [2026-06-28T18:15:31.858Z] req_cache1 <- /v1/responses model=gpt-5.5 route=gpt-5.5 api=responses upstream_model=gpt-5.5 stream=true previous_response_id=- client_auth=codex_openai upstream_auth=codex_openai");
+  usage.recordLine("[10:15:35] [2026-06-28T18:15:35.184Z] req_cache1 <- upstream route=gpt-5.5 usage prompt=16000 cached=15400 fresh=600 completion=20 total=16020");
+
+  const [event] = usage.events();
+  assert.equal(event.promptTokens, 16000);
+  assert.equal(event.cacheReadTokens, 15400);
+  assert.equal(event.freshPromptTokens, 600);
+  assert.equal(event.completionTokens, 20);
+  assert.equal(event.totalTokens, 16020);
+
+  const summary = usage.summary();
+  assert.equal(summary.promptTokens, 16000);
+  assert.equal(summary.freshPromptTokens, 600);
+  assert.equal(summary.cacheReadTokens, 15400);
+  assert.equal(summary.byModel[0].promptTokens, 16000);
+  assert.equal(summary.byModel[0].freshPromptTokens, 600);
+  assert.equal(summary.byModel[0].cacheReadTokens, 15400);
+});
+
 test("usage store records status-only responses for responses api routes", () => {
   const usage = createUsageStore();
 

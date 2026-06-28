@@ -342,19 +342,39 @@ function extractResponsesSummaryText(response) {
 
 function responseUsage(usage = {}) {
   usage ||= {};
-  const inputTokens = usage.prompt_tokens || usage.input_tokens || 0;
-  const outputTokens = usage.completion_tokens || usage.output_tokens || 0;
+  const inputTokens = tokenNumber(usage.prompt_tokens, usage.input_tokens);
+  const outputTokens = tokenNumber(usage.completion_tokens, usage.output_tokens);
   return {
     input_tokens: inputTokens,
     output_tokens: outputTokens,
-    total_tokens: usage.total_tokens || inputTokens + outputTokens,
+    total_tokens: tokenNumber(usage.total_tokens, inputTokens + outputTokens),
     input_tokens_details: {
-      cached_tokens: usage.prompt_tokens_details?.cached_tokens || 0,
+      cached_tokens: cachedInputTokens(usage),
     },
     output_tokens_details: {
       reasoning_tokens: usage.completion_tokens_details?.reasoning_tokens || 0,
     },
   };
+}
+
+function cachedInputTokens(usage = {}) {
+  return tokenNumber(
+    usage.prompt_cache_hit_tokens,
+    usage.cache_read_input_tokens,
+    usage.cache_read_tokens,
+    usage.prompt_tokens_details?.cached_tokens,
+    usage.input_tokens_details?.cached_tokens,
+  );
+}
+
+function tokenNumber(...values) {
+  for (const value of values) {
+    const number = Number(value);
+    if (Number.isFinite(number) && number >= 0) {
+      return number;
+    }
+  }
+  return 0;
 }
 
 function responseItems(input) {

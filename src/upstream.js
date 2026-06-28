@@ -55,6 +55,7 @@ const DUPLICATE_INITIAL_REQUEST_TTL_MS = 120_000;
 const DUPLICATE_INITIAL_REQUEST_PENDING_TTL_MS = 60_000;
 const DUPLICATE_INITIAL_REQUEST_ERROR_TTL_MS = 30_000;
 const DUPLICATE_TURN_REQUEST_TTL_MS = 30_000;
+const DUPLICATE_OPAQUE_TURN_REQUEST_TTL_MS = 120_000;
 const DUPLICATE_INITIAL_REQUEST_MAX_ENTRIES = 200;
 const DEFAULT_CHAT_TOOL_CONTINUATION_TURNS = 5;
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 300_000;
@@ -697,6 +698,16 @@ function duplicateInitialRequestKeys(requestBody = {}, route = {}, context = {})
       cacheAnyError: true,
     });
   }
+  const opaqueClientTurnKey = duplicateOpaqueClientTurnRequestKey(requestBody, route, context);
+  if (opaqueClientTurnKey) {
+    keys.push({
+      key: `opaque_client_turn:${opaqueClientTurnKey}`,
+      kind: "opaque_client_turn",
+      ttlMs: DUPLICATE_OPAQUE_TURN_REQUEST_TTL_MS,
+      pendingTtlMs: DUPLICATE_INITIAL_REQUEST_PENDING_TTL_MS,
+      cacheAnyError: true,
+    });
+  }
   return keys;
 }
 
@@ -807,6 +818,55 @@ function duplicateClientTurnRequestKey(requestBody = {}, route = {}, context = {
   return createHash("sha256").update(material).digest("hex");
 }
 
+function duplicateOpaqueClientTurnRequestKey(requestBody = {}, route = {}, context = {}) {
+  if (
+    !["chat_completions", "responses"].includes(route.api) ||
+    !isCodexClientRequest(context)
+  ) {
+    return "";
+  }
+  if (!requestHasFreshInput(requestBody) || requestHasToolProtocolInput(requestBody)) {
+    return "";
+  }
+  const input = requestBody.messages ?? requestBody.input;
+  const profile = opaqueUserInputProfile(input);
+  if (!profile.hasOpaqueUserInput || profile.visibleUserInputCount > 0) {
+    return "";
+  }
+  const headers = context.clientHeaders || {};
+  const turnIdentity = codexTurnIdentity(headers);
+  const material = stableStringify({
+    client: {
+      threadId: headerValue(headers, "x-codex-thread-id") || headerValue(headers, "thread-id") || "",
+      windowId: headerValue(headers, "x-codex-window-id") || "",
+      parentThreadId: headerValue(headers, "x-codex-parent-thread-id") || "",
+      installationId: headerValue(headers, "x-codex-installation-id") || "",
+      userAgent: headerValue(headers, "user-agent") || "",
+    },
+    compactKind: context.compactKind || "",
+    inputShape: turnIdentity
+      ? { turnIdentity }
+      : {
+          userInputCount: profile.userInputCount,
+          opaqueUserInputCount: profile.opaqueUserInputCount,
+          hasPreviousResponseId: Boolean(requestBody.previous_response_id),
+        },
+  });
+  return createHash("sha256").update(material).digest("hex");
+}
+
+function codexTurnIdentity(headers = {}) {
+  const state = headerValue(headers, "x-codex-turn-state") || "";
+  const metadata = headerValue(headers, "x-codex-turn-metadata") || "";
+  if (!state && !metadata) {
+    return "";
+  }
+  const metadataHash = metadata
+    ? createHash("sha256").update(metadata).digest("hex")
+    : "";
+  return stableStringify({ state, metadataHash });
+}
+
 function requestHasToolProtocolInput(requestBody = {}) {
   return responseInputItems(requestBody.messages ?? requestBody.input).some((item) =>
     inputItemContainsToolProtocol(item),
@@ -891,17 +951,47 @@ function normalizeUserInputSignature(value) {
 }
 
 function inputHasOpaqueUserInput(input) {
-  return responseInputItems(input).some((item) => {
+  return opaqueUserInputProfile(input).hasOpaqueUserInput;
+}
+
+function opaqueUserInputProfile(input) {
+  const items = responseInputItems(input);
+  const profile = {
+    itemCount: items.length,
+    userInputCount: 0,
+    opaqueUserInputCount: 0,
+    visibleUserInputCount: 0,
+    latestUserIndex: -1,
+    hasOpaqueUserInput: false,
+  };
+  items.forEach((item, index) => {
     if (!item || typeof item !== "object") {
-      return false;
+      if (typeof item === "string" && item.trim()) {
+        profile.userInputCount += 1;
+        profile.visibleUserInputCount += 1;
+        profile.latestUserIndex = index;
+      }
+      return;
     }
     const role = String(item.role || "").toLowerCase();
-    return (
-      (role === "user" || (item.type === "message" && role === "user")) &&
+    if (role !== "user" && !(item.type === "message" && role === "user")) {
+      return;
+    }
+    profile.userInputCount += 1;
+    profile.latestUserIndex = index;
+    const visibleText = contentToText(item.content ?? item.text ?? item.output ?? "");
+    if (visibleText.trim()) {
+      profile.visibleUserInputCount += 1;
+    }
+    if (
       typeof item.encrypted_content === "string" &&
       item.encrypted_content.trim().length > 0
-    );
+    ) {
+      profile.opaqueUserInputCount += 1;
+      profile.hasOpaqueUserInput = true;
+    }
   });
+  return profile;
 }
 
 function isCodexClientRequest(context = {}) {
@@ -2861,6 +2951,7 @@ function logUsage(context, route, usage) {
   console.log(
     `[${new Date().toISOString()}] ${requestId} <- upstream ` +
       `route=${route.id} usage prompt=${normalized.prompt_tokens} ` +
+      `cached=${normalized.cache_read_tokens} fresh=${normalized.fresh_prompt_tokens} ` +
       `completion=${normalized.completion_tokens} total=${normalized.total_tokens}`,
   );
 }
@@ -3241,6 +3332,30 @@ function normalizeUsage(usage = {}) {
     usage.completionTokens,
     usage.outputTokens,
   );
+  const cacheReadTokens = tokenNumber(
+    usage.prompt_cache_hit_tokens,
+    usage.cache_read_input_tokens,
+    usage.cache_read_tokens,
+    usage.prompt_tokens_details?.cached_tokens,
+    usage.input_tokens_details?.cached_tokens,
+    usage.promptTokensDetails?.cachedTokens,
+    usage.inputTokensDetails?.cachedTokens,
+  );
+  const cacheCreationTokens = tokenNumber(
+    usage.cache_creation_input_tokens,
+    usage.cache_creation_tokens,
+    usage.cache_write_input_tokens,
+    usage.cache_write_tokens,
+  );
+  const cacheMissTokens = tokenNumber(
+    usage.prompt_cache_miss_tokens,
+    usage.cache_miss_input_tokens,
+    usage.cache_miss_tokens,
+  );
+  const freshPromptTokens =
+    cacheMissTokens > 0
+      ? cacheMissTokens
+      : Math.max(0, promptTokens - cacheReadTokens);
   const totalTokens = tokenNumber(
     usage.total_tokens,
     usage.totalTokens,
@@ -3248,6 +3363,10 @@ function normalizeUsage(usage = {}) {
   );
   return {
     prompt_tokens: promptTokens,
+    fresh_prompt_tokens: freshPromptTokens,
+    cache_read_tokens: cacheReadTokens,
+    cache_creation_tokens: cacheCreationTokens,
+    cache_miss_tokens: cacheMissTokens,
     completion_tokens: completionTokens,
     total_tokens: totalTokens,
   };

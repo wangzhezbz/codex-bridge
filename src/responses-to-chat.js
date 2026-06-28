@@ -32,6 +32,10 @@ const COMMAND_TOOL_GUIDANCE =
   "and a command or shell tool is available, call that tool and report the exact command output. " +
   "For git push, inspect git status and remotes if needed, then run git push with the configured remote. " +
   "Do not claim network, GitHub, sandbox, or approval is unavailable unless an attempted command returns that error.";
+const GITHUB_REPOSITORY_COMMAND_GUIDANCE =
+  "CodexBridge GitHub repository guidance: when the user asks to inspect or open a GitHub repository " +
+  "and a command or shell tool is available, call that tool to open the repository URL or query the GitHub API. " +
+  "Do not ask the user to open it themselves unless the attempted command fails.";
 const TOOL_RESULT_CONTEXT_HEADER =
   "CodexBridge tool result context: these tool outputs are already completed historical results. " +
   "Do not repeat or re-run these tool calls just because they appear here. " +
@@ -843,11 +847,14 @@ function toolGuidanceFromContext(toolContext, request = {}) {
     !chatNameForTool(toolContext, "mcp__node_repl__js");
   const needsCommandGuidance =
     names.some(isCommandToolName) && requestMentionsCommandWork(request);
+  const needsGitHubRepositoryGuidance =
+    names.some(isCommandToolName) && requestMentionsGitHubRepositoryInspection(request);
   const needsToolOutputContinuationGuidance = requestHasResponseToolOutput(request);
   return [
     needsGuidance ? MCP_TOOL_GUIDANCE : "",
     needsInteractiveFallbackGuidance ? INTERACTIVE_CHAT_FALLBACK_GUIDANCE : "",
     needsCommandGuidance ? COMMAND_TOOL_GUIDANCE : "",
+    needsGitHubRepositoryGuidance ? GITHUB_REPOSITORY_COMMAND_GUIDANCE : "",
     needsToolOutputContinuationGuidance ? TOOL_OUTPUT_CONTINUATION_GUIDANCE : "",
   ]
     .filter(Boolean)
@@ -885,6 +892,18 @@ function requestMentionsCommandWork(request = {}) {
 
 function requestCurrentUserText(request = {}) {
   return currentInputText(request.input ?? request.messages);
+}
+
+function requestMentionsGitHubRepositoryInspection(request = {}) {
+  return textMentionsGitHubRepositoryInspection(requestCurrentUserText(request));
+}
+
+function textMentionsGitHubRepositoryInspection(text = "") {
+  const value = String(text || "");
+  if (!/github|repository|repo|仓库/i.test(value)) {
+    return false;
+  }
+  return /(?:https?:\/\/github\.com\/)?[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/.test(value);
 }
 
 function currentInputText(input) {
@@ -1032,6 +1051,9 @@ function requestMentionsInteractivePluginWork(request = {}) {
 
 export function interactivePluginKindForRequest(request = {}) {
   const text = requestCurrentUserText(request);
+  if (textMentionsGitHubRepositoryInspection(text)) {
+    return "chrome";
+  }
   if (/@chrome\b|control[-_\s]?chrome|chrome\s*:/i.test(text)) {
     return "chrome";
   }

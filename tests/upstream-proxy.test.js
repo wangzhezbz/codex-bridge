@@ -856,6 +856,9 @@ test("responses stream logs token usage from completed SSE event", async () => {
             input_tokens: 12,
             output_tokens: 34,
             total_tokens: 46,
+            input_tokens_details: {
+              cached_tokens: 5,
+            },
           },
         },
       })}\n\n`,
@@ -895,7 +898,7 @@ test("responses stream logs token usage from completed SSE event", async () => {
     assert.match(res.body(), /response.completed/);
     assert.ok(
       logs.some((line) =>
-        line.includes("req_usage <- upstream route=gpt-5.5 usage prompt=12 completion=34 total=46"),
+        line.includes("req_usage <- upstream route=gpt-5.5 usage prompt=12 cached=5 fresh=7 completion=34 total=46"),
       ),
       "expected Responses SSE usage to be logged",
     );

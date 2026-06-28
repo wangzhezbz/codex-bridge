@@ -294,7 +294,7 @@ test("route fidelity matrix keeps native GPT Responses contracts separate", () =
   );
   assert.deepEqual(filtered.metadata, { trace: "ok" });
   assert.equal(filtered.stream, true);
-  assert.equal(filtered.store, false);
+  assert.equal(filtered.store, true);
   assert.equal(filtered.max_output_tokens, undefined);
   assert.deepEqual(filtered.include, ["output_text", "reasoning.encrypted_content"]);
   assert.equal(filtered.response_format, undefined);
@@ -607,6 +607,13 @@ test("route fidelity compaction strips tools from upstream summarization and rep
           },
         },
       ],
+      usage: {
+        prompt_tokens: 16000,
+        completion_tokens: 40,
+        total_tokens: 16040,
+        prompt_cache_hit_tokens: 15400,
+        prompt_cache_miss_tokens: 600,
+      },
     },
     deepseekRoute.id,
   );
@@ -621,6 +628,8 @@ test("route fidelity compaction strips tools from upstream summarization and rep
 
   assert.equal(response.output.length, 1);
   assert.equal(response.output[0].type, "compaction");
+  assert.equal(response.usage.input_tokens, 16000);
+  assert.equal(response.usage.input_tokens_details.cached_tokens, 15400);
   assert.match(replay[0].content, /Summary: preserve the route decision/);
   assert.equal(replay[1].content, "continue after compact");
 });

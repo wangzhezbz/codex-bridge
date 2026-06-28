@@ -98,7 +98,7 @@ test("model catalog uses configured catalog context as the Codex desktop safety 
   assert.equal(catalog.models[0].auto_compact_token_limit, 206720);
 });
 
-test("chat catalog exposes a bridge-sized context window to avoid Codex local overflow", () => {
+test("chat catalog keeps the configured upstream context instead of inflating history", () => {
   const catalog = buildModelCatalog({
     models: [
       {
@@ -112,9 +112,29 @@ test("chat catalog exposes a bridge-sized context window to avoid Codex local ov
     ],
   });
 
-  assert.equal(catalog.models[0].context_window, 1_000_000);
-  assert.equal(catalog.models[0].truncation_policy.limit, 950_000);
-  assert.equal(catalog.models[0].auto_compact_token_limit, 800_000);
+  assert.equal(catalog.models[0].context_window, 8192);
+  assert.equal(catalog.models[0].truncation_policy.limit, 7782);
+  assert.equal(catalog.models[0].auto_compact_token_limit, 6553);
+});
+
+test("chat catalog can still expose a larger explicit catalog context window", () => {
+  const catalog = buildModelCatalog({
+    models: [
+      {
+        id: "gpt-5.2",
+        displayName: "ERNIE 4.0 Turbo 8K",
+        api: "chat_completions",
+        baseUrl: "http://example.test/v1",
+        model: "ernie-4.0-turbo-8k",
+        contextWindow: 8192,
+        catalogContextWindow: 200000,
+      },
+    ],
+  });
+
+  assert.equal(catalog.models[0].context_window, 200000);
+  assert.equal(catalog.models[0].truncation_policy.limit, 190000);
+  assert.equal(catalog.models[0].auto_compact_token_limit, 160000);
 });
 
 test("chat catalog accepts standard Codex reasoning levels for model switching", () => {
@@ -1005,6 +1025,36 @@ test("custom apply_patch maps to chat function and back to custom_tool_call", ()
   assert.equal(response.output[0].type, "custom_tool_call");
   assert.equal(response.output[0].name, "apply_patch");
   assert.match(response.output[0].input, /\*\*\* Begin Patch/);
+});
+
+test("chat responses preserve provider cache-hit usage details for Codex", () => {
+  const response = chatResponseToResponse(
+    {
+      id: "chatcmpl_cache",
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: "cached hello",
+          },
+        },
+      ],
+      usage: {
+        prompt_tokens: 16000,
+        completion_tokens: 20,
+        total_tokens: 16020,
+        prompt_cache_hit_tokens: 15400,
+        prompt_cache_miss_tokens: 600,
+      },
+    },
+    "deepseek-v4-pro",
+    null,
+  );
+
+  assert.equal(response.usage.input_tokens, 16000);
+  assert.equal(response.usage.input_tokens_details.cached_tokens, 15400);
+  assert.equal(response.usage.output_tokens, 20);
+  assert.equal(response.usage.total_tokens, 16020);
 });
 
 test("previous_response_id restores assistant tool calls before tool output", () => {
@@ -2407,6 +2457,53 @@ test("interactive plugin requests prefer command fallback when Node REPL is not 
     type: "function",
     function: { name: "shell_command" },
   });
+});
+
+test("github repository inspection uses command fallback on chat routes", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "GitHub 看看这是什么 wangzhezbz/codex-bridge",
+      tools: [
+        {
+          type: "namespace",
+          name: "mcp__node_repl__",
+          tools: [
+            {
+              type: "function",
+              name: "js",
+              description: "Run JavaScript.",
+              parameters: {
+                type: "object",
+                properties: {
+                  code: { type: "string" },
+                },
+                required: ["code"],
+              },
+            },
+          ],
+        },
+        {
+          type: "function",
+          name: "shell_command",
+          description: "Run shell.",
+          parameters: { type: "object", properties: {} },
+        },
+      ],
+    },
+    route,
+    new ResponseHistory(),
+  );
+
+  assert.deepEqual(converted.body.tool_choice, {
+    type: "function",
+    function: { name: "shell_command" },
+  });
+  assert.equal(
+    converted.body.tools.some((tool) => tool.function?.name === "mcp__node_repl__js"),
+    false,
+  );
+  assert.match(converted.body.messages[0].content, /GitHub repository/i);
+  assert.match(converted.body.messages[0].content, /Do not ask the user to open/i);
 });
 
 test("chat providers do not expose Node REPL MCP tools for interactive plugin requests", () => {

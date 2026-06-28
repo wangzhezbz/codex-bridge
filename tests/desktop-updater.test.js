@@ -1,8 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 import {
   assetNameForPlatform,
+  cleanupManagedUpdateArtifacts,
   fetchLatestRelease,
   fetchInitForUpdateDownload,
   generateMacPortableUpdateScript,
@@ -53,7 +56,8 @@ test("updater compares release versions without string-order mistakes", () => {
 });
 
 test("updater selects the preferred install asset for the current platform", () => {
-  assert.equal(assetNameForPlatform("win32", "x64"), "CodexBridge-Windows-x64-Setup.exe");
+  assert.equal(assetNameForPlatform("win32", "x64", { installKind: "installed" }), "CodexBridge-Windows-x64-Setup.exe");
+  assert.equal(assetNameForPlatform("win32", "x64", { installKind: "portable" }), "CodexBridge-Windows-x64-Portable.zip");
   assert.equal(assetNameForPlatform("darwin", "arm64"), "CodexBridge-macOS-arm64-Portable.zip");
   assert.equal(assetNameForPlatform("darwin", "x64"), "CodexBridge-macOS-x64-Portable.zip");
   assert.equal(assetNameForPlatform("linux", "x64"), null);
@@ -64,6 +68,7 @@ test("updater plans a direct install from the latest matching release asset", ()
     currentVersion: "0.1.65",
     platform: "win32",
     arch: "x64",
+    installKind: "installed",
     release,
   });
 
@@ -80,6 +85,7 @@ test("updater marks Windows setup as primary while preserving portable fallback 
     currentVersion: "0.1.65",
     platform: "win32",
     arch: "x64",
+    installKind: "installed",
     release,
   });
 
@@ -87,8 +93,24 @@ test("updater marks Windows setup as primary while preserving portable fallback 
   assert.equal(plan.asset.kind, "installer");
   assert.equal(plan.fallbackAsset.name, "CodexBridge-Windows-x64-Portable.zip");
   assert.equal(plan.fallbackAsset.kind, "portable");
-  assert.match(plan.nextStep, /Windows Setup/);
-  assert.match(plan.nextStep, /updates/);
+  assert.doesNotMatch(plan.nextStep, /Windows Setup installer will be saved|updates folder|manual fallback/);
+});
+
+test("updater keeps portable builds on portable update packages even when setup exists", () => {
+  const plan = planReleaseUpdate({
+    currentVersion: "0.1.65",
+    platform: "win32",
+    arch: "x64",
+    installKind: "portable",
+    release,
+  });
+
+  assert.equal(plan.ok, true);
+  assert.equal(plan.asset.name, "CodexBridge-Windows-x64-Portable.zip");
+  assert.equal(plan.asset.kind, "portable");
+  assert.equal(plan.installMode, "manual_portable");
+  assert.equal(plan.fallbackAsset, null);
+  assert.doesNotMatch(plan.nextStep, /Windows Setup installer will be saved|updates folder|manual fallback/);
 });
 
 test("updater falls back to the portable asset when no installer is published", () => {
@@ -100,6 +122,7 @@ test("updater falls back to the portable asset when no installer is published", 
     currentVersion: "0.1.65",
     platform: "win32",
     arch: "x64",
+    installKind: "installed",
     release: portableOnlyRelease,
   });
 
@@ -108,8 +131,7 @@ test("updater falls back to the portable asset when no installer is published", 
   assert.equal(plan.asset.kind, "portable");
   assert.equal(plan.installMode, "manual_portable");
   assert.equal(plan.fallbackAsset, null);
-  assert.match(plan.nextStep, /manual fallback/);
-  assert.match(plan.nextStep, /updates/);
+  assert.doesNotMatch(plan.nextStep, /Windows Setup installer will be saved|updates folder|manual fallback/);
 });
 
 test("updater reports current and unsupported states clearly", () => {
@@ -221,6 +243,33 @@ test("updater falls back to GitHub latest redirect when release API is rate limi
   assert.equal(plan.updateAvailable, true);
   assert.equal(plan.latestVersion, "0.1.94");
   assert.equal(plan.asset.kind, "installer");
+});
+
+test("updater cleans old managed update artifacts while keeping the newest package", async () => {
+  const root = fs.mkdtempSync(path.join(process.cwd(), ".tmp-updates-"));
+  const files = [
+    "2026-06-28-010000000-CodexBridge-Windows-x64-Setup.exe",
+    "install-update-2026-06-28-010000000.txt",
+    "2026-06-28-020000000-CodexBridge-Windows-x64-Setup.exe",
+    "install-update-2026-06-28-020000000.txt",
+    "keep-user-file.txt",
+  ];
+  for (const file of files) {
+    fs.writeFileSync(path.join(root, file), file);
+  }
+
+  await cleanupManagedUpdateArtifacts(root, { keepPackages: 1 });
+
+  assert.equal(fs.existsSync(path.join(root, "2026-06-28-010000000-CodexBridge-Windows-x64-Setup.exe")), false);
+  assert.equal(fs.existsSync(path.join(root, "install-update-2026-06-28-010000000.txt")), false);
+  assert.equal(fs.existsSync(path.join(root, "2026-06-28-020000000-CodexBridge-Windows-x64-Setup.exe")), true);
+  assert.equal(fs.existsSync(path.join(root, "install-update-2026-06-28-020000000.txt")), true);
+  assert.equal(fs.existsSync(path.join(root, "keep-user-file.txt")), true);
+
+  for (const file of fs.readdirSync(root)) {
+    fs.rmSync(path.join(root, file), { force: true });
+  }
+  fs.rmdirSync(root);
 });
 
 test("Windows portable updater script replaces and restarts without batch deletion", () => {

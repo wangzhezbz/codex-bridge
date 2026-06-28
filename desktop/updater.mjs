@@ -1,3 +1,5 @@
+import fs from "node:fs/promises";
+import path from "node:path";
 import { fetchInitWithProxy, proxyLogLabel } from "../src/proxy.js";
 
 export const GITHUB_LATEST_RELEASE_URL =
@@ -35,12 +37,21 @@ const RELEASE_ASSETS = [
 ];
 const RELEASE_ASSET_NAMES = RELEASE_ASSETS.map((asset) => asset.name);
 
-export function assetNameForPlatform(platform = process.platform, arch = process.arch) {
-  return assetCandidatesForPlatform(platform, arch)[0]?.name || null;
+export function assetNameForPlatform(platform = process.platform, arch = process.arch, options = {}) {
+  return assetCandidatesForPlatform(platform, arch, options)[0]?.name || null;
 }
 
-function assetCandidatesForPlatform(platform = process.platform, arch = process.arch) {
-  return RELEASE_ASSETS.filter((asset) => asset.platform === platform && asset.arch === arch);
+function assetCandidatesForPlatform(platform = process.platform, arch = process.arch, options = {}) {
+  const candidates = RELEASE_ASSETS.filter((asset) => asset.platform === platform && asset.arch === arch);
+  if (platform === "win32" && options.installKind === "portable") {
+    return [...candidates].sort((left, right) => {
+      if (left.kind === right.kind) {
+        return 0;
+      }
+      return left.kind === "portable" ? -1 : 1;
+    });
+  }
+  return candidates;
 }
 
 export function isNewerVersion(latestTag, currentVersion) {
@@ -63,9 +74,10 @@ export function planReleaseUpdate({
   currentVersion,
   platform = process.platform,
   arch = process.arch,
+  installKind = "installed",
   release,
 } = {}) {
-  const assetCandidates = assetCandidatesForPlatform(platform, arch);
+  const assetCandidates = assetCandidatesForPlatform(platform, arch, { installKind });
   const latestVersion = normalizeVersion(release?.tag_name || release?.name || "");
   if (!assetCandidates.length) {
     return {
@@ -122,12 +134,66 @@ export function planReleaseUpdate({
     asset: releaseAssetPayload(asset, candidate),
     fallbackAsset: fallbackAsset ? releaseAssetPayload(fallbackAsset, fallbackCandidate) : null,
     nextStep: installMode === "windows_setup"
-      ? "Windows Setup installer will be saved in the updates folder, then launched. If Windows blocks it, open the updates folder and run the downloaded installer manually."
-      : "This is a portable manual fallback. The zip will be saved in the updates folder; the current app will keep running so you can open the extracted new app manually.",
+      ? "下载完成后会打开安装器，并退出当前窗口；安装完成后会启动新版。"
+      : "下载完成后会保存在更新目录；当前程序保持运行，可退出后手动解压打开新版。",
     message: updateAvailable
       ? `发现新版本 ${latestVersion}。`
       : `当前已经是最新版本 ${normalizeVersion(currentVersion)}。`,
   };
+}
+
+const MANAGED_PACKAGE_RE = /^(\d{4}-\d{2}-\d{2}-\d{9})-CodexBridge-.*\.(?:exe|zip|dmg)$/i;
+const MANAGED_SIDE_FILE_RE = /^(?:install|manual|apply)-update-(\d{4}-\d{2}-\d{2}-\d{9})\.(?:txt|ps1|sh)$/i;
+
+export async function cleanupManagedUpdateArtifacts(updateDir, { keepPackages = 2 } = {}) {
+  const resolvedDir = path.resolve(String(updateDir || ""));
+  if (!resolvedDir) {
+    return { deleted: [] };
+  }
+  let entries = [];
+  try {
+    entries = await fs.readdir(resolvedDir, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return { deleted: [] };
+    }
+    throw error;
+  }
+
+  const packageEntries = entries
+    .filter((entry) => entry.isFile() && MANAGED_PACKAGE_RE.test(entry.name))
+    .map((entry) => ({
+      name: entry.name,
+      stamp: entry.name.match(MANAGED_PACKAGE_RE)?.[1] || "",
+    }))
+    .sort((left, right) => right.stamp.localeCompare(left.stamp));
+  const keepStamps = new Set(packageEntries.slice(0, Math.max(0, keepPackages)).map((entry) => entry.stamp));
+  const deleteNames = new Set();
+  for (const entry of packageEntries) {
+    if (!keepStamps.has(entry.stamp)) {
+      deleteNames.add(entry.name);
+    }
+  }
+  for (const entry of entries) {
+    if (!entry.isFile()) {
+      continue;
+    }
+    const sideMatch = entry.name.match(MANAGED_SIDE_FILE_RE);
+    if (sideMatch && !keepStamps.has(sideMatch[1])) {
+      deleteNames.add(entry.name);
+    }
+  }
+
+  const deleted = [];
+  for (const name of [...deleteNames].sort()) {
+    const filePath = path.resolve(resolvedDir, name);
+    if (path.dirname(filePath) !== resolvedDir) {
+      continue;
+    }
+    await fs.rm(filePath, { force: true });
+    deleted.push(filePath);
+  }
+  return { deleted };
 }
 
 function releaseAssetPayload(asset, assetInfo) {
