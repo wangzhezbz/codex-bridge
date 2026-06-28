@@ -7263,6 +7263,123 @@ test("server stops Codex desktop replay when only volatile retry metadata change
   }
 });
 
+test("server stops Codex desktop replay even when old tool history is present", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    upstreamCalls += 1;
+    const body = await readJson(req);
+    assert.equal(body.model, "deepseek-v4-pro");
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: `chatcmpl_tool_history_replay_${upstreamCalls}`,
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: `tool history replay answer ${upstreamCalls}`,
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 24000,
+          completion_tokens: 80,
+          total_tokens: 24080,
+        },
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const headers = {
+    "content-type": "application/json",
+    authorization: "Bearer router-token",
+    "user-agent": "Codex Desktop/0.142.3",
+    "x-codex-thread-id": "thread_tool_history_replay",
+    "x-codex-window-id": "window_tool_history_replay",
+  };
+  const oldToolHistory = [
+    {
+      type: "function_call",
+      call_id: "call_old_shell",
+      name: "shell",
+      arguments: JSON.stringify({ command: "pwd" }),
+    },
+    {
+      type: "function_call_output",
+      call_id: "call_old_shell",
+      output: "F:/game_code/router",
+    },
+  ];
+  const userMessage = {
+    type: "message",
+    role: "user",
+    content: [{ type: "input_text", text: "hello from a replayed turn" }],
+  };
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        stream: true,
+        metadata: { retryCounter: 1 },
+        input: [...oldToolHistory, userMessage],
+      }),
+    });
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /tool history replay answer 1/);
+    assert.equal(upstreamCalls, 1);
+
+    const second = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        stream: true,
+        previous_response_id: "resp_codex_replay_with_old_tool_history",
+        metadata: { retryCounter: 2 },
+        input: [
+          ...oldToolHistory,
+          userMessage,
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "tool history replay answer 1" }],
+          },
+        ],
+      }),
+    });
+    assert.equal(second.statusCode, 200);
+    assert.match(second.body, /tool history replay answer 1/);
+    assert.equal(upstreamCalls, 1);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
 test("server lets a real next Codex desktop user message reach upstream", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer(async (req, res) => {
@@ -7362,6 +7479,112 @@ test("server lets a real next Codex desktop user message reach upstream", async 
     });
     assert.equal(second.statusCode, 200);
     assert.match(second.body, /next user message answer 2/);
+    assert.equal(upstreamCalls, 2);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("server lets current Codex desktop tool output reach upstream", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    upstreamCalls += 1;
+    const body = await readJson(req);
+    assert.equal(body.model, "deepseek-v4-pro");
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: `chatcmpl_current_tool_output_${upstreamCalls}`,
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: `current tool output answer ${upstreamCalls}`,
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 100,
+          completion_tokens: 5,
+          total_tokens: 105,
+        },
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const headers = {
+    "content-type": "application/json",
+    authorization: "Bearer router-token",
+    "user-agent": "Codex Desktop/0.142.3",
+    "x-codex-thread-id": "thread_current_tool_output",
+    "x-codex-window-id": "window_current_tool_output",
+  };
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        stream: true,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "use a tool then continue" }],
+          },
+        ],
+      }),
+    });
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /current tool output answer 1/);
+    assert.equal(upstreamCalls, 1);
+
+    const second = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        stream: true,
+        previous_response_id: "resp_current_tool_output",
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "use a tool then continue" }],
+          },
+          {
+            type: "function_call_output",
+            call_id: "call_current_shell",
+            output: "tool result that the model still needs to read",
+          },
+        ],
+      }),
+    });
+    assert.equal(second.statusCode, 200);
+    assert.match(second.body, /current tool output answer 2/);
     assert.equal(upstreamCalls, 2);
   } finally {
     await close(router);

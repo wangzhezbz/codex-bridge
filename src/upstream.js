@@ -653,10 +653,12 @@ function duplicateSemanticTurnRequestKey(requestBody = {}, route = {}, context =
   ) {
     return "";
   }
-  if (!requestHasFreshInput(requestBody) || requestHasToolProtocolInput(requestBody)) {
+  if (!requestHasFreshInput(requestBody)) {
     return "";
   }
-  const latestUser = latestUserInputSignature(requestBody.messages ?? requestBody.input);
+  const latestUser = latestSemanticUserInputSignature(
+    requestBody.messages ?? requestBody.input,
+  );
   if (!latestUser) {
     return "";
   }
@@ -712,6 +714,22 @@ function latestUserInputSignature(input) {
   const items = responseInputItems(input);
   for (let index = items.length - 1; index >= 0; index -= 1) {
     const text = userInputText(items[index]);
+    const normalized = normalizeUserInputSignature(text);
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return "";
+}
+
+function latestSemanticUserInputSignature(input) {
+  const items = responseInputItems(input);
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (inputItemContainsToolProtocol(item)) {
+      return "";
+    }
+    const text = userInputText(item);
     const normalized = normalizeUserInputSignature(text);
     if (normalized) {
       return normalized;
