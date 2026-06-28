@@ -271,7 +271,7 @@ function requestHasFreshInput(requestBody = {}) {
 }
 
 function requestRepeatsPreviousUserContext(requestBody = {}, route = {}, history = null) {
-  if (requestHasToolProtocolInput(requestBody)) {
+  if (requestHasCurrentToolProtocolContinuation(requestBody, history)) {
     return false;
   }
   const previousId = requestBody.previous_response_id;
@@ -299,6 +299,28 @@ function requestRepeatsPreviousUserContext(requestBody = {}, route = {}, history
     currentUsers.length <= previousUserCount &&
     Boolean(previousMeta.hasOpaqueUserInput || currentHasOpaqueUserInput)
   );
+}
+
+function requestHasCurrentToolProtocolContinuation(requestBody = {}, history = null) {
+  if (!requestHasToolProtocolInput(requestBody)) {
+    return false;
+  }
+  const previousId = requestBody.previous_response_id;
+  if (!previousId || !history) {
+    return true;
+  }
+  const previousResponse = history.getResponse?.(previousId);
+  if (previousResponse) {
+    return responseHasRunnableToolCall(previousResponse);
+  }
+  const previousMeta = history.getResponseMeta?.(previousId) || {};
+  if (
+    Array.isArray(previousMeta.toolCallSignatures) &&
+    previousMeta.toolCallSignatures.length > 0
+  ) {
+    return true;
+  }
+  return !previousMeta.routeId;
 }
 
 function previousUserInputSignatures(history, previousId, previousMeta = {}) {
