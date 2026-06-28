@@ -109,6 +109,51 @@ test("usage summary marks whether an upstream row is still the current route", (
   assert.equal(summary.byModel.find((item) => item.upstreamModel === "mimo-v2.5")?.isCurrentRoute, false);
 });
 
+test("usage summary exposes current route totals separately from history", () => {
+  const usage = createUsageStore();
+
+  usage.recordLine("[10:30:00] [2026-06-27T02:30:00.000Z] req_old <- /v1/responses model=gpt-5.5 route=gpt-5.5 api=chat_completions upstream_model=mimo-v2.5 stream=true previous_response_id=- client_auth=codex_openai upstream_auth=api_key");
+  usage.recordLine("[10:30:04] [2026-06-27T02:30:04.000Z] req_old <- upstream route=gpt-5.5 usage prompt=10 completion=2 total=12");
+  usage.recordLine("[10:31:00] [2026-06-27T02:31:00.000Z] req_new <- /v1/responses model=gpt-5.5 route=gpt-5.5 api=chat_completions upstream_model=mimo-v2.5-pro stream=true previous_response_id=- client_auth=codex_openai upstream_auth=api_key");
+  usage.recordLine("[10:31:03] [2026-06-27T02:31:03.000Z] req_new <- upstream route=gpt-5.5 usage prompt=20 completion=4 total=24");
+
+  const summary = usage.summary({
+    routes: [
+      {
+        id: "gpt-5.5",
+        api: "chat_completions",
+        model: "mimo-v2.5-pro",
+      },
+    ],
+  });
+
+  assert.equal(summary.totalTokens, 36);
+  assert.equal(summary.current.totalCalls, 1);
+  assert.equal(summary.current.totalTokens, 24);
+  assert.equal(summary.current.byModel.length, 1);
+  assert.equal(summary.current.byModel[0].upstreamModel, "mimo-v2.5-pro");
+  assert.equal(summary.current.events.length, 1);
+  assert.equal(summary.current.latest.upstreamModel, "mimo-v2.5-pro");
+  assert.equal(summary.history.totalCalls, 1);
+  assert.equal(summary.history.totalTokens, 12);
+  assert.equal(summary.history.byModel.length, 1);
+  assert.equal(summary.history.byModel[0].upstreamModel, "mimo-v2.5");
+});
+
+test("usage summary treats all records as current when no active routes are available", () => {
+  const usage = createUsageStore();
+
+  usage.recordLine("[10:30:00] [2026-06-27T02:30:00.000Z] req_only <- /v1/responses model=gpt-5.5 route=gpt-5.5 api=responses upstream_model=gpt-5.5 stream=true previous_response_id=- client_auth=codex_openai upstream_auth=codex_openai");
+  usage.recordLine("[10:30:04] [2026-06-27T02:30:04.000Z] req_only <- upstream route=gpt-5.5 usage prompt=10 completion=2 total=12");
+
+  const summary = usage.summary();
+
+  assert.equal(summary.current.totalCalls, 1);
+  assert.equal(summary.current.totalTokens, 12);
+  assert.equal(summary.history.totalCalls, 0);
+  assert.equal(summary.history.totalTokens, 0);
+});
+
 test("usage store records request-scoped upstream errors", () => {
   const usage = createUsageStore();
 

@@ -201,6 +201,9 @@ export function createRouterServer(config = loadConfig()) {
     }
     socket.destroy();
   });
+  server.on("clientError", (error, socket) => {
+    handleClientSocketError(error, socket);
+  });
   return server;
 }
 
@@ -279,22 +282,50 @@ function bearerTokenFromHeader(value) {
 
 function clientAbortContext(req, res) {
   const controller = new AbortController();
-  const abort = () => {
+  const abort = (reason) => {
     if (!res.writableEnded && !controller.signal.aborted) {
-      controller.abort(new Error("client connection closed"));
+      const message = reason?.message || "client connection closed";
+      controller.abort(new Error(message));
     }
+  };
+  const socketError = (error) => {
+    abort(error);
   };
   req.once("aborted", abort);
   res.once("close", abort);
   req.socket?.once?.("close", abort);
+  req.socket?.once?.("error", socketError);
   return {
     signal: controller.signal,
     cleanup() {
       req.off("aborted", abort);
       res.off("close", abort);
       req.socket?.off?.("close", abort);
+      req.socket?.off?.("error", socketError);
     },
   };
+}
+
+function handleClientSocketError(error, socket) {
+  const code = String(error?.code || "");
+  const message = safeLogValue(error?.message || error || "unknown client socket error");
+  console.warn(`[${new Date().toISOString()}] client socket error${code ? ` code=${code}` : ""}: ${message}`);
+  if (!socket || socket.destroyed) {
+    return;
+  }
+  if (code === "ECONNRESET" || code === "EPIPE") {
+    socket.destroy();
+    return;
+  }
+  try {
+    if (socket.writable) {
+      socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+      return;
+    }
+  } catch {
+    // Fall through to destroy; socket cleanup must not crash the router.
+  }
+  socket.destroy();
 }
 
 function writeCors(res) {

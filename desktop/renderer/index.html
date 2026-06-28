@@ -25,7 +25,7 @@
           <button class="nav-item" data-section="models">模型</button>
           <button class="nav-item" data-section="providers">密钥</button>
           <button class="nav-item" data-section="stats">统计</button>
-          <button class="nav-item" data-section="codex">Codex</button>
+          <button class="nav-item" data-section="codex">Codex 配置</button>
           <button class="nav-item" data-section="logs">日志</button>
         </nav>
         <div class="sidebar-actions">
@@ -241,8 +241,8 @@
           <article class="panel stats-panel">
             <div class="panel-header">
               <div>
-                <h2>调用统计</h2>
-                <p>记录每次请求的入口模型、实际上游模型、状态码、耗时和 token。用于确认到底走了 GPT、DeepSeek、Kimi 还是其他 API。</p>
+                <h2>当前调用统计</h2>
+                <p>默认只展示当前生效模型栏的请求、状态码、耗时和 token；历史路由只保留为诊断记录，避免旧模型选择误导判断。</p>
               </div>
             </div>
             <div class="grid four stat-summary">
@@ -272,8 +272,8 @@
           <article class="panel">
             <div class="panel-header">
               <div>
-                <h2>Codex 接入</h2>
-                <p>写入前会自动备份原来的 %USERPROFILE%\.codex\config.toml。</p>
+                <h2>Codex 配置接入</h2>
+                <p>把 Codex 的模型栏接到本地 Router。写入前会自动备份原来的 %USERPROFILE%\.codex\config.toml。</p>
               </div>
               <button class="ghost-button light" id="openCodexFolder">打开 Codex 目录</button>
             </div>

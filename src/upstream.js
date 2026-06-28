@@ -53,6 +53,7 @@ const FAILURE_CACHE_FATAL_TTL_MS = 120_000;
 const DUPLICATE_INITIAL_REQUEST_TTL_MS = 120_000;
 const DUPLICATE_INITIAL_REQUEST_PENDING_TTL_MS = 60_000;
 const DUPLICATE_INITIAL_REQUEST_ERROR_TTL_MS = 30_000;
+const DUPLICATE_TURN_REQUEST_TTL_MS = 30_000;
 const DUPLICATE_INITIAL_REQUEST_MAX_ENTRIES = 200;
 const DEFAULT_CHAT_TOOL_CONTINUATION_TURNS = 5;
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 300_000;
@@ -205,7 +206,11 @@ export async function handleResponsesRequest(
     return;
   }
   const guardedContext = duplicateGuard.key
-    ? { ...duplicateContext, duplicateInitialRequestKey: duplicateGuard.key }
+    ? {
+        ...duplicateContext,
+        duplicateInitialRequestKey: duplicateGuard.key,
+        duplicateInitialRequestKeys: duplicateGuard.keys || [duplicateGuard.key],
+      }
     : duplicateContext;
   try {
     if (compactKind && route.api === "chat_completions") {
@@ -343,63 +348,88 @@ function beginDuplicateInitialRequestGuard(
   res,
   context = {},
 ) {
-  const key = duplicateInitialRequestKey(requestBody, route, context);
-  if (!key) {
-    return { key: "", served: false };
+  const keys = duplicateInitialRequestKeys(requestBody, route, context);
+  if (keys.length === 0) {
+    return { key: "", keys: [], served: false };
   }
   trimDuplicateInitialRequestCache();
-  const existing = recentInitialRequests.get(key);
   const now = Date.now();
-  if (existing?.expiresAt > now && existing.status === "completed" && existing.response) {
-    existing.expiresAt = now + DUPLICATE_INITIAL_REQUEST_TTL_MS;
-    serveDuplicateInitialResponse(
-      existing.response,
-      requestBody,
-      route,
-      res,
-      context,
-      existing.reason || "completed",
-    );
-    return { key, served: true };
+  for (const keyInfo of keys) {
+    const existing = recentInitialRequests.get(keyInfo.key);
+    if (existing?.expiresAt > now && existing.status === "completed" && existing.response) {
+      existing.expiresAt = now + keyInfo.ttlMs;
+      serveDuplicateInitialResponse(
+        existing.response,
+        requestBody,
+        route,
+        res,
+        context,
+        existing.reason || keyInfo.kind || "completed",
+      );
+      return {
+        key: keyInfo.key,
+        keys: keys.map((key) => key.key),
+        served: true,
+      };
+    }
+    if (existing?.expiresAt > now && existing.status === "pending") {
+      existing.expiresAt = now + keyInfo.pendingTtlMs;
+      serveDuplicateInitialResponse(
+        duplicateInitialRequestPendingResponse(requestBody, route, context),
+        requestBody,
+        route,
+        res,
+        context,
+        "pending",
+      );
+      return {
+        key: keyInfo.key,
+        keys: keys.map((key) => key.key),
+        served: true,
+      };
+    }
   }
-  if (existing?.expiresAt > now && existing.status === "pending") {
-    existing.expiresAt = now + DUPLICATE_INITIAL_REQUEST_PENDING_TTL_MS;
-    serveDuplicateInitialResponse(
-      duplicateInitialRequestPendingResponse(requestBody, route, context),
-      requestBody,
-      route,
-      res,
-      context,
-      "pending",
-    );
-    return { key, served: true };
+  for (const keyInfo of keys) {
+    recentInitialRequests.set(keyInfo.key, {
+      status: "pending",
+      response: null,
+      expiresAt: now + keyInfo.pendingTtlMs,
+      kind: keyInfo.kind,
+      ttlMs: keyInfo.ttlMs,
+    });
   }
-  recentInitialRequests.set(key, {
-    status: "pending",
-    response: null,
-    expiresAt: now + DUPLICATE_INITIAL_REQUEST_PENDING_TTL_MS,
-  });
-  return { key, served: false };
+  return { key: keys[0].key, keys: keys.map((key) => key.key), served: false };
 }
 
 function finishDuplicateInitialRequestGuard(context = {}, route = {}, response = null) {
-  const key = context.duplicateInitialRequestKey;
-  if (!key || !recentInitialRequests.has(key)) {
+  const keys = duplicateInitialRequestKeysFromContext(context);
+  if (keys.length === 0) {
     return;
   }
   const safeResponse = responseHasRunnableToolCall(response)
     ? duplicateInitialRequestNoopResponse(response?.model || route.id || route.model)
     : duplicateInitialResponse(response);
   if (!safeResponse) {
-    recentInitialRequests.delete(key);
+    for (const key of keys) {
+      recentInitialRequests.delete(key);
+    }
     return;
   }
-  recentInitialRequests.set(key, {
-    status: "completed",
-    response: safeResponse,
-    expiresAt: Date.now() + DUPLICATE_INITIAL_REQUEST_TTL_MS,
-    reason: "completed",
-  });
+  const now = Date.now();
+  for (const key of keys) {
+    const existing = recentInitialRequests.get(key);
+    if (!existing) {
+      continue;
+    }
+    recentInitialRequests.set(key, {
+      status: "completed",
+      response: safeResponse,
+      expiresAt: now + Number(existing.ttlMs || DUPLICATE_INITIAL_REQUEST_TTL_MS),
+      reason: existing.kind === "semantic" ? "semantic_replay" : "completed",
+      kind: existing.kind,
+      ttlMs: existing.ttlMs,
+    });
+  }
 }
 
 function finishDuplicateInitialRequestGuardWithError(
@@ -408,25 +438,33 @@ function finishDuplicateInitialRequestGuardWithError(
   requestBody = {},
   error,
 ) {
-  const key = context.duplicateInitialRequestKey;
-  if (!key) {
+  const keys = duplicateInitialRequestKeysFromContext(context);
+  if (keys.length === 0) {
     return;
   }
-  const existing = recentInitialRequests.get(key);
-  if (existing?.status !== "pending") {
+  const pendingKeys = keys.filter((key) => recentInitialRequests.get(key)?.status === "pending");
+  if (pendingKeys.length === 0) {
     return;
   }
   if (!shouldStopDuplicateRetryAfterError(error)) {
-    recentInitialRequests.delete(key);
+    for (const key of pendingKeys) {
+      recentInitialRequests.delete(key);
+    }
     return;
   }
   const response = duplicateInitialRequestErrorResponse(requestBody, route, error, context);
-  recentInitialRequests.set(key, {
-    status: "completed",
-    response,
-    expiresAt: Date.now() + DUPLICATE_INITIAL_REQUEST_ERROR_TTL_MS,
-    reason: "retry_error",
-  });
+  const now = Date.now();
+  for (const key of pendingKeys) {
+    const existing = recentInitialRequests.get(key);
+    recentInitialRequests.set(key, {
+      status: "completed",
+      response,
+      expiresAt: now + DUPLICATE_INITIAL_REQUEST_ERROR_TTL_MS,
+      reason: "retry_error",
+      kind: existing?.kind,
+      ttlMs: existing?.ttlMs,
+    });
+  }
 }
 
 function serveDuplicateInitialResponse(response, requestBody, route, res, context = {}, reason = "duplicate") {
@@ -546,6 +584,38 @@ function duplicateInitialRequestPendingResponse(requestBody = {}, route = {}, co
   return duplicateInitialRequestNoopResponse(requestBody.model || route.id || route.model);
 }
 
+function duplicateInitialRequestKeys(requestBody = {}, route = {}, context = {}) {
+  const exactKey = duplicateInitialRequestKey(requestBody, route, context);
+  if (!exactKey) {
+    return [];
+  }
+  const keys = [
+    {
+      key: `exact:${exactKey}`,
+      kind: "exact",
+      ttlMs: DUPLICATE_INITIAL_REQUEST_TTL_MS,
+      pendingTtlMs: DUPLICATE_INITIAL_REQUEST_PENDING_TTL_MS,
+    },
+  ];
+  const semanticKey = duplicateSemanticTurnRequestKey(requestBody, route, context);
+  if (semanticKey) {
+    keys.push({
+      key: `semantic:${semanticKey}`,
+      kind: "semantic",
+      ttlMs: DUPLICATE_TURN_REQUEST_TTL_MS,
+      pendingTtlMs: DUPLICATE_INITIAL_REQUEST_PENDING_TTL_MS,
+    });
+  }
+  return keys;
+}
+
+function duplicateInitialRequestKeysFromContext(context = {}) {
+  const keys = Array.isArray(context.duplicateInitialRequestKeys)
+    ? context.duplicateInitialRequestKeys
+    : [context.duplicateInitialRequestKey];
+  return [...new Set(keys.filter((key) => typeof key === "string" && key))];
+}
+
 function duplicateInitialRequestKey(requestBody = {}, route = {}, context = {}) {
   if (
     !["chat_completions", "responses"].includes(route.api) ||
@@ -574,6 +644,102 @@ function duplicateInitialRequestKey(requestBody = {}, route = {}, context = {}) 
     body: requestBody,
   });
   return createHash("sha256").update(material).digest("hex");
+}
+
+function duplicateSemanticTurnRequestKey(requestBody = {}, route = {}, context = {}) {
+  if (
+    !["chat_completions", "responses"].includes(route.api) ||
+    !isCodexClientRequest(context)
+  ) {
+    return "";
+  }
+  if (!requestHasFreshInput(requestBody) || requestHasToolProtocolInput(requestBody)) {
+    return "";
+  }
+  const latestUser = latestUserInputSignature(requestBody.messages ?? requestBody.input);
+  if (!latestUser) {
+    return "";
+  }
+  const headers = context.clientHeaders || {};
+  const material = stableStringify({
+    route: {
+      id: route.id || "",
+      provider: route.provider || route.providerId || "",
+      api: route.api || "",
+      model: route.model || "",
+      baseUrl: route.baseUrl || "",
+      authMode: authModeForRoute(route),
+    },
+    client: {
+      threadId: headerValue(headers, "x-codex-thread-id") || headerValue(headers, "thread-id") || "",
+      windowId: headerValue(headers, "x-codex-window-id") || "",
+      parentThreadId: headerValue(headers, "x-codex-parent-thread-id") || "",
+      installationId: headerValue(headers, "x-codex-installation-id") || "",
+      userAgent: headerValue(headers, "user-agent") || "",
+    },
+    compactKind: context.compactKind || "",
+    latestUser,
+  });
+  return createHash("sha256").update(material).digest("hex");
+}
+
+function requestHasToolProtocolInput(requestBody = {}) {
+  return responseInputItems(requestBody.messages ?? requestBody.input).some((item) =>
+    inputItemContainsToolProtocol(item),
+  );
+}
+
+function inputItemContainsToolProtocol(item) {
+  if (!item || typeof item !== "object") {
+    return false;
+  }
+  if (isResponseToolCallItem(item) || isResponseToolOutputItem(item)) {
+    return true;
+  }
+  if (Array.isArray(item.tool_calls) && item.tool_calls.length > 0) {
+    return true;
+  }
+  if (String(item.role || "").toLowerCase() === "tool") {
+    return true;
+  }
+  if (Array.isArray(item.content)) {
+    return item.content.some(inputItemContainsToolProtocol);
+  }
+  return false;
+}
+
+function latestUserInputSignature(input) {
+  const items = responseInputItems(input);
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const text = userInputText(items[index]);
+    const normalized = normalizeUserInputSignature(text);
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return "";
+}
+
+function userInputText(item) {
+  if (typeof item === "string") {
+    return item;
+  }
+  if (!item || typeof item !== "object") {
+    return "";
+  }
+  if (item.type === "input_text") {
+    return item.text || "";
+  }
+  const role = String(item.role || "").toLowerCase();
+  if (role !== "user" && !(item.type === "message" && role === "user")) {
+    return "";
+  }
+  return contentToText(item.content ?? item.text ?? item.output ?? "");
+}
+
+function normalizeUserInputSignature(value) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  return text ? boundedSignatureText(text) : "";
 }
 
 function isCodexClientRequest(context = {}) {

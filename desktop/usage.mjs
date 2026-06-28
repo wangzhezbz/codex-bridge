@@ -188,6 +188,27 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
       }
       return b.calls - a.calls;
     });
+    const currentByModel = byModel.filter((item) => item.isCurrentRoute !== false);
+    const historyByModel = byModel.filter((item) => item.isCurrentRoute === false);
+    const currentEvents = [];
+    const historyEvents = [];
+    for (const event of records) {
+      if (eventMatchesActiveRoute(event, activeRoutes, hasActiveRoutes)) {
+        currentEvents.push(event);
+      } else {
+        historyEvents.push(event);
+      }
+    }
+    const current = {
+      ...totalsForEvents(currentEvents),
+      byModel: currentByModel,
+      events: currentEvents.slice().reverse(),
+    };
+    const history = {
+      ...totalsForEvents(historyEvents),
+      byModel: historyByModel,
+      events: historyEvents.slice().reverse(),
+    };
 
     return {
       totalCalls: records.length,
@@ -197,6 +218,8 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
       statusCounts,
       byModel,
       latest: records.at(-1) || null,
+      current,
+      history,
     };
   }
 
@@ -287,6 +310,40 @@ function normalizeEvent(event) {
     errorType: String(event.errorType || ""),
     errorCause: String(event.errorCause || ""),
     source: String(event.source || "router"),
+  };
+}
+
+function eventMatchesActiveRoute(event, activeRoutes, hasActiveRoutes) {
+  if (!hasActiveRoutes) {
+    return true;
+  }
+  const active = activeRoutes.get(event.route) || activeRoutes.get(event.codexModel);
+  return Boolean(
+    active &&
+      (!active.model || active.model === event.upstreamModel) &&
+      (!active.api || active.api === event.api),
+  );
+}
+
+function totalsForEvents(events = []) {
+  const statusCounts = {};
+  let totalTokens = 0;
+  let promptTokens = 0;
+  let completionTokens = 0;
+  for (const event of events) {
+    totalTokens += event.totalTokens || 0;
+    promptTokens += event.promptTokens || 0;
+    completionTokens += event.completionTokens || 0;
+    const statusKey = String(event.status || "unknown");
+    statusCounts[statusKey] = (statusCounts[statusKey] || 0) + 1;
+  }
+  return {
+    totalCalls: events.length,
+    totalTokens,
+    promptTokens,
+    completionTokens,
+    statusCounts,
+    latest: events.at(-1) || null,
   };
 }
 

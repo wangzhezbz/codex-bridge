@@ -12,6 +12,48 @@ import { createRouterServer } from "../src/server.js";
 import { callJsonUpstream, proxyResponsesApi } from "../src/upstream.js";
 import { __resetRateLimiterForTests } from "../src/rate-limit.js";
 
+test("router handles client socket parser errors without crashing", () => {
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        provider: "deepseek",
+        api: "chat_completions",
+        model: "deepseek-v4-pro",
+        baseUrl: "https://api.deepseek.com/v1",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+  let destroyed = false;
+  let ended = false;
+  const socket = {
+    writable: true,
+    destroyed: false,
+    end() {
+      ended = true;
+      this.destroy();
+    },
+    destroy() {
+      destroyed = true;
+      this.destroyed = true;
+    },
+  };
+
+  const handled = router.emit(
+    "clientError",
+    Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }),
+    socket,
+  );
+
+  assert.equal(handled, true);
+  assert.equal(destroyed, true);
+  assert.equal(ended, false);
+});
+
 test("server exposes health, models, catalog, and converted responses", async () => {
   const upstream = http.createServer(async (req, res) => {
     assert.equal(req.url, "/v1/chat/completions");
@@ -7107,6 +7149,220 @@ test("server serves duplicate Codex desktop request with previous_response_id lo
     assert.equal(second.statusCode, 200);
     assert.match(second.body, /previous response answer 1/);
     assert.equal(upstreamCalls, 1);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("server stops Codex desktop replay when only volatile retry metadata changes", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    upstreamCalls += 1;
+    const body = await readJson(req);
+    assert.equal(body.model, "deepseek-v4-pro");
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: `chatcmpl_semantic_duplicate_${upstreamCalls}`,
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: `semantic duplicate answer ${upstreamCalls}`,
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 1000,
+          completion_tokens: 10,
+          total_tokens: 1010,
+        },
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const headers = {
+    "content-type": "application/json",
+    authorization: "Bearer router-token",
+    "user-agent": "Codex Desktop/0.142.3",
+    "x-codex-thread-id": "thread_semantic_duplicate",
+    "x-codex-window-id": "window_semantic_duplicate",
+  };
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        stream: true,
+        metadata: { retryCounter: 1 },
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "你好" }],
+          },
+        ],
+      }),
+    });
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /semantic duplicate answer 1/);
+    assert.equal(upstreamCalls, 1);
+
+    const second = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        stream: true,
+        previous_response_id: "resp_codex_retry_marker_changed",
+        metadata: { retryCounter: 2 },
+        input: [
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "semantic duplicate answer 1" }],
+          },
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "你好" }],
+          },
+        ],
+      }),
+    });
+    assert.equal(second.statusCode, 200);
+    assert.match(second.body, /semantic duplicate answer 1/);
+    assert.equal(upstreamCalls, 1);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("server lets a real next Codex desktop user message reach upstream", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    upstreamCalls += 1;
+    const body = await readJson(req);
+    assert.equal(body.model, "deepseek-v4-pro");
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: `chatcmpl_next_user_message_${upstreamCalls}`,
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: `next user message answer ${upstreamCalls}`,
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 100,
+          completion_tokens: 5,
+          total_tokens: 105,
+        },
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const headers = {
+    "content-type": "application/json",
+    authorization: "Bearer router-token",
+    "user-agent": "Codex Desktop/0.142.3",
+    "x-codex-thread-id": "thread_next_user_message",
+    "x-codex-window-id": "window_next_user_message",
+  };
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        stream: true,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "hello" }],
+          },
+        ],
+      }),
+    });
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /next user message answer 1/);
+    assert.equal(upstreamCalls, 1);
+
+    const second = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        stream: true,
+        previous_response_id: "resp_real_next_message",
+        input: [
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "next user message answer 1" }],
+          },
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "hello again" }],
+          },
+        ],
+      }),
+    });
+    assert.equal(second.statusCode, 200);
+    assert.match(second.body, /next user message answer 2/);
+    assert.equal(upstreamCalls, 2);
   } finally {
     await close(router);
     await close(upstream);

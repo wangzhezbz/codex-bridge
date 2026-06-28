@@ -72,3 +72,10 @@ test("desktop renderer surfaces route capabilities and real upstream status", ()
   assert.match(rendererSource, /routeProviderName/);
   assert.match(rendererSource, /latest\.api/);
 });
+
+test("desktop renderer shows current usage by default and keeps history separate", () => {
+  assert.match(rendererSource, /const current = summary\.current \|\| summary;/);
+  assert.match(rendererSource, /const history = summary\.history \|\| emptyUsageSummary\(\);/);
+  assert.match(rendererSource, /renderUsageTableStable\(current\.byModel \|\| \[\], events, history\)/);
+  assert.match(rendererSource, /历史路由已隐藏/);
+});

@@ -997,17 +997,19 @@ function renderCustomFormState() {
 
 function renderUsage() {
   const summary = state.usageSummary || emptyUsageSummary();
-  const events = state.usageEvents || [];
-  els.statCalls.textContent = formatNumber(summary.totalCalls || 0);
-  els.statTokens.textContent = formatNumber(summary.totalTokens || 0);
-  els.statPrompt.textContent = formatNumber(summary.promptTokens || 0);
-  els.statCompletion.textContent = formatNumber(summary.completionTokens || 0);
-  renderUsageChart(summary.byModel || []);
-  renderUsageTableStable(summary.byModel || [], events);
+  const current = summary.current || summary;
+  const history = summary.history || emptyUsageSummary();
+  const events = current.events || state.usageEvents || [];
+  els.statCalls.textContent = formatNumber(current.totalCalls || 0);
+  els.statTokens.textContent = formatNumber(current.totalTokens || 0);
+  els.statPrompt.textContent = formatNumber(current.promptTokens || 0);
+  els.statCompletion.textContent = formatNumber(current.completionTokens || 0);
+  renderUsageChart(current.byModel || []);
+  renderUsageTableStable(current.byModel || [], events, history);
 }
 
 function renderOverviewUsage() {
-  const latest = state.usageSummary?.latest;
+  const latest = state.usageSummary?.current?.latest || state.usageSummary?.latest;
   if (!latest) {
     els.latestUsage.textContent = "暂无";
     return;
@@ -1048,10 +1050,10 @@ function renderUsageChart(rows) {
 
 function usageRouteState(row) {
   if (row?.isCurrentRoute === true) {
-    return "current";
+    return "当前";
   }
   if (row?.isCurrentRoute === false) {
-    return "history";
+    return "历史";
   }
   return "";
 }
@@ -1143,7 +1145,7 @@ function renderUsageTable(rows, events) {
   `;
 }
 
-function renderUsageTableStable(rows, events) {
+function renderUsageTableStable(rows, events, history = {}) {
   const modelRows = rows.length
     ? rows
         .map(
@@ -1183,8 +1185,13 @@ function renderUsageTableStable(rows, events) {
         )
         .join("")
     : `<div class="empty-state">暂无明细记录。</div>`;
+  const hiddenHistoryNote =
+    Number(history.totalCalls || 0) > 0
+      ? `<div class="empty-state">历史路由已隐藏：${formatNumber(history.totalCalls || 0)} 次调用，${formatNumber(history.totalTokens || 0)} token。当前页只展示正在生效的模型配置，避免旧模型选择误导判断。</div>`
+      : "";
   els.usageTable.innerHTML = `
     <h3>按模型汇总</h3>
+    ${hiddenHistoryNote}
     <div class="usage-table-block">
       <div class="usage-grid">
         <div class="usage-row header">
@@ -1446,6 +1453,26 @@ function emptyUsageSummary() {
     statusCounts: {},
     byModel: [],
     latest: null,
+    current: {
+      totalCalls: 0,
+      totalTokens: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      statusCounts: {},
+      byModel: [],
+      events: [],
+      latest: null,
+    },
+    history: {
+      totalCalls: 0,
+      totalTokens: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      statusCounts: {},
+      byModel: [],
+      events: [],
+      latest: null,
+    },
   };
 }
 

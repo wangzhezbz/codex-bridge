@@ -1293,6 +1293,26 @@ function emptyUsageSummary() {
     statusCounts: {},
     byModel: [],
     latest: null,
+    current: {
+      totalCalls: 0,
+      totalTokens: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      statusCounts: {},
+      byModel: [],
+      events: [],
+      latest: null,
+    },
+    history: {
+      totalCalls: 0,
+      totalTokens: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      statusCounts: {},
+      byModel: [],
+      events: [],
+      latest: null,
+    },
   };
 }
 
