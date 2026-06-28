@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import zlib from "node:zlib";
 import { loadConfig, routeForModel } from "../src/config.js";
+import { COMPACT_SUMMARY_PREFIX } from "../src/compact.js";
 import { ResponseHistory } from "../src/history.js";
 import { shouldUseImageGenerationFallback } from "../src/image-generation.js";
 import { createRouterServer } from "../src/server.js";
@@ -320,6 +321,110 @@ test("codex_openai responses routes force upstream streaming but preserve non-st
     assert.equal(upstreamBody.temperature, undefined);
     assert.equal(upstreamBody.top_p, undefined);
     assert.ok(upstreamBody.include.includes("reasoning.encrypted_content"));
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("codex_openai responses routes send bridge compact summaries as text context", async () => {
+  let upstreamBody;
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/responses");
+    upstreamBody = await readJson(req);
+    const raw = JSON.stringify(upstreamBody);
+    if (raw.includes('"encrypted_content"') || raw.includes('"type":"compaction"')) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: {
+            message:
+              "The encrypted content Annotation could not be verified. Reason: Encrypted content could not be decrypted or parsed.",
+          },
+        }),
+      );
+      return;
+    }
+
+    const response = {
+      id: "resp_codex_compacted_context",
+      object: "response",
+      status: "completed",
+      model: "gpt-5.5",
+      output: [
+        {
+          id: "msg_codex_compacted_context",
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [
+            {
+              type: "output_text",
+              text: "compacted context accepted",
+              annotations: [],
+            },
+          ],
+        },
+      ],
+      output_text: "compacted context accepted",
+    };
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    res.write(`event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response })}\n\n`);
+    res.end("data: [DONE]\n\n");
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    clientAuth: { allowOpenAiBearer: true },
+    defaultModel: "gpt-5.5",
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        api: "responses",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "gpt-5.5",
+        authMode: "codex_openai",
+      },
+    ],
+  });
+
+  await listen(router);
+  try {
+    const response = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer codex-token",
+        "user-agent": "Codex Desktop/0.142.3",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        stream: true,
+        input: [
+          {
+            id: "cmp_bridge_plain_summary",
+            type: "compaction",
+            encrypted_content: `${COMPACT_SUMMARY_PREFIX}\nImportant summary for GPT after compact.`,
+          },
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "continue after compact" }],
+          },
+        ],
+      }),
+    });
+
+    assert.equal(response.statusCode, 200);
+    assert.match(response.body, /compacted context accepted/);
+    const raw = JSON.stringify(upstreamBody);
+    assert.doesNotMatch(raw, /"encrypted_content"/);
+    assert.doesNotMatch(raw, /"type":"compaction"/);
+    assert.match(raw, /Important summary for GPT after compact/);
   } finally {
     await close(router);
     await close(upstream);
@@ -7716,7 +7821,7 @@ test("server stops Codex desktop replay from switching routes after an upstream 
   }
 });
 
-test("server lets a deliberate route switch run after a completed Codex desktop turn", async () => {
+test("server stops completed Codex desktop turn from replaying on a different route", async () => {
   let firstRouteCalls = 0;
   let secondRouteCalls = 0;
   const firstUpstream = http.createServer(async (req, res) => {
@@ -7838,7 +7943,144 @@ test("server lets a deliberate route switch run after a completed Codex desktop 
       }),
     });
     assert.equal(second.statusCode, 200);
-    assert.match(second.body, /second route answer 1/);
+    assert.match(second.body, /first route answer 1|duplicate automatic request replay/i);
+    assert.equal(firstRouteCalls, 1);
+    assert.equal(secondRouteCalls, 0);
+  } finally {
+    await close(router);
+    await close(firstUpstream);
+    await close(secondUpstream);
+  }
+});
+
+test("server lets a route switch run when the Codex desktop turn has new input", async () => {
+  let firstRouteCalls = 0;
+  let secondRouteCalls = 0;
+  const firstUpstream = http.createServer(async (req, res) => {
+    firstRouteCalls += 1;
+    await readJson(req);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: `chatcmpl_first_new_input_${firstRouteCalls}`,
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: `first route new input answer ${firstRouteCalls}`,
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: 3,
+          total_tokens: 13,
+        },
+      }),
+    );
+  });
+  const secondUpstream = http.createServer(async (req, res) => {
+    secondRouteCalls += 1;
+    await readJson(req);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: `chatcmpl_second_new_input_${secondRouteCalls}`,
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: `second route new input answer ${secondRouteCalls}`,
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 11,
+          completion_tokens: 3,
+          total_tokens: 14,
+        },
+      }),
+    );
+  });
+
+  await listen(firstUpstream);
+  await listen(secondUpstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "gpt-5.5",
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        provider: "custom",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(firstUpstream)}/v1`,
+        model: "gpt-5.5",
+        apiKey: "upstream-key",
+      },
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(secondUpstream)}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const headers = {
+    "content-type": "application/json",
+    authorization: "Bearer router-token",
+    "user-agent": "Codex Desktop/0.142.3",
+    "x-codex-thread-id": "thread_route_switch_new_input",
+    "x-codex-window-id": "window_route_switch_new_input",
+  };
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        stream: true,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "first user turn" }],
+          },
+        ],
+      }),
+    });
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /first route new input answer 1/);
+    assert.equal(firstRouteCalls, 1);
+    assert.equal(secondRouteCalls, 0);
+
+    const second = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        stream: true,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "second user turn after switching model" }],
+          },
+        ],
+      }),
+    });
+    assert.equal(second.statusCode, 200);
+    assert.match(second.body, /second route new input answer 1/);
     assert.equal(firstRouteCalls, 1);
     assert.equal(secondRouteCalls, 1);
   } finally {

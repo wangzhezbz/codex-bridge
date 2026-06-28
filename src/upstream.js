@@ -26,6 +26,7 @@ import {
 import {
   buildCompactChatRequest,
   buildCompactResponsesRequest,
+  COMPACT_SUMMARY_PREFIX,
   compactKindForResponsesRequest,
   compactResponseFromChat,
   compactResponseFromLocalFallback,
@@ -620,7 +621,6 @@ function duplicateInitialRequestKeys(requestBody = {}, route = {}, context = {})
       kind: "client_turn",
       ttlMs: DUPLICATE_TURN_REQUEST_TTL_MS,
       pendingTtlMs: DUPLICATE_INITIAL_REQUEST_PENDING_TTL_MS,
-      recordSuccess: false,
       cacheAnyError: true,
     });
   }
@@ -849,6 +849,7 @@ export async function proxyResponsesApi(
   if (shouldInlineLocalHistoryForResponses(requestBody, history)) {
     inlineLocalHistoryForResponsesPayload(payload, sourceMessages);
   }
+  normalizeCodexOpenAiBridgeCompactionPayload(payload, route, context);
 
   const upstreamPayload = filterPayloadForUpstream(
     payload,
@@ -1067,6 +1068,59 @@ function inlineLocalHistoryForResponsesPayload(payload, sourceMessages) {
   );
   delete payload.messages;
   delete payload.previous_response_id;
+}
+
+function normalizeCodexOpenAiBridgeCompactionPayload(payload, route = {}, context = {}) {
+  if (authModeForRoute(route) !== "codex_openai" || route.api !== "responses") {
+    return;
+  }
+  const normalizedInput = normalizeBridgeCompactionInput(payload.input, context);
+  if (normalizedInput !== payload.input) {
+    payload.input = normalizedInput;
+  }
+  if (payload.messages !== undefined) {
+    const normalizedMessages = normalizeBridgeCompactionInput(payload.messages, context);
+    if (normalizedMessages !== payload.messages) {
+      payload.messages = normalizedMessages;
+    }
+  }
+}
+
+function normalizeBridgeCompactionInput(input, context = {}) {
+  if (!Array.isArray(input)) {
+    return input;
+  }
+  let changed = false;
+  const normalized = input.map((item) => {
+    if (!isBridgePlainCompactionItem(item)) {
+      return item;
+    }
+    changed = true;
+    const text = String(item.encrypted_content || "");
+    console.warn(
+      `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+        "!! compact-plaintext-context normalized bridge compaction for codex_openai",
+    );
+    return {
+      type: "message",
+      role: "user",
+      content: [
+        {
+          type: "input_text",
+          text,
+        },
+      ],
+    };
+  });
+  return changed ? normalized : input;
+}
+
+function isBridgePlainCompactionItem(item) {
+  return (
+    (item?.type === "compaction" || item?.type === "context_compaction") &&
+    typeof item.encrypted_content === "string" &&
+    item.encrypted_content.startsWith(COMPACT_SUMMARY_PREFIX)
+  );
 }
 
 function chatMessagesToResponsesInput(messages) {
@@ -1506,6 +1560,7 @@ async function proxyResponsesCompact(requestBody, route, history, res, context =
   if (shouldInlineLocalHistoryForResponses(compactBody, history)) {
     inlineLocalHistoryForResponsesPayload(compactBody, sourceMessages);
   }
+  normalizeCodexOpenAiBridgeCompactionPayload(compactBody, route, context);
 
   const upstreamUrl = joinOpenAiEndpointUrl(responsesBaseUrlForRoute(route), "/responses");
   logRoute(context, route, upstreamUrl);
@@ -1529,6 +1584,7 @@ async function proxyResponsesCompact(requestBody, route, history, res, context =
       if (shouldInlineLocalHistoryForResponses(streamCompactBody, history)) {
         inlineLocalHistoryForResponsesPayload(streamCompactBody, sourceMessages);
       }
+      normalizeCodexOpenAiBridgeCompactionPayload(streamCompactBody, route, context);
       console.warn(
         `[${new Date().toISOString()}] ${context.requestId || "req"} !! upstream ` +
           `route=${route.id} compact requires stream=true; retrying compact request as event stream`,
