@@ -45,11 +45,12 @@ test("desktop updater waits for router child process before replacing portable f
   assert.match(main, /blockingPids:\s*\[routerProcess\?\.pid\]\.filter\(Boolean\)/);
 });
 
-test("desktop update launches installers and keeps portable downloads as manual fallback", () => {
+test("desktop update launches installers and portable replacements automatically", () => {
   const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
 
   assert.match(main, /prepareInstallerUpdate/);
-  assert.match(main, /shell\.openPath\(prepared\.installerPath\)/);
+  assert.match(main, /launchDownloadedInstaller\(prepared\.installerPath\)/);
+  assert.match(main, /spawn\(installerPath,\s*\["\/S"\]/);
   assert.match(main, /phase:\s*"launching"/);
   assert.match(main, /quitAfterUpdateLaunch\(\)/);
   assert.match(main, /installerPath:\s*prepared\.installerPath/);
@@ -57,29 +58,34 @@ test("desktop update launches installers and keeps portable downloads as manual 
   assert.match(main, /updateFolder:\s*prepared\.updatesDir/);
   assert.match(main, /nextStep:/);
   assert.match(main, /preparePortableUpdate/);
-  assert.match(main, /Update package ready for manual install/);
-  assert.match(main, /phase:\s*"ready"/);
-  assert.match(main, /shell\.showItemInFolder\(prepared\.downloadPath\)/);
+  assert.match(main, /launchPortableUpdateScript\(prepared\.scriptPath\)/);
+  assert.match(main, /phase:\s*"restarting"/);
+  assert.match(main, /relaunching:\s*true/);
   assert.match(main, /downloadPath:\s*prepared\.downloadPath/);
   assert.match(main, /manualNotePath:\s*prepared\.manualNotePath/);
   assert.match(main, /writeInstallerUpdateInstructions/);
   assert.match(main, /Windows Setup installer update/);
+  assert.doesNotMatch(main, /Update package ready for manual install/);
+  assert.doesNotMatch(main, /shell\.showItemInFolder\(prepared\.downloadPath\)/);
   assert.doesNotMatch(main, /onSpawn:\s*\(\) => exitForPortableUpdate\(\)/);
-  assert.doesNotMatch(main, /phase:\s*"restarting"/);
 });
 
-test("desktop does not auto-launch the portable updater from the running app", () => {
+test("desktop auto-launches the portable updater from the running app", () => {
   const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
 
+  assert.match(main, /function launchPortableUpdateScript\(scriptPath\)/);
+  assert.match(main, /spawn\("powershell\.exe",\s*\[/);
+  assert.match(main, /"-ExecutionPolicy",\s*"Bypass"/);
+  assert.match(main, /"-File",\s*scriptPath/);
+  assert.match(main, /child\.unref\?\.\(\)/);
+  assert.match(main, /quitAfterUpdateLaunch\(\)/);
   assert.doesNotMatch(main, /function launchPortableUpdater/);
   assert.doesNotMatch(main, /function exitForPortableUpdate/);
-  assert.doesNotMatch(main, /spawn\("powershell\.exe",\s*\[/);
-  assert.doesNotMatch(main, /"-File",\s*scriptFile/);
   assert.doesNotMatch(main, /spawn\("cmd\.exe"/);
   assert.doesNotMatch(main, /start "" \/min powershell\.exe/);
 });
 
-test("desktop updater keeps downloaded package visible in the update folder", () => {
+test("desktop updater uses the data update folder and auto-cleans update artifacts", () => {
   const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
 
   assert.match(main, /const updatesDir = portableUpdatesDir\(\)/);
@@ -90,9 +96,9 @@ test("desktop updater keeps downloaded package visible in the update folder", ()
   assert.match(main, /const finalBytes = fs\.statSync\(targetPath\)\.size/);
   assert.match(main, /更新包下载不完整/);
   assert.match(main, /function writeManualUpdateInstructions/);
-  assert.match(main, /Manual update instructions/);
-  assert.match(main, /download-only portable update/);
-  assert.doesNotMatch(main, /If automatic update does not restart/);
+  assert.match(main, /Portable update fallback instructions/);
+  assert.match(main, /Automatic update should launch the helper script/);
+  assert.match(main, /If automatic update does not restart/);
   assert.doesNotMatch(main, /The automatic updater normally backs up/);
   assert.doesNotMatch(main, /path\.join\(updatesDir, "downloads"\)/);
 });
@@ -104,11 +110,13 @@ test("desktop update completion uses in-app notification instead of a native mes
   assert.doesNotMatch(main, /dialog\.showMessageBox\(mainWindow/);
 });
 
-test("desktop cleans old managed update artifacts on startup while keeping the latest package", () => {
+test("desktop cleans old managed update artifacts and previous installed apps after update", () => {
   const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
 
   assert.match(main, /cleanupUpdateArtifactsOnStartup/);
-  assert.match(main, /cleanupManagedUpdateArtifacts\?\.\(portableUpdatesDir\(\),\s*\{\s*keepPackages:\s*1\s*\}\)/);
+  assert.match(main, /cleanupManagedUpdateArtifacts\?\.\(portableUpdatesDir\(\),\s*\{\s*keepPackages:\s*launchedAfterUpdate \? 0 : 1\s*\}\)/);
+  assert.match(main, /cleanupInstalledAppVersionsAfterUpdate/);
+  assert.match(main, /removeDirectoryTreeSafeSync/);
   assert.match(main, /prepareInstallerUpdate/);
   assert.match(main, /keepPackages:\s*1/);
 });

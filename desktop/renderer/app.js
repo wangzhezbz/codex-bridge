@@ -379,12 +379,12 @@ els.checkUpdates.addEventListener("click", () =>
     showToast(
       installerUpdate
         ? "正在下载安装器，完成后会自动打开安装程序。"
-        : "正在下载更新包，完成后会打开更新目录。",
+        : "正在下载更新包，完成后会自动重启到新版。",
     );
     try {
       const result = await api.installUpdate();
       renderUpdateProgress({
-        phase: result.installerPath ? "launching" : "ready",
+        phase: result.relaunching ? "restarting" : result.installerPath ? "launching" : "ready",
         downloadedBytes: updatePlan.asset?.size || 0,
         totalBytes: updatePlan.asset?.size || 0,
         percent: 100,
@@ -3183,6 +3183,10 @@ function showUpdateDialog(updatePlan) {
     els.updateDialogVersion.textContent = `v${updatePlan.latestVersion || ""}`;
     els.updateDialogMessage.textContent =
       "下载完成后会保存到更新目录，当前程序保持运行，可手动处理。";
+    if (!installerUpdate) {
+      els.updateDialogMessage.textContent =
+        "下载完成后会自动关闭旧版、替换文件并打开新版。";
+    }
     if (installerUpdate) {
       els.updateDialogMessage.textContent =
         "下载完成后会打开安装器，当前窗口会退出，安装完成后会启动新版。";
@@ -3284,6 +3288,9 @@ function updateProgressText(phase, details) {
   }
   if (phase === "launching") {
     return "下载完成，正在启动安装器...";
+  }
+  if (phase === "restarting") {
+    return "下载完成，正在关闭旧版并打开新版...";
   }
   if (phase === "error") {
     return "更新失败，请稍后重试。";

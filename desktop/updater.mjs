@@ -122,7 +122,11 @@ export function planReleaseUpdate({
     ? releaseAssets.find((item) => item?.name === fallbackCandidate.name)
     : null;
   const updateAvailable = isNewerVersion(latestVersion, currentVersion);
-  const installMode = candidate.kind === "installer" ? "windows_setup" : "manual_portable";
+  const installMode = candidate.kind === "installer"
+    ? "windows_setup"
+    : platform === "win32" || platform === "darwin"
+      ? "portable_replacement"
+      : "manual_portable";
   return {
     ok: true,
     updateAvailable,
@@ -139,7 +143,18 @@ export function planReleaseUpdate({
     message: updateAvailable
       ? `发现新版本 ${latestVersion}。`
       : `当前已经是最新版本 ${normalizeVersion(currentVersion)}。`,
+    nextStep: releaseUpdateNextStep(installMode),
   };
+}
+
+function releaseUpdateNextStep(installMode) {
+  if (installMode === "windows_setup") {
+    return "下载完成后会自动运行安装器、关闭旧版并打开新版。";
+  }
+  if (installMode === "portable_replacement") {
+    return "下载完成后会自动重启到新版，并清理更新包和旧版备份。";
+  }
+  return "下载完成后会保存到更新目录；当前程序保持运行，可退出后手动解压打开新版。";
 }
 
 const MANAGED_PACKAGE_RE = /^(\d{4}-\d{2}-\d{2}-\d{9})-CodexBridge-.*\.(?:exe|zip|dmg)$/i;
@@ -542,6 +557,41 @@ function Open-UpdateFolder() {
   }
 }
 
+function Remove-FileSafely([string]$FilePath, [string]$AllowedRoot, [string]$Description = "file") {
+  if (-not $FilePath -or -not (Test-Path -LiteralPath $FilePath -PathType Leaf)) {
+    return
+  }
+  if (-not (Test-UpdatePathInside $FilePath $AllowedRoot)) {
+    Write-UpdateLog ("Skipped removing " + $Description + " outside allowed root: " + $FilePath)
+    return
+  }
+  Invoke-UpdateStep ("Removing " + $Description) {
+    Remove-Item -LiteralPath $FilePath -Force
+  }
+}
+
+function Remove-DirectoryTreeSafely([string]$DirectoryPath, [string]$AllowedRoot, [string]$Description = "directory") {
+  if (-not $DirectoryPath -or -not (Test-Path -LiteralPath $DirectoryPath -PathType Container)) {
+    return
+  }
+  $target = Normalize-UpdatePath $DirectoryPath
+  $root = Normalize-UpdatePath $AllowedRoot
+  if (-not $target -or -not $root -or $target.Equals($root, [System.StringComparison]::OrdinalIgnoreCase) -or -not (Test-UpdatePathInside $target $root)) {
+    Write-UpdateLog ("Skipped removing " + $Description + " outside allowed root: " + $DirectoryPath)
+    return
+  }
+  Invoke-UpdateStep ("Removing " + $Description) {
+    $items = @(Get-ChildItem -LiteralPath $target -Force -Recurse | Sort-Object { $_.FullName.Length } -Descending)
+    foreach ($item in $items) {
+      if (-not (Test-UpdatePathInside $item.FullName $target)) {
+        throw ("Refusing to remove item outside target directory: " + $item.FullName)
+      }
+      Remove-Item -LiteralPath $item.FullName -Force
+    }
+    Remove-Item -LiteralPath $target -Force
+  }
+}
+
 function Find-CodexBridgeAppDir([string]$Root) {
   $matches = @()
   $exeFiles = Get-ChildItem -LiteralPath $Root -Filter $EXE_NAME -File -Recurse
@@ -663,7 +713,11 @@ try {
   if (-not (Get-Process -Id $startedProcess.Id -ErrorAction SilentlyContinue)) {
     throw "Updated CodexBridge exited immediately after launch: $nextExe"
   }
-  Write-UpdateLog "Update completed. Previous version kept at $backupDir."
+  Write-UpdateLog "Updated CodexBridge stayed running; removing previous version and update package."
+  Remove-DirectoryTreeSafely $backupDir $appParent "previous app directory"
+  Remove-DirectoryTreeSafely $extractDir $WORK_DIR "extract directory"
+  Remove-FileSafely $ZIP_PATH $WORK_DIR "update package"
+  Write-UpdateLog "Update completed. Previous version removed."
 } catch {
   $failureMessage = $_.Exception.Message
   Write-UpdateLog ("Update failed: " + $failureMessage)

@@ -43,13 +43,14 @@ test("desktop renderer exposes update from sidebar without a dedicated page", ()
   assert.match(rendererSource, /api\.onUpdateProgress\?\.\(\(progress\) => renderUpdateProgress\(progress\)\)/);
   assert.match(rendererSource, /api\.onUpdateFinished\?\.\(\(result\) =>/);
   assert.match(rendererSource, /function renderUpdateProgress/);
-  assert.match(rendererSource, /result\.installerPath \? "launching" : "ready"/);
+  assert.match(rendererSource, /result\.relaunching \? "restarting" : result\.installerPath \? "launching" : "ready"/);
   assert.match(rendererSource, /result\.nextStep \|\| result\.message/);
   assert.match(rendererSource, /bytesPerSecond/);
   assert.match(rendererSource, /formatBytes\(details\.bytesPerSecond\)/);
   assert.match(rendererSource, /\}\/s`/);
   assert.match(rendererSource, /els\.appVersion\.textContent = `v\$\{state\.appVersion \|\| "-"\}`;/);
   assert.match(rendererSource, /showUpdateDialog/);
+  assert.match(rendererSource, /phase === "restarting"/);
   assert.doesNotMatch(rendererSource, /window\.confirm/);
   assert.doesNotMatch(rendererSource, /Windows Setup installer will be saved|updates folder|manual fallback/);
   assert.doesNotMatch(htmlSource, /Windows Setup installer will be saved|updates folder|manual fallback/);

@@ -1052,15 +1052,16 @@ ipcMain.handle("updates:install", async () => {
       percent: 100,
       message: "Update installer downloaded; launching installer.",
     });
-    const openError = await shell.openPath(prepared.installerPath);
-    if (openError) {
-      appendRuntimeLog(`openUpdateInstaller: ${openError}`);
+    try {
+      launchDownloadedInstaller(prepared.installerPath);
+    } catch (error) {
+      appendRuntimeLog(formatError("launchUpdateInstaller", error));
       try {
         shell.showItemInFolder(prepared.installerPath);
-      } catch (error) {
-        appendRuntimeLog(formatError("showUpdateInstaller", error));
+      } catch (folderError) {
+        appendRuntimeLog(formatError("showUpdateInstaller", folderError));
       }
-      throw new Error(`Unable to launch update installer: ${openError}`);
+      throw new Error(`Unable to launch update installer: ${error?.message || error}`);
     }
     quitAfterUpdateLaunch();
     return {
@@ -1075,29 +1076,33 @@ ipcMain.handle("updates:install", async () => {
   }
   const prepared = await preparePortableUpdate(updater, plan, emitUpdateProgress);
   appendLog(`Update package downloaded: ${prepared.downloadPath}`);
-  appendLog(`Update package ready for manual install: ${prepared.downloadPath}`);
-  appendLog(`Manual update instructions: ${prepared.manualNotePath}`);
+  appendLog(`Portable update script ready: ${prepared.scriptPath}`);
+  appendLog(`Portable update fallback instructions: ${prepared.manualNotePath}`);
   emitUpdateProgress({
-    phase: "ready",
+    phase: "restarting",
     downloadedBytes: plan.asset?.size || 0,
     totalBytes: plan.asset?.size || 0,
     percent: 100,
-    message: "更新包已下载到 updates 目录；当前程序保持运行。",
+    message: "Update package downloaded; restarting into the new version.",
   });
   try {
-    shell.showItemInFolder(prepared.downloadPath);
+    launchPortableUpdateScript(prepared.scriptPath);
   } catch (error) {
-    appendRuntimeLog(formatError("showUpdatePackage", error));
-    const openError = await shell.openPath(path.dirname(prepared.downloadPath));
-    if (openError) {
-      appendRuntimeLog(`openUpdateFolder: ${openError}`);
+    appendRuntimeLog(formatError("launchPortableUpdateScript", error));
+    try {
+      showDownloadedUpdatePackage(prepared.downloadPath);
+    } catch (folderError) {
+      appendRuntimeLog(formatError("showUpdatePackage", folderError));
     }
+    throw new Error(`Unable to launch portable update script: ${error?.message || error}`);
   }
+  quitAfterUpdateLaunch();
   return {
     ok: true,
-    message: `已下载 ${plan.latestVersion}，更新包已放到 updates 目录。当前程序不会自动退出；如需立即升级，请退出 CodexBridge 后从 updates 目录打开新版。`,
-    nextStep: `Portable fallback is ready in ${path.dirname(prepared.downloadPath)}. Fully exit CodexBridge, unzip the package there, and open the extracted CodexBridge app. The current app will not auto-replace itself.`,
+    message: `Downloaded CodexBridge ${plan.latestVersion} portable update.`,
+    nextStep: "正在关闭旧版并启动新版；更新完成后会自动清理安装包和旧版备份。",
     latestVersion: plan.latestVersion,
+    relaunching: true,
     downloadPath: prepared.downloadPath,
     manualNotePath: prepared.manualNotePath,
     scriptPath: prepared.scriptPath,
@@ -1127,6 +1132,10 @@ function ensureFolderForOpen(folder) {
   const resolvedFolder = path.resolve(folder);
   fs.mkdirSync(resolvedFolder, { recursive: true });
   return resolvedFolder;
+}
+
+function showDownloadedUpdatePackage(packagePath) {
+  shell.showItemInFolder(packagePath);
 }
 
 ipcMain.handle("github:open", async () => {
@@ -1508,10 +1517,107 @@ async function cleanupUpdateArtifactsOnStartup() {
   try {
     const updater = await loadUpdater();
     fs.mkdirSync(portableUpdatesDir(), { recursive: true });
-    await updater.cleanupManagedUpdateArtifacts?.(portableUpdatesDir(), { keepPackages: 1 });
+    await updater.cleanupManagedUpdateArtifacts?.(portableUpdatesDir(), { keepPackages: launchedAfterUpdate ? 0 : 1 });
+    if (launchedAfterUpdate) {
+      cleanupInstalledAppVersionsAfterUpdate();
+    }
   } catch (error) {
     appendRuntimeLog(formatError("cleanupUpdates", error));
   }
+}
+
+function cleanupInstalledAppVersionsAfterUpdate() {
+  if (process.platform !== "win32" || !app.isPackaged || !process.env.LOCALAPPDATA) {
+    return;
+  }
+  const installedRoot = path.resolve(process.env.LOCALAPPDATA, "Programs", "CodexBridge");
+  const currentAppDir = path.resolve(path.dirname(process.execPath));
+  if (!isPathInsideOrEqual(currentAppDir, installedRoot) || samePath(currentAppDir, installedRoot)) {
+    return;
+  }
+  let entries = [];
+  try {
+    entries = fs.readdirSync(installedRoot, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      appendRuntimeLog(formatError("cleanupInstalledApps", error));
+    }
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^app-/i.test(entry.name)) {
+      continue;
+    }
+    const targetDir = path.resolve(installedRoot, entry.name);
+    if (samePath(targetDir, currentAppDir)) {
+      continue;
+    }
+    try {
+      removeDirectoryTreeSafeSync(targetDir, installedRoot);
+      appendRuntimeLog(`Removed previous CodexBridge app directory: ${targetDir}`);
+    } catch (error) {
+      appendRuntimeLog(formatError("cleanupInstalledAppVersion", error));
+    }
+  }
+}
+
+function removeDirectoryTreeSafeSync(targetDir, allowedRoot) {
+  const target = normalizeFsPath(targetDir);
+  const root = normalizeFsPath(allowedRoot);
+  if (!target || !root || samePath(target, root) || !isPathInsideOrEqual(target, root)) {
+    throw new Error(`Refusing to remove directory outside allowed root: ${targetDir}`);
+  }
+  if (!fs.existsSync(target)) {
+    return;
+  }
+  const removeEntries = [];
+  const collect = (folder) => {
+    const children = fs.readdirSync(folder, { withFileTypes: true });
+    for (const child of children) {
+      const childPath = path.resolve(folder, child.name);
+      if (!isPathInsideOrEqual(childPath, target)) {
+        throw new Error(`Refusing to remove item outside target directory: ${childPath}`);
+      }
+      if (child.isDirectory() && !child.isSymbolicLink()) {
+        collect(childPath);
+        removeEntries.push({ path: childPath, directory: true });
+      } else {
+        removeEntries.push({ path: childPath, directory: false });
+      }
+    }
+  };
+  collect(target);
+  for (const entry of removeEntries) {
+    if (entry.directory) {
+      fs.rmdirSync(entry.path);
+    } else {
+      fs.rmSync(entry.path, { force: true });
+    }
+  }
+  fs.rmdirSync(target);
+}
+
+function isPathInsideOrEqual(candidate, root) {
+  const candidatePath = normalizeFsPath(candidate);
+  const rootPath = normalizeFsPath(root);
+  if (!candidatePath || !rootPath) {
+    return false;
+  }
+  if (samePath(candidatePath, rootPath)) {
+    return true;
+  }
+  return candidatePath.toLowerCase().startsWith(`${rootPath.toLowerCase()}${path.sep}`);
+}
+
+function samePath(left, right) {
+  return normalizeFsPath(left).toLowerCase() === normalizeFsPath(right).toLowerCase();
+}
+
+function normalizeFsPath(value) {
+  if (!value) {
+    return "";
+  }
+  return path.resolve(String(value)).replace(/[\\/]+$/, "");
 }
 
 function scheduleRouterRestart(exitCode) {
@@ -1691,6 +1797,46 @@ function quitAfterUpdateLaunch() {
   timer.unref?.();
 }
 
+function launchDownloadedInstaller(installerPath) {
+  if (!installerPath) {
+    throw new Error("Missing update installer path.");
+  }
+  const child = process.platform === "win32"
+    ? spawn(installerPath, ["/S"], {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      })
+    : spawn(installerPath, [], {
+        detached: true,
+        stdio: "ignore",
+      });
+  child.unref?.();
+}
+
+function launchPortableUpdateScript(scriptPath) {
+  if (!scriptPath) {
+    throw new Error("Missing portable update script path.");
+  }
+  const child = process.platform === "win32"
+    ? spawn("powershell.exe", [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        scriptPath,
+      ], {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      })
+    : spawn("/bin/sh", [scriptPath], {
+        detached: true,
+        stdio: "ignore",
+      });
+  child.unref?.();
+}
+
 function writeInstallerUpdateInstructions({
   installerNotePath,
   installerPath,
@@ -1720,11 +1866,12 @@ function writeManualUpdateInstructions({
   platform,
 }) {
   const lines = [
-    "CodexBridge download-only portable update",
+    "CodexBridge Portable update fallback instructions",
     "",
     `Downloaded package: ${packagePath}`,
     `Current app directory: ${currentAppDir}`,
-    "This portable build keeps the current app running after download.",
+    "Automatic update should launch the helper script and restart CodexBridge after download.",
+    "If automatic update does not restart, use the fallback steps below.",
     "",
   ];
   if (platform === "win32") {

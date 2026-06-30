@@ -96,7 +96,7 @@ test("updater marks Windows setup as primary while preserving portable fallback 
   assert.doesNotMatch(plan.nextStep, /Windows Setup installer will be saved|updates folder|manual fallback/);
 });
 
-test("updater keeps portable builds on portable update packages even when setup exists", () => {
+test("updater keeps portable builds on auto-applied portable packages even when setup exists", () => {
   const plan = planReleaseUpdate({
     currentVersion: "0.1.65",
     platform: "win32",
@@ -108,9 +108,10 @@ test("updater keeps portable builds on portable update packages even when setup 
   assert.equal(plan.ok, true);
   assert.equal(plan.asset.name, "CodexBridge-Windows-x64-Portable.zip");
   assert.equal(plan.asset.kind, "portable");
-  assert.equal(plan.installMode, "manual_portable");
+  assert.equal(plan.installMode, "portable_replacement");
   assert.equal(plan.fallbackAsset, null);
-  assert.doesNotMatch(plan.nextStep, /Windows Setup installer will be saved|updates folder|manual fallback/);
+  assert.match(plan.nextStep, /自动|重启|新版/);
+  assert.doesNotMatch(plan.nextStep, /手动|manual fallback|updates folder/);
 });
 
 test("updater falls back to the portable asset when no installer is published", () => {
@@ -129,9 +130,10 @@ test("updater falls back to the portable asset when no installer is published", 
   assert.equal(plan.ok, true);
   assert.equal(plan.asset.name, "CodexBridge-Windows-x64-Portable.zip");
   assert.equal(plan.asset.kind, "portable");
-  assert.equal(plan.installMode, "manual_portable");
+  assert.equal(plan.installMode, "portable_replacement");
   assert.equal(plan.fallbackAsset, null);
-  assert.doesNotMatch(plan.nextStep, /Windows Setup installer will be saved|updates folder|manual fallback/);
+  assert.match(plan.nextStep, /自动|重启|新版/);
+  assert.doesNotMatch(plan.nextStep, /手动|manual fallback|updates folder/);
 });
 
 test("updater reports current and unsupported states clearly", () => {
@@ -288,6 +290,8 @@ test("Windows portable updater script replaces and restarts without batch deleti
   assert.match(script, /Move-Item/);
   assert.match(script, /Start-Process/);
   assert.match(script, /function Find-CodexBridgeAppDir/);
+  assert.match(script, /function Remove-FileSafely/);
+  assert.match(script, /function Remove-DirectoryTreeSafely/);
   assert.match(script, /function Wait-AppDirectoryProcessesExit/);
   assert.match(script, /Get-CimInstance Win32_Process/);
   assert.match(script, /Stop-Process -Id \$runningPid -Force/);
@@ -314,6 +318,10 @@ test("Windows portable updater script replaces and restarts without batch deleti
   assert.match(script, /-ArgumentList "--updated"/);
   assert.match(script, /-WorkingDirectory \$CURRENT_APP_DIR -PassThru/);
   assert.match(script, /Updated CodexBridge exited immediately after launch/);
+  assert.match(script, /Remove-DirectoryTreeSafely \$backupDir/);
+  assert.match(script, /Remove-DirectoryTreeSafely \$extractDir/);
+  assert.match(script, /Remove-FileSafely \$ZIP_PATH/);
+  assert.match(script, /Update completed. Previous version removed/);
   assert.match(script, /\$\{EXE_NAME\}: \$AppDir/);
   assert.doesNotMatch(script, /\$EXE_NAME:/);
   assert.match(script, /\$WAIT_PIDS = @\(1234, 5678\)/);
