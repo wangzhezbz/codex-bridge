@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildModelCatalog } from "../src/model-catalog.js";
+import { buildModelCatalog, openAiModelsList } from "../src/model-catalog.js";
 import { authModeForRoute, validateConfig } from "../src/config.js";
 import { ResponseHistory } from "../src/history.js";
 import { filterPayloadForAdapter } from "../src/adapter-profile.js";
@@ -11,7 +11,11 @@ import {
 import {
   assistantHistoryMessageFromChat,
   chatResponseToResponse,
+  returnedToolDiagnosticsFromChat,
+  returnedToolDiagnosticsLogFields,
+  responseToSse,
 } from "../src/chat-to-responses.js";
+import { toolDiagnosticsLogFields } from "../src/tools.js";
 
 const route = {
   id: "deepseek-v4-pro",
@@ -44,11 +48,43 @@ test("model catalog keeps Codex tool capability fields", () => {
   assert.equal(catalog.models[0].shell_type, "shell_command");
   assert.equal(catalog.models[0].apply_patch_tool_type, "freeform");
   assert.equal(catalog.models[0].supports_parallel_tool_calls, true);
+  assert.equal(catalog.models[0].supports_tools, "chat-functions");
+  assert.equal(catalog.models[0].supports_mcp_namespaces, true);
+  assert.equal(catalog.models[0].codexbridge_capabilities.tools, "chat-functions");
+  assert.equal(catalog.models[0].codexbridge_capabilities.mcp_namespaces, "native");
   assert.deepEqual(
     catalog.models[0].supported_reasoning_levels.map((level) => level.effort),
     ["low", "medium", "high", "xhigh"],
   );
   assert.equal(catalog.models[0].default_reasoning_level, "medium");
+});
+
+test("OpenAI model list exposes display names for Codex model picker fallback", () => {
+  const list = openAiModelsList({
+    models: [
+      {
+        id: "cb-deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        description: "DeepSeek V4 Pro via DeepSeek.",
+        api: "chat_completions",
+        baseUrl: "http://example.test/v1",
+        model: "deepseek-v4-pro",
+        provider: "deepseek",
+      },
+    ],
+  });
+
+  assert.equal(list.data[0].id, "cb-deepseek-v4-pro");
+  assert.equal(list.data[0].name, "DeepSeek V4 Pro");
+  assert.equal(list.data[0].display_name, "DeepSeek V4 Pro");
+  assert.equal(list.data[0].description, "DeepSeek V4 Pro via DeepSeek.");
+  assert.equal(list.data[0].slug, "cb-deepseek-v4-pro");
+  assert.equal(list.data[0].shell_type, "shell_command");
+  assert.equal(list.data[0].apply_patch_tool_type, "freeform");
+  assert.equal(list.data[0].supports_tools, "chat-functions");
+  assert.equal(list.data[0].supports_mcp_namespaces, true);
+  assert.equal(list.data[0].codexbridge_capabilities.tools, "chat-functions");
+  assert.equal(list.data[0].codexbridge_capabilities.mcp_namespaces, "native");
 });
 
 test("model catalog uses model context window for truncation instead of a 10k cap", () => {
@@ -1969,6 +2005,73 @@ test("namespace tools keep unique names so MCP tools are not dropped", () => {
   );
 });
 
+test("chat conversion exposes privacy-safe tool diagnostics", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "use figma but do not leak this user text",
+      tools: [
+        {
+          type: "namespace",
+          name: "mcp__figma__",
+          tools: [
+            {
+              type: "function",
+              name: "whoami",
+              description: "Check Figma session",
+              parameters: {
+                type: "object",
+                properties: {
+                  secret_token: { type: "string" },
+                },
+              },
+            },
+          ],
+        },
+        {
+          type: "namespace",
+          name: "mcp__node_repl__",
+          tools: [
+            {
+              type: "function",
+              name: "js",
+              description: "Run JavaScript",
+              parameters: {
+                type: "object",
+                properties: { code: { type: "string" } },
+              },
+            },
+          ],
+        },
+        {
+          type: "custom",
+          name: "apply_patch",
+          description: "Edit files",
+        },
+      ],
+    },
+    route,
+    new ResponseHistory(),
+  );
+
+  assert.deepEqual(converted.toolDiagnostics, {
+    requestedToolCount: 3,
+    chatToolCount: 2,
+    suppressedToolCount: 1,
+    namespaceCount: 2,
+    namespaceNames: ["mcp__figma__", "mcp__node_repl__"],
+    hasNodeRepl: true,
+    hasCommandTool: false,
+    hasApplyPatch: true,
+    toolChoice: "auto",
+  });
+  assert.equal(
+    toolDiagnosticsLogFields(converted.toolDiagnostics),
+    "tools=3 chat_tools=2 suppressed=1 namespaces=2 namespace_names=mcp__figma__,mcp__node_repl__ node_repl=true command=false apply_patch=true tool_choice=auto",
+  );
+  const serialized = JSON.stringify(converted.toolDiagnostics);
+  assert.doesNotMatch(serialized, /secret_token|properties|use figma|Check Figma session/);
+});
+
 test("chat conversion orders tools stably to improve cache reuse", () => {
   const requestA = {
     input: "use stable tools",
@@ -2030,7 +2133,7 @@ test("chat conversion adds prompt cache hints only for explicit cache-control ro
   assert.doesNotMatch(JSON.stringify(withCache.body), /private reasoning/);
 });
 
-test("chat namespace tool calls are returned with full Codex tool names", () => {
+test("chat namespace tool calls are returned with native Codex namespace metadata", () => {
   const converted = responsesToChatRequest(
     {
       input: "use sample mcp",
@@ -2086,9 +2189,143 @@ test("chat namespace tool calls are returned with full Codex tool names", () => 
   );
 
   assert.equal(response.output[0].type, "function_call");
-  assert.equal(response.output[0].namespace, undefined);
-  assert.equal(response.output[0].name, "mcp__sample__ping");
+  assert.equal(response.output[0].namespace, "mcp__sample__");
+  assert.equal(response.output[0].name, "ping");
   assert.equal(response.output[0].arguments, '{"text":"hello"}');
+});
+
+test("streaming namespace tool calls include native function argument events", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "use sample mcp",
+      tools: [
+        {
+          type: "namespace",
+          name: "mcp__sample__",
+          tools: [
+            {
+              type: "function",
+              name: "ping",
+              description: "Ping sample MCP.",
+              parameters: {
+                type: "object",
+                properties: { text: { type: "string" } },
+              },
+            },
+          ],
+        },
+      ],
+    },
+    route,
+    new ResponseHistory(),
+  );
+  const response = chatResponseToResponse(
+    {
+      id: "chatcmpl_stream_tool",
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call_stream_tool",
+                type: "function",
+                function: {
+                  name: "mcp__sample__ping",
+                  arguments: '{"text":"hello"}',
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    route.id,
+    converted.toolContext,
+  );
+
+  const sse = responseToSse(response);
+  assert.match(sse, /event: response\.output_item\.added/);
+  assert.match(sse, /"type":"function_call"/);
+  assert.match(sse, /"namespace":"mcp__sample__"/);
+  assert.match(sse, /"name":"ping"/);
+  assert.match(sse, /event: response\.function_call_arguments\.delta/);
+  assert.match(sse, /event: response\.function_call_arguments\.done/);
+  assert.match(sse, /"arguments":"{\\"text\\":\\"hello\\"}"/);
+  assert.doesNotMatch(sse, /unsupported_call/);
+});
+
+test("chat tool return diagnostics classify runnable and unknown MCP tool calls", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "use figma mcp",
+      tools: [
+        {
+          type: "namespace",
+          name: "mcp__figma__",
+          tools: [
+            {
+              type: "function",
+              name: "whoami",
+              description: "Check Figma plugin connection.",
+              parameters: { type: "object", properties: {} },
+            },
+          ],
+        },
+      ],
+    },
+    route,
+    new ResponseHistory(),
+  );
+
+  const chat = {
+    id: "chatcmpl_tool_diag",
+    choices: [
+      {
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "call_figma",
+              type: "function",
+              function: {
+                name: "mcp__figma__whoami",
+                arguments: "{}",
+              },
+            },
+            {
+              id: "call_unknown",
+              type: "function",
+              function: {
+                name: "mcp__figma__missing_private_token",
+                arguments: '{"secret":"sk-tool-secret","prompt":"private user text"}',
+              },
+            },
+          ],
+        },
+      },
+    ],
+  };
+
+  const diagnostics = returnedToolDiagnosticsFromChat(chat, converted.toolContext);
+  assert.deepEqual(diagnostics, {
+    returnedToolCount: 2,
+    runnableToolCount: 1,
+    suppressedToolCount: 1,
+    unknownToolCount: 1,
+    namespaceCount: 1,
+    namespaceNames: ["mcp__figma__"],
+    hasNodeRepl: false,
+    hasCommandTool: false,
+    hasApplyPatch: false,
+  });
+  assert.equal(
+    returnedToolDiagnosticsLogFields(diagnostics),
+    "returned_tools=2 runnable_tools=1 suppressed_tools=1 unknown_tools=1 namespaces=1 namespace_names=mcp__figma__ node_repl=false command=false apply_patch=false",
+  );
+  assert.doesNotMatch(JSON.stringify(diagnostics), /sk-tool-secret|private user text|missing_private_token/);
 });
 
 test("suppressed Node REPL tool calls from chat providers are not returned to Codex", () => {

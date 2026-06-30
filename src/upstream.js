@@ -21,6 +21,8 @@ import {
   assistantHistoryMessageFromResponse,
   assistantHistoryMessageFromChat,
   chatResponseToResponse,
+  returnedToolDiagnosticsFromChat,
+  returnedToolDiagnosticsLogFields,
   responseToSse,
 } from "./chat-to-responses.js";
 import {
@@ -38,7 +40,8 @@ import {
   shouldUseImageGenerationFallback,
 } from "./image-generation.js";
 import { fetchInitWithProxy, proxyLogLabel } from "./proxy.js";
-import { markRouteRateLimited, waitForRouteCapacity } from "./rate-limit.js";
+import { redactSecretText } from "./redact.js";
+import { markRouteRateLimited, routeRateLimitStatus, waitForRouteCapacity } from "./rate-limit.js";
 import { classifyUpstreamError } from "./route-health.js";
 import {
   buildResponsesStreamErrorSse,
@@ -46,7 +49,12 @@ import {
   extractUsageFromSse,
   responsesSseStreamComplete,
 } from "./sse.js";
-import { isResponseToolCallItem, isResponseToolOutputItem } from "./tools.js";
+import {
+  isResponseToolCallItem,
+  isResponseToolOutputItem,
+  toolDiagnosticsFromContext,
+  toolDiagnosticsLogFields,
+} from "./tools.js";
 
 const CHATGPT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const FAILURE_CACHE_MAX_ENTRIES = 200;
@@ -429,17 +437,24 @@ function beginDuplicateInitialRequestGuard(
   }
   trimDuplicateInitialRequestCache();
   const now = Date.now();
+  const currentRouteKey = duplicateGuardRouteKey(route);
   for (const keyInfo of keys) {
     const existing = recentInitialRequests.get(keyInfo.key);
     if (existing?.expiresAt > now && existing.status === "completed" && existing.response) {
       existing.expiresAt = now + keyInfo.ttlMs;
+      const response =
+        existing.routeKey && currentRouteKey && existing.routeKey !== currentRouteKey
+          ? duplicateInitialRequestRouteChangedResponse(requestBody, route)
+          : existing.response;
       serveDuplicateInitialResponse(
-        existing.response,
+        response,
         requestBody,
         route,
         res,
         context,
-        existing.reason || keyInfo.kind || "completed",
+        existing.routeKey && currentRouteKey && existing.routeKey !== currentRouteKey
+          ? "route_changed"
+          : existing.reason || keyInfo.kind || "completed",
       );
       return {
         key: keyInfo.key,
@@ -473,6 +488,7 @@ function beginDuplicateInitialRequestGuard(
       ttlMs: keyInfo.ttlMs,
       recordSuccess: keyInfo.recordSuccess !== false,
       cacheAnyError: Boolean(keyInfo.cacheAnyError),
+      routeKey: currentRouteKey,
     });
   }
   return { key: keys[0].key, keys: keys.map((key) => key.key), served: false };
@@ -493,6 +509,7 @@ function finishDuplicateInitialRequestGuard(context = {}, route = {}, response =
     return;
   }
   const now = Date.now();
+  const routeKey = duplicateGuardRouteKey(route);
   for (const key of keys) {
     const existing = recentInitialRequests.get(key);
     if (!existing) {
@@ -509,6 +526,7 @@ function finishDuplicateInitialRequestGuard(context = {}, route = {}, response =
       reason: existing.kind === "semantic" ? "semantic_replay" : "completed",
       kind: existing.kind,
       ttlMs: existing.ttlMs,
+      routeKey: existing.routeKey || routeKey,
     });
   }
 }
@@ -530,9 +548,12 @@ function finishDuplicateInitialRequestGuardWithError(
   const shouldCacheRetryError = shouldStopDuplicateRetryAfterError(error);
   const response = duplicateInitialRequestErrorResponse(requestBody, route, error, context);
   const now = Date.now();
+  const routeKey = duplicateGuardRouteKey(route);
   for (const key of pendingKeys) {
     const existing = recentInitialRequests.get(key);
-    if (!shouldCacheRetryError && !existing?.cacheAnyError) {
+    const shouldCacheTurnError =
+      Boolean(existing?.cacheAnyError) && shouldCacheDuplicateTurnError(error);
+    if (!shouldCacheRetryError && !shouldCacheTurnError) {
       recentInitialRequests.delete(key);
       continue;
     }
@@ -545,6 +566,7 @@ function finishDuplicateInitialRequestGuardWithError(
       ttlMs: existing?.ttlMs,
       recordSuccess: existing?.recordSuccess,
       cacheAnyError: existing?.cacheAnyError,
+      routeKey: existing?.routeKey || routeKey,
     });
   }
 }
@@ -615,12 +637,23 @@ function duplicateInitialRequestNoopResponse(model, text) {
   };
 }
 
+function duplicateInitialRequestRouteChangedResponse(requestBody = {}, route = {}) {
+  const displayName = route.displayName || route.id || route.model || "the selected model";
+  return duplicateInitialRequestNoopResponse(
+    requestBody.model || route.id || route.model,
+    "CodexBridge 已拦截来自上一模型选择的自动重放，避免误请求上游和消耗 token。 " +
+      "本次没有请求任何上游模型。 " +
+      `请发送一条新消息继续使用 ${displayName}。`,
+  );
+}
+
 function duplicateInitialRequestErrorResponse(requestBody = {}, route = {}, error, context = {}) {
   const detail = retryableErrorDetail(error);
   const reason =
-    "CodexBridge stopped an automatic retry of the same failed request to avoid repeated upstream calls and token usage. " +
-    "The latest upstream error was kept in the previous message. Send a new message to retry after the provider is ready." +
-    (detail ? ` Latest error: ${detail}` : "");
+    "CodexBridge 已拦截同一失败请求的自动重试，避免重复请求上游和消耗 token。 " +
+    "这次拦截没有再次请求任何上游模型；下面的错误来自上一次失败请求。 " +
+    "如果你已经切换模型或想继续当前任务，请发送一条新消息，新消息会按当前模型重新请求。" +
+    (detail ? ` 上一次错误: ${detail}` : "");
   if (context.compactKind) {
     return compactResponseFromLocalFallback(requestBody.model || route.id || route.model, {
       requestBody,
@@ -642,7 +675,12 @@ function shouldStopDuplicateRetryAfterError(error) {
     return true;
   }
   const statusCode = Number(error?.statusCode || 0);
-  return [413, 502, 503, 504].includes(statusCode);
+  return [413, 502, 504].includes(statusCode);
+}
+
+function shouldCacheDuplicateTurnError(error) {
+  const statusCode = Number(error?.statusCode || 0);
+  return statusCode !== 503;
 }
 
 function retryableErrorDetail(error) {
@@ -718,6 +756,17 @@ function duplicateInitialRequestKeysFromContext(context = {}) {
   return [...new Set(keys.filter((key) => typeof key === "string" && key))];
 }
 
+function duplicateGuardRouteKey(route = {}) {
+  return stableStringify({
+    id: route.id || "",
+    provider: route.provider || route.providerId || "",
+    api: route.api || "",
+    model: route.model || "",
+    baseUrl: route.baseUrl || "",
+    authMode: authModeForRoute(route),
+  });
+}
+
 function duplicateInitialRequestKey(requestBody = {}, route = {}, context = {}) {
   if (
     !["chat_completions", "responses"].includes(route.api) ||
@@ -729,6 +778,7 @@ function duplicateInitialRequestKey(requestBody = {}, route = {}, context = {}) 
     return "";
   }
   const headers = context.clientHeaders || {};
+  const turnIdentity = codexTurnIdentity(headers);
   const material = stableStringify({
     route: {
       id: route.id || "",
@@ -742,6 +792,7 @@ function duplicateInitialRequestKey(requestBody = {}, route = {}, context = {}) 
       threadId: headerValue(headers, "x-codex-thread-id") || headerValue(headers, "thread-id"),
       windowId: headerValue(headers, "x-codex-window-id"),
       parentThreadId: headerValue(headers, "x-codex-parent-thread-id"),
+      turnIdentity,
     },
     body: requestBody,
   });
@@ -765,6 +816,7 @@ function duplicateSemanticTurnRequestKey(requestBody = {}, route = {}, context =
     return "";
   }
   const headers = context.clientHeaders || {};
+  const turnIdentity = codexTurnIdentity(headers);
   const material = stableStringify({
     route: {
       id: route.id || "",
@@ -780,6 +832,7 @@ function duplicateSemanticTurnRequestKey(requestBody = {}, route = {}, context =
       parentThreadId: headerValue(headers, "x-codex-parent-thread-id") || "",
       installationId: headerValue(headers, "x-codex-installation-id") || "",
       userAgent: headerValue(headers, "user-agent") || "",
+      turnIdentity,
     },
     compactKind: context.compactKind || "",
     latestUser,
@@ -804,6 +857,7 @@ function duplicateClientTurnRequestKey(requestBody = {}, route = {}, context = {
     return "";
   }
   const headers = context.clientHeaders || {};
+  const turnIdentity = codexTurnIdentity(headers);
   const material = stableStringify({
     client: {
       threadId: headerValue(headers, "x-codex-thread-id") || headerValue(headers, "thread-id") || "",
@@ -811,6 +865,7 @@ function duplicateClientTurnRequestKey(requestBody = {}, route = {}, context = {
       parentThreadId: headerValue(headers, "x-codex-parent-thread-id") || "",
       installationId: headerValue(headers, "x-codex-installation-id") || "",
       userAgent: headerValue(headers, "user-agent") || "",
+      turnIdentity,
     },
     compactKind: context.compactKind || "",
     latestUser,
@@ -1031,6 +1086,12 @@ export async function proxyResponsesApi(
     route,
     history,
   );
+  logToolDiagnostics(
+    context,
+    route,
+    toolDiagnosticsFromContext(toolContext, requestBody.tool_choice || ""),
+    "responses-native",
+  );
   if (shouldInlineLocalHistoryForResponses(requestBody, history)) {
     inlineLocalHistoryForResponsesPayload(payload, sourceMessages);
   }
@@ -1079,6 +1140,51 @@ export async function proxyResponsesApi(
 
   if (!upstream.ok) {
     const bodyText = await upstream.text();
+    const completedResponse = extractResponsesObject(bodyText);
+    if (
+      upstreamPayload.stream &&
+      looksLikeSseResponse(bodyText) &&
+      responsesSseStreamComplete(bodyText) &&
+      isCompletedResponsesObject(completedResponse)
+    ) {
+      console.warn(
+        `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+          `!! upstream route=${route.id} returned HTTP ${upstream.status} with completed Responses SSE; ` +
+          "treating stream as completed for compatibility",
+      );
+      recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
+        requestBody,
+        route,
+      });
+      finishDuplicateInitialRequestGuard(context, route, completedResponse);
+      logUsage(context, route, extractUsageObject(completedResponse) || extractResponsesUsage(bodyText));
+      res.writeHead(200, {
+        ...filteredHeaders(upstream.headers),
+        "content-type": "text/event-stream; charset=utf-8",
+      });
+      res.end(bodyText);
+      return;
+    }
+    if (
+      !upstreamPayload.stream &&
+      looksLikeSseResponse(bodyText) &&
+      responsesSseStreamComplete(bodyText) &&
+      isCompletedResponsesObject(completedResponse)
+    ) {
+      console.warn(
+        `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+          `!! upstream route=${route.id} returned HTTP ${upstream.status} with completed Responses SSE; ` +
+          "returning completed response JSON for compatibility",
+      );
+      recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
+        requestBody,
+        route,
+      });
+      finishDuplicateInitialRequestGuard(context, route, completedResponse);
+      logUsage(context, route, extractUsageObject(completedResponse) || extractResponsesUsage(bodyText));
+      jsonResponse(res, 200, completedResponse);
+      return;
+    }
     const error = new UpstreamHttpError(upstream.status, bodyText, activeUpstreamUrl, route);
     rememberUpstreamFailure(route, activeUpstreamUrl, upstreamPayload, error);
     throw error;
@@ -1432,6 +1538,7 @@ export async function proxyChatCompletions(
   context = {},
 ) {
   const converted = responsesToChatRequest(requestBody, route, history);
+  logToolDiagnostics(context, route, converted.toolDiagnostics, "chat-compat");
   const toolContinuationTurns = chatToolContinuationTurns(requestBody, history);
   const upstreamUrl = joinOpenAiEndpointUrl(route.baseUrl, "/chat/completions");
   logRoute(context, route, upstreamUrl);
@@ -1496,6 +1603,12 @@ export async function proxyChatCompletions(
     requestBody,
     converted,
     context,
+  );
+  logReturnedToolDiagnostics(
+    context,
+    route,
+    returnedToolDiagnosticsFromChat(adjustedUpstream, converted.toolContext),
+    "chat-compat",
   );
   logUsage(context, route, adjustedUpstream.usage);
   let chatForHistory = adjustedUpstream;
@@ -1916,7 +2029,7 @@ function compactFallbackReason(error) {
     return upstreamBodyMessage(error.bodyText, tryParseJson(error.bodyText)) ||
       `HTTP ${error.statusCode}`;
   }
-  return error?.message || String(error || "remote compact failed");
+  return safeText(error?.message || String(error || "remote compact failed"), 800);
 }
 
 function chatToolContinuationTurns(requestBody, history) {
@@ -2303,6 +2416,7 @@ function sendLocalRateLimitedResponse({
     ...responseRequestUserMeta(requestBody),
     localFallback: "provider_rate_limited",
   });
+  finishDuplicateInitialRequestGuard(context, route, response);
   logUsage(context, route, null);
 
   if (converted.wantsStream) {
@@ -2319,13 +2433,20 @@ function sendLocalRateLimitedResponse({
 }
 
 function localRateLimitedChat(route, error) {
-  const retryAfterMs = Number(error?.retryAfterMs || 0);
+  const retryAfterMs = Number(error?.retryAfterMs || routeRateLimitStatus(route).cooldownRemainingMs || 0);
   const waitSeconds = Math.ceil(Math.max(0, retryAfterMs) / 1000);
+  const localCooldown = error?.code === "provider_rate_limited";
+  const upstream429 = Number(error?.statusCode || 0) === 429;
   const waitText =
     waitSeconds > 0
-      ? `Please wait about ${waitSeconds}s, then retry or switch to another model.`
-      : "Please wait a moment, then retry or switch to another model.";
+      ? `Please wait about ${waitSeconds}s, then retry. If you switch models, send a new message to continue; this failed turn will not be replayed automatically.`
+      : "Please wait a moment, then retry. If you switch models, send a new message to continue; this failed turn will not be replayed automatically.";
   const displayName = route.displayName || route.id || "the current model";
+  const reasonText = localCooldown
+    ? `CodexBridge is in local cooldown for ${displayName} because this provider is currently rate limited and recently returned a rate limit. `
+    : upstream429
+      ? `${displayName} returned HTTP 429 because the provider is rate limited. CodexBridge will pause this provider briefly to avoid repeated upstream calls and token waste. `
+      : `CodexBridge paused requests to ${displayName} because the provider is rate limited. `;
   return {
     id: `chatcmpl_rate_limited_${Date.now().toString(36)}_${Math.random()
       .toString(36)
@@ -2336,8 +2457,8 @@ function localRateLimitedChat(route, error) {
         message: {
           role: "assistant",
           content:
-            `CodexBridge stopped sending requests to ${displayName} because the provider is rate limited. ` +
-            "This turn was handled locally to avoid repeated upstream calls and token waste. " +
+            reasonText +
+            "This is not a CodexBridge quota limit; it is based on the upstream provider response. " +
             waitText,
         },
       },
@@ -2930,6 +3051,38 @@ function logRoute(context, route, upstreamUrl) {
   );
 }
 
+function logToolDiagnostics(context, route, diagnostics = {}, mode = "") {
+  const requested = Number(diagnostics.requestedToolCount || 0);
+  const namespaces = Number(diagnostics.namespaceCount || 0);
+  const suppressed = Number(diagnostics.suppressedToolCount || 0);
+  if (requested <= 0 && namespaces <= 0 && suppressed <= 0) {
+    return;
+  }
+  const requestId = context.requestId || "req";
+  console.log(
+    `[${new Date().toISOString()}] ${requestId} tool_diag ` +
+      `route=${safeLogValue(route.id || route.model || "unknown")} ` +
+      `mode=${safeLogValue(mode || route.api || "unknown")} ` +
+      toolDiagnosticsLogFields(diagnostics),
+  );
+}
+
+function logReturnedToolDiagnostics(context, route, diagnostics = {}, mode = "") {
+  const returned = Number(diagnostics.returnedToolCount || 0);
+  const suppressed = Number(diagnostics.suppressedToolCount || 0);
+  const unknown = Number(diagnostics.unknownToolCount || 0);
+  if (returned <= 0 && suppressed <= 0 && unknown <= 0) {
+    return;
+  }
+  const requestId = context.requestId || "req";
+  console.log(
+    `[${new Date().toISOString()}] ${requestId} tool_return_diag ` +
+      `route=${safeLogValue(route.id || route.model || "unknown")} ` +
+      `mode=${safeLogValue(mode || route.api || "unknown")} ` +
+      returnedToolDiagnosticsLogFields(diagnostics),
+  );
+}
+
 function logStatus(context, route, status) {
   const requestId = context.requestId || "req";
   console.log(
@@ -3250,6 +3403,11 @@ function isResponsesObject(value) {
   return Boolean(normalizeResponsesObject(value));
 }
 
+function isCompletedResponsesObject(value) {
+  const response = normalizeResponsesObject(value);
+  return Boolean(response && response.status === "completed" && !response.error);
+}
+
 function normalizeResponsesObject(value) {
   if (!value || typeof value !== "object" || typeof value.id !== "string" || !value.id) {
     return null;
@@ -3392,7 +3550,7 @@ function safeUrl(value) {
 }
 
 function safeText(value, limit = 240) {
-  return String(value || "")
+  return redactSecretText(value, limit)
     .replaceAll("\r", " ")
     .replaceAll("\n", " ")
     .replace(/\s+/g, " ")

@@ -389,7 +389,7 @@ test("route fidelity preserves custom OpenAI-compatible params while honoring pr
   });
 });
 
-test("route fidelity keeps MCP namespace tools callable and mapped back to Codex names", () => {
+test("route fidelity keeps MCP namespace tools callable and mapped back to Codex namespace metadata", () => {
   const converted = responsesToChatRequest(
     {
       input: "read the selected file through MCP",
@@ -448,7 +448,8 @@ test("route fidelity keeps MCP namespace tools callable and mapped back to Codex
   );
 
   assert.equal(response.output[0].type, "function_call");
-  assert.equal(response.output[0].name, "mcp__filesystem__read_file");
+  assert.equal(response.output[0].namespace, "mcp__filesystem__");
+  assert.equal(response.output[0].name, "read_file");
   assert.equal(response.output[0].call_id, "call_read");
 });
 
@@ -670,6 +671,111 @@ test("route fidelity compaction uses chat-summary requests for Kimi and custom r
     assert.equal(compact.body.parallel_tool_calls, undefined, route.id);
     assert.match(JSON.stringify(compact.body.messages), /CONTEXT CHECKPOINT COMPACTION/);
     assert.doesNotMatch(JSON.stringify(compact.body.messages), /compaction_trigger/);
+  }
+});
+
+test("route fidelity compaction never sends trimmed native tool call pairs to chat upstreams", () => {
+  for (const route of [deepseekRoute, kimiRoute, customRoute]) {
+    const history = new ResponseHistory();
+    history.record(`resp_large_tool_${route.id}`, [
+      { role: "user", content: "inspect a very large tool result" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "call_huge_log",
+            type: "function",
+            function: {
+              name: "shell_command",
+              arguments: '{"command":"Get-Content huge.log"}',
+            },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        tool_call_id: "call_huge_log",
+        content: "huge log line\n".repeat(20_000),
+      },
+    ]);
+
+    const compact = buildCompactChatRequest(
+      {
+        model: route.id,
+        previous_response_id: `resp_large_tool_${route.id}`,
+        stream: true,
+        input: [{ type: "compaction_trigger" }],
+      },
+      route,
+      history,
+    );
+
+    assert.equal(
+      compact.body.messages.some((message) => Array.isArray(message.tool_calls)),
+      false,
+      route.id,
+    );
+    assert.equal(
+      compact.body.messages.some((message) => message.role === "tool"),
+      false,
+      route.id,
+    );
+    assert.match(JSON.stringify(compact.body.messages), /call_huge_log/);
+  }
+});
+
+test("route fidelity compaction flattens complete native tool call pairs for chat upstreams", () => {
+  for (const route of [deepseekRoute, kimiRoute, customRoute]) {
+    const history = new ResponseHistory();
+    history.record(`resp_complete_tool_${route.id}`, [
+      { role: "user", content: "inspect the working directory" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "call_shell",
+            type: "function",
+            function: {
+              name: "shell_command",
+              arguments: '{"command":"pwd"}',
+            },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        tool_call_id: "call_shell",
+        content: "F:\\game_code\\router",
+      },
+    ]);
+
+    const compact = buildCompactChatRequest(
+      {
+        model: route.id,
+        previous_response_id: `resp_complete_tool_${route.id}`,
+        stream: true,
+        input: [{ type: "compaction_trigger" }],
+      },
+      route,
+      history,
+    );
+
+    const payload = JSON.stringify(compact.body.messages);
+    assert.equal(
+      compact.body.messages.some((message) => Array.isArray(message.tool_calls)),
+      false,
+      route.id,
+    );
+    assert.equal(
+      compact.body.messages.some((message) => message.role === "tool"),
+      false,
+      route.id,
+    );
+    assert.match(payload, /call_shell/, route.id);
+    assert.match(payload, /shell_command/, route.id);
+    assert.match(payload, /F:\\\\game_code\\\\router/, route.id);
   }
 });
 

@@ -62,8 +62,11 @@ let isQuitting = false;
 let routerStopRequested = false;
 let routerRestartTimer = null;
 let routerRestartAttempts = 0;
-const ROUTER_RESTART_MAX_ATTEMPTS = 3;
+let launchedUpdateLoadHookRegistered = false;
+let desktopSmokeLoadHookRegistered = false;
+const ROUTER_RESTART_MAX_ATTEMPTS = 12;
 const ROUTER_RESTART_BASE_DELAY_MS = 1500;
+const ROUTER_RESTART_MAX_DELAY_MS = 30000;
 const launchedAfterUpdate = process.argv.includes("--updated");
 
 function shouldDisableChromiumSandbox() {
@@ -174,10 +177,37 @@ function createWindow() {
     mainWindow.hide();
   });
 
+  registerWindowLoadHooks();
   mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
 }
 
-app.whenReady().then(() => {
+function registerWindowLoadHooks() {
+  if (launchedAfterUpdate && process.env.CODEXBRIDGE_DESKTOP_SMOKE !== "1" && !launchedUpdateLoadHookRegistered) {
+    launchedUpdateLoadHookRegistered = true;
+    mainWindow.webContents.once("did-finish-load", () => {
+      showMainWindow();
+      appendLog(`Updated CodexBridge launched: v${app.getVersion()}`);
+      sendToRenderer("updates:finished", {
+        version: app.getVersion(),
+        message: `CodexBridge 已更新到 v${app.getVersion()}，配置、密钥和模型选择仍保存在用户数据目录。`,
+      });
+    });
+  }
+
+  if (process.env.CODEXBRIDGE_DESKTOP_SMOKE === "1" && !desktopSmokeLoadHookRegistered) {
+    desktopSmokeLoadHookRegistered = true;
+    const timeout = setTimeout(() => {
+      console.error("Desktop smoke test timed out.");
+      app.exit(1);
+    }, 15000);
+    mainWindow.webContents.once("did-finish-load", () => {
+      clearTimeout(timeout);
+      runDesktopSmokeChecks();
+    });
+  }
+}
+
+app.whenReady().then(async () => {
   if (!hasSingleInstanceLock) {
     return;
   }
@@ -188,7 +218,10 @@ app.whenReady().then(() => {
     createTray();
   }
   createWindow();
-  if (launchedAfterUpdate && process.env.CODEXBRIDGE_DESKTOP_SMOKE !== "1") {
+  cleanupUpdateArtifactsOnStartup().catch((error) => {
+    appendRuntimeLog(formatError("cleanupUpdates", error));
+  });
+  if (launchedAfterUpdate && process.env.CODEXBRIDGE_DESKTOP_SMOKE !== "1" && !launchedUpdateLoadHookRegistered) {
     mainWindow.webContents.once("did-finish-load", () => {
       showMainWindow();
       appendLog(`Updated CodexBridge launched: v${app.getVersion()}`);
@@ -198,7 +231,7 @@ app.whenReady().then(() => {
       });
     });
   }
-  if (process.env.CODEXBRIDGE_DESKTOP_SMOKE === "1") {
+  if (process.env.CODEXBRIDGE_DESKTOP_SMOKE === "1" && !desktopSmokeLoadHookRegistered) {
     const timeout = setTimeout(() => {
       console.error("Desktop smoke test timed out.");
       app.exit(1);
@@ -229,10 +262,57 @@ function createTray() {
   }
   tray = new Tray(trayIconPath);
   tray.setToolTip("CodexBridge");
+  refreshTrayMenu();
+  tray.on("click", () => showMainWindow());
+  return tray;
+}
+
+async function refreshTrayMenu() {
+  if (!tray) {
+    return;
+  }
+  let profiles = [];
+  try {
+    const settings = await loadSettings();
+    profiles = settings.loadConfigProfiles(dataRootDir).slice(0, 5);
+  } catch (error) {
+    appendRuntimeLog(formatError("refreshTrayMenu", error));
+  }
+  const profileSubmenu = profiles.length
+    ? profiles.map((profile) => ({
+        label: profile.name,
+        click: () => applyProfileFromTray(profile.id),
+      }))
+    : [{
+        label: "暂无配置档",
+        enabled: false,
+      }];
   tray.setContextMenu(Menu.buildFromTemplate([
     {
       label: "打开 CodexBridge",
       click: () => showMainWindow(),
+    },
+    {
+      label: routerProcess ? "停止 Router" : "启动 Router",
+      click: () => {
+        if (routerProcess) {
+          stopRouterFromTray();
+        } else {
+          startRouterProcess();
+        }
+      },
+    },
+    {
+      label: "重启 Codex",
+      click: () => restartCodexDesktop().catch((error) => appendLog(`Restart Codex failed: ${error?.message || error}`)),
+    },
+    {
+      label: "打开日志",
+      click: () => navigateRenderer("logs"),
+    },
+    {
+      label: "配置档",
+      submenu: profileSubmenu,
     },
     {
       type: "separator",
@@ -246,8 +326,46 @@ function createTray() {
       },
     },
   ]));
-  tray.on("click", () => showMainWindow());
-  return tray;
+}
+
+async function stopRouterFromTray() {
+  stopRouter();
+  try {
+    const settings = await loadSettings();
+    const result = settings.restoreCodexConfig();
+    appendLog(result?.backup
+      ? `Restored Codex config after Router stop: ${result.backup}`
+      : "Codex config restored after Router stop.");
+  } catch (error) {
+    appendLog(`Codex config restore after Router stop skipped: ${error?.message || error}`);
+  }
+  await broadcastState();
+  refreshTrayMenu();
+}
+
+async function applyProfileFromTray(profileId) {
+  try {
+    const settings = await loadSettings();
+    const profile = settings.loadConfigProfiles(dataRootDir).find((item) => item.id === String(profileId || ""));
+    if (!profile) {
+      throw new Error("Config profile not found.");
+    }
+    settings.saveSelection(dataRootDir, profile.selectedModelIds || [], profile.mode);
+    settings.saveDesktopOptions(dataRootDir, profile.desktopOptions || {});
+    settings.writeRouterConfigFromSelection(dataRootDir, profile.mode);
+    appendLog(`Applied config profile from tray: ${profile.name}.`);
+    await broadcastState();
+    navigateRenderer("settings");
+  } catch (error) {
+    appendLog(`Apply config profile from tray failed: ${error?.message || error}`);
+  } finally {
+    refreshTrayMenu();
+  }
+}
+
+function navigateRenderer(section) {
+  showMainWindow();
+  sendToRenderer("ui:navigate", { section });
 }
 
 function showMainWindow() {
@@ -286,6 +404,16 @@ ipcMain.handle("state:get", async () => {
     secretStatus: settings.secretStatus(dataRootDir),
     desktopOptions: settings.loadDesktopOptions(dataRootDir),
     diagnostics,
+    startupCheck: settings.buildStartupCheck(dataRootDir, {
+      appVersion: app.getVersion(),
+      routerRunning: Boolean(routerProcess),
+      lastHealth,
+      config,
+    }),
+    configProfiles: settings.loadConfigProfiles(dataRootDir),
+    codexBackups: settings.listCodexBackups(),
+    codexResources: settings.listCodexResources({ rootDir: appRootDir }),
+    codexSessions: settings.listCodexSessions({ limit: 50 }),
     lastHealth,
     usageEvents: usageStore?.events() || [],
     usageSummary: usageStore?.summary({ routes: config?.models || [] }) || emptyUsageSummary(),
@@ -324,8 +452,31 @@ ipcMain.handle("options:save", async (_event, options) => {
       ? "System proxy bypass enabled for Router process."
       : "System proxy bypass disabled for Router process.",
   );
+  try {
+    const config = settings.writeRouterConfigFromSelection(
+      dataRootDir,
+      settings.detectModeFromConfig(settings.readRouterConfig(dataRootDir)),
+    );
+    appendLog(`Router port configured: ${config.port}. Restart Router for port changes to take effect.`);
+  } catch (error) {
+    appendLog(`Router config refresh after options save skipped: ${error?.message || error}`);
+  }
   broadcastState();
   return getStatePayload(settings);
+});
+
+ipcMain.handle("startup:check", async () => {
+  const settings = await loadSettings();
+  const config = settings.readRouterConfig(dataRootDir);
+  const check = settings.buildStartupCheck(dataRootDir, {
+    appVersion: app.getVersion(),
+    routerRunning: Boolean(routerProcess),
+    lastHealth,
+    config,
+  });
+  appendLog(`Startup check: pass=${check.summary.pass} warn=${check.summary.warn} fail=${check.summary.fail}.`);
+  broadcastState();
+  return check;
 });
 
 ipcMain.handle("models:saveSelection", async (_event, selectedModelIds) => {
@@ -404,6 +555,27 @@ ipcMain.handle("models:saveCapabilities", async (_event, payload) => {
   };
 });
 
+ipcMain.handle("models:resetCapabilities", async (_event, presetId) => {
+  const settings = await loadSettings();
+  const reset = settings.resetModelCapabilityOverride(dataRootDir, String(presetId || ""));
+  const config = settings.readRouterConfig(dataRootDir);
+  const mode = settings.detectModeFromConfig(config);
+  settings.writeRouterConfigFromSelection(dataRootDir, mode);
+  const catalogResult = await runNodeScript([
+    scriptPath("scripts/generate-catalog.js"),
+    settings.catalogPath(dataRootDir),
+  ]);
+  if (!catalogResult.ok) {
+    throw new Error(catalogResult.output || "Failed to generate model catalog.");
+  }
+  appendLog(`Reset model capabilities: ${reset.presetId}.`);
+  broadcastState();
+  return {
+    reset,
+    state: await getStatePayload(settings),
+  };
+});
+
 ipcMain.handle("providers:refreshModels", async (_event, providerId) => {
   const settings = await loadSettings();
   const result = await settings.refreshProviderModelDirectory(dataRootDir, String(providerId || ""));
@@ -419,9 +591,69 @@ ipcMain.handle("providers:refreshModels", async (_event, providerId) => {
   };
 });
 
+ipcMain.handle("providers:save", async (_event, provider) => {
+  const settings = await loadSettings();
+  const providerId = String(provider?.providerId || provider?.id || "").trim();
+  const saved = settings.saveProviderOverride(dataRootDir, providerId, provider || {});
+  const current = settings.providerCatalog(dataRootDir).find((item) => item.id === providerId);
+  const apiKey = typeof provider?.apiKey === "string" ? provider.apiKey.trim() : "";
+  const keyEnv = saved.keyEnv || current?.keyEnv || "";
+  if (apiKey && keyEnv) {
+    settings.saveSecrets(dataRootDir, { [keyEnv]: apiKey });
+  }
+  appendLog(`Saved provider settings: ${saved.name || providerId}.`);
+  broadcastState();
+  return {
+    saved,
+    state: await getStatePayload(settings),
+  };
+});
+
+ipcMain.handle("providers:testConnection", async (_event, provider) => {
+  const settings = await loadSettings();
+  const result = await settings.testProviderConnection(dataRootDir, provider);
+  appendLog(
+    result.ok
+      ? `Provider connection OK: ${result.providerId} (${result.status || 0}).`
+      : `Provider connection failed: ${result.providerId || "unknown"} ${result.error || result.message || "unknown error"}.`,
+  );
+  return result;
+});
+
+ipcMain.handle("logos:select", async (_event, payload = {}) => {
+  const providerId = String(payload?.providerId || payload?.ownerId || "").trim();
+  const ownerId = providerId || String(payload?.ownerId || "provider").trim();
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: "选择本地图标",
+    properties: ["openFile"],
+    filters: [
+      { name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "gif", "svg", "ico"] },
+    ],
+  });
+  if (result.canceled || !result.filePaths?.[0]) {
+    return { canceled: true };
+  }
+  const settings = await loadSettings();
+  const saved = settings.saveProviderLogo(dataRootDir, ownerId, result.filePaths[0]);
+  if (payload?.applyToProvider && providerId) {
+    settings.saveProviderOverride(dataRootDir, providerId, { logoUrl: saved.logoUrl });
+    appendLog(`Updated provider logo: ${providerId}.`);
+    broadcastState();
+    return {
+      ...saved,
+      state: await getStatePayload(settings),
+    };
+  }
+  return saved;
+});
+
 ipcMain.handle("customModel:save", async (_event, model) => {
   const settings = await loadSettings();
   const saved = settings.saveCustomModel(dataRootDir, model);
+  const apiKey = typeof model?.apiKey === "string" ? model.apiKey.trim() : "";
+  if (apiKey && saved.keyEnv) {
+    settings.saveSecrets(dataRootDir, { [saved.keyEnv]: apiKey });
+  }
   appendLog(`Saved custom model: ${saved.displayName}.`);
   broadcastState();
   return saved;
@@ -433,6 +665,71 @@ ipcMain.handle("customModel:remove", async (_event, presetId) => {
   appendLog(`Removed custom model: ${presetId}.`);
   broadcastState();
   return getStatePayload(settings);
+});
+
+ipcMain.handle("profiles:save", async (_event, profile) => {
+  const settings = await loadSettings();
+  const config = settings.readRouterConfig(dataRootDir);
+  const mode = settings.detectModeFromConfig(config);
+  const saved = settings.saveConfigProfile(dataRootDir, {
+    id: profile?.id,
+    name: profile?.name || `配置档 ${new Date().toLocaleString("zh-CN", { hour12: false })}`,
+    mode: profile?.mode || mode,
+    selectedModelIds: Array.isArray(profile?.selectedModelIds)
+      ? profile.selectedModelIds
+      : settings.readSelection(dataRootDir, mode),
+    desktopOptions: profile?.desktopOptions || settings.loadDesktopOptions(dataRootDir),
+    note: profile?.note || "",
+    createdAt: profile?.createdAt,
+  });
+  appendLog(`Saved config profile: ${saved.name}.`);
+  broadcastState();
+  return {
+    saved,
+    state: await getStatePayload(settings),
+  };
+});
+
+ipcMain.handle("profiles:apply", async (_event, profileId) => {
+  const settings = await loadSettings();
+  const profile = settings.loadConfigProfiles(dataRootDir).find((item) => item.id === String(profileId || ""));
+  if (!profile) {
+    throw new Error("Config profile not found.");
+  }
+  settings.saveSelection(dataRootDir, profile.selectedModelIds || [], profile.mode);
+  settings.saveDesktopOptions(dataRootDir, profile.desktopOptions || {});
+  settings.writeRouterConfigFromSelection(dataRootDir, profile.mode);
+  appendLog(`Applied config profile: ${profile.name}.`);
+  broadcastState();
+  refreshTrayMenu();
+  return getStatePayload(settings);
+});
+
+ipcMain.handle("backups:restore", async (_event, backupPath) => {
+  const settings = await loadSettings();
+  const result = settings.restoreCodexConfigFromBackup(String(backupPath || ""));
+  appendLog(`Restored Codex config from selected backup: ${result.backup}`);
+  if (result.currentBackup) {
+    appendLog(`Current config backed up before selected restore: ${result.currentBackup}`);
+  }
+  broadcastState();
+  return {
+    result,
+    state: await getStatePayload(settings),
+  };
+});
+
+ipcMain.handle("sessions:export", async (_event, sessionId) => {
+  const settings = await loadSettings();
+  const exported = settings.exportCodexSessionMarkdown(String(sessionId || ""));
+  clipboard.writeText(exported.markdown);
+  appendLog(`Exported Codex session markdown: ${exported.session?.id || sessionId}.`);
+  return {
+    ok: true,
+    session: exported.session,
+    databasePath: exported.databasePath,
+    markdownLength: exported.markdown.length,
+  };
 });
 
 ipcMain.handle("catalog:generate", async () => {
@@ -509,6 +806,45 @@ ipcMain.handle("codex:restore", async () => {
   return result;
 });
 
+ipcMain.handle("codex:restart", async () => {
+  const result = await restartCodexDesktop();
+  appendLog(result.message);
+  broadcastState();
+  return result;
+});
+
+ipcMain.handle("codex:select-exe", async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: "Choose Codex.exe or shortcut",
+    properties: ["openFile"],
+    filters: [
+      { name: "Codex Desktop", extensions: ["exe", "lnk"] },
+    ],
+  });
+  if (result.canceled || !result.filePaths?.[0]) {
+    return { canceled: true };
+  }
+  const selectedPath = result.filePaths[0];
+  if (!/\.(?:exe|lnk)$/i.test(selectedPath)) {
+    throw new Error("Please choose Codex.exe or a Codex shortcut.");
+  }
+  if (!fs.existsSync(selectedPath)) {
+    throw new Error(`Codex Desktop launch target does not exist: ${selectedPath}`);
+  }
+  const settings = await loadSettings();
+  const savePayload = /\.exe$/i.test(selectedPath)
+    ? { codexDesktopExe: selectedPath, codexDesktopLaunchTarget: selectedPath }
+    : { codexDesktopLaunchTarget: selectedPath };
+  const saved = settings.saveDesktopOptions(dataRootDir, savePayload);
+  appendLog(`Saved Codex Desktop launch target: ${saved.codexDesktopLaunchTarget || saved.codexDesktopExe}`);
+  broadcastState();
+  return {
+    ok: true,
+    path: saved.codexDesktopLaunchTarget || saved.codexDesktopExe,
+    state: await getStatePayload(settings),
+  };
+});
+
 ipcMain.handle("codex:recover-history", async () => {
   const settings = await loadSettings();
   const result = settings.recoverCodexHistoryAccess();
@@ -564,6 +900,7 @@ async function startRouterProcess(options = {}) {
     env: runtimeEnv(settings),
     windowsHide: true,
   });
+  refreshTrayMenu();
 
   appendLog(`Starting router with ${nodePath}.`);
   routerProcess.stdout.on("data", (chunk) => appendLog(chunk.toString("utf8").trimEnd()));
@@ -572,10 +909,12 @@ async function startRouterProcess(options = {}) {
     const stoppedByRequest = routerStopRequested;
     if (isQuitting) {
       routerProcess = null;
+      refreshTrayMenu();
       return;
     }
     appendLog(`Router stopped with code ${code ?? "unknown"}.`);
     routerProcess = null;
+    refreshTrayMenu();
     if (stoppedByRequest) {
       routerStopRequested = false;
       lastHealth = {
@@ -619,6 +958,15 @@ async function startRouterProcess(options = {}) {
 ipcMain.handle("router:stop", async () => {
   stopRouter();
   appendLog("Router stop requested.");
+  try {
+    const settings = await loadSettings();
+    const result = settings.restoreCodexConfig();
+    appendLog(result?.backup
+      ? `Restored Codex config after Router stop: ${result.backup}`
+      : "Codex config restored after Router stop.");
+  } catch (error) {
+    appendLog(`Codex config restore after Router stop skipped: ${error?.message || error}`);
+  }
   lastHealth = {
     ok: false,
     status: 0,
@@ -627,6 +975,7 @@ ipcMain.handle("router:stop", async () => {
     checkedAt: new Date().toISOString(),
   };
   broadcastState();
+  refreshTrayMenu();
   return { ok: true };
 });
 
@@ -814,6 +1163,357 @@ function stopRouter(options = {}) {
   routerProcess = null;
 }
 
+async function restartCodexDesktop() {
+  if (process.platform === "win32") {
+    return restartCodexDesktopWindows();
+  }
+  if (process.platform === "darwin") {
+    const child = spawn("open", ["-a", "Codex"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
+    return { ok: true, message: "Codex restart requested with macOS open -a Codex." };
+  }
+  throw new Error("Restart Codex is currently supported on Windows and macOS only.");
+}
+
+async function restartCodexDesktopWindows() {
+  const settings = await loadSettings();
+  const desktopOptions = settings.loadDesktopOptions(dataRootDir);
+  const running = await listRunningCodexDesktopProcesses();
+  const launchPath = firstExistingPath([
+    ...running.map((item) => item.executablePath),
+    ...(await codexDesktopLaunchCandidates(desktopOptions)),
+  ]);
+  if (!launchPath) {
+    throw new Error(
+      "Could not find Codex Desktop. Click Choose Codex.exe in CodexBridge, install Codex Desktop normally, or set CODEX_DESKTOP_EXE to Codex.exe and try again.",
+    );
+  }
+
+  await stopCodexDesktopProcesses(running);
+  if (running.length) {
+    await delay(900);
+  }
+  launchCodexDesktopTarget(launchPath);
+  return {
+    ok: true,
+    message: running.length
+      ? `Codex restarted: ${launchPath}`
+      : `Codex started: ${launchPath}`,
+  };
+}
+
+function launchCodexDesktopTarget(launchPath) {
+  const isShortcut = /\.lnk$/i.test(launchPath);
+  const isShellTarget = /^shell:/i.test(launchPath);
+  const child = isShortcut || isShellTarget
+    ? spawn("explorer.exe", [launchPath], {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: false,
+      })
+    : spawn(launchPath, [], {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: false,
+      });
+  child.unref();
+}
+
+async function listRunningCodexDesktopProcesses() {
+  const wmicRows = await listCodexDesktopProcessesWithWmic();
+  if (wmicRows.length) {
+    return wmicRows;
+  }
+  return listCodexDesktopProcessesWithTasklist();
+}
+
+async function listCodexDesktopProcessesWithWmic() {
+  const result = await runCommandCapture("wmic.exe", [
+    "process",
+    "where",
+    "name='Codex.exe'",
+    "get",
+    "ProcessId,ExecutablePath",
+    "/format:csv",
+  ]);
+  if (!result.ok || !result.stdout.trim()) {
+    return [];
+  }
+  return result.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !/^Node,ExecutablePath,ProcessId$/i.test(line))
+    .map((line) => {
+      const parts = line.split(",");
+      const processId = Number(parts.pop());
+      const executablePath = parts.slice(1).join(",").trim();
+      return { processId, executablePath };
+    })
+    .filter((item) => Number.isInteger(item.processId) && item.executablePath && !/CodexBridge/i.test(item.executablePath));
+}
+
+async function listCodexDesktopProcessesWithTasklist() {
+  const result = await runCommandCapture("tasklist.exe", [
+    "/FI",
+    "IMAGENAME eq Codex.exe",
+    "/FO",
+    "CSV",
+    "/NH",
+  ]);
+  if (!result.ok || !result.stdout.trim() || /No tasks are running/i.test(result.stdout)) {
+    return [];
+  }
+  return result.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const columns = parseCsvLine(line);
+      return {
+        processId: Number(columns[1]),
+        executablePath: "",
+      };
+    })
+    .filter((item) => Number.isInteger(item.processId));
+}
+
+async function stopCodexDesktopProcesses(running) {
+  if (!running.length) {
+    return;
+  }
+  const processIds = running
+    .map((item) => item.processId)
+    .filter((processId) => Number.isInteger(processId));
+  if (processIds.length) {
+    await Promise.all(processIds.map((processId) => runCommandQuiet("taskkill.exe", ["/PID", String(processId), "/F"])));
+    return;
+  }
+  await runCommandQuiet("taskkill.exe", ["/IM", "Codex.exe", "/F"]);
+}
+
+function parseCsvLine(line) {
+  const values = [];
+  let current = "";
+  let quoted = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    if (char === '"') {
+      if (quoted && line[index + 1] === '"') {
+        current += '"';
+        index += 1;
+      } else {
+        quoted = !quoted;
+      }
+    } else if (char === "," && !quoted) {
+      values.push(current);
+      current = "";
+    } else {
+      current += char;
+    }
+  }
+  values.push(current);
+  return values;
+}
+
+function codexDesktopCandidates(desktopOptions = {}) {
+  const localAppData = process.env.LOCALAPPDATA || "";
+  const appData = process.env.APPDATA || "";
+  const userProfile = process.env.USERPROFILE || "";
+  const programFiles = process.env.ProgramFiles || "";
+  const programFilesX86 = process.env["ProgramFiles(x86)"] || "";
+  const candidates = [
+    desktopOptions?.codexDesktopLaunchTarget,
+    desktopOptions?.codexDesktopExe,
+    process.env.CODEX_DESKTOP_EXE,
+    path.join(localAppData, "OpenAI", "Codex", "Codex.exe"),
+    path.join(localAppData, "OpenAI", "Codex", "app", "Codex.exe"),
+    path.join(localAppData, "OpenAI", "Codex", "app", "app", "Codex.exe"),
+    path.join(localAppData, "Programs", "Codex", "app", "Codex.exe"),
+    path.join(localAppData, "Programs", "Codex", "Codex.exe"),
+    path.join(localAppData, "Programs", "Codex Desktop", "Codex.exe"),
+    path.join(localAppData, "Programs", "OpenAI Codex", "Codex.exe"),
+    path.join(localAppData, "Programs", "OpenAI", "Codex.exe"),
+    path.join(localAppData, "Programs", "OpenAI", "Codex", "Codex.exe"),
+    path.join(localAppData, "Codex", "Codex.exe"),
+    path.join(appData, "Codex", "Codex.exe"),
+    path.join(userProfile, "AppData", "Local", "OpenAI", "Codex", "Codex.exe"),
+    path.join(userProfile, "AppData", "Local", "Programs", "Codex", "Codex.exe"),
+    path.join(programFiles, "Codex", "Codex.exe"),
+    path.join(programFiles, "OpenAI Codex", "Codex.exe"),
+    path.join(programFiles, "OpenAI", "Codex", "Codex.exe"),
+    path.join(programFilesX86, "Codex", "Codex.exe"),
+    path.join(programFilesX86, "OpenAI Codex", "Codex.exe"),
+    path.join(programFilesX86, "OpenAI", "Codex", "Codex.exe"),
+  ];
+  return [...new Set(candidates.filter(Boolean))];
+}
+
+async function codexDesktopLaunchCandidates(desktopOptions = {}) {
+  if (process.platform !== "win32") {
+    return codexDesktopCandidates(desktopOptions);
+  }
+  const shortcutCandidates = codexDesktopShortcutCandidates();
+  const candidates = [
+    ...codexDesktopCandidates(desktopOptions),
+    ...shortcutCandidates,
+    ...(await codexDesktopShortcutTargets(shortcutCandidates)),
+    ...(await codexDesktopWhereCandidates()),
+  ];
+  return [...new Set(candidates.filter(Boolean))];
+}
+
+function codexDesktopShortcutCandidates() {
+  const appData = process.env.APPDATA || "";
+  const programData = process.env.ProgramData || "";
+  const userProfile = process.env.USERPROFILE || "";
+  const startMenuRoots = [
+    path.join(appData, "Microsoft", "Windows", "Start Menu", "Programs"),
+    path.join(programData, "Microsoft", "Windows", "Start Menu", "Programs"),
+    path.join(userProfile, "Desktop"),
+    path.join(process.env.PUBLIC || "", "Desktop"),
+  ].filter(Boolean);
+  const fixed = [
+    path.join(appData, "Microsoft", "Windows", "Start Menu", "Programs", "Codex.lnk"),
+    path.join(appData, "Microsoft", "Windows", "Start Menu", "Programs", "Codex Desktop.lnk"),
+    path.join(appData, "Microsoft", "Windows", "Start Menu", "Programs", "OpenAI Codex.lnk"),
+    path.join(programData, "Microsoft", "Windows", "Start Menu", "Programs", "Codex.lnk"),
+    path.join(programData, "Microsoft", "Windows", "Start Menu", "Programs", "Codex Desktop.lnk"),
+    path.join(programData, "Microsoft", "Windows", "Start Menu", "Programs", "OpenAI Codex.lnk"),
+    path.join(userProfile, "Desktop", "Codex.lnk"),
+    path.join(userProfile, "Desktop", "Codex Desktop.lnk"),
+    path.join(userProfile, "Desktop", "OpenAI Codex.lnk"),
+  ].filter(Boolean);
+  return [
+    ...fixed,
+    ...startMenuRoots.flatMap((root) => findCodexDesktopShortcuts(root)),
+  ].filter(Boolean);
+}
+
+function findCodexDesktopShortcuts(rootDir, maxDepth = 3) {
+  const found = [];
+  const stack = [{ dir: rootDir, depth: 0 }];
+  while (stack.length) {
+    const current = stack.pop();
+    try {
+      for (const entry of fs.readdirSync(current.dir, { withFileTypes: true })) {
+        const entryPath = path.join(current.dir, entry.name);
+        if (entry.isDirectory() && current.depth < maxDepth) {
+          stack.push({ dir: entryPath, depth: current.depth + 1 });
+          continue;
+        }
+        if (entry.isFile() && /\.lnk$/i.test(entry.name) && /codex/i.test(entry.name)) {
+          found.push(entryPath);
+        }
+      }
+    } catch {
+      // Some shell folders can be unavailable or permission-protected.
+    }
+  }
+  return found;
+}
+
+async function codexDesktopShortcutTargets(shortcutCandidates = codexDesktopShortcutCandidates()) {
+  const existingShortcuts = shortcutCandidates.filter((candidate) => safeExists(candidate));
+  const targets = [];
+  for (const shortcutPath of existingShortcuts) {
+    const target = await resolveWindowsShortcutTarget(shortcutPath);
+    if (target && /codex\.exe$/i.test(target)) {
+      targets.push(target);
+    }
+  }
+  return targets;
+}
+
+async function resolveWindowsShortcutTarget(shortcutPath) {
+  const result = await runCommandCapture("powershell.exe", [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-Command",
+    "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($args[0]); [Console]::OutputEncoding=[Text.UTF8Encoding]::UTF8; $s.TargetPath",
+    shortcutPath,
+  ]);
+  if (!result.ok) {
+    return "";
+  }
+  return result.stdout.trim().split(/\r?\n/)[0] || "";
+}
+
+async function codexDesktopWhereCandidates() {
+  const result = await runCommandCapture("where.exe", ["Codex.exe"]);
+  if (!result.ok) {
+    return [];
+  }
+  return result.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /codex\.exe$/i.test(line));
+}
+
+function firstExistingPath(candidates) {
+  return candidates.find((candidate) => {
+    try {
+      return candidate && fs.existsSync(candidate);
+    } catch {
+      return false;
+    }
+  });
+}
+
+function safeExists(targetPath) {
+  try {
+    return Boolean(targetPath && fs.existsSync(targetPath));
+  } catch {
+    return false;
+  }
+}
+
+function runCommandCapture(command, args) {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    let stdout = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.on("exit", (code) => resolve({ ok: code === 0, stdout }));
+    child.on("error", () => resolve({ ok: false, stdout: "" }));
+  });
+}
+
+function runCommandQuiet(command, args) {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, {
+      windowsHide: true,
+      stdio: "ignore",
+    });
+    child.on("exit", () => resolve());
+    child.on("error", () => resolve());
+  });
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function cleanupUpdateArtifactsOnStartup() {
+  if (process.env.CODEXBRIDGE_DESKTOP_SMOKE === "1") {
+    return;
+  }
+  try {
+    const updater = await loadUpdater();
+    fs.mkdirSync(portableUpdatesDir(), { recursive: true });
+    await updater.cleanupManagedUpdateArtifacts?.(portableUpdatesDir(), { keepPackages: 1 });
+  } catch (error) {
+    appendRuntimeLog(formatError("cleanupUpdates", error));
+  }
+}
+
 function scheduleRouterRestart(exitCode) {
   if (isQuitting || routerStopRequested || routerRestartTimer) {
     return;
@@ -831,7 +1531,7 @@ function scheduleRouterRestart(exitCode) {
     return;
   }
   routerRestartAttempts += 1;
-  const delayMs = ROUTER_RESTART_BASE_DELAY_MS * routerRestartAttempts;
+  const delayMs = Math.min(ROUTER_RESTART_BASE_DELAY_MS * routerRestartAttempts, ROUTER_RESTART_MAX_DELAY_MS);
   appendLog(
     `Router watchdog will restart in ${delayMs} ms ` +
       `(attempt ${routerRestartAttempts}/${ROUTER_RESTART_MAX_ATTEMPTS}, last code ${exitCode ?? "unknown"}).`,
@@ -886,7 +1586,7 @@ async function prepareInstallerUpdate(updater, plan, onProgress) {
     installerPath,
     updatesDir,
   });
-  await updater.cleanupManagedUpdateArtifacts?.(updatesDir, { keepPackages: 2 });
+  await updater.cleanupManagedUpdateArtifacts?.(updatesDir, { keepPackages: 1 });
   return { installerPath, installerNotePath, updatesDir };
 }
 
@@ -934,7 +1634,7 @@ async function preparePortableUpdate(updater, plan, onProgress) {
       logPath,
     });
     fs.writeFileSync(scriptFile, script, "utf8");
-    await updater.cleanupManagedUpdateArtifacts?.(updatesDir, { keepPackages: 2 });
+    await updater.cleanupManagedUpdateArtifacts?.(updatesDir, { keepPackages: 1 });
     return { downloadPath, scriptPath: scriptFile, manualNotePath };
   }
   if (process.platform === "darwin") {
@@ -948,7 +1648,7 @@ async function preparePortableUpdate(updater, plan, onProgress) {
       logPath,
     });
     fs.writeFileSync(scriptFile, script, { encoding: "utf8", mode: 0o755 });
-    await updater.cleanupManagedUpdateArtifacts?.(updatesDir, { keepPackages: 2 });
+    await updater.cleanupManagedUpdateArtifacts?.(updatesDir, { keepPackages: 1 });
     return { downloadPath, scriptPath: scriptFile, manualNotePath };
   }
   throw new Error(`当前系统暂不支持应用内更新：${process.platform} ${process.arch}`);
@@ -1360,6 +2060,16 @@ async function getStatePayload(settings) {
     secretStatus: settings.secretStatus(dataRootDir),
     desktopOptions: settings.loadDesktopOptions(dataRootDir),
     diagnostics,
+    startupCheck: settings.buildStartupCheck(dataRootDir, {
+      appVersion: app.getVersion(),
+      routerRunning: Boolean(routerProcess),
+      lastHealth,
+      config,
+    }),
+    configProfiles: settings.loadConfigProfiles(dataRootDir),
+    codexBackups: settings.listCodexBackups(),
+    codexResources: settings.listCodexResources({ rootDir: appRootDir }),
+    codexSessions: settings.listCodexSessions({ limit: 50 }),
     lastHealth,
     usageEvents: usageStore?.events() || [],
     usageSummary: usageStore?.summary({ routes: config?.models || [] }) || emptyUsageSummary(),
@@ -1389,10 +2099,6 @@ async function refreshRouterHealth(config) {
   return result;
 }
 
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function usagePayload() {
   return {
     usageEvents: usageStore?.events() || [],
@@ -1405,6 +2111,9 @@ function emptyUsageSummary() {
     totalCalls: 0,
     totalTokens: 0,
     promptTokens: 0,
+    freshPromptTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
     completionTokens: 0,
     statusCounts: {},
     byModel: [],
@@ -1413,6 +2122,9 @@ function emptyUsageSummary() {
       totalCalls: 0,
       totalTokens: 0,
       promptTokens: 0,
+      freshPromptTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
       completionTokens: 0,
       statusCounts: {},
       byModel: [],
@@ -1423,6 +2135,9 @@ function emptyUsageSummary() {
       totalCalls: 0,
       totalTokens: 0,
       promptTokens: 0,
+      freshPromptTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
       completionTokens: 0,
       statusCounts: {},
       byModel: [],
@@ -1437,16 +2152,25 @@ async function runDesktopSmokeChecks() {
     const result = await mainWindow.webContents.executeJavaScript(`
       (async () => {
         const required = [
-          "#initializeCodex",
-          "#restoreCodexConfig",
-          "#recoverHistoryAccess",
+          "#runStartupCheck",
           "#routerToggle",
+          "#restartCodex",
           "#healthStatus",
-          "#bypassSystemProxy",
           "#saveModelSelectionPanel",
           "#providerGrid",
+          "#providerPreview",
+          "#modelConfigPool",
           "#stats",
+          "#settings",
+          "#routerPort",
+          "#saveDesktopOptions",
+          "#bypassSystemProxy",
+          "#usageRange",
           "#usageChart",
+          "#resourceSummary",
+          "#resourceList",
+          "#sessionList",
+          "#recoverHistoryAccessSessions",
           "#copyDiagnostics",
           "#checkUpdates",
           "#openUpdateFolder"
@@ -1470,16 +2194,38 @@ async function runDesktopSmokeChecks() {
             }
           }, 80);
         });
-        await waitFor(() => document.querySelectorAll(".provider-card").length >= 3);
-        document.querySelector('[data-section="providers"]').click();
-        if (document.querySelector("#providers").classList.contains("hidden")) {
-          throw new Error("Providers nav did not activate");
+        await waitFor(() => document.querySelectorAll("[data-provider-preview]").length >= 3);
+        document.querySelector('[data-section="models"]').click();
+        if (document.querySelector("#models").classList.contains("hidden")) {
+          throw new Error("Models nav did not activate");
         }
-        if (!document.querySelector("[data-save-provider]")) {
-          throw new Error("Provider save button missing");
+        if (!document.querySelector("[data-provider-preview]")) {
+          throw new Error("Provider preview did not render");
         }
-        if (!document.querySelector("[data-toggle-secret]")) {
-          throw new Error("Provider reveal button missing");
+        if (!document.querySelector("[data-provider-edit]")) {
+          throw new Error("Provider edit button missing");
+        }
+        if (!document.querySelector("[data-open-custom-editor]")) {
+          throw new Error("Custom model entry missing");
+        }
+        if (!document.querySelector("#modelPool .model-card")) {
+          throw new Error("Model pool did not render");
+        }
+        document.querySelector('[data-section="settings"]').click();
+        if (document.querySelector("#settings").classList.contains("hidden")) {
+          throw new Error("Settings nav did not activate");
+        }
+        document.querySelector('[data-section="preflight"]').click();
+        if (document.querySelector("#preflight").classList.contains("hidden")) {
+          throw new Error("Preflight nav did not activate");
+        }
+        document.querySelector('[data-section="resources"]').click();
+        if (document.querySelector("#resources").classList.contains("hidden")) {
+          throw new Error("Resources nav did not activate");
+        }
+        document.querySelector('[data-section="sessions"]').click();
+        if (document.querySelector("#sessions").classList.contains("hidden")) {
+          throw new Error("Sessions nav did not activate");
         }
         document.querySelector('[data-section="stats"]').click();
         if (document.querySelector("#stats").classList.contains("hidden")) {

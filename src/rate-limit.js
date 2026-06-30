@@ -86,7 +86,7 @@ async function reserveRouteCapacity(state, route, context, options = {}) {
     if (cooldownRemainingMs > 0) {
       if (context.requestId) {
         console.log(
-          `[${new Date().toISOString()}] ${context.requestId} rate-limit ` +
+          `[${new Date().toISOString()}] ${context.requestId} rate-limit-cooldown ` +
             `route=${route.id || route.model || "unknown"} cooldown_remaining_ms=${cooldownRemainingMs}`,
         );
       }
@@ -106,7 +106,7 @@ async function reserveRouteCapacity(state, route, context, options = {}) {
 
   if (context.requestId) {
     console.log(
-      `[${new Date().toISOString()}] ${context.requestId} rate-limit ` +
+      `[${new Date().toISOString()}] ${context.requestId} rate-limit-pacing ` +
         `route=${route.id || route.model || "unknown"} next_after_ms=${intervalMs}`,
     );
   }
@@ -120,11 +120,36 @@ async function waitUntil(timestamp) {
 }
 
 function routeIntervalMs(route = {}) {
-  const rpm = Number(route.rpm || route.rateLimit?.rpm || 0);
+  const rpm = effectiveRouteRpm(route);
   if (!Number.isFinite(rpm) || rpm <= 0) {
     return 0;
   }
   return Math.ceil(60_000 / rpm);
+}
+
+function effectiveRouteRpm(route = {}) {
+  const nestedRpm = Number(route.rateLimit?.rpm || 0);
+  if (Number.isFinite(nestedRpm) && nestedRpm > 0) {
+    return nestedRpm;
+  }
+  if (isLegacyDefaultKimiRpm(route)) {
+    return 0;
+  }
+  return Number(route.rpm || 0);
+}
+
+function isLegacyDefaultKimiRpm(route = {}) {
+  return Number(route.rpm || 0) === 12 && isKimiRoute(route);
+}
+
+function isKimiRoute(route = {}) {
+  const provider = String(route.provider || route.providerId || route.providerFamily || "").toLowerCase();
+  if (provider.includes("kimi") || provider.includes("moonshot")) {
+    return true;
+  }
+  const baseUrl = String(route.baseUrl || "").toLowerCase();
+  const model = String(route.model || route.id || "").toLowerCase();
+  return baseUrl.includes("moonshot") || model.includes("kimi");
 }
 
 function clampCooldownMs(value, route = {}) {

@@ -34,3 +34,12 @@ test("model pool does not trap scrolling before the custom form", () => {
   assert.doesNotMatch(customForm, /max-height:/);
   assert.match(modelPool, /overflow:\s*visible;/);
 });
+
+test("model context inline label is vertically centered", () => {
+  const contextLabel = cssBlock(".model-context-inline span");
+
+  assert.match(contextLabel, /display:\s*flex;/);
+  assert.match(contextLabel, /align-items:\s*center;/);
+  assert.match(contextLabel, /height:\s*32px;/);
+  assert.match(contextLabel, /margin:\s*0;/);
+});

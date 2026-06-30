@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   MODEL_PRESETS,
   PROVIDERS,
@@ -9,6 +10,7 @@ import {
   providerById,
 } from "./presets.mjs";
 import { normalizeAdapterProfile } from "../src/adapter-profile.js";
+import { buildModelCatalog } from "../src/model-catalog.js";
 import { proxySettingsForUrl } from "../src/proxy.js";
 
 const require = createRequire(import.meta.url);
@@ -41,6 +43,7 @@ const CODEX_BRIDGE_MANAGED_START = "# >>> CodexBridge managed config";
 const CODEX_BRIDGE_MANAGED_END = "# <<< CodexBridge managed config";
 const CODEX_BRIDGE_MODEL_ID_PREFIX = "cb-";
 const DEFAULT_CODEX_BRIDGE_MODEL_ID = "cb-gpt-5-5";
+const CODEX_BRIDGE_MODEL_CATALOG_FILENAME = "codexbridge-model-catalog.json";
 const DEFAULT_CHAT_TOOL_CONTINUATION_TURNS = 5;
 
 const CODEX_REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh"]);
@@ -104,6 +107,10 @@ export function modelDirectoryPath(rootDir) {
   return path.join(rootDir, "config", "model-directory.local.json");
 }
 
+export function providerOverridesPath(rootDir) {
+  return path.join(rootDir, "config", "provider-overrides.json");
+}
+
 export function modelImageGenerationPath(rootDir) {
   return path.join(rootDir, "config", "model-image-generation.json");
 }
@@ -112,8 +119,16 @@ export function desktopOptionsPath(rootDir) {
   return path.join(rootDir, "config", "desktop-options.json");
 }
 
+export function configProfilesPath(rootDir) {
+  return path.join(rootDir, "config", "profiles.json");
+}
+
 export function codexConfigPath(homeDir = os.homedir()) {
   return path.join(homeDir, ".codex", "config.toml");
+}
+
+export function codexCatalogPath(homeDir = os.homedir()) {
+  return path.join(homeDir, ".codex", CODEX_BRIDGE_MODEL_CATALOG_FILENAME);
 }
 
 export function exampleConfigForMode(rootDir, mode, templateRootDir = rootDir) {
@@ -193,14 +208,135 @@ export function loadDesktopOptions(rootDir) {
 }
 
 export function saveDesktopOptions(rootDir, options = {}) {
-  const saved = {
+  const saved = normalizeDesktopOptions({
     ...loadDesktopOptions(rootDir),
-    ...normalizeDesktopOptions(options),
-  };
+    ...(options || {}),
+  });
   const target = desktopOptionsPath(rootDir);
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.writeFileSync(target, `${JSON.stringify(saved, null, 2)}\n`, "utf8");
   return saved;
+}
+
+export function loadConfigProfiles(rootDir) {
+  const saved = readJsonIfExists(configProfilesPath(rootDir), {});
+  const profiles = Array.isArray(saved?.profiles)
+    ? saved.profiles
+    : Array.isArray(saved)
+      ? saved
+      : [];
+  return profiles
+    .map(normalizeConfigProfile)
+    .filter(Boolean)
+    .sort((left, right) => String(right.updatedAt || "").localeCompare(String(left.updatedAt || "")));
+}
+
+export function saveConfigProfile(rootDir, profile = {}) {
+  const normalized = normalizeConfigProfile({
+    ...profile,
+    updatedAt: new Date().toISOString(),
+  });
+  if (!normalized) {
+    throw new Error("Config profile requires a name.");
+  }
+  const profiles = loadConfigProfiles(rootDir).filter((item) => item.id !== normalized.id);
+  profiles.unshift(normalized);
+  writeJsonAtomic(configProfilesPath(rootDir), {
+    version: 1,
+    profiles,
+  });
+  return normalized;
+}
+
+export function buildStartupCheck(rootDir, {
+  homeDir = os.homedir(),
+  appVersion = "",
+  routerRunning = false,
+  lastHealth = null,
+  config = readRouterConfig(rootDir),
+  proxyEnv = process.env,
+  platform = process.platform,
+} = {}) {
+  const options = loadDesktopOptions(rootDir);
+  const diagnostics = routerConfigDiagnostics(rootDir, config);
+  const codexConfig = codexConfigPath(homeDir);
+  const catalog = codexCatalogPath(homeDir);
+  const backups = listCodexBackups({ homeDir });
+  const proxyKeys = proxyEnvironmentKeys(proxyEnv);
+  const codexLaunchTarget = options.codexDesktopLaunchTarget || options.codexDesktopExe || "";
+  const items = [
+    checkItem({
+      id: "codex_config",
+      label: "Codex 配置",
+      status: fs.existsSync(codexConfig) ? "pass" : "warn",
+      detail: fs.existsSync(codexConfig) ? codexConfig : "还没有找到 Codex config.toml。",
+      action: "启动一次 Router 会自动写入 CodexBridge 配置。",
+    }),
+    checkItem({
+      id: "model_catalog",
+      label: "模型目录",
+      status: fs.existsSync(catalog) || (Array.isArray(config?.models) && config.models.length > 0) ? "pass" : "warn",
+      detail: fs.existsSync(catalog)
+        ? catalog
+        : `当前有 ${Array.isArray(config?.models) ? config.models.length : 0} 个模型路由可生成目录。`,
+      count: Array.isArray(config?.models) ? config.models.length : 0,
+      action: "启动 Router 或重新保存模型选择后会生成目录。",
+    }),
+    checkItem({
+      id: "api_keys",
+      label: "API Key",
+      status: diagnostics.ok || !diagnostics.missingApiKeys.length ? "pass" : "fail",
+      detail: diagnostics.missingApiKeys.length
+        ? diagnostics.missingApiKeys.map((item) => `${item.displayName || item.id}: ${item.apiKeyEnv || "API Key"}`).join("; ")
+        : `${diagnostics.savedApiKeyRoutes || 0}/${diagnostics.apiKeyRoutes || 0} 个 API 模型 Key 已就绪。`,
+      count: diagnostics.missingApiKeys.length,
+      action: "缺少 Key 的供应商需要先保存 API Key。",
+    }),
+    checkItem({
+      id: "router",
+      label: "Router",
+      status: routerRunning && lastHealth?.ok ? "pass" : routerRunning ? "warn" : "warn",
+      detail: routerRunning
+        ? lastHealth?.ok
+          ? `Router 正在 ${config?.port || options.routerPort || 15722} 端口运行，健康检查通过。`
+          : lastHealth?.message || "Router 正在运行，但健康检查还没有通过。"
+        : `Router 未运行，配置端口为 ${config?.port || options.routerPort || 15722}。`,
+      action: routerRunning ? "查看具体模型路由健康状态。" : "点击启动 Router。",
+    }),
+    checkItem({
+      id: "proxy",
+      label: "Proxy",
+      status: "pass",
+      detail: proxyKeys.length
+        ? `检测到 ${proxyKeys.join(", ")}；本地 Router 绕过系统代理：${options.bypassSystemProxy ? "已开启" : "未开启"}。`
+        : `未检测到代理环境变量；本地 Router 绕过系统代理：${options.bypassSystemProxy ? "已开启" : "未开启"}。`,
+      count: proxyKeys.length,
+      action: "如果 127.0.0.1 请求被 VPN/代理截走，可以开启绕过代理。",
+    }),
+    checkItem({
+      id: "backups",
+      label: "备份",
+      status: "pass",
+      detail: backups.length ? `已有 ${backups.length} 个 Codex 配置备份。` : "还没有 CodexBridge 配置备份。",
+      count: backups.length,
+      action: "每次写入 Codex 配置前会保留备份。",
+    }),
+    checkItem({
+      id: "codex_desktop",
+      label: "Codex Desktop",
+      status: codexLaunchTarget ? (fs.existsSync(codexLaunchTarget) ? "pass" : "fail") : platform === "darwin" ? "pass" : "warn",
+      detail: codexLaunchTarget || (platform === "darwin" ? "macOS 通常可以从应用程序里启动 Codex。" : "还没有保存 Codex Desktop 启动路径。"),
+      action: "如果重启 Codex 仍失败，可以选择 Codex.exe 或开始菜单快捷方式。",
+    }),
+  ];
+  const summary = startupCheckSummary(items);
+  return {
+    version: 1,
+    appVersion,
+    checkedAt: new Date().toISOString(),
+    summary,
+    items,
+  };
 }
 
 export function secretStatus(rootDir) {
@@ -330,7 +466,11 @@ export function supportDiagnostics(rootDir, {
     ),
   ].sort();
   const errorLines = StringLines(logs)
-    .filter((line) => /\b(error|status=4\d\d|status=5\d\d|!! upstream|Health failed|Preflight)/i.test(line))
+    .filter((line) => /\b(error|status=4\d\d|status=5\d\d|!! upstream|compact-local-fallback|rate-limit|Health failed|Preflight)/i.test(line))
+    .slice(-20)
+    .map(redactSecretText);
+  const toolLines = StringLines(logs)
+    .filter((line) => /\btool(?:_return)?_diag\b/i.test(line))
     .slice(-20)
     .map(redactSecretText);
 
@@ -358,6 +498,9 @@ export function supportDiagnostics(rootDir, {
     "",
     "Provider model directory:",
     ...modelDirectoryDiagnosticsLines(rootDir),
+    "",
+    "Codex model catalog:",
+    ...codexModelCatalogDiagnosticsLines(homeDir),
     "",
     "API keys:",
     ...(selectedKeyEnvs.length
@@ -393,6 +536,9 @@ export function supportDiagnostics(rootDir, {
     "Codex plugin diagnostics:",
     ...pluginDiagnostics.lines,
     "",
+    "Recent tool diagnostics:",
+    ...(toolLines.length ? toolLines.map((line) => `- ${line}`) : ["- none"]),
+    "",
     "Recent errors:",
     ...(errorLines.length ? errorLines.map((line) => `- ${line}`) : ["- none"]),
   ];
@@ -407,6 +553,7 @@ export function supportDiagnostics(rootDir, {
       missingApiKeys: routeDiagnostics.missingApiKeys,
       invalidBaseUrls: routeDiagnostics.invalidBaseUrls,
       errorCount: errorLines.length,
+      toolDiagnosticCount: toolLines.length,
       unhealthyRoutes: routeHealthSummary(lastHealth).unhealthyRoutes,
       usage: usageDiagnosticsSummary(usageSummary),
       requestLimits: requestLimitDiagnosticsSummary(config),
@@ -418,6 +565,7 @@ export function supportDiagnostics(rootDir, {
       },
       modelCapabilityOverrides: Object.keys(readModelCapabilityOverrides(rootDir)).length,
       modelDirectory: modelDirectoryDiagnosticsSummary(rootDir),
+      codexModelCatalog: codexModelCatalogDiagnosticsSummary(homeDir),
       history: historyDiagnostics.summary,
       codexPlugins: pluginDiagnostics.summary,
     },
@@ -518,6 +666,54 @@ function modelDirectoryDiagnosticsSummary(rootDir) {
       .filter((entry) => modelDirectoryEntryIsStale(entry.fetchedAt))
       .map((entry) => entry.providerId),
   };
+}
+
+function codexModelCatalogDiagnostics(homeDir = os.homedir()) {
+  const target = codexCatalogPath(homeDir);
+  const summary = {
+    path: target,
+    exists: false,
+    ok: false,
+    models: 0,
+    firstModels: [],
+    error: "",
+  };
+  const lines = [`- path: ${toTomlPath(target)}`];
+
+  if (!fs.existsSync(target)) {
+    lines.push("- exists: false");
+    return { lines, summary };
+  }
+
+  summary.exists = true;
+  lines.push("- exists: true");
+
+  try {
+    const catalog = JSON.parse(fs.readFileSync(target, "utf8"));
+    const models = Array.isArray(catalog?.models) ? catalog.models : [];
+    summary.ok = true;
+    summary.models = models.length;
+    summary.firstModels = models
+      .slice(0, 8)
+      .map((model) => `${model.slug || model.id || "(no-id)"}:${model.display_name || model.name || "(no-name)"}`);
+    lines.push("- ok: true");
+    lines.push(`- models: ${summary.models}`);
+    lines.push(`- firstModels: ${summary.firstModels.map(redactSecretText).join(", ") || "none"}`);
+  } catch (error) {
+    summary.error = redactSecretText(error?.message || error).slice(0, 200);
+    lines.push("- ok: false");
+    lines.push(`- error: ${summary.error}`);
+  }
+
+  return { lines, summary };
+}
+
+function codexModelCatalogDiagnosticsLines(homeDir = os.homedir()) {
+  return codexModelCatalogDiagnostics(homeDir).lines;
+}
+
+function codexModelCatalogDiagnosticsSummary(homeDir = os.homedir()) {
+  return codexModelCatalogDiagnostics(homeDir).summary;
 }
 
 function modelDirectoryEntryIsStale(fetchedAt) {
@@ -901,6 +1097,812 @@ function codexHistoryDiagnostics({ homeDir = os.homedir() } = {}) {
   return { summary, lines };
 }
 
+export function listCodexResources({ rootDir = process.cwd(), homeDir = os.homedir() } = {}) {
+  const configPath = codexConfigPath(homeDir);
+  const content = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "";
+  const configuredMcpServers = parseMcpServers(content);
+  const mcpServers = configuredMcpServers.filter((item) => item.enabled);
+  const configuredPlugins = parseCodexPlugins(content);
+  const enabledPlugins = configuredPlugins.filter((item) => item.enabled);
+  const disabledPlugins = configuredPlugins
+    .filter((item) => !item.enabled)
+    .map((item) => ({ ...item, availability: "disabled" }));
+  const cachedPlugins = listCodexPluginCache(homeDir);
+  const visibleCachedPlugins = cachedPlugins
+    .filter(isCodexVisibleInstalledPlugin)
+    .map((plugin) => ({ ...plugin, availability: "enabled" }));
+  const visibleConfiguredPlugins = enabledPlugins
+    .filter(isCodexVisibleConfiguredPlugin)
+    .map((plugin) => ({
+      ...cachedPlugins.find((cached) => sameResourceId(cached.id, plugin.id)),
+      ...plugin,
+      availability: "enabled",
+    }));
+  const plugins = uniqueResourceItems([
+    ...visibleCachedPlugins,
+    ...visibleConfiguredPlugins,
+  ], (item) => item.id);
+  const visiblePluginIds = new Set(plugins.map((item) => normalizedResourceId(item.id)));
+  const internalEnabledPlugins = enabledPlugins
+    .filter(isCodexInternalPlugin)
+    .map((plugin) => ({
+      ...cachedPlugins.find((cached) => sameResourceId(cached.id, plugin.id)),
+      ...plugin,
+      availability: "internal",
+    }));
+  const cachedOnlyPlugins = cachedPlugins
+    .filter((plugin) => !visiblePluginIds.has(normalizedResourceId(plugin.id)))
+    .filter((plugin) => !isCodexVisibleInstalledPlugin(plugin))
+    .map((plugin) => ({ ...plugin, availability: "cached" }));
+  const skills = uniqueResourceItems([
+    ...listCodexSkillFiles(homeDir),
+  ], (item) => `${item.source}:${item.pluginId || ""}:${item.name}`);
+  const discovered = {
+    mcpServers: configuredMcpServers
+      .filter((item) => !item.enabled)
+      .map((item) => ({ ...item, availability: "disabled" })),
+    plugins: uniqueResourceItems([
+      ...disabledPlugins,
+      ...internalEnabledPlugins,
+      ...cachedOnlyPlugins,
+    ], (item) => item.id),
+    skills: uniqueResourceItems(
+      [
+        ...listAgentSkillFiles(homeDir).map((item) => ({ ...item, availability: "local" })),
+        ...listPluginSkillFiles(homeDir, { pluginIds: visiblePluginIds, availability: "plugin" }),
+        ...listPluginSkillFiles(homeDir, { excludePluginIds: visiblePluginIds, availability: "cached" }),
+      ],
+      (item) => `${item.source}:${item.pluginId || ""}:${item.name}`,
+    ),
+    prompts: [],
+    agentFiles: [],
+  };
+  const prompts = uniqueResourceItems([
+    ...listCodexPromptFiles(homeDir),
+    ...listProjectPromptFiles(rootDir),
+  ], (item) => item.path);
+  const agentFiles = listAgentInstructionFiles(rootDir, homeDir);
+  return {
+    version: 1,
+    configPath,
+    summary: resourceCountSummary({ mcpServers, plugins, skills, prompts, agentFiles }),
+    discoveredSummary: resourceCountSummary(discovered),
+    mcpServers,
+    plugins,
+    skills,
+    prompts,
+    agentFiles,
+    discovered,
+  };
+}
+
+export function listCodexSessions({ homeDir = os.homedir(), limit = 80 } = {}) {
+  let DatabaseSync;
+  try {
+    ({ DatabaseSync } = require("node:sqlite"));
+  } catch {
+    return [];
+  }
+  const codexDir = path.join(homeDir, ".codex");
+  if (!fs.existsSync(codexDir)) {
+    return [];
+  }
+  const workspaceState = readCodexWorkspaceState(homeDir);
+  const requestedLimit = Number(limit || 50);
+  const rowLimit = Math.min(Math.max(requestedLimit * 6, 200), 1000);
+  let sessions = listCodexThreadCatalogSessions(codexDir, DatabaseSync, rowLimit, workspaceState);
+  if (!sessions.length) {
+    sessions = listCodexStateSessions(codexDir, DatabaseSync, rowLimit, workspaceState);
+  }
+  const seen = new Set();
+  const output = [];
+  for (const session of sessions
+    .filter(isUserFacingSession)
+    .sort((left, right) => right.sortAt - left.sortAt || right.id.localeCompare(left.id))) {
+    const key = session.id.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    output.push(session);
+    if (output.length >= requestedLimit) {
+      break;
+    }
+  }
+  return output;
+}
+
+function listCodexThreadCatalogSessions(codexDir, DatabaseSync, rowLimit, workspaceState) {
+  const dbPath = path.join(codexDir, "sqlite", "codex-dev.db");
+  if (!fs.existsSync(dbPath)) {
+    return [];
+  }
+  let db;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    db.exec("PRAGMA busy_timeout = 1500");
+    if (!hasTable(db, "local_thread_catalog")) {
+      return [];
+    }
+    const columns = tableColumns(db, "local_thread_catalog");
+    const selectColumns = [
+      "thread_id AS id",
+      columns.includes("display_title") ? "display_title AS title" : "thread_id AS title",
+      columns.includes("model_provider") ? "model_provider" : "'' AS model_provider",
+      "'' AS model",
+      columns.includes("source_kind") ? "source_kind AS source" : "'' AS source",
+      "'user' AS thread_source",
+      "'' AS project",
+      columns.includes("cwd") ? "cwd AS project_path" : "'' AS project_path",
+      "0 AS archived",
+      "1 AS has_user_event",
+      "'' AS first_user_message",
+      columns.includes("source_updated_at") ? "source_updated_at AS session_sort_at" : "0 AS session_sort_at",
+    ].join(", ");
+    const where = columns.includes("missing_candidate") ? " WHERE COALESCE(missing_candidate, 0) = 0" : "";
+    const order = columns.includes("source_updated_at") ? " ORDER BY source_updated_at DESC, thread_id DESC" : " ORDER BY thread_id DESC";
+    return db
+      .prepare(`SELECT ${selectColumns} FROM local_thread_catalog${where}${order} LIMIT ?`)
+      .all(rowLimit)
+      .map((row) => classifySessionWorkspace(normalizeSessionRow(row, dbPath), workspaceState));
+  } catch {
+    return [];
+  } finally {
+    if (db) {
+      db.close();
+    }
+  }
+}
+
+function listCodexStateSessions(codexDir, DatabaseSync, rowLimit, workspaceState) {
+  const sessions = [];
+  for (const dbPath of codexStateDatabasePaths(codexDir)) {
+    let db;
+    try {
+      db = new DatabaseSync(dbPath, { readOnly: true });
+      db.exec("PRAGMA busy_timeout = 1500");
+      if (!hasTable(db, "threads")) {
+        continue;
+      }
+      const columns = tableColumns(db, "threads");
+      const selectColumns = [
+        "id",
+        columns.includes("title") ? "title" : "'' AS title",
+        columns.includes("model_provider") ? "model_provider" : "'' AS model_provider",
+        columns.includes("model") ? "model" : "'' AS model",
+        columns.includes("source") ? "source" : "'' AS source",
+        columns.includes("thread_source") ? "thread_source" : "'' AS thread_source",
+        columns.includes("project") ? "project" : "'' AS project",
+        sessionProjectPathSelect(columns),
+        columns.includes("archived") ? "archived" : "0 AS archived",
+        columns.includes("has_user_event") ? "has_user_event" : "0 AS has_user_event",
+        columns.includes("first_user_message") ? "first_user_message" : "'' AS first_user_message",
+        sessionSortSelect(columns),
+      ].join(", ");
+      const rows = db
+        .prepare(`SELECT ${selectColumns} FROM threads${sessionOrderClause(columns)} LIMIT ?`)
+        .all(rowLimit);
+      for (const row of rows) {
+        sessions.push(classifySessionWorkspace(normalizeSessionRow(row, dbPath), workspaceState));
+      }
+    } catch {
+      // Ignore unreadable Codex history databases in the lightweight list.
+    } finally {
+      if (db) {
+        db.close();
+      }
+    }
+  }
+  return sessions;
+}
+
+export function exportCodexSessionMarkdown(sessionId, { homeDir = os.homedir() } = {}) {
+  const targetId = String(sessionId || "").trim();
+  if (!targetId) {
+    throw new Error("Session id is required.");
+  }
+  let DatabaseSync;
+  try {
+    ({ DatabaseSync } = require("node:sqlite"));
+  } catch (error) {
+    throw new Error(`Codex session export unavailable: ${error.message}`);
+  }
+  const codexDir = path.join(homeDir, ".codex");
+  const workspaceState = readCodexWorkspaceState(homeDir);
+  for (const dbPath of fs.existsSync(codexDir) ? codexStateDatabasePaths(codexDir) : []) {
+    let db;
+    try {
+      db = new DatabaseSync(dbPath, { readOnly: true });
+      db.exec("PRAGMA busy_timeout = 1500");
+      if (!hasTable(db, "threads")) {
+        continue;
+      }
+      const columns = tableColumns(db, "threads");
+      const row = selectSessionRow(db, columns, targetId);
+      if (!row) {
+        continue;
+      }
+      const session = classifySessionWorkspace(normalizeSessionRow(row, dbPath), workspaceState);
+      const markdown = codexSessionMarkdown(session);
+      return {
+        session,
+        databasePath: dbPath,
+        markdown,
+      };
+    } finally {
+      if (db) {
+        db.close();
+      }
+    }
+  }
+  throw new Error("Codex session not found.");
+}
+
+function parseMcpServers(content) {
+  return directTomlTables(content, "mcp_servers")
+    .map(({ tableName, parts }) => {
+      const name = parts[1] || "";
+      return {
+        name,
+        tableName,
+        command: readTomlStringInTable(content, tableName, "command") || "",
+        enabled: readTomlBooleanInTable(content, tableName, "enabled") !== false,
+        configured: true,
+      };
+    })
+    .filter((item) => item.name);
+}
+
+function parseCodexPlugins(content) {
+  return directTomlTables(content, "plugins")
+    .map(({ tableName, parts }) => {
+      const id = parts[1] || "";
+      const enabled = readTomlBooleanInTable(content, tableName, "enabled") !== false;
+      return {
+        id,
+        tableName,
+        enabled,
+        source: "config",
+        availability: enabled ? "enabled" : "disabled",
+      };
+    })
+    .filter((item) => item.id);
+}
+
+function listCodexSkillFiles(homeDir) {
+  const skillRoot = path.join(homeDir, ".codex", "skills");
+  return listSkillFilesFromRoot(skillRoot, "codex");
+}
+
+function listAgentSkillFiles(homeDir) {
+  const skillRoot = path.join(homeDir, ".agents", "skills");
+  return listSkillFilesFromRoot(skillRoot, "agents");
+}
+
+function listPluginSkillFiles(homeDir, { pluginIds = null, excludePluginIds = null, availability = "" } = {}) {
+  const output = [];
+  for (const plugin of listCodexPluginCache(homeDir)) {
+    const pluginId = normalizedResourceId(plugin.id);
+    if (pluginIds && !pluginIds.has(pluginId)) {
+      continue;
+    }
+    if (excludePluginIds && excludePluginIds.has(pluginId)) {
+      continue;
+    }
+    output.push(...listSkillFilesFromRoot(path.join(plugin.path, "skills"), "plugin", plugin.id, availability));
+  }
+  return output.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function listSkillFilesFromRoot(skillRoot, source, pluginId = "", availability = "enabled") {
+  if (!fs.existsSync(skillRoot)) {
+    return [];
+  }
+  return safeReadDir(skillRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => {
+      const skillPath = path.join(skillRoot, entry.name, "SKILL.md");
+      return {
+        name: entry.name,
+        path: skillPath,
+        source,
+        pluginId,
+        availability,
+        exists: fs.existsSync(skillPath),
+      };
+    })
+    .filter((item) => item.exists)
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function listCodexPromptFiles(homeDir) {
+  const promptRoot = path.join(homeDir, ".codex", "prompts");
+  return listPromptFilesFromRoot(promptRoot, "codex");
+}
+
+function listProjectPromptFiles(rootDir) {
+  return listPromptFilesFromRoot(path.join(rootDir, ".codex", "prompts"), "project");
+}
+
+function listPromptFilesFromRoot(promptRoot, source) {
+  if (!fs.existsSync(promptRoot)) {
+    return [];
+  }
+  return safeReadDir(promptRoot, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && /\.(md|txt|prompt)$/i.test(entry.name))
+    .map((entry) => ({
+      name: entry.name,
+      path: path.join(promptRoot, entry.name),
+      source,
+    }))
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function listCodexPluginCache(homeDir) {
+  const cacheRoot = path.join(homeDir, ".codex", "plugins", "cache");
+  if (!fs.existsSync(cacheRoot)) {
+    return [];
+  }
+  const output = [];
+  for (const sourceEntry of safeReadDir(cacheRoot, { withFileTypes: true })) {
+    if (!sourceEntry.isDirectory()) {
+      continue;
+    }
+    const sourceRoot = path.join(cacheRoot, sourceEntry.name);
+    for (const pluginEntry of safeReadDir(sourceRoot, { withFileTypes: true })) {
+      if (!pluginEntry.isDirectory()) {
+        continue;
+      }
+      const pluginRoot = path.join(sourceRoot, pluginEntry.name);
+      const versionDirs = safeReadDir(pluginRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+      for (const versionEntry of versionDirs.length ? versionDirs : [{ name: "", isDirectory: () => true }]) {
+        const pluginPath = versionEntry.name ? path.join(pluginRoot, versionEntry.name) : pluginRoot;
+        if (!fs.existsSync(pluginPath)) {
+          continue;
+        }
+        const manifest = readPluginManifest(pluginPath);
+        output.push({
+          id: `${pluginEntry.name}@${sourceEntry.name}`,
+          name: pluginDisplayName(manifest, pluginEntry.name),
+          version: versionEntry.name || pluginCacheVersion(pluginPath, manifest),
+          source: "cache",
+          pluginSource: sourceEntry.name,
+          path: pluginPath,
+        });
+      }
+    }
+  }
+  return output.sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function readPluginManifest(pluginPath) {
+  const candidates = [
+    path.join(pluginPath, ".codex-plugin", "plugin.json"),
+    path.join(pluginPath, ".claude-plugin", "plugin.json"),
+    path.join(pluginPath, "plugin.json"),
+    path.join(pluginPath, ".codex-plugin.json"),
+    path.join(pluginPath, "package.json"),
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (!fs.existsSync(candidate)) {
+        continue;
+      }
+      return JSON.parse(fs.readFileSync(candidate, "utf8"));
+    } catch {
+      // Ignore malformed plugin metadata in the lightweight resource list.
+    }
+  }
+  return null;
+}
+
+function pluginDisplayName(manifest, fallback = "") {
+  const candidates = [
+    manifest?.displayName,
+    manifest?.display_name,
+    manifest?.title,
+    manifest?.name,
+    fallback,
+  ];
+  return String(candidates.find((item) => String(item || "").trim()) || fallback || "");
+}
+
+function pluginCacheVersion(pluginPath, manifest = null) {
+  if (manifest?.version) {
+    return String(manifest.version);
+  }
+  const parsed = manifest || readPluginManifest(pluginPath);
+  if (parsed?.version) {
+    return String(parsed.version);
+  }
+  return "";
+}
+
+function resourceCountSummary(resources = {}) {
+  return {
+    mcpServers: Array.isArray(resources.mcpServers) ? resources.mcpServers.length : 0,
+    plugins: Array.isArray(resources.plugins) ? resources.plugins.length : 0,
+    skills: Array.isArray(resources.skills) ? resources.skills.length : 0,
+    prompts: Array.isArray(resources.prompts) ? resources.prompts.length : 0,
+    agentFiles: Array.isArray(resources.agentFiles) ? resources.agentFiles.length : 0,
+  };
+}
+
+function normalizedResourceId(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function sameResourceId(left, right) {
+  return normalizedResourceId(left) === normalizedResourceId(right);
+}
+
+function pluginSourceFromId(id = "") {
+  const parts = String(id || "").split("@");
+  return parts.length > 1 ? parts[parts.length - 1] : "";
+}
+
+function isCodexInternalPlugin(plugin = {}) {
+  return plugin.pluginSource === "openai-bundled" || pluginSourceFromId(plugin.id) === "openai-bundled";
+}
+
+function isCodexVisibleInstalledPlugin(plugin = {}) {
+  return plugin.pluginSource === "openai-curated-remote";
+}
+
+function isCodexVisibleConfiguredPlugin(plugin = {}) {
+  const source = pluginSourceFromId(plugin.id);
+  return source === "personal";
+}
+
+function uniqueResourceItems(items, keyFn) {
+  const seen = new Set();
+  const output = [];
+  for (const item of items || []) {
+    const rawKey = keyFn(item);
+    const key = process.platform === "win32"
+      ? String(rawKey || "").toLowerCase()
+      : String(rawKey || "");
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    output.push(item);
+  }
+  return output;
+}
+
+function listAgentInstructionFiles(rootDir, homeDir) {
+  const candidates = [
+    path.join(rootDir, "AGENTS.md"),
+    path.join(rootDir, ".codex", "AGENTS.md"),
+    path.join(homeDir, ".codex", "AGENTS.md"),
+  ];
+  const seen = new Set();
+  const output = [];
+  for (const candidate of candidates) {
+    const resolved = path.resolve(candidate);
+    const key = process.platform === "win32" ? resolved.toLowerCase() : resolved;
+    if (seen.has(key) || !fs.existsSync(resolved)) {
+      continue;
+    }
+    seen.add(key);
+    output.push({
+      name: path.basename(resolved),
+      path: resolved,
+    });
+  }
+  return output;
+}
+
+function normalizeSessionRow(row = {}, databasePath = "") {
+  const workspacePath = normalizeStoredProjectPath(row.project_path || "");
+  return {
+    id: String(row.id || ""),
+    title: String(row.title || row.id || "Untitled session"),
+    modelProvider: String(row.model_provider || ""),
+    model: String(row.model || ""),
+    source: String(row.source || ""),
+    threadSource: String(row.thread_source || ""),
+    project: String(row.project || projectNameFromPath(workspacePath)),
+    projectPath: workspacePath,
+    workspacePath,
+    archived: Number(row.archived || 0) !== 0,
+    hasUserEvent: Number(row.has_user_event || 0) !== 0,
+    firstUserMessage: String(row.first_user_message || ""),
+    sortAt: normalizeSessionSortValue(row.session_sort_at),
+    databasePath,
+  };
+}
+
+function readCodexWorkspaceState(homeDir) {
+  const statePath = path.join(homeDir, ".codex", ".codex-global-state.json");
+  if (!fs.existsSync(statePath)) {
+    return emptyCodexWorkspaceState();
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    const savedRoots = Array.isArray(parsed?.["electron-saved-workspace-roots"])
+      ? parsed["electron-saved-workspace-roots"]
+      : [];
+    const activeRoots = Array.isArray(parsed?.["active-workspace-roots"])
+      ? parsed["active-workspace-roots"]
+      : [];
+    const roots = savedRoots.length ? savedRoots : activeRoots;
+    return {
+      workspaceRoots: uniqueWorkspaceRoots(roots),
+      projectlessThreadIds: new Set(
+        (Array.isArray(parsed?.["projectless-thread-ids"]) ? parsed["projectless-thread-ids"] : [])
+          .map((item) => String(item || "").toLowerCase())
+          .filter(Boolean),
+      ),
+    };
+  } catch {
+    return emptyCodexWorkspaceState();
+  }
+}
+
+function emptyCodexWorkspaceState() {
+  return {
+    workspaceRoots: [],
+    projectlessThreadIds: new Set(),
+  };
+}
+
+function uniqueWorkspaceRoots(roots = []) {
+  const seen = new Set();
+  const output = [];
+  for (const root of roots) {
+    const clean = normalizeStoredProjectPath(root);
+    const key = canonicalProjectRootKey(clean);
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    output.push({
+      path: clean,
+      key,
+    });
+  }
+  return output.sort((left, right) => right.key.length - left.key.length);
+}
+
+function classifySessionWorkspace(session = {}, workspaceState = emptyCodexWorkspaceState()) {
+  const workspacePath = normalizeStoredProjectPath(session.workspacePath || session.projectPath || "");
+  const id = String(session.id || "").toLowerCase();
+  if (!workspacePath) {
+    return {
+      ...session,
+      project: "",
+      projectPath: "",
+      workspacePath: "",
+    };
+  }
+  if (workspaceState.projectlessThreadIds?.has(id)) {
+    return {
+      ...session,
+      project: "",
+      projectPath: "",
+      workspacePath,
+    };
+  }
+  const projectRoot = matchingWorkspaceRoot(workspacePath, workspaceState.workspaceRoots || []);
+  if (projectRoot) {
+    return {
+      ...session,
+      project: projectNameFromPath(projectRoot.path),
+      projectPath: projectRoot.path,
+      workspacePath,
+    };
+  }
+  if (!workspaceState.workspaceRoots?.length) {
+    return {
+      ...session,
+      project: String(session.project || projectNameFromPath(workspacePath)),
+      projectPath: workspacePath,
+      workspacePath,
+    };
+  }
+  return {
+    ...session,
+    project: "",
+    projectPath: "",
+    workspacePath,
+  };
+}
+
+function matchingWorkspaceRoot(workspacePath, workspaceRoots = []) {
+  const workspaceKey = canonicalProjectRootKey(workspacePath);
+  if (!workspaceKey) {
+    return null;
+  }
+  return workspaceRoots.find((root) => workspaceKey === root.key || workspaceKey.startsWith(`${root.key}/`)) || null;
+}
+
+function canonicalProjectRootKey(projectPath = "") {
+  const clean = normalizeStoredProjectPath(projectPath)
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "");
+  return process.platform === "win32" ? clean.toLowerCase() : clean;
+}
+
+function sessionProjectPathSelect(columns = []) {
+  const candidates = ["project_path", "cwd", "working_directory", "workspace", "workspace_path", "root_dir"];
+  const column = candidates.find((item) => columns.includes(item));
+  return column ? `${column} AS project_path` : "'' AS project_path";
+}
+
+function sessionSortSelect(columns = []) {
+  const column = sessionSortColumn(columns);
+  return column ? `${quoteIdentifier(column)} AS session_sort_at` : "0 AS session_sort_at";
+}
+
+function sessionOrderClause(columns = []) {
+  const column = sessionSortColumn(columns);
+  return column
+    ? ` ORDER BY ${quoteIdentifier(column)} DESC, id DESC`
+    : " ORDER BY id DESC";
+}
+
+function sessionSortColumn(columns = []) {
+  return [
+    "recency_at_ms",
+    "updated_at_ms",
+    "last_active_at_ms",
+    "last_message_at_ms",
+    "created_at_ms",
+    "recency_at",
+    "updated_at",
+    "last_active_at",
+    "last_message_at",
+    "created_at",
+  ].find((item) => columns.includes(item));
+}
+
+function normalizeSessionSortValue(value) {
+  if (value === null || value === undefined || value === "") {
+    return 0;
+  }
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    return numeric;
+  }
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function isUserFacingSession(session = {}) {
+  if (!session.id || session.archived) {
+    return false;
+  }
+  const threadSource = String(session.threadSource || "").trim().toLowerCase();
+  if (threadSource === "subagent") {
+    return false;
+  }
+  if (threadSource && threadSource !== "user") {
+    return false;
+  }
+  const source = String(session.source || "").trim();
+  if (source.startsWith("{\"subagent\"") || source.includes("\"thread_spawn\"")) {
+    return false;
+  }
+  return true;
+}
+
+function normalizeStoredProjectPath(projectPath = "") {
+  return String(projectPath || "").replace(/^\\\\\?\\/, "").trim();
+}
+
+function projectNameFromPath(projectPath = "") {
+  const clean = normalizeStoredProjectPath(projectPath).replace(/[\\/]+$/, "");
+  if (!clean) {
+    return "";
+  }
+  return path.basename(clean);
+}
+
+function selectSessionRow(db, columns, sessionId) {
+  const selectColumns = [
+    "id",
+    columns.includes("title") ? "title" : "'' AS title",
+    columns.includes("model_provider") ? "model_provider" : "'' AS model_provider",
+    columns.includes("model") ? "model" : "'' AS model",
+    columns.includes("source") ? "source" : "'' AS source",
+    columns.includes("thread_source") ? "thread_source" : "'' AS thread_source",
+    columns.includes("project") ? "project" : "'' AS project",
+    sessionProjectPathSelect(columns),
+    columns.includes("archived") ? "archived" : "0 AS archived",
+    columns.includes("has_user_event") ? "has_user_event" : "0 AS has_user_event",
+    columns.includes("first_user_message") ? "first_user_message" : "'' AS first_user_message",
+  ].join(", ");
+  return db.prepare(`SELECT ${selectColumns} FROM threads WHERE id = ?`).get(sessionId);
+}
+
+function codexSessionMarkdown(session) {
+  const lines = [
+    `# ${session.title || session.id}`,
+    "",
+    `- Thread ID: ${session.id}`,
+    `- Provider: ${session.modelProvider || "-"}`,
+    `- Model: ${session.model || "-"}`,
+    `- Source: ${session.source || "-"}`,
+    `- Project: ${session.project || "-"}`,
+    `- Project path: ${session.projectPath || "-"}`,
+    `- Workspace path: ${session.workspacePath || "-"}`,
+    `- Archived: ${session.archived ? "yes" : "no"}`,
+    "",
+  ];
+  if (session.firstUserMessage) {
+    lines.push("## First User Message", "", session.firstUserMessage, "");
+  }
+  lines.push("## Notes", "", "Exported by CodexBridge. Full event replay depends on Codex local history storage.");
+  return `${lines.join("\n")}\n`;
+}
+
+function tomlTableNames(content) {
+  return String(content || "")
+    .split(/\r?\n/)
+    .map(tomlHeaderName)
+    .filter(Boolean);
+}
+
+function directTomlTables(content, rootName) {
+  return tomlTableNames(content)
+    .map((tableName) => ({
+      tableName,
+      parts: tomlPathParts(tableName),
+    }))
+    .filter((item) => item.parts.length === 2 && item.parts[0] === rootName);
+}
+
+function tomlPathParts(value) {
+  const parts = [];
+  let current = "";
+  let quote = "";
+  let escaped = false;
+  for (const char of String(value || "")) {
+    if (quote) {
+      current += char;
+      if (quote === '"' && char === "\\" && !escaped) {
+        escaped = true;
+        continue;
+      }
+      if (char === quote && !escaped) {
+        quote = "";
+      }
+      escaped = false;
+      continue;
+    }
+    if (char === "." && !quote) {
+      parts.push(unquoteTomlString(current.trim()));
+      current = "";
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+    }
+    current += char;
+  }
+  if (current.trim()) {
+    parts.push(unquoteTomlString(current.trim()));
+  }
+  return parts;
+}
+
+function unquoteTomlPathPart(value) {
+  return String(value || "")
+    .split(".")
+    .map((part) => unquoteTomlString(part.trim()))
+    .join(".");
+}
+
+function safeReadDir(target, options) {
+  try {
+    return fs.readdirSync(target, options);
+  } catch {
+    return [];
+  }
+}
+
 function summarizeCodexHistoryDatabase(DatabaseSync, dbPath) {
   const item = {
     path: dbPath,
@@ -1047,10 +2049,77 @@ function formatCountGroups(groups) {
   return groups.map((group) => `${group.key}=${group.count}`).join(", ") || "none";
 }
 
+export function readProviderOverrides(rootDir) {
+  const saved = readJsonIfExists(providerOverridesPath(rootDir), {});
+  const source = saved?.providers && typeof saved.providers === "object"
+    ? saved.providers
+    : saved;
+  if (!source || typeof source !== "object" || Array.isArray(source)) {
+    return {};
+  }
+  const overrides = {};
+  for (const [providerId, value] of Object.entries(source)) {
+    const normalized = normalizeProviderOverride(value);
+    if (normalized) {
+      overrides[providerId] = normalized;
+    }
+  }
+  return overrides;
+}
+
+export function saveProviderOverride(rootDir, providerId, input = {}) {
+  const id = String(providerId || input?.id || "").trim();
+  if (!id) {
+    throw new Error("Provider id is required.");
+  }
+  const overrides = readProviderOverrides(rootDir);
+  const saved = normalizeProviderOverride({
+    ...overrides[id],
+    ...input,
+    id,
+  });
+  if (!saved) {
+    throw new Error("Provider settings are empty.");
+  }
+  saved.id = id;
+  saved.updatedAt = new Date().toISOString();
+  overrides[id] = saved;
+  writeJsonAtomic(providerOverridesPath(rootDir), {
+    version: 1,
+    providers: overrides,
+  });
+  refreshRouterConfigIfPresent(rootDir);
+  return saved;
+}
+
+export function saveProviderLogo(rootDir, ownerId, sourcePath) {
+  const id = slugify(String(ownerId || "provider").trim()) || "provider";
+  const source = String(sourcePath || "").trim();
+  if (!source || !fs.existsSync(source) || !fs.statSync(source).isFile()) {
+    throw new Error("Logo file does not exist.");
+  }
+  const extension = providerLogoExtension(source);
+  const targetDir = path.join(rootDir, "config", "provider-logos");
+  fs.mkdirSync(targetDir, { recursive: true });
+  const target = path.join(targetDir, `${id}${extension}`);
+  if (path.resolve(source) !== path.resolve(target)) {
+    fs.copyFileSync(source, target);
+  }
+  return {
+    path: target,
+    logoUrl: pathToFileURL(target).href,
+  };
+}
+
 export function providerCatalog(rootDir) {
+  const overrides = readProviderOverrides(rootDir);
   const customProviders = new Map();
+  const builtInProviderIds = new Set(PROVIDERS.map((provider) => provider.id));
   for (const model of readCustomModels(rootDir)) {
     if (!model.providerId || !model.keyEnv) {
+      continue;
+    }
+    if (builtInProviderIds.has(model.providerId)) {
       continue;
     }
     if (!customProviders.has(model.providerId)) {
@@ -1063,23 +2132,237 @@ export function providerCatalog(rootDir) {
         keyUrl: model.keyUrl || "",
         docsUrl: model.docsUrl || "",
         baseUrl: model.baseUrl,
+        api: model.api || "chat_completions",
+        logoUrl: model.logoUrl || "",
         authMode: model.authMode || "api_key",
         description: "用户自定义 OpenAI-compatible Provider。",
         custom: true,
       });
     }
   }
-  return [...PROVIDERS, ...customProviders.values()];
+  return [...PROVIDERS, ...customProviders.values()]
+    .map((provider) => applyProviderOverride(provider, overrides[provider.id]));
 }
 
 export function modelCatalog(rootDir) {
+  const providers = providerCatalog(rootDir);
+  const providerMap = new Map(providers.map((provider) => [provider.id, provider]));
   const imageInputOverrides = readModelImageInputOverrides(rootDir);
   const capabilityOverrides = readModelCapabilityOverrides(rootDir);
-  return [...MODEL_PRESETS, ...readCustomModels(rootDir)]
+  return [...effectiveBuiltInModels(rootDir, providers), ...readCustomModels(rootDir)]
+    .map((model) => applyProviderSettingsToModel(model, providerMap.get(model.providerId)))
     .map((model) => modelWithDefaultCapabilities(model))
     .map((model) => applyModelImageInputOverride(model, imageInputOverrides))
     .map((model) => applyModelCapabilityOverride(model, capabilityOverrides))
     .map((model) => withCapabilityStatus(model));
+}
+
+function effectiveBuiltInModels(rootDir, providers = providerCatalog(rootDir)) {
+  const directory = readModelDirectory(rootDir);
+  const providersById = new Map(providers.map((provider) => [provider.id, provider]));
+  const presetsByProvider = new Map();
+  for (const model of MODEL_PRESETS) {
+    const list = presetsByProvider.get(model.providerId) || [];
+    list.push(model);
+    presetsByProvider.set(model.providerId, list);
+  }
+  const usedPresetIds = new Set(MODEL_PRESETS.map((model) => model.presetId));
+  const models = [];
+  for (const [providerId, presets] of presetsByProvider.entries()) {
+    const provider = providersById.get(providerId);
+    const entry = directory.providers?.[providerId];
+    if (!provider || !entry || (provider.authMode || "api_key") === "codex_openai") {
+      models.push(...presets);
+      continue;
+    }
+    models.push(...modelsForProviderDirectoryEntry(provider, entry, presets, usedPresetIds));
+  }
+  return models;
+}
+
+function modelsForProviderDirectoryEntry(provider, entry, presets, usedPresetIds) {
+  const providerId = provider.id;
+  const exactTemplates = new Map(
+    presets.map((model) => [providerModelKey(providerId, model.model), model]),
+  );
+  const fallbackTemplate = presets[0] || providerDefaultModelTemplate(providerId);
+  const models = [];
+  for (const remoteModel of entry.models || []) {
+    const upstreamModel = String(remoteModel?.id || "").trim();
+    if (!upstreamModel) {
+      continue;
+    }
+    const exact = exactTemplates.get(providerModelKey(providerId, upstreamModel));
+    const presetId = exact?.presetId || uniqueSyncedPresetId(
+      `${providerId}-${slugify(upstreamModel)}`,
+      usedPresetIds,
+    );
+    usedPresetIds.add(presetId);
+    const dropParams = exact?.dropParams || fallbackTemplate?.dropParams || [];
+    models.push({
+      ...(exact || {}),
+      presetId,
+      providerId,
+      providerName: provider.name || entry.providerName || providerId,
+      displayName: exact?.displayName || `${provider.shortName || provider.name || providerId} ${upstreamModel}`,
+      description: exact?.description || `${upstreamModel} synced from ${provider.name || providerId}.`,
+      api: provider.api || exact?.api || fallbackTemplate?.api || "chat_completions",
+      baseUrl: provider.baseUrl || entry.baseUrl || fallbackTemplate?.baseUrl || "",
+      model: upstreamModel,
+      authMode: provider.authMode || "api_key",
+      apiKeyEnv: provider.keyEnv || undefined,
+      keyEnv: provider.keyEnv || undefined,
+      keyUrl: provider.keyUrl || "",
+      docsUrl: provider.docsUrl || "",
+      logoUrl: provider.logoUrl || "",
+      contextWindow: Number(remoteModel?.contextWindow || exact?.contextWindow || fallbackTemplate?.contextWindow || 258400),
+      ...(Array.isArray(exact?.inputModalities)
+        ? { inputModalities: [...exact.inputModalities] }
+        : exact ? {} : { inputModalities: ["text"] }),
+      ...(Array.isArray(dropParams) && dropParams.length ? { dropParams: [...dropParams] } : {}),
+      synced: true,
+      custom: false,
+    });
+  }
+  return models;
+}
+
+function applyProviderSettingsToModel(model, provider) {
+  if (!provider) {
+    return model;
+  }
+  const next = {
+    ...model,
+    providerName: provider.name || model.providerName || model.providerId,
+    keyUrl: provider.keyUrl ?? model.keyUrl,
+    docsUrl: provider.docsUrl ?? model.docsUrl,
+    logoUrl: provider.logoUrl ?? model.logoUrl,
+  };
+  if ((next.authMode || provider.authMode || "api_key") !== "codex_openai") {
+    if (provider.baseUrl) {
+      next.baseUrl = provider.baseUrl;
+    }
+    if (provider.api && !model.custom) {
+      next.api = provider.api;
+    }
+  }
+  if (provider.keyEnv) {
+    next.keyEnv = provider.keyEnv;
+    next.apiKeyEnv = provider.keyEnv;
+  }
+  if (provider.authMode) {
+    next.authMode = provider.authMode;
+  }
+  return next;
+}
+
+function normalizeProviderOverride(input = {}) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return null;
+  }
+  const result = {};
+  for (const key of ["id", "name", "shortName", "baseUrl", "keyUrl", "docsUrl", "keyEnv", "keyLabel", "logoUrl"]) {
+    if (typeof input[key] === "string") {
+      const value = input[key].trim();
+      if (value) {
+        result[key] = key === "baseUrl" ? value.replace(/\/+$/, "") : value;
+      }
+    }
+  }
+  if (input.api === "responses" || input.api === "chat_completions") {
+    result.api = input.api;
+  }
+  if (input.authMode === "codex_openai" || input.authMode === "api_key") {
+    result.authMode = input.authMode;
+  }
+  if (typeof input.custom === "boolean") {
+    result.custom = input.custom;
+  }
+  if (typeof input.updatedAt === "string" && input.updatedAt.trim()) {
+    result.updatedAt = input.updatedAt.trim();
+  }
+  return Object.keys(result).length ? result : null;
+}
+
+function applyProviderOverride(provider, override) {
+  if (!override) {
+    return { ...provider };
+  }
+  return {
+    ...provider,
+    ...override,
+    id: provider.id,
+    custom: Boolean(provider.custom),
+  };
+}
+
+function syncedProviderModels(rootDir) {
+  const directory = readModelDirectory(rootDir);
+  const providers = providerCatalog(rootDir);
+  const builtinUpstreamKeys = new Set(
+    MODEL_PRESETS.map((model) => providerModelKey(model.providerId, model.model)),
+  );
+  const usedPresetIds = new Set(MODEL_PRESETS.map((model) => model.presetId));
+  const synced = [];
+
+  for (const [providerId, entry] of Object.entries(directory.providers || {})) {
+    const provider = providers.find((item) => item.id === providerId);
+    if (!provider || (provider.authMode || "api_key") === "codex_openai") {
+      continue;
+    }
+    const template = providerDefaultModelTemplate(providerId);
+    for (const remoteModel of entry.models || []) {
+      const upstreamModel = String(remoteModel?.id || "").trim();
+      if (!upstreamModel || builtinUpstreamKeys.has(providerModelKey(providerId, upstreamModel))) {
+        continue;
+      }
+      const presetId = uniqueSyncedPresetId(
+        `${providerId}-${slugify(upstreamModel)}`,
+        usedPresetIds,
+      );
+      usedPresetIds.add(presetId);
+      synced.push({
+        presetId,
+        providerId,
+        providerName: provider.name || entry.providerName || providerId,
+        displayName: `${provider.shortName || provider.name || providerId} ${upstreamModel}`,
+        description: `${upstreamModel} synced from ${provider.name || providerId}.`,
+        api: template?.api || "chat_completions",
+        baseUrl: entry.baseUrl || provider.baseUrl,
+        model: upstreamModel,
+        authMode: provider.authMode || "api_key",
+        apiKeyEnv: provider.keyEnv || undefined,
+        keyEnv: provider.keyEnv || undefined,
+        keyUrl: provider.keyUrl || "",
+        docsUrl: provider.docsUrl || "",
+        contextWindow: template?.contextWindow || 258400,
+        inputModalities: ["text"],
+        ...(Array.isArray(template?.dropParams) ? { dropParams: [...template.dropParams] } : {}),
+        synced: true,
+        custom: false,
+      });
+    }
+  }
+
+  return synced;
+}
+
+function providerModelKey(providerId, upstreamModel) {
+  return `${String(providerId || "").toLowerCase()}\u0000${String(upstreamModel || "").toLowerCase()}`;
+}
+
+function providerDefaultModelTemplate(providerId) {
+  return MODEL_PRESETS.find((model) => model.providerId === providerId);
+}
+
+function uniqueSyncedPresetId(base, usedPresetIds) {
+  let candidate = `remote-${base}`;
+  let suffix = 2;
+  while (usedPresetIds.has(candidate)) {
+    candidate = `remote-${base}-${suffix}`;
+    suffix += 1;
+  }
+  return candidate;
 }
 
 export function readSelection(rootDir, mode = MODE_HYBRID) {
@@ -1199,6 +2482,19 @@ export function saveModelCapabilityOverride(rootDir, presetId, override = {}, op
   return saved;
 }
 
+export function resetModelCapabilityOverride(rootDir, presetId) {
+  const id = String(presetId || "").trim();
+  if (!id) {
+    throw new Error("Model id is required.");
+  }
+  const imageInput = readModelImageInputOverrides(rootDir);
+  const overrides = readModelCapabilityOverrides(rootDir);
+  delete overrides[id];
+  writeModelCapabilities(rootDir, { imageInput, overrides });
+  refreshRouterConfigIfPresent(rootDir);
+  return { presetId: id, reset: true };
+}
+
 export function readModelDirectory(rootDir) {
   return normalizeModelDirectory(readJsonIfExists(modelDirectoryPath(rootDir), {}));
 }
@@ -1225,7 +2521,7 @@ export async function refreshProviderModelDirectory(rootDir, providerId, {
   }
   const keyEnv = provider.keyEnv || provider.apiKeyEnv || "";
   const apiKey = keyEnv ? (loadSecrets(rootDir)[keyEnv] || process.env[keyEnv] || "") : "";
-  if ((provider.authMode || "api_key") === "api_key" && keyEnv && !apiKey) {
+  if (providerRequiresApiKey(provider) && !apiKey) {
     return modelDirectoryRefreshFailure(id, `Missing API key: ${keyEnv}`, existing);
   }
 
@@ -1264,6 +2560,114 @@ export async function refreshProviderModelDirectory(rootDir, providerId, {
   } catch (error) {
     return modelDirectoryRefreshFailure(id, error.message || String(error), existing);
   }
+}
+
+export async function testProviderConnection(rootDir, providerInput, {
+  fetchImpl = globalThis.fetch,
+} = {}) {
+  const provider = resolveConnectionProvider(rootDir, providerInput);
+  const providerId = provider?.id || String(providerInput || "").trim();
+  if (!provider) {
+    return {
+      ok: false,
+      providerId,
+      error: `Unknown provider: ${providerId}`,
+    };
+  }
+  if ((provider.authMode || "api_key") === "codex_openai") {
+    return {
+      ok: false,
+      providerId: provider.id,
+      error: "Codex subscription providers do not expose an API-key model endpoint.",
+    };
+  }
+  if (typeof fetchImpl !== "function") {
+    return {
+      ok: false,
+      providerId: provider.id,
+      error: "fetch is not available in this runtime",
+    };
+  }
+  const endpoint = modelDirectoryEndpointForProvider(provider);
+  if (!endpoint) {
+    return {
+      ok: false,
+      providerId: provider.id,
+      error: "Provider Base URL is invalid.",
+    };
+  }
+  const keyEnv = provider.keyEnv || provider.apiKeyEnv || "";
+  const apiKey = String(
+    provider.apiKey ||
+      (keyEnv ? (loadSecrets(rootDir)[keyEnv] || process.env[keyEnv] || "") : ""),
+  ).trim();
+  if (providerRequiresApiKey(provider) && !apiKey) {
+    return {
+      ok: false,
+      providerId: provider.id,
+      endpoint,
+      error: `Missing API key: ${keyEnv}`,
+    };
+  }
+  const headers = { Accept: "application/json" };
+  if (apiKey) {
+    headers.Authorization = `Bearer ${apiKey}`;
+  }
+  try {
+    const response = await fetchImpl(endpoint, {
+      method: "GET",
+      headers,
+    });
+    const ok = Boolean(response?.ok);
+    const status = Number(response?.status || 0);
+    let body = "";
+    if (!ok && typeof response?.text === "function") {
+      body = await response.text();
+    }
+    return {
+      ok,
+      providerId: provider.id,
+      endpoint,
+      status,
+      message: ok ? "Connection OK" : `HTTP ${status || 0}${body ? ` ${String(body).slice(0, 160)}` : ""}`,
+      ...(ok ? {} : { error: `HTTP ${status || 0}${body ? ` ${String(body).slice(0, 160)}` : ""}` }),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      providerId: provider.id,
+      endpoint,
+      error: error.message || String(error),
+    };
+  }
+}
+
+function resolveConnectionProvider(rootDir, providerInput) {
+  const providers = providerCatalog(rootDir);
+  if (typeof providerInput === "string") {
+    return providers.find((provider) => provider.id === providerInput) || null;
+  }
+  if (!providerInput || typeof providerInput !== "object" || Array.isArray(providerInput)) {
+    return null;
+  }
+  const id = String(providerInput.providerId || providerInput.id || "").trim();
+  const base = providers.find((provider) => provider.id === id) || {
+    id,
+    name: providerInput.name || providerInput.shortName || id,
+    shortName: providerInput.shortName || providerInput.name || id,
+    authMode: "api_key",
+  };
+  if (!id) {
+    return null;
+  }
+  return {
+    ...base,
+    ...normalizeProviderOverride({
+      ...providerInput,
+      id,
+    }),
+    apiKey: typeof providerInput.apiKey === "string" ? providerInput.apiKey.trim() : "",
+  };
 }
 
 export function readModelImageGenerationOverrides(rootDir) {
@@ -1315,6 +2719,7 @@ export function saveCustomModel(rootDir, input) {
     keyEnv: input?.keyEnv || existing?.keyEnv || existing?.apiKeyEnv,
     inputModalities: input?.inputModalities || existing?.inputModalities,
     docsUrl: input?.docsUrl ?? existing?.docsUrl,
+    logoUrl: input?.logoUrl ?? existing?.logoUrl,
     contextWindow: input?.contextWindow || existing?.contextWindow,
   });
   const models = existingModels.filter(
@@ -1355,6 +2760,7 @@ function refreshRouterConfigIfPresent(rootDir) {
 export function buildRouterConfigFromSelection(rootDir, mode = MODE_HYBRID) {
   const selectedModelIds = readSelection(rootDir, mode);
   const models = modelCatalog(rootDir);
+  const desktopOptions = loadDesktopOptions(rootDir);
   const selected = selectedModelIds.map((id) => {
     const model = models.find((item) => item.presetId === id);
     if (!model) {
@@ -1380,7 +2786,7 @@ export function buildRouterConfigFromSelection(rootDir, mode = MODE_HYBRID) {
   return {
     mode,
     host: "127.0.0.1",
-    port: 15722,
+    port: desktopOptions.routerPort,
     authToken: "sk-local-codex-router",
     clientAuth: {
       allowOpenAiBearer: true,
@@ -1421,14 +2827,14 @@ export function buildCodexToml({
   reasoningEffort = "medium",
   sandboxMode = "danger-full-access",
   approvalPolicy = "never",
+  homeDir = os.homedir(),
 }) {
-  const normalizedCatalogPath = toTomlPath(catalogPath(rootDir));
-
+  const modelCatalogJson = toTomlString(toTomlPath(codexCatalogPath(homeDir)));
   return [
     CODEX_BRIDGE_MANAGED_START,
     'model_provider = "openai"',
     `model = "${model}"`,
-    `model_catalog_json = "${normalizedCatalogPath}"`,
+    `model_catalog_json = ${modelCatalogJson}`,
     `model_reasoning_effort = "${reasoningEffort}"`,
     `sandbox_mode = "${sandboxMode}"`,
     `approval_policy = "${approvalPolicy}"`,
@@ -1439,6 +2845,13 @@ export function buildCodexToml({
     CODEX_BRIDGE_MANAGED_END,
     "",
   ].join("\n");
+}
+
+function writeCodexVisibleModelCatalog({ rootDir, mode = MODE_HYBRID, homeDir = os.homedir() }) {
+  const config = readRouterConfig(rootDir) || buildRouterConfigFromSelection(rootDir, mode);
+  const target = codexCatalogPath(homeDir);
+  writeJsonAtomic(target, buildModelCatalog(config));
+  return target;
 }
 
 export function applyCodexConfig({
@@ -1452,12 +2865,18 @@ export function applyCodexConfig({
   const target = codexConfigPath(homeDir);
   const targetDir = path.dirname(target);
   fs.mkdirSync(targetDir, { recursive: true });
+  const modelCatalogTarget = writeCodexVisibleModelCatalog({
+    rootDir,
+    mode: mode || MODE_HYBRID,
+    homeDir,
+  });
   const existingContent = fs.existsSync(target) ? fs.readFileSync(target, "utf8") : "";
   const currentSettings = currentCodexModelSettings(existingContent);
   const bridgeContent = buildCodexToml({
     rootDir,
     mode,
     port,
+    homeDir,
     ...currentSettings,
     model: model || currentSettings.model || DEFAULT_CODEX_BRIDGE_MODEL_ID,
   });
@@ -1465,7 +2884,7 @@ export function applyCodexConfig({
 
   if (fs.existsSync(target) && existingContent === content) {
     const historySync = syncCodexBridgeConversationProviders({ homeDir });
-    return { target, backup: null, unchanged: true, historySync };
+    return { target, backup: null, unchanged: true, modelCatalog: modelCatalogTarget, historySync };
   }
 
   let backup = null;
@@ -1486,7 +2905,7 @@ export function applyCodexConfig({
     throw error;
   }
   const historySync = syncCodexBridgeConversationProviders({ homeDir });
-  return { target, backup, unchanged: false, historySync };
+  return { target, backup, unchanged: false, modelCatalog: modelCatalogTarget, historySync };
 }
 
 export function restoreCodexConfig({ homeDir = os.homedir() } = {}) {
@@ -1517,6 +2936,60 @@ export function restoreCodexConfig({ homeDir = os.homedir() } = {}) {
   return {
     target,
     backup: restoreFrom.fullPath,
+    currentBackup,
+  };
+}
+
+export function listCodexBackups({ homeDir = os.homedir() } = {}) {
+  const target = codexConfigPath(homeDir);
+  const targetDir = path.dirname(target);
+  if (!fs.existsSync(targetDir)) {
+    return [];
+  }
+  const patterns = [
+    { kind: "codexbridge", pattern: /^config\.toml\.codexbridge\..+\.bak$/ },
+    { kind: "before_restore", pattern: /^config\.toml\.before-restore\..+\.bak$/ },
+    { kind: "history_access", pattern: /^config\.toml\.history-access\..+\.bak$/ },
+  ];
+  return fs
+    .readdirSync(targetDir)
+    .filter((name) => patterns.some((item) => item.pattern.test(name)))
+    .map((name) => {
+      const fullPath = path.join(targetDir, name);
+      const stat = fs.statSync(fullPath);
+      const kind = patterns.find((item) => item.pattern.test(name))?.kind || "backup";
+      return {
+        name,
+        fullPath,
+        kind,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        updatedAt: new Date(stat.mtimeMs).toISOString(),
+      };
+    })
+    .sort((left, right) => right.mtimeMs - left.mtimeMs || right.name.localeCompare(left.name));
+}
+
+export function restoreCodexConfigFromBackup(backupPath, { homeDir = os.homedir() } = {}) {
+  const target = codexConfigPath(homeDir);
+  const allowed = new Set(listCodexBackups({ homeDir }).map((item) => path.resolve(item.fullPath)));
+  const resolvedBackup = path.resolve(String(backupPath || ""));
+  if (!allowed.has(resolvedBackup)) {
+    throw new Error("Backup is not a known CodexBridge config backup.");
+  }
+  if (!fs.existsSync(resolvedBackup)) {
+    throw new Error("Selected Codex config backup does not exist.");
+  }
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  let currentBackup = null;
+  if (fs.existsSync(target)) {
+    currentBackup = `${target}.before-restore.${timestamp()}.bak`;
+    fs.copyFileSync(target, currentBackup);
+  }
+  fs.copyFileSync(resolvedBackup, target);
+  return {
+    target,
+    backup: resolvedBackup,
     currentBackup,
   };
 }
@@ -1873,7 +3346,7 @@ export function recoverCodexHistoryAccess({ homeDir = os.homedir() } = {}) {
       action: "recover_history_access",
       historySync,
       message: "当前 Codex 配置不是 CodexBridge 配置，无需调整。历史对话应由当前 Codex 配置自行显示。",
-      nextStep: "请完全退出并重启 Codex。若还要使用 CodexBridge，请回到本应用点击“更新 Codex 配置”并打开 Router。",
+      nextStep: "请完全退出并重启 Codex。若还要使用 CodexBridge，请回到本应用开启 Router，配置会自动刷新。",
     };
   }
 
@@ -2898,9 +4371,13 @@ function toTomlPath(filePath) {
   return path.resolve(filePath).replaceAll("\\", "/");
 }
 
+function toTomlString(value) {
+  return `"${String(value || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
 function normalizeSelection(rootDir, selectedModelIds, mode) {
   const available = new Set([
-    ...MODEL_PRESETS.map((model) => model.presetId),
+    ...effectiveBuiltInModels(rootDir).map((model) => model.presetId),
     ...defaultSelectedModelIds(mode),
   ]);
   const custom = readCustomModels(rootDir).map((model) => model.presetId);
@@ -3042,8 +4519,28 @@ function routeForSelectedModel(model, priority, imageGenerationOverrides = {}) {
   if (model.custom && route.inputModalities === undefined) {
     route.inputModalities = normalizeInputModalities(model.inputModalities, ["text"]);
   }
+  removeLegacyKimiLocalThrottle(route, model);
   route.capabilityStatus = routeCapabilityStatus(route);
   return route;
+}
+
+function removeLegacyKimiLocalThrottle(route = {}, model = {}) {
+  if (!isKimiRoute(route) || model.custom) {
+    return;
+  }
+  if (Number(route.rpm) === 12 && route.rateLimit === undefined) {
+    delete route.rpm;
+  }
+}
+
+function isKimiRoute(route = {}) {
+  const provider = String(route.provider || route.providerId || route.providerFamily || "").toLowerCase();
+  if (provider.includes("kimi") || provider.includes("moonshot")) {
+    return true;
+  }
+  const baseUrl = String(route.baseUrl || "").toLowerCase();
+  const model = String(route.model || route.id || "").toLowerCase();
+  return baseUrl.includes("moonshot") || model.includes("kimi");
 }
 
 function providerFamilyForRoute(model = {}, provider) {
@@ -3162,7 +4659,7 @@ function normalizeCustomModel(input = {}) {
   if (!displayName || !model || !baseUrl) {
     throw new Error("自定义模型需要填写显示名称、真实模型名和 Base URL。");
   }
-  const providerId = `custom-${slugify(providerName)}`;
+  const providerId = String(input.providerId || "").trim() || `custom-${slugify(providerName)}`;
   const keyEnv = String(input.keyEnv || `${slugifyEnv(providerName)}_API_KEY`).trim();
   const dropParams = normalizeCustomDropParams(input.dropParams);
   return {
@@ -3179,6 +4676,7 @@ function normalizeCustomModel(input = {}) {
     keyEnv,
     keyUrl: String(input.keyUrl || "").trim(),
     docsUrl: String(input.docsUrl || "").trim(),
+    logoUrl: String(input.logoUrl || "").trim(),
     contextWindow: Number(input.contextWindow || 258400),
     inputModalities: normalizeInputModalities(input.inputModalities, ["text"]),
     ...(dropParams.length && input.api !== "responses" ? { dropParams } : {}),
@@ -3361,6 +4859,19 @@ function modelDirectoryEndpointForProvider(provider = {}) {
   return `${baseUrl}/models`;
 }
 
+function providerLogoExtension(sourcePath) {
+  const extension = path.extname(String(sourcePath || "").trim()).toLowerCase();
+  if ([".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".ico"].includes(extension)) {
+    return extension;
+  }
+  return ".png";
+}
+
+function providerRequiresApiKey(provider = {}) {
+  const authMode = provider.authMode || "api_key";
+  return authMode === "api_key" && Boolean(provider.keyEnv || provider.apiKeyEnv);
+}
+
 function normalizeProviderModelList(body) {
   const rawModels = Array.isArray(body?.data)
     ? body.data
@@ -3497,9 +5008,81 @@ function routeCapabilityDiagnosticText(route = {}) {
 }
 
 function normalizeDesktopOptions(options = {}) {
+  const routerPort = normalizeRouterPort(options.routerPort ?? options.port);
+  const codexDesktopExe = String(options.codexDesktopExe || "").trim();
+  const codexDesktopLaunchTarget = String(options.codexDesktopLaunchTarget || "").trim();
   return {
     bypassSystemProxy: Boolean(options.bypassSystemProxy),
+    routerPort,
+    codexDesktopExe,
+    codexDesktopLaunchTarget,
   };
+}
+
+function normalizeConfigProfile(profile = {}) {
+  const name = String(profile.name || "").trim();
+  if (!name) {
+    return null;
+  }
+  const id = String(profile.id || slugify(name)).trim() || slugify(name);
+  const mode = profile.mode === MODE_ALL_API ? MODE_ALL_API : MODE_HYBRID;
+  return {
+    id,
+    name,
+    mode,
+    selectedModelIds: Array.isArray(profile.selectedModelIds)
+      ? [...new Set(profile.selectedModelIds.map((item) => String(item || "").trim()).filter(Boolean))]
+      : [],
+    desktopOptions: normalizeDesktopOptions(profile.desktopOptions || {}),
+    note: String(profile.note || "").trim().slice(0, 240),
+    createdAt: String(profile.createdAt || profile.updatedAt || new Date().toISOString()),
+    updatedAt: String(profile.updatedAt || new Date().toISOString()),
+  };
+}
+
+function checkItem({ id, label, status, detail, action = "", count = null } = {}) {
+  const normalizedStatus = ["pass", "warn", "fail"].includes(status) ? status : "warn";
+  return {
+    id: String(id || ""),
+    label: String(label || id || ""),
+    status: normalizedStatus,
+    detail: String(detail || ""),
+    action: String(action || ""),
+    count: Number.isFinite(Number(count)) ? Number(count) : null,
+  };
+}
+
+function startupCheckSummary(items = []) {
+  const summary = {
+    ok: true,
+    pass: 0,
+    warn: 0,
+    fail: 0,
+  };
+  for (const item of items) {
+    if (item.status === "pass") {
+      summary.pass += 1;
+    } else if (item.status === "fail") {
+      summary.fail += 1;
+      summary.ok = false;
+    } else {
+      summary.warn += 1;
+    }
+  }
+  return summary;
+}
+
+function proxyEnvironmentKeys(env = process.env) {
+  return ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"]
+    .filter((key) => env[key] || env[key.toLowerCase()]);
+}
+
+function normalizeRouterPort(value) {
+  const numeric = Number(value || 15722);
+  if (!Number.isInteger(numeric) || numeric < 1024 || numeric > 65535) {
+    return 15722;
+  }
+  return numeric;
 }
 
 function isValidHttpUrl(value) {
@@ -3526,7 +5109,15 @@ function redactSecretText(value) {
       "$1[REDACTED]",
     )
     .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
-    .replace(/\bsk-[A-Za-z0-9._-]{8,}\b/g, "sk-[REDACTED]")
+    .replace(/\b(?:sk|ak)-[A-Za-z0-9._-]{6,}\b/gi, (match) => {
+      const prefix = match.slice(0, 2).toLowerCase();
+      return `${prefix}-[REDACTED]`;
+    })
+    .replace(/<\s*(ak)-[A-Za-z0-9._-]{6,}\s*>/gi, "<ak-[REDACTED]>")
+    .replace(/\b(?:org|proj)-[A-Za-z0-9._-]{8,}\b/gi, (match) => {
+      const prefix = match.split("-")[0].toLowerCase();
+      return `${prefix}-[REDACTED]`;
+    })
     .replace(/(api[_-]?key["'\s:=]+)[A-Za-z0-9._-]{8,}/gi, "$1[REDACTED]")
     .slice(0, 1000);
 }

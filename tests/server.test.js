@@ -166,6 +166,12 @@ test("server exposes health, models, catalog, and converted responses", async ()
 
     const models = await fetchJson(`${baseUrl}/v1/models`);
     assert.equal(models.data[0].id, "deepseek-v4-pro");
+    assert.equal(models.data[0].display_name, "DeepSeek V4 Pro");
+    assert.equal(models.data[0].slug, "deepseek-v4-pro");
+    assert.equal(models.data[0].supports_tools, "chat-functions");
+    assert.equal(models.data[0].supports_mcp_namespaces, true);
+    assert.equal(models.data[0].codexbridge_capabilities.tools, "chat-functions");
+    assert.equal(models.data[0].codexbridge_capabilities.mcp_namespaces, "native");
 
     const catalog = await fetchJson(`${baseUrl}/model-catalog.json`);
     assert.equal(catalog.models[0].apply_patch_tool_type, "freeform");
@@ -722,6 +728,10 @@ test("server returns a local rate-limit response without retrying the provider",
 
     assert.match(first.output_text, /rate limited|token waste/i);
     assert.match(second.output_text, /rate limited|token waste/i);
+    assert.match(first.output_text, /Kimi K2\.7 Code returned HTTP 429/i);
+    assert.match(first.output_text, /about 30s/i);
+    assert.match(second.output_text, /local cooldown/i);
+    assert.match(second.output_text, /about 30s/i);
     assert.equal(upstreamCalls, 1);
   } finally {
     await close(router);
@@ -2389,6 +2399,287 @@ test("server suppresses unexpected Node REPL tool calls from chat providers", as
   assert.equal(
     chatBodies[0].tools.some((tool) => tool.function?.name === "mcp__node_repl__js"),
     false,
+  );
+});
+
+test("server restores MCP namespace metadata from chat tool calls", async () => {
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (line) => logs.push(String(line));
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/chat/completions");
+    const chunks = [];
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    assert.equal(
+      body.tools.some((tool) => tool.function?.name === "mcp__figma__whoami"),
+      true,
+    );
+
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: "chatcmpl_figma_whoami",
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: null,
+              tool_calls: [
+                {
+                  id: "call_figma_whoami",
+                  type: "function",
+                  function: {
+                    name: "mcp__figma__whoami",
+                    arguments: "{}",
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const upstreamUrl = serverUrl(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        api: "chat_completions",
+        baseUrl: `${upstreamUrl}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const baseUrl = serverUrl(router);
+
+  try {
+    const response = await fetchJson(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        input: "Figma whoami",
+        tools: [
+          {
+            type: "namespace",
+            name: "mcp__figma__",
+            tools: [
+              {
+                type: "function",
+                name: "whoami",
+                description: "Check Figma plugin connection.",
+                parameters: { type: "object", properties: {} },
+              },
+            ],
+          },
+        ],
+      }),
+    });
+
+    assert.equal(response.output.length, 1);
+    assert.equal(response.output[0].type, "function_call");
+    assert.equal(response.output[0].namespace, "mcp__figma__");
+    assert.equal(response.output[0].name, "whoami");
+    assert.equal(response.output[0].call_id, "call_figma_whoami");
+  } finally {
+    console.log = originalLog;
+    await close(router);
+    await close(upstream);
+  }
+  assert.ok(logs.some((line) =>
+    /tool_return_diag route=deepseek-v4-pro mode=chat-compat returned_tools=1 runnable_tools=1 suppressed_tools=0 unknown_tools=0 namespaces=1 namespace_names=mcp__figma__/.test(line)
+  ));
+});
+
+test("server streams MCP namespace tool calls and preserves tool-output continuation", async () => {
+  const logs = [];
+  const chatBodies = [];
+  const originalLog = console.log;
+  console.log = (line) => logs.push(String(line));
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/chat/completions");
+    const body = await readJson(req);
+    chatBodies.push(body);
+    assert.equal(
+      body.tools.some((tool) => tool.function?.name === "mcp__figma__whoami"),
+      true,
+    );
+
+    res.writeHead(200, { "content-type": "application/json" });
+    if (chatBodies.length === 1) {
+      res.end(
+        JSON.stringify({
+          id: "chatcmpl_figma_stream_canary",
+          object: "chat.completion",
+          choices: [
+            {
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    id: "call_figma_whoami",
+                    type: "function",
+                    function: {
+                      name: "mcp__figma__whoami",
+                      arguments: "{}",
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      );
+      return;
+    }
+
+    const assistant = body.messages.find((message) => Array.isArray(message.tool_calls));
+    assert.equal(assistant.tool_calls[0].function.name, "mcp__figma__whoami");
+    assert.equal(assistant.tool_calls[0].id, "call_figma_whoami");
+    const toolMessage = body.messages.find(
+      (message) => message.role === "tool" && message.tool_call_id === "call_figma_whoami",
+    );
+    assert.match(String(toolMessage?.content || ""), /figma user ok/);
+
+    res.end(
+      JSON.stringify({
+        id: "chatcmpl_figma_tool_output",
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: "figma tool output accepted",
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 42,
+          completion_tokens: 5,
+          total_tokens: 47,
+        },
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const baseUrl = serverUrl(router);
+  const headers = {
+    "content-type": "application/json",
+    authorization: "Bearer router-token",
+  };
+  const tools = [
+    {
+      type: "namespace",
+      name: "mcp__figma__",
+      tools: [
+        {
+          type: "function",
+          name: "whoami",
+          description: "Check Figma plugin connection.",
+          parameters: { type: "object", properties: {} },
+        },
+      ],
+    },
+  ];
+
+  try {
+    const first = await requestText(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        stream: true,
+        input: "Figma whoami",
+        tools,
+      }),
+    });
+
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /event: response\.output_item\.added/);
+    assert.match(first.body, /"type":"function_call"/);
+    assert.match(first.body, /"namespace":"mcp__figma__"/);
+    assert.match(first.body, /"name":"whoami"/);
+    assert.match(first.body, /"call_id":"call_figma_whoami"/);
+    assert.match(first.body, /event: response\.function_call_arguments\.done/);
+    assert.doesNotMatch(first.body, /unsupported_call/);
+
+    const second = await requestText(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        stream: true,
+        previous_response_id: "resp_chatcmpl_figma_stream_canary",
+        input: [
+          {
+            type: "function_call_output",
+            call_id: "call_figma_whoami",
+            output: "figma user ok",
+          },
+        ],
+        tools,
+      }),
+    });
+
+    assert.equal(second.statusCode, 200);
+    assert.match(second.body, /figma tool output accepted/);
+    assert.equal(chatBodies.length, 2);
+  } finally {
+    console.log = originalLog;
+    await close(router);
+    await close(upstream);
+  }
+  assert.ok(
+    logs.some((line) =>
+      /tool_diag route=deepseek-v4-pro mode=chat-compat tools=1 chat_tools=1 suppressed=0 namespaces=1 namespace_names=mcp__figma__/.test(
+        line,
+      ),
+    ),
+  );
+  assert.ok(
+    logs.some((line) =>
+      /tool_return_diag route=deepseek-v4-pro mode=chat-compat returned_tools=1 runnable_tools=1 suppressed_tools=0 unknown_tools=0 namespaces=1 namespace_names=mcp__figma__/.test(
+        line,
+      ),
+    ),
   );
 });
 
@@ -7568,19 +7859,41 @@ test("server stops duplicate initial Codex desktop replay while the first reques
   }
 });
 
-test("server stops duplicate Codex desktop retry after retryable upstream 503", async () => {
+test("server allows duplicate Codex desktop retry after transient upstream 503", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer(async (req, res) => {
     upstreamCalls += 1;
     const body = await readJson(req);
     assert.equal(body.model, "deepseek-v4-pro");
-    res.writeHead(503, { "content-type": "application/json" });
+    if (upstreamCalls === 1) {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: {
+            message:
+              "No available channel for model deepseek-v4-pro under group default (distributor)",
+          },
+        }),
+      );
+      return;
+    }
+
+    res.writeHead(200, { "content-type": "application/json" });
     res.end(
       JSON.stringify({
-        error: {
-          message:
-            "No available channel for model deepseek-v4-pro under group default (distributor)",
-        },
+        id: "chatcmpl_transient_503_recovered",
+        object: "chat.completion",
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: "Recovered after transient 503.",
+            },
+            finish_reason: "stop",
+          },
+        ],
+        usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 },
       }),
     );
   });
@@ -7631,8 +7944,8 @@ test("server stops duplicate Codex desktop retry after retryable upstream 503", 
     const second = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
     assert.equal(second.statusCode, 200);
     assert.match(second.body, /response\.completed/);
-    assert.match(second.body, /stopped an automatic retry/);
-    assert.equal(upstreamCalls, 1);
+    assert.match(second.body, /Recovered after transient 503/);
+    assert.equal(upstreamCalls, 2);
   } finally {
     await close(router);
     await close(upstream);
@@ -7700,7 +8013,7 @@ test("server stops duplicate Codex desktop retry after oversized upstream 413", 
     const second = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
     assert.equal(second.statusCode, 200);
     assert.match(second.body, /response\.completed/);
-    assert.match(second.body, /stopped an automatic retry/);
+    assert.match(second.body, /已拦截同一失败请求的自动重试/);
     assert.equal(upstreamCalls, 1);
   } finally {
     await close(router);
@@ -7763,7 +8076,7 @@ test("server stops duplicate Codex desktop retry after retryable upstream 502", 
     const second = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
     assert.equal(second.statusCode, 200);
     assert.match(second.body, /response\.completed/);
-    assert.match(second.body, /stopped an automatic retry/);
+    assert.match(second.body, /已拦截同一失败请求的自动重试/);
     assert.equal(upstreamCalls, 1);
   } finally {
     await close(router);
@@ -7836,7 +8149,7 @@ test("server stops duplicate Codex desktop retry after truncated responses strea
     const second = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
     assert.equal(second.statusCode, 200);
     assert.match(second.body, /response\.completed/);
-    assert.match(second.body, /stopped an automatic retry/);
+    assert.match(second.body, /已拦截同一失败请求的自动重试/);
     assert.equal(upstreamCalls, 1);
   } finally {
     await close(router);
@@ -8367,6 +8680,135 @@ test("server lets current Codex desktop tool output reach upstream", async () =>
     assert.match(second.body, /current tool output answer 2/);
     assert.equal(upstreamCalls, 2);
   } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("server lets a new Codex turn continue after a tool-output timeout", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    upstreamCalls += 1;
+    await readJson(req);
+    if (upstreamCalls === 1) {
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: `chatcmpl_tool_timeout_recovery_${upstreamCalls}`,
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: "skill continuation finished after user retry",
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 200,
+          completion_tokens: 10,
+          total_tokens: 210,
+        },
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+        upstreamTimeoutMs: 30,
+      },
+    ],
+  });
+
+  await listen(router);
+  const headers = {
+    "content-type": "application/json",
+    authorization: "Bearer router-token",
+    "user-agent": "Codex Desktop/0.142.3",
+    "x-codex-thread-id": "thread_tool_output_timeout",
+    "x-codex-window-id": "window_tool_output_timeout",
+    "x-codex-turn-state": "turn-tool-output-timeout",
+  };
+  const toolOutputInput = [
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "run the HyperFrames health check" }],
+    },
+    {
+      type: "function_call_output",
+      call_id: "call_hyperframes_health",
+      output: "Node, npm, and ffmpeg checks already ran locally.",
+    },
+  ];
+
+  try {
+    const timedOut = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        stream: true,
+        previous_response_id: "resp_tool_output_timeout",
+        input: toolOutputInput,
+      }),
+    });
+    assert.equal(timedOut.statusCode, 200);
+    assert.match(timedOut.body, /timed out/i);
+    assert.equal(upstreamCalls, 1);
+
+    const automaticReplay = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        stream: true,
+        previous_response_id: "resp_tool_output_timeout",
+        input: toolOutputInput,
+      }),
+    });
+    assert.equal(automaticReplay.statusCode, 200);
+    assert.match(automaticReplay.body, /上一次错误|timed out/i);
+    assert.equal(upstreamCalls, 1);
+
+    const userContinue = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: { ...headers, "x-codex-turn-state": "turn-user-continue-after-timeout" },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        stream: true,
+        previous_response_id: "resp_after_tool_output_timeout",
+        input: [
+          ...toolOutputInput,
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "continue the HyperFrames check" }],
+          },
+        ],
+      }),
+    });
+    assert.equal(userContinue.statusCode, 200);
+    assert.match(userContinue.body, /skill continuation finished after user retry/);
+    assert.equal(upstreamCalls, 2);
+  } finally {
+    router.closeAllConnections?.();
+    upstream.closeAllConnections?.();
     await close(router);
     await close(upstream);
   }
@@ -8961,7 +9403,9 @@ test("server stops Codex desktop model-slot replay with longer history after GPT
       }),
     });
     assert.equal(second.statusCode, 200);
-    assert.match(second.body, /GPT answered before longer history replay|automatic resume/i);
+    assert.match(second.body, /上一模型选择/);
+    assert.match(second.body, /DeepSeek V4 Pro/);
+    assert.doesNotMatch(second.body, /GPT answered before longer history replay/);
     assert.doesNotMatch(second.body, /DeepSeek should not run/);
     assert.equal(gptCalls, 1);
     assert.equal(deepseekCalls, 0);
@@ -9231,7 +9675,9 @@ test("server stops Codex desktop replay from switching routes after an upstream 
       }),
     });
     assert.equal(second.statusCode, 200);
-    assert.match(second.body, /encrypted content Annotation|automatic replay/i);
+    assert.match(second.body, /上一模型选择/);
+    assert.match(second.body, /DeepSeek V4 Pro/);
+    assert.doesNotMatch(second.body, /encrypted content Annotation/);
     assert.doesNotMatch(second.body, /deepseek should not run/);
     assert.equal(gptCalls, 1);
     assert.equal(deepseekCalls, 0);
@@ -9239,6 +9685,220 @@ test("server stops Codex desktop replay from switching routes after an upstream 
     await close(router);
     await close(gptUpstream);
     await close(deepseekUpstream);
+  }
+});
+
+test("server allows a new Codex turn to retry the same text on the newly selected model", async () => {
+  let sudobugCalls = 0;
+  let gptCalls = 0;
+  const sudobugUpstream = http.createServer(async (req, res) => {
+    sudobugCalls += 1;
+    await readJson(req);
+    res.writeHead(403, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        error: {
+          message: "quota exhausted: balance -0.057090",
+        },
+      }),
+    );
+  });
+  const gptUpstream = http.createServer(async (req, res) => {
+    gptCalls += 1;
+    await readJson(req);
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    writeResponseCompletedSse(res, {
+      id: `resp_new_turn_after_provider_failure_${gptCalls}`,
+      object: "response",
+      status: "completed",
+      model: "gpt-5.5",
+      output: [
+        {
+          type: "message",
+          role: "assistant",
+          content: [
+            {
+              type: "output_text",
+              text: `gpt subscription handled retry ${gptCalls}`,
+            },
+          ],
+        },
+      ],
+    });
+  });
+
+  await listen(sudobugUpstream);
+  await listen(gptUpstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    clientAuth: { allowOpenAiBearer: true },
+    defaultModel: "gpt-5.5",
+    models: [
+      {
+        id: "cb-custom-sudobug-gpt-5-5",
+        displayName: "SudoBug",
+        provider: "custom",
+        api: "responses",
+        baseUrl: `${serverUrl(sudobugUpstream)}/v1`,
+        model: "gpt-5.5",
+        apiKey: "sudobug-key",
+      },
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        provider: "codex",
+        api: "responses",
+        baseUrl: `${serverUrl(gptUpstream)}/v1`,
+        model: "gpt-5.5",
+        authMode: "codex_openai",
+      },
+    ],
+  });
+
+  await listen(router);
+  const headers = {
+    "content-type": "application/json",
+    authorization: "Bearer codex-openai-token",
+    "user-agent": "Codex Desktop/0.142.3",
+    "x-codex-thread-id": "thread_sudobug_to_gpt_same_text",
+    "x-codex-window-id": "window_sudobug_to_gpt_same_text",
+  };
+  const input = [
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "same visible text after provider switch" }],
+    },
+  ];
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: { ...headers, "x-codex-turn-state": "turn-provider-quota-failed" },
+      body: JSON.stringify({
+        model: "cb-custom-sudobug-gpt-5-5",
+        stream: true,
+        input,
+      }),
+    });
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /quota exhausted/);
+    assert.equal(sudobugCalls, 1);
+    assert.equal(gptCalls, 0);
+
+    const automaticReplay = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: { ...headers, "x-codex-turn-state": "turn-provider-quota-failed" },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        stream: true,
+        previous_response_id: "resp_after_sudobug_quota_failure",
+        input,
+      }),
+    });
+    assert.equal(automaticReplay.statusCode, 200);
+    assert.match(automaticReplay.body, /上一模型选择/);
+    assert.match(automaticReplay.body, /GPT-5\.5/);
+    assert.doesNotMatch(automaticReplay.body, /quota exhausted/);
+    assert.doesNotMatch(automaticReplay.body, /gpt subscription handled retry/);
+    assert.equal(gptCalls, 0);
+
+    const manualRetry = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: { ...headers, "x-codex-turn-state": "turn-user-manual-retry" },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        stream: true,
+        input,
+      }),
+    });
+    assert.equal(manualRetry.statusCode, 200);
+    assert.match(manualRetry.body, /gpt subscription handled retry 1/);
+    assert.equal(sudobugCalls, 1);
+    assert.equal(gptCalls, 1);
+  } finally {
+    await close(router);
+    await close(sudobugUpstream);
+    await close(gptUpstream);
+  }
+});
+
+test("server accepts completed Responses SSE wrapped in a non-2xx upstream status", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    upstreamCalls += 1;
+    await readJson(req);
+    res.writeHead(500, { "content-type": "text/event-stream; charset=utf-8" });
+    writeResponseCompletedSse(res, {
+      id: "resp_completed_inside_500",
+      object: "response",
+      status: "completed",
+      model: "gpt-5.4",
+      output: [
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "middleman completed anyway" }],
+        },
+      ],
+      usage: {
+        input_tokens: 12,
+        output_tokens: 4,
+        total_tokens: 16,
+      },
+    });
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    defaultModel: "cb-custom-model-gpt-5-4",
+    models: [
+      {
+        id: "cb-custom-model-gpt-5-4",
+        displayName: "中转gpt-5.4",
+        provider: "custom",
+        api: "responses",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "gpt-5.4",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  try {
+    const response = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer client-key",
+        "user-agent": "Codex Desktop/0.142.3",
+      },
+      body: JSON.stringify({
+        model: "cb-custom-model-gpt-5-4",
+        stream: true,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "hello" }],
+          },
+        ],
+      }),
+    });
+
+    assert.equal(response.statusCode, 200);
+    assert.match(response.body, /response.completed/);
+    assert.match(response.body, /middleman completed anyway/);
+    assert.doesNotMatch(response.body, /CodexBridge upstream error/);
+    assert.equal(upstreamCalls, 1);
+  } finally {
+    await close(router);
+    await close(upstream);
   }
 });
 
@@ -9364,13 +10024,160 @@ test("server stops completed Codex desktop turn from replaying on a different ro
       }),
     });
     assert.equal(second.statusCode, 200);
-    assert.match(second.body, /first route answer 1|duplicate automatic request replay/i);
+    assert.match(second.body, /上一模型选择/);
+    assert.match(second.body, /DeepSeek V4 Pro/);
+    assert.doesNotMatch(second.body, /first route answer 1/);
+    assert.doesNotMatch(second.body, /second route answer/);
     assert.equal(firstRouteCalls, 1);
     assert.equal(secondRouteCalls, 0);
   } finally {
     await close(router);
     await close(firstUpstream);
     await close(secondUpstream);
+  }
+});
+
+test("server does not replay an old rate-limit response after switching routes", async () => {
+  __resetRateLimiterForTests();
+  let glmCalls = 0;
+  let deepseekCalls = 0;
+  const glmUpstream = http.createServer(async (req, res) => {
+    glmCalls += 1;
+    await readJson(req);
+    res.writeHead(429, {
+      "content-type": "application/json",
+      "retry-after": "30",
+    });
+    res.end(JSON.stringify({ error: { message: "Too Many Requests" } }));
+  });
+  const deepseekUpstream = http.createServer(async (req, res) => {
+    deepseekCalls += 1;
+    await readJson(req);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: `chatcmpl_deepseek_after_glm_limit_${deepseekCalls}`,
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: `deepseek handled new turn ${deepseekCalls}`,
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 12,
+          completion_tokens: 4,
+          total_tokens: 16,
+        },
+      }),
+    );
+  });
+
+  await listen(glmUpstream);
+  await listen(deepseekUpstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "glm-4-6",
+    models: [
+      {
+        id: "glm-4-6",
+        displayName: "GLM-4.6",
+        provider: "zhipu",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(glmUpstream)}/v1`,
+        model: "glm-4.6",
+        apiKey: "glm-key",
+      },
+      {
+        id: "deepseek-v4-flash",
+        displayName: "DeepSeek V4 Flash",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(deepseekUpstream)}/v1`,
+        model: "deepseek-v4-flash",
+        apiKey: "deepseek-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  const headers = {
+    "content-type": "application/json",
+    authorization: "Bearer router-token",
+    "user-agent": "Codex Desktop/0.142.3",
+    "x-codex-thread-id": "thread_glm_limit_then_deepseek",
+    "x-codex-window-id": "window_glm_limit_then_deepseek",
+  };
+  const firstInput = [
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "hello before model switch" }],
+    },
+  ];
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "glm-4-6",
+        stream: true,
+        input: firstInput,
+      }),
+    });
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /GLM-4\.6/);
+    assert.match(first.body, /rate limited/);
+    assert.equal(glmCalls, 1);
+    assert.equal(deepseekCalls, 0);
+
+    const replayAfterSwitch = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "deepseek-v4-flash",
+        stream: true,
+        previous_response_id: "resp_after_glm_rate_limit",
+        input: firstInput,
+      }),
+    });
+    assert.equal(replayAfterSwitch.statusCode, 200);
+    assert.match(replayAfterSwitch.body, /上一模型选择/);
+    assert.match(replayAfterSwitch.body, /DeepSeek V4 Flash/);
+    assert.doesNotMatch(replayAfterSwitch.body, /GLM-4\.6/);
+    assert.doesNotMatch(replayAfterSwitch.body, /rate limited/);
+    assert.equal(glmCalls, 1);
+    assert.equal(deepseekCalls, 0);
+
+    const newTurn = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "deepseek-v4-flash",
+        stream: true,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "continue with the selected model" }],
+          },
+        ],
+      }),
+    });
+    assert.equal(newTurn.statusCode, 200);
+    assert.match(newTurn.body, /deepseek handled new turn 1/);
+    assert.equal(glmCalls, 1);
+    assert.equal(deepseekCalls, 1);
+  } finally {
+    await close(router);
+    await close(glmUpstream);
+    await close(deepseekUpstream);
+    __resetRateLimiterForTests();
   }
 });
 
@@ -9842,6 +10649,82 @@ test("chat-routed remote compact v2 falls back locally when upstream compaction 
     assert.match(text, /CodexBridge local compact fallback/);
     assert.match(text, /compact upstream unavailable/);
     assert.match(text, /latest Kimi compact fallback detail must survive/);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("chat-routed remote compact fallback redacts upstream account identifiers", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/chat/completions");
+    upstreamCalls += 1;
+    await readJson(req);
+    res.writeHead(429, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        error: {
+          message:
+            "Your account org-testfixtures000000000 / proj-testfixtures000000000 <ak-testfixtures000000000> request reached organization TPD rate limit",
+        },
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "kimi-k2-code",
+    models: [
+      {
+        id: "kimi-k2-code",
+        displayName: "Kimi K2 Code",
+        provider: "kimi",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "kimi-k2-code",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+
+  try {
+    const response = await fetch(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "kimi-k2-code",
+        stream: true,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: "latest Kimi compact fallback detail must survive redaction",
+          },
+          { type: "compaction_trigger" },
+        ],
+      }),
+    });
+    const text = await response.text();
+    assert.equal(response.ok, true, text);
+    assert.equal(upstreamCalls, 1);
+    assert.match(text, /CodexBridge local compact fallback/);
+    assert.match(text, /TPD rate limit/);
+    assert.match(text, /latest Kimi compact fallback detail must survive redaction/);
+    assert.doesNotMatch(text, /ak-testfixtures000000000/);
+    assert.doesNotMatch(text, /org-testfixtures000000000/);
+    assert.doesNotMatch(text, /proj-testfixtures000000000/);
+    assert.match(text, /ak-\[REDACTED\]/);
+    assert.match(text, /org-\[REDACTED\]/);
+    assert.match(text, /proj-\[REDACTED\]/);
   } finally {
     await close(router);
     await close(upstream);

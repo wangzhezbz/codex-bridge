@@ -166,10 +166,13 @@ test("proxySettingsForUrl reads macOS HTTPS system proxy settings", () => {
 
 test("upstream requests honor per-route rpm before calling providers", async () => {
   const originalFetch = globalThis.fetch;
+  const originalLog = console.log;
   const sleeps = [];
+  const logs = [];
   let now = 0;
   let calls = 0;
 
+  console.log = (line) => logs.push(String(line));
   globalThis.fetch = async () => {
     calls += 1;
     return new Response(JSON.stringify({ ok: true }), {
@@ -200,6 +203,125 @@ test("upstream requests honor per-route rpm before calling providers", async () 
       "https://api.moonshot.cn/v1/chat/completions",
       route,
       { model: "kimi-k2.7-code" },
+      { requestId: "req_rpm_pacing" },
+    );
+    await callJsonUpstream(
+      "https://api.moonshot.cn/v1/chat/completions",
+      route,
+      { model: "kimi-k2.7-code" },
+      { requestId: "req_rpm_pacing" },
+    );
+
+    assert.equal(calls, 2);
+    assert.deepEqual(sleeps, [1000]);
+    assert.equal(
+      logs.some((line) => /rate-limit-pacing route=kimi-k2\.7-code next_after_ms=1000/.test(line)),
+      true,
+    );
+    assert.equal(
+      logs.some((line) => / rate-limit route=kimi-k2\.7-code next_after_ms=1000/.test(line)),
+      false,
+    );
+  } finally {
+    console.log = originalLog;
+    globalThis.fetch = originalFetch;
+    __resetRateLimiterForTests();
+  }
+});
+
+test("upstream requests ignore legacy default Kimi rpm throttling", async () => {
+  const originalFetch = globalThis.fetch;
+  const sleeps = [];
+  let now = 0;
+  let calls = 0;
+
+  globalThis.fetch = async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  __resetRateLimiterForTests();
+  __setRateLimitClockForTests({
+    now: () => now,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      now += ms;
+    },
+  });
+
+  try {
+    const legacyKimiRoute = {
+      id: "cb-kimi-k2-7-code",
+      provider: "kimi",
+      api: "chat_completions",
+      baseUrl: "https://api.moonshot.cn/v1",
+      model: "kimi-k2.7-code",
+      apiKey: "test-key",
+      rpm: 12,
+    };
+
+    await callJsonUpstream(
+      "https://api.moonshot.cn/v1/chat/completions",
+      legacyKimiRoute,
+      { model: "kimi-k2.7-code" },
+      {},
+    );
+    await callJsonUpstream(
+      "https://api.moonshot.cn/v1/chat/completions",
+      legacyKimiRoute,
+      { model: "kimi-k2.7-code" },
+      {},
+    );
+
+    assert.equal(calls, 2);
+    assert.deepEqual(sleeps, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+    __resetRateLimiterForTests();
+  }
+});
+
+test("upstream requests still honor explicit nested Kimi rate limits", async () => {
+  const originalFetch = globalThis.fetch;
+  const sleeps = [];
+  let now = 0;
+  let calls = 0;
+
+  globalThis.fetch = async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  __resetRateLimiterForTests();
+  __setRateLimitClockForTests({
+    now: () => now,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      now += ms;
+    },
+  });
+
+  try {
+    const route = {
+      id: "cb-kimi-k2-7-code",
+      provider: "kimi",
+      api: "chat_completions",
+      baseUrl: "https://api.moonshot.cn/v1",
+      model: "kimi-k2.7-code",
+      apiKey: "test-key",
+      rateLimit: { rpm: 12 },
+    };
+
+    await callJsonUpstream(
+      "https://api.moonshot.cn/v1/chat/completions",
+      route,
+      { model: "kimi-k2.7-code" },
       {},
     );
     await callJsonUpstream(
@@ -210,7 +332,7 @@ test("upstream requests honor per-route rpm before calling providers", async () 
     );
 
     assert.equal(calls, 2);
-    assert.deepEqual(sleeps, [1000]);
+    assert.deepEqual(sleeps, [5000]);
   } finally {
     globalThis.fetch = originalFetch;
     __resetRateLimiterForTests();

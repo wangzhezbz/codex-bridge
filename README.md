@@ -171,9 +171,9 @@ macOS 下下载对应的 macOS 压缩包，解压后打开：
 CodexBridge.app
 ```
 
-The app opens the CodexBridge window directly. In the window, choose a billing mode, select up to five models, fill API keys, update Codex config, and start the router.
+The app opens the CodexBridge window directly. In the window, choose a billing mode, select the models you want to expose to Codex, fill API keys, and start the router.
 
-应用会直接打开 CodexBridge 窗口。你可以在窗口里选择计费模式、选择最多 5 个模型、填写 API Key、更新 Codex 配置并启动 Router。
+应用会直接打开 CodexBridge 窗口。你可以在窗口里选择计费模式、选择要暴露给 Codex 的模型、填写 API Key，然后启动 Router。
 
 Starting Router from the desktop app also refreshes the Codex config and model catalog, so Win users and Mac users do not need to click setup buttons in a strict order.
 
@@ -326,7 +326,7 @@ If Codex shows `502 Bad Gateway`, open the CodexBridge log page first.
 
 ## Recover Conversations / 找回历史对话
 
-Current releases keep `model_provider = "openai"` and use `openai_base_url`, so old Codex Desktop conversations should remain visible after clicking `更新 Codex 配置`, starting Router, and fully reopening Codex. The recover button is only a fallback for merging old desktop/history settings from backups; it cannot recreate conversations if Codex's local session database was deleted or a different `CODEX_HOME` is being used.
+Current releases keep `model_provider = "openai"` and use `openai_base_url`, so old Codex Desktop conversations should remain visible after starting Router and fully reopening Codex. The recover button is only a fallback for merging old desktop/history settings from backups; it cannot recreate conversations if Codex's local session database was deleted or a different `CODEX_HOME` is being used.
 
 If old Codex conversations disappear after enabling CodexBridge, open CodexBridge and click `找回历史对话`. The app merges history and desktop-related settings from the pre-Bridge backup while keeping the current CodexBridge model list, Router URL, and API settings. Then fully quit and reopen Codex.
 

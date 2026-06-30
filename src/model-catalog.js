@@ -1,3 +1,5 @@
+import { normalizeAdapterProfile } from "./adapter-profile.js";
+
 const DEFAULT_BASE_INSTRUCTIONS =
   "You are Codex, a coding agent. Follow the developer and user instructions in the current session.";
 
@@ -45,6 +47,10 @@ export function modelCatalogEntry(model, defaults = {}, index = 0) {
     Math.floor(contextWindow * (effectiveContextWindowPercent / 100)),
   );
   const inputModalities = inputModalitiesForModel(model);
+  const profile = normalizeAdapterProfile(model);
+  const capabilities = profile.capabilities || {};
+  const toolMode = capabilities.tools || profile.supportsTools || "unknown";
+  const mcpNamespaceMode = capabilityMode(capabilities.mcpNamespaces);
 
   const entry = {
     slug: model.id,
@@ -78,6 +84,25 @@ export function modelCatalogEntry(model, defaults = {}, index = 0) {
     experimental_supported_tools: [],
     input_modalities: inputModalities,
     supports_search_tool: false,
+    supports_tools: toolMode,
+    supports_mcp_namespaces: capabilities.mcpNamespaces === true,
+    codexbridge_capabilities: {
+      provider_family: capabilities.providerFamily || profile.providerFamily,
+      api: capabilities.api || profile.api,
+      upstream_model: model.model || model.id,
+      tools: toolMode,
+      mcp_namespaces: mcpNamespaceMode,
+      images: capabilities.images || "unknown",
+      files: capabilities.files || "unknown",
+      audio: capabilities.audio || "unknown",
+      reasoning: capabilityReasoningMode(capabilities.reasoning),
+      compact: capabilityCompactMode(capabilities.compact),
+      compact_strategy: capabilities.compact?.strategy || "unknown",
+      prompt_cache: capabilities.promptCache || "unknown",
+      context_window: capabilities.contextWindow || contextWindow,
+      catalog_context_window: capabilities.catalogContextWindow || contextWindow,
+      previous_response_id: capabilities.previousResponseId === true,
+    },
   };
 
   const reasoning = reasoningSpecForModel(model);
@@ -86,6 +111,26 @@ export function modelCatalogEntry(model, defaults = {}, index = 0) {
     model.supportedReasoningLevels || reasoning.levels;
 
   return entry;
+}
+
+function capabilityMode(value) {
+  if (value === true) return "native";
+  if (value === false || value == null) return "none";
+  return String(value);
+}
+
+function capabilityReasoningMode(reasoning) {
+  if (!reasoning || typeof reasoning !== "object") {
+    return "unknown";
+  }
+  return reasoning.mode || "unknown";
+}
+
+function capabilityCompactMode(compact) {
+  if (!compact || typeof compact !== "object") {
+    return "unknown";
+  }
+  return compact.mode || "unknown";
 }
 
 function inputModalitiesForModel(model) {
@@ -99,14 +144,22 @@ function inputModalitiesForModel(model) {
 }
 
 export function openAiModelsList(config) {
+  const defaults = config.catalog || {};
   return {
     object: "list",
-    data: config.models.map((model) => ({
-      id: model.id,
-      object: "model",
-      created: 0,
-      owned_by: model.provider || "codex-router",
-    })),
+    data: config.models.map((model, index) => {
+      const catalogEntry = modelCatalogEntry(model, defaults, index);
+      return {
+        ...catalogEntry,
+        id: model.id,
+        object: "model",
+        created: 0,
+        owned_by: model.provider || "codex-router",
+        name: model.displayName || model.id,
+        display_name: model.displayName || model.id,
+        description: model.description || model.displayName || model.id,
+      };
+    }),
   };
 }
 

@@ -7,6 +7,7 @@ import {
   isResponseToolCallItem,
   isResponseToolOutputItem,
   namespacedToolName,
+  toolDiagnosticsFromContext,
 } from "./tools.js";
 
 const MAX_CHAT_DATA_IMAGE_URL_CHARS = 2_000_000;
@@ -68,9 +69,11 @@ export function responsesToChatRequest(request, route, history) {
     body.reasoning_split = true;
   }
 
+  let resolvedToolChoice = "";
   if (toolContext.chatTools.length > 0) {
     body.tools = toolContext.chatTools;
     const toolChoice = chatToolChoice(request.tool_choice, toolContext, request);
+    resolvedToolChoice = toolChoice || "";
     if (toolChoice) {
       body.tool_choice = toolChoice;
     }
@@ -105,6 +108,7 @@ export function responsesToChatRequest(request, route, history) {
   return {
     body,
     toolContext,
+    toolDiagnostics: toolDiagnosticsFromContext(toolContext, resolvedToolChoice),
     wantsStream: Boolean(request.stream),
     messagesForHistory: sourceMessages,
   };

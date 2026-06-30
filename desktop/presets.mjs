@@ -185,11 +185,9 @@ export const MODEL_PRESETS = [
     dropParams: ["response_format", "parallel_tool_calls"],
   }),
   route("kimi-k2-7-code", "kimi", "Kimi K2.7 Code", "kimi-k2.7-code", "chat_completions", 258400, imageInput({
-    rpm: 12,
     dropParams: ["response_format", "parallel_tool_calls"],
   })),
   route("kimi-k2-6", "kimi", "Kimi K2.6", "kimi-k2.6", "chat_completions", 258400, imageInput({
-    rpm: 12,
     dropParams: ["response_format", "parallel_tool_calls"],
   })),
   route("xiaomi-mimo-v2-5-pro", "xiaomi", "MiMo V2.5 Pro", "mimo-v2.5-pro", "chat_completions", 258400, imageInput({

@@ -1,6 +1,7 @@
 import { tryParseJson } from "./json.js";
 import { proxyLogLabel } from "./proxy.js";
 import { routeRateLimitStatus } from "./rate-limit.js";
+import { redactSecretText } from "./redact.js";
 
 const ERROR_TYPES = {
   authentication: {
@@ -291,7 +292,7 @@ function defaultStatusForCode(code, error) {
 }
 
 function safeText(value, limit = 240) {
-  return String(value || "")
+  return redactSecretText(value, limit)
     .replaceAll("\r", " ")
     .replaceAll("\n", " ")
     .replace(/\s+/g, " ")

@@ -5,6 +5,8 @@ import {
   responseToolCallFromChat,
 } from "./tools.js";
 
+const APPLY_PATCH = "apply_patch";
+
 export function chatResponseToResponse(chat, requestedModel, toolContext, options = {}) {
   const choice = chat?.choices?.[0] || {};
   const message = choice.message || {};
@@ -78,6 +80,106 @@ export function chatResponseToResponse(chat, requestedModel, toolContext, option
     incomplete_details: null,
     usage: responseUsage(chat?.usage),
   };
+}
+
+export function returnedToolDiagnosticsFromChat(chat, toolContext = {}) {
+  const message = chat?.choices?.[0]?.message || {};
+  const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+  const namespaceNames = new Set();
+  const diagnostics = {
+    returnedToolCount: toolCalls.length,
+    runnableToolCount: 0,
+    suppressedToolCount: 0,
+    unknownToolCount: 0,
+    namespaceCount: 0,
+    namespaceNames: [],
+    hasNodeRepl: false,
+    hasCommandTool: false,
+    hasApplyPatch: false,
+  };
+
+  for (const toolCall of toolCalls) {
+    const chatName = chatToolCallName(toolCall);
+    const responseName = responseToolNameForChatCall(chatName, toolContext);
+    const namespace = namespaceForReturnedTool(responseName, toolContext);
+    if (namespace) {
+      namespaceNames.add(namespace);
+    }
+    if (isSuppressedToolCall(toolCall, toolContext)) {
+      diagnostics.suppressedToolCount += 1;
+    } else {
+      diagnostics.runnableToolCount += 1;
+    }
+    if (isUnknownChatToolCall(toolCall, toolContext)) {
+      diagnostics.unknownToolCount += 1;
+    }
+    if (responseName === APPLY_PATCH || chatName === APPLY_PATCH) {
+      diagnostics.hasApplyPatch = true;
+    }
+    if (responseName === "mcp__node_repl__js" || responseName.includes("node_repl")) {
+      diagnostics.hasNodeRepl = true;
+    }
+    if (isCommandToolName(responseName) || isCommandToolName(chatName)) {
+      diagnostics.hasCommandTool = true;
+    }
+  }
+
+  diagnostics.namespaceNames = [...namespaceNames].sort();
+  diagnostics.namespaceCount = diagnostics.namespaceNames.length;
+  return diagnostics;
+}
+
+export function returnedToolDiagnosticsLogFields(diagnostics = {}) {
+  const namespaceNames = Array.isArray(diagnostics.namespaceNames)
+    ? diagnostics.namespaceNames
+    : [];
+  return [
+    `returned_tools=${Number(diagnostics.returnedToolCount || 0)}`,
+    `runnable_tools=${Number(diagnostics.runnableToolCount || 0)}`,
+    `suppressed_tools=${Number(diagnostics.suppressedToolCount || 0)}`,
+    `unknown_tools=${Number(diagnostics.unknownToolCount || 0)}`,
+    `namespaces=${Number(diagnostics.namespaceCount || 0)}`,
+    `namespace_names=${safeToolDiagnosticsList(namespaceNames)}`,
+    `node_repl=${Boolean(diagnostics.hasNodeRepl)}`,
+    `command=${Boolean(diagnostics.hasCommandTool)}`,
+    `apply_patch=${Boolean(diagnostics.hasApplyPatch)}`,
+  ].join(" ");
+}
+
+function chatToolCallName(toolCall) {
+  return String(toolCall?.function?.name || toolCall?.name || "").trim();
+}
+
+function responseToolNameForChatCall(chatName, toolContext = {}) {
+  if (!chatName) {
+    return "";
+  }
+  return toolContext?.chatNameToResponseName?.get?.(chatName) || chatName;
+}
+
+function namespaceForReturnedTool(responseName, toolContext = {}) {
+  if (!responseName) {
+    return "";
+  }
+  const metadata = toolContext?.responseToolMetadata?.get?.(responseName);
+  if (metadata?.namespace) {
+    return metadata.namespace;
+  }
+  return namespacePrefixFromToolName(responseName);
+}
+
+function namespacePrefixFromToolName(name) {
+  const match = String(name || "").match(/^(mcp__[A-Za-z0-9_-]+__)/);
+  return match ? match[1] : "";
+}
+
+function safeToolDiagnosticsList(values = []) {
+  return values
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .filter((value) => /^[A-Za-z0-9_.:-]+$/.test(value))
+    .slice(0, 20)
+    .join(",") || "none";
 }
 
 function suppressedToolCallMessage(toolCall, toolContext, hasRunnableToolCall = false) {
@@ -321,6 +423,7 @@ export function responseToSse(response) {
         item,
       }),
     );
+    events.push(...toolCallArgumentSseEvents(item, outputIndex));
     events.push(
       sse("response.output_item.done", {
         type: "response.output_item.done",
@@ -338,6 +441,61 @@ export function responseToSse(response) {
   );
   events.push("data: [DONE]\n\n");
   return events.join("");
+}
+
+function toolCallArgumentSseEvents(item, outputIndex) {
+  if (!item || typeof item !== "object") {
+    return [];
+  }
+  if (item.type === "function_call") {
+    const argumentsText = toolPayloadText(item.arguments);
+    return [
+      sse("response.function_call_arguments.delta", {
+        type: "response.function_call_arguments.delta",
+        item_id: item.id,
+        output_index: outputIndex,
+        delta: argumentsText,
+      }),
+      sse("response.function_call_arguments.done", {
+        type: "response.function_call_arguments.done",
+        item_id: item.id,
+        output_index: outputIndex,
+        arguments: argumentsText,
+      }),
+    ];
+  }
+  if (item.type === "custom_tool_call") {
+    const inputText = toolPayloadText(item.input);
+    return [
+      sse("response.custom_tool_call_input.delta", {
+        type: "response.custom_tool_call_input.delta",
+        item_id: item.id,
+        output_index: outputIndex,
+        delta: inputText,
+      }),
+      sse("response.custom_tool_call_input.done", {
+        type: "response.custom_tool_call_input.done",
+        item_id: item.id,
+        output_index: outputIndex,
+        input: inputText,
+      }),
+    ];
+  }
+  return [];
+}
+
+function toolPayloadText(value) {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value == null) {
+    return "";
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 function responseUsage(usage = {}) {

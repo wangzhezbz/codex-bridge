@@ -51,10 +51,10 @@ Win 用户机器不需要安装 Node.js、npm 或 Electron。
 ### 应用内操作
 
 1. 在“概览”选择计费模式。大多数用户选择混合模式。
-2. 在“模型”页从内置模型池里选择最多 5 个模型。
-3. 如需接入新服务，在“模型”页添加自定义 OpenAI-compatible 模型。
-4. 在“密钥”页填写对应 Provider 的 API Key。
-5. 点击“更新 Codex 配置”，再打开 Router 开关。
+2. 在“模型”页选择要暴露给 Codex 的模型。
+3. 如需接入新服务，在“模型”页添加自定义 OpenAI-compatible 模型，或刷新服务商模型列表后再选择。
+4. 填写对应 Provider 的 API Key。
+5. 打开 Router 开关，CodexBridge 会自动刷新 Codex 配置。
 6. 打开或重启 Codex。
 
 GPT 订阅模型不需要在 CodexBridge 里填写 API Key。DeepSeek、Kimi、Qwen、OpenRouter 等 API 模型需要填写各自 Provider 的 API Key。

@@ -95,6 +95,41 @@ test("route health snapshot reports degraded routes and recovers after success",
   assert.equal(snapshot.routes[0].lastErrorType, "parameter_error");
 });
 
+test("route health redacts provider account identifiers from upstream errors", () => {
+  const store = createRouteHealthStore({
+    rateLimitStatus: () => ({
+      cooldownRemainingMs: 0,
+      nextAfterMs: 0,
+    }),
+  });
+  const route = {
+    id: "kimi-k2-code",
+    provider: "kimi",
+    api: "chat_completions",
+    model: "kimi-k2-code",
+  };
+
+  store.recordError(route, {
+    statusCode: 429,
+    bodyText: JSON.stringify({
+      error: {
+        message:
+          "Your account org-testfixtures000000000 / proj-testfixtures000000000 <ak-testfixtures000000000> request reached organization TPD rate limit",
+      },
+    }),
+  });
+  const snapshot = store.snapshot({ models: [route] });
+  const lastError = snapshot.routes[0].lastError;
+
+  assert.match(lastError, /TPD rate limit/);
+  assert.doesNotMatch(lastError, /ak-testfixtures000000000/);
+  assert.doesNotMatch(lastError, /org-testfixtures000000000/);
+  assert.doesNotMatch(lastError, /proj-testfixtures000000000/);
+  assert.match(lastError, /ak-\[REDACTED\]/);
+  assert.match(lastError, /org-\[REDACTED\]/);
+  assert.match(lastError, /proj-\[REDACTED\]/);
+});
+
 test("route health snapshot includes effective upstream proxy label", () => {
   const original = captureProxyEnv();
   process.env.CODEXBRIDGE_HTTPS_PROXY = "http://user:pass@127.0.0.1:7890";

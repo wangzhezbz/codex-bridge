@@ -19,6 +19,14 @@ export function buildToolContext(responseTools = [], options = {}) {
     chatNameToResponseName: new Map(),
     responseNameToChatName: new Map(),
     route: options.route || {},
+    diagnostics: {
+      requestedToolCount: 0,
+      suppressedToolCount: 0,
+      namespaceNames: new Set(),
+      hasNodeRepl: false,
+      hasCommandTool: false,
+      hasApplyPatch: false,
+    },
   };
 
   for (const tool of responseTools || []) {
@@ -27,6 +35,38 @@ export function buildToolContext(responseTools = [], options = {}) {
 
   sortChatTools(context);
   return context;
+}
+
+export function toolDiagnosticsFromContext(context, toolChoice = "") {
+  const namespaceNames = [...(context?.diagnostics?.namespaceNames || [])].sort();
+  return {
+    requestedToolCount: Number(context?.diagnostics?.requestedToolCount || 0),
+    chatToolCount: Number(context?.chatTools?.length || 0),
+    suppressedToolCount: Number(context?.diagnostics?.suppressedToolCount || 0),
+    namespaceCount: namespaceNames.length,
+    namespaceNames,
+    hasNodeRepl: Boolean(context?.diagnostics?.hasNodeRepl),
+    hasCommandTool: Boolean(context?.diagnostics?.hasCommandTool),
+    hasApplyPatch: Boolean(context?.diagnostics?.hasApplyPatch),
+    toolChoice: toolChoiceLogValue(toolChoice),
+  };
+}
+
+export function toolDiagnosticsLogFields(diagnostics = {}) {
+  const namespaceNames = Array.isArray(diagnostics.namespaceNames)
+    ? diagnostics.namespaceNames
+    : [];
+  return [
+    `tools=${Number(diagnostics.requestedToolCount || 0)}`,
+    `chat_tools=${Number(diagnostics.chatToolCount || 0)}`,
+    `suppressed=${Number(diagnostics.suppressedToolCount || 0)}`,
+    `namespaces=${Number(diagnostics.namespaceCount || 0)}`,
+    `namespace_names=${safeDiagnosticsList(namespaceNames)}`,
+    `node_repl=${Boolean(diagnostics.hasNodeRepl)}`,
+    `command=${Boolean(diagnostics.hasCommandTool)}`,
+    `apply_patch=${Boolean(diagnostics.hasApplyPatch)}`,
+    `tool_choice=${safeDiagnosticsValue(diagnostics.toolChoice || "none")}`,
+  ].join(" ");
 }
 
 export function responseToolCallFromChat(call, context) {
@@ -74,11 +114,11 @@ export function responseToolCallFromChat(call, context) {
     id: `fc_${stableSuffix(callId)}`,
     type: "function_call",
     call_id: callId,
-    name: metadata.namespace ? responseName : responseCallName,
+    name: responseCallName,
     arguments: stringifyJson(args),
     status: "completed",
   };
-  return metadata.namespace ? functionCall : withNamespace(metadata, functionCall);
+  return withNamespace(metadata, functionCall);
 }
 
 export function chatToolCallFromResponseItem(item, context) {
@@ -162,6 +202,9 @@ function appendResponseTool(context, tool, namespace = "") {
 
   if (tool.type === "namespace") {
     const nestedNamespace = namespaceToolPrefix(tool.name || namespace);
+    if (nestedNamespace) {
+      context.diagnostics.namespaceNames.add(nestedNamespace);
+    }
     for (const inner of tool.tools || []) {
       appendResponseTool(context, inner, nestedNamespace);
     }
@@ -171,6 +214,7 @@ function appendResponseTool(context, tool, namespace = "") {
   if (tool.type === "web_search" || tool.type === "web_search_preview") {
     return;
   }
+  noteRequestedTool(context, tool, namespace);
 
   if (tool.type === "tool_search") {
     const name = namespacedToolName(tool.name || "tool_search", namespace);
@@ -228,6 +272,7 @@ function appendResponseTool(context, tool, namespace = "") {
   }
   const responseName = namespacedToolName(fn.name, namespace);
   if (shouldSuppressChatTool(context, responseName, tool)) {
+    context.diagnostics.suppressedToolCount += 1;
     return;
   }
   const chatName = chatNameForResponseName(context, responseName);
@@ -246,6 +291,45 @@ function appendResponseTool(context, tool, namespace = "") {
       }),
     },
   });
+}
+
+function noteRequestedTool(context, tool, namespace = "") {
+  context.diagnostics.requestedToolCount += 1;
+  const name = namespacedToolName(requestedToolName(tool), namespace);
+  if (name === APPLY_PATCH) {
+    context.diagnostics.hasApplyPatch = true;
+  }
+  if (name === "mcp__node_repl__js" || name.includes("node_repl")) {
+    context.diagnostics.hasNodeRepl = true;
+  }
+  if (isCommandToolName(name)) {
+    context.diagnostics.hasCommandTool = true;
+  }
+}
+
+function requestedToolName(tool = {}) {
+  if (tool.type === "custom") {
+    return tool.name || "custom_tool";
+  }
+  if (tool.type === "tool_search") {
+    return tool.name || "tool_search";
+  }
+  if (tool.type === "computer_use") {
+    return tool.name || "computer_use";
+  }
+  const fn = normalizeFunctionTool(tool);
+  return fn?.name || tool.name || tool.type || "tool";
+}
+
+function isCommandToolName(name) {
+  return (
+    name === "shell_command" ||
+    name === "exec_command" ||
+    name === "execute_command" ||
+    name.endsWith("__shell_command") ||
+    name.endsWith("__exec_command") ||
+    name.endsWith("__execute_command")
+  );
 }
 
 function shouldSuppressChatTool(context, responseName, tool = {}) {
@@ -509,6 +593,31 @@ function customToolDescription(name, description = "") {
     "Call this function with input set to the exact patch text.",
     "The input must not be JSON inside the string; it must start with *** Begin Patch.",
   ].join(" ");
+}
+
+function toolChoiceLogValue(toolChoice) {
+  if (!toolChoice) {
+    return "none";
+  }
+  if (typeof toolChoice === "string") {
+    return toolChoice;
+  }
+  const name = toolChoice.function?.name || toolChoice.name || "";
+  return name ? `function:${name}` : "object";
+}
+
+function safeDiagnosticsList(values) {
+  const safeValues = values
+    .map((value) => safeDiagnosticsValue(value))
+    .filter(Boolean)
+    .slice(0, 12);
+  return safeValues.length ? safeValues.join(",") : "-";
+}
+
+function safeDiagnosticsValue(value) {
+  return String(value || "")
+    .replace(/[^A-Za-z0-9_.:-]/g, "_")
+    .slice(0, 160);
 }
 
 function stableSuffix(value) {

@@ -104,6 +104,51 @@ test("desktop update completion uses in-app notification instead of a native mes
   assert.doesNotMatch(main, /dialog\.showMessageBox\(mainWindow/);
 });
 
+test("desktop cleans old managed update artifacts on startup while keeping the latest package", () => {
+  const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
+
+  assert.match(main, /cleanupUpdateArtifactsOnStartup/);
+  assert.match(main, /cleanupManagedUpdateArtifacts\?\.\(portableUpdatesDir\(\),\s*\{\s*keepPackages:\s*1\s*\}\)/);
+  assert.match(main, /prepareInstallerUpdate/);
+  assert.match(main, /keepPackages:\s*1/);
+});
+
+test("desktop empty usage summary includes fresh and cache token fields", () => {
+  const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
+
+  assert.match(main, /freshPromptTokens:\s*0/);
+  assert.match(main, /cacheReadTokens:\s*0/);
+  assert.match(main, /cacheCreationTokens:\s*0/);
+});
+
+test("desktop restart finds Codex across common install locations and shortcuts", () => {
+  const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
+
+  assert.match(main, /async function codexDesktopLaunchCandidates/);
+  assert.match(main, /codexDesktopShortcutTargets/);
+  assert.match(main, /resolveWindowsShortcutTarget/);
+  assert.match(main, /where\.exe/);
+  assert.match(main, /CODEX_DESKTOP_EXE/);
+  assert.match(main, /settings\.loadDesktopOptions\(dataRootDir\)/);
+  assert.match(main, /desktopOptions\?\.codexDesktopExe/);
+  assert.match(main, /desktopOptions\?\.codexDesktopLaunchTarget/);
+  assert.match(main, /codex:select-exe/);
+  assert.match(main, /Choose Codex\.exe or shortcut/);
+  assert.match(main, /findCodexDesktopShortcuts/);
+  assert.match(main, /launchCodexDesktopTarget/);
+  assert.match(main, /explorer\.exe/);
+});
+
+test("desktop router watchdog restarts crashed routers unless the user stopped it", () => {
+  const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
+
+  assert.match(main, /ROUTER_RESTART_MAX_ATTEMPTS/);
+  assert.match(main, /scheduleRouterRestart\(code\)/);
+  assert.match(main, /routerStopRequested/);
+  assert.match(main, /options\.watchdog/);
+  assert.match(main, /ROUTER_RESTART_MAX_DELAY_MS/);
+});
+
 test("desktop opens local folders only after ensuring they exist", () => {
   const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
 
@@ -140,6 +185,10 @@ test("Windows release archive uses formal portable package naming", () => {
   assert.match(packager, /CODEXBRIDGE_RELEASE_VERSION/);
   assert.match(packager, /CodexBridge-Windows-x64-Portable-/);
   assert.match(packager, /codexbridge-icon\.ico/);
+  assert.match(packager, /\^\\\/\\\.agents/);
+  assert.match(packager, /\^\\\/\\\.codex/);
+  assert.match(packager, /\^\\\/\\\.superpowers/);
+  assert.match(packager, /\^\\\/\\\.tmp/);
 });
 
 test("Windows installer script installs a versioned app and does not batch-delete", () => {
@@ -179,6 +228,10 @@ test("macOS release archives use formal x64 and arm64 package naming", () => {
   assert.match(packager, /platform:\s*"darwin"/);
   assert.match(packager, /CodexBridge-macOS-\$\{targetArch\}-Portable-/);
   assert.match(packager, /codexbridge-icon\.icns/);
+  assert.match(packager, /\^\\\/\\\.agents/);
+  assert.match(packager, /\^\\\/\\\.codex/);
+  assert.match(packager, /\^\\\/\\\.superpowers/);
+  assert.match(packager, /\^\\\/\\\.tmp/);
 });
 
 test("macOS release archives are extracted and checked for Electron Framework", () => {
@@ -223,6 +276,16 @@ test("desktop close button hides to tray instead of quitting", () => {
   assert.match(main, /event\.preventDefault\(\)/);
   assert.match(main, /mainWindow\.hide\(\)/);
   assert.match(main, /退出 CodexBridge|Quit CodexBridge/);
+});
+
+test("desktop tray exposes quick router, Codex, logs, and profile actions", () => {
+  const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
+
+  assert.match(main, /function refreshTrayMenu/);
+  assert.match(main, /Router/);
+  assert.match(main, /Codex/);
+  assert.match(main, /ui:navigate/);
+  assert.match(main, /profiles:apply/);
 });
 
 test("router checks include the route fidelity regression suite", () => {

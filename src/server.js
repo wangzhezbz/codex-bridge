@@ -213,7 +213,7 @@ export function createRouterServer(config = loadConfig()) {
             res,
             401,
             openAiError(
-              "CodexBridge Router token mismatch. 请在 CodexBridge 点“更新 Codex 配置”，关闭并重新启动 Router，然后重试。",
+              "CodexBridge Router token mismatch. 请在 CodexBridge 关闭并重新开启 Router，配置会自动刷新，然后重试。",
               401,
               "invalid_router_token",
             ),

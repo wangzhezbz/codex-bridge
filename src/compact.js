@@ -49,7 +49,9 @@ export function buildCompactChatRequest(requestBody, route, history) {
   delete converted.body.tools;
   delete converted.body.tool_choice;
   delete converted.body.parallel_tool_calls;
-  converted.body.messages = trimMessagesToCompactBudget(converted.body.messages || []);
+  converted.body.messages = flattenCompactToolProtocolMessages(
+    trimMessagesToCompactBudget(converted.body.messages || []),
+  );
   return converted;
 }
 
@@ -243,6 +245,63 @@ function shortenCompactMessage(message) {
     result.name = message.name;
   }
   return result;
+}
+
+function flattenCompactToolProtocolMessages(messages) {
+  const result = [];
+  for (const message of messages) {
+    if (hasCompactToolCalls(message)) {
+      const assistantText = contentToText(message.content).trim();
+      if (assistantText) {
+        result.push({
+          role: "assistant",
+          content: assistantText,
+        });
+      }
+      const toolCallText = compactToolCallsText(message.tool_calls);
+      if (toolCallText) {
+        result.push({
+          role: "system",
+          content:
+            "CodexBridge compacted historical assistant tool calls so the summary request " +
+            "can use them as context without replaying native tool calls.\n\n" +
+            toolCallText,
+        });
+      }
+      continue;
+    }
+
+    if (message?.role === "tool") {
+      result.push(shortenCompactMessage(message));
+      continue;
+    }
+
+    result.push(message);
+  }
+  return result;
+}
+
+function hasCompactToolCalls(message) {
+  return (
+    message?.role === "assistant" &&
+    Array.isArray(message.tool_calls) &&
+    message.tool_calls.length > 0
+  );
+}
+
+function compactToolCallsText(toolCalls = []) {
+  const lines = [];
+  for (const toolCall of toolCalls) {
+    const id = toolCall?.id || toolCall?.call_id || "unknown_call";
+    const name = toolCall?.function?.name || toolCall?.name || toolCall?.type || "tool";
+    const args = toolCall?.function?.arguments ?? toolCall?.arguments ?? "";
+    const argsText = safeCompactText(
+      typeof args === "string" ? args : JSON.stringify(args || {}),
+      COMPACT_MESSAGE_MAX_CHARS,
+    );
+    lines.push(`Tool call ${id}: ${name}${argsText ? `\nArguments: ${argsText}` : ""}`);
+  }
+  return lines.join("\n\n");
 }
 
 function trimNotice() {

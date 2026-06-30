@@ -48,6 +48,10 @@ const appPaths = await packager({
   ignore: [
     /^\/\.git(?:\/|$)/,
     /^\/\.github(?:\/|$)/,
+    /^\/\.agents(?:\/|$)/,
+    /^\/\.codex(?:\/|$)/,
+    /^\/\.superpowers(?:\/|$)/,
+    /^\/\.tmp(?:\/|$)/,
     /^\/\.tmp-electron-packager(?:\/|$)/,
     /^\/AGENTS\.md$/,
     /^\/Start-CodexBridge\.cmd$/,

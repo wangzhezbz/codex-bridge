@@ -9,22 +9,32 @@ import {
   MODE_HYBRID,
   MODEL_PRESETS,
   applyCodexConfig,
+  buildStartupCheck,
   buildRouterConfigFromSelection,
   buildCodexToml,
   detectModeFromConfig,
   ensureRouterConfig,
+  exportCodexSessionMarkdown,
+  listCodexBackups,
+  listCodexResources,
+  listCodexSessions,
+  loadConfigProfiles,
   loadDesktopOptions,
   modelCatalog,
+  modelDirectoryPath,
   providerCatalog,
   prepareRouterStartConfig,
   readModelCapabilityOverrides,
   readModelDirectory,
   readRouterConfig,
   readCustomModels,
+  readProviderOverrides,
   refreshProviderModelDirectory,
   recoverCodexHistoryAccess,
   removeCustomModel,
+  resetModelCapabilityOverride,
   restoreCodexConfig,
+  restoreCodexConfigFromBackup,
   routerConfigPath,
   routerConfigDiagnostics,
   routerRuntimeEnv,
@@ -33,12 +43,16 @@ import {
   saveModelCapabilityOverride,
   saveModelImageGenerationOverride,
   saveCustomModel,
+  saveConfigProfile,
   saveDesktopOptions,
+  saveProviderLogo,
+  saveProviderOverride,
   saveSelection,
   saveSecrets,
   secretValue,
   secretStatus,
   supportDiagnostics,
+  testProviderConnection,
   syncCodexBridgeConversationProviders,
   writeRouterConfigFromSelection,
 } from "../desktop/settings.mjs";
@@ -55,20 +69,37 @@ test("detectModeFromConfig distinguishes all-api and hybrid", () => {
 
 test("buildCodexToml uses built-in OpenAI provider in all-api mode", () => {
   const rootDir = path.join(os.tmpdir(), "codex-bridge-router");
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
   const toml = buildCodexToml({
     rootDir,
     mode: MODE_ALL_API,
     port: 15722,
+    homeDir,
   });
+  const catalogFile = toFixtureTomlPath(path.join(homeDir, ".codex", "codexbridge-model-catalog.json"));
 
-  const expectedCatalogPath = path.resolve(rootDir, "model-catalog.json").replaceAll("\\", "/");
   assert.match(toml, /model_provider = "openai"/);
   assert.match(toml, /openai_base_url = "http:\/\/127\.0\.0\.1:15722\/v1"/);
   assert.doesNotMatch(toml, /experimental_bearer_token/);
   assert.doesNotMatch(toml, /requires_openai_auth/);
   assert.doesNotMatch(toml, /supports_websockets/);
   assert.doesNotMatch(toml, /\[model_providers\.codex-bridge]/);
-  assert.match(toml, new RegExp(`model_catalog_json = "${escapeRegExp(expectedCatalogPath)}"`));
+  assert.match(toml, new RegExp(`model_catalog_json = "${escapeRegExp(catalogFile)}"`));
+});
+
+test("buildCodexToml points Codex at an absolute catalog file", () => {
+  const rootDir = path.join(os.tmpdir(), "codex-bridge-router");
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
+  const toml = buildCodexToml({
+    rootDir,
+    mode: MODE_HYBRID,
+    port: 15722,
+    homeDir,
+  });
+  const catalogFile = toFixtureTomlPath(path.join(homeDir, ".codex", "codexbridge-model-catalog.json"));
+
+  assert.match(toml, new RegExp(`model_catalog_json = "${escapeRegExp(catalogFile)}"`));
+  assert.doesNotMatch(toml, new RegExp(escapeRegExp(path.resolve(rootDir))));
 });
 
 test("buildCodexToml wraps CodexBridge-owned settings in managed markers", () => {
@@ -253,6 +284,36 @@ test("desktop options persist proxy bypass setting", () => {
   assert.equal(loadDesktopOptions(rootDir).bypassSystemProxy, true);
 });
 
+test("desktop options persist router port without clobbering partial updates", () => {
+  const rootDir = makeTempProject();
+
+  assert.equal(loadDesktopOptions(rootDir).routerPort, 15722);
+  const saved = saveDesktopOptions(rootDir, {
+    bypassSystemProxy: true,
+    routerPort: 15999,
+    codexDesktopExe: " C:\\Tools\\Codex\\Codex.exe ",
+    codexDesktopLaunchTarget: " C:\\Users\\User\\Desktop\\Codex.lnk ",
+  });
+
+  assert.equal(saved.bypassSystemProxy, true);
+  assert.equal(saved.routerPort, 15999);
+  assert.equal(saved.codexDesktopExe, "C:\\Tools\\Codex\\Codex.exe");
+  assert.equal(saved.codexDesktopLaunchTarget, "C:\\Users\\User\\Desktop\\Codex.lnk");
+  const partial = saveDesktopOptions(rootDir, { bypassSystemProxy: false });
+  assert.equal(partial.bypassSystemProxy, false);
+  assert.equal(partial.routerPort, 15999);
+  assert.equal(partial.codexDesktopExe, "C:\\Tools\\Codex\\Codex.exe");
+  assert.equal(partial.codexDesktopLaunchTarget, "C:\\Users\\User\\Desktop\\Codex.lnk");
+});
+
+test("router config uses the configured desktop router port", () => {
+  const rootDir = makeTempProject();
+  saveDesktopOptions(rootDir, { routerPort: 15999 });
+  const config = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
+
+  assert.equal(config.port, 15999);
+});
+
 test("routerRuntimeEnv disables system proxy when desktop option is enabled", () => {
   const rootDir = makeTempProject();
   saveDesktopOptions(rootDir, { bypassSystemProxy: true });
@@ -320,6 +381,7 @@ test("supportDiagnostics redacts keys and summarizes current config", () => {
       "[10:00:00] access POST /v1/responses host=localhost:15722 ua=Codex",
       "[10:00:01] req_a1234567 !! upstream route=gpt-5.2 status=502 error=fetch failed cause=UND_ERR_CONNECT_TIMEOUT",
       "[10:00:02] authorization=Bearer sk-sensitive-token",
+      "[10:00:03] req_kimi !! compact-local-fallback route=cb-kimi-k2-7-code reason=Your account org-testfixtures000000000 / proj-testfixtures000000000 <ak-testfixtures000000000> request reached organization TPD rate limit",
     ],
     homeDir,
   });
@@ -344,6 +406,12 @@ test("supportDiagnostics redacts keys and summarizes current config", () => {
   assert.doesNotMatch(diagnostics.text, /sk-sensitive-token/);
   assert.doesNotMatch(diagnostics.text, /user:pass/);
   assert.doesNotMatch(diagnostics.text, /secret-token-123456/);
+  assert.doesNotMatch(diagnostics.text, /ak-testfixtures000000000/);
+  assert.doesNotMatch(diagnostics.text, /org-testfixtures000000000/);
+  assert.doesNotMatch(diagnostics.text, /proj-testfixtures000000000/);
+  assert.match(diagnostics.text, /ak-\[REDACTED\]/);
+  assert.match(diagnostics.text, /org-\[REDACTED\]/);
+  assert.match(diagnostics.text, /proj-\[REDACTED\]/);
   assert.match(diagnostics.text, /api\.moonshot\.cn/);
 });
 
@@ -420,7 +488,10 @@ test("supportDiagnostics includes route health, usage, proxy, and update paths w
         },
       ],
     },
-    logs: [],
+    logs: [
+      "[2026-06-29T10:00:00.000Z] req_tool123 tool_diag route=deepseek-v4-pro mode=chat-compat tools=3 chat_tools=2 suppressed=1 namespaces=2 namespace_names=mcp__figma__,mcp__node_repl__ node_repl=true command=false apply_patch=true tool_choice=auto sk-tool-secret",
+      "[2026-06-29T10:00:01.000Z] req_tool456 tool_return_diag route=deepseek-v4-pro mode=chat-compat returned_tools=2 runnable_tools=1 suppressed_tools=1 unknown_tools=1 namespaces=1 namespace_names=mcp__figma__ node_repl=false command=false apply_patch=false sk-return-secret",
+    ],
     homeDir,
   });
 
@@ -439,12 +510,19 @@ test("supportDiagnostics includes route health, usage, proxy, and update paths w
   assert.match(diagnostics.text, /NO_PROXY: set localhost,127\.0\.0\.1/);
   assert.match(diagnostics.text, /Update diagnostics/);
   assert.match(diagnostics.text, new RegExp(escapeRegExp(updateDir)));
+  assert.match(diagnostics.text, /Recent tool diagnostics/);
+  assert.match(diagnostics.text, /tool_diag route=deepseek-v4-pro/);
+  assert.match(diagnostics.text, /tool_return_diag route=deepseek-v4-pro/);
+  assert.match(diagnostics.text, /namespace_names=mcp__figma__,mcp__node_repl__/);
+  assert.match(diagnostics.text, /unknown_tools=1/);
   assert.equal(diagnostics.summary.unhealthyRoutes, 1);
   assert.equal(diagnostics.summary.usage.totalCalls, 2);
   assert.equal(diagnostics.summary.proxy.HTTPS_PROXY, "set");
   assert.doesNotMatch(diagnostics.text, /user:pass/);
   assert.doesNotMatch(diagnostics.text, /sk-sensitive-token/);
   assert.doesNotMatch(diagnostics.text, /sk-usage-secret/);
+  assert.doesNotMatch(diagnostics.text, /sk-tool-secret/);
+  assert.doesNotMatch(diagnostics.text, /sk-return-secret/);
 });
 
 test("supportDiagnostics reports effective upstream proxy per selected route", () => {
@@ -526,6 +604,484 @@ test("supportDiagnostics effective upstream proxy honors system proxy bypass", (
   assert.match(diagnostics.text, /gpt-5\.5: direct/);
   assert.equal(diagnostics.summary.effectiveProxyRoutes.direct, 1);
   assert.equal(diagnostics.summary.effectiveProxyRoutes.proxied, 0);
+});
+
+test("startup check summarizes Codex, router, catalog, keys, proxy, and backups", () => {
+  const rootDir = makeTempProject();
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
+  const codexDir = path.join(homeDir, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  fs.writeFileSync(path.join(codexDir, "config.toml"), 'model = "gpt-5.5"\n', "utf8");
+  fs.writeFileSync(path.join(codexDir, "config.toml.codexbridge.2026-07-01-010101000.bak"), 'model = "old"\n', "utf8");
+  saveSecrets(rootDir, { DEEPSEEK_API_KEY: "deepseek-key" });
+  saveDesktopOptions(rootDir, { routerPort: 15999, codexDesktopExe: "C:\\Tools\\Codex\\Codex.exe" });
+
+  const check = buildStartupCheck(rootDir, {
+    homeDir,
+    appVersion: "0.1.200",
+    routerRunning: false,
+    lastHealth: null,
+    config: {
+      port: 15999,
+      models: [
+        {
+          id: "deepseek",
+          displayName: "DeepSeek",
+          api: "chat_completions",
+          baseUrl: "https://api.deepseek.com/v1",
+          model: "deepseek-v4",
+          authMode: "api_key",
+          apiKeyEnv: "DEEPSEEK_API_KEY",
+        },
+      ],
+    },
+    proxyEnv: { HTTPS_PROXY: "http://127.0.0.1:7890" },
+    platform: "win32",
+  });
+
+  assert.equal(check.summary.ok, false);
+  assert.equal(check.summary.pass, 5);
+  assert.equal(check.summary.warn, 1);
+  assert.equal(check.summary.fail, 1);
+  assert.equal(check.items.find((item) => item.id === "codex_config").status, "pass");
+  assert.equal(check.items.find((item) => item.id === "router").status, "warn");
+  assert.equal(check.items.find((item) => item.id === "api_keys").status, "pass");
+  assert.equal(check.items.find((item) => item.id === "codex_desktop").status, "fail");
+  assert.match(check.items.find((item) => item.id === "proxy").detail, /HTTPS_PROXY/);
+  assert.equal(check.items.find((item) => item.id === "backups").count, 1);
+  assert.equal(check.items.find((item) => item.id === "codex_config").label, "Codex 配置");
+  assert.equal(check.items.find((item) => item.id === "model_catalog").label, "模型目录");
+  assert.equal(check.items.find((item) => item.id === "api_keys").label, "API Key");
+  assert.doesNotMatch(JSON.stringify(check.items), /Model catalog|Start Router|No proxy environment/i);
+});
+
+test("config profiles save and load model selections and desktop options", () => {
+  const rootDir = makeTempProject();
+  saveSelection(rootDir, ["gpt-5.5", "deepseek-v4-pro"], MODE_HYBRID);
+  saveDesktopOptions(rootDir, { routerPort: 15988, bypassSystemProxy: true });
+
+  const saved = saveConfigProfile(rootDir, {
+    name: "Domestic API",
+    mode: MODE_HYBRID,
+    selectedModelIds: ["deepseek-v4-pro"],
+    desktopOptions: { routerPort: 15988, bypassSystemProxy: true },
+  });
+  const profiles = loadConfigProfiles(rootDir);
+
+  assert.equal(saved.id, "domestic-api");
+  assert.equal(profiles.length, 1);
+  assert.deepEqual(profiles[0].selectedModelIds, ["deepseek-v4-pro"]);
+  assert.equal(profiles[0].desktopOptions.routerPort, 15988);
+  assert.equal(profiles[0].desktopOptions.bypassSystemProxy, true);
+
+  const renamed = saveConfigProfile(rootDir, {
+    ...profiles[0],
+    name: "国内模型常用配置",
+  });
+  assert.equal(renamed.id, "domestic-api");
+  assert.equal(loadConfigProfiles(rootDir)[0].name, "国内模型常用配置");
+});
+
+test("backup center lists and restores a selected Codex config backup", () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
+  const codexDir = path.join(homeDir, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  const target = path.join(codexDir, "config.toml");
+  const backup = path.join(codexDir, "config.toml.codexbridge.2026-07-01-010101000.bak");
+  fs.writeFileSync(target, 'model = "current"\n', "utf8");
+  fs.writeFileSync(backup, 'model = "backup"\n', "utf8");
+
+  const backups = listCodexBackups({ homeDir });
+  assert.equal(backups.length, 1);
+  assert.equal(backups[0].fullPath, backup);
+  assert.equal(backups[0].kind, "codexbridge");
+
+  const restored = restoreCodexConfigFromBackup(backup, { homeDir });
+  assert.equal(restored.backup, backup);
+  assert.ok(restored.currentBackup);
+  assert.equal(fs.readFileSync(target, "utf8"), 'model = "backup"\n');
+});
+
+test("resource center lists MCP, plugins, skills, prompts, and AGENTS files", () => {
+  const rootDir = makeTempProject();
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
+  fs.mkdirSync(path.join(homeDir, ".codex", "skills", "demo"), { recursive: true });
+  fs.mkdirSync(path.join(homeDir, ".agents", "skills", "agent-demo"), { recursive: true });
+  fs.mkdirSync(
+    path.join(homeDir, ".codex", "plugins", "cache", "openai-curated-remote", "github", "0.1.5", "skills", "gh-fix-ci"),
+    { recursive: true },
+  );
+  fs.mkdirSync(
+    path.join(homeDir, ".codex", "plugins", "cache", "personal", "cowart", "0.1.3", "skills", "cowart-open-canvas"),
+    { recursive: true },
+  );
+  fs.mkdirSync(path.join(homeDir, ".codex", "prompts"), { recursive: true });
+  fs.mkdirSync(path.join(rootDir, ".codex", "prompts"), { recursive: true });
+  fs.writeFileSync(path.join(homeDir, ".codex", "skills", "demo", "SKILL.md"), "# Demo\n", "utf8");
+  fs.writeFileSync(path.join(homeDir, ".agents", "skills", "agent-demo", "SKILL.md"), "# Agent Demo\n", "utf8");
+  fs.writeFileSync(
+    path.join(homeDir, ".codex", "plugins", "cache", "openai-curated-remote", "github", "0.1.5", ".codex-plugin.json"),
+    JSON.stringify({ name: "github", displayName: "GitHub", version: "0.1.5" }),
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(homeDir, ".codex", "plugins", "cache", "openai-curated-remote", "github", "0.1.5", "skills", "gh-fix-ci", "SKILL.md"),
+    "# GH Fix CI\n",
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(homeDir, ".codex", "plugins", "cache", "personal", "cowart", "0.1.3", ".codex-plugin.json"),
+    JSON.stringify({ name: "cowart", version: "0.1.3" }),
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(homeDir, ".codex", "plugins", "cache", "personal", "cowart", "0.1.3", "skills", "cowart-open-canvas", "SKILL.md"),
+    "# Cowart Open Canvas\n",
+    "utf8",
+  );
+  fs.writeFileSync(path.join(homeDir, ".codex", "prompts", "ship.md"), "Ship it\n", "utf8");
+  fs.writeFileSync(path.join(rootDir, ".codex", "prompts", "project.md"), "Project prompt\n", "utf8");
+  fs.writeFileSync(
+    path.join(homeDir, ".codex", "config.toml"),
+    [
+      '[mcp_servers.node_repl]',
+      'command = "C:/Codex/node_repl.exe"',
+      "",
+      '[mcp_servers.node_repl.env]',
+      'NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS = "1000"',
+      "",
+      '[mcp_servers.disabled_server]',
+      'command = "C:/Codex/disabled.exe"',
+      "enabled = false",
+      "",
+      '[plugins."browser@openai-bundled"]',
+      "enabled = true",
+      "",
+      '[plugins."disabled@personal"]',
+      "enabled = false",
+      "",
+      '[plugins."browser@openai-bundled".mcp_servers.browser]',
+      "enabled = true",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  fs.writeFileSync(path.join(rootDir, "AGENTS.md"), "agent rules\n", "utf8");
+
+  const resources = listCodexResources({ rootDir, homeDir });
+
+  assert.equal(resources.summary.mcpServers, 1);
+  assert.equal(resources.summary.plugins, 1);
+  assert.equal(resources.summary.skills, 1);
+  assert.equal(resources.summary.prompts, 2);
+  assert.equal(resources.summary.agentFiles, 1);
+  assert.equal(resources.mcpServers[0].name, "node_repl");
+  assert.equal(resources.mcpServers.some((item) => item.name === "node_repl.env"), false);
+  assert.equal(resources.mcpServers.some((item) => item.name === "disabled_server"), false);
+  assert.equal(resources.plugins[0].id, "github@openai-curated-remote");
+  assert.equal(resources.plugins[0].name, "GitHub");
+  assert.equal(resources.plugins.some((item) => item.id === "browser@openai-bundled"), false);
+  assert.equal(resources.plugins.some((item) => item.id === "cowart@personal"), false);
+  assert.equal(resources.discovered.plugins.some((item) => item.id === "browser@openai-bundled" && item.availability === "internal"), true);
+  assert.equal(resources.discovered.plugins.some((item) => item.id === "cowart@personal" && item.availability === "cached"), true);
+  assert.equal(resources.discovered.plugins.some((item) => item.id === "disabled@personal" && item.availability === "disabled"), true);
+  assert.equal(resources.skills[0].name, "demo");
+  assert.equal(resources.skills.some((item) => item.name === "agent-demo" && item.source === "agents"), false);
+  assert.equal(resources.skills.some((item) => item.name === "gh-fix-ci" && item.source === "plugin"), false);
+  assert.ok(resources.discovered.skills.some((item) => item.name === "agent-demo" && item.availability === "local"));
+  assert.ok(resources.discovered.skills.some((item) => item.name === "gh-fix-ci" && item.availability === "plugin"));
+  assert.ok(resources.discovered.skills.some((item) => item.name === "cowart-open-canvas" && item.availability === "cached"));
+  assert.equal(resources.prompts[0].name, "ship.md");
+});
+
+test("session center lists Codex sessions and exports a markdown handoff", () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
+  const codexDir = path.join(homeDir, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  const dbPath = createCodexStateDbWithMetadata(codexDir, [
+    {
+      id: "thread_alpha",
+      modelProvider: "openai",
+      model: "gpt-5.5",
+      title: "Alpha Session",
+      source: "vscode",
+      threadSource: "user",
+      archived: 0,
+      hasUserEvent: 1,
+      firstUserMessage: "hello alpha",
+    },
+  ]);
+
+  const sessions = listCodexSessions({ homeDir });
+  assert.equal(sessions.length, 1);
+  assert.equal(sessions[0].id, "thread_alpha");
+  assert.equal(sessions[0].title, "Alpha Session");
+  assert.equal(sessions[0].modelProvider, "openai");
+
+  const exported = exportCodexSessionMarkdown("thread_alpha", { homeDir });
+  assert.match(exported.markdown, /# Alpha Session/);
+  assert.match(exported.markdown, /thread_alpha/);
+  assert.match(exported.markdown, /hello alpha/);
+  assert.equal(exported.databasePath, dbPath);
+});
+
+test("session center surfaces project/workspace information", () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
+  const codexDir = path.join(homeDir, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(codexDir, ".codex-global-state.json"),
+    JSON.stringify({ "electron-saved-workspace-roots": ["F:/game_code/router"] }),
+    "utf8",
+  );
+  const dbPath = path.join(codexDir, "state_5.sqlite");
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec(
+      [
+        "CREATE TABLE threads (",
+        "id TEXT PRIMARY KEY,",
+        "model_provider TEXT,",
+        "model TEXT,",
+        "title TEXT,",
+        "source TEXT,",
+        "thread_source TEXT,",
+        "project TEXT,",
+        "cwd TEXT,",
+        "first_user_message TEXT",
+        ")",
+      ].join(" "),
+    );
+    db.prepare(
+      "INSERT INTO threads (id, model_provider, model, title, source, thread_source, project, cwd, first_user_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(
+      "thread_project",
+      "openai",
+      "gpt-5.5",
+      "Project Session",
+      "desktop",
+      "user",
+      "router",
+      "F:/game_code/router",
+      "fix project session",
+    );
+  } finally {
+    db.close();
+  }
+
+  const sessions = listCodexSessions({ homeDir });
+  assert.equal(sessions[0].project, "router");
+  assert.equal(sessions[0].projectPath, "F:/game_code/router");
+  assert.equal(sessions[0].workspacePath, "F:/game_code/router");
+
+  const exported = exportCodexSessionMarkdown("thread_project", { homeDir });
+  assert.match(exported.markdown, /Project: router/);
+  assert.match(exported.markdown, /Project path: F:\/game_code\/router/);
+  assert.match(exported.markdown, /Workspace path: F:\/game_code\/router/);
+});
+
+test("session center uses Codex workspace roots instead of treating every cwd as a project", () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
+  const codexDir = path.join(homeDir, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(codexDir, ".codex-global-state.json"),
+    JSON.stringify({
+      "electron-saved-workspace-roots": ["C:/Users/Administrator/Documents/aaa"],
+      "projectless-thread-ids": ["thread_projectless_inside_root"],
+    }),
+    "utf8",
+  );
+  createCodexStateDbWithMetadata(codexDir, [
+    {
+      id: "thread_project",
+      modelProvider: "openai",
+      title: "Project Session",
+      source: "vscode",
+      threadSource: "user",
+      cwd: "C:/Users/Administrator/Documents/aaa",
+      firstUserMessage: "inside project",
+      recencyAtMs: 30,
+    },
+    {
+      id: "thread_projectless_inside_root",
+      modelProvider: "openai",
+      title: "Projectless Inside Root",
+      source: "vscode",
+      threadSource: "user",
+      cwd: "C:/Users/Administrator/Documents/aaa",
+      firstUserMessage: "ordinary chat opened from aaa",
+      recencyAtMs: 20,
+    },
+    {
+      id: "thread_projectless_codex_folder",
+      modelProvider: "openai",
+      title: "Projectless Codex Folder",
+      source: "vscode",
+      threadSource: "user",
+      cwd: "C:/Users/Administrator/Documents/Codex/2026-07/new-chat-1",
+      firstUserMessage: "ordinary chat",
+      recencyAtMs: 10,
+    },
+  ]);
+
+  const sessions = listCodexSessions({ homeDir, limit: 50 });
+
+  assert.deepEqual(sessions.map((item) => item.id), [
+    "thread_project",
+    "thread_projectless_inside_root",
+    "thread_projectless_codex_folder",
+  ]);
+  assert.equal(sessions[0].project, "aaa");
+  assert.equal(sessions[0].projectPath, "C:/Users/Administrator/Documents/aaa");
+  assert.equal(sessions[1].project, "");
+  assert.equal(sessions[1].projectPath, "");
+  assert.equal(sessions[1].workspacePath, "C:/Users/Administrator/Documents/aaa");
+  assert.equal(sessions[2].project, "");
+  assert.equal(sessions[2].projectPath, "");
+  assert.equal(sessions[2].workspacePath, "C:/Users/Administrator/Documents/Codex/2026-07/new-chat-1");
+});
+
+test("session center prefers Codex local thread catalog over stale history rows", () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
+  const codexDir = path.join(homeDir, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(codexDir, ".codex-global-state.json"),
+    JSON.stringify({ "electron-saved-workspace-roots": ["F:/game_code/router"] }),
+    "utf8",
+  );
+  createCodexThreadCatalogDb(codexDir, [
+    {
+      id: "thread_catalog",
+      title: "Catalog Session",
+      cwd: "F:/game_code/router",
+      sourceKind: "vscode",
+      modelProvider: "openai",
+      updatedAt: 200,
+    },
+  ]);
+  createCodexStateDbWithMetadata(codexDir, [
+    {
+      id: "thread_stale_state_only",
+      modelProvider: "openai",
+      title: "Stale State Only",
+      source: "vscode",
+      threadSource: "user",
+      cwd: "F:/game_code/router",
+      firstUserMessage: "not in sidebar catalog",
+      recencyAtMs: 300,
+    },
+  ]);
+
+  const sessions = listCodexSessions({ homeDir, limit: 50 });
+
+  assert.deepEqual(sessions.map((item) => item.id), ["thread_catalog"]);
+  assert.equal(sessions[0].project, "router");
+  assert.equal(sessions[0].projectPath, "F:/game_code/router");
+});
+
+test("session center counts only user-facing Codex threads once", () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
+  const codexDir = path.join(homeDir, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  createCodexStateDbWithMetadata(
+    codexDir,
+    [
+      {
+        id: "thread_z_old",
+        modelProvider: "openai",
+        model: "gpt-5.5",
+        title: "Old Visible",
+        source: "vscode",
+        threadSource: "user",
+        cwd: "\\\\?\\F:\\game_code\\router",
+        archived: 0,
+        hasUserEvent: 0,
+        firstUserMessage: "old visible",
+        recencyAtMs: 10,
+      },
+      {
+        id: "thread_a_new",
+        modelProvider: "openai",
+        model: "gpt-5.5",
+        title: "New Visible",
+        source: "vscode",
+        threadSource: "user",
+        cwd: "F:/game_code/router",
+        archived: 0,
+        hasUserEvent: 0,
+        firstUserMessage: "new visible",
+        recencyAtMs: 30,
+      },
+      {
+        id: "thread_legacy_visible",
+        modelProvider: "openai",
+        model: "gpt-5.5",
+        title: "Legacy Visible",
+        source: "vscode",
+        threadSource: null,
+        cwd: "F:/game_code/legacy",
+        archived: 0,
+        hasUserEvent: 0,
+        firstUserMessage: "legacy visible",
+        recencyAtMs: 20,
+      },
+      {
+        id: "thread_archived",
+        modelProvider: "openai",
+        model: "gpt-5.5",
+        title: "Archived",
+        source: "vscode",
+        threadSource: "user",
+        cwd: "F:/game_code/router",
+        archived: 1,
+        hasUserEvent: 0,
+        firstUserMessage: "archived",
+        recencyAtMs: 40,
+      },
+      {
+        id: "thread_subagent",
+        modelProvider: "openai",
+        model: "gpt-5.5",
+        title: "Subagent",
+        source: "{\"subagent\":{\"thread_spawn\":{}}}",
+        threadSource: "subagent",
+        cwd: "F:/game_code/router",
+        archived: 0,
+        hasUserEvent: 0,
+        firstUserMessage: "subagent",
+        recencyAtMs: 50,
+      },
+    ],
+    path.join(codexDir, "state_5.sqlite"),
+  );
+  createCodexStateDbWithMetadata(
+    codexDir,
+    [
+      {
+        id: "thread_a_new",
+        modelProvider: "openai",
+        model: "gpt-5.5",
+        title: "New Visible Duplicate",
+        source: "vscode",
+        threadSource: "user",
+        cwd: "F:/game_code/router",
+        archived: 0,
+        hasUserEvent: 0,
+        firstUserMessage: "duplicate",
+        recencyAtMs: 35,
+      },
+    ],
+    path.join(codexDir, "state_6.sqlite"),
+  );
+
+  const sessions = listCodexSessions({ homeDir, limit: 50 });
+
+  assert.deepEqual(
+    sessions.map((item) => item.id),
+    ["thread_a_new", "thread_legacy_visible", "thread_z_old"],
+  );
 });
 
 test("supportDiagnostics reports stale Codex plugin runtime without mutating it", () => {
@@ -848,6 +1404,48 @@ test("chat completion routes get a conservative default tool guard", () => {
   assert.equal(config.models[1].maxToolContinuationTurns, 5);
 });
 
+test("built-in Kimi routes do not impose local rpm throttling by default", () => {
+  const rootDir = makeTempProject();
+  saveSelection(rootDir, ["kimi-k2-7-code", "kimi-k2-6"], MODE_HYBRID);
+
+  const config = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
+
+  const kimiRoutes = config.models.filter((model) => model.provider === "kimi");
+  assert.equal(kimiRoutes.length, 2);
+  for (const route of kimiRoutes) {
+    assert.equal(route.rpm, undefined, route.id);
+    assert.equal(route.rateLimit, undefined, route.id);
+  }
+});
+
+test("synced Kimi routes do not inherit legacy built-in rpm throttling", () => {
+  const rootDir = makeTempProject();
+  fs.mkdirSync(path.join(rootDir, "config"), { recursive: true });
+  fs.writeFileSync(
+    modelDirectoryPath(rootDir),
+    JSON.stringify({
+      version: 1,
+      providers: {
+        kimi: {
+          providerId: "kimi",
+          models: [{ id: "kimi-k2.8-code" }],
+        },
+      },
+    }),
+  );
+  const synced = modelCatalog(rootDir).find((model) => model.model === "kimi-k2.8-code");
+  assert.ok(synced?.presetId);
+  saveSelection(rootDir, [synced.presetId], MODE_HYBRID);
+
+  const config = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
+
+  assert.equal(config.models.length, 1);
+  assert.equal(config.models[0].provider, "kimi");
+  assert.equal(config.models[0].model, "kimi-k2.8-code");
+  assert.equal(config.models[0].rpm, undefined);
+  assert.equal(config.models[0].rateLimit, undefined);
+});
+
 test("domestic model presets route with their own provider keys", () => {
   const rootDir = makeTempProject();
   saveSelection(rootDir, [
@@ -885,6 +1483,51 @@ test("all-api defaults use public API presets only", () => {
   assert.equal(config.models.some((model) => model.baseUrl.includes("fenno.ai")), false);
   assert.equal(config.models.some((model) => model.apiKeyEnv === "FENNO_API_KEY"), false);
   assert.equal(config.models[0].apiKeyEnv, "OPENAI_API_KEY");
+});
+
+test("all-api Codex-visible model catalog keeps provider display names", () => {
+  const rootDir = makeTempProject();
+  writeRouterConfigFromSelection(rootDir, MODE_ALL_API);
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
+
+  applyCodexConfig({ rootDir, mode: MODE_ALL_API, homeDir });
+
+  const target = path.join(homeDir, ".codex", "config.toml");
+  const written = fs.readFileSync(target, "utf8");
+  const catalogFile = path.join(homeDir, ".codex", "codexbridge-model-catalog.json");
+  const catalog = JSON.parse(fs.readFileSync(catalogFile, "utf8"));
+  const names = new Map(catalog.models.map((model) => [model.slug, model.display_name]));
+
+  assert.match(written, new RegExp(`model_catalog_json = "${escapeRegExp(toFixtureTomlPath(catalogFile))}"`));
+  assert.equal(names.get("cb-openai-gpt-4-1"), "OpenAI GPT-4.1");
+  assert.equal(names.get("cb-deepseek-v4-pro"), "DeepSeek V4 Pro");
+  assert.equal(names.get("cb-kimi-k2-7-code"), "Kimi K2.7 Code");
+  assert.equal(catalog.models.some((model) => model.display_name === "自定义"), false);
+});
+
+test("Codex-visible model catalog keeps tool and MCP capability metadata in both modes", () => {
+  const assertCatalogCapabilities = (mode, expectedFirstToolMode) => {
+    const rootDir = makeTempProject();
+    writeRouterConfigFromSelection(rootDir, mode);
+    const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
+
+    applyCodexConfig({ rootDir, mode, homeDir });
+
+    const catalogFile = path.join(homeDir, ".codex", "codexbridge-model-catalog.json");
+    const catalog = JSON.parse(fs.readFileSync(catalogFile, "utf8"));
+    const first = catalog.models[0];
+    const deepseek = catalog.models.find((model) => model.slug === "cb-deepseek-v4-pro");
+
+    assert.equal(first.supports_tools, expectedFirstToolMode);
+    assert.equal(first.supports_mcp_namespaces, true);
+    assert.equal(first.codexbridge_capabilities.mcp_namespaces, "native");
+    assert.equal(deepseek.supports_tools, "chat-functions");
+    assert.equal(deepseek.supports_mcp_namespaces, true);
+    assert.equal(deepseek.codexbridge_capabilities.mcp_namespaces, "native");
+  };
+
+  assertCatalogCapabilities(MODE_HYBRID, "native");
+  assertCatalogCapabilities(MODE_ALL_API, "native");
 });
 
 test("bundled all-api router template does not contain private Fenno routes", () => {
@@ -1060,7 +1703,31 @@ test("legacy false image overrides do not disable built-in vision presets", () =
   assert.deepEqual(explicitConfig.models[0].inputModalities, ["text"]);
 });
 
-test("provider model directory refresh caches model ids without saving secrets", async () => {
+test("provider model directory refresh requires a saved API key", async () => {
+  const rootDir = makeTempProject();
+  let fetched = false;
+
+  const result = await refreshProviderModelDirectory(rootDir, "deepseek", {
+    now: () => "2026-06-26T01:02:03.000Z",
+    fetchImpl: async () => {
+      fetched = true;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ data: [] }),
+      };
+    },
+  });
+
+  const directory = readModelDirectory(rootDir);
+
+  assert.equal(result.ok, false);
+  assert.match(result.error, /Missing API key: DEEPSEEK_API_KEY/);
+  assert.equal(fetched, false);
+  assert.equal(directory.providers.deepseek, undefined);
+});
+
+test("provider model directory refresh sends the saved API key", async () => {
   const rootDir = makeTempProject();
   saveSecrets(rootDir, { DEEPSEEK_API_KEY: "deepseek-secret" });
 
@@ -1098,7 +1765,154 @@ test("provider model directory refresh caches model ids without saving secrets",
     "deepseek-v4-pro",
     "deepseek-reasoner",
   ]);
-  assert.equal(JSON.stringify(directory).includes("deepseek-secret"), false);
+  assert.equal(JSON.stringify(directory).includes("DEEPSEEK_API_KEY"), false);
+});
+
+test("provider model directory refresh replaces built-in provider models with the remote list", async () => {
+  const rootDir = makeTempProject();
+  saveSecrets(rootDir, { DEEPSEEK_API_KEY: "deepseek-secret" });
+  saveSelection(rootDir, ["codex-gpt-5-5", "deepseek-v4-pro"], MODE_HYBRID);
+  const before = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
+
+  await refreshProviderModelDirectory(rootDir, "deepseek", {
+    now: () => "2026-06-26T01:02:03.000Z",
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: [
+          { id: "deepseek-v4-pro" },
+          { id: "deepseek-coder-next" },
+        ],
+      }),
+    }),
+  });
+
+  const catalog = modelCatalog(rootDir);
+  const synced = catalog.find((model) => model.model === "deepseek-coder-next");
+  const deepseekModels = catalog
+    .filter((model) => model.providerId === "deepseek")
+    .map((model) => model.model);
+  const after = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
+
+  assert.deepEqual(deepseekModels, [
+    "deepseek-v4-pro",
+    "deepseek-coder-next",
+  ]);
+  assert.ok(synced);
+  assert.equal(synced.providerId, "deepseek");
+  assert.equal(synced.api, "chat_completions");
+  assert.equal(synced.authMode, "api_key");
+  assert.equal(synced.apiKeyEnv, "DEEPSEEK_API_KEY");
+  assert.equal(synced.custom, false);
+  assert.deepEqual(after, before);
+});
+
+test("provider overrides update provider catalog and generated routes", () => {
+  const rootDir = makeTempProject();
+  const saved = saveProviderOverride(rootDir, "deepseek", {
+    name: "DeepSeek Proxy",
+    shortName: "DS Proxy",
+    baseUrl: "https://proxy.example.com/v1",
+    api: "responses",
+    keyUrl: "https://proxy.example.com/key",
+    docsUrl: "https://proxy.example.com/docs",
+  });
+  saveSelection(rootDir, ["deepseek-v4-pro"], MODE_HYBRID);
+
+  const provider = providerCatalog(rootDir).find((item) => item.id === "deepseek");
+  const model = modelCatalog(rootDir).find((item) => item.presetId === "deepseek-v4-pro");
+  const config = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
+
+  assert.equal(saved.baseUrl, "https://proxy.example.com/v1");
+  assert.equal(readProviderOverrides(rootDir).deepseek.name, "DeepSeek Proxy");
+  assert.equal(provider.name, "DeepSeek Proxy");
+  assert.equal(provider.shortName, "DS Proxy");
+  assert.equal(provider.baseUrl, "https://proxy.example.com/v1");
+  assert.equal(provider.api, "responses");
+  assert.equal(model.baseUrl, "https://proxy.example.com/v1");
+  assert.equal(model.api, "responses");
+  assert.equal(config.models[0].baseUrl, "https://proxy.example.com/v1");
+  assert.equal(config.models[0].api, "responses");
+});
+
+test("provider logos are copied into the local data directory", () => {
+  const rootDir = makeTempProject();
+  const source = path.join(rootDir, "source-logo.png");
+  fs.writeFileSync(source, "fake-png-bytes", "utf8");
+
+  const saved = saveProviderLogo(rootDir, "deepseek", source);
+
+  assert.match(saved.logoUrl, /^file:\/\/\//);
+  assert.equal(path.basename(saved.path), "deepseek.png");
+  assert.equal(fs.readFileSync(saved.path, "utf8"), "fake-png-bytes");
+  assert.match(saved.path, /provider-logos/);
+});
+
+test("provider connection test requires an API key before fetching", async () => {
+  const rootDir = makeTempProject();
+  let fetched = false;
+  const result = await testProviderConnection(rootDir, "deepseek", {
+    fetchImpl: async () => {
+      fetched = true;
+      return {
+        ok: true,
+        status: 200,
+        text: async () => "",
+      };
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.match(result.error, /Missing API key: DEEPSEEK_API_KEY/);
+  assert.equal(fetched, false);
+});
+
+test("provider connection test can use a typed unsaved API key", async () => {
+  const rootDir = makeTempProject();
+  const result = await testProviderConnection(rootDir, {
+    providerId: "deepseek",
+    apiKey: "typed-secret",
+  }, {
+    fetchImpl: async (url, options) => {
+      assert.equal(url, "https://api.deepseek.com/v1/models");
+      assert.equal(options.method, "GET");
+      assert.equal(options.headers.Authorization, "Bearer typed-secret");
+      return {
+        ok: true,
+        status: 200,
+        text: async () => "",
+      };
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.providerId, "deepseek");
+  assert.equal(result.status, 200);
+});
+
+test("synced provider models can be selected and routed explicitly", async () => {
+  const rootDir = makeTempProject();
+  saveSecrets(rootDir, { DEEPSEEK_API_KEY: "deepseek-secret" });
+
+  await refreshProviderModelDirectory(rootDir, "deepseek", {
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: [{ id: "deepseek-coder-next" }],
+      }),
+    }),
+  });
+
+  const synced = modelCatalog(rootDir).find((model) => model.model === "deepseek-coder-next");
+  saveSelection(rootDir, [synced.presetId], MODE_HYBRID);
+  const config = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
+
+  assert.equal(config.models.length, 1);
+  assert.equal(config.models[0].sourcePresetId, synced.presetId);
+  assert.equal(config.models[0].model, "deepseek-coder-next");
+  assert.equal(config.models[0].provider, "deepseek");
 });
 
 test("provider model directory refresh failure keeps presets and router config intact", async () => {
@@ -1171,6 +1985,26 @@ test("manual capability overrides apply to one route without changing route-spec
   assert.equal(config.models[1].contextWindow, 258400);
 });
 
+test("manual capability overrides can be reset without changing image upload overrides", () => {
+  const rootDir = makeTempProject();
+  saveModelCapabilityOverride(rootDir, "deepseek-v4-pro", {
+    inputModalities: ["text", "file", "audio"],
+    contextWindow: 123456,
+    reasoning: { mode: "unsupported" },
+  });
+  saveModelImageInputOverride(rootDir, "deepseek-v4-pro", true);
+
+  const reset = resetModelCapabilityOverride(rootDir, "deepseek-v4-pro");
+  const overrides = readModelCapabilityOverrides(rootDir);
+  const model = modelCatalog(rootDir).find((item) => item.presetId === "deepseek-v4-pro");
+
+  assert.equal(reset.presetId, "deepseek-v4-pro");
+  assert.equal(reset.reset, true);
+  assert.equal(overrides["deepseek-v4-pro"], undefined);
+  assert.notEqual(model.capabilityOverrideSource, "manual");
+  assert.deepEqual(model.inputModalities, ["text", "image"]);
+});
+
 test("custom models can disable image upload support", () => {
   const rootDir = makeTempProject();
   const custom = saveCustomModel(rootDir, {
@@ -1186,6 +2020,31 @@ test("custom models can disable image upload support", () => {
   const config = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
 
   assert.deepEqual(config.models[0].inputModalities, ["text"]);
+});
+
+test("custom models can extend an existing provider without creating a duplicate provider", () => {
+  const rootDir = makeTempProject();
+  const custom = saveCustomModel(rootDir, {
+    providerId: "deepseek",
+    providerName: "DeepSeek",
+    displayName: "DeepSeek Custom",
+    model: "deepseek-custom",
+    baseUrl: "https://api.deepseek.com/v1",
+    api: "responses",
+    keyEnv: "DEEPSEEK_API_KEY",
+    contextWindow: 123456,
+    inputModalities: ["text", "image"],
+  });
+  const providers = providerCatalog(rootDir).filter((provider) => provider.id === "deepseek");
+  const model = modelCatalog(rootDir).find((item) => item.presetId === custom.presetId);
+
+  assert.equal(custom.providerId, "deepseek");
+  assert.equal(providers.length, 1);
+  assert.equal(model.providerId, "deepseek");
+  assert.equal(model.baseUrl, "https://api.deepseek.com/v1");
+  assert.equal(model.api, "responses");
+  assert.equal(model.apiKeyEnv, "DEEPSEEK_API_KEY");
+  assert.equal(model.contextWindow, 123456);
 });
 
 test("editing a custom model preserves its existing API key slot", () => {
@@ -1560,13 +2419,31 @@ test("applyCodexConfig preserves the current independent CodexBridge model selec
   assert.match(written, /\[history]\s+persistence = "save-all"/);
 });
 
+test("applyCodexConfig writes a Codex-visible model catalog next to config.toml", () => {
+  const rootDir = makeTempProject();
+  writeRouterConfigFromSelection(rootDir, MODE_HYBRID);
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
+
+  applyCodexConfig({ rootDir, mode: MODE_HYBRID, homeDir });
+
+  const target = path.join(homeDir, ".codex", "config.toml");
+  const written = fs.readFileSync(target, "utf8");
+  const catalogFile = path.join(homeDir, ".codex", "codexbridge-model-catalog.json");
+  const catalog = JSON.parse(fs.readFileSync(catalogFile, "utf8"));
+
+  assert.match(written, new RegExp(`model_catalog_json = "${escapeRegExp(toFixtureTomlPath(catalogFile))}"`));
+  assert.doesNotMatch(written, new RegExp(escapeRegExp(path.resolve(rootDir))));
+  assert.equal(catalog.models[0].slug, "cb-gpt-5-5");
+  assert.equal(catalog.models[0].display_name, "GPT-5.5");
+});
+
 test("applyCodexConfig skips backup when Codex config is already current", () => {
   const rootDir = makeTempProject();
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
   const codexDir = path.join(homeDir, ".codex");
   fs.mkdirSync(codexDir, { recursive: true });
   const target = path.join(codexDir, "config.toml");
-  fs.writeFileSync(target, buildCodexToml({ rootDir, mode: MODE_HYBRID }), "utf8");
+  fs.writeFileSync(target, buildCodexToml({ rootDir, mode: MODE_HYBRID, homeDir }), "utf8");
 
   const result = applyCodexConfig({
     rootDir,
@@ -1585,7 +2462,7 @@ test("applyCodexConfig syncs legacy CodexBridge conversations even when config i
   const codexDir = path.join(homeDir, ".codex");
   fs.mkdirSync(codexDir, { recursive: true });
   const target = path.join(codexDir, "config.toml");
-  fs.writeFileSync(target, buildCodexToml({ rootDir, mode: MODE_HYBRID }), "utf8");
+  fs.writeFileSync(target, buildCodexToml({ rootDir, mode: MODE_HYBRID, homeDir }), "utf8");
   const dbPath = createCodexStateDb(codexDir, [
     ["thread_bridge", "codex-bridge", "gpt-5.5", "Bridge thread"],
     ["thread_openai", "openai", "gpt-5.5", "OpenAI thread"],
@@ -1638,7 +2515,7 @@ test("restoreCodexConfig restores the latest CodexBridge backup", () => {
   const codexDir = path.join(homeDir, ".codex");
   fs.mkdirSync(codexDir, { recursive: true });
   const target = path.join(codexDir, "config.toml");
-  fs.writeFileSync(target, buildCodexToml({ rootDir, mode: MODE_HYBRID }), "utf8");
+  fs.writeFileSync(target, buildCodexToml({ rootDir, mode: MODE_HYBRID, homeDir }), "utf8");
   const firstBackup = path.join(codexDir, "config.toml.codexbridge.2026-06-25-010000000.bak");
   const secondBackup = path.join(codexDir, "config.toml.codexbridge.2026-06-25-020000000.bak");
   fs.writeFileSync(firstBackup, 'model = "before"\n', "utf8");
@@ -1657,7 +2534,7 @@ test("restoreCodexConfig prefers the latest non-CodexBridge backup", () => {
   const codexDir = path.join(homeDir, ".codex");
   fs.mkdirSync(codexDir, { recursive: true });
   const target = path.join(codexDir, "config.toml");
-  fs.writeFileSync(target, buildCodexToml({ rootDir, mode: MODE_HYBRID }), "utf8");
+  fs.writeFileSync(target, buildCodexToml({ rootDir, mode: MODE_HYBRID, homeDir }), "utf8");
   fs.writeFileSync(
     path.join(codexDir, "config.toml.codexbridge.2026-06-25-010000000.bak"),
     'model_provider = "openai"\nopenai_base_url = "http://localhost:15722/v1"\n',
@@ -1680,7 +2557,7 @@ test("restoreCodexConfig falls back to the oldest backup when all backups are Co
   const codexDir = path.join(homeDir, ".codex");
   fs.mkdirSync(codexDir, { recursive: true });
   const target = path.join(codexDir, "config.toml");
-  const bridgeConfig = buildCodexToml({ rootDir, mode: MODE_HYBRID });
+  const bridgeConfig = buildCodexToml({ rootDir, mode: MODE_HYBRID, homeDir });
   fs.writeFileSync(target, bridgeConfig, "utf8");
   fs.writeFileSync(
     `${target}.codexbridge.2026-06-21-120000000.bak`,
@@ -1710,7 +2587,7 @@ test("restoreCodexConfig can remove only the managed CodexBridge block when no b
     [
       'notify = ["C:/Codex/openai-bundled/computer-use/codex-computer-use.exe", "turn-ended"]',
       "",
-      buildCodexToml({ rootDir, mode: MODE_HYBRID }).trimEnd(),
+      buildCodexToml({ rootDir, mode: MODE_HYBRID, homeDir }).trimEnd(),
       "",
       "[history]",
       'persistence = "save-all"',
@@ -1792,7 +2669,7 @@ test("recoverCodexHistoryAccess does not roll current CodexBridge config back to
   );
 
   const applied = applyCodexConfig({ rootDir, mode: MODE_HYBRID, homeDir });
-  fs.writeFileSync(target, buildCodexToml({ rootDir, mode: MODE_HYBRID }), "utf8");
+  fs.writeFileSync(target, buildCodexToml({ rootDir, mode: MODE_HYBRID, homeDir }), "utf8");
 
   const recovered = recoverCodexHistoryAccess({ homeDir });
   const written = fs.readFileSync(target, "utf8");
@@ -2177,9 +3054,11 @@ function createCodexStateDbWithMetadata(codexDir, rows, dbPath = path.join(codex
         "title TEXT,",
         "source TEXT,",
         "thread_source TEXT,",
+        "cwd TEXT,",
         "archived INTEGER DEFAULT 0,",
         "has_user_event INTEGER DEFAULT 0,",
-        "first_user_message TEXT",
+        "first_user_message TEXT,",
+        "recency_at_ms INTEGER DEFAULT 0",
         ")",
       ].join(" "),
     );
@@ -2187,7 +3066,7 @@ function createCodexStateDbWithMetadata(codexDir, rows, dbPath = path.join(codex
       "CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT, status TEXT)",
     );
     const insert = db.prepare(
-      "INSERT INTO threads (id, model_provider, model, title, source, thread_source, archived, has_user_event, first_user_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO threads (id, model_provider, model, title, source, thread_source, cwd, archived, has_user_event, first_user_message, recency_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     );
     for (const row of rows) {
       insert.run(
@@ -2196,10 +3075,59 @@ function createCodexStateDbWithMetadata(codexDir, rows, dbPath = path.join(codex
         row.model || "gpt-5.5",
         row.title,
         row.source,
-        row.threadSource,
+        row.threadSource ?? null,
+        row.cwd ?? "",
         row.archived || 0,
         row.hasUserEvent || 0,
         row.firstUserMessage ?? null,
+        row.recencyAtMs || 0,
+      );
+    }
+  } finally {
+    db.close();
+  }
+  return dbPath;
+}
+
+function createCodexThreadCatalogDb(codexDir, rows, dbPath = path.join(codexDir, "sqlite", "codex-dev.db")) {
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec(
+      [
+        "CREATE TABLE local_thread_catalog (",
+        "host_id TEXT,",
+        "thread_id TEXT PRIMARY KEY,",
+        "display_title TEXT,",
+        "source_created_at INTEGER,",
+        "source_updated_at INTEGER,",
+        "cwd TEXT,",
+        "source_kind TEXT,",
+        "source_detail TEXT,",
+        "model_provider TEXT,",
+        "git_branch TEXT,",
+        "observation_sequence INTEGER,",
+        "missing_candidate INTEGER DEFAULT 0",
+        ")",
+      ].join(" "),
+    );
+    const insert = db.prepare(
+      "INSERT INTO local_thread_catalog (host_id, thread_id, display_title, source_created_at, source_updated_at, cwd, source_kind, source_detail, model_provider, git_branch, observation_sequence, missing_candidate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    );
+    for (const row of rows) {
+      insert.run(
+        row.hostId || "local",
+        row.id,
+        row.title,
+        row.createdAt || row.updatedAt || 0,
+        row.updatedAt || 0,
+        row.cwd || "",
+        row.sourceKind || "vscode",
+        row.sourceDetail ?? null,
+        row.modelProvider || "",
+        row.gitBranch || "",
+        row.observationSequence || 0,
+        row.missingCandidate || 0,
       );
     }
   } finally {

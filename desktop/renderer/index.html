@@ -1,10 +1,10 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self';"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https: http:;"
     />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>CodexBridge</title>
@@ -22,11 +22,14 @@
         </div>
         <nav class="nav-list" aria-label="主导航">
           <button class="nav-item active" data-section="dashboard">概览</button>
+          <button class="nav-item" data-section="preflight">体检</button>
           <button class="nav-item" data-section="models">模型</button>
-          <button class="nav-item" data-section="providers">密钥</button>
           <button class="nav-item" data-section="stats">统计</button>
-          <button class="nav-item" data-section="codex">Codex 配置</button>
+          <button class="nav-item" data-section="settings">设置</button>
+          <button class="nav-item" data-section="resources">资源</button>
+          <button class="nav-item" data-section="sessions">会话</button>
           <button class="nav-item" data-section="logs">日志</button>
+          <button class="nav-item" data-section="vvip">VVIP功能</button>
         </nav>
         <div class="sidebar-actions">
           <div class="app-version">
@@ -46,14 +49,24 @@
             <p>把 GPT、DeepSeek、Kimi 和更多模型放进同一个 Codex 模型栏。</p>
           </div>
           <div class="status-cluster">
-            <button class="ghost-button light small" id="restoreCodexConfig">初始化 Codex 配置</button>
-            <button class="ghost-button light small" id="recoverHistoryAccess">找回历史对话</button>
             <span class="status-pill muted" id="routerStatus">Router 未启动</span>
             <span class="status-pill muted" id="modeStatus">读取中</span>
           </div>
         </header>
 
         <div class="toast hidden" id="toast"></div>
+        <div class="modal-backdrop hidden" id="requestDetailDialog" aria-hidden="true">
+          <div class="request-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="requestDetailTitle">
+            <div class="update-dialog-header">
+              <div>
+                <h2 id="requestDetailTitle">请求详情</h2>
+                <p>查看这次请求在 CodexBridge 里的真实路由、上游状态和降级线索。</p>
+              </div>
+              <button class="ghost-button light small" id="closeRequestDetail" type="button">关闭</button>
+            </div>
+            <div class="request-detail-body" id="requestDetailBody"></div>
+          </div>
+        </div>
         <div class="modal-backdrop hidden" id="updateDialog" aria-hidden="true">
           <div class="update-dialog" role="dialog" aria-modal="true" aria-labelledby="updateDialogTitle">
             <div class="update-dialog-header">
@@ -80,6 +93,25 @@
             <div class="update-dialog-actions">
               <button class="plain-button" id="cancelUpdate" type="button">稍后</button>
               <button class="primary-button" id="confirmUpdate" type="button">下载更新包</button>
+            </div>
+          </div>
+        </div>
+        <div class="modal-backdrop hidden" id="vvipDialog" aria-hidden="true">
+          <div class="vvip-dialog" role="dialog" aria-modal="true" aria-labelledby="vvipDialogTitle">
+            <div class="vvip-dialog-header">
+              <div>
+                <span class="vvip-kicker">VVIP 愿望审核中心</span>
+                <h2 id="vvipDialogTitle">功能已进入宇宙级排期</h2>
+              </div>
+              <span class="status-pill">3000年</span>
+            </div>
+            <div class="vvip-dialog-body">
+              <span class="vvip-feature" id="vvipFeatureName">神秘功能</span>
+              <strong id="vvipDialogMessage">任务排期：3000年，敬请期待。。。</strong>
+              <p id="vvipDialogNote">产品经理已经认真点头，工程师也已经郑重收藏到“梦里开发”清单。</p>
+            </div>
+            <div class="vvip-dialog-actions">
+              <button class="primary-button" id="closeVvipDialog" type="button">收到，继续许愿</button>
             </div>
           </div>
         </div>
@@ -110,34 +142,27 @@
               <div class="panel-header">
                 <div>
                   <h2>运行控制</h2>
-                  <p>常规流程：选模型 → 填密钥 → 更新配置 → 启动 Router → 重开 Codex。</p>
+                  <p>启动 Router 时会自动刷新 CodexBridge 配置；关闭 Router 时会自动恢复 Codex 原配置。</p>
                 </div>
-              </div>
-              <div class="action-grid">
-                <button class="primary-button" id="initializeCodex">更新 Codex 配置</button>
               </div>
               <button class="router-toggle" id="routerToggle" aria-pressed="false">
                 <span class="switch-track"><span></span></span>
                 <strong>Router 已关闭</strong>
                 <small>点击启动本地网关</small>
               </button>
+              <div class="action-grid">
+                <button class="plain-button" id="restartCodex">重启 Codex</button>
+                <button class="plain-button" id="selectCodexDesktopExe">选择 Codex 启动项</button>
+              </div>
+              <div class="codex-path-row">
+                <span>Codex 路径</span>
+                <strong id="codexDesktopPath">自动查找</strong>
+              </div>
               <div class="health-card" id="healthStatus">Router 健康检查：尚未检查</div>
-              <label class="option-toggle">
-                <input id="bypassSystemProxy" type="checkbox" />
-                <span>
-                  <strong>本应用绕过系统代理</strong>
-                  <small>遇到 502、fetch failed 或 VPN/代理冲突时可开启；只影响 CodexBridge Router。</small>
-                </span>
-              </label>
             </article>
           </div>
 
-          <div class="grid four metric-row">
-            <article class="metric">
-              <span class="metric-label">本机保存位置</span>
-              <strong id="rootDir">-</strong>
-              <p>这里不是模型地址。配置、密钥、模型选择、统计和日志统一保存在用户目录，更新或重新解压应用不会丢。</p>
-            </article>
+          <div class="grid three metric-row">
             <article class="metric">
               <span class="metric-label">已启用模型</span>
               <strong><span id="selectedCount">0</span></strong>
@@ -156,6 +181,20 @@
           </div>
         </section>
 
+        <section class="section-panel hidden" id="preflight">
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>启动体检</h2>
+                <p>一键检查 Codex、Router、模型目录、API Key、代理和备份状态。</p>
+              </div>
+              <button class="primary-button small" id="runStartupCheck" type="button">重新体检</button>
+            </div>
+            <div class="check-summary" id="startupCheckSummary"></div>
+            <div class="check-list" id="startupCheckList"></div>
+          </article>
+        </section>
+
         <section class="section-panel hidden" id="models">
           <article class="panel">
             <div class="panel-header">
@@ -172,6 +211,29 @@
             <div class="model-pool" id="modelPool"></div>
           </article>
 
+        </section>
+
+        <section class="section-panel hidden" id="modelConfig">
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>供应商与密钥</h2>
+                <p>密钥只保存在本机用户目录下的 CodexBridge/config/secrets.local.json。每个供应商都可以单独保存 Key，并按需刷新模型列表。</p>
+              </div>
+            </div>
+            <div class="provider-grid" id="providerGrid"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>模型能力配置</h2>
+                <p>这里配置图片上传、图片生成、上下文和文件/音频能力；不会改变模型选择顺序。</p>
+              </div>
+            </div>
+            <div class="model-pool" id="modelConfigPool"></div>
+          </article>
+
           <article class="panel">
             <div class="panel-header">
               <div>
@@ -180,26 +242,41 @@
               </div>
             </div>
             <form class="custom-form" id="customModelForm">
-              <label>
+              <label data-custom-provider-field>
                 <span>服务商名称</span>
                 <input id="customProviderName" placeholder="例如 My API / 火山方舟" />
               </label>
-              <label>
+              <label data-custom-provider-field>
                 <span>Codex 显示名</span>
                 <input id="customDisplayName" placeholder="例如 My Coder" />
               </label>
               <label>
-                <span>真实模型名</span>
+                <span id="customModelNameLabel">真实模型名</span>
                 <input id="customModelName" placeholder="例如 my-coder-v1" />
               </label>
-              <label>
+              <label data-custom-provider-field>
                 <span>Base URL</span>
                 <input id="customBaseUrl" placeholder="例如 https://api.example.com/v1" />
               </label>
-              <label>
+              <label data-custom-provider-field>
                 <span>获取 Key 链接，可选</span>
                 <input id="customKeyUrl" placeholder="例如 https://example.com/keys" />
               </label>
+              <label data-custom-provider-field>
+                <span>官网 / 文档链接，可选</span>
+                <input id="customDocsUrl" placeholder="例如 https://example.com/docs" />
+              </label>
+              <input id="customLogoUrl" type="hidden" />
+              <div class="logo-upload-field" data-custom-global-field>
+                <span>服务商图标</span>
+                <div class="logo-upload-row">
+                  <span class="provider-logo provider-logo-default" id="customLogoPreview" aria-hidden="true">
+                    <img src="./assets/providers/default.svg" alt="" loading="lazy" />
+                  </span>
+                  <button class="ghost-button light small" id="customLogoUpload" type="button">上传本地图标</button>
+                  <small id="customLogoStatus">未选择时使用默认 AI 图标</small>
+                </div>
+              </div>
               <label>
                 <span>接口类型</span>
                 <select id="customApiType">
@@ -207,32 +284,29 @@
                   <option value="responses">Responses</option>
                 </select>
               </label>
+              <label>
+                <span>上下文大小</span>
+                <input id="customContextWindow" type="number" min="1" step="1" value="258400" placeholder="258400" />
+              </label>
+              <label class="wide-field" data-custom-provider-field>
+                <span>API Key</span>
+                <input id="customApiKey" type="password" placeholder="已保存可留空；新服务商请填写" />
+              </label>
               <label class="checkbox-field">
                 <input id="customImageInput" type="checkbox" checked />
                 <span>允许图片上传</span>
                 <small>关闭后，Codex 会把这个模型当作纯文本模型显示。</small>
               </label>
-              <div class="form-help">
+              <div class="form-help" data-custom-provider-field>
                 <strong>怎么填</strong>
                 <p>大多数国产模型选 Chat Completions；如果服务商明确支持 OpenAI Responses API，再选 Responses。</p>
               </div>
               <div class="form-actions">
                 <button class="primary-button" id="customSubmitButton" type="submit">添加模型</button>
+                <button class="ghost-button light" id="testCustomConnection" type="button" data-custom-provider-field>测试连接</button>
                 <button class="plain-button hidden" id="cancelCustomEdit" type="button">取消编辑</button>
               </div>
             </form>
-          </article>
-        </section>
-
-        <section class="section-panel hidden" id="providers">
-          <article class="panel">
-            <div class="panel-header">
-              <div>
-                <h2>API Key</h2>
-                <p>密钥只保存在本机用户目录下的 CodexBridge/config/secrets.local.json，不会提交到 Git。每张卡片单独保存，空输入不会覆盖旧密钥。</p>
-              </div>
-            </div>
-            <div class="provider-grid" id="providerGrid"></div>
           </article>
         </section>
 
@@ -244,7 +318,7 @@
                 <p>展示当前生效模型的请求、状态码、耗时和 token。</p>
               </div>
             </div>
-            <div class="grid four stat-summary">
+            <div class="grid five stat-summary">
               <article class="metric">
                 <span class="metric-label">总调用</span>
                 <strong id="statCalls">0</strong>
@@ -258,6 +332,10 @@
                 <strong id="statPrompt">0</strong>
               </article>
               <article class="metric">
+                <span class="metric-label">缓存 Token</span>
+                <strong id="statCache">0</strong>
+              </article>
+              <article class="metric">
                 <span class="metric-label">输出 Token</span>
                 <strong id="statCompletion">0</strong>
               </article>
@@ -267,22 +345,78 @@
           </article>
         </section>
 
-        <section class="section-panel hidden" id="codex">
+        <section class="section-panel hidden" id="settings">
           <article class="panel">
             <div class="panel-header">
               <div>
-                <h2>Codex 配置接入</h2>
-                <p>把 Codex 的模型栏接到本地 Router。写入前会自动备份原来的 %USERPROFILE%\.codex\config.toml。</p>
+                <h2>基础设置</h2>
+                <p>这些设置只影响 CodexBridge 本地 Router。修改端口或代理后，重新启动 Router 生效。</p>
               </div>
-              <button class="ghost-button light" id="openCodexFolder">打开 Codex 目录</button>
             </div>
-            <div class="notice">
-              CodexBridge 使用 Codex 内置 OpenAI provider，并通过 <code>openai_base_url</code> 指向本地 Router；混合模式和全部 API 模式的上游认证由模型路由决定。
+            <div class="settings-grid">
+              <label>
+                <span>Router 端口</span>
+                <input id="routerPort" type="number" min="1024" max="65535" step="1" placeholder="15722" />
+              </label>
+              <label class="option-toggle">
+                <input id="bypassSystemProxy" type="checkbox" />
+                <span>
+                  <strong>本应用绕过系统代理</strong>
+                  <small>遇到 502、fetch failed 或 VPN/代理冲突时可开启；只影响 CodexBridge Router。</small>
+                </span>
+              </label>
             </div>
-            <div class="action-grid codex-actions">
-              <button class="plain-button" id="generateCatalog">只生成模型目录</button>
-              <button class="plain-button" id="applyCodex">只写入 Codex 配置</button>
+            <div class="settings-actions">
+              <button class="primary-button" id="saveDesktopOptions" type="button">保存设置</button>
             </div>
+          </article>
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>配置档</h2>
+                <p>把当前模式、模型选择和基础设置保存成一个可快速切换的配置。</p>
+              </div>
+              <button class="primary-button small" id="saveConfigProfile" type="button">保存当前配置</button>
+            </div>
+            <div class="profile-list" id="profileList"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>备份恢复中心</h2>
+                <p>每次写入 Codex 配置前会保留备份；这里可以恢复指定备份。</p>
+              </div>
+            </div>
+            <div class="backup-list" id="backupList"></div>
+          </article>
+        </section>
+
+        <section class="section-panel hidden" id="resources">
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>资源中心</h2>
+                <p>只读查看 Codex 当前资源，便于确认插件、MCP、技能、提示词和 AGENTS 规则有没有就位。</p>
+              </div>
+              <button class="primary-button small" id="copyResourceDiagnostics" type="button">复制诊断</button>
+            </div>
+            <div class="resource-layout">
+              <div class="resource-summary" id="resourceSummary"></div>
+              <div class="resource-grid" id="resourceList"></div>
+            </div>
+          </article>
+        </section>
+
+        <section class="section-panel hidden" id="sessions">
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>会话与项目</h2>
+                <p>查看本机 Codex 会话、来源项目和摘要，并把单个会话导出成 Markdown。</p>
+              </div>
+              <button class="ghost-button light small" id="recoverHistoryAccessSessions" type="button">找回历史对话</button>
+            </div>
+            <div class="session-list" id="sessionList"></div>
           </article>
         </section>
 
@@ -296,6 +430,31 @@
               <button class="primary-button small" id="copyDiagnostics">复制诊断信息</button>
             </div>
             <pre id="logOutput"></pre>
+          </article>
+        </section>
+
+        <section class="section-panel hidden" id="vvip">
+          <article class="panel vvip-panel">
+            <div class="panel-header">
+              <div>
+                <h2>VVIP功能</h2>
+                <p>网友高频许愿区，点击即可查看排期。</p>
+              </div>
+            </div>
+            <div class="vvip-grid" aria-label="VVIP 功能按钮">
+              <button class="vvip-button" type="button" data-vvip-feature="收购OPEN AI">收购OPEN AI</button>
+              <button class="vvip-button" type="button" data-vvip-feature="免费洗脚">免费洗脚</button>
+              <button class="vvip-button" type="button" data-vvip-feature="送房送车">送房送车</button>
+              <button class="vvip-button" type="button" data-vvip-feature="接入Claude">接入Claude</button>
+              <button class="vvip-button" type="button" data-vvip-feature="免费GPT">免费GPT</button>
+              <button class="vvip-button" type="button" data-vvip-feature="长生不老">长生不老</button>
+              <button class="vvip-button" type="button" data-vvip-feature="送媳妇">送媳妇</button>
+              <button class="vvip-button" type="button" data-vvip-feature="Computer Use">Computer Use</button>
+              <button class="vvip-button" type="button" data-vvip-feature="免费生图">免费生图</button>
+              <button class="vvip-button" type="button" data-vvip-feature="一键起飞">一键起飞</button>
+              <button class="vvip-button" type="button" data-vvip-feature="牛了个逼">牛了个逼</button>
+              <button class="vvip-button" type="button" data-vvip-feature="无限额度">无限额度</button>
+            </div>
           </article>
         </section>
       </main>

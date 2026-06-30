@@ -28,4 +28,4 @@ Remove-Item "C:\path\to\file.txt"
 
 If batch deletion seems necessary, stop and ask the user to delete the files manually.
 
-如果需要批量删除文件，应停止操作，并请求用户手动删除。
+如果需要批量删除文件，应停止操作，并请求用户手动删除，除非用户明确要求。
