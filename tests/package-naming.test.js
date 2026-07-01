@@ -49,8 +49,11 @@ test("desktop update launches installers and portable replacements automatically
   const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
 
   assert.match(main, /prepareInstallerUpdate/);
+  assert.match(main, /installedRootForVersionedAppDir\(path\.dirname\(process\.execPath\)\)/);
   assert.match(main, /launchDownloadedInstaller\(prepared\.installerPath\)/);
-  assert.match(main, /spawn\(installerPath,\s*\["\/S"\]/);
+  assert.match(main, /await shell\.openPath\(installerPath\)/);
+  assert.doesNotMatch(main, /spawn\(installerPath,\s*\["\/S"\]/);
+  assert.doesNotMatch(main, /"\/S"/);
   assert.match(main, /phase:\s*"launching"/);
   assert.match(main, /quitAfterUpdateLaunch\(\)/);
   assert.match(main, /installerPath:\s*prepared\.installerPath/);
@@ -116,6 +119,9 @@ test("desktop cleans old managed update artifacts and previous installed apps af
   assert.match(main, /cleanupUpdateArtifactsOnStartup/);
   assert.match(main, /cleanupManagedUpdateArtifacts\?\.\(portableUpdatesDir\(\),\s*\{\s*keepPackages:\s*launchedAfterUpdate \? 0 : 1\s*\}\)/);
   assert.match(main, /cleanupInstalledAppVersionsAfterUpdate/);
+  assert.match(main, /cleanupInstallerPackageAfterUpdate/);
+  assert.match(main, /updatePreviousInstallDir\(\)/);
+  assert.match(main, /updateCleanupInstallerPath\(\)/);
   assert.match(main, /removeDirectoryTreeSafeSync/);
   assert.match(main, /prepareInstallerUpdate/);
   assert.match(main, /keepPackages:\s*1/);
@@ -206,11 +212,16 @@ test("Windows installer script installs a versioned app and does not batch-delet
   );
 
   assert.match(installer, /InstallDir "\$LOCALAPPDATA\\Programs\\CodexBridge"/);
+  assert.match(installer, /!insertmacro MUI_PAGE_DIRECTORY/);
   assert.match(installer, /SetOutPath "\$INSTDIR\\app-\$\{VERSION\}"/);
   assert.match(installer, /File \/r "\$\{APP_DIR\}\\\*\.\*"/);
-  assert.match(installer, /CreateShortCut/);
+  assert.match(installer, /CreateShortCut "\$DESKTOP\\CodexBridge\.lnk"/);
+  assert.match(installer, /Var PREVIOUS_INSTALL_DIR/);
+  assert.match(installer, /ReadRegStr \$PREVIOUS_INSTALL_DIR HKCU "Software\\CodexBridge" "InstallRoot"/);
   assert.match(installer, /WriteRegStr HKCU "Software\\CodexBridge" "CurrentVersion"/);
-  assert.match(installer, /ExecShell "" "\$INSTDIR\\app-\$\{VERSION\}\\CodexBridge\.exe" "--updated"/);
+  assert.match(installer, /WriteRegStr HKCU "Software\\CodexBridge" "InstallRoot" "\$INSTDIR"/);
+  assert.match(installer, /ExecShell "" "\$INSTDIR\\app-\$\{VERSION\}\\CodexBridge\.exe" "--updated --previous-install-dir/);
+  assert.match(installer, /--cleanup-installer/);
   assert.doesNotMatch(installer, /RMDir\s+\/r|Delete\s+\/REBOOTOK|Remove-Item\s+-Recurse|rm\s+-rf|rmdir\s+\/s|rd\s+\/s|del\s+\/s/i);
 });
 

@@ -1050,10 +1050,10 @@ ipcMain.handle("updates:install", async () => {
       downloadedBytes: plan.asset?.size || 0,
       totalBytes: plan.asset?.size || 0,
       percent: 100,
-      message: "Update installer downloaded; launching installer.",
+      message: "Update installer downloaded; opening installer window.",
     });
     try {
-      launchDownloadedInstaller(prepared.installerPath);
+      await launchDownloadedInstaller(prepared.installerPath);
     } catch (error) {
       appendRuntimeLog(formatError("launchUpdateInstaller", error));
       try {
@@ -1067,7 +1067,7 @@ ipcMain.handle("updates:install", async () => {
     return {
       ok: true,
       message: `Downloaded CodexBridge ${plan.latestVersion} installer.`,
-      nextStep: `安装器已下载并启动：${prepared.installerPath}。当前 CodexBridge 会退出，安装完成后会打开新版。`,
+      nextStep: `安装窗口已打开：${prepared.installerPath}。你可以选择安装位置；当前 CodexBridge 会退出，安装完成后会启动新版并清理旧版和安装包。`,
       latestVersion: plan.latestVersion,
       installerPath: prepared.installerPath,
       installerNotePath: prepared.installerNotePath,
@@ -1519,6 +1519,7 @@ async function cleanupUpdateArtifactsOnStartup() {
     fs.mkdirSync(portableUpdatesDir(), { recursive: true });
     await updater.cleanupManagedUpdateArtifacts?.(portableUpdatesDir(), { keepPackages: launchedAfterUpdate ? 0 : 1 });
     if (launchedAfterUpdate) {
+      cleanupInstallerPackageAfterUpdate();
       cleanupInstalledAppVersionsAfterUpdate();
     }
   } catch (error) {
@@ -1526,39 +1527,119 @@ async function cleanupUpdateArtifactsOnStartup() {
   }
 }
 
-function cleanupInstalledAppVersionsAfterUpdate() {
-  if (process.platform !== "win32" || !app.isPackaged || !process.env.LOCALAPPDATA) {
+function cleanupInstallerPackageAfterUpdate() {
+  const installerPath = updateCleanupInstallerPath();
+  if (!installerPath) {
     return;
   }
-  const installedRoot = path.resolve(process.env.LOCALAPPDATA, "Programs", "CodexBridge");
-  const currentAppDir = path.resolve(path.dirname(process.execPath));
-  if (!isPathInsideOrEqual(currentAppDir, installedRoot) || samePath(currentAppDir, installedRoot)) {
+  const updatesDir = portableUpdatesDir();
+  if (!isPathInsideOrEqual(installerPath, updatesDir)) {
+    appendRuntimeLog(`Skipped update installer cleanup outside managed updates folder: ${installerPath}`);
     return;
   }
-  let entries = [];
+  if (!/CodexBridge-Windows-x64-Setup\.exe$/i.test(path.basename(installerPath))) {
+    appendRuntimeLog(`Skipped update installer cleanup for unexpected file: ${installerPath}`);
+    return;
+  }
   try {
-    entries = fs.readdirSync(installedRoot, { withFileTypes: true });
+    fs.rmSync(installerPath, { force: true });
+    appendRuntimeLog(`Removed update installer package: ${installerPath}`);
   } catch (error) {
-    if (error?.code !== "ENOENT") {
-      appendRuntimeLog(formatError("cleanupInstalledApps", error));
-    }
+    appendRuntimeLog(formatError("cleanupUpdateInstaller", error));
+  }
+}
+
+function cleanupInstalledAppVersionsAfterUpdate() {
+  if (process.platform !== "win32" || !app.isPackaged) {
     return;
   }
-  for (const entry of entries) {
-    if (!entry.isDirectory() || !/^app-/i.test(entry.name)) {
-      continue;
-    }
-    const targetDir = path.resolve(installedRoot, entry.name);
-    if (samePath(targetDir, currentAppDir)) {
-      continue;
-    }
+  const currentAppDir = path.resolve(path.dirname(process.execPath));
+  const roots = uniquePaths([
+    installedRootForVersionedAppDir(currentAppDir),
+    updatePreviousInstallDir(),
+  ].filter(Boolean));
+  if (!roots.length) {
+    return;
+  }
+
+  for (const installedRoot of roots) {
+    let entries = [];
     try {
-      removeDirectoryTreeSafeSync(targetDir, installedRoot);
-      appendRuntimeLog(`Removed previous CodexBridge app directory: ${targetDir}`);
+      entries = fs.readdirSync(installedRoot, { withFileTypes: true });
     } catch (error) {
-      appendRuntimeLog(formatError("cleanupInstalledAppVersion", error));
+      if (error?.code !== "ENOENT") {
+        appendRuntimeLog(formatError("cleanupInstalledApps", error));
+      }
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !/^app-/i.test(entry.name)) {
+        continue;
+      }
+      const targetDir = path.resolve(installedRoot, entry.name);
+      if (samePath(targetDir, currentAppDir)) {
+        continue;
+      }
+      try {
+        removeDirectoryTreeSafeSync(targetDir, installedRoot);
+        appendRuntimeLog(`Removed previous CodexBridge app directory: ${targetDir}`);
+      } catch (error) {
+        appendRuntimeLog(formatError("cleanupInstalledAppVersion", error));
+      }
     }
   }
+}
+
+function installedRootForVersionedAppDir(appDir) {
+  const resolvedAppDir = path.resolve(appDir || "");
+  if (!/^app-/i.test(path.basename(resolvedAppDir))) {
+    return "";
+  }
+  return path.dirname(resolvedAppDir);
+}
+
+function updatePreviousInstallDir() {
+  const value = commandLineOptionValue("--previous-install-dir");
+  if (!value) {
+    return "";
+  }
+  const resolved = path.resolve(value);
+  return /^app-/i.test(path.basename(resolved)) ? path.dirname(resolved) : resolved;
+}
+
+function updateCleanupInstallerPath() {
+  const value = commandLineOptionValue("--cleanup-installer");
+  return value ? path.resolve(value) : "";
+}
+
+function commandLineOptionValue(name) {
+  const args = process.argv || [];
+  const prefix = `${name}=`;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = String(args[index] || "");
+    if (arg === name) {
+      const nextArg = String(args[index + 1] || "");
+      return nextArg && !nextArg.startsWith("--") ? nextArg : "";
+    }
+    if (arg.startsWith(prefix)) {
+      return arg.slice(prefix.length);
+    }
+  }
+  return "";
+}
+
+function uniquePaths(paths) {
+  const seen = new Set();
+  const result = [];
+  for (const item of paths) {
+    const resolved = path.resolve(item);
+    const key = normalizeFsPath(resolved).toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(resolved);
+    }
+  }
+  return result;
 }
 
 function removeDirectoryTreeSafeSync(targetDir, allowedRoot) {
@@ -1775,6 +1856,10 @@ function currentInstallKind() {
   if (process.platform !== "win32") {
     return "portable";
   }
+  const versionedInstallRoot = installedRootForVersionedAppDir(path.dirname(process.execPath));
+  if (versionedInstallRoot) {
+    return "installed";
+  }
   const localAppData = process.env.LOCALAPPDATA;
   if (!localAppData) {
     return "portable";
@@ -1797,20 +1882,21 @@ function quitAfterUpdateLaunch() {
   timer.unref?.();
 }
 
-function launchDownloadedInstaller(installerPath) {
+async function launchDownloadedInstaller(installerPath) {
   if (!installerPath) {
     throw new Error("Missing update installer path.");
   }
-  const child = process.platform === "win32"
-    ? spawn(installerPath, ["/S"], {
-        detached: true,
-        stdio: "ignore",
-        windowsHide: true,
-      })
-    : spawn(installerPath, [], {
-        detached: true,
-        stdio: "ignore",
-      });
+  if (process.platform === "win32") {
+    const openError = await shell.openPath(installerPath);
+    if (openError) {
+      throw new Error(openError);
+    }
+    return;
+  }
+  const child = spawn(installerPath, [], {
+    detached: true,
+    stdio: "ignore",
+  });
   child.unref?.();
 }
 
@@ -1849,10 +1935,11 @@ function writeInstallerUpdateInstructions({
     `Updates folder: ${updatesDir}`,
     "",
     "What happens next:",
-    "1. CodexBridge tries to launch this installer after the download finishes.",
-    "2. If Windows blocks or hides the installer window, run the downloaded installer from this folder.",
-    "3. The installer writes a versioned app under the user Programs directory and launches the new CodexBridge.",
-    "4. Your configuration, keys, model selection, statistics, and logs are stored in the user data directory.",
+    "1. CodexBridge opens the interactive installer window after the download finishes.",
+    "2. Choose an install location in the installer if you do not want the default user Programs folder.",
+    "3. The installer creates a desktop shortcut by default, launches the new CodexBridge, and passes cleanup information to it.",
+    "4. The new app removes the downloaded installer package and previous managed app-* version folders.",
+    "5. Your configuration, keys, model selection, statistics, and logs are stored in the user data directory.",
     "",
     "The current app is not silently replaced while it is running.",
   ];
