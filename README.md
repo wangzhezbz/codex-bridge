@@ -8,18 +8,17 @@ CodexBridge lets Codex use GPT, DeepSeek, Kimi, and more OpenAI-compatible model
 
 CodexBridge 让 Codex 通过一个本地 Router 和一个模型栏同时使用 GPT、DeepSeek、Kimi 以及更多 OpenAI-compatible 模型。
 
-## Download / 下载
+## 下载
 
-Latest builds:
+### Windows
 
-最新安装包：
+- **推荐·安装版：** [CodexBridge-Windows-x64-Setup.exe](https://github.com/wangzhezbz/codex-bridge/releases/latest/download/CodexBridge-Windows-x64-Setup.exe)
+- **免安装版：** [CodexBridge-Windows-x64-Portable.zip](https://github.com/wangzhezbz/codex-bridge/releases/latest/download/CodexBridge-Windows-x64-Portable.zip)
 
-- Windows installer: [CodexBridge-Windows-x64-Setup.exe](https://github.com/wangzhezbz/codex-bridge/releases/latest/download/CodexBridge-Windows-x64-Setup.exe)
-- Windows portable fallback: [CodexBridge-Windows-x64-Portable.zip](https://github.com/wangzhezbz/codex-bridge/releases/latest/download/CodexBridge-Windows-x64-Portable.zip)
-- Mac M series: [CodexBridge-macOS-arm64-Portable.zip](https://github.com/wangzhezbz/codex-bridge/releases/latest/download/CodexBridge-macOS-arm64-Portable.zip)
-- Mac Intel: [CodexBridge-macOS-x64-Portable.zip](https://github.com/wangzhezbz/codex-bridge/releases/latest/download/CodexBridge-macOS-x64-Portable.zip)
+### macOS
 
-macOS note:
+- **M 系列芯片：** [CodexBridge-macOS-arm64-Portable.zip](https://github.com/wangzhezbz/codex-bridge/releases/latest/download/CodexBridge-macOS-arm64-Portable.zip)
+- **Intel 芯片：** [CodexBridge-macOS-x64-Portable.zip](https://github.com/wangzhezbz/codex-bridge/releases/latest/download/CodexBridge-macOS-x64-Portable.zip)
 
 macOS 提示“已损坏”或无法打开时，先把 `CodexBridge.app` 放到“应用程序”，然后打开“终端”执行下面命令，输入电脑密码并回车：
 
@@ -27,13 +26,7 @@ macOS 提示“已损坏”或无法打开时，先把 `CodexBridge.app` 放到�
 sudo xattr -cr /Applications/CodexBridge.app
 ```
 
-Release history:
-
-历史版本：
-
-[GitHub Releases](https://github.com/wangzhezbz/codex-bridge/releases)
-
-After downloading, Windows users should run the installer. The Windows portable zip is a fallback for locked-down or manual environments; macOS users should extract the matching macOS zip.
+历史版本：[GitHub Releases](https://github.com/wangzhezbz/codex-bridge/releases)
 
 下载后，Windows 用户优先运行 Windows 安装版；Windows 免安装包只是备用方案。macOS 用户解压对应芯片的 macOS 包后运行。
 

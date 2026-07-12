@@ -43,7 +43,7 @@ test("user-facing docs separate Win users and Mac users", () => {
   ]) {
     const text = fs.readFileSync(path.join(process.cwd(), file), "utf8");
     assert.match(text, /Win 用户|Win users|Windows/, `${file} should name Win or Windows users`);
-    assert.match(text, /Mac 用户|Mac users|Mac/, `${file} should name Mac users`);
+    assert.match(text, /Mac 用户|Mac users|Mac|macOS/, `${file} should name Mac or macOS users`);
     assert.doesNotMatch(text, /普通用户|Normal users/i, `${file} should not say normal users`);
     assert.doesNotMatch(text, /高级用户|Advanced users/i, `${file} should not say advanced users`);
   }
@@ -52,10 +52,13 @@ test("user-facing docs separate Win users and Mac users", () => {
 test("top-level download sections use simple platform labels", () => {
   for (const file of ["README.md", path.join("docs", "releases.md")]) {
     const text = fs.readFileSync(path.join(process.cwd(), file), "utf8");
-    assert.match(text, /- Windows installer: \[CodexBridge-Windows-x64-Setup\.exe\]/, `${file} should use a simple Windows installer label`);
-    assert.match(text, /- Windows portable fallback: \[CodexBridge-Windows-x64-Portable\.zip\]/, `${file} should use a simple Windows portable fallback label`);
-    assert.match(text, /- Mac M series: \[CodexBridge-macOS-arm64-Portable\.zip\]/, `${file} should use a simple Mac M label`);
-    assert.match(text, /- Mac Intel: \[CodexBridge-macOS-x64-Portable\.zip\]/, `${file} should use a simple Mac Intel label`);
+    assert.match(text, /### Windows/, `${file} should group Windows downloads`);
+    assert.match(text, /推荐·安装版：\*\* \[CodexBridge-Windows-x64-Setup\.exe\]/, `${file} should recommend the Windows installer`);
+    assert.match(text, /免安装版：\*\* \[CodexBridge-Windows-x64-Portable\.zip\]/, `${file} should retain the Windows portable build`);
+    assert.match(text, /### macOS/, `${file} should group macOS downloads`);
+    assert.match(text, /M 系列芯片：\*\* \[CodexBridge-macOS-arm64-Portable\.zip\]/, `${file} should label Apple Silicon`);
+    assert.match(text, /Intel 芯片：\*\* \[CodexBridge-macOS-x64-Portable\.zip\]/, `${file} should label Intel Macs`);
+    assert.doesNotMatch(text, /Download\s*\/\s*下载|Latest Download\s*\/\s*最新下载/i, `${file} should not duplicate translated headings`);
     assert.doesNotMatch(text, /Win users\s*\/\s*Win/i, `${file} should not duplicate Win labels`);
     assert.doesNotMatch(text, /Mac users\s*\/\s*Mac/i, `${file} should not duplicate Mac labels`);
   }
