@@ -12,7 +12,7 @@ CodexBridge 让 Codex 通过一个本地 Router 和一个模型栏同时使用 G
 
 Latest builds:
 
-最新免安装包：
+最新安装包：
 
 - Windows installer: [CodexBridge-Windows-x64-Setup.exe](https://github.com/wangzhezbz/codex-bridge/releases/latest/download/CodexBridge-Windows-x64-Setup.exe)
 - Windows portable fallback: [CodexBridge-Windows-x64-Portable.zip](https://github.com/wangzhezbz/codex-bridge/releases/latest/download/CodexBridge-Windows-x64-Portable.zip)
@@ -33,9 +33,9 @@ Release history:
 
 [GitHub Releases](https://github.com/wangzhezbz/codex-bridge/releases)
 
-After downloading, run the Windows installer or extract the portable zip for your platform.
+After downloading, Windows users should run the installer. The Windows portable zip is a fallback for locked-down or manual environments; macOS users should extract the matching macOS zip.
 
-下载后解压，并运行对应平台的应用。
+下载后，Windows 用户优先运行 Windows 安装版；Windows 免安装包只是备用方案。macOS 用户解压对应芯片的 macOS 包后运行。
 
 ## Status / 当前状态
 
@@ -63,20 +63,20 @@ Current capabilities:
 
 ## Why / 为什么做这个
 
-Codex Desktop can point its built-in OpenAI provider at a local base URL, but users still need a practical way to mix multiple upstream providers in one model picker.
+The unified ChatGPT Desktop app (and legacy Codex Desktop) can point its Codex provider at a local base URL, but users still need a practical way to mix multiple upstream providers in one model picker.
 
 CodexBridge acts as a local bridge:
 
 ```text
-Codex Desktop -> CodexBridge -> GPT / DeepSeek / Kimi / other models
+ChatGPT / Codex Desktop -> CodexBridge -> GPT / DeepSeek / Kimi / other models
 ```
 
-Codex Desktop 可以把内置 OpenAI provider 指向本地 base URL，但很多 Win 用户和 Mac 用户很难把多家模型同时放进一个模型栏里稳定使用。
+新版 ChatGPT Desktop（以及仍受支持的旧版 Codex Desktop）可以把 Codex provider 指向本地 base URL，但很多 Win 用户和 Mac 用户仍很难把多家模型同时放进一个模型栏里稳定使用。
 
 CodexBridge 的角色就是本地桥接层：
 
 ```text
-Codex Desktop -> CodexBridge -> GPT / DeepSeek / Kimi / 更多模型
+ChatGPT / Codex Desktop -> CodexBridge -> GPT / DeepSeek / Kimi / 更多模型
 ```
 
 ## Billing Modes / 计费模式
@@ -99,19 +99,20 @@ Use:
 config/router.config.example.json
 ```
 
-Codex config keeps the built-in OpenAI provider and points it at the local router:
+Codex config uses a dedicated CodexBridge provider and points it at the local router:
 
-Codex 配置保留内置 OpenAI provider，并把 base URL 指到本地 Router：
+Codex 配置使用独立的 CodexBridge provider，并把 base URL 指到本地 Router：
 
 ```toml
-model_provider = "openai"
-model = "gpt-5.5"
-model_catalog_json = "C:/Users/you/AppData/Roaming/CodexBridge/model-catalog.json"
+model_provider = "codexbridge"
+model = "cb-gpt-5-6-sol"
+model_catalog_json = "C:/Users/you/.codex/codexbridge-model-catalog.json"
 model_reasoning_effort = "medium"
-disable_response_storage = false
-network_access = "enabled"
-openai_base_url = "http://127.0.0.1:15722/v1"
-windows_wsl_setup_acknowledged = true
+model_providers.codexbridge.name = "CodexBridge"
+model_providers.codexbridge.base_url = "http://127.0.0.1:15722/v1"
+model_providers.codexbridge.wire_api = "responses"
+model_providers.codexbridge.requires_openai_auth = false
+model_providers.codexbridge.http_headers = { Authorization = "Bearer sk-local-codex-router" }
 ```
 
 ### Hybrid / 混合模式
@@ -128,19 +129,16 @@ Use:
 config/router.config.hybrid.example.json
 ```
 
-Codex config is the same as All API mode. The router decides whether a selected model uses the Codex/OpenAI bearer or that provider's API key:
+Hybrid mode preserves Codex's built-in `openai` provider identity so legacy OpenAI conversations stay in the same history scope. Only the built-in provider base URL is redirected to the local Router:
 
-Codex 配置和全部 API 模式相同；具体上游认证由 Router 按模型决定：
+混合模式保留 Codex 内置 `openai` provider 身份，让旧 OpenAI 会话继续处于同一历史作用域；只把内置 provider 的 base URL 指向本地 Router：
 
 ```toml
 model_provider = "openai"
-model = "gpt-5.5"
-model_catalog_json = "C:/Users/you/AppData/Roaming/CodexBridge/model-catalog.json"
+model = "cb-gpt-5-6-sol"
+model_catalog_json = "C:/Users/you/.codex/codexbridge-model-catalog.json"
 model_reasoning_effort = "medium"
-disable_response_storage = false
-network_access = "enabled"
 openai_base_url = "http://127.0.0.1:15722/v1"
-windows_wsl_setup_acknowledged = true
 ```
 
 Hybrid mode is implemented in the router core, but real ChatGPT subscription billing must be verified on a signed-in Codex account because unit tests cannot create a ChatGPT subscription bearer token.
@@ -149,15 +147,15 @@ Hybrid mode is implemented in the router core, but real ChatGPT subscription bil
 
 ## Quick Start / 快速开始
 
-Win users and Mac users should use the portable builds above. Node.js is only needed when developing from source.
+Win users should use the Windows installer above. The Windows portable zip is only a fallback; Mac users should use the macOS portable builds. Node.js is only needed when developing from source.
 
-Win 用户和 Mac 用户请使用上面的免安装包。只有从源码开发时才需要 Node.js。
+Win 用户请优先使用上面的 Windows 安装版；Windows 免安装包只是备用。Mac 用户使用对应芯片的 macOS 免安装包。只有从源码开发时才需要 Node.js。
 
 ### Desktop manager / 桌面管理器
 
-On Windows, download the Windows installer and run it. Portable zip users can extract it and double-click:
+On Windows, download the Windows installer and run it. Portable fallback users can extract the zip and double-click:
 
-Windows 下下载 Windows 免安装包，解压后双击：
+Windows 下下载 Windows 安装版并运行。需要便携版备用时，再解压 zip 后双击：
 
 ```text
 CodexBridge.exe
@@ -267,22 +265,19 @@ Example:
 
 ```toml
 model_provider = "openai"
-model = "gpt-5.5"
-model_catalog_json = "C:/Users/you/AppData/Roaming/CodexBridge/model-catalog.json"
+model = "cb-gpt-5-6-sol"
+model_catalog_json = "C:/Users/you/.codex/codexbridge-model-catalog.json"
 model_reasoning_effort = "medium"
-disable_response_storage = false
-network_access = "enabled"
 openai_base_url = "http://127.0.0.1:15722/v1"
-windows_wsl_setup_acknowledged = true
 ```
 
-CodexBridge now uses `openai_base_url` instead of a custom `model_providers.codex-bridge` entry, so existing Codex Desktop conversations remain attached to the built-in `openai` provider.
+Hybrid mode keeps the built-in `openai` provider identity and redirects it to the local Router. This preserves the legacy OpenAI conversation scope; the desktop app repairs older managed configs automatically and keeps a backup before writing. All-API mode continues to use the dedicated `model_providers.codexbridge` entry.
 
-CodexBridge 现在使用 `openai_base_url` 指向本地 Router，不再写 `experimental_bearer_token` 或 `requires_openai_auth`。
+混合模式保留内置 `openai` provider 身份，只把它重定向到本地 Router，从而保留旧 OpenAI 会话作用域。桌面端会自动修复旧托管配置，并在写入前保留备份；全部 API 模式仍使用独立的 `model_providers.codexbridge`。
 
-Restart Codex Desktop after changing `model_catalog_json`.
+Restart ChatGPT / Codex Desktop after changing `model_catalog_json`.
 
-修改 `model_catalog_json` 后，需要重启 Codex Desktop 才能刷新模型栏。
+修改 `model_catalog_json` 后，需要点击“重启 ChatGPT / Codex”才能刷新模型栏。
 
 ## Verify / 验证
 
@@ -310,23 +305,23 @@ PowerShell 里建议使用 `curl.exe`，因为 `curl` 通常是 `Invoke-WebReque
 
 ## Troubleshooting 502 / 502 排查
 
-If Codex shows `502 Bad Gateway`, open the CodexBridge log page first.
+If ChatGPT / Codex Desktop shows `502 Bad Gateway`, open the CodexBridge log page first.
 
-如果 Codex 显示 `502 Bad Gateway`，请先打开 CodexBridge 的日志页。
+如果 ChatGPT / Codex Desktop 显示 `502 Bad Gateway`，请先打开 CodexBridge 的日志页。
 
-- If there is no `access POST /v1/responses` line, Codex did not reach Router. Restart CodexBridge, start Router again, then restart Codex.
+- If there is no `access POST /v1/responses` line, the desktop app did not reach Router. Restart CodexBridge, start Router again, then restart ChatGPT / Codex Desktop.
 - If `access POST /v1/responses` appears, the request reached Router. Check the following `req_... -> upstream` and `req_... !! upstream` lines for the real provider, model, proxy, status, and upstream message.
 - If every model fails with 502 and there is no access log, the usual cause is stale Codex config or a system proxy/VPN intercepting local traffic. Current releases write `http://127.0.0.1:15722/v1` automatically when Router starts.
 - If the log says `Missing API key ... Set MOONSHOT_API_KEY` or another `*_API_KEY`, save that provider key in the API Key page. The Codex slot name such as `gpt-5.2` may actually map to Kimi or another provider.
 
-- 如果没有 `access POST /v1/responses`，说明 Codex 没有打到 Router。请重启 CodexBridge，重新启动 Router，再重启 Codex。
+- 如果没有 `access POST /v1/responses`，说明桌面应用没有打到 Router。请重启 CodexBridge，重新启动 Router，再点击“重启 ChatGPT / Codex”。
 - 如果出现了 `access POST /v1/responses`，说明请求已经进 Router。继续看后面的 `req_... -> upstream` 和 `req_... !! upstream`，里面会显示真实 provider、真实模型、代理、状态码和上游错误。
 - 如果所有模型都 502 且没有 access 日志，常见原因是 Codex 配置仍是旧的，或系统代理/VPN 接管了本地流量。当前版本在启动 Router 时会自动写入 `http://127.0.0.1:15722/v1`。
 - 如果日志写着 `Missing API key ... Set MOONSHOT_API_KEY` 或其他 `*_API_KEY`，请到“密钥”页保存对应服务商的 Key。`gpt-5.2` 这类 Codex 槽位名可能实际映射到 Kimi 或其他模型。
 
 ## Recover Conversations / 找回历史对话
 
-Current releases keep `model_provider = "openai"` and use `openai_base_url`, so old Codex Desktop conversations should remain visible after starting Router and fully reopening Codex. The recover button is only a fallback for merging old desktop/history settings from backups; it cannot recreate conversations if Codex's local session database was deleted or a different `CODEX_HOME` is being used.
+Hybrid mode uses `model_provider = "openai"` with `openai_base_url` pointing to the local Router, so enabling Bridge does not switch legacy conversations into a different provider scope. All-API mode still uses the independent `codexbridge` provider. The recover button is a separate repair tool and is not the primary fix for provider-scoped history visibility.
 
 If old Codex conversations disappear after enabling CodexBridge, open CodexBridge and click `找回历史对话`. The app merges history and desktop-related settings from the pre-Bridge backup while keeping the current CodexBridge model list, Router URL, and API settings. Then fully quit and reopen Codex.
 
@@ -346,13 +341,17 @@ If old Codex conversations disappear after enabling CodexBridge, open CodexBridg
 
 ## Roadmap / 路线图
 
+Detailed current progress is tracked in [docs/roadmap-progress.md](docs/roadmap-progress.md).
+
+当前路线图的真实进度记录在 [docs/roadmap-progress.md](docs/roadmap-progress.md)。
+
 - Desktop app with setup wizard.
 - Provider and API key management.
 - Large preset model/provider library.
 - One-click Codex config apply and rollback.
 - Usage dashboard with real upstream model and token records.
 - Live logs and diagnostics export.
-- Win and Mac portable packages with no manual Node.js setup.
+- Windows installer, Windows portable fallback, and macOS portable packages with no manual Node.js setup.
 
 - 桌面应用和新手配置向导。
 - Provider 与 API Key 管理。
@@ -360,7 +359,7 @@ If old Codex conversations disappear after enabling CodexBridge, open CodexBridg
 - 一键写入 Codex 配置和一键回滚。
 - 展示真实上游模型和 token 记录的用量面板。
 - 实时日志和诊断导出。
-- Win 和 Mac 免安装包，不再要求用户手动安装 Node.js。
+- Windows 安装版、Windows 免安装备用包和 macOS 免安装包，不再要求用户手动安装 Node.js。
 
 ## License / 许可证
 

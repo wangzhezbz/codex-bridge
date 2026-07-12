@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Bridge</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="/styles.css?v=20260707-gpt-copy">
+  </head>
+  <body class="project-mode">
+    <div class="app-shell">
+      <header class="topbar" aria-label="Bridge 顶栏">
+        <div class="brand-area">
+          <button id="backToProjectsButton" class="icon-button is-hidden" type="button" aria-label="返回项目列表">←</button>
+          <div>
+            <div class="brand">Bridge</div>
+            <div id="activeProjectTitle" class="project-title">选择项目</div>
+          </div>
+        </div>
+
+        <div class="status-line" aria-label="连接状态">
+          <span id="bindingState">未绑定</span>
+          <span id="syncModeText">等待同步</span>
+          <span id="routingRuleState" class="routing-rule-state">规则未写入</span>
+          <details id="chainStatusPanel" class="chain-status-panel" aria-label="链路状态">
+            <summary class="chain-status-summary">
+              <span id="chainSummaryValue">链路待命</span>
+            </summary>
+            <div class="chain-status-popover">
+              <div class="chain-status-meta">
+                <span>最近更新</span>
+                <strong id="chainUpdatedValue">等待数据</strong>
+              </div>
+              <div class="chain-status-grid">
+                <span class="chain-status-item">
+                  <span>链路</span>
+                  <strong id="chainRouteValue" class="chain-status-value">未开始</strong>
+                </span>
+                <span class="chain-status-item">
+                  <span>省额度</span>
+                  <strong id="chainSavingsValue" class="chain-status-value">未触发</strong>
+                </span>
+                <span class="chain-status-item">
+                  <span>规则</span>
+                  <strong id="chainRuleValue" class="chain-status-value">待检测</strong>
+                </span>
+                <span class="chain-status-item">
+                  <span>错误</span>
+                  <strong id="chainErrorValue" class="chain-status-value">无</strong>
+                </span>
+              </div>
+              <div id="selfCheckPanel" class="self-check-panel" hidden aria-live="polite">
+                <div>
+                  <span id="selfCheckTitle">自检准备中</span>
+                  <p id="selfCheckDetail">检查服务、扩展、绑定会话和规则状态。</p>
+                </div>
+                <strong id="selfCheckNextStep">请稍等</strong>
+              </div>
+              <div class="chain-status-actions">
+                <button id="chainCopyStatusButton" class="chain-status-copy-button" type="button">复制状态</button>
+                <button id="chainCopyAcceptanceRecordButton" class="chain-status-copy-button" type="button">验收记录</button>
+              </div>
+            </div>
+          </details>
+        </div>
+
+        <div class="top-actions">
+          <button id="themeToggle" class="icon-button theme-toggle" type="button" aria-label="切换黑白主题">
+            <span aria-hidden="true"></span>
+          </button>
+          <button id="selfCheckButton" class="icon-button self-check-button" type="button" aria-label="一键自检" title="一键自检">✓</button>
+          <button id="clearMessagesButton" class="icon-button clear-messages-button" type="button" aria-label="清空当前对话" title="清空当前对话">清</button>
+          <button id="settingsButton" class="icon-button" type="button" aria-label="设置">⚙</button>
+          <button id="refreshButton" class="icon-button" type="button" aria-label="刷新">↻</button>
+        </div>
+      </header>
+
+      <main class="main-surface">
+        <section id="projectView" class="project-view" aria-label="绑定当前会话">
+          <div class="project-hero">
+            <p class="kicker">当前 Codex 会话</p>
+            <h1>先有 Codex 会话，再绑定右侧 GPT</h1>
+            <p>在当前 Codex 会话里打开这个页面后，绑定它自己的 GPT 会话和本地项目目录。后续消息、文件和上下文只归这个会话使用。</p>
+          </div>
+
+          <section id="onboardingGuide" class="onboarding-guide" aria-label="首次使用检查">
+            <div class="onboarding-copy">
+              <p class="kicker">首次使用</p>
+              <h2>先确认三件事</h2>
+              <p>页面能打开说明本地服务已启动；绑定当前会话后点自检，确认扩展、GPT 会话和规则都在同一条链路上。</p>
+            </div>
+            <ol class="onboarding-steps">
+              <li><span>1</span><strong>打开本页</strong></li>
+              <li><span>2</span><strong>绑定当前会话</strong></li>
+              <li><span>3</span><strong>运行自检</strong></li>
+            </ol>
+          </section>
+
+          <div id="projectList" class="project-list"></div>
+
+          <form id="newProjectForm" class="new-project-form" aria-label="绑定当前会话">
+            <label>
+              项目名称
+              <input id="projectNameInput" name="name" autocomplete="off" placeholder="例如：游戏登录页">
+            </label>
+            <label>
+              GPT 会话
+              <input id="projectUrlInput" name="chatgptProjectUrl" autocomplete="off" placeholder="https://chatgpt.com/c/...">
+            </label>
+            <label>
+              本地项目目录
+              <input id="targetRepoInput" name="targetRepo" autocomplete="off" placeholder="请选择或粘贴本地项目目录">
+            </label>
+            <button id="newProjectSubmitButton" type="submit">绑定当前会话并进入</button>
+          </form>
+        </section>
+
+        <section id="chatView" class="chat-view is-hidden" aria-label="Bridge 聊天">
+          <section id="acceptancePanel" class="acceptance-panel" hidden aria-label="隐藏验收模式">
+            <div class="acceptance-head">
+              <div>
+                <p class="kicker">隐藏验收</p>
+                <h2>Bridge 验收台</h2>
+                <p id="acceptanceSummary">打开 ?qa=1 后显示当前房间的数据读取和自动路由覆盖情况。</p>
+              </div>
+              <div class="acceptance-actions">
+                <button id="acceptanceRefreshButton" class="button-like" type="button">刷新验收</button>
+                <button id="acceptanceSendNextButton" class="button-like" type="button">发送下一项</button>
+                <button id="acceptanceReportButton" class="button-like" type="button">复制报告</button>
+                <button id="acceptanceRecordButton" class="button-like" type="button">下载记录</button>
+              </div>
+            </div>
+            <div id="acceptanceList" class="acceptance-list"></div>
+          </section>
+
+          <section id="workflowBanner" class="workflow-banner" hidden aria-live="polite">
+            <div class="workflow-copy">
+              <span id="workflowTitle">Bridge 已连接</span>
+              <p id="workflowDetail">可以直接发送消息或拖入文件。</p>
+            </div>
+            <div class="workflow-side">
+              <span id="workflowNextStep" class="workflow-next-step">继续工作</span>
+              <div id="workflowActions" class="workflow-actions" hidden>
+                <button id="workflowOpenBoundChatButton" class="workflow-action-button" data-workflow-action="bound-chat" type="button">打开绑定会话</button>
+                <button id="workflowOpenExtensionsButton" class="workflow-action-button" data-workflow-action="extension" type="button">打开扩展管理</button>
+                <button id="workflowApplyPreferencesButton" class="workflow-action-button" data-workflow-action="preference" type="button">重新应用偏好</button>
+                <button id="workflowRecheckButton" class="workflow-action-button" data-workflow-action="always" type="button">重新检测</button>
+                <button id="workflowCopyStepsButton" class="workflow-action-button" data-workflow-action="always" type="button">复制修复步骤</button>
+              </div>
+            </div>
+          </section>
+
+          <div id="chatMessages" class="message-list" aria-live="polite"></div>
+
+          <details id="outputDrawer" class="output-drawer" hidden aria-hidden="true">
+            <summary>
+              <span>输出</span>
+              <span id="outputSummary">0 个文件</span>
+            </summary>
+            <div class="output-tools">
+              <label class="button-like import-file-label">
+                添加文件
+                <input id="artifactImportInput" type="file" multiple>
+              </label>
+            </div>
+            <div id="artifactList" class="artifact-list"></div>
+          </details>
+
+          <form id="chatForm" class="composer">
+            <div id="composerBox" class="composer-box">
+              <div id="attachmentTray" class="attachment-tray" hidden></div>
+              <textarea id="chatInput" name="text" placeholder="给 GPT 发消息"></textarea>
+              <div class="composer-footer">
+                <label class="attach-button" title="添加本机文件" aria-label="添加本机文件">
+                  <span aria-hidden="true">+</span>
+                  <input id="composerFileInput" type="file" multiple>
+                </label>
+                <div class="composer-footer-right">
+                  <select id="modeSelect" class="preference-select mode-select" aria-label="GPT 模式">
+                    <option value="default">默认</option>
+                    <option value="fast">极速 5.5</option>
+                    <option value="balanced" selected>中</option>
+                    <option value="advanced">高</option>
+                    <option value="high">极高</option>
+                    <option value="pro">Pro</option>
+                  </select>
+                  <select id="modelSelect" class="preference-select model-select" aria-label="GPT 模型">
+                    <option value="gpt-5.6-sol">GPT-5.6 Sol</option>
+                    <option value="gpt-5.5">GPT-5.5</option>
+                    <option value="gpt-5.4">GPT-5.4</option>
+                    <option value="gpt-5.3">GPT-5.3</option>
+                    <option value="o3">o3</option>
+                  </select>
+                  <button id="sendButton" class="send-button" type="submit" aria-label="发送">↑</button>
+                </div>
+              </div>
+              <p id="composerBlockHint" class="composer-block-hint" hidden aria-live="polite"></p>
+            </div>
+          </form>
+        </section>
+      </main>
+
+      <dialog id="settingsDialog" class="panel-dialog">
+        <form method="dialog" class="dialog-header">
+          <div>
+            <p class="kicker">项目设置</p>
+            <h2>绑定信息</h2>
+          </div>
+          <button type="submit" class="icon-button" aria-label="关闭">×</button>
+        </form>
+        <form id="bindingForm" class="settings-form">
+          <label>
+            GPT 会话
+            <input id="settingsProjectUrlInput" name="chatgptProjectUrl" autocomplete="off">
+          </label>
+          <label>
+            本地项目目录
+            <input id="settingsTargetRepoInput" name="targetRepo" autocomplete="off">
+          </label>
+          <button type="submit">保存</button>
+        </form>
+      </dialog>
+
+      <dialog id="previewDialog" class="panel-dialog preview-dialog">
+        <form method="dialog" class="dialog-header">
+          <div>
+            <p class="kicker">预览</p>
+            <h2 id="previewTitle">未选择文件</h2>
+          </div>
+          <div class="dialog-actions">
+            <button id="previewDownloadButton" class="icon-button" type="button" aria-label="下载">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v10m0 0 4-4m-4 4-4-4M5 17v2h14v-2"/></svg>
+            </button>
+            <button type="submit" class="icon-button" aria-label="关闭">×</button>
+          </div>
+        </form>
+        <div id="previewBody" class="preview-body"></div>
+      </dialog>
+
+      <dialog id="acceptanceRecordDialog" class="panel-dialog acceptance-record-dialog">
+        <form method="dialog" class="dialog-header">
+          <div>
+            <p class="kicker">验收记录</p>
+            <h2>真实链路记录</h2>
+          </div>
+          <div class="dialog-actions">
+            <button id="acceptanceRecordCopyButton" class="icon-button" type="button" aria-label="复制">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 8h10v12H8zM6 16H4V4h10v2"/></svg>
+            </button>
+            <button id="acceptanceRecordDownloadButton" class="icon-button" type="button" aria-label="下载">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v10m0 0 4-4m-4 4-4-4M5 17v2h14v-2"/></svg>
+            </button>
+            <button type="submit" class="icon-button" aria-label="关闭">×</button>
+          </div>
+        </form>
+        <pre id="acceptanceRecordBody" class="acceptance-record-body"></pre>
+      </dialog>
+
+      <dialog id="imageDialog" class="image-dialog">
+        <form method="dialog" class="image-dialog-header">
+          <span id="imagePreviewTitle">图片</span>
+          <span id="imagePreviewCounter" class="image-preview-counter"></span>
+          <div class="dialog-actions">
+            <button id="imagePreviewDownloadButton" class="icon-button" type="button" aria-label="下载">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v10m0 0 4-4m-4 4-4-4M5 17v2h14v-2"/></svg>
+            </button>
+            <button id="imagePreviewPrev" class="icon-button" type="button" aria-label="上一张">‹</button>
+            <button id="imagePreviewNext" class="icon-button" type="button" aria-label="下一张">›</button>
+            <button type="submit" class="icon-button" aria-label="关闭">×</button>
+          </div>
+        </form>
+        <img id="imagePreview" alt="GPT 输出图片预览">
+      </dialog>
+
+      <p id="toast" class="toast" role="status"></p>
+    </div>
+    <script type="module" src="/app.js?v=20260712-project-binding"></script>
+  </body>
+</html>

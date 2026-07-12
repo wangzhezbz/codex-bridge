@@ -11,11 +11,25 @@ import { COMPACT_SUMMARY_PREFIX } from "../src/compact.js";
 import { ResponseHistory } from "../src/history.js";
 import { shouldUseImageGenerationFallback } from "../src/image-generation.js";
 import {
-  createRouterServer,
+  createRouterServer as createRouterServerBase,
   isBenignRouterProcessError,
 } from "../src/server.js";
 import { callJsonUpstream, proxyResponsesApi } from "../src/upstream.js";
 import { __resetRateLimiterForTests } from "../src/rate-limit.js";
+
+// This suite predates the user-facing default-off duplicate request setting and
+// exercises the protection behavior throughout. Keep the legacy protection
+// explicit in this fixture; default-off behavior is covered by the dedicated
+// settings and pending-request suites.
+function createRouterServer(config, options) {
+  return createRouterServerBase(
+    {
+      duplicateRequestProtection: true,
+      ...config,
+    },
+    options,
+  );
+}
 
 test("router handles client socket parser errors without crashing", () => {
   const router = createRouterServer({
@@ -245,7 +259,7 @@ test("routeForModel never maps native GPT slot names to independent non-GPT rout
 
   assert.throws(
     () => routeForModel(config, "gpt-5.4"),
-    /Model is not configured in CodexBridge: gpt-5\.4/,
+    /CodexBridge 没有配置这个模型：gpt-5\.4/,
   );
   assert.equal(routeForModel(config, "deepseek-v4-pro").id, "cb-deepseek-v4-pro");
 });
@@ -279,7 +293,7 @@ test("routeForModel keeps native GPT names only for selected GPT routes", () => 
   );
   assert.throws(
     () => routeForModel(config, "gpt-5.4", { exactModelIdOnly: true }),
-    /Model is not configured in CodexBridge for Codex client requests: gpt-5\.4/,
+    /CodexBridge 没有为 Codex 客户端配置这个模型：gpt-5\.4/,
   );
 });
 
@@ -333,8 +347,8 @@ test("server reports upstream 413 as a request size problem with recovery guidan
     const body = await response.json();
     assert.equal(response.status, 413);
     assert.equal(body.error.code, "upstream_payload_too_large");
-    assert.match(body.error.message, /request is too large/i);
-    assert.match(body.error.message, /\/compact|large pasted logs|inline images/i);
+    assert.match(body.error.message, /请求内容太大/);
+    assert.match(body.error.message, /压缩上下文|大段日志|图片/);
   } finally {
     await close(router);
     await close(upstream);
@@ -399,7 +413,7 @@ test("server completes Codex desktop legacy native model aliases locally without
     assert.match(body, /event: response\.completed/);
     assert.match(
       body,
-      /CodexBridge 已在本地拦截旧模型槽位请求：gpt-5\.4/,
+      /检测到旧模型槽位请求：gpt-5\.4/,
     );
     assert.match(
       body,
@@ -659,8 +673,8 @@ test("server reports local request body limit with compact guidance", async () =
     const body = await response.json();
     assert.equal(response.status, 413);
     assert.equal(body.error.code, "request_body_too_large");
-    assert.match(body.error.message, /CodexBridge local request body is too large/i);
-    assert.match(body.error.message, /compact|inline images|large pasted/i);
+    assert.match(body.error.message, /本次请求内容太大/);
+    assert.match(body.error.message, /压缩上下文|开启新会话|内联图片/);
     assert.equal(upstreamCalls, 0);
   } finally {
     await close(router);
@@ -668,13 +682,13 @@ test("server reports local request body limit with compact guidance", async () =
   }
 });
 
-test("server returns a local rate-limit response without retrying the provider", async () => {
+test("server waits for provider cooldown before a completed rate-limit request retries", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer(async (_req, res) => {
     upstreamCalls += 1;
     res.writeHead(429, {
       "content-type": "application/json",
-      "retry-after": "30",
+      "retry-after": "0.01",
     });
     res.end(JSON.stringify({ error: { message: "Too Many Requests" } }));
   });
@@ -703,7 +717,7 @@ test("server returns a local rate-limit response without retrying the provider",
   const baseUrl = serverUrl(router);
 
   try {
-    const first = await fetchJson(`${baseUrl}/v1/responses`, {
+    const firstResponse = await requestText(`${baseUrl}/v1/responses`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -714,7 +728,7 @@ test("server returns a local rate-limit response without retrying the provider",
         input: "Chrome \u6253\u5f00 youtube",
       }),
     });
-    const second = await fetchJson(`${baseUrl}/v1/responses`, {
+    const secondResponse = await requestText(`${baseUrl}/v1/responses`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -726,13 +740,17 @@ test("server returns a local rate-limit response without retrying the provider",
       }),
     });
 
-    assert.match(first.output_text, /rate limited|token waste/i);
-    assert.match(second.output_text, /rate limited|token waste/i);
-    assert.match(first.output_text, /Kimi K2\.7 Code returned HTTP 429/i);
-    assert.match(first.output_text, /about 30s/i);
-    assert.match(second.output_text, /local cooldown/i);
-    assert.match(second.output_text, /about 30s/i);
-    assert.equal(upstreamCalls, 1);
+    const first = JSON.parse(firstResponse.body);
+    const second = JSON.parse(secondResponse.body);
+    assert.equal(firstResponse.statusCode, 429);
+    assert.equal(secondResponse.statusCode, 429);
+    assert.equal(first.error.code, "upstream_rate_limit");
+    assert.equal(second.error.code, "upstream_rate_limit");
+    assert.match(first.error.message, /Kimi K2\.7 Code.*供应商限流/);
+    assert.match(first.error.message, /约 1 秒/);
+    assert.match(second.error.message, /Kimi K2\.7 Code.*供应商限流/);
+    assert.match(second.error.message, /约 1 秒/);
+    assert.equal(upstreamCalls, 2);
   } finally {
     await close(router);
     await close(upstream);
@@ -1007,7 +1025,7 @@ test("server stops runaway chat tool loops after repeated tool continuations", a
       third.output.some((item) => item.type === "function_call"),
       false,
     );
-    assert.match(third.output_text, /stopped.*tool loop/i);
+    assert.match(third.output_text, /模型一直重复调用工具/);
     assert.equal(upstreamCalls, 3);
   } finally {
     await close(router);
@@ -1163,7 +1181,7 @@ test("server stops chat tool loops when Codex sends full input without previous_
       third.output.some((item) => item.type === "function_call"),
       false,
     );
-    assert.match(third.output_text, /stopped.*tool loop/i);
+    assert.match(third.output_text, /模型一直重复调用工具/);
     assert.equal(upstreamCalls, 3);
   } finally {
     await close(router);
@@ -1511,7 +1529,7 @@ test("server default chat tool guard stops repeated no-progress tool calls", asy
       stopped.output.some((item) => item.type === "function_call"),
       false,
     );
-    assert.match(stopped.output_text, /stopped.*tool loop/i);
+    assert.match(stopped.output_text, /模型一直重复调用工具/);
     assert.equal(upstreamCalls, 7);
   } finally {
     await close(router);
@@ -2997,7 +3015,7 @@ test("server preserves executable shell tool calls for Computer Use requests", a
   }
 });
 
-test("image generation fallback is not triggered by prompt keywords alone", () => {
+test("image generation fallback requires a configured provider but not an explicit tool choice", () => {
   assert.equal(
     shouldUseImageGenerationFallback(
       {
@@ -3026,7 +3044,7 @@ test("image generation fallback is not triggered by prompt keywords alone", () =
         },
       },
     ),
-    false,
+    true,
   );
 });
 
@@ -3095,15 +3113,14 @@ test("chat routes can use a per-route custom image generation provider", async (
       },
       body: JSON.stringify({
         model: "deepseek-v4-pro",
-        input: "generate an image of a small app icon",
+        input: "\u5e2e\u6211\u751f\u6210\u4e00\u5f20\u673a\u68b0\u6050\u9f99",
         tools: [{ type: "image_generation" }],
-        tool_choice: { type: "image_generation" },
       }),
     });
 
     assert.equal(imagePayload.model, "custom-image-v1");
     assert.equal(imagePayload.size, "768x768");
-    assert.match(imagePayload.prompt, /small app icon/);
+    assert.match(imagePayload.prompt, /\u673a\u68b0\u6050\u9f99/);
     assert.equal(response.codexbridge_image_generation.provider, "Custom Image API");
     assert.equal(response.codexbridge_image_generation.upstream_model, "custom-image-v1");
     assert.equal(response.usage.total_tokens, 9);
@@ -3114,7 +3131,7 @@ test("chat routes can use a per-route custom image generation provider", async (
   }
 });
 
-test("server serves duplicate image generation fallback request locally", async () => {
+test("server retries a completed image generation request when no request is pending", async () => {
   const previousEnv = snapshotEnv(["CUSTOM_IMAGE_API_KEY"]);
   process.env.CUSTOM_IMAGE_API_KEY = "custom-image-key";
 
@@ -3189,8 +3206,8 @@ test("server serves duplicate image generation fallback request locally", async 
 
     const second = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
     assert.equal(second.statusCode, 200);
-    assert.match(second.body, /duplicate-1\.png/);
-    assert.equal(imageCalls, 1);
+    assert.match(second.body, /duplicate-2\.png/);
+    assert.equal(imageCalls, 2);
   } finally {
     restoreEnv(previousEnv);
     await close(router);
@@ -3274,6 +3291,45 @@ test("responses routes can override native image generation with a custom provid
     restoreEnv(previousEnv);
     await close(router);
     await close(imageUpstream);
+  }
+});
+
+test("configured non-GPT image proxy recognizes colloquial Chinese subject requests", () => {
+  const route = {
+    api: "chat_completions",
+    provider: "deepseek",
+    imageGeneration: {
+      enabled: true,
+      mode: "custom",
+      baseUrl: "https://images.example/v1",
+      endpoint: "/images/generations",
+      model: "configured-image-model",
+      apiKeyEnv: "IMAGE_KEY",
+    },
+  };
+
+  for (const input of [
+    "\u5e2e\u6211\u751f\u6210\u4e00\u5f20\u673a\u68b0\u6050\u9f99",
+    "\u7ed9\u6211\u751f\u6210\u4e00\u53ea\u5c0f\u732b",
+    "\u751f\u6210\u4e00\u5e45\u661f\u7a7a\u57ce\u5e02",
+  ]) {
+    assert.equal(
+      shouldUseImageGenerationFallback({ input, tools: [{ type: "image_generation" }] }, route),
+      true,
+      input,
+    );
+  }
+
+  for (const input of [
+    "\u5e2e\u6211\u751f\u6210\u4e00\u4efd\u6d4b\u8bd5\u62a5\u544a",
+    "\u5e2e\u6211\u751f\u6210\u4e00\u4e2a React \u7ec4\u4ef6",
+    "\u5e2e\u6211\u751f\u6210\u4e00\u4e2a 2 \u79d2\u89c6\u9891",
+  ]) {
+    assert.equal(
+      shouldUseImageGenerationFallback({ input, tools: [{ type: "image_generation" }] }, route),
+      false,
+      input,
+    );
   }
 });
 
@@ -7175,7 +7231,7 @@ test("responses routes do not resume upstream when previous_response_id has no n
   assert.equal(upstreamCalls, 1);
 });
 
-test("server serves duplicate initial Codex desktop request locally without replaying upstream", async () => {
+test("server allows a completed initial Codex desktop request to run again", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer(async (req, res) => {
     upstreamCalls += 1;
@@ -7257,15 +7313,15 @@ test("server serves duplicate initial Codex desktop request locally without repl
 
     const second = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
     assert.equal(second.statusCode, 200);
-    assert.match(second.body, /answer 1/);
-    assert.equal(upstreamCalls, 1);
+    assert.match(second.body, /answer 2/);
+    assert.equal(upstreamCalls, 2);
   } finally {
     await close(router);
     await close(upstream);
   }
 });
 
-test("server stops Codex desktop startup resume when encrypted input changes without a new visible turn", async () => {
+test("server allows completed encrypted startup requests to continue after input changes", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer(async (req, res) => {
     upstreamCalls += 1;
@@ -7373,9 +7429,8 @@ test("server stops Codex desktop startup resume when encrypted input changes wit
       }),
     });
     assert.equal(second.statusCode, 200);
-    assert.match(second.body, /startup resume answer 1|duplicate automatic request replay/i);
-    assert.doesNotMatch(second.body, /startup resume answer 2/);
-    assert.equal(upstreamCalls, 1);
+    assert.match(second.body, /startup resume answer 2/);
+    assert.equal(upstreamCalls, 2);
 
     const third = await requestText(`${serverUrl(router)}/v1/responses`, {
       method: "POST",
@@ -7398,9 +7453,8 @@ test("server stops Codex desktop startup resume when encrypted input changes wit
       }),
     });
     assert.equal(third.statusCode, 200);
-    assert.match(third.body, /startup resume answer 1|duplicate automatic request replay/i);
-    assert.doesNotMatch(third.body, /startup resume answer 3/);
-    assert.equal(upstreamCalls, 1);
+    assert.match(third.body, /startup resume answer 3/);
+    assert.equal(upstreamCalls, 3);
   } finally {
     await close(router);
     await close(upstream);
@@ -7528,7 +7582,7 @@ test("server lets a real new encrypted Codex desktop user turn reach upstream", 
   }
 });
 
-test("server stops same-turn encrypted GPT-5.5 resume from calling upstream twice", async () => {
+test("server allows a completed encrypted GPT-5.5 request to run again", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer(async (req, res) => {
     upstreamCalls += 1;
@@ -7634,9 +7688,8 @@ test("server stops same-turn encrypted GPT-5.5 resume from calling upstream twic
       }),
     });
     assert.equal(second.statusCode, 200);
-    assert.match(second.body, /GPT-5\.5 same turn answer 1|duplicate automatic request replay/i);
-    assert.doesNotMatch(second.body, /GPT-5\.5 same turn answer 2/);
-    assert.equal(upstreamCalls, 1);
+    assert.match(second.body, /GPT-5\.5 same turn answer 2/);
+    assert.equal(upstreamCalls, 2);
   } finally {
     await close(router);
     await close(upstream);
@@ -7842,7 +7895,7 @@ test("server stops duplicate initial Codex desktop replay while the first reques
 
     const second = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
     assert.equal(second.statusCode, 200);
-    assert.match(second.body, /duplicate automatic request replay/);
+    assert.match(second.body, /检测到重复的自动请求重放/);
     assert.equal(upstreamCalls, 1);
 
     releaseUpstream();
@@ -7952,7 +8005,7 @@ test("server allows duplicate Codex desktop retry after transient upstream 503",
   }
 });
 
-test("server stops duplicate Codex desktop retry after oversized upstream 413", async () => {
+test("server allows a completed Codex desktop retry after upstream 413", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer(async (req, res) => {
     upstreamCalls += 1;
@@ -8012,16 +8065,16 @@ test("server stops duplicate Codex desktop retry after oversized upstream 413", 
 
     const second = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
     assert.equal(second.statusCode, 200);
-    assert.match(second.body, /response\.completed/);
-    assert.match(second.body, /已拦截同一失败请求的自动重试/);
-    assert.equal(upstreamCalls, 1);
+    assert.match(second.body, /response\.failed/);
+    assert.match(second.body, /HTTP 413/);
+    assert.equal(upstreamCalls, 2);
   } finally {
     await close(router);
     await close(upstream);
   }
 });
 
-test("server stops duplicate Codex desktop retry after retryable upstream 502", async () => {
+test("server allows a completed Codex desktop retry after upstream 502", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer(async (req, res) => {
     upstreamCalls += 1;
@@ -8075,16 +8128,16 @@ test("server stops duplicate Codex desktop retry after retryable upstream 502", 
 
     const second = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
     assert.equal(second.statusCode, 200);
-    assert.match(second.body, /response\.completed/);
-    assert.match(second.body, /已拦截同一失败请求的自动重试/);
-    assert.equal(upstreamCalls, 1);
+    assert.match(second.body, /response\.failed/);
+    assert.match(second.body, /HTTP 502/);
+    assert.equal(upstreamCalls, 2);
   } finally {
     await close(router);
     await close(upstream);
   }
 });
 
-test("server stops duplicate Codex desktop retry after truncated responses stream", async () => {
+test("server allows a completed Codex desktop retry after a truncated responses stream", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer(async (req, res) => {
     upstreamCalls += 1;
@@ -8148,16 +8201,16 @@ test("server stops duplicate Codex desktop retry after truncated responses strea
 
     const second = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
     assert.equal(second.statusCode, 200);
-    assert.match(second.body, /response\.completed/);
-    assert.match(second.body, /已拦截同一失败请求的自动重试/);
-    assert.equal(upstreamCalls, 1);
+    assert.match(second.body, /response\.failed/);
+    assert.match(second.body, /upstream_stream_truncated/);
+    assert.equal(upstreamCalls, 2);
   } finally {
     await close(router);
     await close(upstream);
   }
 });
 
-test("server serves duplicate Codex desktop request with previous_response_id locally", async () => {
+test("server allows a completed Codex desktop request with previous_response_id to run again", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer(async (req, res) => {
     upstreamCalls += 1;
@@ -8240,15 +8293,15 @@ test("server serves duplicate Codex desktop request with previous_response_id lo
 
     const second = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
     assert.equal(second.statusCode, 200);
-    assert.match(second.body, /previous response answer 1/);
-    assert.equal(upstreamCalls, 1);
+    assert.match(second.body, /previous response answer 2/);
+    assert.equal(upstreamCalls, 2);
   } finally {
     await close(router);
     await close(upstream);
   }
 });
 
-test("server stops Codex desktop replay when only volatile retry metadata changes", async () => {
+test("server allows a completed Codex desktop request when volatile retry metadata changes", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer(async (req, res) => {
     upstreamCalls += 1;
@@ -8348,15 +8401,15 @@ test("server stops Codex desktop replay when only volatile retry metadata change
       }),
     });
     assert.equal(second.statusCode, 200);
-    assert.match(second.body, /semantic duplicate answer 1/);
-    assert.equal(upstreamCalls, 1);
+    assert.match(second.body, /semantic duplicate answer 2/);
+    assert.equal(upstreamCalls, 2);
   } finally {
     await close(router);
     await close(upstream);
   }
 });
 
-test("server stops Codex desktop replay even when old tool history is present", async () => {
+test("server allows a completed Codex desktop request with old tool history to run again", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer(async (req, res) => {
     upstreamCalls += 1;
@@ -8465,8 +8518,8 @@ test("server stops Codex desktop replay even when old tool history is present", 
       }),
     });
     assert.equal(second.statusCode, 200);
-    assert.match(second.body, /tool history replay answer 1/);
-    assert.equal(upstreamCalls, 1);
+    assert.match(second.body, /tool history replay answer 2/);
+    assert.equal(upstreamCalls, 2);
   } finally {
     await close(router);
     await close(upstream);
@@ -8685,7 +8738,7 @@ test("server lets current Codex desktop tool output reach upstream", async () =>
   }
 });
 
-test("server lets a new Codex turn continue after a tool-output timeout", async () => {
+test("server retries a completed tool-output timeout and lets the next Codex turn continue", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer(async (req, res) => {
     upstreamCalls += 1;
@@ -8783,8 +8836,8 @@ test("server lets a new Codex turn continue after a tool-output timeout", async 
       }),
     });
     assert.equal(automaticReplay.statusCode, 200);
-    assert.match(automaticReplay.body, /上一次错误|timed out/i);
-    assert.equal(upstreamCalls, 1);
+    assert.match(automaticReplay.body, /skill continuation finished after user retry/);
+    assert.equal(upstreamCalls, 2);
 
     const userContinue = await requestText(`${serverUrl(router)}/v1/responses`, {
       method: "POST",
@@ -8805,7 +8858,7 @@ test("server lets a new Codex turn continue after a tool-output timeout", async 
     });
     assert.equal(userContinue.statusCode, 200);
     assert.match(userContinue.body, /skill continuation finished after user retry/);
-    assert.equal(upstreamCalls, 2);
+    assert.equal(upstreamCalls, 3);
   } finally {
     router.closeAllConnections?.();
     upstream.closeAllConnections?.();
@@ -8814,7 +8867,7 @@ test("server lets a new Codex turn continue after a tool-output timeout", async 
   }
 });
 
-test("server stops Codex desktop previous_response_id replay from another model slot after GPT success", async () => {
+test("server allows a completed previous_response_id request on another model slot", async () => {
   let gptCalls = 0;
   let deepseekCalls = 0;
   const gptUpstream = http.createServer(async (req, res) => {
@@ -8948,10 +9001,9 @@ test("server stops Codex desktop previous_response_id replay from another model 
       }),
     });
     assert.equal(second.statusCode, 200);
-    assert.match(second.body, /GPT answered the selected model slot|automatic resume/i);
-    assert.doesNotMatch(second.body, /DeepSeek should not run/);
+    assert.match(second.body, /DeepSeek should not run for slot replay 1/);
     assert.equal(gptCalls, 1);
-    assert.equal(deepseekCalls, 0);
+    assert.equal(deepseekCalls, 1);
   } finally {
     await close(router);
     await close(gptUpstream);
@@ -8959,7 +9011,7 @@ test("server stops Codex desktop previous_response_id replay from another model 
   }
 });
 
-test("server stops Codex desktop cross-slot replay when old tool output follows the latest user", async () => {
+test("server allows a completed cross-slot request when old tool output follows the latest user", async () => {
   let gptCalls = 0;
   let deepseekCalls = 0;
   const gptUpstream = http.createServer(async (req, res) => {
@@ -9099,10 +9151,9 @@ test("server stops Codex desktop cross-slot replay when old tool output follows 
       }),
     });
     assert.equal(second.statusCode, 200);
-    assert.match(second.body, /GPT answered before old tool history appeared|automatic resume/i);
-    assert.doesNotMatch(second.body, /DeepSeek should not run/);
+    assert.match(second.body, /DeepSeek should not run for old tool slot replay 1/);
     assert.equal(gptCalls, 1);
-    assert.equal(deepseekCalls, 0);
+    assert.equal(deepseekCalls, 1);
   } finally {
     await close(router);
     await close(gptUpstream);
@@ -9110,7 +9161,7 @@ test("server stops Codex desktop cross-slot replay when old tool output follows 
   }
 });
 
-test("server stops Codex desktop cross-slot replay after GPT compact with old tool history", async () => {
+test("server allows a completed cross-slot request after GPT compact with old tool history", async () => {
   let gptCalls = 0;
   let deepseekCalls = 0;
   const gptUpstream = http.createServer(async (req, res) => {
@@ -9253,10 +9304,9 @@ test("server stops Codex desktop cross-slot replay after GPT compact with old to
       }),
     });
     assert.equal(replay.statusCode, 200);
-    assert.match(replay.body, /GPT compacted the selected model slot|automatic resume/i);
-    assert.doesNotMatch(replay.body, /DeepSeek should not run/);
+    assert.match(replay.body, /DeepSeek should not run after GPT compact 1/);
     assert.equal(gptCalls, 1);
-    assert.equal(deepseekCalls, 0);
+    assert.equal(deepseekCalls, 1);
   } finally {
     await close(router);
     await close(gptUpstream);
@@ -9264,7 +9314,7 @@ test("server stops Codex desktop cross-slot replay after GPT compact with old to
   }
 });
 
-test("server stops Codex desktop model-slot replay with longer history after GPT success", async () => {
+test("server allows a completed model-slot request with longer history after GPT success", async () => {
   let gptCalls = 0;
   let deepseekCalls = 0;
   const gptUpstream = http.createServer(async (req, res) => {
@@ -9403,12 +9453,9 @@ test("server stops Codex desktop model-slot replay with longer history after GPT
       }),
     });
     assert.equal(second.statusCode, 200);
-    assert.match(second.body, /上一模型选择/);
-    assert.match(second.body, /DeepSeek V4 Pro/);
-    assert.doesNotMatch(second.body, /GPT answered before longer history replay/);
-    assert.doesNotMatch(second.body, /DeepSeek should not run/);
+    assert.match(second.body, /DeepSeek should not run for longer history replay 1/);
     assert.equal(gptCalls, 1);
-    assert.equal(deepseekCalls, 0);
+    assert.equal(deepseekCalls, 1);
   } finally {
     await close(router);
     await close(gptUpstream);
@@ -9562,7 +9609,7 @@ test("server lets a model-slot switch with an added new user turn reach upstream
   }
 });
 
-test("server stops Codex desktop replay from switching routes after an upstream error", async () => {
+test("server allows a completed Codex desktop request to switch routes after an upstream error", async () => {
   let gptCalls = 0;
   let deepseekCalls = 0;
   const gptUpstream = http.createServer(async (_req, res) => {
@@ -9675,12 +9722,9 @@ test("server stops Codex desktop replay from switching routes after an upstream 
       }),
     });
     assert.equal(second.statusCode, 200);
-    assert.match(second.body, /上一模型选择/);
-    assert.match(second.body, /DeepSeek V4 Pro/);
-    assert.doesNotMatch(second.body, /encrypted content Annotation/);
-    assert.doesNotMatch(second.body, /deepseek should not run/);
+    assert.match(second.body, /deepseek should not run 1/);
     assert.equal(gptCalls, 1);
-    assert.equal(deepseekCalls, 0);
+    assert.equal(deepseekCalls, 1);
   } finally {
     await close(router);
     await close(gptUpstream);
@@ -9799,11 +9843,8 @@ test("server allows a new Codex turn to retry the same text on the newly selecte
       }),
     });
     assert.equal(automaticReplay.statusCode, 200);
-    assert.match(automaticReplay.body, /上一模型选择/);
-    assert.match(automaticReplay.body, /GPT-5\.5/);
-    assert.doesNotMatch(automaticReplay.body, /quota exhausted/);
-    assert.doesNotMatch(automaticReplay.body, /gpt subscription handled retry/);
-    assert.equal(gptCalls, 0);
+    assert.match(automaticReplay.body, /gpt subscription handled retry 1/);
+    assert.equal(gptCalls, 1);
 
     const manualRetry = await requestText(`${serverUrl(router)}/v1/responses`, {
       method: "POST",
@@ -9815,9 +9856,9 @@ test("server allows a new Codex turn to retry the same text on the newly selecte
       }),
     });
     assert.equal(manualRetry.statusCode, 200);
-    assert.match(manualRetry.body, /gpt subscription handled retry 1/);
+    assert.match(manualRetry.body, /gpt subscription handled retry 2/);
     assert.equal(sudobugCalls, 1);
-    assert.equal(gptCalls, 1);
+    assert.equal(gptCalls, 2);
   } finally {
     await close(router);
     await close(sudobugUpstream);
@@ -9902,7 +9943,7 @@ test("server accepts completed Responses SSE wrapped in a non-2xx upstream statu
   }
 });
 
-test("server stops completed Codex desktop turn from replaying on a different route", async () => {
+test("server allows a completed Codex desktop turn to run on a different route", async () => {
   let firstRouteCalls = 0;
   let secondRouteCalls = 0;
   const firstUpstream = http.createServer(async (req, res) => {
@@ -10024,12 +10065,9 @@ test("server stops completed Codex desktop turn from replaying on a different ro
       }),
     });
     assert.equal(second.statusCode, 200);
-    assert.match(second.body, /上一模型选择/);
-    assert.match(second.body, /DeepSeek V4 Pro/);
-    assert.doesNotMatch(second.body, /first route answer 1/);
-    assert.doesNotMatch(second.body, /second route answer/);
+    assert.match(second.body, /second route answer 1/);
     assert.equal(firstRouteCalls, 1);
-    assert.equal(secondRouteCalls, 0);
+    assert.equal(secondRouteCalls, 1);
   } finally {
     await close(router);
     await close(firstUpstream);
@@ -10132,7 +10170,7 @@ test("server does not replay an old rate-limit response after switching routes",
     });
     assert.equal(first.statusCode, 200);
     assert.match(first.body, /GLM-4\.6/);
-    assert.match(first.body, /rate limited/);
+    assert.match(first.body, /供应商限流/);
     assert.equal(glmCalls, 1);
     assert.equal(deepseekCalls, 0);
 
@@ -10147,12 +10185,9 @@ test("server does not replay an old rate-limit response after switching routes",
       }),
     });
     assert.equal(replayAfterSwitch.statusCode, 200);
-    assert.match(replayAfterSwitch.body, /上一模型选择/);
-    assert.match(replayAfterSwitch.body, /DeepSeek V4 Flash/);
-    assert.doesNotMatch(replayAfterSwitch.body, /GLM-4\.6/);
-    assert.doesNotMatch(replayAfterSwitch.body, /rate limited/);
+    assert.match(replayAfterSwitch.body, /deepseek handled new turn 1/);
     assert.equal(glmCalls, 1);
-    assert.equal(deepseekCalls, 0);
+    assert.equal(deepseekCalls, 1);
 
     const newTurn = await requestText(`${serverUrl(router)}/v1/responses`, {
       method: "POST",
@@ -10170,9 +10205,9 @@ test("server does not replay an old rate-limit response after switching routes",
       }),
     });
     assert.equal(newTurn.statusCode, 200);
-    assert.match(newTurn.body, /deepseek handled new turn 1/);
+    assert.match(newTurn.body, /deepseek handled new turn 2/);
     assert.equal(glmCalls, 1);
-    assert.equal(deepseekCalls, 1);
+    assert.equal(deepseekCalls, 2);
   } finally {
     await close(router);
     await close(glmUpstream);
@@ -10318,7 +10353,7 @@ test("server lets a route switch run when the Codex desktop turn has new input",
   }
 });
 
-test("server serves duplicate compact Codex desktop request locally", async () => {
+test("server allows a completed compact Codex desktop request to run again", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer(async (req, res) => {
     upstreamCalls += 1;
@@ -10398,8 +10433,8 @@ test("server serves duplicate compact Codex desktop request locally", async () =
 
     const second = await requestText(`${serverUrl(router)}/v1/responses`, requestInit);
     assert.equal(second.statusCode, 200);
-    assert.match(second.body, /Summary: compact answer 1/);
-    assert.equal(upstreamCalls, 1);
+    assert.match(second.body, /Summary: compact answer 2/);
+    assert.equal(upstreamCalls, 2);
   } finally {
     await close(router);
     await close(upstream);
@@ -10505,7 +10540,7 @@ test("idle resume guard does not replay stored tool calls", async () => {
     });
 
     assert.equal(second.output.some((item) => item.type === "function_call"), false);
-    assert.match(second.output_text, /stopped an automatic resume request/i);
+    assert.match(second.output_text, /自动恢复请求没有新的用户输入/);
   } finally {
     await close(router);
     await close(upstream);
@@ -10646,7 +10681,7 @@ test("chat-routed remote compact v2 falls back locally when upstream compaction 
     assert.equal(response.ok, true, text);
     assert.equal(upstreamCalls, 1);
     assert.equal((text.match(/"type":"compaction"/g) || []).length, 3);
-    assert.match(text, /CodexBridge local compact fallback/);
+    assert.match(text, /上下文压缩失败，已使用本地摘要继续/);
     assert.match(text, /compact upstream unavailable/);
     assert.match(text, /latest Kimi compact fallback detail must survive/);
   } finally {
@@ -10716,7 +10751,7 @@ test("chat-routed remote compact fallback redacts upstream account identifiers",
     const text = await response.text();
     assert.equal(response.ok, true, text);
     assert.equal(upstreamCalls, 1);
-    assert.match(text, /CodexBridge local compact fallback/);
+    assert.match(text, /上下文压缩失败，已使用本地摘要继续/);
     assert.match(text, /TPD rate limit/);
     assert.match(text, /latest Kimi compact fallback detail must survive redaction/);
     assert.doesNotMatch(text, /ak-testfixtures000000000/);
@@ -10792,7 +10827,7 @@ test("chat-routed remote compact v2 falls back locally when upstream returns 413
     assert.equal(response.status, 200, text);
     assert.equal(upstreamCalls, 1);
     assert.equal((text.match(/"type":"compaction"/g) || []).length, 3);
-    assert.match(text, /CodexBridge local compact fallback/);
+    assert.match(text, /上下文压缩失败，已使用本地摘要继续/);
     assert.match(text, /Payload Too Large/);
     assert.match(text, /latest DeepSeek compact fallback detail must survive 413/);
   } finally {
@@ -10813,7 +10848,7 @@ test("chat-routed remote compact v2 falls back locally on upstream 413 across pr
     assert.equal(upstreamBody.parallel_tool_calls, undefined, route.id);
     assert.equal(upstreamBody.response_format, undefined, route.id);
     assert.equal((text.match(/"type":"compaction"/g) || []).length, 3, route.id);
-    assert.match(text, /CodexBridge local compact fallback/, route.id);
+    assert.match(text, /上下文压缩失败，已使用本地摘要继续/, route.id);
     assert.match(text, /Payload Too Large/, route.id);
     assert.match(text, new RegExp(`latest compact fallback detail for ${escapeRegExp(route.id)}`), route.id);
   }
@@ -10980,7 +11015,7 @@ test("responses-routed remote compact v2 falls back locally when upstream return
     assert.equal(response.status, 200, text);
     assert.equal(upstreamCalls, 1);
     assert.equal((text.match(/"type":"compaction"/g) || []).length, 3);
-    assert.match(text, /CodexBridge local compact fallback/);
+    assert.match(text, /上下文压缩失败，已使用本地摘要继续/);
     assert.match(text, /Payload Too Large/);
     assert.match(text, /latest GPT compact fallback detail must survive 413/);
   } finally {
@@ -11049,7 +11084,7 @@ test("responses-routed remote compact v2 uses local summary context when upstrea
     const text = await response.text();
     assert.equal(response.ok, true, text);
     assert.equal((text.match(/"type":"compaction"/g) || []).length, 3);
-    assert.match(text, /CodexBridge local compact fallback/);
+    assert.match(text, /上下文压缩失败，已使用本地摘要继续/);
     assert.match(text, /upstream model returned no summary text/);
     assert.match(text, /latest GPT compact fallback detail must survive/);
   } finally {
@@ -11302,6 +11337,80 @@ test("chat-routed responses compact endpoint returns compaction JSON", async () 
     assert.equal(response.object, "response");
     assert.equal(response.output[0].type, "compaction");
     assert.match(response.output[0].encrypted_content, /Summary: compact endpoint result/);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("GPT native image generation recovers the final image from response.output_item.done", async () => {
+  let upstreamBody;
+  const expectedImage = "b3V0cHV0LWl0ZW0tZG9uZS1pbWFnZQ==";
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/responses");
+    upstreamBody = await readJson(req);
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    res.write(`event: response.output_item.done\ndata: ${JSON.stringify({
+      type: "response.output_item.done",
+      output_index: 0,
+      item: {
+        id: "ig_native_output_done",
+        type: "image_generation_call",
+        status: "completed",
+        result: expectedImage,
+        revised_prompt: "a small native dinosaur",
+      },
+    })}\n\n`);
+    res.write(`event: response.completed\ndata: ${JSON.stringify({
+      type: "response.completed",
+      response: {
+        id: "resp_native_output_done",
+        object: "response",
+        status: "completed",
+        model: "gpt-5.6-sol",
+        output: [],
+        usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 },
+      },
+    })}\n\n`);
+    res.end("data: [DONE]\n\n");
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    clientAuth: { allowOpenAiBearer: true },
+    defaultModel: "cb-gpt-5-6-sol",
+    models: [{
+      id: "cb-gpt-5-6-sol",
+      displayName: "GPT-5.6-Sol",
+      provider: "codex",
+      api: "responses",
+      baseUrl: `${serverUrl(upstream)}/v1`,
+      model: "gpt-5.6-sol",
+      authMode: "codex_openai",
+    }],
+  });
+  await listen(router);
+
+  try {
+    const response = await fetch(`${serverUrl(router)}/v1/images/generations`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer codex-token",
+      },
+      body: JSON.stringify({ model: "gpt-image-2", prompt: "a small dinosaur" }),
+    });
+    const text = await response.text();
+    assert.equal(response.status, 200, text);
+    const payload = JSON.parse(text);
+    assert.equal(payload.data[0].b64_json, expectedImage);
+    assert.equal(payload.data[0].revised_prompt, "a small native dinosaur");
+    assert.equal(upstreamBody.stream, true);
+    assert.equal(upstreamBody.store, false);
+    assert.equal(upstreamBody.tools[0].type, "image_generation");
   } finally {
     await close(router);
     await close(upstream);

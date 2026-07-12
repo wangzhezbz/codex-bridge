@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import {
   assetNameForPlatform,
@@ -10,9 +11,13 @@ import {
   fetchInitForUpdateDownload,
   generateMacPortableUpdateScript,
   generateWindowsPortableUpdateScript,
+  inferUpdateInstallKind,
+  installedLegacyAppCleanupTargets,
+  installedAppVersionCleanupTargets,
   isNewerVersion,
   planReleaseUpdate,
   updateDownloadProxyLabel,
+  validateDownloadedReleaseAsset,
 } from "../desktop/updater.mjs";
 
 const release = {
@@ -61,6 +66,51 @@ test("updater selects the preferred install asset for the current platform", () 
   assert.equal(assetNameForPlatform("darwin", "arm64"), "CodexBridge-macOS-arm64-Portable.zip");
   assert.equal(assetNameForPlatform("darwin", "x64"), "CodexBridge-macOS-x64-Portable.zip");
   assert.equal(assetNameForPlatform("linux", "x64"), null);
+});
+
+test("updater treats unknown packaged Windows apps as installer updates unless explicitly portable", () => {
+  const detected = inferUpdateInstallKind({
+    appIsPackaged: true,
+    platform: "win32",
+    execPath: "D:\\Apps\\CodexBridge\\CodexBridge.exe",
+    localAppData: "C:\\Users\\me\\AppData\\Local",
+    registryRoot: "",
+  });
+  const forcedPortable = inferUpdateInstallKind({
+    forcedInstallKind: "portable",
+    appIsPackaged: true,
+    platform: "win32",
+    execPath: "D:\\Apps\\CodexBridge\\CodexBridge.exe",
+    localAppData: "C:\\Users\\me\\AppData\\Local",
+    registryRoot: "",
+  });
+
+  assert.equal(detected, "installed");
+  assert.equal(forcedPortable, "portable");
+});
+
+test("updater detects official Windows portable update layouts", () => {
+  assert.equal(
+    inferUpdateInstallKind({
+      appIsPackaged: true,
+      platform: "win32",
+      execPath: "D:\\CodexBridge-Windows-x64-Portable-v0.2.3\\CodexBridge-win32-x64\\CodexBridge.exe",
+      localAppData: "C:\\Users\\me\\AppData\\Local",
+      registryRoot: "",
+    }),
+    "portable",
+  );
+  assert.equal(
+    inferUpdateInstallKind({
+      appIsPackaged: true,
+      platform: "win32",
+      execPath: "D:\\CodexBridgePortable\\CodexBridge.exe",
+      localAppData: "C:\\Users\\me\\AppData\\Local",
+      registryRoot: "",
+      portableMarkerFound: true,
+    }),
+    "portable",
+  );
 });
 
 test("updater plans a direct install from the latest matching release asset", () => {
@@ -114,7 +164,7 @@ test("updater keeps portable builds on auto-applied portable packages even when 
   assert.doesNotMatch(plan.nextStep, /手动|manual fallback|updates folder/);
 });
 
-test("updater falls back to the portable asset when no installer is published", () => {
+test("installed Windows updater refuses portable fallback when no installer is published", () => {
   const portableOnlyRelease = {
     ...release,
     assets: release.assets.filter((asset) => asset.name !== "CodexBridge-Windows-x64-Setup.exe"),
@@ -124,6 +174,26 @@ test("updater falls back to the portable asset when no installer is published", 
     platform: "win32",
     arch: "x64",
     installKind: "installed",
+    release: portableOnlyRelease,
+  });
+
+  assert.equal(plan.ok, false);
+  assert.equal(plan.updateAvailable, false);
+  assert.equal(plan.asset, undefined);
+  assert.match(plan.message, /CodexBridge-Windows-x64-Setup\.exe/);
+  assert.match(plan.message, /Setup\.exe|installer|安装器/i);
+});
+
+test("portable Windows updater still uses the portable asset when no installer is published", () => {
+  const portableOnlyRelease = {
+    ...release,
+    assets: release.assets.filter((asset) => asset.name !== "CodexBridge-Windows-x64-Setup.exe"),
+  };
+  const plan = planReleaseUpdate({
+    currentVersion: "0.1.65",
+    platform: "win32",
+    arch: "x64",
+    installKind: "portable",
     release: portableOnlyRelease,
   });
 
@@ -234,6 +304,8 @@ test("updater falls back to GitHub latest redirect when release API is rate limi
       ?.browser_download_url,
     "https://github.com/wangzhezbz/codex-bridge/releases/latest/download/CodexBridge-Windows-x64-Setup.exe",
   );
+  assert.match(latest.body, /GitHub API 不可用/);
+  assert.doesNotMatch(latest.body, /GitHub API unavailable/);
 
   const plan = planReleaseUpdate({
     currentVersion: "0.1.93",
@@ -247,8 +319,60 @@ test("updater falls back to GitHub latest redirect when release API is rate limi
   assert.equal(plan.asset.kind, "installer");
 });
 
+test("updater reports release API and latest-page fallback failures in Chinese", async () => {
+  const seenUrls = [];
+
+  await assert.rejects(
+    () => fetchLatestRelease({
+      releaseUrl: "https://api.github.com/repos/wangzhezbz/codex-bridge/releases/latest",
+      fetchImpl: async (url) => {
+        seenUrls.push(String(url));
+        if (seenUrls.length === 1) {
+          return new Response("rate limited", { status: 403 });
+        }
+        return new Response("<html>oops</html>", { status: 500 });
+      },
+    }),
+    (error) => {
+      assert.match(error.message, /检查更新失败/);
+      assert.match(error.message, /GitHub API 返回 HTTP 403/);
+      assert.match(error.message, /releases\/latest 兜底也失败/);
+      assert.match(error.message, /无法从 HTTP 500 解析最新版本标签/);
+      assert.doesNotMatch(error.message, /GitHub API unavailable|fallback failed|could not resolve latest/);
+      return true;
+    },
+  );
+
+  assert.deepEqual(seenUrls, [
+    "https://api.github.com/repos/wangzhezbz/codex-bridge/releases/latest",
+    "https://github.com/wangzhezbz/codex-bridge/releases/latest",
+  ]);
+});
+
+test("updater rejects downloaded installer and portable assets with invalid file headers", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-updates-headers-"));
+  const installerPath = path.join(root, "CodexBridge-Windows-x64-Setup.exe");
+  const portablePath = path.join(root, "CodexBridge-Windows-x64-Portable.zip");
+  fs.writeFileSync(installerPath, "<!doctype html><title>502 Bad Gateway</title>");
+  fs.writeFileSync(portablePath, "<!doctype html><title>502 Bad Gateway</title>");
+
+  assert.throws(
+    () => validateDownloadedReleaseAsset(installerPath, { kind: "installer", name: "CodexBridge-Windows-x64-Setup.exe" }),
+    /invalid.*installer.*header/i,
+  );
+  assert.throws(
+    () => validateDownloadedReleaseAsset(portablePath, { kind: "portable", name: "CodexBridge-Windows-x64-Portable.zip" }),
+    /invalid.*portable.*header/i,
+  );
+
+  fs.writeFileSync(installerPath, Buffer.from([0x4d, 0x5a, 0x90, 0x00]));
+  fs.writeFileSync(portablePath, Buffer.from([0x50, 0x4b, 0x03, 0x04]));
+  assert.equal(validateDownloadedReleaseAsset(installerPath, { kind: "installer", name: "CodexBridge-Windows-x64-Setup.exe" }).ok, true);
+  assert.equal(validateDownloadedReleaseAsset(portablePath, { kind: "portable", name: "CodexBridge-Windows-x64-Portable.zip" }).ok, true);
+});
+
 test("updater cleans old managed update artifacts while keeping the newest package", async () => {
-  const root = fs.mkdtempSync(path.join(process.cwd(), ".tmp-updates-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-updates-"));
   const files = [
     "2026-06-28-010000000-CodexBridge-Windows-x64-Setup.exe",
     "install-update-2026-06-28-010000000.txt",
@@ -272,6 +396,117 @@ test("updater cleans old managed update artifacts while keeping the newest packa
     fs.rmSync(path.join(root, file), { force: true });
   }
   fs.rmdirSync(root);
+});
+
+test("updater keeps cleaning side files when a managed package is temporarily locked", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-updates-locked-"));
+  const files = [
+    "2026-06-28-010000000-CodexBridge-Windows-x64-Setup.exe",
+    "install-update-2026-06-28-010000000.txt",
+    "2026-06-28-020000000-CodexBridge-Windows-x64-Setup.exe",
+    "install-update-2026-06-28-020000000.txt",
+  ];
+  for (const file of files) {
+    fs.writeFileSync(path.join(root, file), file);
+  }
+
+  const result = await cleanupManagedUpdateArtifacts(root, {
+    keepPackages: 1,
+    removeFile: async (filePath, options) => {
+      if (filePath.endsWith("2026-06-28-010000000-CodexBridge-Windows-x64-Setup.exe")) {
+        throw new Error("file is locked by installer");
+      }
+      await fs.promises.rm(filePath, options);
+    },
+  });
+
+  assert.equal(result.deleted.length, 1);
+  assert.equal(result.failed.length, 1);
+  assert.match(result.failed[0].message, /locked/);
+  assert.equal(fs.existsSync(path.join(root, "2026-06-28-010000000-CodexBridge-Windows-x64-Setup.exe")), true);
+  assert.equal(fs.existsSync(path.join(root, "install-update-2026-06-28-010000000.txt")), false);
+  assert.equal(fs.existsSync(path.join(root, "2026-06-28-020000000-CodexBridge-Windows-x64-Setup.exe")), true);
+  assert.equal(fs.existsSync(path.join(root, "install-update-2026-06-28-020000000.txt")), true);
+
+  for (const file of fs.readdirSync(root)) {
+    fs.rmSync(path.join(root, file), { force: true });
+  }
+  fs.rmdirSync(root);
+});
+
+test("updater selects only previous versioned app directories for installed cleanup", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-installed-cleanup-"));
+  const current = path.join(root, "app-0.2.3");
+  const previous = path.join(root, "app-0.2.2");
+  const otherRoot = path.join(root, "other-install-root");
+  const previousOtherRoot = path.join(otherRoot, "app-0.1.9");
+  const unrelated = path.join(root, "logs");
+  for (const dir of [current, previous, previousOtherRoot, unrelated]) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  fs.writeFileSync(path.join(root, "app-0.2.1.txt"), "not a directory");
+
+  const targets = await installedAppVersionCleanupTargets({
+    installedRoots: [root, otherRoot, root],
+    currentAppDir: current,
+  });
+
+  assert.deepEqual(targets.sort(), [previous, previousOtherRoot].sort());
+
+  for (const file of [path.join(root, "app-0.2.1.txt")]) {
+    fs.rmSync(file, { force: true });
+  }
+  for (const dir of [previousOtherRoot, otherRoot, previous, current, unrelated, root]) {
+    fs.rmdirSync(dir);
+  }
+});
+
+test("updater selects only known legacy installed app files for cleanup", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-installed-legacy-cleanup-"));
+  const current = path.join(root, "app-0.2.3");
+  const resourcesApp = path.join(root, "resources", "app");
+  const locales = path.join(root, "locales");
+  for (const dir of [current, resourcesApp, locales]) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  fs.writeFileSync(path.join(current, "CodexBridge.exe"), "new exe");
+  fs.writeFileSync(path.join(root, "CodexBridge.exe"), "old exe");
+  fs.writeFileSync(path.join(resourcesApp, "package.json"), JSON.stringify({ name: "codexbridge" }));
+  fs.writeFileSync(path.join(locales, "en-US.pak"), "locale");
+  fs.writeFileSync(path.join(root, "user-note.txt"), "keep me");
+
+  const targets = await installedLegacyAppCleanupTargets({
+    installedRoots: [root],
+    currentAppDir: current,
+  });
+
+  assert.deepEqual(
+    targets.map((target) => ({ path: target.path, kind: target.kind })).sort((left, right) => left.path.localeCompare(right.path)),
+    [
+      { path: path.join(root, "CodexBridge.exe"), kind: "file" },
+      { path: locales, kind: "directory" },
+      { path: path.join(root, "resources"), kind: "directory" },
+    ].sort((left, right) => left.path.localeCompare(right.path)),
+  );
+
+  for (const file of [
+    path.join(locales, "en-US.pak"),
+    path.join(resourcesApp, "package.json"),
+    path.join(current, "CodexBridge.exe"),
+    path.join(root, "CodexBridge.exe"),
+    path.join(root, "user-note.txt"),
+  ]) {
+    fs.rmSync(file, { force: true });
+  }
+  for (const dir of [
+    resourcesApp,
+    path.join(root, "resources"),
+    locales,
+    current,
+    root,
+  ]) {
+    fs.rmdirSync(dir);
+  }
 });
 
 test("Windows portable updater script replaces and restarts without batch deletion", () => {
@@ -301,8 +536,11 @@ test("Windows portable updater script replaces and restarts without batch deleti
   assert.match(script, /Update work directory: \$WORK_DIR/);
   assert.match(script, /\$EXE_NAME = 'CodexBridge\.exe'/);
   assert.match(script, /function Show-UpdateNotice/);
+  assert.match(script, /function Convert-UpdateText/);
+  assert.match(script, /FromBase64String/);
   assert.match(script, /WScript\.Shell/);
-  assert.match(script, /CodexBridge is installing the update/);
+  assert.match(script, /Q29kZXhCcmlkZ2Ug5q2j5Zyo5a6J6KOF5pu05paw/);
+  assert.doesNotMatch(script, /CodexBridge is installing the update/);
   assert.match(script, /Invoke-UpdateStep "Renaming current app directory"/);
   assert.match(script, /Invoke-UpdateStep "Moving new app directory into place"/);
   assert.match(script, /Show-UpdateFailure \$failureMessage/);
@@ -311,7 +549,7 @@ test("Windows portable updater script replaces and restarts without batch deleti
   assert.match(script, /function Start-CodexBridgeAfterFailure/);
   assert.match(script, /Restore-PreviousAppDirectory/);
   assert.match(script, /Start-CodexBridgeAfterFailure/);
-  assert.match(script, /Update failed; previous app was restored and restarted when possible/);
+  assert.match(script, /5pu05paw5aSx6LSl77yb5bey5bC96YeP5oGi5aSN5bm26YeN5ZCv5pen54mI5pys44CC/);
   assert.match(script, /Start-Sleep -Seconds 8/);
   assert.doesNotMatch(script, /Update failed; old app directory was restored and left closed/);
   assert.match(script, /resources\\app\\package\.json/);
@@ -321,7 +559,7 @@ test("Windows portable updater script replaces and restarts without batch deleti
   assert.match(script, /Remove-DirectoryTreeSafely \$backupDir/);
   assert.match(script, /Remove-DirectoryTreeSafely \$extractDir/);
   assert.match(script, /Remove-FileSafely \$ZIP_PATH/);
-  assert.match(script, /Update completed. Previous version removed/);
+  assert.match(script, /5pu05paw5a6M5oiQ77yM5pen54mI5pys5bey56e76Zmk44CC/);
   assert.match(script, /\$\{EXE_NAME\}: \$AppDir/);
   assert.doesNotMatch(script, /\$EXE_NAME:/);
   assert.match(script, /\$WAIT_PIDS = @\(1234, 5678\)/);

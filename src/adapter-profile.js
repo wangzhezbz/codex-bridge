@@ -1,4 +1,4 @@
-const DEFAULT_TIMEOUT_MS = 300_000;
+const DEFAULT_TIMEOUT_MS = 600_000;
 const DEFAULT_CHAT_TOOL_TURNS = 5;
 
 const RESPONSES_SAFE_PARAMS = [
@@ -144,6 +144,37 @@ export function normalizeAdapterProfile(route = {}) {
       DEFAULT_TIMEOUT_MS,
     ),
     customConservative,
+  };
+}
+
+export function adapterContractForRoute(route = {}) {
+  const profile = normalizeAdapterProfile(route);
+  return {
+    contractVersion: "adapter-contract-v1",
+    route: {
+      id: String(route.id || route.model || ""),
+      displayName: String(route.displayName || route.name || route.id || route.model || ""),
+      custom: Boolean(route.custom),
+    },
+    upstream: {
+      api: profile.api,
+      providerFamily: profile.providerFamily,
+      model: String(route.model || route.upstreamModel || route.id || ""),
+      baseUrl: String(route.baseUrl || route.base_url || ""),
+      authMode: profile.authMode || "api_key",
+    },
+    adapter: {
+      id: profile.adapterId,
+    },
+    payload: {
+      allowedTopLevelParams: [...profile.safeParams],
+      droppedTopLevelParams: [...profile.dropParams],
+    },
+    capabilities: profile.capabilities,
+    runtime: {
+      timeoutMs: profile.upstreamTimeoutMs,
+      maxToolContinuationTurns: profile.maxToolContinuationTurns,
+    },
   };
 }
 

@@ -21,7 +21,10 @@ const releaseVersion =
   process.env.GITHUB_REF_NAME ||
   `v${packageJson.version}-local-${localStamp}`;
 const safeReleaseVersion = releaseVersion.replace(/[^A-Za-z0-9._-]/g, "-");
-const outDir = path.join(repoRoot, "release", `CodexBridge-Windows-x64-Portable-${safeReleaseVersion}`);
+const releaseRoot = process.env.CODEXBRIDGE_RELEASE_ROOT
+  ? path.resolve(process.env.CODEXBRIDGE_RELEASE_ROOT)
+  : path.join(repoRoot, "release");
+const outDir = path.join(releaseRoot, `CodexBridge-Windows-x64-Portable-${safeReleaseVersion}`);
 const iconPath = path.join(repoRoot, "desktop", "assets", "codexbridge-icon.ico");
 
 fs.mkdirSync(outDir, { recursive: true });
@@ -52,11 +55,13 @@ const appPaths = await packager({
     /^\/\.codex(?:\/|$)/,
     /^\/\.superpowers(?:\/|$)/,
     /^\/\.tmp(?:\/|$)/,
+    /^\/\.tmp-updates-/,
     /^\/\.tmp-electron-packager(?:\/|$)/,
     /^\/AGENTS\.md$/,
     /^\/Start-CodexBridge\.cmd$/,
     /^\/release(?:\/|$)/,
     /^\/dist(?:\/|$)/,
+    /^\/dist-artifacts(?:\/|$)/,
     /^\/build(?:\/|$)/,
     /^\/coverage(?:\/|$)/,
     /^\/data(?:\/|$)/,

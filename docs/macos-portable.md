@@ -52,15 +52,17 @@ Mac 版会把配置、密钥、模型选择、统计和日志写到当前用户�
 3. 如需接入新服务，在“模型”页添加自定义 OpenAI-compatible 模型，或刷新服务商模型列表后再选择。
 4. 填写对应 Provider 的 API Key。
 5. 打开 Router 开关，CodexBridge 会自动刷新 Codex 配置。
-6. 打开或重启 Codex。
+6. 打开或点击“重启 ChatGPT / Codex”；新版优先使用 `ChatGPT.app`，找不到时回退到旧版 `Codex.app`。
 
 GPT 订阅模型不需要在 CodexBridge 里填写 API Key。API providers such as DeepSeek, Kimi, Qwen, and OpenRouter need their own provider keys.
 
 ### 历史对话不见了
 
-如果启动 Router 并重启 Codex 后，Codex 里看不到以前的对话，先不要删除任何目录。打开 CodexBridge，点击右上角“找回历史对话”，然后完全退出并重新打开 Codex。
+如果启动 Router 并重启 ChatGPT / Codex 后，桌面端看不到以前的对话，先不要删除任何目录。打开 CodexBridge，进入左侧“会话”页，点击“找回历史对话”，然后完全退出并重新打开当前使用的 ChatGPT 或 Codex Desktop。
 
 这个按钮会从 CodexBridge 写入前的备份里合并历史对话/桌面相关配置，同时保留当前模型栏、Router 地址和 API 配置。当前配置会先备份，不会删除历史对话文件。
+
+如果 Codex 里的项目列表不对，也在“会话”页点击“恢复项目列表”。CodexBridge 会让 Codex 逐个打开可识别的真实项目目录，用 Codex 自己的方式刷新项目栏；不会修改模型、路由或会话内容。
 
 ## English
 
@@ -114,12 +116,14 @@ Downloading or extracting a newer app will not overwrite saved settings or API k
 3. Add custom OpenAI-compatible models on the Models page when needed.
 4. Enter API keys on the Keys page.
 5. Click Update Codex Config, then turn on Router.
-6. Open or restart Codex.
+6. Open or restart ChatGPT / Codex Desktop; new installations use `ChatGPT.app`, while legacy `Codex.app` remains supported.
 
 GPT subscription models do not need an API key in CodexBridge. API providers such as DeepSeek, Kimi, Qwen, and OpenRouter need their own provider keys.
 
 ### Missing History
 
-If old Codex conversations disappear after starting Router and restarting Codex, do not delete any folders. Open CodexBridge, click Recover History in the top-right corner, then fully quit and reopen Codex.
+If old conversations disappear after starting Router and restarting ChatGPT / Codex, do not delete any folders. Open CodexBridge, go to the Sessions page in the left sidebar, click Recover History, then fully quit and reopen the ChatGPT or Codex Desktop app you currently use.
 
 This merges history and desktop-related settings from the pre-Bridge backup while keeping the current model list, Router URL, and API settings. The current config is backed up first, and conversation files are not deleted.
+
+If the Codex project list is wrong, click Recover Projects on the same Sessions page. CodexBridge asks Codex to open each recognized real project folder so Codex can refresh its own project list; model, router, and conversation data are not changed.

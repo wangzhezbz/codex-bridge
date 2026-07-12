@@ -1,0 +1,16 @@
+{
+  "name": "chatgpt-codex-bridge",
+  "version": "0.1.0",
+  "protocolVersion": 1,
+  "entrypoints": {
+    "http": "src/index.js",
+    "mcp": "src/mcp-server.js"
+  },
+  "defaults": {
+    "host": "127.0.0.1",
+    "port": 4317
+  },
+  "healthPath": "/health",
+  "versionPath": "/version",
+  "extensionDir": "chrome-extension"
+}

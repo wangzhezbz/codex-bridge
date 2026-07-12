@@ -2,16 +2,24 @@
 node_modules/
 .tmp-electron-packager/
 
+# Test scratch directories
+.tmp/
+.tmp-updates-*/
+.tmp-installed-cleanup-*/
+.tmp-installed-legacy-cleanup-*/
+
 # Build outputs
 dist/
 build/
 release/
+dist-artifacts/
 coverage/
 target/
 src-tauri/target/
 
 # Local runtime files
 data/
+state/
 logs/
 *.log
 *.pid
@@ -23,6 +31,7 @@ model-catalog.json
 !.env.example
 config/router.config.json
 config/secrets.local.json
+config/.transactions/
 *.pem
 *.key
 

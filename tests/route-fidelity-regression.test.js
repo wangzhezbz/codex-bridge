@@ -11,6 +11,7 @@ import {
   chatResponseToResponse,
 } from "../src/chat-to-responses.js";
 import { ResponseHistory } from "../src/history.js";
+import { routeForModel } from "../src/config.js";
 import { buildModelCatalog } from "../src/model-catalog.js";
 import {
   responseInputToChatMessages,
@@ -161,6 +162,57 @@ test("route fidelity catalog keeps Codex tool capability across native, chat, an
   assert.deepEqual(catalog.models[1].input_modalities, ["text"]);
   assert.deepEqual(catalog.models[2].input_modalities, ["text", "image"]);
   assert.deepEqual(catalog.models[3].input_modalities, ["text", "image"]);
+});
+
+test("disabled routes are hidden from Codex-visible catalogs and manual routing", () => {
+  const config = {
+    defaultModel: "disabled-model",
+    models: [
+      {
+        ...deepseekRoute,
+        id: "disabled-model",
+        enabled: false,
+      },
+      kimiRoute,
+    ],
+  };
+
+  const catalog = buildModelCatalog(config);
+
+  assert.deepEqual(catalog.models.map((model) => model.id), ["kimi-k2-code"]);
+  assert.equal(routeForModel(config).id, "kimi-k2-code");
+  assert.throws(
+    () => routeForModel(config, "disabled-model", { exactModelIdOnly: true }),
+    (error) => {
+      assert.equal(error.code, "model_not_configured");
+      assert.match(error.message, /kimi-k2-code/);
+      assert.doesNotMatch(error.message, /deepseek-v4-pro/);
+      return true;
+    },
+  );
+});
+
+test("routing fails early when every configured route is disabled", () => {
+  const config = {
+    defaultModel: "disabled-model",
+    models: [
+      {
+        ...deepseekRoute,
+        id: "disabled-model",
+        enabled: false,
+      },
+    ],
+  };
+
+  assert.deepEqual(buildModelCatalog(config).models, []);
+  assert.throws(
+    () => routeForModel(config),
+    (error) => {
+      assert.equal(error.code, "model_not_configured");
+      assert.match(error.message, /default/);
+      return true;
+    },
+  );
 });
 
 test("route fidelity matrix covers provider main-chain chat contracts", () => {
@@ -488,7 +540,8 @@ test("route fidelity degrades images and files intentionally for chat routes", (
   );
   assert.equal(content[0].text, "summarize all attached context");
   assert.match(content[1].text, /image input omitted because it is too large/);
-  assert.match(content[2].text, /File attachment unavailable to this chat provider: large-log\.txt/);
+  assert.match(content[2].text, /文件附件当前 Chat 模型不可用：large-log\.txt/);
+  assert.doesNotMatch(content[2].text, /unavailable to this chat provider/);
   assert.doesNotMatch(JSON.stringify(content), /data:image\/png;base64/);
   assert.doesNotMatch(JSON.stringify(content), /data:text\/plain;base64/);
 });
@@ -676,6 +729,7 @@ test("route fidelity compaction uses chat-summary requests for Kimi and custom r
 
 test("route fidelity compaction never sends trimmed native tool call pairs to chat upstreams", () => {
   for (const route of [deepseekRoute, kimiRoute, customRoute]) {
+    const middleMarker = `TOOL_RESULT_MIDDLE_${route.id}`;
     const history = new ResponseHistory();
     history.record(`resp_large_tool_${route.id}`, [
       { role: "user", content: "inspect a very large tool result" },
@@ -696,7 +750,7 @@ test("route fidelity compaction never sends trimmed native tool call pairs to ch
       {
         role: "tool",
         tool_call_id: "call_huge_log",
-        content: "huge log line\n".repeat(20_000),
+        content: `${"A".repeat(12_000)}${middleMarker}${"B".repeat(12_000)}`,
       },
     ]);
 
@@ -722,6 +776,7 @@ test("route fidelity compaction never sends trimmed native tool call pairs to ch
       route.id,
     );
     assert.match(JSON.stringify(compact.body.messages), /call_huge_log/);
+    assert.match(JSON.stringify(compact.body.messages), new RegExp(middleMarker));
   }
 });
 

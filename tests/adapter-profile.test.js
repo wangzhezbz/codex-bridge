@@ -11,9 +11,11 @@ import {
 } from "../desktop/settings.mjs";
 import {
   adapterIdForRoute,
+  adapterContractForRoute,
   filterPayloadForAdapter,
   normalizeAdapterProfile,
 } from "../src/adapter-profile.js";
+import { routeCapabilityMatrix, routeCapabilitySummary } from "../src/route-capability-matrix.js";
 
 test("adapter profiles classify native responses routes", () => {
   const profile = normalizeAdapterProfile({
@@ -34,6 +36,32 @@ test("adapter profiles classify native responses routes", () => {
   assert.equal(profile.supportsFiles, "native");
   assert.equal(profile.supportsResponsePreviousId, true);
   assert.ok(profile.safeParams.includes("previous_response_id"));
+});
+
+test("adapter contracts expose a stable v1 route boundary", () => {
+  const contract = adapterContractForRoute({
+    id: "deepseek-v4-pro",
+    displayName: "DeepSeek V4 Pro",
+    provider: "deepseek",
+    api: "chat_completions",
+    baseUrl: "https://api.deepseek.com/v1",
+    model: "deepseek-v4-pro",
+    contextWindow: 1000000,
+    dropParams: ["response_format", "parallel_tool_calls"],
+  });
+
+  assert.equal(contract.contractVersion, "adapter-contract-v1");
+  assert.equal(contract.route.id, "deepseek-v4-pro");
+  assert.equal(contract.route.displayName, "DeepSeek V4 Pro");
+  assert.equal(contract.upstream.api, "chat_completions");
+  assert.equal(contract.upstream.model, "deepseek-v4-pro");
+  assert.equal(contract.upstream.providerFamily, "deepseek");
+  assert.equal(contract.adapter.id, "chat-deepseek");
+  assert.ok(contract.payload.allowedTopLevelParams.includes("messages"));
+  assert.ok(contract.payload.droppedTopLevelParams.includes("response_format"));
+  assert.equal(contract.runtime.timeoutMs, 600000);
+  assert.equal(contract.runtime.maxToolContinuationTurns, 5);
+  assert.equal(contract.capabilities.contextWindow, 1000000);
 });
 
 test("codex_openai responses routes enforce ChatGPT backend request contract", () => {
@@ -260,6 +288,37 @@ test("adapter profiles expose a unified capability matrix for native responses r
   assert.equal(profile.capabilities.promptCache, "native");
   assert.equal(profile.capabilities.contextWindow, 258400);
   assert.equal(profile.capabilities.catalogContextWindow, 200000);
+});
+
+test("route capability matrix exposes user-facing states without changing adapter contracts", () => {
+  const matrix = routeCapabilityMatrix({
+    id: "deepseek-v4-pro",
+    provider: "deepseek",
+    api: "chat_completions",
+    model: "deepseek-v4-pro",
+    contextWindow: 1000000,
+    imageGeneration: {
+      mode: "proxy",
+      providerId: "siliconflow-kolors",
+    },
+  });
+  const byKey = new Map(matrix.items.map((item) => [item.key, item]));
+
+  assert.equal(matrix.version, "route-capability-matrix-v1");
+  assert.equal(byKey.get("tools").state, "compatible");
+  assert.equal(byKey.get("files").state, "degraded");
+  assert.equal(byKey.get("files").stateLabel, "降级");
+  assert.equal(byKey.get("image_generation").state, "proxy");
+  assert.match(byKey.get("image_generation").detail, /siliconflow-kolors/);
+
+  const summary = routeCapabilitySummary({
+    provider: "deepseek",
+    api: "chat_completions",
+    model: "deepseek-v4-pro",
+    contextWindow: 1000000,
+  });
+  assert.equal(summary.version, "route-capability-matrix-v1");
+  assert.equal(summary.degraded >= 1, true);
 });
 
 test("adapter profiles expose route-specific chat capabilities without weakening custom models", () => {

@@ -19,6 +19,24 @@ export function fetchInitWithProxy(targetUrl, init = {}) {
   };
 }
 
+export function invalidateProxyAgentForUrl(targetUrl) {
+  const proxy = proxySettingsForUrl(targetUrl);
+  if (!proxy?.url) {
+    return false;
+  }
+  return proxyAgents.delete(proxy.url);
+}
+
+export function refreshFetchInitWithProxy(targetUrl, init = {}) {
+  const previous = proxySettingsForUrl(targetUrl);
+  if (previous?.url) {
+    proxyAgents.delete(previous.url);
+  }
+  cachedWindowsProxySettings = undefined;
+  cachedMacosProxySettings = undefined;
+  return fetchInitWithProxy(targetUrl, init);
+}
+
 export function proxyLogLabel(targetUrl) {
   const proxy = proxySettingsForUrl(targetUrl);
   if (!proxy?.url) {

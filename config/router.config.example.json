@@ -12,6 +12,11 @@
     "effectiveContextWindowPercent": 95,
     "autoCompactPercent": 80
   },
+  "smartRouting": {
+    "autoSelectModel": false,
+    "autoFailover": false
+  },
+  "duplicateRequestProtection": false,
   "models": [
     {
       "id": "gpt-5.5",

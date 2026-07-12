@@ -1,6 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { cloneJson } from "./json.js";
-import { contentToText, responsesToChatRequest } from "./responses-to-chat.js";
+import {
+  contentToText,
+  estimatedMessagesTokens,
+  preservedToolBoundaryCount,
+  responsesToChatRequest,
+  trimMessagesToRouteContext,
+} from "./responses-to-chat.js";
+import { contextPolicyForRoute } from "./context-policy.js";
 
 export const COMPACT_SUMMARY_PREFIX =
   "Another language model started to solve this problem and produced a summary of its thinking process. " +
@@ -20,7 +27,6 @@ const COMPACT_SUMMARIZATION_PROMPT =
   "Be concise, structured, and focused on helping the next LLM seamlessly continue the work. Do not call tools. Return only the summary text.";
 
 const COMPACT_MAX_OUTPUT_TOKENS = 20_000;
-const COMPACT_CHAT_MESSAGES_MAX_BYTES = 120 * 1024;
 const COMPACT_MESSAGE_MAX_CHARS = 8_000;
 const LOCAL_COMPACT_FALLBACK_MAX_CHARS = 60_000;
 
@@ -41,17 +47,59 @@ export function requestHasCompactionTrigger(requestBody = {}) {
   );
 }
 
-export function buildCompactChatRequest(requestBody, route, history) {
-  const compactBody = compactRequestBody(requestBody);
-  const converted = responsesToChatRequest(compactBody, route, history);
+export function buildCompactChatRequest(requestBody, route, history, options = {}) {
+  const sourceMessages = Array.isArray(options.sourceMessages)
+    ? options.sourceMessages
+    : null;
+  const sourceRequest = sourceMessages
+    ? compactSourceRequestBody(requestBody)
+    : requestBody;
+  const compactBody = compactRequestBody(sourceRequest);
+  const converted = responsesToChatRequest(
+    compactBody,
+    route,
+    sourceMessages ? null : history,
+  );
   converted.body.stream = false;
   converted.body.max_tokens = COMPACT_MAX_OUTPUT_TOKENS;
   delete converted.body.tools;
   delete converted.body.tool_choice;
   delete converted.body.parallel_tool_calls;
-  converted.body.messages = flattenCompactToolProtocolMessages(
-    trimMessagesToCompactBudget(converted.body.messages || []),
-  );
+  const compactMessages = sourceMessages
+    ? [...sourceMessages, ...(converted.body.messages || [])]
+    : converted.body.messages || [];
+  const contextPolicy = contextPolicyForRoute(route, {
+    defaultContextWindow: 258400,
+  });
+  const beforeTokens = estimatedMessagesTokens(compactMessages);
+  const budgetedMessages = trimMessagesToRouteContext(compactMessages, route, {
+    contextPolicy,
+  });
+  converted.body.messages = flattenCompactToolProtocolMessages(budgetedMessages);
+  converted.contextMetrics = {
+    policyId: contextPolicy.policyId,
+    policyVersion: contextPolicy.version,
+    inputBudget: contextPolicy.inputBudget,
+    compactThreshold: contextPolicy.compactThreshold,
+    estimatedTokens: beforeTokens,
+    beforeTokens,
+    afterTokens: estimatedMessagesTokens(budgetedMessages),
+    preservedToolCount: preservedToolBoundaryCount(budgetedMessages),
+  };
+  converted.contextDecision = beforeTokens > contextPolicy.inputBudget
+    ? {
+        event: "context_truncation",
+        kind: "compact_payload",
+        policyId: contextPolicy.policyId,
+        policyVersion: contextPolicy.version,
+        inputBudget: contextPolicy.inputBudget,
+        beforeTokens,
+        afterTokens: converted.contextMetrics.afterTokens,
+        preservedToolCount: converted.contextMetrics.preservedToolCount,
+        outcome: "truncated",
+        reasonCode: "compact_input_budget_exceeded",
+      }
+    : null;
   return converted;
 }
 
@@ -89,6 +137,14 @@ export function compactResponseFromResponses(response, requestedModel, fallbackC
     });
   }
   return compactResponseFromSummary(id, summary, requestedModel, responseUsage(response?.usage));
+}
+
+export function strictContextSwitchSummaryFromChat(chat) {
+  return strictContextSwitchSummary(extractChatSummaryText(chat));
+}
+
+export function strictContextSwitchSummaryFromResponses(response) {
+  return strictContextSwitchSummary(extractResponsesSummaryText(response));
 }
 
 export function compactResponseFromLocalFallback(requestedModel, options = {}) {
@@ -174,6 +230,15 @@ function compactRequestBody(requestBody, options = {}) {
   return body;
 }
 
+function compactSourceRequestBody(requestBody = {}) {
+  const body = cloneJson(requestBody) || {};
+  delete body.input;
+  delete body.messages;
+  delete body.previous_response_id;
+  delete body.instructions;
+  return body;
+}
+
 function stripCompactionTrigger(input) {
   if (!Array.isArray(input)) {
     return input;
@@ -196,37 +261,8 @@ function appendCompactPrompt(input) {
   return [input, promptItem];
 }
 
-function trimMessagesToCompactBudget(messages) {
-  if (jsonBytes(messages) <= COMPACT_CHAT_MESSAGES_MAX_BYTES) {
-    return messages;
-  }
-
-  const prompt = messages.at(-1);
-  const preserved = prompt ? [prompt] : [];
-  let trimmed = false;
-
-  for (let index = messages.length - 2; index >= 0; index -= 1) {
-    const candidate = messages[index];
-    const next = [trimNotice(), candidate, ...preserved];
-    if (jsonBytes(next) <= COMPACT_CHAT_MESSAGES_MAX_BYTES) {
-      preserved.unshift(candidate);
-      continue;
-    }
-
-    const shortened = shortenCompactMessage(candidate);
-    const nextShort = [trimNotice(), shortened, ...preserved];
-    if (jsonBytes(nextShort) <= COMPACT_CHAT_MESSAGES_MAX_BYTES) {
-      preserved.unshift(shortened);
-    }
-    trimmed = true;
-  }
-
-  return trimmed ? [trimNotice(), ...preserved] : preserved;
-}
-
-function shortenCompactMessage(message) {
+function flattenCompactToolResultMessage(message) {
   const text = contentToText(message?.content);
-  const shortened = middleExcerpt(text, COMPACT_MESSAGE_MAX_CHARS);
   if (message?.role === "tool") {
     const id = message.tool_call_id ? ` ${message.tool_call_id}` : "";
     return {
@@ -234,12 +270,12 @@ function shortenCompactMessage(message) {
       content:
         "CodexBridge compacted a historical tool result so it can be used as context " +
         `without replaying a native tool message.\n\nResult${id}:\n` +
-        (shortened || "[tool result omitted during context compaction]"),
+        (text || "[tool result omitted during context compaction]"),
     };
   }
   const result = {
     role: message?.role || "user",
-    content: shortened || "[message omitted during context compaction]",
+    content: text || "[message omitted during context compaction]",
   };
   if (message?.name) {
     result.name = message.name;
@@ -272,7 +308,7 @@ function flattenCompactToolProtocolMessages(messages) {
     }
 
     if (message?.role === "tool") {
-      result.push(shortenCompactMessage(message));
+      result.push(flattenCompactToolResultMessage(message));
       continue;
     }
 
@@ -295,21 +331,10 @@ function compactToolCallsText(toolCalls = []) {
     const id = toolCall?.id || toolCall?.call_id || "unknown_call";
     const name = toolCall?.function?.name || toolCall?.name || toolCall?.type || "tool";
     const args = toolCall?.function?.arguments ?? toolCall?.arguments ?? "";
-    const argsText = safeCompactText(
-      typeof args === "string" ? args : JSON.stringify(args || {}),
-      COMPACT_MESSAGE_MAX_CHARS,
-    );
+    const argsText = typeof args === "string" ? args : JSON.stringify(args || {});
     lines.push(`Tool call ${id}: ${name}${argsText ? `\nArguments: ${argsText}` : ""}`);
   }
   return lines.join("\n\n");
-}
-
-function trimNotice() {
-  return {
-    role: "system",
-    content:
-      "Earlier conversation history was omitted by CodexBridge during context compaction to fit the upstream model context window.",
-  };
 }
 
 function localCompactFallbackSummary(options = {}) {
@@ -319,9 +344,9 @@ function localCompactFallbackSummary(options = {}) {
   );
   const context = localCompactContextText(options);
   return [
-    "CodexBridge local compact fallback: remote context compaction did not return a usable summary.",
-    `Reason: ${reason}`,
-    "Recent context excerpt:",
+    "上下文压缩失败，已使用本地摘要继续。",
+    `报错信息：${reason}`,
+    "最近上下文摘录：",
     context || "[no compactable conversation text was available]",
   ].join("\n\n");
 }
@@ -360,6 +385,11 @@ function localCompactResponseItemText(item) {
     return "";
   }
   return `${role}: ${safeCompactText(text, COMPACT_MESSAGE_MAX_CHARS)}`;
+}
+
+function strictContextSwitchSummary(summary) {
+  const text = String(summary || "").trim();
+  return text ? `${COMPACT_SUMMARY_PREFIX}\n${text}` : "";
 }
 
 function safeCompactText(value, maxChars) {
@@ -452,10 +482,6 @@ function responseIdFromCompactUpstream(upstreamId) {
 
 function stableFragment(value) {
   return String(value).replace(/[^A-Za-z0-9]/g, "").slice(-16) || "compact";
-}
-
-function jsonBytes(value) {
-  return Buffer.byteLength(JSON.stringify(value || []), "utf8");
 }
 
 function sse(event, payload) {

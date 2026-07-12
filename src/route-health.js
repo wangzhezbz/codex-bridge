@@ -8,6 +8,10 @@ const ERROR_TYPES = {
     type: "authentication_error",
     code: "upstream_authentication_error",
   },
+  billing: {
+    type: "billing_error",
+    code: "upstream_billing_error",
+  },
   compact: {
     type: "compact_unsupported",
     code: "upstream_compact_unsupported",
@@ -97,9 +101,7 @@ export function createRouteHealthStore({
     const routeSnapshots = routes.map((route) => routeSnapshot(route, records.get(routeHealthKey(route)), rateLimitStatus));
     return {
       routes: routeSnapshots,
-      unhealthyRoutes: routeSnapshots.filter((route) =>
-        route.status === "degraded" || route.status === "rate_limited"
-      ).length,
+      unhealthyRoutes: routeSnapshots.filter(isUnhealthyRouteSnapshot).length,
     };
   }
 
@@ -146,11 +148,14 @@ export function classifyUpstreamError(error, context = {}) {
 }
 
 function classifyBase({ error, statusCode, haystack, context }) {
-  if (error?.code === "provider_rate_limited" || statusCode === 429 || /rate.?limit|too many requests/.test(haystack)) {
+  if (error?.code === "provider_rate_limited" || statusCode === 429) {
     return ERROR_TYPES.rateLimit;
   }
   if (error?.code === "upstream_network_error" || error?.name === "UpstreamNetworkError") {
     return ERROR_TYPES.network;
+  }
+  if (isProviderUnavailableError(statusCode, haystack)) {
+    return ERROR_TYPES.providerUnavailable;
   }
   if (error?.code === "upstream_timeout" || error?.name === "UpstreamTimeoutError" || /timed out|timeout/.test(haystack)) {
     return ERROR_TYPES.timeout;
@@ -175,11 +180,14 @@ function classifyBase({ error, statusCode, haystack, context }) {
   if (isMediaError(statusCode, haystack)) {
     return ERROR_TYPES.media;
   }
+  if (isBillingError(statusCode, haystack)) {
+    return ERROR_TYPES.billing;
+  }
   if (statusCode === 401 || statusCode === 403 || /unauthori[sz]ed|invalid api key|api key|forbidden|permission/.test(haystack)) {
     return ERROR_TYPES.authentication;
   }
-  if (isProviderUnavailableError(statusCode, haystack)) {
-    return ERROR_TYPES.providerUnavailable;
+  if (/rate.?limit|too many requests/.test(haystack)) {
+    return ERROR_TYPES.rateLimit;
   }
   if (statusCode === 400 || statusCode === 404 || statusCode === 409 || statusCode === 422 || /invalid_request|invalid request|bad request|missing field|unknown parameter|unsupported parameter|must be set/.test(haystack)) {
     return ERROR_TYPES.parameter;
@@ -220,10 +228,18 @@ function isMediaError(statusCode, haystack) {
   );
 }
 
+function isBillingError(statusCode, haystack) {
+  return (
+    statusCode === 402 ||
+    /insufficient (balance|quota|credit)|balance insufficient|quota exceeded|quota exhausted|credit exhausted|balance exhausted|insufficient_balance|insufficient_quota|billing|payment required|余额不足|额度不足|欠费/.test(haystack)
+  );
+}
+
 function isProviderUnavailableError(statusCode, haystack) {
   return (
     statusCode === 503 ||
-    /no available (channel|provider)|service unavailable|temporarily unavailable|capacity|overloaded|upstream unavailable|model unavailable|distributor/.test(haystack)
+    ([502, 504].includes(statusCode) && /bad gateway|gateway timeout|cloudflare|nginx|html/.test(haystack)) ||
+    /no available (channel|provider)|service unavailable|temporarily unavailable|capacity|overloaded|upstream unavailable|model unavailable|distributor|bad gateway|gateway timeout/.test(haystack)
   );
 }
 
@@ -236,13 +252,21 @@ function routeSnapshot(route = {}, record = {}, rateLimitStatus) {
   const lastOkAtMs = Number(record?.lastOkAtMs || 0);
   const lastErrorAtMs = Number(record?.lastErrorAtMs || 0);
   let status = "unknown";
-  if (cooldownRemainingMs > 0) {
+  if (route?.enabled === false) {
+    status = "disabled";
+  } else if (cooldownRemainingMs > 0) {
     status = "rate_limited";
   } else if (lastErrorAtMs > lastOkAtMs) {
     status = "degraded";
   } else if (lastOkAtMs > 0) {
     status = "healthy";
   }
+  const availability = routeAvailabilityStatus({
+    status,
+    record,
+    cooldownRemainingMs,
+    nextAfterMs,
+  });
 
   return {
     id: String(route.id || route.model || ""),
@@ -252,6 +276,8 @@ function routeSnapshot(route = {}, record = {}, rateLimitStatus) {
     model: String(route.model || ""),
     proxy: proxyLogLabel(route.baseUrl || ""),
     status,
+    circuitState: availability.circuitState,
+    availability,
     lastStatus: Number.isFinite(Number(record?.lastStatus)) ? Number(record.lastStatus) : null,
     lastOkAt: String(record?.lastOkAt || ""),
     lastErrorAt: String(record?.lastErrorAt || ""),
@@ -265,6 +291,77 @@ function routeSnapshot(route = {}, record = {}, rateLimitStatus) {
       nextAfterMs,
     },
   };
+}
+
+function routeAvailabilityStatus({
+  status = "unknown",
+  record = {},
+  cooldownRemainingMs = 0,
+  nextAfterMs = 0,
+} = {}) {
+  if (status === "disabled") {
+    return {
+      state: "disabled",
+      reason: "route_disabled",
+      circuitState: "disabled",
+      canUseForManual: false,
+      canUseForAutomatic: false,
+      canUseForFailover: false,
+      retryAfterMs: 0,
+      nextAfterMs,
+    };
+  }
+  if (status === "rate_limited") {
+    return {
+      state: "limited",
+      reason: "cooldown_active",
+      circuitState: "open",
+      canUseForManual: false,
+      canUseForAutomatic: false,
+      canUseForFailover: false,
+      retryAfterMs: cooldownRemainingMs,
+      nextAfterMs,
+    };
+  }
+  if (status === "degraded") {
+    const lastErrorType = String(record?.lastErrorType || "");
+    return {
+      state: "degraded",
+      reason: lastErrorType ? `last_error:${lastErrorType}` : "last_error",
+      circuitState: "half_open",
+      canUseForManual: true,
+      canUseForAutomatic: false,
+      canUseForFailover: false,
+      retryAfterMs: 0,
+      nextAfterMs,
+    };
+  }
+  if (status === "healthy") {
+    return {
+      state: nextAfterMs > 0 ? "paced" : "available",
+      reason: nextAfterMs > 0 ? "pacing_active" : "last_success",
+      circuitState: "closed",
+      canUseForManual: true,
+      canUseForAutomatic: true,
+      canUseForFailover: true,
+      retryAfterMs: 0,
+      nextAfterMs,
+    };
+  }
+  return {
+    state: "untested",
+    reason: "no_probe_yet",
+    circuitState: "closed",
+    canUseForManual: true,
+    canUseForAutomatic: true,
+    canUseForFailover: true,
+    retryAfterMs: 0,
+    nextAfterMs,
+  };
+}
+
+function isUnhealthyRouteSnapshot(route = {}) {
+  return route?.status === "degraded" || route?.status === "rate_limited";
 }
 
 function upstreamBodyMessage(rawBody, parsedBody) {

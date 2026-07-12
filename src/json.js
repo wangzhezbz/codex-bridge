@@ -92,14 +92,14 @@ function decodeRequestBody(body, contentEncoding = "") {
     }
     if (encoding === "zstd") {
       if (typeof zlib.zstdDecompressSync !== "function") {
-        const error = new Error("This Node runtime cannot decode zstd request bodies");
+        const error = new Error("当前 Node 运行环境不能解码 zstd 请求体。");
         error.statusCode = 415;
         throw error;
       }
       decoded = zlib.zstdDecompressSync(decoded);
       continue;
     }
-    const error = new Error(`Unsupported request content-encoding: ${contentEncoding}`);
+    const error = new Error(`不支持的请求 Content-Encoding：${contentEncoding}`);
     error.statusCode = 415;
     throw error;
   }

@@ -31,6 +31,49 @@ const imageRoute = {
   inputModalities: ["text", "image"],
 };
 
+test("previous_response_id removes only an exact full persisted-history input prefix", () => {
+  const priorMessages = [
+    { content: "persisted user turn", role: "user" },
+    { content: "persisted assistant turn", role: "assistant" },
+  ];
+  const history = {
+    get: () => priorMessages,
+  };
+  const converted = responsesToChatRequest({
+    model: route.id,
+    previous_response_id: "resp_previous",
+    input: [
+      { role: "user", content: "persisted user turn" },
+      { role: "assistant", content: "persisted assistant turn" },
+      { role: "user", content: "true delta turn" },
+    ],
+  }, route, history);
+
+  assert.deepEqual(converted.body.messages, [
+    { content: "persisted user turn", role: "user" },
+    { content: "persisted assistant turn", role: "assistant" },
+    { role: "user", content: "true delta turn" },
+  ]);
+  assert.deepEqual(converted.messagesForHistory, converted.body.messages);
+});
+
+test("previous_response_id keeps an isolated repeated sentence that is not the full history prefix", () => {
+  const priorMessages = [
+    { role: "user", content: "repeat me" },
+    { role: "assistant", content: "prior answer" },
+  ];
+  const converted = responsesToChatRequest({
+    model: route.id,
+    previous_response_id: "resp_previous",
+    input: [{ role: "user", content: "repeat me" }],
+  }, route, { get: () => priorMessages });
+
+  assert.deepEqual(converted.body.messages, [
+    ...priorMessages,
+    { role: "user", content: "repeat me" },
+  ]);
+});
+
 test("model catalog keeps Codex tool capability fields", () => {
   const catalog = buildModelCatalog({
     models: [
@@ -57,6 +100,52 @@ test("model catalog keeps Codex tool capability fields", () => {
     ["low", "medium", "high", "xhigh"],
   );
   assert.equal(catalog.models[0].default_reasoning_level, "medium");
+});
+
+test("model catalog preserves GPT 5.6 Responses Lite metadata", () => {
+  const supportedReasoningLevels = [
+    { effort: "low", description: "low" },
+    { effort: "medium", description: "medium" },
+    { effort: "high", description: "high" },
+    { effort: "xhigh", description: "xhigh" },
+    { effort: "max", description: "max" },
+    { effort: "ultra", description: "ultra" },
+  ];
+  const catalog = buildModelCatalog({
+    models: [
+      {
+        id: "cb-gpt-5-6-sol",
+        displayName: "GPT-5.6-Sol",
+        api: "responses",
+        model: "gpt-5.6-sol",
+        contextWindow: 372000,
+        defaultReasoningLevel: "low",
+        supportedReasoningLevels,
+        useResponsesLite: true,
+        supportsReasoningSummaries: true,
+        defaultReasoningSummary: "none",
+        supportVerbosity: true,
+        defaultVerbosity: "low",
+        webSearchToolType: "text_and_image",
+        toolMode: "code_mode_only",
+        multiAgentVersion: "v2",
+      },
+    ],
+  });
+  const model = catalog.models[0];
+
+  assert.equal(model.context_window, 372000);
+  assert.equal(model.max_context_window, 372000);
+  assert.equal(model.default_reasoning_level, "low");
+  assert.deepEqual(model.supported_reasoning_levels, supportedReasoningLevels);
+  assert.equal(model.use_responses_lite, true);
+  assert.equal(model.supports_reasoning_summaries, true);
+  assert.equal(model.default_reasoning_summary, "none");
+  assert.equal(model.support_verbosity, true);
+  assert.equal(model.default_verbosity, "low");
+  assert.equal(model.web_search_tool_type, "text_and_image");
+  assert.equal(model.tool_mode, "code_mode_only");
+  assert.equal(model.multi_agent_version, "v2");
 });
 
 test("OpenAI model list exposes display names for Codex model picker fallback", () => {
@@ -87,6 +176,29 @@ test("OpenAI model list exposes display names for Codex model picker fallback", 
   assert.equal(list.data[0].codexbridge_capabilities.mcp_namespaces, "native");
 });
 
+test("OpenAI model list keeps normalized identity when provider is inferred from capabilities", () => {
+  const list = openAiModelsList({
+    models: [
+      {
+        id: "cb-kimi-k2-7-code",
+        displayName: "Kimi K2.7 Code",
+        description: "Kimi coding route.",
+        api: "chat_completions",
+        baseUrl: "http://example.test/v1",
+        model: "kimi-k2.7-code",
+        providerFamily: "kimi",
+      },
+    ],
+  });
+
+  assert.equal(list.data[0].id, "cb-kimi-k2-7-code");
+  assert.equal(list.data[0].name, "Kimi K2.7 Code");
+  assert.equal(list.data[0].display_name, "Kimi K2.7 Code");
+  assert.equal(list.data[0].owned_by, "kimi");
+  assert.equal(list.data[0].provider, "kimi");
+  assert.equal(list.data[0].model, "kimi-k2.7-code");
+});
+
 test("model catalog uses model context window for truncation instead of a 10k cap", () => {
   const catalog = buildModelCatalog({
     models: [
@@ -109,7 +221,7 @@ test("model catalog uses model context window for truncation instead of a 10k ca
   assert.equal(catalog.models[0].auto_compact_token_limit, 800_000);
 });
 
-test("model catalog uses configured catalog context as the Codex desktop safety window", () => {
+test("model catalog does not let global catalog context cap per-route context windows", () => {
   const catalog = buildModelCatalog({
     models: [
       {
@@ -128,10 +240,10 @@ test("model catalog uses configured catalog context as the Codex desktop safety 
     },
   });
 
-  assert.equal(catalog.models[0].context_window, 258400);
-  assert.equal(catalog.models[0].max_context_window, 258400);
-  assert.equal(catalog.models[0].truncation_policy.limit, 245480);
-  assert.equal(catalog.models[0].auto_compact_token_limit, 206720);
+  assert.equal(catalog.models[0].context_window, 1_047_576);
+  assert.equal(catalog.models[0].max_context_window, 1_047_576);
+  assert.equal(catalog.models[0].truncation_policy.limit, 995_197);
+  assert.equal(catalog.models[0].auto_compact_token_limit, 838_060);
 });
 
 test("chat catalog keeps the configured upstream context instead of inflating history", () => {
@@ -153,7 +265,7 @@ test("chat catalog keeps the configured upstream context instead of inflating hi
   assert.equal(catalog.models[0].auto_compact_token_limit, 6553);
 });
 
-test("chat catalog can still expose a larger explicit catalog context window", () => {
+test("chat catalog caps an oversized catalog context window to the upstream limit", () => {
   const catalog = buildModelCatalog({
     models: [
       {
@@ -168,9 +280,9 @@ test("chat catalog can still expose a larger explicit catalog context window", (
     ],
   });
 
-  assert.equal(catalog.models[0].context_window, 200000);
-  assert.equal(catalog.models[0].truncation_policy.limit, 190000);
-  assert.equal(catalog.models[0].auto_compact_token_limit, 160000);
+  assert.equal(catalog.models[0].context_window, 8192);
+  assert.equal(catalog.models[0].truncation_policy.limit, 7782);
+  assert.equal(catalog.models[0].auto_compact_token_limit, 6553);
 });
 
 test("chat catalog accepts standard Codex reasoning levels for model switching", () => {
@@ -388,10 +500,11 @@ test("chat conversion turns unsupported audio into a clear placeholder", () => {
   assert.match(payload, /CodexBridge attachment guidance/);
   assert.equal(
     converted.body.messages.at(-1).content,
-    "transcribe this clip\n[audio input not forwarded to this chat provider: wav audio. Switch to an audio-capable GPT/Responses or chat route, or provide a transcript.]",
+    "transcribe this clip\n[CodexBridge 当前不会把音频直接转发给这个 Chat 模型：wav 音频。请先提供文字转录后再继续。]",
   );
   assert.doesNotMatch(payload, /UklGRgAAAAA=/);
   assert.doesNotMatch(payload, /input_audio/);
+  assert.doesNotMatch(payload, /not forwarded to this chat provider/);
 });
 
 test("chat conversion keeps file inputs visible when chat provider cannot forward them", () => {
@@ -417,8 +530,9 @@ test("chat conversion keeps file inputs visible when chat provider cannot forwar
 
   assert.equal(
     converted.body.messages.at(-1).content,
-    "summarize this file\nPDF attachment unavailable to this chat provider: brief.pdf. CodexBridge did not forward or extract readable text. Ask the user to switch to a GPT/Responses model or provide text/OCR output.",
+    "summarize this file\nPDF 附件当前 Chat 模型不可用：brief.pdf。CodexBridge 没有转发该文件，也没有提取到可读文本。请切换到 GPT/Responses 模型，或提供文本/OCR 内容。",
   );
+  assert.doesNotMatch(converted.body.messages.at(-1).content, /unavailable to this chat provider/);
 });
 
 test("chat conversion injects extracted text file data instead of a raw file placeholder", () => {
@@ -522,8 +636,8 @@ test("chat conversion tells chat models not to tool-loop for unavailable PDFs", 
   );
   assert.ok(guidance);
   assert.match(guidance.content, /Do not call shell, browser, MCP, or local file tools/);
-  assert.match(converted.body.messages.at(-1).content, /PDF attachment unavailable to this chat provider: scan\.pdf/);
-  assert.match(converted.body.messages.at(-1).content, /switch to a GPT\/Responses model/);
+  assert.match(converted.body.messages.at(-1).content, /PDF 附件当前 Chat 模型不可用：scan\.pdf/);
+  assert.match(converted.body.messages.at(-1).content, /切换到 GPT\/Responses 模型/);
 });
 
 test("chat conversion keeps Office attachments as explicit unavailable file context", () => {
@@ -571,11 +685,12 @@ test("chat conversion keeps Office attachments as explicit unavailable file cont
 
   const payload = JSON.stringify(converted.body.messages);
   assert.match(payload, /CodexBridge attachment guidance/);
-  assert.match(converted.body.messages.at(-1).content, /File attachment unavailable to this chat provider: deck\.pptx/);
-  assert.match(converted.body.messages.at(-1).content, /File attachment unavailable to this chat provider: brief\.docx/);
-  assert.match(converted.body.messages.at(-1).content, /File attachment unavailable to this chat provider: table\.xlsx/);
+  assert.match(converted.body.messages.at(-1).content, /文件附件当前 Chat 模型不可用：deck\.pptx/);
+  assert.match(converted.body.messages.at(-1).content, /文件附件当前 Chat 模型不可用：brief\.docx/);
+  assert.match(converted.body.messages.at(-1).content, /文件附件当前 Chat 模型不可用：table\.xlsx/);
   assert.doesNotMatch(payload, /application\/vnd\.openxmlformats/);
   assert.doesNotMatch(payload, /UEsDBAo=/);
+  assert.doesNotMatch(payload, /File attachment unavailable to this chat provider/);
 });
 
 test("chat conversion refuses oversized file data instead of forwarding or decoding it", () => {
@@ -600,7 +715,7 @@ test("chat conversion refuses oversized file data instead of forwarding or decod
   );
 
   const payload = JSON.stringify(converted.body.messages);
-  assert.match(converted.body.messages.at(-1).content, /File attachment unavailable to this chat provider: giant\.txt/);
+  assert.match(converted.body.messages.at(-1).content, /文件附件当前 Chat 模型不可用：giant\.txt/);
   assert.match(payload, /CodexBridge attachment guidance/);
   assert.doesNotMatch(payload, /data:text\/plain;base64/);
   assert.ok(payload.length < 2000, "oversized file data must not be copied into the chat payload");
@@ -987,7 +1102,25 @@ test("invalid auth modes fail config validation", () => {
           },
         ],
       }),
-    /unsupported authMode browser_magic/,
+    /不支持的鉴权模式：browser_magic/,
+  );
+});
+
+test("unsupported route api fails config validation in Chinese", () => {
+  assert.throws(
+    () =>
+      validateConfig({
+        models: [
+          {
+            id: "bad-api",
+            displayName: "Bad API",
+            api: "legacy_completions",
+            baseUrl: "https://api.example.com/v1",
+            model: "bad-api",
+          },
+        ],
+      }),
+    /不支持的接口类型：legacy_completions/,
   );
 });
 
@@ -1007,7 +1140,7 @@ test("router config rejects model baseUrl pointing back to CodexBridge itself", 
           },
         ],
       }),
-    /points back to CodexBridge Router itself/,
+    /Base URL 指回了 CodexBridge Router 自己/,
   );
 });
 
@@ -1964,6 +2097,70 @@ test("namespace tools are flattened for chat providers", () => {
   assert.equal(converted.body.tools[0].function.name, "mcp__demo__demo_read");
 });
 
+test("new ChatGPT built-in namespaces keep their exact identity through chat providers", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "delegate the HyperFrames render",
+      tools: [
+        {
+          type: "namespace",
+          name: "collaboration",
+          tools: [
+            {
+              type: "function",
+              name: "spawn_agent",
+              description: "Spawn a delegated agent.",
+              parameters: {
+                type: "object",
+                properties: { task_name: { type: "string" } },
+                required: ["task_name"],
+              },
+            },
+          ],
+        },
+      ],
+    },
+    route,
+    new ResponseHistory(),
+  );
+
+  assert.equal(
+    converted.body.tools[0].function.name,
+    "collaboration__spawn_agent",
+  );
+
+  const response = chatResponseToResponse(
+    {
+      id: "chatcmpl_collaboration",
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call_spawn_agent",
+                type: "function",
+                function: {
+                  name: "collaboration__spawn_agent",
+                  arguments: '{"task_name":"render_video"}',
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    route.id,
+    converted.toolContext,
+  );
+
+  assert.equal(response.output[0].type, "function_call");
+  assert.equal(response.output[0].namespace, "collaboration");
+  assert.equal(response.output[0].name, "spawn_agent");
+  assert.match(responseToSse(response), /"namespace":"collaboration"/);
+});
+
 test("namespace tools keep unique names so MCP tools are not dropped", () => {
   const converted = responsesToChatRequest(
     {
@@ -2673,6 +2870,68 @@ test("chrome and computer-use requests prefer command fallback instead of Node R
   );
 });
 
+test("chrome open-url requests prefer controlled browser capability when configured", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "Chrome open https://www.youtube.com",
+      tools: [
+        {
+          type: "namespace",
+          name: "mcp__node_repl__",
+          tools: [
+            {
+              type: "function",
+              name: "js",
+              description: "Run JavaScript.",
+              parameters: {
+                type: "object",
+                properties: {
+                  code: { type: "string" },
+                },
+                required: ["code"],
+              },
+            },
+          ],
+        },
+        {
+          type: "function",
+          name: "shell_command",
+          description: "Run shell.",
+          parameters: { type: "object", properties: {} },
+        },
+      ],
+    },
+    route,
+    new ResponseHistory(),
+    {
+      capabilityProviders: [
+        {
+          id: "local-browser",
+          capability: "browser",
+          adapter: "local_browser",
+          enabled: true,
+        },
+      ],
+    },
+  );
+
+  assert.deepEqual(converted.body.tool_choice, {
+    type: "function",
+    function: { name: "codexbridge_capability" },
+  });
+  assert.equal(
+    converted.body.tools.some((tool) => tool.function?.name === "mcp__node_repl__js"),
+    false,
+  );
+  assert.equal(
+    converted.body.tools.some((tool) => tool.function?.name === "shell_command"),
+    true,
+  );
+  assert.match(converted.body.messages[0].content, /browser\/open_url/);
+  assert.doesNotMatch(converted.body.messages[0].content, /browser\/read_url/);
+  assert.doesNotMatch(converted.body.messages[0].content, /use command tools to launch apps/i);
+});
+
 test("interactive plugin requests prefer command fallback when Node REPL is not available", () => {
   const converted = responsesToChatRequest(
     {
@@ -3070,6 +3329,689 @@ test("chat routes keep prior computer tool outputs as text context", () => {
     false,
   );
   assert.match(converted.body.messages.at(-1).content, /screenshot captured/);
+});
+
+test("chat routes expose a controlled CodexBridge capability tool only when providers exist", () => {
+  const withoutProvider = responsesToChatRequest(
+    {
+      input: "read https://example.com",
+    },
+    route,
+    new ResponseHistory(),
+  );
+  assert.equal(withoutProvider.body.tools, undefined);
+
+  const converted = responsesToChatRequest(
+    {
+      input: "read https://example.com",
+    },
+    route,
+    new ResponseHistory(),
+    {
+      capabilityProviders: [
+        {
+          id: "local-browser",
+          capability: "browser",
+          adapter: "local_browser",
+          enabled: true,
+        },
+      ],
+    },
+  );
+
+  const tool = (converted.body.tools || []).find((item) =>
+    item.function?.name === "codexbridge_capability"
+  );
+  assert.ok(tool);
+  assert.match(tool.function.description, /controlled CodexBridge capability/);
+  assert.deepEqual(tool.function.parameters.properties.capability.enum, ["browser"]);
+  assert.deepEqual(tool.function.parameters.properties.action.enum, ["read_url"]);
+  assert.match(converted.body.messages[0].content, /codexbridge_capability/);
+  assert.match(converted.body.messages[0].content, /browser\/read_url/);
+  assert.doesNotMatch(converted.body.messages[0].content, /browser\/open_url/);
+  assert.match(converted.body.messages[0].content, /safe bare domains/i);
+  assert.match(converted.body.messages[0].content, /Do not use shell commands/);
+});
+
+test("chat routes scope browser actions for open-url requests", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "Open https://example.com/docs in the browser.",
+    },
+    route,
+    new ResponseHistory(),
+    {
+      capabilityProviders: [
+        {
+          id: "local-browser",
+          capability: "browser",
+          adapter: "local_browser",
+          enabled: true,
+        },
+      ],
+    },
+  );
+
+  const tool = (converted.body.tools || []).find((item) =>
+    item.function?.name === "codexbridge_capability"
+  );
+  assert.ok(tool);
+  assert.deepEqual(tool.function.parameters.properties.capability.enum, ["browser"]);
+  assert.deepEqual(tool.function.parameters.properties.action.enum, ["open_url"]);
+  assert.deepEqual(Object.keys(tool.function.parameters.properties.input.properties), ["url"]);
+  assert.match(converted.body.messages[0].content, /browser\/open_url/);
+  assert.doesNotMatch(converted.body.messages[0].content, /browser\/read_url/);
+});
+
+test("chat routes expose controlled browser and search capability actions from configured providers", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "search the web and read the best result",
+    },
+    route,
+    new ResponseHistory(),
+    {
+      capabilityProviders: [
+        {
+          id: "local-browser",
+          capability: "browser",
+          adapter: "local_browser",
+          enabled: true,
+        },
+        {
+          id: "search-provider",
+          capability: "web_search",
+          adapter: "generic_http",
+          baseUrl: "https://search.example/v1",
+          endpoint: "/search",
+          enabled: true,
+        },
+      ],
+    },
+  );
+
+  const tool = (converted.body.tools || []).find((item) =>
+    item.function?.name === "codexbridge_capability"
+  );
+  assert.ok(tool);
+  assert.deepEqual(tool.function.parameters.properties.capability.enum, [
+    "browser",
+    "web_search",
+  ]);
+  assert.deepEqual(tool.function.parameters.properties.action.enum, [
+    "read_url",
+    "search",
+  ]);
+  assert.match(tool.function.parameters.properties.input.properties.query.description, /search/i);
+  assert.match(converted.body.messages[0].content, /web_search\/search/);
+});
+
+test("chat routes expose only the capability families requested by the current turn", () => {
+  const capabilityProviders = [
+    {
+      id: "local-browser",
+      capability: "browser",
+      adapter: "local_browser",
+      enabled: true,
+    },
+    {
+      id: "search-provider",
+      capability: "web_search",
+      adapter: "generic_http",
+      baseUrl: "https://search.example/v1",
+      endpoint: "/search",
+      enabled: true,
+    },
+    {
+      id: "ocr-provider",
+      capability: "ocr",
+      adapter: "generic_http",
+      baseUrl: "https://ocr.example/v1",
+      endpoint: "/ocr",
+      enabled: true,
+    },
+    {
+      id: "file-provider",
+      capability: "file_processing",
+      adapter: "generic_http",
+      baseUrl: "https://files.example/v1",
+      endpoint: "/extract-text",
+      enabled: true,
+    },
+  ];
+
+  const converted = responsesToChatRequest(
+    {
+      input: "search the web for current CodexBridge release notes",
+    },
+    route,
+    new ResponseHistory(),
+    { capabilityProviders },
+  );
+
+  const tool = (converted.body.tools || []).find((item) =>
+    item.function?.name === "codexbridge_capability"
+  );
+  assert.ok(tool);
+  assert.deepEqual(tool.function.parameters.properties.capability.enum, [
+    "web_search",
+  ]);
+  assert.deepEqual(tool.function.parameters.properties.action.enum, [
+    "search",
+  ]);
+  assert.match(converted.body.messages[0].content, /web_search\/search/);
+  assert.doesNotMatch(converted.body.messages[0].content, /browser\/open_url/);
+  assert.doesNotMatch(converted.body.messages[0].content, /ocr\/extract_text/);
+  assert.doesNotMatch(converted.body.messages[0].content, /file_processing\/extract_text/);
+});
+
+test("chat routes expose only input fields needed by the requested capability", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "search the web for current CodexBridge release notes",
+    },
+    route,
+    new ResponseHistory(),
+    {
+      capabilityProviders: [
+        {
+          id: "local-browser",
+          capability: "browser",
+          adapter: "local_browser",
+          enabled: true,
+        },
+        {
+          id: "search-provider",
+          capability: "web_search",
+          adapter: "generic_http",
+          baseUrl: "https://search.example/v1",
+          endpoint: "/search",
+          enabled: true,
+        },
+        {
+          id: "ocr-provider",
+          capability: "ocr",
+          adapter: "generic_http",
+          baseUrl: "https://ocr.example/v1",
+          endpoint: "/ocr",
+          enabled: true,
+        },
+        {
+          id: "video-provider",
+          capability: "video",
+          adapter: "generic_http",
+          baseUrl: "https://video.example/v1",
+          endpoint: "/videos",
+          enabled: true,
+        },
+      ],
+    },
+  );
+
+  const tool = (converted.body.tools || []).find((item) =>
+    item.function?.name === "codexbridge_capability"
+  );
+  assert.ok(tool);
+  assert.deepEqual(Object.keys(tool.function.parameters.properties.input.properties), [
+    "query",
+  ]);
+});
+
+test("chat routes do not expose controlled capabilities for setup and UI wording tasks", () => {
+  const capabilityProviders = [
+    {
+      id: "local-browser",
+      capability: "browser",
+      adapter: "local_browser",
+      enabled: true,
+    },
+    {
+      id: "search-provider",
+      capability: "web_search",
+      adapter: "generic_http",
+      baseUrl: "https://search.example/v1",
+      endpoint: "/search",
+      enabled: true,
+    },
+    {
+      id: "screenshot-provider",
+      capability: "webpage_screenshot",
+      adapter: "generic_http",
+      baseUrl: "https://screenshot.example/v1",
+      endpoint: "/screenshot",
+      enabled: true,
+    },
+    {
+      id: "ocr-provider",
+      capability: "ocr",
+      adapter: "generic_http",
+      baseUrl: "https://ocr.example/v1",
+      endpoint: "/ocr",
+      enabled: true,
+    },
+    {
+      id: "file-provider",
+      capability: "file_processing",
+      adapter: "generic_http",
+      baseUrl: "https://file.example/v1",
+      endpoint: "/extract-text",
+      enabled: true,
+    },
+  ];
+
+  for (const input of [
+    "Build a webpage screenshot settings panel.",
+    "Write OCR provider setup docs.",
+    "Create a search box component.",
+    "帮我做一个网页截图按钮。",
+    "帮我写一个 OCR 接入文档。",
+    "做一个文件提取页面，不要读取任何文件。",
+  ]) {
+    const converted = responsesToChatRequest(
+      { input },
+      route,
+      new ResponseHistory(),
+      { capabilityProviders },
+    );
+
+    assert.equal(
+      (converted.body.tools || []).some((item) => item.function?.name === "codexbridge_capability"),
+      false,
+      input,
+    );
+    assert.doesNotMatch(converted.body.messages[0].content, /codexbridge_capability/, input);
+  }
+});
+
+test("chat routes expose controlled computer use app listing, app launch, and desktop screenshot", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "Computer Use",
+    },
+    route,
+    new ResponseHistory(),
+    {
+      capabilityProviders: [
+        {
+          id: "local-computer-use",
+          capability: "computer_use",
+          adapter: "local_computer_use",
+          enabled: true,
+        },
+      ],
+    },
+  );
+
+  const tool = (converted.body.tools || []).find((item) =>
+    item.function?.name === "codexbridge_capability"
+  );
+  assert.ok(tool);
+  assert.deepEqual(tool.function.parameters.properties.capability.enum, ["computer_use"]);
+  assert.deepEqual(tool.function.parameters.properties.action.enum, ["list_apps", "open_app", "screenshot_desktop"]);
+  assert.match(tool.function.parameters.properties.input.properties.app.description, /allowlisted/i);
+  assert.match(tool.function.parameters.properties.input.properties.displayId.description, /desktop display/i);
+  assert.match(converted.body.messages[0].content, /computer_use\/list_apps/);
+  assert.match(converted.body.messages[0].content, /computer_use\/open_app/);
+  assert.match(converted.body.messages[0].content, /computer_use\/screenshot_desktop/);
+  assert.doesNotMatch(converted.body.messages[0].content, /computer_use\/diagnose/);
+});
+
+test("chat routes scope Computer Use actions for app launch requests", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "Computer Use open notepad",
+    },
+    route,
+    new ResponseHistory(),
+    {
+      capabilityProviders: [
+        {
+          id: "local-computer-use",
+          capability: "computer_use",
+          adapter: "local_computer_use",
+          enabled: true,
+        },
+      ],
+    },
+  );
+
+  const tool = (converted.body.tools || []).find((item) =>
+    item.function?.name === "codexbridge_capability"
+  );
+  assert.ok(tool);
+  assert.deepEqual(tool.function.parameters.properties.action.enum, ["list_apps", "open_app"]);
+  assert.deepEqual(Object.keys(tool.function.parameters.properties.input.properties), ["app"]);
+  assert.match(converted.body.messages[0].content, /computer_use\/open_app/);
+  assert.doesNotMatch(converted.body.messages[0].content, /computer_use\/screenshot_desktop/);
+});
+
+test("chat routes scope Computer Use actions for desktop screenshot requests", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "Capture a desktop screenshot.",
+    },
+    route,
+    new ResponseHistory(),
+    {
+      capabilityProviders: [
+        {
+          id: "local-computer-use",
+          capability: "computer_use",
+          adapter: "local_computer_use",
+          enabled: true,
+        },
+      ],
+    },
+  );
+
+  const tool = (converted.body.tools || []).find((item) =>
+    item.function?.name === "codexbridge_capability"
+  );
+  assert.ok(tool);
+  assert.deepEqual(tool.function.parameters.properties.action.enum, ["screenshot_desktop"]);
+  assert.deepEqual(Object.keys(tool.function.parameters.properties.input.properties), ["displayId"]);
+  assert.match(converted.body.messages[0].content, /computer_use\/screenshot_desktop/);
+  assert.doesNotMatch(converted.body.messages[0].content, /computer_use\/open_app/);
+});
+
+test("interactive Computer Use requests prefer controlled capability over shell when configured", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "Computer Use open notepad",
+      tools: [
+        {
+          type: "function",
+          name: "shell_command",
+          description: "Run shell.",
+          parameters: { type: "object", properties: {} },
+        },
+      ],
+    },
+    route,
+    new ResponseHistory(),
+    {
+      capabilityProviders: [
+        {
+          id: "local-computer-use",
+          capability: "computer_use",
+          adapter: "local_computer_use",
+          enabled: true,
+        },
+      ],
+    },
+  );
+
+  assert.deepEqual(converted.body.tool_choice, {
+    type: "function",
+    function: { name: "codexbridge_capability" },
+  });
+  assert.equal(
+    converted.body.tools.some((tool) => tool.function?.name === "shell_command"),
+    true,
+  );
+  assert.match(converted.body.messages[0].content, /computer_use\/open_app/);
+  assert.match(converted.body.messages[0].content, /Do not use shell commands/);
+  assert.doesNotMatch(converted.body.messages[0].content, /use command tools to launch apps or scripts directly/i);
+  assert.doesNotMatch(converted.body.messages[0].content, /use any listed shell or command tools to complete browser\/app tasks/i);
+});
+
+test("chat routes expose a controlled webpage screenshot capability action from configured providers", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "capture a screenshot of the page",
+    },
+    route,
+    new ResponseHistory(),
+    {
+      capabilityProviders: [
+        {
+          id: "screenshot-provider",
+          capability: "webpage_screenshot",
+          adapter: "generic_http",
+          baseUrl: "https://screenshot.example/v1",
+          endpoint: "/screenshot",
+          enabled: true,
+        },
+      ],
+    },
+  );
+
+  const tool = (converted.body.tools || []).find((item) =>
+    item.function?.name === "codexbridge_capability"
+  );
+  assert.ok(tool);
+  assert.deepEqual(tool.function.parameters.properties.capability.enum, [
+    "webpage_screenshot",
+  ]);
+  assert.deepEqual(tool.function.parameters.properties.action.enum, [
+    "screenshot_url",
+  ]);
+  assert.match(tool.function.parameters.properties.input.properties.url.description, /webpage_screenshot\/screenshot_url.*safe bare domains/i);
+  assert.match(converted.body.messages[0].content, /webpage_screenshot\/screenshot_url/);
+});
+
+test("chat routes expose local browser webpage screenshot providers without a remote endpoint", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "capture a screenshot of https://example.com",
+    },
+    route,
+    new ResponseHistory(),
+    {
+      capabilityProviders: [
+        {
+          id: "local-page-screenshot",
+          capability: "webpage_screenshot",
+          adapter: "local_browser",
+          enabled: true,
+        },
+      ],
+    },
+  );
+
+  const tool = (converted.body.tools || []).find((item) =>
+    item.function?.name === "codexbridge_capability"
+  );
+  assert.ok(tool);
+  assert.deepEqual(tool.function.parameters.properties.capability.enum, ["webpage_screenshot"]);
+  assert.deepEqual(tool.function.parameters.properties.action.enum, ["screenshot_url"]);
+  assert.match(converted.body.messages[0].content, /webpage_screenshot\/screenshot_url/);
+});
+
+test("chat routes expose a controlled OCR capability action from configured providers", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "extract text from this image url",
+    },
+    route,
+    new ResponseHistory(),
+    {
+      capabilityProviders: [
+        {
+          id: "ocr-provider",
+          capability: "ocr",
+          adapter: "generic_http",
+          baseUrl: "https://ocr.example/v1",
+          endpoint: "/ocr",
+          enabled: true,
+        },
+      ],
+    },
+  );
+
+  const tool = (converted.body.tools || []).find((item) =>
+    item.function?.name === "codexbridge_capability"
+  );
+  assert.ok(tool);
+  assert.deepEqual(tool.function.parameters.properties.capability.enum, [
+    "ocr",
+  ]);
+  assert.deepEqual(tool.function.parameters.properties.action.enum, [
+    "extract_text",
+  ]);
+  assert.match(tool.function.parameters.properties.input.properties.imageUrl.description, /safe bare domains/i);
+  assert.match(converted.body.messages[0].content, /ocr\/extract_text/);
+});
+
+test("chat routes expose a controlled file processing capability action from configured providers", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "extract text from this report url",
+    },
+    route,
+    new ResponseHistory(),
+    {
+      capabilityProviders: [
+        {
+          id: "file-provider",
+          capability: "file_processing",
+          adapter: "generic_http",
+          baseUrl: "https://files.example/v1",
+          endpoint: "/extract-text",
+          enabled: true,
+        },
+      ],
+    },
+  );
+
+  const tool = (converted.body.tools || []).find((item) =>
+    item.function?.name === "codexbridge_capability"
+  );
+  assert.ok(tool);
+  assert.deepEqual(tool.function.parameters.properties.capability.enum, [
+    "file_processing",
+  ]);
+  assert.deepEqual(tool.function.parameters.properties.action.enum, [
+    "extract_text",
+  ]);
+  assert.match(tool.function.parameters.properties.input.properties.fileUrl.description, /safe bare domains/i);
+  assert.equal(tool.function.parameters.properties.input.properties.path, undefined);
+  assert.match(converted.body.messages[0].content, /file_processing\/extract_text/);
+  assert.doesNotMatch(converted.body.messages[0].content, /file_processing\/inspect_file/);
+  assert.match(converted.body.messages[0].content, /Do not use shell commands/);
+});
+
+test("chat routes expose local file processing providers with explicit path guidance", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "extract text from C:\\Users\\Administrator\\Documents\\report.txt",
+    },
+    route,
+    new ResponseHistory(),
+    {
+      capabilityProviders: [
+        {
+          id: "local-file",
+          capability: "file_processing",
+          adapter: "local_file",
+          enabled: true,
+        },
+      ],
+    },
+  );
+
+  const tool = (converted.body.tools || []).find((item) =>
+    item.function?.name === "codexbridge_capability"
+  );
+  assert.ok(tool);
+  assert.deepEqual(tool.function.parameters.properties.capability.enum, [
+    "file_processing",
+  ]);
+  assert.deepEqual(tool.function.parameters.properties.action.enum, [
+    "extract_text",
+  ]);
+  assert.match(tool.function.parameters.properties.input.properties.path.description, /explicit local file path/i);
+  assert.match(converted.body.messages[0].content, /file_processing\/extract_text/);
+  assert.match(converted.body.messages[0].content, /explicit local file path/i);
+  assert.match(converted.body.messages[0].content, /Do not use shell commands/);
+});
+
+test("chat routes scope local file processing to inspect_file for metadata requests", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "inspect file metadata for C:\\Users\\Administrator\\Documents\\models.json",
+    },
+    route,
+    new ResponseHistory(),
+    {
+      capabilityProviders: [
+        {
+          id: "local-file",
+          capability: "file_processing",
+          adapter: "local_file",
+          enabled: true,
+        },
+      ],
+    },
+  );
+
+  const tool = (converted.body.tools || []).find((item) =>
+    item.function?.name === "codexbridge_capability"
+  );
+  assert.ok(tool);
+  assert.deepEqual(tool.function.parameters.properties.capability.enum, [
+    "file_processing",
+  ]);
+  assert.deepEqual(tool.function.parameters.properties.action.enum, [
+    "inspect_file",
+  ]);
+  assert.deepEqual(Object.keys(tool.function.parameters.properties.input.properties), [
+    "path",
+    "filePath",
+    "localPath",
+  ]);
+  assert.match(tool.function.parameters.properties.input.properties.path.description, /explicit local file path/i);
+  assert.match(converted.body.messages[0].content, /file_processing\/inspect_file/);
+  assert.doesNotMatch(converted.body.messages[0].content, /file_processing\/extract_text/);
+  assert.match(converted.body.messages[0].content, /Do not use shell commands/);
+});
+
+test("chat routes expose controlled speech and video capability actions from configured providers", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "narrate this and generate a short demo video",
+    },
+    route,
+    new ResponseHistory(),
+    {
+      capabilityProviders: [
+        {
+          id: "speech-provider",
+          capability: "speech",
+          adapter: "generic_http",
+          baseUrl: "https://speech.example/v1",
+          endpoint: "/speech",
+          enabled: true,
+        },
+        {
+          id: "video-provider",
+          capability: "video",
+          adapter: "generic_http",
+          baseUrl: "https://video.example/v1",
+          endpoint: "/videos",
+          enabled: true,
+        },
+      ],
+    },
+  );
+
+  const tool = (converted.body.tools || []).find((item) =>
+    item.function?.name === "codexbridge_capability"
+  );
+  assert.ok(tool);
+  assert.deepEqual(tool.function.parameters.properties.capability.enum, [
+    "speech",
+    "video",
+  ]);
+  assert.deepEqual(tool.function.parameters.properties.action.enum, [
+    "synthesize",
+    "generate",
+  ]);
+  assert.match(tool.function.parameters.properties.input.properties.text.description, /speech/i);
+  assert.match(tool.function.parameters.properties.input.properties.prompt.description, /video/i);
+  assert.match(converted.body.messages[0].content, /speech\/synthesize/);
+  assert.match(converted.body.messages[0].content, /video\/generate/);
+  assert.match(converted.body.messages[0].content, /Do not use shell commands/);
 });
 
 test("chat conversion deduplicates exact tool names while keeping namespaced tools", () => {

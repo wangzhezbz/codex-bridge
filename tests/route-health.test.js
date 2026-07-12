@@ -62,6 +62,99 @@ test("classifyUpstreamError separates common upstream failure categories", () =>
   assert.equal(payloadTooLarge.code, "upstream_payload_too_large");
 });
 
+test("classifyUpstreamError keeps P0 route stability failures distinct from rate limits", () => {
+  const cases = [
+    {
+      name: "provider balance",
+      error: {
+        statusCode: 402,
+        bodyText: JSON.stringify({ error: { message: "Insufficient Balance" } }),
+      },
+      type: "billing_error",
+      code: "upstream_billing_error",
+    },
+    {
+      name: "quota exhausted behind forbidden status",
+      error: {
+        statusCode: 403,
+        bodyText: JSON.stringify({ error: { message: "quota exhausted: balance -0.057090" } }),
+      },
+      type: "billing_error",
+      code: "upstream_billing_error",
+    },
+    {
+      name: "html gateway",
+      error: {
+        statusCode: 502,
+        bodyText:
+          '<!DOCTYPE html><html><head><title>cjyuan.fast | 502: Bad gateway</title></head></html>',
+      },
+      type: "provider_unavailable",
+      code: "upstream_provider_unavailable",
+    },
+    {
+      name: "gateway timeout",
+      error: {
+        statusCode: 504,
+        bodyText: "<html><title>504 Gateway Timeout</title></html>",
+      },
+      type: "provider_unavailable",
+      code: "upstream_provider_unavailable",
+    },
+    {
+      name: "network timeout",
+      error: {
+        name: "UpstreamTimeoutError",
+        code: "upstream_timeout",
+        message: "UND_ERR_CONNECT_TIMEOUT while retrying after a previous rate limit banner",
+      },
+      type: "timeout",
+      code: "upstream_timeout",
+    },
+    {
+      name: "stream disconnect",
+      error: {
+        name: "UpstreamStreamError",
+        code: "upstream_stream_truncated",
+        message: "upstream stream disconnected before response.completed",
+      },
+      type: "stream_error",
+      code: "upstream_stream_truncated",
+    },
+    {
+      name: "unsupported account model",
+      error: {
+        statusCode: 400,
+        bodyText: JSON.stringify({
+          detail: "The 'gpt-5.4' model is not supported when using Codex with a ChatGPT account.",
+        }),
+      },
+      type: "parameter_error",
+      code: "upstream_parameter_error",
+    },
+  ];
+
+  for (const item of cases) {
+    const result = classifyUpstreamError(item.error);
+    assert.equal(result.type, item.type, item.name);
+    assert.equal(result.code, item.code, item.name);
+    assert.notEqual(result.type, "rate_limit", item.name);
+    assert.notEqual(result.code, "upstream_rate_limit", item.name);
+  }
+
+  const rateLimited = classifyUpstreamError({
+    statusCode: 429,
+    bodyText: JSON.stringify({
+      error: {
+        message:
+          "Your account org-testfixtures000000000 / proj-testfixtures000000000 <ak-testfixtures000000000> request reached organization TPD rate limit",
+      },
+    }),
+  });
+  assert.equal(rateLimited.type, "rate_limit");
+  assert.equal(rateLimited.code, "upstream_rate_limit");
+});
+
 test("route health snapshot reports degraded routes and recovers after success", () => {
   let now = Date.parse("2026-06-25T00:00:00.000Z");
   const store = createRouteHealthStore({
@@ -93,6 +186,95 @@ test("route health snapshot reports degraded routes and recovers after success",
   assert.equal(snapshot.unhealthyRoutes, 0);
   assert.equal(snapshot.routes[0].status, "healthy");
   assert.equal(snapshot.routes[0].lastErrorType, "parameter_error");
+});
+
+test("route health snapshot exposes route availability and cooldown state", () => {
+  const store = createRouteHealthStore({
+    rateLimitStatus: (route) => route.id === "cooling-route"
+      ? {
+          cooldownRemainingMs: 45_000,
+          nextAfterMs: 0,
+        }
+      : {
+          cooldownRemainingMs: 0,
+          nextAfterMs: 250,
+        },
+  });
+  const coolingRoute = {
+    id: "cooling-route",
+    provider: "kimi",
+    api: "chat_completions",
+    model: "kimi-k2",
+  };
+  const healthyRoute = {
+    id: "healthy-route",
+    provider: "deepseek",
+    api: "chat_completions",
+    model: "deepseek-v4",
+  };
+
+  store.recordSuccess(healthyRoute);
+  const snapshot = store.snapshot({ models: [coolingRoute, healthyRoute] });
+
+  assert.equal(snapshot.routes[0].status, "rate_limited");
+  assert.equal(snapshot.routes[0].circuitState, "open");
+  assert.equal(snapshot.routes[0].availability.reason, "cooldown_active");
+  assert.equal(snapshot.routes[0].availability.canUseForAutomatic, false);
+  assert.equal(snapshot.routes[0].availability.retryAfterMs, 45_000);
+  assert.equal(snapshot.routes[1].status, "healthy");
+  assert.equal(snapshot.routes[1].availability.state, "paced");
+  assert.equal(snapshot.routes[1].availability.canUseForFailover, true);
+});
+
+test("route health does not keep a route rate_limited after cooldown expires", () => {
+  const store = createRouteHealthStore({
+    rateLimitStatus: () => ({
+      cooldownRemainingMs: 0,
+      nextAfterMs: 0,
+    }),
+  });
+  const route = {
+    id: "kimi-k2-code",
+    provider: "kimi",
+    api: "chat_completions",
+    model: "kimi-k2-code",
+  };
+
+  store.recordError(route, {
+    statusCode: 429,
+    bodyText: JSON.stringify({ error: { message: "TPD rate limit" } }),
+  });
+  const snapshot = store.snapshot({ models: [route] });
+
+  assert.equal(snapshot.routes[0].lastErrorType, "rate_limit");
+  assert.equal(snapshot.routes[0].status, "degraded");
+  assert.equal(snapshot.routes[0].circuitState, "half_open");
+  assert.equal(snapshot.routes[0].availability.reason, "last_error:rate_limit");
+  assert.equal(snapshot.routes[0].availability.retryAfterMs, 0);
+});
+
+test("disabled routes are not counted as unhealthy routes", () => {
+  const store = createRouteHealthStore({
+    rateLimitStatus: () => ({
+      cooldownRemainingMs: 0,
+      nextAfterMs: 0,
+    }),
+  });
+  const snapshot = store.snapshot({
+    models: [
+      {
+        id: "disabled-route",
+        enabled: false,
+        provider: "custom",
+        api: "chat_completions",
+        model: "disabled-model",
+      },
+    ],
+  });
+
+  assert.equal(snapshot.unhealthyRoutes, 0);
+  assert.equal(snapshot.routes[0].status, "disabled");
+  assert.equal(snapshot.routes[0].availability.canUseForManual, false);
 });
 
 test("route health redacts provider account identifiers from upstream errors", () => {

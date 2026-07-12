@@ -123,7 +123,7 @@ export function buildResponsesStreamErrorSse(message, options = {}) {
     output_text: "",
     parallel_tool_calls: true,
     error: {
-      code: "upstream_stream_truncated",
+      code: options.code || "upstream_stream_truncated",
       message: String(message || "Upstream stream ended before completion."),
     },
     incomplete_details: null,

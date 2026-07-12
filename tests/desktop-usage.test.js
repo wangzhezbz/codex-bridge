@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createUsageStore } from "../desktop/usage.mjs";
+import { createUsageStore, evaluateUsageBudgets, estimateUsageCosts } from "../desktop/usage.mjs";
 
 test("usage store records model route and token usage from router logs", () => {
   const usage = createUsageStore();
@@ -24,6 +24,19 @@ test("usage store records model route and token usage from router logs", () => {
   assert.equal(summary.totalTokens, 235);
   assert.equal(summary.byModel[0].route, "gpt-5.4-mini");
   assert.equal(summary.byModel[0].calls, 1);
+});
+
+test("usage store attributes auxiliary and automatic route decisions", () => {
+  const usage = createUsageStore();
+  usage.recordLine("[00:00:00] [2026-07-12T00:00:00.000Z] req_aux123 !! route-plan kind=codex_auxiliary reason=codex_auxiliary_task requested_model=gpt-5.4 route=cb-gpt-5-6-sol");
+  usage.recordLine("[00:00:00] [2026-07-12T00:00:00.001Z] req_aux123 <- /v1/responses model=gpt-5.6-sol route=cb-gpt-5-6-sol api=responses upstream_model=gpt-5.6-sol stream=true provider=codex smart_route=codex_auxiliary_task original_route=- compact=- previous_response_id=- client_auth=codex_openai upstream_auth=codex_openai");
+  usage.recordLine("[00:00:01] [2026-07-12T00:00:01.000Z] req_aux123 <- upstream route=cb-gpt-5-6-sol usage prompt=10 completion=2 total=12");
+
+  const [event] = usage.events();
+  assert.equal(event.requestKind, "codex_auxiliary");
+  assert.equal(event.routeReason, "codex_auxiliary_task");
+  assert.equal(event.requestedModel, "gpt-5.4");
+  assert.equal(event.routeSource, "auxiliary");
 });
 
 test("usage store separates fresh input from cache-read tokens", () => {
@@ -206,6 +219,22 @@ test("usage store records upstream error categories from router logs", () => {
   assert.equal(usage.summary().byModel[0].lastErrorType, "rate_limit");
 });
 
+test("usage store preserves smart routing exclusion diagnostics on request events", () => {
+  const usage = createUsageStore();
+
+  usage.recordLine("[10:23:10] [2026-07-05T10:23:10.100Z] req_smart42 !! smart-route-exclusions phase=auto-select excluded=cb-code:budget,cb-old:health+budget");
+  usage.recordLine("[10:23:10] [2026-07-05T10:23:10.101Z] req_smart42 <- /v1/responses model=cb-chat route=cb-chat api=chat_completions upstream_model=qwen-plus stream=true previous_response_id=- client_auth=local upstream_auth=api_key");
+  usage.recordLine("[10:23:10] [2026-07-05T10:23:10.150Z] req_smart42 -> upstream route=cb-chat api=chat_completions upstream_model=qwen-plus url=https://api.example.test/v1/chat/completions");
+  usage.recordLine("[10:23:11] [2026-07-05T10:23:11.200Z] req_smart42 <- upstream route=cb-chat usage prompt=12 completion=6 total=18");
+
+  const events = usage.events();
+  assert.equal(events.length, 1);
+  assert.deepEqual(events[0].smartRouteExclusions, [
+    { phase: "auto-select", route: "cb-code", reasons: ["budget"] },
+    { phase: "auto-select", route: "cb-old", reasons: ["health", "budget"] },
+  ]);
+});
+
 test("usage summary flags zero-token fast failures separately from token usage", () => {
   const usage = createUsageStore();
 
@@ -260,3 +289,135 @@ test("usage store can rebuild summary from saved events", () => {
   assert.equal(usage.summary().totalTokens, 5);
   assert.equal(usage.summary().byModel[0].upstreamModel, "deepseek-v4-flash");
 });
+
+test("usage budget evaluation is empty by default and reports global route and provider alerts", () => {
+  const usage = createUsageStore();
+
+  usage.recordLine("[10:15:31] [2026-07-01T18:15:31.858Z] req_budget1 <- /v1/responses model=gpt-5.2 route=cb-kimi-k2-7-code api=chat_completions upstream_model=kimi-k2.7-code stream=true previous_response_id=- client_auth=local upstream_auth=api_key");
+  usage.recordLine("[10:15:35] [2026-07-01T18:15:35.184Z] req_budget1 <- upstream route=cb-kimi-k2-7-code usage prompt=80 cached=20 fresh=60 completion=25 total=105");
+  usage.recordLine("[10:16:31] [2026-07-01T18:16:31.858Z] req_budget2 <- /v1/responses model=gpt-5.4-mini route=cb-deepseek-v4-pro api=chat_completions upstream_model=deepseek-v4-pro stream=true previous_response_id=- client_auth=local upstream_auth=api_key");
+  usage.recordLine("[10:16:35] [2026-07-01T18:16:35.184Z] req_budget2 <- upstream route=cb-deepseek-v4-pro usage prompt=30 completion=10 total=40");
+
+  const routes = [
+    { id: "cb-kimi-k2-7-code", model: "kimi-k2.7-code", api: "chat_completions", provider: "kimi" },
+    { id: "cb-deepseek-v4-pro", model: "deepseek-v4-pro", api: "chat_completions", provider: "deepseek" },
+  ];
+  const summary = usage.summary({ routes });
+
+  assert.deepEqual(evaluateUsageBudgets(summary, undefined, { routes, now: "2026-07-01T23:00:00.000Z" }), []);
+
+  const alerts = evaluateUsageBudgets(
+    summary,
+    {
+      global: { dailyTokenLimit: 120, dailyCallLimit: 3 },
+      routes: { "cb-kimi-k2-7-code": { dailyTokenLimit: 100 } },
+      providers: { deepseek: { dailyCallLimit: 1 } },
+    },
+    { routes, now: "2026-07-01T23:00:00.000Z" },
+  );
+
+  assert.equal(summary.byModel.length, 2);
+  assert.equal(alerts.find((item) => item.scope === "global")?.status, "exceeded");
+  assert.equal(alerts.find((item) => item.scope === "route")?.label, "cb-kimi-k2-7-code");
+  assert.equal(alerts.find((item) => item.scope === "route")?.status, "exceeded");
+  assert.equal(alerts.find((item) => item.scope === "provider")?.label, "deepseek");
+  assert.equal(alerts.find((item) => item.scope === "provider")?.status, "warning");
+  assert.equal(alerts.find((item) => item.scope === "provider")?.remaining, 0);
+  assert.match(alerts.find((item) => item.scope === "provider")?.message || "", /剩余 0 次请求/);
+  assert.match(alerts.find((item) => item.scope === "global")?.message || "", /已用比例 121%/);
+  assert.match(alerts.find((item) => item.scope === "route")?.message || "", /已用比例 105%/);
+  assert.match(alerts.find((item) => item.scope === "provider")?.message || "", /已用比例 100%/);
+});
+
+test("usage cost estimation uses configured global route and provider token prices", () => {
+  const usage = createUsageStore();
+
+  usage.recordLine("[10:15:31] [2026-07-01T18:15:31.858Z] req_cost1 <- /v1/responses model=gpt-5.2 route=cb-kimi-k2-7-code api=chat_completions upstream_model=kimi-k2.7-code stream=true previous_response_id=- client_auth=local upstream_auth=api_key");
+  usage.recordLine("[10:15:35] [2026-07-01T18:15:35.184Z] req_cost1 <- upstream route=cb-kimi-k2-7-code usage prompt=1000 cached=200 fresh=800 completion=300 total=1300");
+  usage.recordLine("[10:16:31] [2026-07-01T18:16:31.858Z] req_cost2 <- /v1/responses model=gpt-5.4-mini route=cb-deepseek-v4-pro api=chat_completions upstream_model=deepseek-v4-pro stream=true previous_response_id=- client_auth=local upstream_auth=api_key");
+  usage.recordLine("[10:16:35] [2026-07-01T18:16:35.184Z] req_cost2 <- upstream route=cb-deepseek-v4-pro usage prompt=500 completion=100 total=600");
+
+  const routes = [
+    { id: "cb-kimi-k2-7-code", model: "kimi-k2.7-code", api: "chat_completions", provider: "kimi" },
+    { id: "cb-deepseek-v4-pro", model: "deepseek-v4-pro", api: "chat_completions", provider: "deepseek" },
+  ];
+  const summary = usage.summary({ routes });
+
+  assert.equal(estimateUsageCosts(summary, {}, { routes, now: "2026-07-01T23:00:00.000Z" }).hasRates, false);
+
+  const estimate = estimateUsageCosts(
+    summary,
+    {
+      global: { inputCostPerMillion: 1, cacheCostPerMillion: 0.5, outputCostPerMillion: 2 },
+      routes: { "cb-kimi-k2-7-code": { inputCostPerMillion: 10, cacheCostPerMillion: 1, outputCostPerMillion: 20 } },
+      providers: { deepseek: { inputCostPerMillion: 2, outputCostPerMillion: 4 } },
+    },
+    { routes, now: "2026-07-01T23:00:00.000Z" },
+  );
+
+  assert.equal(estimate.hasRates, true);
+  assert.equal(roundCost(estimate.global.totalCost), 0.0022);
+  assert.equal(estimate.routes[0].label, "cb-kimi-k2-7-code");
+  assert.equal(roundCost(estimate.routes[0].totalCost), 0.0142);
+  assert.equal(estimate.providers[0].label, "deepseek");
+  assert.equal(roundCost(estimate.providers[0].totalCost), 0.0014);
+  assert.equal(roundCost(estimate.totalCost), 0.0142);
+});
+
+test("usage budget evaluation reports daily estimated cost alerts", () => {
+  const usage = createUsageStore();
+
+  usage.recordLine("[10:15:31] [2026-07-01T18:15:31.858Z] req_costbudget1 <- /v1/responses model=gpt-5.2 route=cb-kimi-k2-7-code api=chat_completions upstream_model=kimi-k2.7-code stream=true previous_response_id=- client_auth=local upstream_auth=api_key");
+  usage.recordLine("[10:15:35] [2026-07-01T18:15:35.184Z] req_costbudget1 <- upstream route=cb-kimi-k2-7-code usage prompt=1000 cached=200 fresh=800 completion=300 total=1300");
+  usage.recordLine("[10:16:31] [2026-07-01T18:16:31.858Z] req_costbudget2 <- /v1/responses model=gpt-5.4-mini route=cb-deepseek-v4-pro api=chat_completions upstream_model=deepseek-v4-pro stream=true previous_response_id=- client_auth=local upstream_auth=api_key");
+  usage.recordLine("[10:16:35] [2026-07-01T18:16:35.184Z] req_costbudget2 <- upstream route=cb-deepseek-v4-pro usage prompt=500 completion=100 total=600");
+
+  const routes = [
+    { id: "cb-kimi-k2-7-code", model: "kimi-k2.7-code", api: "chat_completions", provider: "kimi" },
+    { id: "cb-deepseek-v4-pro", model: "deepseek-v4-pro", api: "chat_completions", provider: "deepseek" },
+  ];
+  const alerts = evaluateUsageBudgets(
+    usage.summary({ routes }),
+    {
+      global: {
+        dailyCostLimit: 0.002,
+        inputCostPerMillion: 1,
+        cacheCostPerMillion: 0.5,
+        outputCostPerMillion: 2,
+      },
+      routes: {
+        "cb-kimi-k2-7-code": {
+          dailyCostLimit: 0.01,
+          inputCostPerMillion: 10,
+          cacheCostPerMillion: 1,
+          outputCostPerMillion: 20,
+        },
+      },
+      providers: {
+        deepseek: {
+          dailyCostLimit: 0.0015,
+          inputCostPerMillion: 2,
+          outputCostPerMillion: 4,
+        },
+      },
+    },
+    { routes, now: "2026-07-01T23:00:00.000Z" },
+  );
+
+  const globalAlert = alerts.find((item) => item.scope === "global");
+  const routeAlert = alerts.find((item) => item.scope === "route");
+  const providerAlert = alerts.find((item) => item.scope === "provider");
+  assert.equal(globalAlert?.metric, "cost");
+  assert.equal(globalAlert?.status, "exceeded");
+  assert.equal(roundCost(globalAlert?.used), 0.0022);
+  assert.match(globalAlert?.message || "", /今日费用/);
+  assert.equal(routeAlert?.status, "exceeded");
+  assert.equal(roundCost(routeAlert?.used), 0.0142);
+  assert.equal(providerAlert?.status, "warning");
+  assert.equal(roundCost(providerAlert?.used), 0.0014);
+  assert.match(providerAlert?.message || "", /剩余 0\.0001 费用单位/);
+});
+
+function roundCost(value) {
+  return Number(Number(value || 0).toFixed(6));
+}

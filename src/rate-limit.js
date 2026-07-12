@@ -1,7 +1,8 @@
 const DEFAULT_429_COOLDOWN_MS = 30_000;
 const MAX_429_COOLDOWN_MS = 120_000;
 
-const states = new Map();
+const providerCooldowns = new Map();
+const localPacingStates = new Map();
 
 let clock = {
   now: () => Date.now(),
@@ -11,8 +12,8 @@ let clock = {
 export class RouteRateLimitedError extends Error {
   constructor(route = {}, retryAfterMs = 0) {
     super(
-      `Provider is temporarily rate limited for ${route.id || route.model || "this route"}. ` +
-        `Retry after ${Math.ceil(Math.max(0, retryAfterMs) / 1000)}s.`,
+      `供应商暂时限流：${route.displayName || route.id || route.model || "当前路由"}。` +
+        `请在 ${Math.ceil(Math.max(0, retryAfterMs) / 1000)}s 后重试。`,
     );
     this.name = "RouteRateLimitedError";
     this.statusCode = 429;
@@ -28,15 +29,18 @@ export class RouteRateLimitedError extends Error {
 }
 
 export async function waitForRouteCapacity(route = {}, context = {}, options = {}) {
-  const state = stateForRoute(route);
+  await waitForProviderCooldown(route, context, options);
+  if (!localRateLimitEnabled(route, options)) {
+    return;
+  }
+  const state = localPacingStateForRoute(route);
   state.queue = state.queue
     .catch(() => {})
-    .then(() => reserveRouteCapacity(state, route, context, options));
+    .then(() => reserveLocalPacing(state, route, context, options));
   return state.queue;
 }
 
 export function markRouteRateLimited(route = {}, headers) {
-  const state = stateForRoute(route);
   const headerCooldownMs = retryAfterMs(headers);
   const fallbackCooldownMs = Math.max(
     Number(route.cooldownMs || 0),
@@ -47,21 +51,29 @@ export function markRouteRateLimited(route = {}, headers) {
     route,
   );
   const cooldownUntil = clock.now() + Math.max(0, cooldownMs);
-  state.cooldownUntil = Math.max(state.cooldownUntil || 0, cooldownUntil);
+  const key = providerIdentityKey(route);
+  providerCooldowns.set(
+    key,
+    Math.max(Number(providerCooldowns.get(key) || 0), cooldownUntil),
+  );
 }
 
 export function routeRateLimitStatus(route = {}) {
-  const state = states.get(rateLimitKey(route));
-  if (!state) {
-    return {
-      cooldownRemainingMs: 0,
-      nextAfterMs: 0,
-    };
-  }
   const now = clock.now();
+  const key = providerIdentityKey(route);
+  const providerCooldownRemainingMs = Math.max(
+    0,
+    Number(providerCooldowns.get(key) || 0) - now,
+  );
+  const localPacingState = localPacingStates.get(key);
+  const localPacingNextAfterMs = localRateLimitEnabled(route)
+    ? Math.max(0, Number(localPacingState?.nextAt || 0) - now)
+    : 0;
   return {
-    cooldownRemainingMs: Math.max(0, Number(state.cooldownUntil || 0) - now),
-    nextAfterMs: Math.max(0, Number(state.nextAt || 0) - now),
+    providerCooldownRemainingMs,
+    localPacingNextAfterMs,
+    cooldownRemainingMs: providerCooldownRemainingMs,
+    nextAfterMs: localPacingNextAfterMs,
   };
 }
 
@@ -73,30 +85,18 @@ export function __setRateLimitClockForTests(nextClock) {
 }
 
 export function __resetRateLimiterForTests() {
-  states.clear();
+  providerCooldowns.clear();
+  localPacingStates.clear();
   clock = {
     now: () => Date.now(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   };
 }
 
-async function reserveRouteCapacity(state, route, context, options = {}) {
-  if (options.failFastOnCooldown !== false) {
-    const cooldownRemainingMs = Math.max(0, Number(state.cooldownUntil || 0) - clock.now());
-    if (cooldownRemainingMs > 0) {
-      if (context.requestId) {
-        console.log(
-          `[${new Date().toISOString()}] ${context.requestId} rate-limit-cooldown ` +
-            `route=${route.id || route.model || "unknown"} cooldown_remaining_ms=${cooldownRemainingMs}`,
-        );
-      }
-      throw new RouteRateLimitedError(route, cooldownRemainingMs);
-    }
-  }
-  await waitUntil(state.cooldownUntil || 0);
+async function reserveLocalPacing(state, route, context, options = {}) {
   await waitUntil(state.nextAt || 0);
 
-  const intervalMs = routeIntervalMs(route);
+  const intervalMs = routeIntervalMs(route, options);
   if (intervalMs <= 0) {
     return;
   }
@@ -112,6 +112,30 @@ async function reserveRouteCapacity(state, route, context, options = {}) {
   }
 }
 
+async function waitForProviderCooldown(route, context, options = {}) {
+  const key = providerIdentityKey(route);
+  while (true) {
+    const cooldownUntil = Number(providerCooldowns.get(key) || 0);
+    const cooldownRemainingMs = Math.max(0, cooldownUntil - clock.now());
+    if (cooldownRemainingMs <= 0) {
+      if (providerCooldowns.get(key) === cooldownUntil) {
+        providerCooldowns.delete(key);
+      }
+      return;
+    }
+    if (options.failFastOnCooldown === true) {
+      if (context.requestId) {
+        console.log(
+          `[${new Date().toISOString()}] ${context.requestId} rate-limit-cooldown ` +
+            `route=${route.id || route.model || "unknown"} cooldown_remaining_ms=${cooldownRemainingMs}`,
+        );
+      }
+      throw new RouteRateLimitedError(route, cooldownRemainingMs);
+    }
+    await clock.sleep(cooldownRemainingMs);
+  }
+}
+
 async function waitUntil(timestamp) {
   const waitMs = Math.max(0, Number(timestamp || 0) - clock.now());
   if (waitMs > 0) {
@@ -119,7 +143,10 @@ async function waitUntil(timestamp) {
   }
 }
 
-function routeIntervalMs(route = {}) {
+function routeIntervalMs(route = {}, options = {}) {
+  if (!localRateLimitEnabled(route, options)) {
+    return 0;
+  }
   const rpm = effectiveRouteRpm(route);
   if (!Number.isFinite(rpm) || rpm <= 0) {
     return 0;
@@ -136,6 +163,31 @@ function effectiveRouteRpm(route = {}) {
     return 0;
   }
   return Number(route.rpm || 0);
+}
+
+function localRateLimitEnabled(route = {}, options = {}) {
+  if (options.rateLimitEnabled === false) {
+    return false;
+  }
+  if (options.rateLimitEnabled === true) {
+    return true;
+  }
+  if (route.localRateLimitEnabled === false || route.rateLimit?.enabled === false) {
+    return false;
+  }
+  if (route.localRateLimitEnabled === true || route.rateLimit?.enabled === true) {
+    return true;
+  }
+  return hasExplicitRoutePacing(route);
+}
+
+function hasExplicitRoutePacing(route = {}) {
+  const nestedRpm = Number(route.rateLimit?.rpm || 0);
+  const directRpm = Number(route.rpm || 0);
+  return (
+    (Number.isFinite(nestedRpm) && nestedRpm > 0) ||
+    (Number.isFinite(directRpm) && directRpm > 0 && !isLegacyDefaultKimiRpm(route))
+  );
 }
 
 function isLegacyDefaultKimiRpm(route = {}) {
@@ -166,29 +218,45 @@ function maxCooldownMsForRoute(route = {}) {
   return MAX_429_COOLDOWN_MS;
 }
 
-function stateForRoute(route = {}) {
-  const key = rateLimitKey(route);
-  if (!states.has(key)) {
-    states.set(key, {
+function localPacingStateForRoute(route = {}) {
+  const key = providerIdentityKey(route);
+  if (!localPacingStates.has(key)) {
+    localPacingStates.set(key, {
       queue: Promise.resolve(),
       nextAt: 0,
-      cooldownUntil: 0,
     });
   }
-  return states.get(key);
+  return localPacingStates.get(key);
 }
 
-function rateLimitKey(route = {}) {
+function providerIdentityKey(route = {}) {
   const authMode = route.authMode || "api_key";
   const provider = route.provider || route.providerId || "";
-  const baseUrl = route.baseUrl || "";
-  const keyRef = route.rateLimitKey || route.apiKeyEnv || route.keyEnv || (route.apiKey ? "inline-api-key" : "");
+  const baseUrl = nonSecretBaseUrl(route.baseUrl);
+  const keyRef = route.rateLimitKey || route.apiKeyEnv || route.keyEnv || "";
 
   if (provider || baseUrl || keyRef) {
     return [authMode, provider, baseUrl, keyRef].join("|");
   }
 
   return [route.id || "", route.model || ""].join("|");
+}
+
+function nonSecretBaseUrl(value) {
+  const baseUrl = String(value || "");
+  if (!baseUrl) {
+    return "";
+  }
+  try {
+    const parsed = new URL(baseUrl);
+    parsed.username = "";
+    parsed.password = "";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return baseUrl.split(/[?#]/, 1)[0];
+  }
 }
 
 function retryAfterMs(headers) {

@@ -201,7 +201,7 @@ function appendResponseTool(context, tool, namespace = "") {
   }
 
   if (tool.type === "namespace") {
-    const nestedNamespace = namespaceToolPrefix(tool.name || namespace);
+    const nestedNamespace = String(tool.name || namespace || "").trim();
     if (nestedNamespace) {
       context.diagnostics.namespaceNames.add(nestedNamespace);
     }
@@ -381,7 +381,8 @@ export function namespacedToolName(name, namespace) {
   if (!namespace || !rawName) {
     return rawName;
   }
-  return rawName.startsWith(namespace) ? rawName : `${namespace}${rawName}`;
+  const prefix = namespaceToolPrefix(namespace);
+  return rawName.startsWith(prefix) ? rawName : `${prefix}${rawName}`;
 }
 
 function setResponseToolMetadata(context, responseName, originalName, namespace = "") {

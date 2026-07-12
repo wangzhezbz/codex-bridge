@@ -5,7 +5,10 @@ import {
   __resetUpstreamFailureCacheForTests,
   callJsonUpstream,
   proxyResponsesApi,
+  sendUpstreamError,
+  UpstreamHttpError,
 } from "../src/upstream.js";
+import * as upstreamModule from "../src/upstream.js";
 import {
   __resetRateLimiterForTests,
   __setRateLimitClockForTests,
@@ -13,6 +16,16 @@ import {
 import {
   proxySettingsForUrl,
 } from "../src/proxy.js";
+
+test("default upstream and streaming proxy header timeouts are both 600 seconds", () => {
+  assert.equal(typeof upstreamModule.upstreamTimeoutMs, "function");
+  assert.equal(typeof upstreamModule.streamingProxyFetchOptions, "function");
+  assert.equal(upstreamModule.upstreamTimeoutMs({}), 600000);
+  assert.equal(
+    upstreamModule.streamingProxyFetchOptions({}, { streamingResponse: true }, true).timeoutMs,
+    600000,
+  );
+});
 
 test("upstream requests use HTTPS proxy dispatcher when configured", async () => {
   const originalFetch = globalThis.fetch;
@@ -50,7 +63,7 @@ test("upstream requests use HTTPS proxy dispatcher when configured", async () =>
   }
 });
 
-test("upstream requests retry direct when proxy network fetch fails", async () => {
+test("upstream requests refresh a failed proxy connection before retrying direct", async () => {
   const originalFetch = globalThis.fetch;
   const originalEnv = snapshotProxyEnv();
   const calls = [];
@@ -84,11 +97,187 @@ test("upstream requests retry direct when proxy network fetch fails", async () =
       {},
     );
 
-    assert.deepEqual(calls, [true, false]);
+    assert.deepEqual(calls, [true, true, false]);
     assert.deepEqual(response, { ok: true });
   } finally {
     globalThis.fetch = originalFetch;
     restoreProxyEnv(originalEnv);
+  }
+});
+
+test("streaming ChatGPT requests refresh a stalled proxy connection before the route timeout", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalEnv = snapshotProxyEnv();
+  const dispatchers = [];
+
+  globalThis.fetch = async (_url, init) => {
+    dispatchers.push(init?.dispatcher || null);
+    if (dispatchers.length === 1) {
+      return new Promise((_, reject) => {
+        init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+      });
+    }
+    return new Response(
+      [
+        "event: response.completed",
+        `data: ${JSON.stringify({
+          type: "response.completed",
+          response: {
+            id: "resp_proxy_refresh",
+            status: "completed",
+            model: "gpt-5.6-sol",
+            output: [],
+          },
+        })}`,
+        "",
+        "data: [DONE]",
+        "",
+      ].join("\n"),
+      {
+        status: 200,
+        headers: { "content-type": "text/event-stream; charset=utf-8" },
+      },
+    );
+  };
+
+  try {
+    clearProxyEnv();
+    process.env.HTTPS_PROXY = "http://127.0.0.1:7890";
+    const res = collectResponse();
+
+    await proxyResponsesApi(
+      { model: "gpt-5.6-sol", input: "run delegated task", stream: true },
+      {
+        id: "cb-gpt-5-6-sol",
+        displayName: "GPT-5.6-Sol",
+        api: "responses",
+        baseUrl: "https://api.openai.com/v1",
+        model: "gpt-5.6-sol",
+        authMode: "codex_openai",
+        upstreamTimeoutMs: 200,
+        proxyHeaderTimeoutMs: 20,
+      },
+      res,
+      {
+        clientAuth: { kind: "codex_openai", bearerToken: "codex-openai-token" },
+      },
+    );
+
+    assert.equal(res.statusCode, 200);
+    assert.match(res.body(), /resp_proxy_refresh/);
+    assert.equal(dispatchers.length, 2);
+    assert.ok(dispatchers[0]);
+    assert.ok(dispatchers[1]);
+    assert.notEqual(dispatchers[0], dispatchers[1]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreProxyEnv(originalEnv);
+  }
+});
+
+test("callJsonUpstream preserves Retry-After headers on HTTP errors", async () => {
+  const upstream = httpServer(async (_req, res) => {
+    res.writeHead(429, {
+      "content-type": "application/json",
+      "retry-after": "42",
+    });
+    res.end(JSON.stringify({ error: { message: "Too many requests" } }));
+  });
+
+  await listen(upstream);
+  try {
+    await assert.rejects(
+      callJsonUpstream(
+        `${serverUrl(upstream)}/v1/images/generations`,
+        {
+          id: "image-rate-limit-retry-after",
+          api: "images",
+          model: "Kwai-Kolors/Kolors",
+          apiKey: "test-key",
+        },
+        { prompt: "draw a cat" },
+        {},
+      ),
+      (error) => {
+        assert.equal(error.statusCode, 429);
+        assert.equal(error.retryAfter, "42");
+        return true;
+      },
+    );
+  } finally {
+    __resetRateLimiterForTests();
+    __resetUpstreamFailureCacheForTests();
+    await close(upstream);
+  }
+});
+
+test("sendUpstreamError explains common provider HTTP failures in Chinese", () => {
+  const route = {
+    id: "cb-kimi-k2-code",
+    displayName: "Kimi K2 Code",
+    model: "kimi-k2-code",
+    api: "chat_completions",
+  };
+  const cases = [
+    {
+      statusCode: 401,
+      bodyText: JSON.stringify({ error: { message: "Incorrect API key provided" } }),
+      code: "upstream_authentication_error",
+      includes: [/Kimi K2 Code/, /API Key|认证|权限/, /报错信息：HTTP 401 - Incorrect API key provided/],
+      excludes: [/CodexBridge upstream error/],
+    },
+    {
+      statusCode: 402,
+      bodyText: JSON.stringify({ error: { message: "Insufficient Balance" } }),
+      code: "upstream_billing_error",
+      includes: [/Kimi K2 Code/, /余额|额度|账户/, /报错信息：HTTP 402 - Insufficient Balance/],
+      excludes: [/CodexBridge upstream error/],
+    },
+    {
+      statusCode: 429,
+      bodyText: JSON.stringify({ error: { message: "Too Many Requests" } }),
+      code: "upstream_rate_limit",
+      includes: [/Kimi K2 Code/, /供应商限流|请求过快|稍后/, /报错信息：HTTP 429 - Too Many Requests/],
+      excludes: [/CodexBridge upstream error/],
+    },
+    {
+      statusCode: 502,
+      bodyText:
+        "<!DOCTYPE html><html><head><title>ciyuan.fast | 502: Bad gateway</title></head></html>",
+      code: "upstream_provider_unavailable",
+      includes: [/Kimi K2 Code/, /供应商服务|网关|不可用/, /报错信息：HTTP 502 - ciyuan\.fast \| 502: Bad gateway/],
+      excludes: [/CodexBridge upstream error/, /<html/i, /<!DOCTYPE/i],
+    },
+    {
+      statusCode: 413,
+      bodyText: JSON.stringify({ error: { message: "Payload Too Large" } }),
+      code: "upstream_payload_too_large",
+      includes: [/Kimi K2 Code/, /请求内容太大|上下文|压缩|新会话/, /报错信息：HTTP 413 - Payload Too Large/],
+      excludes: [/CodexBridge upstream request is too large/],
+    },
+  ];
+
+  for (const item of cases) {
+    const res = collectResponse();
+    sendUpstreamError(
+      res,
+      new UpstreamHttpError(
+        item.statusCode,
+        item.bodyText,
+        "https://api.example.test/v1/chat/completions",
+        route,
+      ),
+    );
+    const body = JSON.parse(res.body());
+
+    assert.equal(res.statusCode, item.statusCode);
+    assert.equal(body.error.code, item.code);
+    for (const pattern of item.includes) {
+      assert.match(body.error.message, pattern);
+    }
+    for (const pattern of item.excludes) {
+      assert.doesNotMatch(body.error.message, pattern);
+    }
   }
 });
 
@@ -260,6 +449,7 @@ test("upstream requests ignore legacy default Kimi rpm throttling", async () => 
       baseUrl: "https://api.moonshot.cn/v1",
       model: "kimi-k2.7-code",
       apiKey: "test-key",
+      localRateLimitEnabled: true,
       rpm: 12,
     };
 
@@ -339,7 +529,7 @@ test("upstream requests still honor explicit nested Kimi rate limits", async () 
   }
 });
 
-test("upstream 429 response fails fast during route cooldown", async () => {
+test("upstream 429 response waits through route cooldown when local rate limiting is enabled", async () => {
   const originalFetch = globalThis.fetch;
   const sleeps = [];
   let now = 0;
@@ -377,6 +567,7 @@ test("upstream 429 response fails fast during route cooldown", async () => {
       api: "chat_completions",
       model: "deepseek-v4-pro",
       apiKey: "test-key",
+      localRateLimitEnabled: true,
     };
 
     await assert.rejects(
@@ -392,33 +583,18 @@ test("upstream 429 response fails fast during route cooldown", async () => {
       /Upstream returned HTTP 429/,
     );
 
-    await assert.rejects(
-      callJsonUpstream(
-        "https://api.deepseek.com/v1/chat/completions",
-        route,
-        {
-          model: "deepseek-v4-pro",
-          messages: [{ role: "user", content: "next turn" }],
-        },
-        {},
-      ),
-      /Provider is temporarily rate limited/,
-    );
-
-    assert.equal(calls, 1);
-    assert.deepEqual(sleeps, []);
-
-    now = 2000;
     const response = await callJsonUpstream(
       "https://api.deepseek.com/v1/chat/completions",
       route,
       {
         model: "deepseek-v4-pro",
-        messages: [{ role: "user", content: "after cooldown" }],
+        messages: [{ role: "user", content: "next turn" }],
       },
       {},
     );
+
     assert.equal(calls, 2);
+    assert.deepEqual(sleeps, [2000]);
     assert.deepEqual(response, { ok: true });
   } finally {
     globalThis.fetch = originalFetch;
@@ -426,8 +602,167 @@ test("upstream 429 response fails fast during route cooldown", async () => {
   }
 });
 
-test("upstream retry-after cooldown is capped to avoid long local lockouts", async () => {
+test("upstream 429 keeps provider cooldown while local pacing is disabled", async () => {
   const originalFetch = globalThis.fetch;
+  const sleeps = [];
+  let now = 0;
+  let calls = 0;
+
+  globalThis.fetch = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return new Response(JSON.stringify({ error: { message: "Too Many Requests" } }), {
+        status: 429,
+        headers: {
+          "content-type": "application/json",
+          "retry-after": "2",
+        },
+      });
+    }
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  __resetRateLimiterForTests();
+  __setRateLimitClockForTests({
+    now: () => now,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      now += ms;
+    },
+  });
+
+  try {
+    const route = {
+      id: "deepseek-v4-pro",
+      api: "chat_completions",
+      model: "deepseek-v4-pro",
+      apiKey: "test-key",
+      localRateLimitEnabled: false,
+      rpm: 60,
+    };
+
+    await assert.rejects(
+      callJsonUpstream(
+        "https://api.deepseek.com/v1/chat/completions",
+        route,
+        {
+          model: "deepseek-v4-pro",
+          messages: [{ role: "user", content: "first turn" }],
+        },
+        {},
+      ),
+      /Upstream returned HTTP 429/,
+    );
+
+    const response = await callJsonUpstream(
+      "https://api.deepseek.com/v1/chat/completions",
+      route,
+      {
+        model: "deepseek-v4-pro",
+        messages: [{ role: "user", content: "normal retry" }],
+      },
+      {},
+    );
+
+    const immediateNextResponse = await callJsonUpstream(
+      "https://api.deepseek.com/v1/chat/completions",
+      route,
+      {
+        model: "deepseek-v4-pro",
+        messages: [{ role: "user", content: "next request without local pacing" }],
+      },
+      {},
+    );
+
+    assert.equal(calls, 3);
+    assert.deepEqual(sleeps, [2000]);
+    assert.deepEqual(response, { ok: true });
+    assert.deepEqual(immediateNextResponse, { ok: true });
+  } finally {
+    globalThis.fetch = originalFetch;
+    __resetRateLimiterForTests();
+  }
+});
+
+test("upstream 429 waits through relaxed local cooldown when local rate limiting is enabled", async () => {
+  const originalFetch = globalThis.fetch;
+  const sleeps = [];
+  let now = 0;
+  let calls = 0;
+
+  globalThis.fetch = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return new Response(JSON.stringify({ error: { message: "Too Many Requests" } }), {
+        status: 429,
+        headers: {
+          "content-type": "application/json",
+          "retry-after": "2",
+        },
+      });
+    }
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  __resetRateLimiterForTests();
+  __setRateLimitClockForTests({
+    now: () => now,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      now += ms;
+    },
+  });
+
+  try {
+    const route = {
+      id: "deepseek-v4-pro",
+      api: "chat_completions",
+      model: "deepseek-v4-pro",
+      apiKey: "test-key",
+      localRateLimitEnabled: true,
+    };
+
+    await assert.rejects(
+      callJsonUpstream(
+        "https://api.deepseek.com/v1/chat/completions",
+        route,
+        {
+          model: "deepseek-v4-pro",
+          messages: [{ role: "user", content: "first turn" }],
+        },
+        {},
+      ),
+      /Upstream returned HTTP 429/,
+    );
+
+    const response = await callJsonUpstream(
+      "https://api.deepseek.com/v1/chat/completions",
+      route,
+      {
+        model: "deepseek-v4-pro",
+        messages: [{ role: "user", content: "normal retry" }],
+      },
+      {},
+    );
+
+    assert.equal(calls, 2);
+    assert.deepEqual(sleeps, [2000]);
+    assert.deepEqual(response, { ok: true });
+  } finally {
+    globalThis.fetch = originalFetch;
+    __resetRateLimiterForTests();
+  }
+});
+
+test("upstream retry-after cooldown is capped to avoid long local waits", async () => {
+  const originalFetch = globalThis.fetch;
+  const sleeps = [];
   let now = 0;
   let calls = 0;
 
@@ -452,6 +787,7 @@ test("upstream retry-after cooldown is capped to avoid long local lockouts", asy
   __setRateLimitClockForTests({
     now: () => now,
     sleep: async (ms) => {
+      sleeps.push(ms);
       now += ms;
     },
   });
@@ -464,6 +800,7 @@ test("upstream retry-after cooldown is capped to avoid long local lockouts", asy
       baseUrl: "https://api.moonshot.cn/v1",
       model: "kimi-k2.7-code",
       apiKey: "test-key",
+      localRateLimitEnabled: true,
     };
 
     await assert.rejects(
@@ -479,33 +816,18 @@ test("upstream retry-after cooldown is capped to avoid long local lockouts", asy
       /Upstream returned HTTP 429/,
     );
 
-    await assert.rejects(
-      callJsonUpstream(
-        "https://api.moonshot.cn/v1/chat/completions",
-        route,
-        {
-          model: "kimi-k2.7-code",
-          messages: [{ role: "user", content: "second turn" }],
-        },
-        {},
-      ),
-      /Retry after 120s/,
-    );
-
-    assert.equal(calls, 1);
-
-    now = 120_000;
     const response = await callJsonUpstream(
       "https://api.moonshot.cn/v1/chat/completions",
       route,
       {
         model: "kimi-k2.7-code",
-        messages: [{ role: "user", content: "after capped cooldown" }],
+        messages: [{ role: "user", content: "second turn" }],
       },
       {},
     );
 
     assert.equal(calls, 2);
+    assert.deepEqual(sleeps, [120_000]);
     assert.deepEqual(response, { ok: true });
   } finally {
     globalThis.fetch = originalFetch;
@@ -513,7 +835,7 @@ test("upstream retry-after cooldown is capped to avoid long local lockouts", asy
   }
 });
 
-test("upstream 429 cache does not extend retry-after cooldown for the same payload", async () => {
+test("provider cooldown does not extend Retry-After for the same payload", async () => {
   const originalFetch = globalThis.fetch;
   let now = 0;
   let calls = 0;
@@ -585,7 +907,7 @@ test("upstream 429 cache does not extend retry-after cooldown for the same paylo
   }
 });
 
-test("upstream 429 fail-fast cooldown is shared by routes using the same provider key", async () => {
+test("upstream 429 cooldown waits across routes using the same provider key", async () => {
   const originalFetch = globalThis.fetch;
   const sleeps = [];
   let now = 0;
@@ -624,6 +946,7 @@ test("upstream 429 fail-fast cooldown is shared by routes using the same provide
       baseUrl: "https://api.deepseek.com/v1",
       apiKeyEnv: "DEEPSEEK_API_KEY",
       apiKey: "test-key",
+      localRateLimitEnabled: true,
     };
     const proRoute = {
       ...shared,
@@ -646,27 +969,15 @@ test("upstream 429 fail-fast cooldown is shared by routes using the same provide
       /Upstream returned HTTP 429/,
     );
 
-    await assert.rejects(
-      callJsonUpstream(
-        "https://api.deepseek.com/v1/chat/completions",
-        flashRoute,
-        { model: "deepseek-v4-flash" },
-        {},
-      ),
-      /Provider is temporarily rate limited/,
-    );
-
-    assert.equal(calls, 1);
-    assert.deepEqual(sleeps, []);
-
-    now = 3000;
     const response = await callJsonUpstream(
       "https://api.deepseek.com/v1/chat/completions",
       flashRoute,
       { model: "deepseek-v4-flash" },
       {},
     );
+
     assert.equal(calls, 2);
+    assert.deepEqual(sleeps, [3000]);
     assert.deepEqual(response, { ok: true });
   } finally {
     globalThis.fetch = originalFetch;
@@ -735,7 +1046,7 @@ test("transient upstream 503 failures are not cached for identical retries", asy
   }
 });
 
-test("identical fatal upstream failures are short-circuited without another provider call", async () => {
+test("identical fatal upstream failures are retried after the first call completes", async () => {
   const originalFetch = globalThis.fetch;
   let calls = 0;
 
@@ -785,7 +1096,7 @@ test("identical fatal upstream failures are short-circuited without another prov
       /Upstream returned HTTP 400/,
     );
 
-    assert.equal(calls, 1);
+    assert.equal(calls, 2);
   } finally {
     globalThis.fetch = originalFetch;
     __resetUpstreamFailureCacheForTests();
@@ -793,7 +1104,7 @@ test("identical fatal upstream failures are short-circuited without another prov
   }
 });
 
-test("upstream failure cache does not block a different user turn", async () => {
+test("a different user turn reaches upstream after a completed failure", async () => {
   const originalFetch = globalThis.fetch;
   let calls = 0;
 
@@ -974,6 +1285,9 @@ test("responses stream logs token usage from completed SSE event", async () => {
         type: "response.completed",
         response: {
           id: "resp_with_usage",
+          object: "response",
+          status: "completed",
+          output: [],
           usage: {
             input_tokens: 12,
             output_tokens: 34,

@@ -61,6 +61,37 @@ test("top-level download sections use simple platform labels", () => {
   }
 });
 
+test("Windows user docs recommend the installer before the portable fallback", () => {
+  const readDoc = (file) => fs.readFileSync(path.join(process.cwd(), file), "utf8");
+  const readme = readDoc("README.md");
+  const setupDoc = readDoc(path.join("docs", "windows-setup.md"));
+  const portableDoc = readDoc(path.join("docs", "windows-portable.md"));
+
+  for (const [file, text] of [
+    ["README.md", readme],
+    ["docs/windows-setup.md", setupDoc],
+  ]) {
+    const setupIndex = text.indexOf("CodexBridge-Windows-x64-Setup.exe");
+    const portableIndex = text.indexOf("CodexBridge-Windows-x64-Portable.zip");
+    assert.ok(setupIndex >= 0, `${file} should link the Windows installer`);
+    assert.ok(portableIndex >= 0, `${file} should still link the portable fallback`);
+    assert.ok(
+      setupIndex < portableIndex,
+      `${file} should present the installer before the portable fallback`,
+    );
+    assert.match(text, /Windows installer|Windows 安装版/, `${file} should name the installer path clearly`);
+    assert.match(text, /portable fallback|便携版备用|免安装备用/, `${file} should name portable as fallback`);
+  }
+
+  assert.doesNotMatch(readme, /Windows 下下载 Windows 免安装包/);
+  assert.doesNotMatch(readme, /Win 和 Mac 免安装包，不再要求用户手动安装 Node\.js/);
+  assert.match(readme, /On Windows, download the Windows installer and run it/);
+  assert.match(readme, /Windows 下下载 Windows 安装版并运行/);
+  assert.match(portableDoc, /portable fallback|便携版备用|免安装备用/);
+  assert.doesNotMatch(portableDoc, /customer-facing delivery is the Windows portable package/i);
+  assert.doesNotMatch(portableDoc, /正式交付方式是下载 GitHub Release 里的 Windows 免安装包/);
+});
+
 test("portable docs explain stable user data storage", () => {
   const text = fs.readFileSync(
     path.join(process.cwd(), "docs", "windows-portable.md"),
@@ -80,6 +111,32 @@ test("macOS portable docs explain stable user data storage and first launch", ()
   assert.match(text, /~\/Library\/Application Support\/CodexBridge/);
   assert.match(text, /right-click/);
   assert.match(text, /Control-click/);
+});
+
+test("goal coverage audit keeps long-running roadmap status explicit", () => {
+  const text = fs.readFileSync(
+    path.join(process.cwd(), "docs", "goal-coverage-audit.md"),
+    "utf8",
+  );
+
+  for (const heading of [
+    "第一阶段：图片生成代理",
+    "第二阶段：代理底座和发布体检",
+    "第三阶段：能力扩展",
+    "第四阶段：智能路由",
+    "第五阶段：用户资产",
+  ]) {
+    assert.match(text, new RegExp(escapeRegExp(heading)));
+  }
+
+  assert.match(text, /自动选模型：已实现，默认关闭/);
+  assert.match(text, /失败自动切换：已实现，默认关闭/);
+  assert.match(text, /不把真实 Key、真实 Router、真实安装器证据当作仓库代码阻塞/);
+  assert.match(text, /435\/435 tests/);
+  assert.match(text, /当前代码证据/);
+  assert.match(text, /真实环境验收/);
+  assert.match(text, /下一步/);
+  assert.match(text, /不会自动写回 Codex Desktop 本地会话数据库/);
 });
 
 function escapeRegExp(value) {

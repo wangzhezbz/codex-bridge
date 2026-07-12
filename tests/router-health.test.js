@@ -18,7 +18,7 @@ test("probeRouterHealth reports healthy router model list", async () => {
   assert.equal(result.ok, true);
   assert.equal(result.status, 200);
   assert.deepEqual(result.models, ["gpt-5.5", "gpt-5.2"]);
-  assert.match(result.message, /2 models/);
+  assert.match(result.message, /已加载 2 个模型/);
 });
 
 test("probeRouterHealth preserves upstream route health diagnostics", async () => {
@@ -52,7 +52,7 @@ test("probeRouterHealth preserves upstream route health diagnostics", async () =
   assert.equal(result.unhealthyRoutes, 1);
   assert.equal(result.routes.length, 2);
   assert.equal(result.routes[1].status, "rate_limited");
-  assert.match(result.message, /1 route/);
+  assert.match(result.message, /1 条路由需要关注/);
 });
 
 test("probeRouterHealth reports failed router health with concrete reason", async () => {

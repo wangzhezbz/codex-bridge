@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { Worker } from "node:worker_threads";
 
 const require = createRequire(import.meta.url);
 const {
@@ -97,6 +98,8 @@ test("legacy portable data migration copies old settings without overwriting new
   });
 
   assert.equal(result.copiedFiles, 2);
+  assert.match(result.messages.join("\n"), /已从旧版免安装数据迁移 2 个文件/);
+  assert.doesNotMatch(result.messages.join("\n"), /Migrated .* legacy portable data/i);
   assert.equal(
     fs.readFileSync(path.join(newDir, "config", "secrets.local.json"), "utf8"),
     '{"DEEPSEEK_API_KEY":"new-key"}\n',
@@ -134,4 +137,66 @@ test("legacy portable candidate search finds older extracted packages nearby", (
   });
 
   assert.ok(candidates.includes(oldDataDir));
+});
+
+test("legacy portable migration can run in a worker without blocking the desktop thread", async () => {
+  // Keep the fixture more than four ancestors below the shared runner temp.
+  // The production discovery intentionally inspects nearby package siblings;
+  // without this isolation, fixtures from earlier tests in RUNNER_TEMP are
+  // also valid migration candidates on GitHub's Windows runner.
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-worker-scope-"));
+  const parent = path.join(fixtureRoot, "level-1", "level-2", "level-3", "packages");
+  const currentExe = path.join(
+    parent,
+    "codexbridge-current",
+    "CodexBridge-win32-x64",
+    "CodexBridge.exe",
+  );
+  const oldDataDir = path.join(
+    parent,
+    "codexbridge-old",
+    "CodexBridge-win32-x64",
+    "CodexBridgeData",
+  );
+  const targetDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-worker-target-"));
+  fs.mkdirSync(path.dirname(currentExe), { recursive: true });
+  fs.writeFileSync(currentExe, "fixture\n", "utf8");
+  fs.mkdirSync(path.join(oldDataDir, "config"), { recursive: true });
+  fs.writeFileSync(path.join(oldDataDir, "config", "custom-models.json"), "[]\n", "utf8");
+
+  const workerPath = path.resolve("desktop/legacy-migration-worker.cjs");
+  const result = await new Promise((resolve, reject) => {
+    const worker = new Worker(workerPath, {
+      workerData: { execPath: currentExe, targetDir },
+    });
+    worker.once("message", (message) => {
+      if (message?.ok) {
+        resolve(message.result);
+      } else {
+        reject(new Error(message?.error || "Legacy migration worker failed"));
+      }
+    });
+    worker.once("error", reject);
+  });
+
+  assert.equal(result.copiedFiles, 1);
+  assert.equal(fs.readFileSync(path.join(targetDir, "config", "custom-models.json"), "utf8"), "[]\n");
+});
+
+test("legacy portable data migration reports failures in Chinese", () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-parent-"));
+  const legacyDir = path.join(parent, "codexbridge-0.1.3", "CodexBridge-win32-x64", "CodexBridgeData");
+  const targetFile = path.join(parent, "not-a-directory");
+  fs.mkdirSync(path.join(legacyDir, "config"), { recursive: true });
+  fs.writeFileSync(path.join(legacyDir, "config", "model-selection.json"), "{}\n", "utf8");
+  fs.writeFileSync(targetFile, "blocks directory creation\n", "utf8");
+
+  const result = migrateLegacyPortableData({
+    targetDir: targetFile,
+    legacyDirs: [legacyDir],
+  });
+
+  const message = result.messages.join("\n");
+  assert.match(message, /旧版免安装数据迁移失败/);
+  assert.doesNotMatch(message, /Could not migrate legacy portable data/i);
 });

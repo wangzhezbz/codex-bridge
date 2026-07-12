@@ -1,16 +1,20 @@
 # Windows Setup / Windows 配置指南
 
-This guide is for developers running from source. Win users should download the installer; the portable zip remains a fallback:
+This guide is for developers running from source. Win users should use the Windows installer first; the portable zip remains a portable fallback:
 
 [CodexBridge-Windows-x64-Setup.exe](https://github.com/wangzhezbz/codex-bridge/releases/latest/download/CodexBridge-Windows-x64-Setup.exe)
 [CodexBridge-Windows-x64-Portable.zip](https://github.com/wangzhezbz/codex-bridge/releases/latest/download/CodexBridge-Windows-x64-Portable.zip)
+
+Windows installer / Windows 安装版 is the normal path. The portable fallback / 免安装备用 is only for manual or locked-down environments.
 
 Mac users:
 
 - Apple Silicon: [CodexBridge-macOS-arm64-Portable.zip](https://github.com/wangzhezbz/codex-bridge/releases/latest/download/CodexBridge-macOS-arm64-Portable.zip)
 - Intel Mac: [CodexBridge-macOS-x64-Portable.zip](https://github.com/wangzhezbz/codex-bridge/releases/latest/download/CodexBridge-macOS-x64-Portable.zip)
 
-本指南适用于从源码运行的开发者。Win 用户和 Mac 用户请下载免安装包：
+本指南适用于从源码运行的开发者。Win 用户优先下载 Windows 安装版；Windows 免安装备用包只适合无法安装或需要手动解压的环境：
+
+[CodexBridge-Windows-x64-Setup.exe](https://github.com/wangzhezbz/codex-bridge/releases/latest/download/CodexBridge-Windows-x64-Setup.exe)
 
 [CodexBridge-Windows-x64-Portable.zip](https://github.com/wangzhezbz/codex-bridge/releases/latest/download/CodexBridge-Windows-x64-Portable.zip)
 
@@ -18,12 +22,12 @@ Mac users:
 
 - Windows 10/11
 - Node.js 22.15.0 or newer
-- Codex Desktop
+- ChatGPT / Codex Desktop（新版 `ChatGPT.exe`，旧版 `Codex.exe`）
 - API keys for the providers you want to use
 
 - Windows 10/11
 - Node.js 22.15.0 或更高版本
-- Codex Desktop
+- ChatGPT / Codex Desktop（新版 `ChatGPT.exe`，旧版 `Codex.exe`）
 - 你想使用的 provider API Key
 
 ## 1. Prepare Config / 准备配置
@@ -124,13 +128,10 @@ Example. The desktop app writes this automatically:
 
 ```toml
 model_provider = "openai"
-model = "gpt-5.5"
-model_catalog_json = "F:/game_code/router/model-catalog.json"
+model = "cb-gpt-5-6-sol"
+model_catalog_json = "C:/Users/you/.codex/codexbridge-model-catalog.json"
 model_reasoning_effort = "medium"
-disable_response_storage = false
-network_access = "enabled"
 openai_base_url = "http://127.0.0.1:15722/v1"
-windows_wsl_setup_acknowledged = true
 ```
 
 Rules:
@@ -138,14 +139,14 @@ Rules:
 规则：
 
 - `model_catalog_json` must point to your real `model-catalog.json` path.
-- `openai_base_url` must point to the local CodexBridge Router.
-- Do not add `[model_providers.codex-bridge]`, `experimental_bearer_token`, or `requires_openai_auth`.
-- Restart Codex Desktop after changing the catalog path.
+- Hybrid mode keeps `model_provider = "openai"`; `openai_base_url` must point to the local CodexBridge Router.
+- All API mode uses the independent `codexbridge` provider and the local Authorization header written by CodexBridge.
+- Restart ChatGPT / Codex Desktop after changing the catalog path.
 
 - `model_catalog_json` 必须指向你电脑里的真实 `model-catalog.json` 路径。
-- `openai_base_url` 必须指向本地 CodexBridge Router。
-- 不要再添加 `[model_providers.codex-bridge]`、`experimental_bearer_token` 或 `requires_openai_auth`。
-- 修改模型目录路径后，需要重启 Codex Desktop。
+- 混合模式保留 `model_provider = "openai"`；`openai_base_url` 必须指向本地 CodexBridge Router。
+- 全部 API 模式使用独立的 `codexbridge` provider 和 CodexBridge 自动写入的本地 Authorization 请求头。
+- 修改模型目录路径后，需要重启 ChatGPT / Codex Desktop。
 
 ## 6. Verify / 验证
 
@@ -170,11 +171,11 @@ PowerShell 注意：
 ### Codex does not show models / Codex 没显示模型
 
 - Confirm `model_catalog_json` path is correct.
-- Restart Codex Desktop.
+- Restart ChatGPT / Codex Desktop.
 - Open `http://127.0.0.1:15722/model-catalog.json` and confirm it returns JSON.
 
 - 确认 `model_catalog_json` 路径正确。
-- 重启 Codex Desktop。
+- 重启 ChatGPT / Codex Desktop。
 - 打开 `http://127.0.0.1:15722/model-catalog.json`，确认能返回 JSON。
 
 ### Provider returns 401 / provider 返回 401
@@ -203,12 +204,12 @@ Open the CodexBridge log page first.
 
 先打开 CodexBridge 的日志页。
 
-- No `access POST /v1/responses`: Codex did not reach Router. Start Router again from CodexBridge, then restart Codex.
+- No `access POST /v1/responses`: ChatGPT / Codex Desktop did not reach Router. Start Router again from CodexBridge, then restart ChatGPT / Codex.
 - Has `access POST /v1/responses`: the request reached Router. Read the next `req_... -> upstream` and `req_... !! upstream` lines to see the real provider, model, proxy, status, and upstream message.
 - All models fail with 502 and there is no access log: usually stale Codex config or a Windows proxy/VPN intercepting local traffic. Current releases write `http://127.0.0.1:15722/v1` when Router starts.
 - `Missing API key ... Set MOONSHOT_API_KEY`: save the Kimi / Moonshot key in the API Key page. The visible Codex slot can be `gpt-5.2` even when the real upstream model is Kimi.
 
-- 没有 `access POST /v1/responses`：Codex 没有打到 Router。请从 CodexBridge 重新启动 Router，然后重启 Codex。
+- 没有 `access POST /v1/responses`：ChatGPT / Codex Desktop 没有打到 Router。请从 CodexBridge 重新启动 Router，然后点击“重启 ChatGPT / Codex”。
 - 有 `access POST /v1/responses`：请求已经进 Router。继续看后面的 `req_... -> upstream` 和 `req_... !! upstream`，确认真实 provider、真实模型、代理、状态码和上游错误。
 - 所有模型都 502 且没有 access 日志：通常是 Codex 配置仍是旧的，或 Windows 代理/VPN 接管了本地流量。当前版本启动 Router 时会写入 `http://127.0.0.1:15722/v1`。
 - `Missing API key ... Set MOONSHOT_API_KEY`：去“密钥”页保存 Kimi / Moonshot 的 Key。Codex 里显示的槽位可能是 `gpt-5.2`，但真实上游模型是 Kimi。

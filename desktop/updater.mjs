@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import path from "node:path";
 import { fetchInitWithProxy, proxyLogLabel } from "../src/proxy.js";
 
@@ -39,6 +40,54 @@ const RELEASE_ASSET_NAMES = RELEASE_ASSETS.map((asset) => asset.name);
 
 export function assetNameForPlatform(platform = process.platform, arch = process.arch, options = {}) {
   return assetCandidatesForPlatform(platform, arch, options)[0]?.name || null;
+}
+
+export function inferUpdateInstallKind({
+  forcedInstallKind = "",
+  appIsPackaged = false,
+  platform = process.platform,
+  execPath = process.execPath,
+  localAppData = process.env.LOCALAPPDATA || "",
+  registryRoot = "",
+  portableMarkerFound = false,
+} = {}) {
+  const forced = String(forcedInstallKind || "").toLowerCase();
+  if (forced === "installed" || forced === "portable") {
+    return forced;
+  }
+  if (!appIsPackaged || platform !== "win32") {
+    return "portable";
+  }
+
+  const appDir = path.dirname(path.resolve(String(execPath || "")));
+  if (isVersionedInstalledAppDir(appDir)) {
+    return "installed";
+  }
+  if (registryRoot && isPathInsideOrEqual(appDir, registryRoot)) {
+    return "installed";
+  }
+  if (localAppData) {
+    const installedRoot = path.resolve(localAppData, "Programs", "CodexBridge");
+    if (isPathInsideOrEqual(appDir, installedRoot)) {
+      return "installed";
+    }
+  }
+  if (portableMarkerFound || isWindowsPortableReleaseLayout(appDir)) {
+    return "portable";
+  }
+
+  return "installed";
+}
+
+function isVersionedInstalledAppDir(appDir) {
+  return /^app-/i.test(path.basename(path.resolve(String(appDir || ""))));
+}
+
+function isWindowsPortableReleaseLayout(appDir) {
+  const resolved = path.resolve(String(appDir || ""));
+  const folder = path.basename(resolved);
+  const parent = path.basename(path.dirname(resolved));
+  return /^CodexBridge-win32-x64$/i.test(folder) && /^CodexBridge-Windows-x64-Portable(?:-|$)/i.test(parent);
 }
 
 function assetCandidatesForPlatform(platform = process.platform, arch = process.arch, options = {}) {
@@ -97,6 +146,19 @@ export function planReleaseUpdate({
   }
 
   const releaseAssets = release.assets || [];
+  const primaryCandidate = assetCandidates[0];
+  const primaryAsset = releaseAssets.find((item) => item?.name === primaryCandidate?.name);
+  if (platform === "win32" && installKind !== "portable" && primaryCandidate?.kind === "installer" && !primaryAsset?.browser_download_url) {
+    return {
+      ok: false,
+      updateAvailable: false,
+      latestVersion,
+      releaseUrl: release.html_url || "",
+      message:
+        `Windows 安装版更新必须发布 ${primaryCandidate.name} 安装器；` +
+        "本次 Release 缺少 Setup.exe，CodexBridge 不会自动下载 Portable.zip。请补发安装器后再更新。",
+    };
+  }
   const candidate = assetCandidates.find((assetInfo) =>
     releaseAssets.some((item) => item?.name === assetInfo.name && item?.browser_download_url),
   );
@@ -137,13 +199,43 @@ export function planReleaseUpdate({
     installMode,
     asset: releaseAssetPayload(asset, candidate),
     fallbackAsset: fallbackAsset ? releaseAssetPayload(fallbackAsset, fallbackCandidate) : null,
-    nextStep: installMode === "windows_setup"
-      ? "下载完成后会打开安装器，并退出当前窗口；安装完成后会启动新版。"
-      : "下载完成后会保存在更新目录；当前程序保持运行，可退出后手动解压打开新版。",
     message: updateAvailable
       ? `发现新版本 ${latestVersion}。`
       : `当前已经是最新版本 ${normalizeVersion(currentVersion)}。`,
     nextStep: releaseUpdateNextStep(installMode),
+  };
+}
+
+export function validateDownloadedReleaseAsset(filePath, asset = {}) {
+  const resolved = path.resolve(String(filePath || ""));
+  if (!resolved) {
+    throw new Error("Downloaded release asset path is empty.");
+  }
+  const stat = fsSync.statSync(resolved);
+  if (!stat.isFile() || stat.size <= 0) {
+    throw new Error(`Downloaded ${asset?.name || "release asset"} is empty or not a file.`);
+  }
+  const headerBuffer = Buffer.alloc(4);
+  const fd = fsSync.openSync(resolved, "r");
+  try {
+    fsSync.readSync(fd, headerBuffer, 0, headerBuffer.length, 0);
+  } finally {
+    fsSync.closeSync(fd);
+  }
+  const headerHex = headerBuffer.toString("hex").toLowerCase();
+  const kind = String(asset?.kind || "").toLowerCase();
+  if (kind === "installer" && !headerHex.startsWith("4d5a")) {
+    throw new Error(`Downloaded installer has an invalid installer header: ${headerHex || "empty"}.`);
+  }
+  if (kind === "portable" && !headerHex.startsWith("504b")) {
+    throw new Error(`Downloaded portable package has an invalid portable header: ${headerHex || "empty"}.`);
+  }
+  return {
+    ok: true,
+    path: resolved,
+    size: stat.size,
+    headerHex,
+    kind,
   };
 }
 
@@ -160,17 +252,17 @@ function releaseUpdateNextStep(installMode) {
 const MANAGED_PACKAGE_RE = /^(\d{4}-\d{2}-\d{2}-\d{9})-CodexBridge-.*\.(?:exe|zip|dmg)$/i;
 const MANAGED_SIDE_FILE_RE = /^(?:install|manual|apply)-update-(\d{4}-\d{2}-\d{2}-\d{9})\.(?:txt|ps1|sh)$/i;
 
-export async function cleanupManagedUpdateArtifacts(updateDir, { keepPackages = 2 } = {}) {
+export async function cleanupManagedUpdateArtifacts(updateDir, { keepPackages = 2, removeFile = fs.rm } = {}) {
   const resolvedDir = path.resolve(String(updateDir || ""));
   if (!resolvedDir) {
-    return { deleted: [] };
+    return { deleted: [], failed: [] };
   }
   let entries = [];
   try {
     entries = await fs.readdir(resolvedDir, { withFileTypes: true });
   } catch (error) {
     if (error?.code === "ENOENT") {
-      return { deleted: [] };
+      return { deleted: [], failed: [] };
     }
     throw error;
   }
@@ -200,15 +292,158 @@ export async function cleanupManagedUpdateArtifacts(updateDir, { keepPackages = 
   }
 
   const deleted = [];
+  const failed = [];
   for (const name of [...deleteNames].sort()) {
     const filePath = path.resolve(resolvedDir, name);
     if (path.dirname(filePath) !== resolvedDir) {
       continue;
     }
-    await fs.rm(filePath, { force: true });
-    deleted.push(filePath);
+    try {
+      await removeFile(filePath, { force: true });
+      deleted.push(filePath);
+    } catch (error) {
+      failed.push({
+        path: filePath,
+        message: error?.message || String(error),
+      });
+    }
   }
-  return { deleted };
+  return { deleted, failed };
+}
+
+export async function installedAppVersionCleanupTargets({
+  installedRoots = [],
+  currentAppDir = "",
+} = {}) {
+  const current = normalizeFsPath(currentAppDir);
+  const roots = uniqueFsPaths(installedRoots.map((item) => normalizeFsPath(item)).filter(Boolean));
+  const targets = [];
+  for (const root of roots) {
+    let entries = [];
+    try {
+      entries = await fs.readdir(root, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        continue;
+      }
+      throw error;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !/^app-/i.test(entry.name)) {
+        continue;
+      }
+      const target = path.resolve(root, entry.name);
+      if (path.dirname(target) !== root || sameFsPath(target, current)) {
+        continue;
+      }
+      targets.push(target);
+    }
+  }
+  return uniqueFsPaths(targets);
+}
+
+const LEGACY_INSTALLED_APP_FILES = [
+  "CodexBridge.exe",
+  "chrome_100_percent.pak",
+  "chrome_200_percent.pak",
+  "d3dcompiler_47.dll",
+  "ffmpeg.dll",
+  "icudtl.dat",
+  "libEGL.dll",
+  "libGLESv2.dll",
+  "LICENSE.electron.txt",
+  "LICENSES.chromium.html",
+  "resources.pak",
+  "snapshot_blob.bin",
+  "v8_context_snapshot.bin",
+  "vk_swiftshader.dll",
+  "vk_swiftshader_icd.json",
+  "vulkan-1.dll",
+];
+const LEGACY_INSTALLED_APP_DIRS = [
+  "locales",
+  "resources",
+  "swiftshader",
+];
+
+export async function installedLegacyAppCleanupTargets({
+  installedRoots = [],
+  currentAppDir = "",
+  exeName = "CodexBridge.exe",
+} = {}) {
+  const current = normalizeFsPath(currentAppDir);
+  const roots = uniqueFsPaths(installedRoots.map((item) => normalizeFsPath(item)).filter(Boolean));
+  const targets = [];
+  for (const root of roots) {
+    if (!current || sameFsPath(root, current) || !isPathInsideOrEqual(current, root)) {
+      continue;
+    }
+    if (!await isCodexBridgeLegacyRoot(root, exeName)) {
+      continue;
+    }
+    for (const fileName of LEGACY_INSTALLED_APP_FILES) {
+      const filePath = path.resolve(root, fileName);
+      if (path.dirname(filePath) === root && await pathIsFile(filePath)) {
+        targets.push({ path: filePath, kind: "file" });
+      }
+    }
+    for (const dirName of LEGACY_INSTALLED_APP_DIRS) {
+      const dirPath = path.resolve(root, dirName);
+      if (path.dirname(dirPath) === root && !isPathInsideOrEqual(current, dirPath) && await pathIsDirectory(dirPath)) {
+        targets.push({ path: dirPath, kind: "directory" });
+      }
+    }
+  }
+  return uniqueCleanupTargets(targets);
+}
+
+async function isCodexBridgeLegacyRoot(root, exeName) {
+  const exePath = path.resolve(root, exeName || "CodexBridge.exe");
+  const packageJsonPath = path.resolve(root, "resources", "app", "package.json");
+  if (!await pathIsFile(exePath) || !await pathIsFile(packageJsonPath)) {
+    return false;
+  }
+  try {
+    const packageJson = JSON.parse(await fs.readFile(packageJsonPath, "utf8"));
+    return /codex[-_ ]?bridge/i.test(String(packageJson?.name || ""));
+  } catch {
+    return false;
+  }
+}
+
+async function pathIsFile(filePath) {
+  try {
+    return (await fs.stat(filePath)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function pathIsDirectory(dirPath) {
+  try {
+    return (await fs.stat(dirPath)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function uniqueCleanupTargets(targets = []) {
+  const seen = new Set();
+  const result = [];
+  for (const target of targets) {
+    const targetPath = normalizeFsPath(target?.path);
+    const kind = target?.kind === "directory" ? "directory" : "file";
+    if (!targetPath) {
+      continue;
+    }
+    const key = `${kind}:${fsPathKey(targetPath)}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push({ path: targetPath, kind });
+  }
+  return result;
 }
 
 function releaseAssetPayload(asset, assetInfo) {
@@ -305,7 +540,7 @@ async function fetchLatestReleaseWithFallback({
     if (response.ok) {
       return response.json();
     }
-    apiError = new Error(`GitHub API returned HTTP ${response.status}`);
+    apiError = new Error(`GitHub API 返回 HTTP ${response.status}`);
   } catch (error) {
     apiError = error;
   }
@@ -314,7 +549,7 @@ async function fetchLatestReleaseWithFallback({
     return await fetchLatestReleaseFromLatestPage({ fetchImpl, latestReleasePageUrl });
   } catch (fallbackError) {
     throw new Error(
-      `检查更新失败：${apiError?.message || "GitHub API unavailable"}; releases/latest fallback failed: ${fallbackError.message}`,
+      `检查更新失败：${apiError?.message || "GitHub API 不可用"}；releases/latest 兜底也失败：${fallbackError.message}`,
     );
   }
 }
@@ -336,7 +571,7 @@ async function fetchLatestReleaseFromLatestPage({
     latestTag = releaseTagFromText(await response.text());
   }
   if (!latestTag) {
-    throw new Error(`could not resolve latest release tag from HTTP ${response.status}`);
+    throw new Error(`无法从 HTTP ${response.status} 解析最新版本标签`);
   }
   return releaseFromLatestTag(latestTag);
 }
@@ -376,7 +611,7 @@ function releaseFromLatestTag(tag) {
     tag_name: latestTag,
     name: latestTag,
     html_url: `https://github.com/wangzhezbz/codex-bridge/releases/tag/${latestTag}`,
-    body: "GitHub API unavailable; latest release was resolved from releases/latest.",
+    body: "GitHub API 不可用，已通过 releases/latest 兜底解析最新版本。",
     assets: RELEASE_ASSET_NAMES.map((name) => ({
       name,
       size: 0,
@@ -412,6 +647,10 @@ $WORK_DIR = ${psQuote(workDir)}
 $LOG_PATH = ${psQuote(logPath)}
 $backupDir = $null
 $updateStamp = Get-Date -Format "yyyyMMdd-HHmmss"
+
+function Convert-UpdateText([string]$Base64) {
+  return [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Base64))
+}
 
 function Write-UpdateLog([string]$Message) {
   $dir = Split-Path -Parent $LOG_PATH
@@ -531,8 +770,8 @@ function Show-UpdateFailure([string]$Message) {
   try {
     Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
     [System.Windows.MessageBox]::Show(
-      ("CodexBridge update failed. The old version was kept. Log: " + $LOG_PATH + [Environment]::NewLine + [Environment]::NewLine + $Message),
-      "CodexBridge update failed",
+      ((Convert-UpdateText "Q29kZXhCcmlkZ2Ug5pu05paw5aSx6LSl77yM5pen54mI5bey5L+d55WZ44CC5pel5b+X77ya") + $LOG_PATH + [Environment]::NewLine + [Environment]::NewLine + $Message),
+      (Convert-UpdateText "Q29kZXhCcmlkZ2Ug5pu05paw5aSx6LSl"),
       "OK",
       "Error"
     ) | Out-Null
@@ -543,7 +782,7 @@ function Show-UpdateFailure([string]$Message) {
 function Show-UpdateNotice([string]$Message, [int]$Seconds = 2) {
   try {
     $shell = New-Object -ComObject WScript.Shell
-    $shell.Popup($Message, $Seconds, "CodexBridge update", 64) | Out-Null
+    $shell.Popup($Message, $Seconds, (Convert-UpdateText "Q29kZXhCcmlkZ2Ug5pu05paw"), 64) | Out-Null
   } catch {
     Write-UpdateLog ("Could not show update notice: " + $_.Exception.Message)
   }
@@ -673,7 +912,7 @@ try {
   Write-UpdateLog "Current app directory: $CURRENT_APP_DIR"
   Write-UpdateLog "Update package: $ZIP_PATH"
   Write-UpdateLog "Update work directory: $WORK_DIR"
-  Show-UpdateNotice "CodexBridge is installing the update. The new version will open automatically."
+  Show-UpdateNotice (Convert-UpdateText "Q29kZXhCcmlkZ2Ug5q2j5Zyo5a6J6KOF5pu05paw77yM5paw54mI5pys5Lya6Ieq5Yqo5omT5byA44CC")
   foreach ($waitPid in $WAIT_PIDS) {
     Wait-UpdateProcessExit $waitPid
   }
@@ -717,12 +956,12 @@ try {
   Remove-DirectoryTreeSafely $backupDir $appParent "previous app directory"
   Remove-DirectoryTreeSafely $extractDir $WORK_DIR "extract directory"
   Remove-FileSafely $ZIP_PATH $WORK_DIR "update package"
-  Write-UpdateLog "Update completed. Previous version removed."
+  Write-UpdateLog (Convert-UpdateText "5pu05paw5a6M5oiQ77yM5pen54mI5pys5bey56e76Zmk44CC")
 } catch {
   $failureMessage = $_.Exception.Message
-  Write-UpdateLog ("Update failed: " + $failureMessage)
+  Write-UpdateLog ((Convert-UpdateText "5pu05paw5aSx6LSl77ya") + $failureMessage)
   Restore-PreviousAppDirectory | Out-Null
-  Write-UpdateLog "Update failed; previous app was restored and restarted when possible."
+  Write-UpdateLog (Convert-UpdateText "5pu05paw5aSx6LSl77yb5bey5bC96YeP5oGi5aSN5bm26YeN5ZCv5pen54mI5pys44CC")
   Start-CodexBridgeAfterFailure
   Open-UpdateFolder
   Show-UpdateFailure $failureMessage
@@ -760,7 +999,7 @@ restore_old_app() {
   fi
 }
 
-trap 'log "Update failed."; restore_old_app' ERR
+trap 'log "更新失败。"; restore_old_app' ERR
 
 for pid in $WAIT_PIDS; do
   log "Waiting for process $pid to exit."
@@ -795,12 +1034,56 @@ log "Moving new app bundle into place."
 mv "$new_app" "$CURRENT_APP_BUNDLE"
 log "Starting updated CodexBridge."
 open "$CURRENT_APP_BUNDLE"
-log "Update completed. Previous version kept at $backup_bundle."
+log "更新完成，旧版本保留在 $backup_bundle。"
 `;
 }
 
 function normalizeVersion(value) {
   return String(value || "").trim().replace(/^v/i, "");
+}
+
+function normalizeFsPath(value) {
+  const text = String(value || "").trim();
+  return text ? path.resolve(text) : "";
+}
+
+function uniqueFsPaths(values = []) {
+  const seen = new Set();
+  const result = [];
+  for (const value of values) {
+    const normalized = normalizeFsPath(value);
+    if (!normalized) {
+      continue;
+    }
+    const key = fsPathKey(normalized);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(normalized);
+  }
+  return result;
+}
+
+function sameFsPath(left, right) {
+  return fsPathKey(left) === fsPathKey(right);
+}
+
+function isPathInsideOrEqual(candidate, root) {
+  const candidatePath = normalizeFsPath(candidate);
+  const rootPath = normalizeFsPath(root);
+  if (!candidatePath || !rootPath) {
+    return false;
+  }
+  if (sameFsPath(candidatePath, rootPath)) {
+    return true;
+  }
+  return fsPathKey(candidatePath).startsWith(`${fsPathKey(rootPath)}${path.sep}`);
+}
+
+function fsPathKey(value) {
+  const normalized = normalizeFsPath(value);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
 function parseVersion(value) {

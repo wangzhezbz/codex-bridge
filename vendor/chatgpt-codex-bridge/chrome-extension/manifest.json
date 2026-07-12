@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Codex GPT Bridge",
+  "version": "0.1.1",
+  "version_name": "0.1.1 - 20260712",
+  "description": "Sync Codex workbench messages with a bound GPT session.",
+  "permissions": [
+    "downloads",
+    "debugger",
+    "scripting",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "https://chatgpt.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["bridge-config.js", "content-script.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

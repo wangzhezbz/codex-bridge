@@ -68,6 +68,9 @@ jobs:
       - name: Run router health tests
         run: node --test tests/router-health.test.js
 
+      - name: Run Windows release preflight
+        run: node scripts/release-preflight.mjs --platform win32 --arch x64
+
       - name: Package Windows portable app
         env:
           CODEXBRIDGE_RELEASE_VERSION: ${{ github.ref_name }}
@@ -81,31 +84,10 @@ jobs:
         run: choco install nsis -y
 
       - name: Create Windows release artifacts
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path "dist-artifacts" | Out-Null
-          $appPath = Get-ChildItem -Path "release" -Directory -Recurse |
-            Where-Object { $_.Name -eq "CodexBridge-win32-x64" } |
-            Select-Object -First 1
-          if (-not $appPath) {
-            throw "Could not find packaged CodexBridge-win32-x64 directory."
-          }
-          Compress-Archive -Path (Join-Path $appPath.FullName "*") -DestinationPath "dist-artifacts/CodexBridge-Windows-x64-Portable.zip" -Force
-          $version = (Get-Content -LiteralPath "package.json" | ConvertFrom-Json).version
-          $programFilesX86 = [Environment]::GetFolderPath("ProgramFilesX86")
-          $makensis = Join-Path $programFilesX86 "NSIS\makensis.exe"
-          if (-not (Test-Path -LiteralPath $makensis)) {
-            $makensis = "makensis"
-          }
-          $outFile = Join-Path (Resolve-Path "dist-artifacts").Path "CodexBridge-Windows-x64-Setup.exe"
-          $iconPath = (Resolve-Path "desktop\assets\codexbridge-icon.ico").Path
-          & $makensis "/DVERSION=$version" "/DAPP_DIR=$($appPath.FullName)" "/DOUT_FILE=$outFile" "/DICON_PATH=$iconPath" "scripts\installer\windows\CodexBridge.nsi"
-          if ($LASTEXITCODE -ne 0) {
-            throw "makensis failed with exit code $LASTEXITCODE."
-          }
-          if (-not (Test-Path -LiteralPath $outFile)) {
-            throw "Windows installer was not created."
-          }
+        run: npm run package:win:artifacts
+
+      - name: Run Windows release artifact preflight
+        run: node scripts/release-preflight.mjs --platform win32 --arch x64 --release-dir dist-artifacts --write-gate-report windows-release-gate.json
 
       - name: Smoke test Windows release archive
         shell: pwsh
@@ -113,6 +95,9 @@ jobs:
           $extractPath = Join-Path $env:RUNNER_TEMP "codexbridge-release-archive-smoke"
           New-Item -ItemType Directory -Force -Path $extractPath | Out-Null
           Expand-Archive -LiteralPath "dist-artifacts/CodexBridge-Windows-x64-Portable.zip" -DestinationPath $extractPath -Force
+          if (-not (Test-Path -LiteralPath (Join-Path $extractPath ".codexbridge-portable"))) {
+            throw "Release archive does not contain .codexbridge-portable marker."
+          }
           $exe = Get-ChildItem -LiteralPath $extractPath -Filter "CodexBridge.exe" -File -Recurse | Select-Object -First 1
           if (-not $exe) {
             throw "Release archive does not contain CodexBridge.exe."
@@ -131,6 +116,7 @@ jobs:
           path: |
             dist-artifacts/CodexBridge-Windows-x64-Portable.zip
             dist-artifacts/CodexBridge-Windows-x64-Setup.exe
+            windows-release-gate.json
 
   macos:
     name: macOS ${{ matrix.arch }}
@@ -159,9 +145,13 @@ jobs:
 
       - name: Run macOS packaging checks
         run: |
+          node --check scripts/release-preflight.mjs
           node --check scripts/package-macos.mjs
           node --check scripts/smoke-packaged-macos.mjs
           node --check desktop/data-dir.cjs
+
+      - name: Run macOS release preflight
+        run: node scripts/release-preflight.mjs --platform darwin --arch ${{ matrix.arch }} --write-gate-report macos-${{ matrix.arch }}-release-gate.json
 
       - name: Package macOS portable app
         env:
@@ -197,7 +187,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: CodexBridge-macOS-${{ matrix.arch }}-Portable
-          path: dist-artifacts/CodexBridge-macOS-${{ matrix.arch }}-Portable.zip
+          path: |
+            dist-artifacts/CodexBridge-macOS-${{ matrix.arch }}-Portable.zip
+            macos-${{ matrix.arch }}-release-gate.json
 
   publish:
     name: Publish GitHub release
@@ -211,6 +203,24 @@ jobs:
         with:
           path: dist-artifacts
           merge-multiple: true
+
+      - name: Prepare verified release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          for name in \
+            CodexBridge-Windows-x64-Setup.exe \
+            CodexBridge-Windows-x64-Portable.zip \
+            CodexBridge-macOS-arm64-Portable.zip \
+            CodexBridge-macOS-x64-Portable.zip
+          do
+            source_path="$(find dist-artifacts -type f -name "$name" -print -quit)"
+            test -n "$source_path"
+            test -s "$source_path"
+            cp "$source_path" "release-assets/$name"
+            test -s "release-assets/$name"
+          done
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
@@ -230,4 +240,8 @@ jobs:
 
             Mac Intel:
             https://github.com/${{ github.repository }}/releases/latest/download/CodexBridge-macOS-x64-Portable.zip
-          files: dist-artifacts/*
+          files: |
+            release-assets/CodexBridge-Windows-x64-Setup.exe
+            release-assets/CodexBridge-Windows-x64-Portable.zip
+            release-assets/CodexBridge-macOS-arm64-Portable.zip
+            release-assets/CodexBridge-macOS-x64-Portable.zip

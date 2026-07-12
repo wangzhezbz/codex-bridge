@@ -11,11 +11,17 @@ import {
   normalizeAdapterProfile,
 } from "./adapter-profile.js";
 import {
+  CODEXBRIDGE_CAPABILITY_TOOL_NAME,
   contentToText,
   interactiveNodeReplToolNameForRequest,
   interactivePluginKindForRequest,
+  estimatedMessagesTokens,
+  preservedToolBoundaryCount,
+  responseInputToChatMessages,
   responseRequestToChatSourceMessages,
   responsesToChatRequest,
+  stripExactPersistedHistoryPrefix,
+  trimMessagesToRouteContext,
 } from "./responses-to-chat.js";
 import {
   assistantHistoryMessageFromResponse,
@@ -34,22 +40,42 @@ import {
   compactResponseFromLocalFallback,
   compactResponseFromResponses,
   compactResponseToSse,
+  strictContextSwitchSummaryFromChat,
+  strictContextSwitchSummaryFromResponses,
 } from "./compact.js";
+import { contextPolicyForRoute } from "./context-policy.js";
+import {
+  createRouteSnapshot,
+  resolveRouteSnapshot,
+  validateRouteSnapshot,
+} from "./route-snapshot.js";
 import {
   proxyImageGenerationFallback,
   shouldUseImageGenerationFallback,
 } from "./image-generation.js";
-import { fetchInitWithProxy, proxyLogLabel } from "./proxy.js";
+import {
+  fetchInitWithProxy,
+  invalidateProxyAgentForUrl,
+  proxyLogLabel,
+  refreshFetchInitWithProxy,
+} from "./proxy.js";
 import { redactSecretText } from "./redact.js";
 import { markRouteRateLimited, routeRateLimitStatus, waitForRouteCapacity } from "./rate-limit.js";
 import { classifyUpstreamError } from "./route-health.js";
 import {
+  createRouteTrace,
+  recordRouteTraceEvent,
+  routeTraceForLog,
+} from "./route-trace.js";
+import {
   buildResponsesStreamErrorSse,
   extractResponseObjectFromSse,
   extractUsageFromSse,
+  parseSseEvents,
   responsesSseStreamComplete,
 } from "./sse.js";
 import {
+  buildToolContext,
   isResponseToolCallItem,
   isResponseToolOutputItem,
   toolDiagnosticsFromContext,
@@ -57,20 +83,15 @@ import {
 } from "./tools.js";
 
 const CHATGPT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
-const FAILURE_CACHE_MAX_ENTRIES = 200;
-const FAILURE_CACHE_FATAL_TTL_MS = 120_000;
-const DUPLICATE_INITIAL_REQUEST_TTL_MS = 120_000;
-const DUPLICATE_INITIAL_REQUEST_PENDING_TTL_MS = 60_000;
-const DUPLICATE_INITIAL_REQUEST_ERROR_TTL_MS = 30_000;
-const DUPLICATE_TURN_REQUEST_TTL_MS = 30_000;
-const DUPLICATE_OPAQUE_TURN_REQUEST_TTL_MS = 120_000;
-const DUPLICATE_INITIAL_REQUEST_MAX_ENTRIES = 200;
+// A completed response is persisted both as the provider response and as an
+// assistant history message. Keep headroom below the store's 100 MiB turn cap;
+// the store remains the final whole-turn limit when source input is also large.
+const MAX_RESPONSES_SSE_EVENT_BUFFER_BYTES = 48 * 1024 * 1024;
+const MAX_RESPONSES_TERMINAL_BUFFER_BYTES = 48 * 1024 * 1024;
 const DEFAULT_CHAT_TOOL_CONTINUATION_TURNS = 5;
-const DEFAULT_UPSTREAM_TIMEOUT_MS = 300_000;
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 600_000;
+const DEFAULT_STREAMING_PROXY_HEADER_TIMEOUT_MS = 600_000;
 const INVALID_JSON_VALUE = Symbol("invalid_json_value");
-
-const recentUpstreamFailures = new Map();
-const recentInitialRequests = new Map();
 
 const CODEX_EXACT_PASSTHROUGH_HEADERS = [
   "user-agent",
@@ -115,11 +136,12 @@ const CODEX_PASSTHROUGH_BLOCKED_HEADERS = new Set([
 ]);
 
 export class UpstreamHttpError extends Error {
-  constructor(statusCode, bodyText, upstreamUrl, route = {}) {
+  constructor(statusCode, bodyText, upstreamUrl, route = {}, options = {}) {
     super(`Upstream returned HTTP ${statusCode}`);
     this.statusCode = statusCode;
     this.bodyText = bodyText;
     this.upstreamUrl = upstreamUrl;
+    this.retryAfter = headerValue(options.headers, "retry-after");
     this.route = {
       id: route.id || "",
       displayName: route.displayName || "",
@@ -218,40 +240,598 @@ export async function handleResponsesRequest(
   const guardedContext = duplicateGuard.key
     ? {
         ...duplicateContext,
-        duplicateInitialRequestKey: duplicateGuard.key,
-        duplicateInitialRequestKeys: duplicateGuard.keys || [duplicateGuard.key],
+        pendingRequestLease: duplicateGuard.lease,
       }
     : duplicateContext;
   try {
+    const requestContext = await contextWithSwitchCompaction(
+      requestBody,
+      route,
+      history,
+      guardedContext,
+    );
     if (compactKind && route.api === "chat_completions") {
-      return await proxyChatCompact(requestBody, route, history, res, guardedContext);
+      return await proxyChatCompact(requestBody, route, history, res, requestContext);
     }
     if (compactKind && route.api === "responses") {
-      return await proxyResponsesCompact(requestBody, route, history, res, guardedContext);
+      return await proxyResponsesCompact(requestBody, route, history, res, requestContext);
     }
     if (shouldUseImageGenerationFallback(requestBody, route)) {
+      const imageRequestBody = context?.routeSelection?.changed
+        ? { ...requestBody, model: route.id || requestBody.model }
+        : requestBody;
       const response = await proxyImageGenerationFallback(
-        requestBody,
-        route,
-        history,
-        res,
-        guardedContext,
-        callJsonUpstream,
+          imageRequestBody,
+          route,
+          history,
+          res,
+          requestContext,
+          callJsonUpstream,
       );
-      finishDuplicateInitialRequestGuard(guardedContext, route, response);
       return response;
     }
     if (route.api === "responses") {
-      return await proxyResponsesApi(requestBody, route, history, res, guardedContext);
+      return await proxyResponsesApi(requestBody, route, history, res, requestContext);
     }
     if (route.api === "chat_completions") {
-      return await proxyChatCompletions(requestBody, route, history, res, guardedContext);
+      return await proxyChatCompletions(requestBody, route, history, res, requestContext);
     }
-  } catch (error) {
-    finishDuplicateInitialRequestGuardWithError(guardedContext, route, requestBody, error);
-    throw error;
+  } finally {
+    releasePendingRequestGuard(guardedContext);
   }
-  jsonResponse(res, 500, openAiError(`Unsupported route api: ${route.api}`));
+  jsonResponse(res, 500, openAiError(`不支持的路由接口类型：${route.api}`));
+}
+
+async function contextWithSwitchCompaction(
+  requestBody = {},
+  route = {},
+  history = null,
+  context = {},
+) {
+  const compaction = await maybeCreateContextSwitchCompaction(
+    requestBody,
+    route,
+    history,
+    context,
+  );
+  return compaction ? { ...context, contextSwitchCompaction: compaction } : context;
+}
+
+async function maybeCreateContextSwitchCompaction(
+  requestBody = {},
+  route = {},
+  history = null,
+  context = {},
+) {
+  if (
+    context.compactKind ||
+    context.contextSwitchCompaction ||
+    !requestBody?.previous_response_id ||
+    !history?.getResponseMeta ||
+    !history?.get
+  ) {
+    return null;
+  }
+
+  const previousMeta = history.getResponseMeta(requestBody.previous_response_id) || {};
+  const storedSnapshot = previousMeta.routeSnapshot;
+  const previousRouteId = String(storedSnapshot?.id || previousMeta.routeId || "").trim();
+  if (!previousRouteId) {
+    return null;
+  }
+
+  const targetPolicy = contextSwitchPolicyForRoute(route);
+  const targetContextWindow = targetPolicy.contextWindow;
+  const { messages } = responseRequestToChatSourceMessages(requestBody, route, history);
+  const estimatedTokens = estimatedMessagesTokens(messages || []);
+  const compactThreshold = targetPolicy.compactThreshold;
+  if (previousRouteId === route.id) {
+    if (!storedSnapshot) {
+      return null;
+    }
+    const storedValidation = validateRouteSnapshot(storedSnapshot);
+    const resolution = storedValidation.ok
+      ? resolveRouteSnapshot(
+          storedValidation.snapshot,
+          context.activeConfig?.models || [route],
+          { contextPolicyForRoute: contextSwitchPolicyForRoute },
+        )
+      : exactUnsafeSameRouteSnapshotMatch(
+          storedSnapshot,
+          route,
+          targetPolicy,
+          storedValidation,
+        );
+    if (!resolution.ok) {
+      logContextSwitchCompactionOutcome(context, route, {
+        policyId: targetPolicy.policyId,
+        policyVersion: targetPolicy.version,
+        fromRouteId: previousRouteId,
+        toRouteId: route.id || "",
+        estimatedTokens,
+        inputBudget: targetPolicy.inputBudget,
+        compactThreshold,
+        preservedToolCount: 0,
+        reasonCode: resolution.code,
+      }, "failed");
+      throw contextSwitchCompactionFailedError();
+    }
+    return null;
+  }
+  if (!estimatedTokens || estimatedTokens <= compactThreshold) {
+    return null;
+  }
+
+  const storedValidation = validateRouteSnapshot(storedSnapshot);
+  if (!storedValidation.ok) {
+    logContextSwitchCompactionOutcome(context, route, {
+      policyId: targetPolicy.policyId,
+      policyVersion: targetPolicy.version,
+      fromRouteId: previousRouteId,
+      toRouteId: route.id || "",
+      estimatedTokens,
+      compactThreshold,
+      preservedToolCount: 0,
+      reasonCode: storedValidation.code,
+    }, "failed");
+    throw contextSwitchCompactionFailedError();
+  }
+  const previousContextWindow = storedValidation.snapshot.contextPolicy.contextWindow;
+  if (!previousContextWindow || !targetContextWindow || previousContextWindow <= targetContextWindow) {
+    return null;
+  }
+
+  const resolution = resolveRouteSnapshot(
+    storedValidation.snapshot,
+    context.activeConfig?.models,
+    { contextPolicyForRoute: contextSwitchPolicyForRoute },
+  );
+  if (!resolution.ok) {
+    logContextSwitchCompactionOutcome(context, route, {
+      policyId: targetPolicy.policyId,
+      policyVersion: targetPolicy.version,
+      fromRouteId: previousRouteId,
+      toRouteId: route.id || "",
+      estimatedTokens,
+      compactThreshold,
+      preservedToolCount: 0,
+      reasonCode: resolution.code,
+    }, "failed");
+    throw contextSwitchCompactionFailedError();
+  }
+  const previousRoute = resolution.route;
+
+  let sourcePlan;
+  try {
+    sourcePlan = contextSwitchSourcePlan(
+      requestBody,
+      history,
+      targetPolicy,
+      previousRoute,
+    );
+  } catch (error) {
+    logContextSwitchCompactionOutcome(context, route, {
+      policyId: targetPolicy.policyId,
+      policyVersion: targetPolicy.version,
+      fromRouteId: previousRoute.id || "",
+      toRouteId: route.id || "",
+      estimatedTokens,
+      compactThreshold,
+      preservedToolCount: Number(error?.preservedToolCount || 0),
+      reasonCode: "protected_tool_boundary_invalid",
+    }, "failed");
+    throw contextSwitchCompactionFailedError();
+  }
+  const logDetails = {
+    policyId: targetPolicy.policyId,
+    policyVersion: targetPolicy.version,
+    fromRouteId: previousRoute.id || "",
+    toRouteId: route.id || "",
+    estimatedTokens,
+    compactThreshold,
+    preservedToolCount: sourcePlan.preservedToolCount,
+    reasonCode: "old_route_compacted",
+  };
+  let summary = "";
+  try {
+    summary = await createContextSwitchSummary(
+      requestBody,
+      previousRoute,
+      context,
+      sourcePlan.summaryMessages,
+    );
+    if (!summary) {
+      throw contextSwitchCompactionFailedError();
+    }
+  } catch {
+    logContextSwitchCompactionOutcome(context, route, {
+      ...logDetails,
+      reasonCode: "old_route_compaction_failed",
+    }, "failed");
+    throw contextSwitchCompactionFailedError();
+  }
+
+  const compaction = {
+    summary,
+    fromRouteId: previousRoute.id || "",
+    fromDisplayName: previousRoute.displayName || previousRoute.id || previousRoute.model || "",
+    fromContextWindow: previousContextWindow,
+    toRouteId: route.id || "",
+    toDisplayName: route.displayName || route.id || route.model || "",
+    toContextWindow: targetContextWindow,
+    estimatedTokens,
+    targetInputBudget: targetPolicy.inputBudget,
+    compactThreshold,
+    policyId: targetPolicy.policyId,
+    policyVersion: targetPolicy.version,
+    protectedMessages: sourcePlan.protectedMessages,
+    preservedToolCount: sourcePlan.preservedToolCount,
+  };
+  if (!contextSwitchCompactedContextIsSafe(
+    requestBody,
+    route,
+    history,
+    compaction,
+    targetPolicy,
+    sourcePlan.protectedToolCallIds,
+  )) {
+    logContextSwitchCompactionOutcome(context, route, {
+      ...logDetails,
+      reasonCode: "compacted_context_unsafe",
+    }, "failed");
+    throw contextSwitchCompactionFailedError();
+  }
+  recordRouteTraceEvent(
+    ensureRouteTrace(context, route),
+    "context_switch_compact",
+    contextSwitchCompactTraceDetails({ ...compaction, outcome: "succeeded" }),
+  );
+  logContextSwitchCompactionOutcome(context, route, logDetails, "succeeded");
+  return compaction;
+}
+
+function exactUnsafeSameRouteSnapshotMatch(
+  storedSnapshot,
+  route,
+  targetPolicy,
+  validation,
+) {
+  if (![
+    "route_snapshot_inline_credentials",
+    "route_snapshot_credentials_unavailable",
+    "route_snapshot_custom_headers_unsupported",
+  ].includes(validation?.code)) {
+    return validation || { ok: false, code: "route_snapshot_invalid" };
+  }
+  try {
+    const currentSnapshot = createRouteSnapshot(route, {
+      contextPolicy: targetPolicy,
+    });
+    return stableStringify(storedSnapshot) === stableStringify(currentSnapshot)
+      ? { ok: true, route, snapshot: storedSnapshot }
+      : { ok: false, code: "route_snapshot_same_id_drift" };
+  } catch {
+    return { ok: false, code: "route_snapshot_same_id_drift" };
+  }
+}
+
+function contextSwitchCompactTraceDetails(compaction = {}) {
+  return {
+    policyId: compaction.policyId || "",
+    policyVersion: compaction.policyVersion || 0,
+    fromRouteId: compaction.fromRouteId || "",
+    fromDisplayName: compaction.fromDisplayName || "",
+    fromContextWindow: compaction.fromContextWindow || 0,
+    toRouteId: compaction.toRouteId || "",
+    toDisplayName: compaction.toDisplayName || "",
+    toContextWindow: compaction.toContextWindow || 0,
+    estimatedTokens: compaction.estimatedTokens || 0,
+    targetInputBudget: compaction.targetInputBudget || 0,
+    compactThreshold: compaction.compactThreshold || compaction.targetInputBudget || 0,
+    preservedToolCount: compaction.preservedToolCount || 0,
+    outcome: compaction.outcome || "succeeded",
+  };
+}
+
+function logContextSwitchCompactionOutcome(context, route, details = {}, outcome) {
+  let policy = null;
+  try {
+    policy = contextSwitchPolicyForRoute(route);
+  } catch {
+    policy = null;
+  }
+  const entry = {
+    event: "context_switch_compaction",
+    policyId: details.policyId || "",
+    policyVersion: Number(details.policyVersion || 0),
+    fromRouteId: details.fromRouteId || "",
+    toRouteId: details.toRouteId || route.id || "",
+    estimatedTokens: Number(details.estimatedTokens || 0),
+    inputBudget: Number(details.inputBudget || policy?.inputBudget || 0),
+    compactThreshold: Number(details.compactThreshold || policy?.compactThreshold || 0),
+    preservedToolCount: Number(details.preservedToolCount || 0),
+    outcome,
+    reasonCode: details.reasonCode || (outcome === "succeeded" ? "old_route_compacted" : "failed"),
+  };
+  console.warn(
+    `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+      `context_switch_compaction ${JSON.stringify(entry)}`,
+  );
+}
+
+function logContextTruncationDecision(context, route, decision) {
+  if (!decision || decision.outcome !== "truncated") {
+    return;
+  }
+  const entry = {
+    event: "context_truncation",
+    kind: decision.kind || "chat_payload",
+    policyId: decision.policyId || "",
+    policyVersion: Number(decision.policyVersion || 0),
+    routeId: route.id || "",
+    inputBudget: Number(decision.inputBudget || 0),
+    beforeTokens: Number(decision.beforeTokens || 0),
+    afterTokens: Number(decision.afterTokens || 0),
+    preservedToolCount: Number(decision.preservedToolCount || 0),
+    outcome: "truncated",
+    reasonCode: decision.reasonCode || "input_budget_exceeded",
+  };
+  console.warn(
+    `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+      `context_truncation ${JSON.stringify(entry)}`,
+  );
+}
+
+function logContextCompactionOutcome(context, route, details = {}) {
+  let policy = null;
+  try {
+    policy = contextSwitchPolicyForRoute(route);
+  } catch {
+    policy = null;
+  }
+  const entry = {
+    event: "context_compaction",
+    kind: details.kind || context.compactKind || "explicit",
+    policyId: policy?.policyId || "unknown",
+    policyVersion: Number(policy?.version || 0),
+    routeId: route.id || "",
+    fromRouteId: details.fromRouteId || route.id || "",
+    toRouteId: details.toRouteId || route.id || "",
+    estimatedTokens: Number(details.estimatedTokens || details.beforeTokens || 0),
+    inputBudget: Number(details.inputBudget || policy?.inputBudget || 0),
+    compactThreshold: Number(details.compactThreshold || policy?.compactThreshold || 0),
+    preservedToolCount: Number(details.preservedToolCount || 0),
+    outcome: details.outcome || "completed",
+    reasonCode: details.reasonCode || "remote_summary_completed",
+  };
+  console.warn(
+    `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+      `context_compaction ${JSON.stringify(entry)}`,
+  );
+}
+
+async function createContextSwitchSummary(
+  requestBody = {},
+  compactRoute = {},
+  context = {},
+  sourceMessages = [],
+) {
+  const compactContext = {
+    ...context,
+    contextSwitchCompactRoute: compactRoute.id || compactRoute.model || "",
+  };
+  if (compactRoute.api === "chat_completions") {
+    const converted = buildCompactChatRequest(requestBody, compactRoute, null, {
+      sourceMessages,
+    });
+    logContextTruncationDecision(compactContext, compactRoute, converted.contextDecision);
+    const upstreamUrl = joinOpenAiEndpointUrl(compactRoute.baseUrl, "/chat/completions");
+    logRoute(compactContext, compactRoute, upstreamUrl);
+    const upstream = await callChatCompletionsUpstream(
+      upstreamUrl,
+      compactRoute,
+      converted.body,
+      compactContext,
+      { trackRateLimit: false },
+    );
+    logUsage(compactContext, compactRoute, upstream.usage);
+    return strictContextSwitchSummaryFromChat(upstream);
+  }
+
+  if (compactRoute.api === "responses") {
+    const sourceRequest = cloneJson(requestBody) || {};
+    sourceRequest.input = chatMessagesToResponsesInput(sourceMessages);
+    delete sourceRequest.messages;
+    delete sourceRequest.previous_response_id;
+    const compactBody = buildCompactResponsesRequest(sourceRequest, {
+      stream: shouldStreamResponsesCompact(compactRoute),
+      omitMaxOutputTokens: shouldOmitResponsesCompactMaxOutputTokens(compactRoute),
+    });
+    compactBody.model = compactRoute.model;
+    const budgeted = budgetResponsesCompactPayload(compactBody, compactRoute, null);
+    logContextTruncationDecision(compactContext, compactRoute, budgeted.contextDecision);
+    const upstreamUrl = joinOpenAiEndpointUrl(responsesBaseUrlForRoute(compactRoute), "/responses");
+    logRoute(compactContext, compactRoute, upstreamUrl);
+    const upstream = await callResponsesCompactUpstream(
+      upstreamUrl,
+      compactRoute,
+      compactBody,
+      compactContext,
+      {},
+    );
+    logUsage(compactContext, compactRoute, extractUsageObject(upstream));
+    return strictContextSwitchSummaryFromResponses(upstream);
+  }
+  return "";
+}
+
+function contextSwitchSourcePlan(
+  requestBody = {},
+  history = null,
+  targetPolicy = {},
+  previousRoute = {},
+) {
+  const priorMessages = history?.get?.(requestBody.previous_response_id) || [];
+  const toolContext = buildToolContext(requestBody.tools || [], { route: previousRoute });
+  const currentMessages = stripExactPersistedHistoryPrefix(
+    responseInputToChatMessages(
+      requestBody.messages ?? requestBody.input,
+      toolContext,
+      previousRoute,
+    ),
+    priorMessages,
+  );
+  const lastPriorMessage = priorMessages.at(-1);
+  const activeToolCalls =
+    lastPriorMessage?.role === "assistant" &&
+    Array.isArray(lastPriorMessage.tool_calls) &&
+    lastPriorMessage.tool_calls.length > 0
+      ? lastPriorMessage.tool_calls
+      : [];
+  const deltaHasToolProtocol = currentMessages.some((message) =>
+    message?.role === "tool" ||
+    (
+      message?.role === "assistant" &&
+      Array.isArray(message.tool_calls) &&
+      message.tool_calls.length > 0
+    )
+  );
+  if (!deltaHasToolProtocol) {
+    if (activeToolCalls.length > 0) {
+      throw contextSwitchCompactionFailedError({
+        preservedToolCount: activeToolCalls.length,
+      });
+    }
+    return {
+      summaryMessages: priorMessages,
+      protectedMessages: [],
+      protectedToolCallIds: [],
+      preservedToolCount: 0,
+    };
+  }
+
+  if (
+    currentMessages.length === 0 ||
+    currentMessages.some((message) => message?.role !== "tool")
+  ) {
+    throw contextSwitchCompactionFailedError();
+  }
+
+  if (activeToolCalls.length === 0) {
+    throw contextSwitchCompactionFailedError();
+  }
+
+  const activeCallIndex = priorMessages.length - 1;
+  const activeCall = lastPriorMessage;
+  const toolCalls = activeToolCalls;
+  const protectedToolCallIds = toolCalls.map((toolCall) => toolCall?.id || toolCall?.call_id || "");
+  if (
+    protectedToolCallIds.some((id) => !id) ||
+    new Set(protectedToolCallIds).size !== protectedToolCallIds.length ||
+    toolCalls.some((toolCall) => !validProtectedToolCall(toolCall))
+  ) {
+    throw contextSwitchCompactionFailedError({
+      preservedToolCount: protectedToolCallIds.filter(Boolean).length,
+    });
+  }
+
+  const toolOutputs = currentMessages;
+  const outputIds = toolOutputs.map((message) => message.tool_call_id || "");
+  if (
+    currentMessages.length !== toolOutputs.length ||
+    outputIds.some((id) => !id) ||
+    new Set(outputIds).size !== outputIds.length ||
+    outputIds.length !== protectedToolCallIds.length ||
+    protectedToolCallIds.some((id) => !outputIds.includes(id))
+  ) {
+    throw contextSwitchCompactionFailedError({
+      preservedToolCount: protectedToolCallIds.length,
+    });
+  }
+
+  const protectedSuffix = [activeCall, ...toolOutputs];
+  if (estimatedMessagesTokens(protectedSuffix) > Number(targetPolicy.inputBudget || 0)) {
+    throw contextSwitchCompactionFailedError({
+      preservedToolCount: protectedToolCallIds.length,
+    });
+  }
+  return {
+    summaryMessages: priorMessages.slice(0, activeCallIndex),
+    protectedMessages: [activeCall],
+    protectedToolCallIds,
+    preservedToolCount: protectedToolCallIds.length,
+  };
+}
+
+function validProtectedToolCall(toolCall = {}) {
+  return Boolean(
+    (toolCall.id || toolCall.call_id) &&
+    toolCall.function?.name &&
+    typeof toolCall.function?.arguments === "string"
+  );
+}
+
+function contextSwitchCompactedContextIsSafe(
+  requestBody,
+  route,
+  history,
+  compaction,
+  targetPolicy,
+  protectedToolCallIds = [],
+) {
+  const { messages } = responseRequestToChatSourceMessages(
+    requestBody,
+    route,
+    history,
+    { contextSwitchCompaction: compaction },
+  );
+  if (estimatedMessagesTokens(messages) > Number(targetPolicy.inputBudget || 0)) {
+    return false;
+  }
+  if (protectedToolCallIds.length === 0) {
+    return true;
+  }
+  return contextMessagesContainProtectedToolPair(messages, protectedToolCallIds);
+}
+
+function contextMessagesContainProtectedToolPair(messages = [], expectedIds = []) {
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (message?.role !== "assistant" || !Array.isArray(message.tool_calls)) {
+      continue;
+    }
+    const callIds = message.tool_calls.map((toolCall) => toolCall?.id || toolCall?.call_id || "");
+    if (
+      callIds.length !== expectedIds.length ||
+      expectedIds.some((id) => !callIds.includes(id))
+    ) {
+      continue;
+    }
+    const outputIds = [];
+    for (let next = index + 1; next < messages.length && messages[next]?.role === "tool"; next += 1) {
+      outputIds.push(messages[next].tool_call_id || "");
+    }
+    return (
+      outputIds.length === expectedIds.length &&
+      expectedIds.every((id) => outputIds.includes(id))
+    );
+  }
+  return false;
+}
+
+function contextSwitchCompactionFailedError(options = {}) {
+  const error = new Error("旧模型上下文压缩失败，已取消本次模型切换。");
+  error.statusCode = 409;
+  error.code = "context_switch_compaction_failed";
+  error.localContextSwitchError = true;
+  error.preservedToolCount = Number(options.preservedToolCount || 0);
+  return error;
+}
+
+function contextSwitchPolicyForRoute(route = {}) {
+  return contextPolicyForRoute(route, {
+    defaultContextWindow: normalizeAdapterProfile(route).contextWindow,
+  });
 }
 
 function shouldServeIdleResumeLocally(
@@ -260,19 +840,11 @@ function shouldServeIdleResumeLocally(
   history = null,
   context = {},
 ) {
-  if (
-    !["chat_completions", "responses"].includes(route.api) ||
-    !requestBody.previous_response_id
-  ) {
-    return false;
-  }
-  if (!requestHasFreshInput(requestBody)) {
-    return true;
-  }
-  if (!isCodexClientRequest(context)) {
-    return false;
-  }
-  return requestRepeatsPreviousUserContext(requestBody, route, history);
+  return (
+    ["chat_completions", "responses"].includes(route.api) &&
+    Boolean(requestBody.previous_response_id) &&
+    !requestHasFreshInput(requestBody)
+  );
 }
 
 function requestHasFreshInput(requestBody = {}) {
@@ -394,8 +966,7 @@ function idleResumeNoopResponse(model) {
     .toString(36)
     .slice(2, 8)}`;
   const text =
-    "CodexBridge stopped an automatic resume request with no new input to avoid unintended token usage. " +
-    "Send a new message to continue this task.";
+    "检测到这次自动恢复请求没有新的用户输入，因此没有重复请求上游，避免额外消耗 token。请发送一条新消息继续当前任务。";
   return {
     id,
     object: "response",
@@ -431,144 +1002,53 @@ function beginDuplicateInitialRequestGuard(
   res,
   context = {},
 ) {
-  const keys = duplicateInitialRequestKeys(requestBody, route, context);
-  if (keys.length === 0) {
-    return { key: "", keys: [], served: false };
+  const guard = context.pendingRequestGuard;
+  if (!guard || typeof guard.begin !== "function") {
+    return { key: "", lease: null, served: false };
   }
-  trimDuplicateInitialRequestCache();
-  const now = Date.now();
-  const currentRouteKey = duplicateGuardRouteKey(route);
-  for (const keyInfo of keys) {
-    const existing = recentInitialRequests.get(keyInfo.key);
-    if (existing?.expiresAt > now && existing.status === "completed" && existing.response) {
-      existing.expiresAt = now + keyInfo.ttlMs;
-      const response =
-        existing.routeKey && currentRouteKey && existing.routeKey !== currentRouteKey
-          ? duplicateInitialRequestRouteChangedResponse(requestBody, route)
-          : existing.response;
-      serveDuplicateInitialResponse(
-        response,
-        requestBody,
-        route,
-        res,
-        context,
-        existing.routeKey && currentRouteKey && existing.routeKey !== currentRouteKey
-          ? "route_changed"
-          : existing.reason || keyInfo.kind || "completed",
-      );
-      return {
-        key: keyInfo.key,
-        keys: keys.map((key) => key.key),
-        served: true,
-      };
-    }
-    if (existing?.expiresAt > now && existing.status === "pending") {
-      existing.expiresAt = now + keyInfo.pendingTtlMs;
-      serveDuplicateInitialResponse(
-        duplicateInitialRequestPendingResponse(requestBody, route, context),
-        requestBody,
-        route,
-        res,
-        context,
-        "pending",
-      );
-      return {
-        key: keyInfo.key,
-        keys: keys.map((key) => key.key),
-        served: true,
-      };
-    }
+  const result = guard.begin(
+    {
+      configRevision: context.configRevision || "",
+      requestSurface: context.requestSurface || "responses",
+      route,
+      compactKind: context.compactKind || "",
+      headers: context.clientHeaders || {},
+      requestBody,
+    },
+    { enabled: context.duplicateRequestProtection === true },
+  );
+  if (result.status === "duplicate") {
+    serveDuplicateInitialResponse(
+      duplicateInitialRequestPendingResponse(requestBody, route, context),
+      requestBody,
+      route,
+      res,
+      context,
+      "pending_exact",
+    );
+    return { key: result.fingerprint, lease: null, served: true };
   }
-  for (const keyInfo of keys) {
-    recentInitialRequests.set(keyInfo.key, {
-      status: "pending",
-      response: null,
-      expiresAt: now + keyInfo.pendingTtlMs,
-      kind: keyInfo.kind,
-      ttlMs: keyInfo.ttlMs,
-      recordSuccess: keyInfo.recordSuccess !== false,
-      cacheAnyError: Boolean(keyInfo.cacheAnyError),
-      routeKey: currentRouteKey,
-    });
+  if (result.status === "capacity_bypass") {
+    console.warn(
+      `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+        `!! duplicate-request-guard route=${route.id || "-"} reason=pending_guard_capacity`,
+    );
   }
-  return { key: keys[0].key, keys: keys.map((key) => key.key), served: false };
+  if (result.status !== "owner") {
+    return { key: "", lease: null, served: false };
+  }
+  return {
+    key: result.fingerprint,
+    lease: {
+      fingerprint: result.fingerprint,
+      ownershipToken: result.ownershipToken,
+    },
+    served: false,
+  };
 }
 
-function finishDuplicateInitialRequestGuard(context = {}, route = {}, response = null) {
-  const keys = duplicateInitialRequestKeysFromContext(context);
-  if (keys.length === 0) {
-    return;
-  }
-  const safeResponse = responseHasRunnableToolCall(response)
-    ? duplicateInitialRequestNoopResponse(response?.model || route.id || route.model)
-    : duplicateInitialResponse(response);
-  if (!safeResponse) {
-    for (const key of keys) {
-      recentInitialRequests.delete(key);
-    }
-    return;
-  }
-  const now = Date.now();
-  const routeKey = duplicateGuardRouteKey(route);
-  for (const key of keys) {
-    const existing = recentInitialRequests.get(key);
-    if (!existing) {
-      continue;
-    }
-    if (existing.recordSuccess === false) {
-      recentInitialRequests.delete(key);
-      continue;
-    }
-    recentInitialRequests.set(key, {
-      status: "completed",
-      response: safeResponse,
-      expiresAt: now + Number(existing.ttlMs || DUPLICATE_INITIAL_REQUEST_TTL_MS),
-      reason: existing.kind === "semantic" ? "semantic_replay" : "completed",
-      kind: existing.kind,
-      ttlMs: existing.ttlMs,
-      routeKey: existing.routeKey || routeKey,
-    });
-  }
-}
-
-function finishDuplicateInitialRequestGuardWithError(
-  context = {},
-  route = {},
-  requestBody = {},
-  error,
-) {
-  const keys = duplicateInitialRequestKeysFromContext(context);
-  if (keys.length === 0) {
-    return;
-  }
-  const pendingKeys = keys.filter((key) => recentInitialRequests.get(key)?.status === "pending");
-  if (pendingKeys.length === 0) {
-    return;
-  }
-  const shouldCacheRetryError = shouldStopDuplicateRetryAfterError(error);
-  const response = duplicateInitialRequestErrorResponse(requestBody, route, error, context);
-  const now = Date.now();
-  const routeKey = duplicateGuardRouteKey(route);
-  for (const key of pendingKeys) {
-    const existing = recentInitialRequests.get(key);
-    const shouldCacheTurnError =
-      Boolean(existing?.cacheAnyError) && shouldCacheDuplicateTurnError(error);
-    if (!shouldCacheRetryError && !shouldCacheTurnError) {
-      recentInitialRequests.delete(key);
-      continue;
-    }
-    recentInitialRequests.set(key, {
-      status: "completed",
-      response,
-      expiresAt: now + DUPLICATE_INITIAL_REQUEST_ERROR_TTL_MS,
-      reason: shouldCacheRetryError ? "retry_error" : "turn_error",
-      kind: existing?.kind,
-      ttlMs: existing?.ttlMs,
-      recordSuccess: existing?.recordSuccess,
-      cacheAnyError: existing?.cacheAnyError,
-      routeKey: existing?.routeKey || routeKey,
-    });
-  }
+function releasePendingRequestGuard(context = {}) {
+  return context.pendingRequestGuard?.release?.(context.pendingRequestLease) || false;
 }
 
 function serveDuplicateInitialResponse(response, requestBody, route, res, context = {}, reason = "duplicate") {
@@ -592,22 +1072,12 @@ function serveDuplicateInitialResponse(response, requestBody, route, res, contex
   jsonResponse(res, 200, response);
 }
 
-function duplicateInitialResponse(response) {
-  if (!response || typeof response !== "object") {
-    return null;
-  }
-  const cloned = cloneJson(response);
-  cloned.usage = null;
-  return cloned;
-}
-
 function duplicateInitialRequestNoopResponse(model, text) {
   const id = `resp_duplicate_request_${Date.now().toString(36)}_${Math.random()
     .toString(36)
     .slice(2, 8)}`;
   const outputText = text ||
-    "CodexBridge stopped a duplicate automatic request replay to avoid unintended token usage. " +
-    "Send a new message to continue this task.";
+    "检测到重复的自动请求重放，因此没有重复请求上游，避免额外消耗 token。请发送一条新消息继续当前任务。";
   return {
     id,
     object: "response",
@@ -637,289 +1107,15 @@ function duplicateInitialRequestNoopResponse(model, text) {
   };
 }
 
-function duplicateInitialRequestRouteChangedResponse(requestBody = {}, route = {}) {
-  const displayName = route.displayName || route.id || route.model || "the selected model";
-  return duplicateInitialRequestNoopResponse(
-    requestBody.model || route.id || route.model,
-    "CodexBridge 已拦截来自上一模型选择的自动重放，避免误请求上游和消耗 token。 " +
-      "本次没有请求任何上游模型。 " +
-      `请发送一条新消息继续使用 ${displayName}。`,
-  );
-}
-
-function duplicateInitialRequestErrorResponse(requestBody = {}, route = {}, error, context = {}) {
-  const detail = retryableErrorDetail(error);
-  const reason =
-    "CodexBridge 已拦截同一失败请求的自动重试，避免重复请求上游和消耗 token。 " +
-    "这次拦截没有再次请求任何上游模型；下面的错误来自上一次失败请求。 " +
-    "如果你已经切换模型或想继续当前任务，请发送一条新消息，新消息会按当前模型重新请求。" +
-    (detail ? ` 上一次错误: ${detail}` : "");
-  if (context.compactKind) {
-    return compactResponseFromLocalFallback(requestBody.model || route.id || route.model, {
-      requestBody,
-      reason,
-    });
-  }
-  return duplicateInitialRequestNoopResponse(requestBody.model || route.id || route.model, reason);
-}
-
-function shouldStopDuplicateRetryAfterError(error) {
-  if (error?.code === "client_closed_request") {
-    return false;
-  }
-  if (
-    error instanceof UpstreamNetworkError ||
-    error instanceof UpstreamTimeoutError ||
-    error instanceof UpstreamStreamError
-  ) {
-    return true;
-  }
-  const statusCode = Number(error?.statusCode || 0);
-  return [413, 502, 504].includes(statusCode);
-}
-
-function shouldCacheDuplicateTurnError(error) {
-  const statusCode = Number(error?.statusCode || 0);
-  return statusCode !== 503;
-}
-
-function retryableErrorDetail(error) {
-  if (!error) {
-    return "";
-  }
-  if (error instanceof UpstreamHttpError) {
-    return safeText(clientUpstreamErrorMessage(error, tryParseJson(error.bodyText)), 500);
-  }
-  return safeText(error.message || String(error), 500);
-}
-
 function duplicateInitialRequestPendingResponse(requestBody = {}, route = {}, context = {}) {
   if (context.compactKind) {
     return compactResponseFromLocalFallback(requestBody.model || route.id || route.model, {
       requestBody,
       reason:
-        "CodexBridge stopped a duplicate automatic compact replay while the first compact request is still pending.",
+        "上一次上下文压缩仍在进行，本次自动重放没有重复请求上游。请稍等上一轮请求完成，或发送新消息继续。",
     });
   }
   return duplicateInitialRequestNoopResponse(requestBody.model || route.id || route.model);
-}
-
-function duplicateInitialRequestKeys(requestBody = {}, route = {}, context = {}) {
-  const exactKey = duplicateInitialRequestKey(requestBody, route, context);
-  if (!exactKey) {
-    return [];
-  }
-  const keys = [
-    {
-      key: `exact:${exactKey}`,
-      kind: "exact",
-      ttlMs: DUPLICATE_INITIAL_REQUEST_TTL_MS,
-      pendingTtlMs: DUPLICATE_INITIAL_REQUEST_PENDING_TTL_MS,
-    },
-  ];
-  const semanticKey = duplicateSemanticTurnRequestKey(requestBody, route, context);
-  if (semanticKey) {
-    keys.push({
-      key: `semantic:${semanticKey}`,
-      kind: "semantic",
-      ttlMs: DUPLICATE_TURN_REQUEST_TTL_MS,
-      pendingTtlMs: DUPLICATE_INITIAL_REQUEST_PENDING_TTL_MS,
-    });
-  }
-  const clientTurnKey = duplicateClientTurnRequestKey(requestBody, route, context);
-  if (clientTurnKey) {
-    keys.push({
-      key: `client_turn:${clientTurnKey}`,
-      kind: "client_turn",
-      ttlMs: DUPLICATE_TURN_REQUEST_TTL_MS,
-      pendingTtlMs: DUPLICATE_INITIAL_REQUEST_PENDING_TTL_MS,
-      cacheAnyError: true,
-    });
-  }
-  const opaqueClientTurnKey = duplicateOpaqueClientTurnRequestKey(requestBody, route, context);
-  if (opaqueClientTurnKey) {
-    keys.push({
-      key: `opaque_client_turn:${opaqueClientTurnKey}`,
-      kind: "opaque_client_turn",
-      ttlMs: DUPLICATE_OPAQUE_TURN_REQUEST_TTL_MS,
-      pendingTtlMs: DUPLICATE_INITIAL_REQUEST_PENDING_TTL_MS,
-      cacheAnyError: true,
-    });
-  }
-  return keys;
-}
-
-function duplicateInitialRequestKeysFromContext(context = {}) {
-  const keys = Array.isArray(context.duplicateInitialRequestKeys)
-    ? context.duplicateInitialRequestKeys
-    : [context.duplicateInitialRequestKey];
-  return [...new Set(keys.filter((key) => typeof key === "string" && key))];
-}
-
-function duplicateGuardRouteKey(route = {}) {
-  return stableStringify({
-    id: route.id || "",
-    provider: route.provider || route.providerId || "",
-    api: route.api || "",
-    model: route.model || "",
-    baseUrl: route.baseUrl || "",
-    authMode: authModeForRoute(route),
-  });
-}
-
-function duplicateInitialRequestKey(requestBody = {}, route = {}, context = {}) {
-  if (
-    !["chat_completions", "responses"].includes(route.api) ||
-    !isCodexClientRequest(context)
-  ) {
-    return "";
-  }
-  if (!requestHasFreshInput(requestBody)) {
-    return "";
-  }
-  const headers = context.clientHeaders || {};
-  const turnIdentity = codexTurnIdentity(headers);
-  const material = stableStringify({
-    route: {
-      id: route.id || "",
-      provider: route.provider || route.providerId || "",
-      api: route.api || "",
-      model: route.model || "",
-      baseUrl: route.baseUrl || "",
-      authMode: authModeForRoute(route),
-    },
-    client: {
-      threadId: headerValue(headers, "x-codex-thread-id") || headerValue(headers, "thread-id"),
-      windowId: headerValue(headers, "x-codex-window-id"),
-      parentThreadId: headerValue(headers, "x-codex-parent-thread-id"),
-      turnIdentity,
-    },
-    body: requestBody,
-  });
-  return createHash("sha256").update(material).digest("hex");
-}
-
-function duplicateSemanticTurnRequestKey(requestBody = {}, route = {}, context = {}) {
-  if (
-    !["chat_completions", "responses"].includes(route.api) ||
-    !isCodexClientRequest(context)
-  ) {
-    return "";
-  }
-  if (!requestHasFreshInput(requestBody)) {
-    return "";
-  }
-  const latestUser = latestSemanticUserInputSignature(
-    requestBody.messages ?? requestBody.input,
-  );
-  if (!latestUser) {
-    return "";
-  }
-  const headers = context.clientHeaders || {};
-  const turnIdentity = codexTurnIdentity(headers);
-  const material = stableStringify({
-    route: {
-      id: route.id || "",
-      provider: route.provider || route.providerId || "",
-      api: route.api || "",
-      model: route.model || "",
-      baseUrl: route.baseUrl || "",
-      authMode: authModeForRoute(route),
-    },
-    client: {
-      threadId: headerValue(headers, "x-codex-thread-id") || headerValue(headers, "thread-id") || "",
-      windowId: headerValue(headers, "x-codex-window-id") || "",
-      parentThreadId: headerValue(headers, "x-codex-parent-thread-id") || "",
-      installationId: headerValue(headers, "x-codex-installation-id") || "",
-      userAgent: headerValue(headers, "user-agent") || "",
-      turnIdentity,
-    },
-    compactKind: context.compactKind || "",
-    latestUser,
-  });
-  return createHash("sha256").update(material).digest("hex");
-}
-
-function duplicateClientTurnRequestKey(requestBody = {}, route = {}, context = {}) {
-  if (
-    !["chat_completions", "responses"].includes(route.api) ||
-    !isCodexClientRequest(context)
-  ) {
-    return "";
-  }
-  if (!requestHasFreshInput(requestBody)) {
-    return "";
-  }
-  const latestUser = latestSemanticUserInputSignature(
-    requestBody.messages ?? requestBody.input,
-  );
-  if (!latestUser) {
-    return "";
-  }
-  const headers = context.clientHeaders || {};
-  const turnIdentity = codexTurnIdentity(headers);
-  const material = stableStringify({
-    client: {
-      threadId: headerValue(headers, "x-codex-thread-id") || headerValue(headers, "thread-id") || "",
-      windowId: headerValue(headers, "x-codex-window-id") || "",
-      parentThreadId: headerValue(headers, "x-codex-parent-thread-id") || "",
-      installationId: headerValue(headers, "x-codex-installation-id") || "",
-      userAgent: headerValue(headers, "user-agent") || "",
-      turnIdentity,
-    },
-    compactKind: context.compactKind || "",
-    latestUser,
-  });
-  return createHash("sha256").update(material).digest("hex");
-}
-
-function duplicateOpaqueClientTurnRequestKey(requestBody = {}, route = {}, context = {}) {
-  if (
-    !["chat_completions", "responses"].includes(route.api) ||
-    !isCodexClientRequest(context)
-  ) {
-    return "";
-  }
-  if (!requestHasFreshInput(requestBody) || requestHasToolProtocolInput(requestBody)) {
-    return "";
-  }
-  const input = requestBody.messages ?? requestBody.input;
-  const profile = opaqueUserInputProfile(input);
-  if (!profile.hasOpaqueUserInput || profile.visibleUserInputCount > 0) {
-    return "";
-  }
-  const headers = context.clientHeaders || {};
-  const turnIdentity = codexTurnIdentity(headers);
-  const material = stableStringify({
-    client: {
-      threadId: headerValue(headers, "x-codex-thread-id") || headerValue(headers, "thread-id") || "",
-      windowId: headerValue(headers, "x-codex-window-id") || "",
-      parentThreadId: headerValue(headers, "x-codex-parent-thread-id") || "",
-      installationId: headerValue(headers, "x-codex-installation-id") || "",
-      userAgent: headerValue(headers, "user-agent") || "",
-    },
-    compactKind: context.compactKind || "",
-    inputShape: turnIdentity
-      ? { turnIdentity }
-      : {
-          userInputCount: profile.userInputCount,
-          opaqueUserInputCount: profile.opaqueUserInputCount,
-          hasPreviousResponseId: Boolean(requestBody.previous_response_id),
-        },
-  });
-  return createHash("sha256").update(material).digest("hex");
-}
-
-function codexTurnIdentity(headers = {}) {
-  const state = headerValue(headers, "x-codex-turn-state") || "";
-  const metadata = headerValue(headers, "x-codex-turn-metadata") || "";
-  if (!state && !metadata) {
-    return "";
-  }
-  const metadataHash = metadata
-    ? createHash("sha256").update(metadata).digest("hex")
-    : "";
-  return stableStringify({ state, metadataHash });
 }
 
 function requestHasToolProtocolInput(requestBody = {}) {
@@ -947,38 +1143,10 @@ function inputItemContainsToolProtocol(item) {
   return false;
 }
 
-function latestUserInputSignature(input) {
-  const items = responseInputItems(input);
-  for (let index = items.length - 1; index >= 0; index -= 1) {
-    const text = userInputText(items[index]);
-    const normalized = normalizeUserInputSignature(text);
-    if (normalized) {
-      return normalized;
-    }
-  }
-  return "";
-}
-
 function userInputSignatures(input) {
   return responseInputItems(input)
     .map((item) => normalizeUserInputSignature(userInputText(item)))
     .filter(Boolean);
-}
-
-function latestSemanticUserInputSignature(input) {
-  const items = responseInputItems(input);
-  for (let index = items.length - 1; index >= 0; index -= 1) {
-    const item = items[index];
-    if (inputItemContainsToolProtocol(item)) {
-      return "";
-    }
-    const text = userInputText(item);
-    const normalized = normalizeUserInputSignature(text);
-    if (normalized) {
-      return normalized;
-    }
-  }
-  return "";
 }
 
 function userInputText(item) {
@@ -1049,24 +1217,6 @@ function opaqueUserInputProfile(input) {
   return profile;
 }
 
-function isCodexClientRequest(context = {}) {
-  const userAgent = headerValue(context.clientHeaders || {}, "user-agent");
-  return /codex/i.test(userAgent);
-}
-
-function trimDuplicateInitialRequestCache() {
-  const now = Date.now();
-  for (const [key, value] of recentInitialRequests) {
-    if (value.expiresAt <= now) {
-      recentInitialRequests.delete(key);
-    }
-  }
-  while (recentInitialRequests.size >= DUPLICATE_INITIAL_REQUEST_MAX_ENTRIES) {
-    const oldestKey = recentInitialRequests.keys().next().value;
-    recentInitialRequests.delete(oldestKey);
-  }
-}
-
 export async function proxyResponsesApi(
   requestBody,
   route,
@@ -1085,6 +1235,9 @@ export async function proxyResponsesApi(
     requestBody,
     route,
     history,
+    {
+      contextSwitchCompaction: context.contextSwitchCompaction,
+    },
   );
   logToolDiagnostics(
     context,
@@ -1092,7 +1245,7 @@ export async function proxyResponsesApi(
     toolDiagnosticsFromContext(toolContext, requestBody.tool_choice || ""),
     "responses-native",
   );
-  if (shouldInlineLocalHistoryForResponses(requestBody, history)) {
+  if (context.contextSwitchCompaction || shouldInlineLocalHistoryForResponses(requestBody, history)) {
     inlineLocalHistoryForResponsesPayload(payload, sourceMessages);
   }
   normalizeCodexOpenAiBridgeCompactionPayload(payload, route, context);
@@ -1106,7 +1259,6 @@ export async function proxyResponsesApi(
   const upstreamPath = context.compactKind === "v1" ? "/responses/compact" : "/responses";
   const upstreamUrl = joinOpenAiEndpointUrl(responsesBaseUrlForRoute(route), upstreamPath);
   let activeUpstreamUrl = upstreamUrl;
-  throwIfRecentUpstreamFailure(route, upstreamUrl, upstreamPayload, context);
   logRoute(context, route, upstreamUrl);
   let upstream;
   try {
@@ -1117,7 +1269,9 @@ export async function proxyResponsesApi(
       }),
       body: JSON.stringify(upstreamPayload),
     };
-    upstream = await fetchUpstream(activeUpstreamUrl, upstreamInit, context, route);
+    upstream = await fetchUpstream(activeUpstreamUrl, upstreamInit, context, route, {
+      streamingResponse: Boolean(upstreamPayload.stream),
+    });
     logStatus(context, route, upstream.status);
     const fallbackUrl = responsesV1FallbackUrl(route, activeUpstreamUrl, upstreamPath);
     if (fallbackUrl && upstreamResponseLooksHtml(upstream)) {
@@ -1126,15 +1280,15 @@ export async function proxyResponsesApi(
           `!! upstream route=${route.id} returned HTML at root responses endpoint; ` +
           `retrying ${safeUrl(fallbackUrl)}`,
       );
+      await cancelUpstreamResponse(upstream);
       activeUpstreamUrl = fallbackUrl;
       logRoute(context, route, activeUpstreamUrl);
       upstream = await fetchUpstream(activeUpstreamUrl, upstreamInit, context, route, {
-        cacheFailures: false,
+        streamingResponse: Boolean(upstreamPayload.stream),
       });
       logStatus(context, route, upstream.status);
     }
   } catch (error) {
-    rememberUpstreamFailure(route, activeUpstreamUrl, upstreamPayload, error);
     throw error;
   }
 
@@ -1156,7 +1310,6 @@ export async function proxyResponsesApi(
         requestBody,
         route,
       });
-      finishDuplicateInitialRequestGuard(context, route, completedResponse);
       logUsage(context, route, extractUsageObject(completedResponse) || extractResponsesUsage(bodyText));
       res.writeHead(200, {
         ...filteredHeaders(upstream.headers),
@@ -1180,13 +1333,13 @@ export async function proxyResponsesApi(
         requestBody,
         route,
       });
-      finishDuplicateInitialRequestGuard(context, route, completedResponse);
       logUsage(context, route, extractUsageObject(completedResponse) || extractResponsesUsage(bodyText));
       jsonResponse(res, 200, completedResponse);
       return;
     }
-    const error = new UpstreamHttpError(upstream.status, bodyText, activeUpstreamUrl, route);
-    rememberUpstreamFailure(route, activeUpstreamUrl, upstreamPayload, error);
+    const error = new UpstreamHttpError(upstream.status, bodyText, activeUpstreamUrl, route, {
+      headers: upstream.headers,
+    });
     throw error;
   }
 
@@ -1200,10 +1353,10 @@ export async function proxyResponsesApi(
       logUsage(context, route, extractResponsesUsage(responseText));
       throw new UpstreamStreamError(message, activeUpstreamUrl, route, "upstream_stream_truncated");
     }
-    if (!completedResponse) {
+    if (!isCompletedResponsesObject(completedResponse)) {
       throw new UpstreamHttpError(
         502,
-        `Upstream returned a forced stream without a response object: ${responseText.slice(0, 500)}`,
+        `Upstream returned a forced stream without a completed response: ${responseText.slice(0, 500)}`,
         activeUpstreamUrl,
         route,
       );
@@ -1212,40 +1365,110 @@ export async function proxyResponsesApi(
       requestBody,
       route,
     });
-    finishDuplicateInitialRequestGuard(context, route, completedResponse);
     logUsage(context, route, extractUsageObject(completedResponse) || extractResponsesUsage(responseText));
     jsonResponse(res, upstream.status, completedResponse);
     return;
   }
 
-  res.writeHead(upstream.status, filteredHeaders(upstream.headers));
-  if (!upstream.body) {
-    logUsage(context, route, null);
-    res.end();
+  if (!upstreamPayload.stream || !responseUsesEventStream(upstream)) {
+    const responseText = upstream.body ? await upstream.text() : "";
+    const completedResponse = extractResponsesObject(responseText);
+    if (!isCompletedResponsesObject(completedResponse)) {
+      throw new UpstreamHttpError(
+        502,
+        `Upstream returned HTTP ${upstream.status} without a completed response: ` +
+          responseText.slice(0, 500),
+        activeUpstreamUrl,
+        route,
+      );
+    }
+    recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
+      requestBody,
+      route,
+    });
+    logUsage(
+      context,
+      route,
+      extractUsageObject(completedResponse) || extractResponsesUsage(responseText),
+    );
+    res.writeHead(upstream.status, filteredHeaders(upstream.headers));
+    res.end(responseText);
     return;
   }
-  const decoder = new TextDecoder();
-  let responseTail = "";
+
+  res.writeHead(upstream.status, filteredHeaders(upstream.headers));
+  if (!upstream.body) {
+    const message =
+      `CodexBridge upstream stream from ${route.displayName || route.id || route.model || "route"} ` +
+      "ended without a response body.";
+    res.end(buildResponsesStreamErrorSse(message, {
+      model: requestBody.model || route.id || route.model || null,
+    }));
+    throw new UpstreamStreamError(message, activeUpstreamUrl, route, "upstream_stream_truncated");
+  }
+  const pendingEvent = createSseBlockAccumulator();
+  let diagnosticTail = "";
+  const terminalBuffer = createTextBuffer();
+  let terminalStarted = false;
   let streamError = null;
   try {
     for await (const chunk of upstream.body) {
-      const buffer = Buffer.from(chunk);
-      responseTail += decoder.decode(buffer, { stream: true });
-      if (responseTail.length > 2_000_000) {
-        responseTail = responseTail.slice(-2_000_000);
+      const blocks = takeCompleteSseBlocks(pendingEvent, Buffer.from(chunk));
+      for (const block of blocks) {
+        if (terminalStarted || responsesSseStreamComplete(block)) {
+          terminalStarted = true;
+          appendTerminalText(terminalBuffer, block);
+          continue;
+        }
+        diagnosticTail = appendDiagnosticTail(diagnosticTail, block);
+        res.write(block);
       }
-      res.write(buffer);
+    }
+    const pendingText = finishSseBlockAccumulator(pendingEvent);
+    if (pendingText) {
+      if (terminalStarted || responsesSseStreamComplete(pendingText)) {
+        terminalStarted = true;
+        appendTerminalText(terminalBuffer, pendingText);
+      } else {
+        diagnosticTail = appendDiagnosticTail(diagnosticTail, pendingText);
+        res.write(pendingText);
+      }
     }
   } catch (error) {
     streamError = error;
   }
-  responseTail += decoder.decode();
-  const completedResponse = extractResponsesObject(responseTail);
-  const usage = extractUsageObject(completedResponse) || extractResponsesUsage(responseTail);
+  const terminalText = textBufferValue(terminalBuffer);
+  const completedResponse = extractResponsesObject(`${diagnosticTail}${terminalText}`);
+  const usage = extractUsageObject(completedResponse) ||
+    extractResponsesUsage(`${diagnosticTail}${terminalText}`);
   if (streamError) {
     if (isClientClosedStreamWrite(context, res, streamError)) {
       logUsage(context, route, usage);
       throw new ClientClosedRequestError();
+    }
+    if (streamError instanceof UpstreamTimeoutError) {
+      if (!res.destroyed && !res.writableEnded) {
+        res.write(buildResponsesStreamErrorSse("上游流式响应超时，请稍后重试。", {
+          code: "upstream_timeout",
+          model: requestBody.model || route.id || route.model || null,
+        }));
+        res.end();
+      }
+      logUsage(context, route, usage);
+      throw streamError;
+    }
+    if (streamError?.localHistoryError) {
+      const localError = asLocalHistoryStorageError(streamError);
+      const message = "本地模型历史保存失败，请新建会话后重试。";
+      if (!res.destroyed && !res.writableEnded) {
+        res.write(buildResponsesStreamErrorSse(message, {
+          code: "local_history_storage_unavailable",
+          model: requestBody.model || route.id || route.model || null,
+        }));
+        res.end();
+      }
+      logUsage(context, route, usage);
+      throw localError;
     }
     if (!upstreamPayload.stream) {
       throw streamError;
@@ -1264,7 +1487,7 @@ export async function proxyResponsesApi(
     logUsage(context, route, usage);
     throw new UpstreamStreamError(message, activeUpstreamUrl, route, "upstream_stream_error");
   }
-  if (upstreamPayload.stream && !responsesSseStreamComplete(responseTail)) {
+  if (!terminalStarted || !responsesSseStreamComplete(terminalText)) {
     const message =
       `CodexBridge upstream stream from ${route.displayName || route.id || route.model || "route"} ` +
       "ended before response.completed or [DONE].";
@@ -1280,13 +1503,194 @@ export async function proxyResponsesApi(
     throw new UpstreamStreamError(message, activeUpstreamUrl, route, "upstream_stream_truncated");
   }
 
-  res.end();
-  recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
-    requestBody,
-    route,
-  });
-  finishDuplicateInitialRequestGuard(context, route, completedResponse);
+  const terminalKind = responsesTerminalKind(terminalText);
+  if (isPassThroughNonSuccessTerminal(terminalKind, completedResponse)) {
+    res.end(terminalText);
+    logUsage(context, route, usage);
+    return;
+  }
+  if (!isCompletedResponsesObject(completedResponse)) {
+    const message =
+      `CodexBridge upstream stream from ${route.displayName || route.id || route.model || "route"} ` +
+      "ended with an invalid terminal event and no completed response.";
+    if (!res.destroyed && !res.writableEnded) {
+      res.end(buildResponsesStreamErrorSse(message, {
+        code: "upstream_stream_invalid_terminal",
+        model: requestBody.model || route.id || route.model || null,
+      }));
+    }
+    logUsage(context, route, usage);
+    throw new UpstreamStreamError(
+      message,
+      activeUpstreamUrl,
+      route,
+      "upstream_stream_invalid_terminal",
+    );
+  }
+
+  try {
+    recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
+      requestBody,
+      route,
+    });
+  } catch (error) {
+    const localError = asLocalHistoryStorageError(error);
+    const message = "本地模型历史保存失败，请新建会话后重试。";
+    if (!res.destroyed && !res.writableEnded) {
+      res.end(buildResponsesStreamErrorSse(message, {
+        code: "local_history_storage_unavailable",
+        model: requestBody.model || route.id || route.model || null,
+      }));
+    }
+    logUsage(context, route, usage);
+    throw localError;
+  }
   logUsage(context, route, usage);
+  res.end(terminalText);
+}
+
+function responseUsesEventStream(response) {
+  return /text\/event-stream/i.test(String(response?.headers?.get?.("content-type") || ""));
+}
+
+function responsesTerminalKind(text = "") {
+  for (const event of parseSseEvents(text)) {
+    const data = event.data.trim();
+    if (data === "[DONE]") {
+      return "done";
+    }
+    const type = event.event || tryParseJson(data)?.type || "";
+    if ([
+      "response.completed",
+      "response.failed",
+      "response.incomplete",
+      "response.cancelled",
+    ].includes(type)) {
+      return type;
+    }
+  }
+  return "";
+}
+
+function isPassThroughNonSuccessTerminal(kind, response) {
+  const expectedStatus = {
+    "response.failed": "failed",
+    "response.incomplete": "incomplete",
+    "response.cancelled": "cancelled",
+  }[kind];
+  return Boolean(
+    expectedStatus &&
+      isResponsesObject(response) &&
+      String(response.status || "").toLowerCase() === expectedStatus,
+  );
+}
+
+function createSseBlockAccumulator() {
+  return {
+    parts: [],
+    byteLength: 0,
+    separatorTail: [],
+  };
+}
+
+function takeCompleteSseBlocks(state, chunk) {
+  const blocks = [];
+  let segmentStart = 0;
+  for (let index = 0; index < chunk.length; index += 1) {
+    state.separatorTail.push(chunk[index]);
+    if (state.separatorTail.length > 4) {
+      state.separatorTail.shift();
+    }
+    assertSseEventBufferSize(state.byteLength + index - segmentStart + 1);
+    if (!sseSeparatorEndsTail(state.separatorTail)) {
+      continue;
+    }
+    addSseAccumulatorPart(state, chunk.subarray(segmentStart, index + 1));
+    blocks.push(Buffer.concat(state.parts, state.byteLength).toString("utf8"));
+    state.parts = [];
+    state.byteLength = 0;
+    state.separatorTail = [];
+    segmentStart = index + 1;
+  }
+  addSseAccumulatorPart(state, chunk.subarray(segmentStart));
+  return blocks;
+}
+
+function finishSseBlockAccumulator(state) {
+  if (state.byteLength === 0) {
+    return "";
+  }
+  const value = Buffer.concat(state.parts, state.byteLength).toString("utf8");
+  state.parts = [];
+  state.byteLength = 0;
+  state.separatorTail = [];
+  return value;
+}
+
+function addSseAccumulatorPart(state, part) {
+  if (!part?.length) {
+    return;
+  }
+  assertSseEventBufferSize(state.byteLength + part.length);
+  state.parts.push(part);
+  state.byteLength += part.length;
+}
+
+function assertSseEventBufferSize(byteLength) {
+  if (byteLength > MAX_RESPONSES_SSE_EVENT_BUFFER_BYTES) {
+    throw localHistoryBufferError(
+      `Responses SSE event exceeds ${MAX_RESPONSES_SSE_EVENT_BUFFER_BYTES} bytes.`,
+    );
+  }
+}
+
+function sseSeparatorEndsTail(tail) {
+  const length = tail.length;
+  if (
+    length >= 4 &&
+    tail[length - 4] === 13 &&
+    tail[length - 3] === 10 &&
+    tail[length - 2] === 13 &&
+    tail[length - 1] === 10
+  ) {
+    return true;
+  }
+  return length >= 2 && (
+    (tail[length - 2] === 10 && tail[length - 1] === 10) ||
+    (tail[length - 2] === 13 && tail[length - 1] === 13)
+  );
+}
+
+function createTextBuffer() {
+  return { parts: [], byteLength: 0 };
+}
+
+function appendTerminalText(state, value) {
+  const byteLength = Buffer.byteLength(value, "utf8");
+  if (state.byteLength + byteLength > MAX_RESPONSES_TERMINAL_BUFFER_BYTES) {
+    throw localHistoryBufferError(
+      `Responses terminal event exceeds ${MAX_RESPONSES_TERMINAL_BUFFER_BYTES} bytes.`,
+    );
+  }
+  state.parts.push(value);
+  state.byteLength += byteLength;
+}
+
+function textBufferValue(state) {
+  return state.parts.join("");
+}
+
+function localHistoryBufferError(message) {
+  const error = new Error(message);
+  error.statusCode = 503;
+  error.code = "local_history_storage_unavailable";
+  error.localHistoryError = true;
+  return error;
+}
+
+function appendDiagnosticTail(current, value) {
+  const next = `${current}${value}`;
+  return next.length > 2_000_000 ? next.slice(-2_000_000) : next;
 }
 
 function shouldAggregateForcedResponsesStream(requestBody = {}, upstreamPayload = {}, route = {}) {
@@ -1318,6 +1722,7 @@ function isClientClosedStreamWrite(context = {}, res = {}, error) {
   const message = String(error?.message || error || "");
   return (
     Boolean(res.destroyed) ||
+    code === "client_closed_request" ||
     code === "ERR_STREAM_DESTROYED" ||
     /write after end|stream.*destroyed|client connection closed/i.test(message)
   );
@@ -1344,6 +1749,121 @@ function isLikelyLocalChatResponseId(responseId) {
   return /^resp_chatcmpl[_-]/.test(String(responseId || ""));
 }
 
+export async function proxyDirectChatCompletions(
+  requestBody,
+  route,
+  res,
+  context = {},
+) {
+  const payload = cloneJson(requestBody);
+  payload.model = route.model;
+
+  if (payload.stream) {
+    return proxyDirectChatCompletionsStream(payload, route, res, context);
+  }
+
+  const upstreamUrl = joinOpenAiEndpointUrl(route.baseUrl, "/chat/completions");
+  logRoute(context, route, upstreamUrl);
+  const upstream = await callChatCompletionsUpstream(
+    upstreamUrl,
+    route,
+    payload,
+    context,
+  );
+  logUsage(context, route, upstream.usage);
+  jsonResponse(res, 200, upstream);
+}
+
+async function proxyDirectChatCompletionsStream(
+  payload,
+  route,
+  res,
+  context = {},
+) {
+  const upstreamPayload = filterPayloadForUpstream(
+    payload,
+    route,
+    context,
+    { api: "chat_completions" },
+  );
+  const upstreamUrl = joinOpenAiEndpointUrl(route.baseUrl, "/chat/completions");
+  let activeUpstreamUrl = upstreamUrl;
+  logRoute(context, route, upstreamUrl);
+
+  let upstream;
+  try {
+    const upstreamInit = {
+      method: "POST",
+      headers: upstreamHeaders(route, context, {
+        acceptEventStream: true,
+      }),
+      body: JSON.stringify(upstreamPayload),
+    };
+    upstream = await fetchUpstream(activeUpstreamUrl, upstreamInit, context, route, {
+      streamingResponse: Boolean(payload.stream),
+    });
+    logStatus(context, route, upstream.status);
+
+    const fallbackUrl = chatCompletionsRootFallbackUrl(route, activeUpstreamUrl);
+    if (fallbackUrl && upstreamResponseLooksHtml(upstream)) {
+      console.warn(
+        `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+          `!! upstream route=${route.id} returned HTML at root chat endpoint; ` +
+          `retrying ${safeUrl(fallbackUrl)}`,
+      );
+      await cancelUpstreamResponse(upstream);
+      activeUpstreamUrl = fallbackUrl;
+      logRoute(context, route, activeUpstreamUrl);
+      upstream = await fetchUpstream(activeUpstreamUrl, upstreamInit, context, route, {
+        streamingResponse: Boolean(payload.stream),
+      });
+      logStatus(context, route, upstream.status);
+    }
+  } catch (error) {
+    throw error;
+  }
+
+  if (!upstream.ok) {
+    const bodyText = await upstream.text();
+    const error = new UpstreamHttpError(upstream.status, bodyText, activeUpstreamUrl, route, {
+      headers: upstream.headers,
+    });
+    throw error;
+  }
+
+  res.writeHead(upstream.status, {
+    ...filteredHeaders(upstream.headers),
+    "content-type":
+      upstream.headers.get("content-type") || "text/event-stream; charset=utf-8",
+  });
+  if (!upstream.body) {
+    logUsage(context, route, null);
+    res.end();
+    return;
+  }
+
+  try {
+    for await (const chunk of upstream.body) {
+      res.write(Buffer.from(chunk));
+    }
+    logUsage(context, route, null);
+    res.end();
+  } catch (error) {
+    if (
+      error instanceof ClientClosedRequestError ||
+      error instanceof UpstreamTimeoutError
+    ) {
+      throw error;
+    }
+    throw new UpstreamStreamError(
+      `CodexBridge upstream chat stream from ${route.displayName || route.id || route.model || "route"} disconnected before completion.`,
+      activeUpstreamUrl,
+      route,
+      "upstream_stream_truncated",
+    );
+  }
+}
+
 function inlineLocalHistoryForResponsesPayload(payload, sourceMessages) {
   const systemInstructions = sourceMessages
     .filter((message) => message?.role === "system")
@@ -1365,6 +1885,52 @@ function inlineLocalHistoryForResponsesPayload(payload, sourceMessages) {
   );
   delete payload.messages;
   delete payload.previous_response_id;
+}
+
+function budgetResponsesCompactPayload(payload, route, history) {
+  const { messages: sourceMessages, toolContext } = responseRequestToChatSourceMessages(
+    payload,
+    route,
+    history,
+  );
+  const contextPolicy = contextSwitchPolicyForRoute(route);
+  const beforeTokens = estimatedMessagesTokens(sourceMessages);
+  const budgetedMessages = trimMessagesToRouteContext(sourceMessages, route, {
+    contextPolicy,
+  });
+  const afterTokens = estimatedMessagesTokens(budgetedMessages);
+  const preservedToolCount = preservedToolBoundaryCount(budgetedMessages);
+  inlineLocalHistoryForResponsesPayload(payload, budgetedMessages);
+  const contextMetrics = {
+    policyId: contextPolicy.policyId,
+    policyVersion: contextPolicy.version,
+    inputBudget: contextPolicy.inputBudget,
+    compactThreshold: contextPolicy.compactThreshold,
+    estimatedTokens: beforeTokens,
+    beforeTokens,
+    afterTokens,
+    preservedToolCount,
+  };
+  return {
+    sourceMessages,
+    budgetedMessages,
+    toolContext,
+    contextMetrics,
+    contextDecision: beforeTokens > contextPolicy.inputBudget
+      ? {
+          event: "context_truncation",
+          kind: "compact_payload",
+          policyId: contextPolicy.policyId,
+          policyVersion: contextPolicy.version,
+          inputBudget: contextPolicy.inputBudget,
+          beforeTokens,
+          afterTokens,
+          preservedToolCount,
+          outcome: "truncated",
+          reasonCode: "compact_input_budget_exceeded",
+        }
+      : null,
+  };
 }
 
 function normalizeCodexOpenAiBridgeCompactionPayload(payload, route = {}, context = {}) {
@@ -1421,23 +1987,55 @@ function isBridgePlainCompactionItem(item) {
 }
 
 function chatMessagesToResponsesInput(messages) {
-  return messages.map(chatMessageToResponsesInput).filter(Boolean);
+  return messages.flatMap(chatMessageToResponsesInputItems).filter(Boolean);
 }
 
-function chatMessageToResponsesInput(message) {
+function chatMessageToResponsesInputItems(message) {
   if (!message || typeof message !== "object") {
-    return null;
+    return [];
+  }
+  if (message.role === "tool" && message.tool_call_id) {
+    return [{
+      type: "function_call_output",
+      call_id: message.tool_call_id,
+      output: contentToText(message.content),
+    }];
+  }
+  if (
+    message.role === "assistant" &&
+    Array.isArray(message.tool_calls) &&
+    message.tool_calls.length > 0
+  ) {
+    const items = [];
+    const assistantContent = chatContentToResponsesContent(message.content, "assistant");
+    if (assistantContent) {
+      items.push({ role: "assistant", content: assistantContent });
+    }
+    for (const toolCall of message.tool_calls) {
+      const callId = toolCall?.id || toolCall?.call_id || "";
+      const name = toolCall?.function?.name || toolCall?.name || "";
+      if (!callId || !name) {
+        continue;
+      }
+      const args = toolCall?.function?.arguments ?? toolCall?.arguments ?? "";
+      items.push({
+        type: "function_call",
+        call_id: callId,
+        name,
+        arguments: typeof args === "string" ? args : JSON.stringify(args || {}),
+      });
+    }
+    return items;
   }
   const role = responsesInputRole(message.role);
   const content = chatContentToResponsesContent(
     message.content,
     role,
-    toolCallsToHandoffText(message.tool_calls),
   );
   if (!content) {
-    return null;
+    return [];
   }
-  return { role, content };
+  return [{ role, content }];
 }
 
 function responsesInputRole(role) {
@@ -1518,18 +2116,6 @@ function textPartForRole(role, text) {
   };
 }
 
-function toolCallsToHandoffText(toolCalls) {
-  if (!Array.isArray(toolCalls) || toolCalls.length === 0) {
-    return "";
-  }
-  const names = toolCalls
-    .map((toolCall) => toolCall?.function?.name || toolCall?.name || toolCall?.id)
-    .filter(Boolean);
-  return `[assistant tool calls omitted during provider handoff${
-    names.length ? `: ${names.join(", ")}` : ""
-  }]`;
-}
-
 export async function proxyChatCompletions(
   requestBody,
   route,
@@ -1537,7 +2123,11 @@ export async function proxyChatCompletions(
   res,
   context = {},
 ) {
-  const converted = responsesToChatRequest(requestBody, route, history);
+  const converted = responsesToChatRequest(requestBody, route, history, {
+    capabilityProviders: context.capabilityProviders,
+    contextSwitchCompaction: context.contextSwitchCompaction,
+  });
+  logContextTruncationDecision(context, route, converted.contextDecision);
   logToolDiagnostics(context, route, converted.toolDiagnostics, "chat-compat");
   const toolContinuationTurns = chatToolContinuationTurns(requestBody, history);
   const upstreamUrl = joinOpenAiEndpointUrl(route.baseUrl, "/chat/completions");
@@ -1553,16 +2143,7 @@ export async function proxyChatCompletions(
     );
   } catch (error) {
     if (isRateLimitError(error)) {
-      return sendLocalRateLimitedResponse({
-        requestBody,
-        route,
-        history,
-        res,
-        context,
-        converted,
-        messagesForHistory,
-        error,
-      });
+      throw error;
     }
     if (!shouldRetryChatWithoutImages(error, converted.body)) {
       throw error;
@@ -1598,8 +2179,41 @@ export async function proxyChatCompletions(
       });
     }
   }
-  const adjustedUpstream = enforceInteractivePluginBootstrap(
+  let adjustedUpstream = enforceInteractivePluginBootstrap(
     upstream,
+    requestBody,
+    converted,
+    context,
+  );
+  const bridgeContinuation = await continueChatWithBridgeCapability({
+    upstreamUrl,
+    adjustedUpstream,
+    converted,
+    route,
+    context,
+  });
+  if (bridgeContinuation) {
+    logReturnedToolDiagnostics(
+      context,
+      route,
+      returnedToolDiagnosticsFromChat(adjustedUpstream, converted.toolContext),
+      "chat-compat",
+    );
+    logUsage(context, route, adjustedUpstream.usage);
+    messagesForHistory = [
+      ...messagesForHistory,
+      bridgeContinuation.assistantMessage,
+      ...bridgeContinuation.toolMessages,
+    ];
+    adjustedUpstream = enforceInteractivePluginBootstrap(
+      bridgeContinuation.upstream,
+      requestBody,
+      converted,
+      context,
+    );
+  }
+  adjustedUpstream = blockCommandFallbackForControlledCapability(
+    adjustedUpstream,
     requestBody,
     converted,
     context,
@@ -1664,31 +2278,35 @@ export async function proxyChatCompletions(
     );
     localFallback = "tool_loop_guard";
   }
+  response = annotateSmartFailoverResponse(response, route, context);
 
-  history.record(response.id, [
-    ...messagesForHistory,
-    assistantHistoryMessageFromChat(chatForHistory, converted.toolContext),
-  ]);
-  history.recordResponse(response, {
-    api: "chat_completions",
-    routeId: route.id || "",
-    upstreamModel: route.model || "",
-    upstreamKnown: false,
-    ...responseRequestUserMeta(requestBody),
-    toolContinuationTurns: responseHasRunnableToolCall(response)
-      ? toolContinuationTurns
-      : 0,
-    noProgressToolLoopTurns: responseHasRunnableToolCall(response)
-      ? noProgressToolLoopTurns
-      : 0,
-    toolCallSignatures: responseHasRunnableToolCall(response)
-      ? toolCallSignatures
-      : [],
-    toolResultSignatures,
-    ...(localFallback ? { localFallback } : {}),
-  });
-  finishDuplicateInitialRequestGuard(context, route, response);
-
+  recordHistoryTurn(
+    history,
+    response,
+    [
+      ...messagesForHistory,
+      assistantHistoryMessageFromChat(chatForHistory, converted.toolContext),
+    ],
+    {
+      api: "chat_completions",
+      routeId: route.id || "",
+      upstreamModel: route.model || "",
+      upstreamKnown: false,
+      ...responseRequestUserMeta(requestBody),
+      toolContinuationTurns: responseHasRunnableToolCall(response)
+        ? toolContinuationTurns
+        : 0,
+      noProgressToolLoopTurns: responseHasRunnableToolCall(response)
+        ? noProgressToolLoopTurns
+        : 0,
+      toolCallSignatures: responseHasRunnableToolCall(response)
+        ? toolCallSignatures
+        : [],
+      toolResultSignatures,
+      ...(localFallback ? { localFallback } : {}),
+    },
+    { requestBody, route },
+  );
   if (converted.wantsStream) {
     const payload = responseToSse(response);
     res.writeHead(200, {
@@ -1703,8 +2321,582 @@ export async function proxyChatCompletions(
   jsonResponse(res, 200, response);
 }
 
+function annotateSmartFailoverResponse(response = {}, route = {}, context = {}) {
+  const fromRoute = safeText(context.failoverFromRoute || "", 120);
+  const reason = safeText(context.smartFailoverReason || "", 120);
+  if (!fromRoute || !reason || !response || typeof response !== "object") {
+    return response;
+  }
+  const metadata = {
+    fromRoute,
+    fromModel: safeText(context.failoverFromModel || "", 160),
+    toRoute: safeText(route.id || "", 120),
+    toModel: safeText(route.model || "", 160),
+    reason,
+  };
+  response.codexbridge_smart_failover = metadata;
+  const note = smartFailoverNotice(metadata, {
+    fromDisplayName: context.failoverFromDisplayName,
+    toDisplayName: route.displayName || route.id || route.model,
+  });
+  if (note) {
+    prependResponseOutputText(response, note);
+  }
+  return response;
+}
+
+function smartFailoverNotice(metadata = {}, labels = {}) {
+  const fromLabel = labels.fromDisplayName || metadata.fromModel || metadata.fromRoute || "原模型";
+  const toLabel = labels.toDisplayName || metadata.toModel || metadata.toRoute || "备用模型";
+  const reason = smartFailoverReasonLabel(metadata.reason);
+  return `已自动切换模型：${fromLabel} -> ${toLabel}。原因：${reason}。`;
+}
+
+function smartFailoverReasonLabel(reason = "") {
+  const labels = {
+    rate_limited: "原供应商限流",
+    quota_or_balance: "原供应商余额或额度不足",
+    upstream_unavailable: "原供应商暂时不可用",
+  };
+  return labels[reason] || reason || "原供应商请求失败";
+}
+
+function prependResponseOutputText(response = {}, note = "") {
+  const cleanNote = String(note || "").trim();
+  if (!cleanNote) {
+    return;
+  }
+  const oldText = String(response.output_text || "").trim();
+  response.output_text = oldText ? `${cleanNote}\n\n${oldText}` : cleanNote;
+  const output = Array.isArray(response.output) ? response.output : [];
+  for (const item of output) {
+    if (!item || item.type !== "message" || !Array.isArray(item.content)) {
+      continue;
+    }
+    const textPart = item.content.find((part) => part?.type === "output_text" && typeof part.text === "string");
+    if (textPart) {
+      const text = textPart.text.trim();
+      textPart.text = text ? `${cleanNote}\n\n${text}` : cleanNote;
+      return;
+    }
+  }
+  if (!output.length) {
+    response.output = [
+      {
+        id: `msg_${response.id || Date.now().toString(36)}`,
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        content: [
+          {
+            type: "output_text",
+            text: response.output_text,
+            annotations: [],
+          },
+        ],
+      },
+    ];
+  }
+}
+
+async function continueChatWithBridgeCapability({
+  upstreamUrl,
+  adjustedUpstream,
+  converted,
+  route,
+  context = {},
+}) {
+  const toolCalls = chatMessageToolCalls(adjustedUpstream);
+  if (toolCalls.length === 0 || typeof context.executeCapabilityRequest !== "function") {
+    return null;
+  }
+  const bridgeCalls = toolCalls.filter(isBridgeCapabilityToolCall);
+  if (bridgeCalls.length === 0 || bridgeCalls.length !== toolCalls.length) {
+    return null;
+  }
+
+  const assistantMessage = {
+    role: "assistant",
+    content: adjustedUpstream?.choices?.[0]?.message?.content ?? null,
+    tool_calls: bridgeCalls,
+  };
+  const toolMessages = [];
+  for (const toolCall of bridgeCalls) {
+    toolMessages.push(await bridgeCapabilityToolMessage(toolCall, context));
+  }
+  const body = {
+    ...converted.body,
+    messages: [
+      ...converted.body.messages,
+      assistantMessage,
+      ...toolMessages,
+    ],
+    stream: false,
+  };
+  delete body.tools;
+  delete body.tool_choice;
+  delete body.parallel_tool_calls;
+
+  console.log(
+    `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+      `codexbridge_capability_continue route=${route.id} calls=${bridgeCalls.length}`,
+  );
+  logRoute(context, route, upstreamUrl);
+  const upstream = await callChatCompletionsUpstream(
+    upstreamUrl,
+    route,
+    body,
+    context,
+    { trackRateLimit: false },
+  );
+  return { upstream, assistantMessage, toolMessages };
+}
+
+function chatMessageToolCalls(chat = {}) {
+  const toolCalls = chat?.choices?.[0]?.message?.tool_calls;
+  return Array.isArray(toolCalls) ? toolCalls : [];
+}
+
+function isBridgeCapabilityToolCall(toolCall = {}) {
+  const name = toolCall?.function?.name || toolCall?.name || "";
+  return name === CODEXBRIDGE_CAPABILITY_TOOL_NAME;
+}
+
+async function bridgeCapabilityToolMessage(toolCall = {}, context = {}) {
+  const parsed = parseBridgeCapabilityToolCall(toolCall);
+  if (!parsed.ok) {
+    return bridgeCapabilityErrorToolMessage(toolCall, parsed.error);
+  }
+  try {
+    const result = await context.executeCapabilityRequest(parsed.request);
+    return {
+      role: "tool",
+      tool_call_id: bridgeToolCallId(toolCall),
+      content: bridgeCapabilityToolContent(result),
+    };
+  } catch (error) {
+    return bridgeCapabilityErrorToolMessage(toolCall, error);
+  }
+}
+
+function parseBridgeCapabilityToolCall(toolCall = {}) {
+  const rawArgs = toolCall?.function?.arguments ?? toolCall?.arguments ?? {};
+  const args = typeof rawArgs === "string" ? tryParseJson(rawArgs) : rawArgs;
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    return {
+      ok: false,
+      error: new Error("codexbridge_capability arguments must be a JSON object."),
+    };
+  }
+  const capability = String(args.capability || "").trim().toLowerCase();
+  const action = String(args.action || args.input?.action || "").trim().toLowerCase();
+  const input = args.input && typeof args.input === "object" && !Array.isArray(args.input)
+    ? { ...args.input }
+    : {};
+  if (capability === "browser" && action === "read_url") {
+    const url = normalizeBridgeHttpUrl(input.url || args.url || "");
+    if (!url) {
+      return {
+        ok: false,
+        error: new Error("browser/read_url only accepts http/https URLs or safe bare domains."),
+      };
+    }
+    input.url = url;
+    input.action = "read_url";
+    return {
+      ok: true,
+      request: {
+        capability: "browser",
+        providerId: String(args.providerId || args.provider_id || "").trim(),
+        input,
+      },
+    };
+  }
+  if (capability === "browser" && action === "open_url") {
+    const url = normalizeBridgeHttpUrl(input.url || args.url || "");
+    if (!url) {
+      return {
+        ok: false,
+        error: new Error("browser/open_url only accepts http/https URLs or safe bare domains."),
+      };
+    }
+    input.url = url;
+    input.action = "open_url";
+    return {
+      ok: true,
+      request: {
+        capability: "browser",
+        providerId: String(args.providerId || args.provider_id || "").trim(),
+        input,
+      },
+    };
+  }
+  if (capability === "computer_use" && action === "list_apps") {
+    input.action = "list_apps";
+    return {
+      ok: true,
+      request: {
+        capability: "computer_use",
+        providerId: String(args.providerId || args.provider_id || "").trim(),
+        input,
+      },
+    };
+  }
+  if (capability === "computer_use" && action === "open_app") {
+    const app = String(
+      input.app ||
+        input.application ||
+        input.appId ||
+        input.app_id ||
+        input.name ||
+        input.target ||
+        args.app ||
+        args.application ||
+        args.appId ||
+        args.app_id ||
+        args.name ||
+        args.target ||
+        "",
+    ).trim();
+    if (!app) {
+      return {
+        ok: false,
+        error: new Error("computer_use/open_app requires an allowlisted app name."),
+      };
+    }
+    input.app = app;
+    input.action = "open_app";
+    return {
+      ok: true,
+      request: {
+        capability: "computer_use",
+        providerId: String(args.providerId || args.provider_id || "").trim(),
+        input,
+      },
+    };
+  }
+  if (capability === "computer_use" && action === "screenshot_desktop") {
+    const displayId = String(input.displayId || input.display_id || args.displayId || args.display_id || "").trim();
+    input.action = "screenshot_desktop";
+    if (displayId) {
+      input.displayId = displayId;
+    }
+    return {
+      ok: true,
+      request: {
+        capability: "computer_use",
+        providerId: String(args.providerId || args.provider_id || "").trim(),
+        input,
+      },
+    };
+  }
+  if (capability === "web_search" && action === "search") {
+    const query = String(input.query || args.query || "").trim();
+    if (!query) {
+      return {
+        ok: false,
+        error: new Error("web_search/search requires a non-empty query."),
+      };
+    }
+    input.query = query;
+    input.action = "search";
+    return {
+      ok: true,
+      request: {
+        capability: "web_search",
+        providerId: String(args.providerId || args.provider_id || "").trim(),
+        input,
+      },
+    };
+  }
+  if (capability === "webpage_screenshot" && action === "screenshot_url") {
+    const url = normalizeBridgeHttpUrl(input.url || args.url || "");
+    if (!url) {
+      return {
+        ok: false,
+        error: new Error("webpage_screenshot/screenshot_url only accepts http/https URLs or safe bare domains."),
+      };
+    }
+    input.url = url;
+    input.action = "screenshot_url";
+    return {
+      ok: true,
+      request: {
+        capability: "webpage_screenshot",
+        providerId: String(args.providerId || args.provider_id || "").trim(),
+        input,
+      },
+    };
+  }
+  if (capability === "ocr" && action === "extract_text") {
+    const imageUrl = normalizeBridgeHttpUrl(
+      input.imageUrl ||
+        input.image_url ||
+        input.url ||
+        args.imageUrl ||
+        args.image_url ||
+        args.url ||
+        "",
+    );
+    if (!imageUrl) {
+      return {
+        ok: false,
+        error: new Error("ocr/extract_text only accepts http/https image URLs or safe bare domains."),
+      };
+    }
+    input.imageUrl = imageUrl;
+    input.action = "extract_text";
+    return {
+      ok: true,
+      request: {
+        capability: "ocr",
+        providerId: String(args.providerId || args.provider_id || "").trim(),
+        input,
+      },
+    };
+  }
+  if (capability === "file_processing" && (action === "extract_text" || action === "inspect_file")) {
+    const rawFileUrl =
+      input.fileUrl ||
+      input.file_url ||
+      input.url ||
+      args.fileUrl ||
+      args.file_url ||
+      args.url ||
+      "";
+    const fileUrl = normalizeBridgeHttpUrl(
+      rawFileUrl,
+    );
+    const localPath = String(
+      input.path ||
+        input.filePath ||
+        input.file_path ||
+        input.localPath ||
+        input.local_path ||
+        args.path ||
+        args.filePath ||
+        args.file_path ||
+        args.localPath ||
+        args.local_path ||
+        "",
+    ).trim();
+    if (localPath && !fileUrl) {
+      input.path = localPath;
+      input.action = action;
+      return {
+        ok: true,
+        request: {
+          capability: "file_processing",
+          providerId: String(args.providerId || args.provider_id || "").trim(),
+          input,
+        },
+      };
+    }
+    if (String(rawFileUrl || "").trim() && !fileUrl) {
+      return {
+        ok: false,
+        error: new Error(`file_processing/${action} only accepts http/https file URLs or safe bare domains.`),
+      };
+    }
+    if (!fileUrl) {
+      return {
+        ok: false,
+        error: new Error(
+          `file_processing/${action} only accepts http/https file URLs, safe bare domains, or an explicit local file path for a local_file provider.`,
+        ),
+      };
+    }
+    input.fileUrl = fileUrl;
+    input.action = action;
+    return {
+      ok: true,
+      request: {
+        capability: "file_processing",
+        providerId: String(args.providerId || args.provider_id || "").trim(),
+        input,
+      },
+    };
+  }
+  if (capability === "speech" && action === "synthesize") {
+    const text = String(input.text || input.prompt || args.text || args.prompt || "").trim();
+    if (!text) {
+      return {
+        ok: false,
+        error: new Error("speech/synthesize requires non-empty text."),
+      };
+    }
+    input.text = text;
+    input.action = "synthesize";
+    return {
+      ok: true,
+      request: {
+        capability: "speech",
+        providerId: String(args.providerId || args.provider_id || "").trim(),
+        input,
+      },
+    };
+  }
+  if (capability === "video" && action === "generate") {
+    const prompt = String(input.prompt || input.text || args.prompt || args.text || "").trim();
+    if (!prompt) {
+      return {
+        ok: false,
+        error: new Error("video/generate requires a non-empty prompt."),
+      };
+    }
+    input.prompt = prompt;
+    input.action = "generate";
+    return {
+      ok: true,
+      request: {
+        capability: "video",
+        providerId: String(args.providerId || args.provider_id || "").trim(),
+        input,
+      },
+    };
+  }
+  if (capability === "computer_use") {
+    return {
+      ok: false,
+      error: new Error(
+        "本地 Computer Use 的 CodexBridge 中转层目前只支持 computer_use/list_apps 查看白名单、computer_use/open_app 打开白名单应用，" +
+          "以及 computer_use/screenshot_desktop 获取桌面截图；不会执行点击、键盘输入、拖拽、任意命令或脚本。 " +
+          "如果需要完整的原生 Computer Use，请切换到 GPT/OpenAI Responses 路由。",
+      ),
+    };
+  }
+  return {
+    ok: false,
+    error: new Error(
+      "codexbridge_capability only supports browser/read_url, browser/open_url, computer_use/list_apps, computer_use/open_app, computer_use/screenshot_desktop, web_search/search, webpage_screenshot/screenshot_url, ocr/extract_text, file_processing/extract_text, file_processing/inspect_file, speech/synthesize, and video/generate.",
+    ),
+  };
+}
+
+function normalizeBridgeHttpUrl(raw = "") {
+  const value = String(raw || "").trim();
+  if (!value || /[\u0000-\u001f\s]/.test(value) || value.includes("\\") || value.includes("@")) {
+    return "";
+  }
+  const parsedDirect = parseAllowedBridgeHttpUrl(value);
+  if (parsedDirect) {
+    return parsedDirect;
+  }
+  if (!looksLikeBareBridgeHttpUrl(value)) {
+    return "";
+  }
+  return parseAllowedBridgeHttpUrl(`https://${value}`);
+}
+
+function parseAllowedBridgeHttpUrl(value = "") {
+  try {
+    const parsed = new URL(value);
+    return ["http:", "https:"].includes(parsed.protocol) ? parsed.toString() : "";
+  } catch {
+    return "";
+  }
+}
+
+function looksLikeBareBridgeHttpUrl(value = "") {
+  if (/^[a-z][a-z0-9+.-]*:/i.test(value) || value.startsWith("/") || value.startsWith("//")) {
+    return false;
+  }
+  const host = String(value).split(/[/?#]/, 1)[0];
+  if (!host || host.includes("..")) {
+    return false;
+  }
+  const hostname = host.split(":", 1)[0];
+  if (hostname === "localhost" || isBridgeIpv4(hostname)) {
+    return true;
+  }
+  return hostname.includes(".") && hostname
+    .split(".")
+    .every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label));
+}
+
+function isBridgeIpv4(value = "") {
+  const parts = String(value).split(".");
+  return parts.length === 4 && parts.every((part) => {
+    if (!/^\d{1,3}$/.test(part)) {
+      return false;
+    }
+    const numeric = Number(part);
+    return numeric >= 0 && numeric <= 255;
+  });
+}
+
+function bridgeCapabilityToolContent(result = {}) {
+  const response = result?.response && typeof result.response === "object"
+    ? result.response
+    : result;
+  const data = response?.data || result?.upstream || {};
+  const text = response?.output_text || response?.text || data?.text || "";
+  const structuredData = bridgeCapabilityResultData(data);
+  if (response?.localPath || result?.localPath) {
+    structuredData.localPath = response.localPath || result.localPath || "";
+  }
+  if (response?.mimeType || result?.mimeType) {
+    structuredData.mimeType = response.mimeType || result.mimeType || "";
+  }
+  if (response?.sourceUrl || result?.sourceUrl) {
+    structuredData.sourceUrl = response.sourceUrl || result.sourceUrl || "";
+  }
+  return stringifyJson({
+    ok: Boolean(result?.handled && !result?.skipped && !result?.failed),
+    capability: response?.capability || result?.capability || "capability",
+    providerId: response?.providerId || result?.providerId || "",
+    providerName: response?.providerName || result?.providerName || "",
+    output_text: text,
+    data: structuredData,
+  });
+}
+
+function bridgeCapabilityResultData(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return {};
+  }
+  return {
+    action: data.action || "",
+    url: data.url || "",
+    query: data.query || "",
+    fileUrl: data.fileUrl || data.file_url || "",
+    fileName: data.fileName || data.file_name || data.filename || "",
+    imageUrl: data.imageUrl || data.image_url || data.screenshotUrl || data.screenshot_url || "",
+    audioUrl: data.audioUrl || data.audio_url || data.speechUrl || data.speech_url || "",
+    videoUrl: data.videoUrl || data.video_url || "",
+    localPath: data.localPath || data.local_path || "",
+    mimeType: data.mimeType || data.mime_type || "",
+    sourceUrl: data.sourceUrl || data.source_url || "",
+    text: data.text || "",
+    prompt: data.prompt || "",
+    title: data.title || "",
+    status: data.status || "",
+    contentType: data.contentType || "",
+    answer: data.answer || data.output_text || data.summary || "",
+    sources: Array.isArray(data.sources) ? data.sources.slice(0, 5) : [],
+    excerpt: data.excerpt || data.text || "",
+    truncated: Boolean(data.truncated),
+  };
+}
+
+function bridgeCapabilityErrorToolMessage(toolCall = {}, error) {
+  return {
+    role: "tool",
+    tool_call_id: bridgeToolCallId(toolCall),
+    content: stringifyJson({
+      ok: false,
+      error: safeText(error?.message || error || "CodexBridge 能力执行失败。", 600),
+    }),
+  };
+}
+
+function bridgeToolCallId(toolCall = {}) {
+  return toolCall.id || toolCall.call_id || `call_${CODEXBRIDGE_CAPABILITY_TOOL_NAME}`;
+}
+
 async function proxyChatCompact(requestBody, route, history, res, context = {}) {
   const converted = buildCompactChatRequest(requestBody, route, history);
+  logContextTruncationDecision(context, route, converted.contextDecision);
   const upstreamUrl = joinOpenAiEndpointUrl(route.baseUrl, "/chat/completions");
   logRoute(context, route, upstreamUrl);
   let upstream = null;
@@ -1735,23 +2927,31 @@ async function proxyChatCompact(requestBody, route, history, res, context = {}) 
       reason: compactFallbackReason(error),
     });
   }
-  history.record(response.id, [
-    ...converted.messagesForHistory,
-    {
-      role: "assistant",
-      content: response.output[0]?.encrypted_content || null,
-    },
-  ]);
-  history.recordResponse(response, {
-    api: "chat_completions",
-    routeId: route.id || "",
-    upstreamModel: route.model || "",
-    upstreamKnown: false,
-    ...responseRequestUserMeta(requestBody),
-    localFallback: localFallback || "compact",
+  logContextCompactionOutcome(context, route, {
+    ...converted.contextMetrics,
+    outcome: localFallback ? "local_fallback" : "completed",
+    reasonCode: localFallback || "remote_summary_completed",
   });
-  finishDuplicateInitialRequestGuard(context, route, response);
-
+  recordHistoryTurn(
+    history,
+    response,
+    [
+      ...converted.messagesForHistory,
+      {
+        role: "assistant",
+        content: response.output[0]?.encrypted_content || null,
+      },
+    ],
+    {
+      api: "chat_completions",
+      routeId: route.id || "",
+      upstreamModel: route.model || "",
+      upstreamKnown: false,
+      ...responseRequestUserMeta(requestBody),
+      localFallback: localFallback || "compact",
+    },
+    { requestBody, route },
+  );
   if (context.compactKind === "v2") {
     res.writeHead(200, {
       "content-type": "text/event-stream; charset=utf-8",
@@ -1785,15 +2985,19 @@ async function callChatCompletionsUpstream(
         `retrying ${safeUrl(fallbackUrl)}`,
     );
     logRoute(context, route, fallbackUrl);
-    return callJsonUpstream(fallbackUrl, route, payload, context, {
-      ...options,
-      cacheFailures: false,
-    });
+    return callJsonUpstream(fallbackUrl, route, payload, context, options);
   }
 }
 
 function chatCompletionsV1FallbackUrl(route, upstreamUrl, error) {
   if (!isHtmlNonJsonError(error) || !isRootBaseUrl(route?.baseUrl)) {
+    return "";
+  }
+  return chatCompletionsRootFallbackUrl(route, upstreamUrl);
+}
+
+function chatCompletionsRootFallbackUrl(route, upstreamUrl) {
+  if (!isRootBaseUrl(route?.baseUrl)) {
     return "";
   }
   const fallbackBaseUrl = baseUrlWithV1Path(route.baseUrl);
@@ -1858,14 +3062,9 @@ async function proxyResponsesCompact(requestBody, route, history, res, context =
     omitMaxOutputTokens: shouldOmitResponsesCompactMaxOutputTokens(route),
   });
   compactBody.model = route.model;
-  const { messages: sourceMessages, toolContext } = responseRequestToChatSourceMessages(
-    compactBody,
-    route,
-    history,
-  );
-  if (shouldInlineLocalHistoryForResponses(compactBody, history)) {
-    inlineLocalHistoryForResponsesPayload(compactBody, sourceMessages);
-  }
+  const budgeted = budgetResponsesCompactPayload(compactBody, route, history);
+  const { sourceMessages, toolContext } = budgeted;
+  logContextTruncationDecision(context, route, budgeted.contextDecision);
   normalizeCodexOpenAiBridgeCompactionPayload(compactBody, route, context);
 
   const upstreamUrl = joinOpenAiEndpointUrl(responsesBaseUrlForRoute(route), "/responses");
@@ -1882,14 +3081,8 @@ async function proxyResponsesCompact(requestBody, route, history, res, context =
           `!! compact-local-fallback route=${route.id} reason=${safeText(compactFallbackReasonText, 300)}`,
       );
     } else {
-      const streamCompactBody = buildCompactResponsesRequest(requestBody, {
-        stream: true,
-        omitMaxOutputTokens: shouldOmitResponsesCompactMaxOutputTokens(route),
-      });
-      streamCompactBody.model = route.model;
-      if (shouldInlineLocalHistoryForResponses(streamCompactBody, history)) {
-        inlineLocalHistoryForResponsesPayload(streamCompactBody, sourceMessages);
-      }
+      const streamCompactBody = cloneJson(compactBody) || {};
+      streamCompactBody.stream = true;
       normalizeCodexOpenAiBridgeCompactionPayload(streamCompactBody, route, context);
       console.warn(
         `[${new Date().toISOString()}] ${context.requestId || "req"} !! upstream ` +
@@ -1901,7 +3094,7 @@ async function proxyResponsesCompact(requestBody, route, history, res, context =
           route,
           streamCompactBody,
           context,
-          { cacheFailures: false },
+          {},
         );
       } catch (retryError) {
         compactFallbackReasonText = compactFallbackReason(retryError);
@@ -1924,23 +3117,31 @@ async function proxyResponsesCompact(requestBody, route, history, res, context =
         requestBody,
         reason: compactFallbackReasonText,
       });
-  history.record(response.id, [
-    ...sourceMessages,
-    {
-      role: "assistant",
-      content: response.output[0]?.encrypted_content || null,
-    },
-  ]);
-  history.recordResponse(response, {
-    api: "responses",
-    routeId: route.id || "",
-    upstreamModel: route.model || "",
-    upstreamKnown: false,
-    ...responseRequestUserMeta(requestBody),
-    localFallback: upstream ? "compact" : "compact_local_fallback",
+  logContextCompactionOutcome(context, route, {
+    ...budgeted.contextMetrics,
+    outcome: upstream ? "completed" : "local_fallback",
+    reasonCode: upstream ? "remote_summary_completed" : "compact_local_fallback",
   });
-  finishDuplicateInitialRequestGuard(context, route, response);
-
+  recordHistoryTurn(
+    history,
+    response,
+    [
+      ...sourceMessages,
+      {
+        role: "assistant",
+        content: response.output[0]?.encrypted_content || null,
+      },
+    ],
+    {
+      api: "responses",
+      routeId: route.id || "",
+      upstreamModel: route.model || "",
+      upstreamKnown: false,
+      ...responseRequestUserMeta(requestBody),
+      localFallback: upstream ? "compact" : "compact_local_fallback",
+    },
+    { requestBody, route },
+  );
   if (context.compactKind === "v2") {
     res.writeHead(200, {
       "content-type": "text/event-stream; charset=utf-8",
@@ -1962,7 +3163,6 @@ async function callResponsesCompactUpstream(
   options = {},
 ) {
   const upstreamPayload = filterPayloadForUpstream(payload, route, context);
-  throwIfRecentUpstreamFailure(route, upstreamUrl, upstreamPayload, context);
   let upstream;
   try {
     upstream = await fetchUpstream(upstreamUrl, {
@@ -1973,13 +3173,13 @@ async function callResponsesCompactUpstream(
       body: JSON.stringify(upstreamPayload),
     }, context, route, options);
   } catch (error) {
-    rememberUpstreamFailure(route, upstreamUrl, upstreamPayload, error, options);
     throw error;
   }
   const text = await readUpstreamText(upstream, context);
   if (!upstream.ok) {
-    const error = new UpstreamHttpError(upstream.status, text, upstreamUrl, route);
-    rememberUpstreamFailure(route, upstreamUrl, upstreamPayload, error, options);
+    const error = new UpstreamHttpError(upstream.status, text, upstreamUrl, route, {
+      headers: upstream.headers,
+    });
     throw error;
   }
   const parsed = tryParseJson(text);
@@ -1996,7 +3196,6 @@ async function callResponsesCompactUpstream(
     upstreamUrl,
     route,
   );
-  rememberUpstreamFailure(route, upstreamUrl, upstreamPayload, error, options);
   throw error;
 }
 
@@ -2026,8 +3225,10 @@ function isStreamRequiredError(error) {
 
 function compactFallbackReason(error) {
   if (error instanceof UpstreamHttpError) {
-    return upstreamBodyMessage(error.bodyText, tryParseJson(error.bodyText)) ||
-      `HTTP ${error.statusCode}`;
+    const bodyMessage = upstreamBodyMessage(error.bodyText, tryParseJson(error.bodyText));
+    return bodyMessage
+      ? `HTTP ${error.statusCode} - ${bodyMessage}`
+      : `HTTP ${error.statusCode}`;
   }
   return safeText(error?.message || String(error || "remote compact failed"), 800);
 }
@@ -2265,7 +3466,8 @@ function sameStringArray(left, right) {
 }
 
 function localToolLoopGuardChat(route, toolContinuationTurns) {
-  const displayName = route.displayName || route.id || "the current model";
+  const displayName = route.displayName || route.id || "当前模型";
+  const turnCount = Math.max(1, Number(toolContinuationTurns) || 1);
   return {
     id: `chatcmpl_tool_loop_guard_${Date.now().toString(36)}_${Math.random()
       .toString(36)
@@ -2275,11 +3477,7 @@ function localToolLoopGuardChat(route, toolContinuationTurns) {
       {
         message: {
           role: "assistant",
-          content:
-            `CodexBridge stopped repeated tool loop：已停止 ${displayName} 的重复工具调用。连续 ` +
-            `${toolContinuationTurns} 轮工具结果后，模型仍要求继续调用工具。` +
-            "最新工具结果已保留，但本轮不会再继续请求上游，避免重复调用和浪费 token。 " +
-            "请发送一个明确的下一步继续。",
+          content: `模型一直重复调用工具，没有返回最终回答。报错信息：${displayName} 连续 ${turnCount} 轮工具结果后仍请求新工具调用。`,
         },
       },
     ],
@@ -2339,6 +3537,132 @@ function messageHasToolCall(message, toolName) {
     const name = toolCall?.function?.name || toolCall?.name || "";
     return name === toolName;
   });
+}
+
+function blockCommandFallbackForControlledCapability(upstream, requestBody, converted, context = {}) {
+  const kind = interactivePluginKindForRequest(requestBody);
+  const controlledCapability = controlledCapabilityForInteractiveKind(kind);
+  if (!controlledCapability) {
+    return upstream;
+  }
+  if (!toolContextSupportsBridgeCapability(converted?.toolContext, controlledCapability)) {
+    return upstream;
+  }
+  const commandCalls = chatMessageToolCalls(upstream).filter(isCommandToolCall);
+  if (commandCalls.length === 0) {
+    return upstream;
+  }
+
+  const adjusted = cloneJson(upstream);
+  if (!Array.isArray(adjusted.choices) || adjusted.choices.length === 0) {
+    adjusted.choices = [{ index: 0, finish_reason: "stop", message: {} }];
+  }
+  adjusted.choices[0].finish_reason = "stop";
+  adjusted.choices[0].message = {
+    role: "assistant",
+    content: controlledCapabilityShellBlockMessage(
+      controlledCapability,
+      bridgeActionsForCapability(converted?.toolContext, controlledCapability),
+    ),
+  };
+  console.warn(
+    `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+      `!! controlled-capability-shell-block capability=${controlledCapability} calls=${commandCalls.length}`,
+  );
+  return adjusted;
+}
+
+function controlledCapabilityForInteractiveKind(kind) {
+  if (kind === "computer") {
+    return "computer_use";
+  }
+  if (kind === "chrome") {
+    return "browser";
+  }
+  return "";
+}
+
+function toolContextSupportsBridgeCapability(toolContext, capability) {
+  const target = String(capability || "").trim();
+  if (!target) {
+    return false;
+  }
+  const bridgeTool = bridgeCapabilityToolFromContext(toolContext);
+  const capabilities = bridgeTool?.function?.parameters?.properties?.capability?.enum;
+  return Array.isArray(capabilities) && capabilities.includes(target);
+}
+
+function bridgeCapabilityToolFromContext(toolContext) {
+  const bridgeName =
+    toolContext?.responseNameToChatName?.get?.(CODEXBRIDGE_CAPABILITY_TOOL_NAME) ||
+    CODEXBRIDGE_CAPABILITY_TOOL_NAME;
+  return (toolContext?.chatTools || []).find((tool) =>
+    tool?.function?.name === bridgeName || tool?.function?.name === CODEXBRIDGE_CAPABILITY_TOOL_NAME
+  );
+}
+
+function bridgeActionsForCapability(toolContext, capability) {
+  const bridgeTool = bridgeCapabilityToolFromContext(toolContext);
+  const actionEnum = bridgeTool?.function?.parameters?.properties?.action?.enum;
+  if (!Array.isArray(actionEnum)) {
+    return [];
+  }
+  const supported = defaultActionsForControlledCapability(capability);
+  return actionEnum.filter((action) => supported.includes(action));
+}
+
+function defaultActionsForControlledCapability(capability) {
+  if (capability === "computer_use") {
+    return ["list_apps", "open_app", "screenshot_desktop"];
+  }
+  if (capability === "browser") {
+    return ["read_url", "open_url"];
+  }
+  return [];
+}
+
+function isCommandToolCall(toolCall) {
+  const name = String(toolCall?.function?.name || toolCall?.name || "").trim();
+  return isCommandToolName(name);
+}
+
+function isCommandToolName(name) {
+  return (
+    name === "shell_command" ||
+    name === "exec_command" ||
+    name === "execute_command" ||
+    name.endsWith("__shell_command") ||
+    name.endsWith("__exec_command") ||
+    name.endsWith("__execute_command")
+  );
+}
+
+function controlledCapabilityShellBlockMessage(capability, actions = []) {
+  const safeActions = actions.length > 0 ? actions : defaultActionsForControlledCapability(capability);
+  const qualifiedActions = safeActions.map((action) => `${capability}/${action}`);
+  const actionText = formatChineseList(qualifiedActions);
+  if (capability === "computer_use") {
+    return (
+      "出于安全限制，这次受控 Computer Use 请求里的 shell 命令没有执行任何本地动作。 " +
+      `聊天模型必须改用 codexbridge_capability，并且只能调用 ${actionText}，` +
+      "这样动作才会被限制在安全白名单里。"
+    );
+  }
+  return (
+    "出于安全限制，这次受控浏览器请求里的 shell 命令没有执行任何本地动作。 " +
+    `聊天模型必须改用 codexbridge_capability，并且只能调用 ${actionText}。`
+  );
+}
+
+function formatChineseList(items = []) {
+  const values = items.map((item) => String(item || "").trim()).filter(Boolean);
+  if (values.length <= 1) {
+    return values[0] || "";
+  }
+  if (values.length === 2) {
+    return `${values[0]} 或 ${values[1]}`;
+  }
+  return `${values.slice(0, -1).join("、")} 或 ${values.at(-1)}`;
 }
 
 function interactivePluginBootstrapCode(kind) {
@@ -2404,19 +3728,20 @@ function sendLocalRateLimitedResponse({
     { stripReasoningTags: false },
   );
 
-  history.record(response.id, [
-    ...messagesForHistory,
-    assistantHistoryMessageFromChat(localChat),
-  ]);
-  history.recordResponse(response, {
-    api: "chat_completions",
-    routeId: route.id || "",
-    upstreamModel: route.model || "",
-    upstreamKnown: false,
-    ...responseRequestUserMeta(requestBody),
-    localFallback: "provider_rate_limited",
-  });
-  finishDuplicateInitialRequestGuard(context, route, response);
+  recordHistoryTurn(
+    history,
+    response,
+    [...messagesForHistory, assistantHistoryMessageFromChat(localChat)],
+    {
+      api: "chat_completions",
+      routeId: route.id || "",
+      upstreamModel: route.model || "",
+      upstreamKnown: false,
+      ...responseRequestUserMeta(requestBody),
+      localFallback: "provider_rate_limited",
+    },
+    { requestBody, route },
+  );
   logUsage(context, route, null);
 
   if (converted.wantsStream) {
@@ -2437,16 +3762,13 @@ function localRateLimitedChat(route, error) {
   const waitSeconds = Math.ceil(Math.max(0, retryAfterMs) / 1000);
   const localCooldown = error?.code === "provider_rate_limited";
   const upstream429 = Number(error?.statusCode || 0) === 429;
-  const waitText =
-    waitSeconds > 0
-      ? `Please wait about ${waitSeconds}s, then retry. If you switch models, send a new message to continue; this failed turn will not be replayed automatically.`
-      : "Please wait a moment, then retry. If you switch models, send a new message to continue; this failed turn will not be replayed automatically.";
-  const displayName = route.displayName || route.id || "the current model";
-  const reasonText = localCooldown
-    ? `CodexBridge is in local cooldown for ${displayName} because this provider is currently rate limited and recently returned a rate limit. `
-    : upstream429
-      ? `${displayName} returned HTTP 429 because the provider is rate limited. CodexBridge will pause this provider briefly to avoid repeated upstream calls and token waste. `
-      : `CodexBridge paused requests to ${displayName} because the provider is rate limited. `;
+  const displayName = route.displayName || route.id || "当前模型";
+  const reasonText = `${displayName} 的供应商限流，请稍后再试或切换备用模型。`;
+  const errorInfo = upstream429
+    ? upstreamErrorInfo(error, null, classifyUpstreamError(error))
+    : localCooldown && waitSeconds > 0
+      ? `供应商冷却中，剩余约 ${waitSeconds}s`
+      : "供应商当前处于限流状态";
   return {
     id: `chatcmpl_rate_limited_${Date.now().toString(36)}_${Math.random()
       .toString(36)
@@ -2456,10 +3778,7 @@ function localRateLimitedChat(route, error) {
       {
         message: {
           role: "assistant",
-          content:
-            reasonText +
-            "This is not a CodexBridge quota limit; it is based on the upstream provider response. " +
-            waitText,
+          content: `${reasonText}报错信息：${errorInfo}`,
         },
       },
     ],
@@ -2485,18 +3804,20 @@ function sendLocalImageRejectedResponse({
     { stripReasoningTags: false },
   );
 
-  history.record(response.id, [
-    ...messagesForHistory,
-    assistantHistoryMessageFromChat(localChat),
-  ]);
-  history.recordResponse(response, {
-    api: "chat_completions",
-    routeId: route.id || "",
-    upstreamModel: route.model || "",
-    upstreamKnown: false,
-    ...responseRequestUserMeta(requestBody),
-    localFallback: "image_rejected",
-  });
+  recordHistoryTurn(
+    history,
+    response,
+    [...messagesForHistory, assistantHistoryMessageFromChat(localChat)],
+    {
+      api: "chat_completions",
+      routeId: route.id || "",
+      upstreamModel: route.model || "",
+      upstreamKnown: false,
+      ...responseRequestUserMeta(requestBody),
+      localFallback: "image_rejected",
+    },
+    { requestBody, route },
+  );
   logUsage(context, route, null);
 
   if (converted.wantsStream) {
@@ -2528,7 +3849,7 @@ function localImageRejectedChat(route, retryError) {
   const displayName = route.displayName || route.id || "当前模型";
   const content =
     `这次消息里的图片没有继续发送给 ${displayName}：上游模型拒绝了图片输入。` +
-    "CodexBridge 已经把本轮历史改成文本占位，后续会话可以继续。" +
+    "本轮历史已经改成文本占位，后续会话可以继续。" +
     (retryDetail ? ` 去掉图片后上游仍返回：${retryDetail}。` : "") +
     "建议关闭这个模型的“图片上传”开关后重试，或切换到真正支持图片的模型。";
 
@@ -2640,7 +3961,6 @@ export async function callJsonUpstream(
     route?.api === "responses" || route?.api === "chat_completions"
       ? filterPayloadForUpstream(payload, route, context)
       : payload;
-  throwIfRecentUpstreamFailure(route, upstreamUrl, upstreamPayload, context);
   let upstream;
   try {
     upstream = await fetchUpstream(upstreamUrl, {
@@ -2649,13 +3969,13 @@ export async function callJsonUpstream(
       body: JSON.stringify(upstreamPayload),
     }, context, route, options);
   } catch (error) {
-    rememberUpstreamFailure(route, upstreamUrl, upstreamPayload, error, options);
     throw error;
   }
   const text = await readUpstreamText(upstream, context);
   if (!upstream.ok) {
-    const error = new UpstreamHttpError(upstream.status, text, upstreamUrl, route);
-    rememberUpstreamFailure(route, upstreamUrl, upstreamPayload, error, options);
+    const error = new UpstreamHttpError(upstream.status, text, upstreamUrl, route, {
+      headers: upstream.headers,
+    });
     throw error;
   }
   const parsed = tryParseJson(text);
@@ -2666,7 +3986,6 @@ export async function callJsonUpstream(
       upstreamUrl,
       route,
     );
-    rememberUpstreamFailure(route, upstreamUrl, upstreamPayload, error, options);
     throw error;
   }
   return parsed;
@@ -2713,13 +4032,29 @@ async function readUpstreamText(upstream, context = {}) {
 }
 
 export function __resetUpstreamFailureCacheForTests() {
-  recentUpstreamFailures.clear();
+  // Compatibility hook retained for callers while the old payload failure cache is removed.
 }
 
 export function sendUpstreamError(res, error, options = {}) {
   if (options.asResponsesStream) {
+    const localHistoryError = Boolean(
+      error?.localHistoryError || error?.code === "local_history_storage_unavailable",
+    );
+    const contextSwitchError = error?.code === "context_switch_compaction_failed";
     sendResponsesStreamFailure(res, streamErrorMessage(error), {
       model: options.model || error?.route?.model || null,
+      ...(localHistoryError
+        ? {
+            statusCode: error.statusCode || 503,
+            code: "local_history_storage_unavailable",
+          }
+        : {}),
+      ...(contextSwitchError
+        ? {
+            statusCode: error.statusCode || 409,
+            code: "context_switch_compaction_failed",
+          }
+        : {}),
     });
     return;
   }
@@ -2734,7 +4069,11 @@ export function sendUpstreamError(res, error, options = {}) {
     jsonResponse(
       res,
       error.statusCode,
-      openAiError(error.message, error.statusCode, classification.code),
+      openAiError(
+        userFacingUpstreamErrorMessage(error),
+        error.statusCode,
+        classification.code,
+      ),
     );
     return;
   }
@@ -2746,9 +4085,8 @@ export function sendUpstreamError(res, error, options = {}) {
       res,
       error.statusCode || 413,
       openAiError(
-        `CodexBridge local request body is too large${actualMb ? ` (${actualMb} MB)` : ""}. ` +
-          `The local router limit is ${limitMb || "configured"} MB. ` +
-          "Run /compact, remove large pasted logs or inline images, or raise requestBodyLimitBytes if you intentionally need a larger local request.",
+        `本次请求内容太大${actualMb ? `（约 ${actualMb} MB）` : ""}，本地 Router 没有继续发送给供应商。` +
+          `当前本地上限是 ${limitMb || "已配置"} MB。请先压缩上下文、开启新会话，或移除大段日志/内联图片后再试。`,
         error.statusCode || 413,
         "request_body_too_large",
       ),
@@ -2784,7 +4122,24 @@ export function sendUpstreamError(res, error, options = {}) {
   }
 
   const statusCode = error.statusCode || 500;
-  jsonResponse(res, statusCode, openAiError(error.message, statusCode, error.code || "router_error"));
+  const classification = classifyUpstreamError(error);
+  const isUpstreamError = Boolean(
+    error instanceof UpstreamTimeoutError ||
+      error instanceof UpstreamStreamError ||
+      String(error?.name || "").startsWith("Upstream") ||
+      String(error?.code || "").startsWith("upstream_"),
+  );
+  const message = isUpstreamError
+    ? userFacingUpstreamErrorMessage(error)
+    : error.message;
+  const code = isUpstreamError
+    ? classification.code
+    : error.code || classification.code || "router_error";
+  jsonResponse(
+    res,
+    statusCode,
+    openAiError(message, statusCode, code),
+  );
 }
 
 function bytesToMegabytes(value) {
@@ -2797,7 +4152,7 @@ function bytesToMegabytes(value) {
 
 function sendResponsesStreamFailure(res, message, options = {}) {
   if (!res.headersSent) {
-    res.writeHead(200, {
+    res.writeHead(options.statusCode || 200, {
       "content-type": "text/event-stream; charset=utf-8",
       "cache-control": "no-cache",
       connection: "keep-alive",
@@ -2809,11 +4164,14 @@ function sendResponsesStreamFailure(res, message, options = {}) {
 }
 
 function streamErrorMessage(error) {
+  if (error?.code === "context_switch_compaction_failed") {
+    return error.message;
+  }
   if (error instanceof UpstreamHttpError) {
     const parsed = tryParseJson(error.bodyText);
     return clientUpstreamErrorMessage(error, parsed);
   }
-  return error?.message || String(error || "Upstream stream failed.");
+  return userFacingUpstreamErrorMessage(error);
 }
 
 function isMissingResponsesWriteScope(parsedBody, rawBody) {
@@ -2828,55 +4186,238 @@ function isMissingResponsesWriteScope(parsedBody, rawBody) {
 }
 
 function clientUpstreamErrorMessage(error, parsedBody) {
-  const routeLabel = [error.route?.displayName, error.route?.id]
-    .filter(Boolean)
-    .join(" / ");
-  const model = error.route?.model ? ` upstream_model=${error.route.model}` : "";
-  const api = error.route?.api ? ` api=${error.route.api}` : "";
-  const upstreamMessage = upstreamBodyMessage(error.bodyText, parsedBody);
-  if (Number(error.statusCode) === 413) {
+  return userFacingUpstreamErrorMessage(error, parsedBody);
+}
+
+function userFacingUpstreamErrorMessage(error, parsedBody = null) {
+  const classification = classifyUpstreamError(error);
+  const routeLabel = userFacingRouteLabel(error?.route);
+  const statusCode = Number(error?.statusCode || classification.statusCode || 0);
+  const prefix = routeLabel ? `${routeLabel}：` : "";
+  const errorInfo = upstreamErrorInfo(error, parsedBody, classification);
+
+  if (Number(error?.statusCode) === 413) {
     return payloadTooLargeClientMessage({
       routeLabel,
-      model,
-      api,
-      statusCode: error.statusCode,
-      upstreamMessage,
+      statusCode,
+      errorInfo,
     });
   }
-  return (
-    `CodexBridge upstream error` +
-    (routeLabel ? ` from ${routeLabel}` : "") +
-    `${model}${api}: HTTP ${error.statusCode}` +
-    (upstreamMessage ? ` - ${upstreamMessage}` : "")
-  );
+
+  switch (classification.code) {
+    case "upstream_authentication_error":
+      return userFacingErrorSentence(prefix, "API Key 无效或没有权限，请检查当前供应商 Key。", errorInfo);
+    case "upstream_billing_error":
+      return userFacingErrorSentence(prefix, "供应商账户余额不足，请充值或更换 Key。", errorInfo);
+    case "upstream_rate_limit":
+      return userFacingErrorSentence(prefix, `供应商限流，请稍后再试或切换备用模型。${retryAfterAdvice(error?.retryAfter)}`, errorInfo);
+    case "upstream_provider_unavailable":
+      return userFacingErrorSentence(prefix, "供应商服务暂时不可用或网关异常，请稍后重试。", errorInfo);
+    case "upstream_payload_too_large":
+      return payloadTooLargeClientMessage({ routeLabel, statusCode, errorInfo });
+    case "upstream_media_unsupported":
+      return userFacingErrorSentence(prefix, "供应商不支持这次附件或多模态输入，请换支持附件的模型或转成文字后重试。", errorInfo);
+    case "upstream_parameter_error":
+      return userFacingErrorSentence(prefix, "供应商拒绝了请求参数，请检查模型名、接口类型、Base URL 或请求参数。", errorInfo);
+    case "upstream_compact_unsupported":
+      return userFacingErrorSentence(prefix, "供应商不支持这次上下文压缩请求，请换模型或开启新会话继续。", errorInfo);
+    case "upstream_network_error":
+      return userFacingErrorSentence(prefix, "连接供应商失败，请检查网络、代理/VPN 或 Base URL。", errorInfo);
+    case "upstream_timeout":
+      return userFacingErrorSentence(prefix, "请求供应商超时，请稍后重试或切换更稳定的模型/代理。", errorInfo);
+    case "upstream_stream_error":
+    case "upstream_stream_truncated":
+      return userFacingErrorSentence(prefix, "供应商流式响应中断，当前回复没有完整返回。", errorInfo);
+    default:
+      if (String(classification.code || "").startsWith("upstream_")) {
+        return userFacingErrorSentence(prefix, "供应商返回错误，请稍后重试或检查供应商配置。", errorInfo);
+      }
+      return error?.message || "请求处理失败。";
+  }
 }
 
 function payloadTooLargeClientMessage({
   routeLabel,
-  model,
-  api,
   statusCode,
-  upstreamMessage,
+  errorInfo,
 }) {
-  return (
-    `CodexBridge upstream request is too large` +
-    (routeLabel ? ` from ${routeLabel}` : "") +
-    `${model}${api}: HTTP ${statusCode}. ` +
-    "The upstream provider rejected the request body. " +
-    "Recover by running /compact, starting a new thread, removing large pasted logs/files/inline images, " +
-    "or asking the provider to raise its request body limit." +
-    (upstreamMessage ? ` Upstream detail: ${upstreamMessage}` : "")
+  const prefix = routeLabel ? `${routeLabel}：` : "";
+  const detail = errorInfo || (statusCode ? `HTTP ${statusCode}` : "请求内容超过限制");
+  return userFacingErrorSentence(
+    prefix,
+    "请求内容太大，供应商拒绝接收这次上下文。请先压缩上下文、开启新会话，或减少大段日志、文件、图片后再重试。",
+    detail,
   );
 }
 
 function upstreamBodyMessage(rawBody, parsedBody) {
-  const message =
+  return safeText(rawUpstreamBodyMessage(rawBody, parsedBody), 800);
+}
+
+function rawUpstreamBodyMessage(rawBody, parsedBody) {
+  return (
     parsedBody?.error?.message ||
     parsedBody?.message ||
     parsedBody?.error ||
     rawBody ||
-    "";
-  return safeText(message, 800);
+    ""
+  );
+}
+
+function userFacingErrorSentence(prefix, summary, errorInfo) {
+  const message = String(summary || "请求处理失败。").trim();
+  const sentence = /[。！？；]$/.test(message) ? message : `${message}。`;
+  const info = safeErrorInfoText(errorInfo || "未返回详细信息", 320) || "未返回详细信息";
+  return `${prefix}${sentence}报错信息：${info}`;
+}
+
+function upstreamErrorInfo(error, parsedBody = null, classification = {}) {
+  const statusCode = Number(error?.statusCode || classification.statusCode || 0);
+  const rawMessage = error instanceof UpstreamHttpError
+    ? rawUpstreamBodyMessage(error.bodyText, parsedBody)
+    : error?.message || String(error || "");
+  const detail = readableUpstreamErrorDetail(rawMessage);
+  if (statusCode && detail) {
+    return `HTTP ${statusCode} - ${detail}`;
+  }
+  if (statusCode) {
+    return `HTTP ${statusCode}`;
+  }
+  return detail || classification.code || "未返回详细信息";
+}
+
+function readableUpstreamErrorDetail(value) {
+  const raw = String(value || "");
+  const title = htmlTitleText(raw);
+  const text = title || raw;
+  return safeErrorInfoText(
+    text
+      .replace(/<[^>]*>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim(),
+    240,
+  );
+}
+
+function htmlTitleText(value) {
+  if (!looksLikeHtml(value)) {
+    return "";
+  }
+  const match = String(value || "").match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (!match) {
+    return "";
+  }
+  return decodeBasicHtmlEntities(match[1])
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function decodeBasicHtmlEntities(value) {
+  return String(value || "")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
+function safeErrorInfoText(value, limit = 240) {
+  return redactErrorInfoSecretText(value)
+    .replaceAll("\r", " ")
+    .replaceAll("\n", " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, limit);
+}
+
+function redactErrorInfoSecretText(value) {
+  return String(value || "")
+    .replace(/:\/\/[^/?#\s]+@/g, "://[REDACTED]@")
+    .replace(
+      /([?&](?:api[_-]?key|token|access_token|secret|key)=)[^&#\s]+/gi,
+      "$1[REDACTED]",
+    )
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
+    .replace(/\b(?:sk|ak)-[A-Za-z0-9._-]{6,}\b/gi, (match) => {
+      const prefix = match.slice(0, 2).toLowerCase();
+      return `${prefix}-[REDACTED]`;
+    })
+    .replace(/<\s*(ak)-[A-Za-z0-9._-]{6,}\s*>/gi, "<ak-[REDACTED]>")
+    .replace(/\b(?:org|proj)-[A-Za-z0-9._-]{8,}\b/gi, (match) => {
+      const prefix = match.split("-")[0].toLowerCase();
+      return `${prefix}-[REDACTED]`;
+    })
+    .replace(
+      /((?:api[_-]?key|authorization|token|secret|key)["'\s]*[:=]\s*["']?)[A-Za-z0-9._~+/=-]{8,}/gi,
+      "$1[REDACTED]",
+    );
+}
+
+function userFacingRouteLabel(route = {}) {
+  return route?.displayName || route?.id || route?.model || "";
+}
+
+function retryAfterAdvice(value) {
+  if (!value) {
+    return "";
+  }
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds > 0) {
+    return `建议约 ${formatDuration(seconds)} 后再试；`;
+  }
+  const retryAtMs = Date.parse(value);
+  if (Number.isFinite(retryAtMs)) {
+    const waitSeconds = Math.ceil((retryAtMs - Date.now()) / 1000);
+    if (waitSeconds > 0) {
+      return `建议约 ${formatDuration(waitSeconds)} 后再试；`;
+    }
+  }
+  return "";
+}
+
+function formatDuration(seconds) {
+  if (seconds < 60) {
+    return `${Math.ceil(seconds)} 秒`;
+  }
+  if (seconds < 3600) {
+    return `${Math.ceil(seconds / 60)} 分钟`;
+  }
+  return `${Math.ceil(seconds / 3600)} 小时`;
+}
+
+function userFacingUpstreamDetail(value, classification = {}) {
+  const text = safeText(value, 240)
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text || looksLikeHtml(value)) {
+    return "";
+  }
+  if (shouldHideCommonEnglishDetail(text, classification)) {
+    return "";
+  }
+  return text;
+}
+
+function looksLikeHtml(value) {
+  return /<!doctype|<html|<\/html>|<head|<body|cloudflare|nginx/i.test(String(value || ""));
+}
+
+function shouldHideCommonEnglishDetail(text, classification = {}) {
+  const haystack = text.toLowerCase();
+  if (
+    /incorrect api key|invalid api key|too many requests|rate.?limit|insufficient balance|insufficient quota|payment required|payload too large|bad gateway|gateway timeout|service unavailable/.test(haystack)
+  ) {
+    return true;
+  }
+  return [
+    "upstream_authentication_error",
+    "upstream_billing_error",
+    "upstream_rate_limit",
+    "upstream_provider_unavailable",
+    "upstream_payload_too_large",
+  ].includes(classification.code);
 }
 
 function upstreamHeaders(route, context = {}, options = {}) {
@@ -2884,6 +4425,18 @@ function upstreamHeaders(route, context = {}, options = {}) {
     "content-type": "application/json",
     authorization: `Bearer ${upstreamBearerToken(route, context)}`,
   };
+
+  const customHeaders = route?.headers && typeof route.headers === "object" && !Array.isArray(route.headers)
+    ? route.headers
+    : {};
+  for (const [name, value] of Object.entries(customHeaders)) {
+    const key = String(name || "").trim();
+    const headerValue = String(value ?? "").trim();
+    if (!key || !headerValue || blockedCustomUpstreamHeader(key)) {
+      continue;
+    }
+    headers[key] = headerValue;
+  }
 
   if (options.acceptEventStream) {
     headers.accept = "text/event-stream";
@@ -2894,6 +4447,20 @@ function upstreamHeaders(route, context = {}, options = {}) {
   }
 
   return headers;
+}
+
+function blockedCustomUpstreamHeader(name = "") {
+  const normalized = String(name || "").trim().toLowerCase();
+  return [
+    "connection",
+    "content-length",
+    "host",
+    "keep-alive",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+  ].includes(normalized);
 }
 
 function upstreamBearerToken(route, context = {}) {
@@ -2930,7 +4497,7 @@ function filteredHeaders(headers) {
   return result;
 }
 
-function responsesBaseUrlForRoute(route) {
+export function responsesBaseUrlForRoute(route) {
   if (
     authModeForRoute(route) === "codex_openai" &&
     isPublicOpenAiApiBaseUrl(route.baseUrl)
@@ -2979,8 +4546,11 @@ function setCodexPassthroughHeader(target, name, value) {
 }
 
 function headerValue(headers, name) {
-  if (!headers) {
+  if (!headers || !name) {
     return "";
+  }
+  if (typeof headers.get === "function") {
+    return String(headers.get(name) || headers.get(name.toLowerCase()) || headers.get(name.toUpperCase()) || "").trim();
   }
   const value = headers[name] || headers[name.toLowerCase()];
   if (Array.isArray(value)) {
@@ -3003,9 +4573,11 @@ function logPayloadDrops(context, route, drops) {
   if (!drops.length) {
     return;
   }
+  const trace = ensureRouteTrace(context, route);
   const requestId = context.requestId || "req";
   const routeId = route.id || route.model || route.adapterId || "unknown";
   for (const drop of drops) {
+    recordRouteTraceEvent(trace, "payload_drop", drop);
     console.log(
       `[${new Date().toISOString()}] ${requestId} !! payload_drop ` +
         `route=${safeLogValue(routeId)} path=${safeLogValue(drop.path)} ` +
@@ -3043,11 +4615,23 @@ function providerLogLabel(route = {}) {
 function logRoute(context, route, upstreamUrl) {
   const requestId = context.requestId || "req";
   const proxy = proxyLogLabel(upstreamUrl);
+  const trace = ensureRouteTrace(context, route);
+  recordRouteTraceEvent(trace, "upstream_request", {
+    url: safeUrl(upstreamUrl),
+    api: route.api,
+    upstreamModel: route.model,
+    provider: providerLogLabel(route),
+    proxy: proxy || undefined,
+  });
   console.log(
     `[${new Date().toISOString()}] ${requestId} -> upstream ` +
       `route=${route.id} api=${route.api} upstream_model=${route.model} ` +
       `url=${safeUrl(upstreamUrl)} provider=${providerLogLabel(route)}` +
       (proxy ? ` proxy=${proxy}` : ""),
+  );
+  console.log(
+    `[${new Date().toISOString()}] ${requestId} route_trace ` +
+      JSON.stringify(routeTraceForLog(trace)),
   );
 }
 
@@ -3085,6 +4669,9 @@ function logReturnedToolDiagnostics(context, route, diagnostics = {}, mode = "")
 
 function logStatus(context, route, status) {
   const requestId = context.requestId || "req";
+  recordRouteTraceEvent(ensureRouteTrace(context, route), "upstream_status", {
+    status,
+  });
   console.log(
     `[${new Date().toISOString()}] ${requestId} <- upstream ` +
       `route=${route.id} status=${status}`,
@@ -3094,6 +4681,10 @@ function logStatus(context, route, status) {
 function logUsage(context, route, usage) {
   const requestId = context.requestId || "req";
   if (!usage) {
+    notifyUpstreamUsage(context, route, null);
+    recordRouteTraceEvent(ensureRouteTrace(context, route), "upstream_usage", {
+      usage: null,
+    });
     console.log(
       `[${new Date().toISOString()}] ${requestId} <- upstream ` +
         `route=${route.id} usage=(none)`,
@@ -3101,6 +4692,10 @@ function logUsage(context, route, usage) {
     return;
   }
   const normalized = normalizeUsage(usage);
+  notifyUpstreamUsage(context, route, normalized);
+  recordRouteTraceEvent(ensureRouteTrace(context, route), "upstream_usage", {
+    usage: normalized,
+  });
   console.log(
     `[${new Date().toISOString()}] ${requestId} <- upstream ` +
       `route=${route.id} usage prompt=${normalized.prompt_tokens} ` +
@@ -3109,106 +4704,161 @@ function logUsage(context, route, usage) {
   );
 }
 
-function throwIfRecentUpstreamFailure(route, upstreamUrl, payload, context = {}) {
-  const key = upstreamFailureKey(route, upstreamUrl, payload);
-  const cached = recentUpstreamFailures.get(key);
-  if (!cached) {
-    return;
+function ensureRouteTrace(context = {}, route = {}) {
+  if (context.routeTrace) {
+    recordRouteDecisionTraceEvent(context, route);
+    return context.routeTrace;
   }
-  const now = Date.now();
-  if (cached.expiresAt <= now) {
-    recentUpstreamFailures.delete(key);
-    return;
-  }
-
-  cached.hits += 1;
-  const remainingMs = Math.max(0, cached.expiresAt - now);
-  const requestId = context.requestId || "req";
-  console.warn(
-    `[${new Date().toISOString()}] ${requestId} !! upstream ` +
-      `route=${route.id || route.model || "unknown"} cached_failure ` +
-      `status=${cached.statusCode} remaining_ms=${remainingMs}`,
-  );
-
-  const error = new UpstreamHttpError(
-    cached.statusCode,
-    cached.bodyText,
-    upstreamUrl,
+  context.routeTrace = createRouteTrace({
+    requestId: context.requestId || "req",
+    requestedModel: context.requestedModel || route.id || route.model || "",
     route,
-  );
-  error.cachedUpstreamFailure = true;
-  throw error;
+  });
+  recordRouteDecisionTraceEvent(context, route);
+  return context.routeTrace;
 }
 
-function rememberUpstreamFailure(route, upstreamUrl, payload, error, options = {}) {
-  if (
-    options.cacheFailures === false ||
-    error?.cachedUpstreamFailure ||
-    error?.code === "client_closed_request" ||
-    error?.code === "provider_rate_limited"
-  ) {
+function recordRouteDecisionTraceEvent(context = {}, route = {}) {
+  if (!context.routeTrace || context.routeDecisionTraceRecorded) {
     return;
   }
-  const statusCode = Number(error?.statusCode || 500);
-  const ttlMs = upstreamFailureTtlMs(statusCode, route);
-  if (ttlMs <= 0) {
+  const details = routeDecisionTraceDetails(context, route);
+  if (!details) {
     return;
   }
-  trimUpstreamFailureCache();
-  recentUpstreamFailures.set(upstreamFailureKey(route, upstreamUrl, payload), {
-    statusCode,
-    bodyText: upstreamFailureBodyText(error),
-    expiresAt: Date.now() + ttlMs,
-    hits: 0,
-  });
+  recordRouteTraceEvent(context.routeTrace, "route_decision", details);
+  context.routeDecisionTraceRecorded = true;
 }
 
-function upstreamFailureTtlMs(statusCode, route = {}) {
-  if (statusCode === 401 || statusCode === 429) {
-    return 0;
+function routeDecisionTraceDetails(context = {}, route = {}) {
+  if (context.failoverFromRoute || context.smartFailoverReason) {
+    return {
+      reason: "smart_failover",
+      failoverReason: safeTraceText(context.smartFailoverReason || ""),
+      requestedModel: safeTraceText(context.requestedModel || route.id || route.model || ""),
+      originalRoute: safeTraceText(context.failoverFromRoute || ""),
+      originalDisplayName: safeTraceText(context.failoverFromDisplayName || ""),
+      originalUpstreamModel: safeTraceText(context.failoverFromModel || ""),
+      selectedRoute: safeTraceText(route.id || ""),
+      selectedDisplayName: safeTraceText(route.displayName || route.id || route.model || ""),
+      selectedUpstreamModel: safeTraceText(route.model || route.id || ""),
+      selectedApi: safeTraceText(route.api || ""),
+      changed: true,
+    };
   }
-  if ([400, 413, 415, 422].includes(statusCode)) {
-    return FAILURE_CACHE_FATAL_TTL_MS;
+
+  const decision = context.routePlan?.decision &&
+    typeof context.routePlan.decision === "object" &&
+    !Array.isArray(context.routePlan.decision)
+    ? context.routePlan.decision
+    : null;
+  if (decision) {
+    return routeDecisionTraceDetailsFromDecision(decision, route, context);
   }
-  return 0;
+
+  const selection = context.routeSelection &&
+    typeof context.routeSelection === "object" &&
+    !Array.isArray(context.routeSelection)
+    ? context.routeSelection
+    : null;
+  if (!selection) {
+    return {
+      reason: "manual_route",
+      requestedModel: safeTraceText(context.requestedModel || route.id || route.model || ""),
+      originalRoute: safeTraceText(route.id || ""),
+      originalDisplayName: safeTraceText(route.displayName || route.id || route.model || ""),
+      originalUpstreamModel: safeTraceText(route.model || route.id || ""),
+      selectedRoute: safeTraceText(route.id || ""),
+      selectedDisplayName: safeTraceText(route.displayName || route.id || route.model || ""),
+      selectedUpstreamModel: safeTraceText(route.model || route.id || ""),
+      selectedApi: safeTraceText(route.api || ""),
+      changed: false,
+    };
+  }
+
+  const originalRoute = selection.originalRoute || {};
+  const selectedRoute = selection.route || route || {};
+  return {
+    reason: safeTraceText(selection.reason || "manual_route"),
+    requestedModel: safeTraceText(context.requestedModel || selectedRoute.id || selectedRoute.model || ""),
+    originalRoute: safeTraceText(originalRoute.id || ""),
+    originalDisplayName: safeTraceText(
+      originalRoute.displayName || originalRoute.id || originalRoute.model || "",
+    ),
+    originalUpstreamModel: safeTraceText(originalRoute.model || originalRoute.id || ""),
+    selectedRoute: safeTraceText(selectedRoute.id || route.id || ""),
+    selectedDisplayName: safeTraceText(
+      selectedRoute.displayName || selectedRoute.id || selectedRoute.model || route.displayName || "",
+    ),
+    selectedUpstreamModel: safeTraceText(selectedRoute.model || route.model || selectedRoute.id || ""),
+    selectedApi: safeTraceText(selectedRoute.api || route.api || ""),
+    changed: Boolean(selection.changed),
+  };
 }
 
-function upstreamFailureBodyText(error) {
-  if (error instanceof UpstreamHttpError) {
-    return error.bodyText || error.message || "Upstream request failed";
-  }
-  return error?.message || String(error || "Upstream request failed");
+function routeDecisionTraceDetailsFromDecision(decision = {}, route = {}, context = {}) {
+  const originalRoute = decision.originalRoute || {};
+  const selectedRoute = decision.selectedRoute || {};
+  return {
+    decisionVersion: safeTraceText(decision.version || ""),
+    requestKind: safeTraceText(decision.requestKind || ""),
+    reason: safeTraceText(decision.reason || "manual_route"),
+    requestedModel: safeTraceText(
+      decision.requestedModel || context.requestedModel || selectedRoute.id || selectedRoute.upstreamModel || "",
+    ),
+    originalRoute: safeTraceText(originalRoute.id || ""),
+    originalDisplayName: safeTraceText(
+      originalRoute.displayName || originalRoute.id || originalRoute.upstreamModel || "",
+    ),
+    originalUpstreamModel: safeTraceText(originalRoute.upstreamModel || originalRoute.id || ""),
+    selectedRoute: safeTraceText(selectedRoute.id || route.id || ""),
+    selectedDisplayName: safeTraceText(
+      selectedRoute.displayName || selectedRoute.id || selectedRoute.upstreamModel || route.displayName || "",
+    ),
+    selectedUpstreamModel: safeTraceText(selectedRoute.upstreamModel || route.model || selectedRoute.id || ""),
+    selectedApi: safeTraceText(selectedRoute.api || route.api || ""),
+    changed: Boolean(decision.changed),
+    rewriteModel: safeTraceText(decision.rewriteModel || ""),
+    skippedRoutes: routeDecisionTraceSkippedRoutes(decision.skippedRoutes),
+    userMessage: safeTraceText(decision.userMessage || ""),
+  };
 }
 
-function trimUpstreamFailureCache() {
-  const now = Date.now();
-  for (const [key, value] of recentUpstreamFailures) {
-    if (value.expiresAt <= now) {
-      recentUpstreamFailures.delete(key);
-    }
+function routeDecisionTraceSkippedRoutes(skippedRoutes = []) {
+  if (!Array.isArray(skippedRoutes)) {
+    return [];
   }
-  while (recentUpstreamFailures.size >= FAILURE_CACHE_MAX_ENTRIES) {
-    const oldestKey = recentUpstreamFailures.keys().next().value;
-    recentUpstreamFailures.delete(oldestKey);
-  }
+  return skippedRoutes
+    .map((item) => ({
+      routeId: safeTraceText(item?.routeId || item?.id || ""),
+      reason: safeTraceText(item?.reason || "excluded"),
+      detail: safeTraceText(item?.detail || ""),
+    }))
+    .filter((item) => item.routeId);
 }
 
-function upstreamFailureKey(route, upstreamUrl, payload) {
-  const material = stableStringify({
-    route: {
-      id: route.id || "",
-      provider: route.provider || route.providerId || "",
-      api: route.api || "",
-      model: route.model || "",
-      baseUrl: route.baseUrl || "",
-      authMode: authModeForRoute(route),
-      apiKeyEnv: route.apiKeyEnv || route.keyEnv || "",
-      inlineApiKeyPresent: Boolean(route.apiKey),
-    },
-    upstreamUrl: safeUrl(upstreamUrl),
-    payload,
-  });
-  return createHash("sha256").update(material).digest("hex");
+function safeTraceText(value) {
+  return String(value || "")
+    .replaceAll("\r", " ")
+    .replaceAll("\n", " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240);
+}
+
+function notifyUpstreamUsage(context = {}, route = {}, usage = null) {
+  if (typeof context.onUpstreamUsage !== "function") {
+    return;
+  }
+  try {
+    context.onUpstreamUsage(route, usage);
+  } catch (error) {
+    console.warn(
+      `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+        `!! usage-budget-record route=${route.id || "(unknown)"} ` +
+        `error=${safeText(error?.message || error, 240)}`,
+    );
+  }
 }
 
 function stableStringify(value) {
@@ -3228,10 +4878,59 @@ async function fetchUpstream(upstreamUrl, init, context = {}, route = {}, option
   await waitForRouteCapacity(route, context, options);
   const proxiedInit = fetchInitWithProxy(upstreamUrl, init);
   const usedProxy = Boolean(proxiedInit.dispatcher);
+  const proxiedOptions = streamingProxyFetchOptions(route, options, usedProxy);
   const proxyLabel = proxyLogLabel(upstreamUrl);
   try {
-    return await fetchAndTrackRateLimit(upstreamUrl, proxiedInit, route, options, context);
-  } catch (error) {
+    return await fetchAndTrackRateLimit(upstreamUrl, proxiedInit, route, proxiedOptions, context);
+  } catch (initialError) {
+    let error = initialError;
+    if (
+      usedProxy &&
+      options.streamingResponse &&
+      error instanceof UpstreamTimeoutError &&
+      invalidateProxyAgentForUrl(upstreamUrl)
+    ) {
+      const refreshedInit = fetchInitWithProxy(upstreamUrl, init);
+      if (refreshedInit.dispatcher && refreshedInit.dispatcher !== proxiedInit.dispatcher) {
+        console.warn(
+          `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+            `!! proxy route=${route.id || "-"} streaming_headers_timeout ` +
+            `action=refresh_dispatcher retry_timeout_ms=${proxiedOptions.timeoutMs}`,
+        );
+        try {
+          return await fetchAndTrackRateLimit(
+            upstreamUrl,
+            refreshedInit,
+            route,
+            proxiedOptions,
+            context,
+          );
+        } catch (refreshedError) {
+          error = refreshedError;
+        }
+      }
+    }
+    if (usedProxy && isNetworkFetchFailure(error)) {
+      const refreshedInit = refreshFetchInitWithProxy(upstreamUrl, init);
+      if (refreshedInit.dispatcher) {
+        console.warn(
+          `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+            `!! proxy route=${route.id || "-"} network_failure ` +
+            "action=refresh_system_proxy retry=proxy",
+        );
+        try {
+          return await fetchAndTrackRateLimit(
+            upstreamUrl,
+            refreshedInit,
+            route,
+            proxiedOptions,
+            context,
+          );
+        } catch (refreshedError) {
+          error = refreshedError;
+        }
+      }
+    }
     if (!usedProxy || !isNetworkFetchFailure(error)) {
       throw isNetworkFetchFailure(error)
         ? new UpstreamNetworkError(error, upstreamUrl, route, proxyLabel)
@@ -3248,6 +4947,25 @@ async function fetchUpstream(upstreamUrl, init, context = {}, route = {}, option
   }
 }
 
+export function streamingProxyFetchOptions(route = {}, options = {}, usedProxy = false) {
+  if (!usedProxy || !options.streamingResponse) {
+    return options;
+  }
+  const routeTimeout = upstreamTimeoutMs(route, options);
+  const configuredHeaderTimeout = Number(
+    options.proxyHeaderTimeoutMs ??
+      route.proxyHeaderTimeoutMs ??
+      route.proxy_header_timeout_ms,
+  );
+  const headerTimeout = Number.isFinite(configuredHeaderTimeout) && configuredHeaderTimeout > 0
+    ? Math.floor(configuredHeaderTimeout)
+    : DEFAULT_STREAMING_PROXY_HEADER_TIMEOUT_MS;
+  return {
+    ...options,
+    timeoutMs: routeTimeout > 0 ? Math.min(routeTimeout, headerTimeout) : headerTimeout,
+  };
+}
+
 async function fetchAndTrackRateLimit(upstreamUrl, init, route, options = {}, context = {}) {
   const abortable = abortableFetchInit(init, upstreamUrl, route, options, context);
   try {
@@ -3255,17 +4973,73 @@ async function fetchAndTrackRateLimit(upstreamUrl, init, route, options = {}, co
     if (response.status === 429 && options.trackRateLimit !== false) {
       markRouteRateLimited(route, response.headers);
     }
-    return response;
+    abortable.responseStarted(response);
+    return responseWithAbortLifecycle(response, abortable, upstreamUrl, route);
   } catch (error) {
-    if (abortable.clientAborted()) {
-      throw new ClientClosedRequestError();
-    }
-    if (abortable.timedOut()) {
-      throw new UpstreamTimeoutError(abortable.timeoutMs, upstreamUrl, route);
-    }
-    throw error;
-  } finally {
     abortable.cleanup();
+    throw abortLifecycleError(error, abortable, upstreamUrl, route);
+  }
+}
+
+function responseWithAbortLifecycle(response, abortable, upstreamUrl, route) {
+  if (!response?.body) {
+    abortable.cleanup();
+    return response;
+  }
+  const reader = response.body.getReader();
+  let settled = false;
+  const settle = () => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    abortable.cleanup();
+  };
+  const body = new ReadableStream({
+    async pull(controller) {
+      try {
+        const result = await reader.read();
+        if (result.done) {
+          settle();
+          controller.close();
+          return;
+        }
+        controller.enqueue(result.value);
+      } catch (error) {
+        settle();
+        controller.error(abortLifecycleError(error, abortable, upstreamUrl, route));
+      }
+    },
+    async cancel(reason) {
+      try {
+        await reader.cancel(reason);
+      } finally {
+        settle();
+      }
+    },
+  });
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
+function abortLifecycleError(error, abortable, upstreamUrl, route) {
+  if (abortable.clientAborted()) {
+    return new ClientClosedRequestError();
+  }
+  if (abortable.timedOut()) {
+    return new UpstreamTimeoutError(abortable.timeoutMs, upstreamUrl, route);
+  }
+  return error;
+}
+
+async function cancelUpstreamResponse(response) {
+  try {
+    await response?.body?.cancel?.();
+  } catch {
+    // The fallback request is authoritative; cancellation is best-effort cleanup.
   }
 }
 
@@ -3275,6 +5049,7 @@ function abortableFetchInit(init = {}, upstreamUrl, route = {}, options = {}, co
   let timeoutTriggered = false;
   let clientTriggered = Boolean(context.clientSignal?.aborted);
   const timeoutMs = upstreamTimeoutMs(route, options);
+  let clearRequestTimeout = () => {};
 
   const abort = (reason) => {
     if (!controller.signal.aborted) {
@@ -3311,7 +5086,8 @@ function abortableFetchInit(init = {}, upstreamUrl, route = {}, options = {}, co
       timeoutTriggered = true;
       abort(new Error(`upstream timeout after ${timeoutMs}ms`));
     }, timeoutMs);
-    cleanup.push(() => clearTimeout(timeout));
+    clearRequestTimeout = () => clearTimeout(timeout);
+    cleanup.push(clearRequestTimeout);
   }
 
   return {
@@ -3322,6 +5098,11 @@ function abortableFetchInit(init = {}, upstreamUrl, route = {}, options = {}, co
     timeoutMs,
     clientAborted: () => clientTriggered || Boolean(context.clientSignal?.aborted),
     timedOut: () => timeoutTriggered,
+    responseStarted: (response) => {
+      if (options.streamingResponse && responseUsesEventStream(response)) {
+        clearRequestTimeout();
+      }
+    },
     cleanup: () => {
       for (const fn of cleanup.splice(0)) {
         fn();
@@ -3330,7 +5111,7 @@ function abortableFetchInit(init = {}, upstreamUrl, route = {}, options = {}, co
   };
 }
 
-function upstreamTimeoutMs(route = {}, options = {}) {
+export function upstreamTimeoutMs(route = {}, options = {}) {
   const value = Number(
     options.timeoutMs ??
       route.upstreamTimeoutMs ??
@@ -3396,7 +5177,84 @@ function extractResponsesUsage(text) {
 }
 
 function extractResponsesObject(text) {
-  return extractResponseObjectFromSse(text);
+  return hydrateStreamedImageGenerationResults(
+    extractResponseObjectFromSse(text),
+    text,
+  );
+}
+
+function hydrateStreamedImageGenerationResults(response, text = "") {
+  if (!response || !Array.isArray(response.output)) {
+    return response;
+  }
+  const byItemId = new Map();
+  const byOutputIndex = new Map();
+  for (const event of parseSseEvents(text)) {
+    const data = tryParseJson(String(event?.data || "").trim());
+    const outputItem = data?.type === "response.output_item.done" &&
+      data?.item?.type === "image_generation_call"
+      ? data.item
+      : null;
+    const result = outputItem
+      ? (typeof outputItem.result === "string" ? outputItem.result.trim() : "")
+      : data?.type === "response.image_generation_call.partial_image"
+        ? (typeof data.partial_image_b64 === "string" ? data.partial_image_b64.trim() : "")
+        : "";
+    if (!result) {
+      continue;
+    }
+    const candidate = {
+      result,
+      partialImageIndex: Number(data.partial_image_index || 0),
+      revisedPrompt: typeof outputItem?.revised_prompt === "string"
+        ? outputItem.revised_prompt
+        : "",
+      itemId: outputItem?.id || data.item_id || "",
+      outputIndex: Number.isInteger(data.output_index) ? data.output_index : -1,
+      outputItem,
+    };
+    const itemId = outputItem?.id || data.item_id;
+    if (typeof itemId === "string" && itemId) {
+      byItemId.set(itemId, candidate);
+    }
+    if (Number.isInteger(data.output_index) && data.output_index >= 0) {
+      byOutputIndex.set(data.output_index, candidate);
+    }
+  }
+  const appliedCandidates = new Set();
+  response.output.forEach((item, outputIndex) => {
+    if (
+      item?.type !== "image_generation_call" ||
+      (typeof item.result === "string" && item.result.trim())
+    ) {
+      return;
+    }
+    const candidate = byItemId.get(item.id) || byOutputIndex.get(outputIndex);
+    if (candidate?.result) {
+      appliedCandidates.add(candidate);
+      item.result = candidate.result;
+      if (!item.revised_prompt && candidate.revisedPrompt) {
+        item.revised_prompt = candidate.revisedPrompt;
+      }
+    }
+  });
+  const streamedCandidates = [...new Set([
+    ...byOutputIndex.values(),
+    ...byItemId.values(),
+  ])]
+    .filter((candidate) => candidate?.result && !appliedCandidates.has(candidate))
+    .sort((left, right) => left.outputIndex - right.outputIndex);
+  for (const candidate of streamedCandidates) {
+    response.output.push({
+      ...(candidate.outputItem || {}),
+      id: candidate.itemId || candidate.outputItem?.id || `image_generation_${response.output.length}`,
+      type: "image_generation_call",
+      status: candidate.outputItem?.status || "completed",
+      result: candidate.result,
+      ...(candidate.revisedPrompt ? { revised_prompt: candidate.revisedPrompt } : {}),
+    });
+  }
+  return response;
 }
 
 function isResponsesObject(value) {
@@ -3436,17 +5294,87 @@ function recordResponsesHistory(
   if (!history || !isResponsesObject(response)) {
     return;
   }
-  history.record(response.id, [
-    ...sourceMessages,
-    assistantHistoryMessageFromResponse(response, toolContext),
-  ]);
-  history.recordResponse(response, {
-    api: "responses",
-    routeId: route.id || "",
-    upstreamModel: route.model || "",
-    upstreamKnown: true,
-    ...responseRequestUserMeta(requestBody),
-  });
+  recordHistoryTurn(
+    history,
+    response,
+    [
+      ...sourceMessages,
+      assistantHistoryMessageFromResponse(response, toolContext),
+    ],
+    {
+      api: "responses",
+      routeId: route.id || "",
+      upstreamModel: route.model || "",
+      upstreamKnown: true,
+      ...responseRequestUserMeta(requestBody),
+    },
+    { requestBody, route },
+  );
+}
+
+function recordHistoryTurn(
+  history,
+  response,
+  messages,
+  meta = {},
+  { requestBody = {}, route = {} } = {},
+) {
+  if (!history || !response?.id) {
+    return;
+  }
+  const turn = {
+    responseId: response.id,
+    messages,
+    response,
+    meta: {
+      ...meta,
+      parentResponseId: requestBody.previous_response_id || null,
+      routeSnapshot: routeSnapshotForHistory(route),
+    },
+  };
+  try {
+    if (typeof history.recordTurn === "function") {
+      history.recordTurn(turn);
+      return;
+    }
+    history.record?.(response.id, messages);
+    history.recordResponse?.(response, turn.meta);
+  } catch (error) {
+    throw asLocalHistoryStorageError(error);
+  }
+}
+
+function routeSnapshotForHistory(route = {}) {
+  try {
+    return createRouteSnapshot(route, {
+      contextPolicy: contextSwitchPolicyForRoute(route),
+    });
+  } catch {
+    // Keep the response durable even when a malformed legacy route cannot
+    // produce a trusted snapshot. A later cross-route switch will fail closed.
+    return {
+      id: route.id || "",
+      api: route.api || "",
+      model: route.model || "",
+    };
+  }
+}
+
+function asLocalHistoryStorageError(error) {
+  if (
+    error?.localHistoryError ||
+    error?.code === "local_history_storage_unavailable"
+  ) {
+    return error;
+  }
+  const wrapped = new Error(
+    `Local response history storage failed: ${error?.message || String(error)}`,
+  );
+  wrapped.statusCode = 503;
+  wrapped.code = "local_history_storage_unavailable";
+  wrapped.localHistoryError = true;
+  wrapped.cause = error;
+  return wrapped;
 }
 
 function responseRequestUserMeta(requestBody = {}) {

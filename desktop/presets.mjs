@@ -170,6 +170,9 @@ export const PROVIDERS = [
 ];
 
 export const MODEL_PRESETS = [
+  route("codex-gpt-5-6-sol", "codex", "GPT-5.6-Sol", "gpt-5.6-sol", "responses", 372000, imageInput(codexFastMode(codex56Metadata("low", true, "v2")))),
+  route("codex-gpt-5-6-terra", "codex", "GPT-5.6-Terra", "gpt-5.6-terra", "responses", 372000, imageInput(codexFastMode(codex56Metadata("medium", true, "v2")))),
+  route("codex-gpt-5-6-luna", "codex", "GPT-5.6-Luna", "gpt-5.6-luna", "responses", 372000, imageInput(codexFastMode(codex56Metadata("medium", false, "v1")))),
   route("codex-gpt-5-5", "codex", "GPT-5.5", "gpt-5.5", "responses", 258400, imageInput(codexFastMode())),
   route("codex-gpt-5-4", "codex", "GPT-5.4", "gpt-5.4", "responses", 258400, imageInput(codexFastMode())),
   route("codex-gpt-5-4-mini", "codex", "GPT-5.4-Mini", "gpt-5.4-mini", "responses", 258400, imageInput()),
@@ -260,8 +263,8 @@ export function defaultSelectedModelIds(mode) {
     ];
   }
   return [
-    "codex-gpt-5-5",
-    "codex-gpt-5-4",
+    "codex-gpt-5-6-sol",
+    "codex-gpt-5-6-terra",
     "deepseek-v4-pro",
     "deepseek-v4-flash",
     "kimi-k2-7-code",
@@ -307,5 +310,33 @@ function codexFastMode(extra = {}) {
       },
     ],
     ...extra,
+  };
+}
+
+function codex56Metadata(defaultReasoningLevel, includeUltra, multiAgentVersion) {
+  const supportedReasoningLevels = [
+    { effort: "low", description: "Fast responses with lighter reasoning" },
+    { effort: "medium", description: "Balances speed and reasoning depth for everyday tasks" },
+    { effort: "high", description: "Greater reasoning depth for complex problems" },
+    { effort: "xhigh", description: "Extra high reasoning depth for complex problems" },
+    { effort: "max", description: "Maximum reasoning depth for the hardest problems" },
+  ];
+  if (includeUltra) {
+    supportedReasoningLevels.push({
+      effort: "ultra",
+      description: "Maximum reasoning with automatic task delegation",
+    });
+  }
+  return {
+    defaultReasoningLevel,
+    supportedReasoningLevels,
+    useResponsesLite: true,
+    supportsReasoningSummaries: true,
+    defaultReasoningSummary: "none",
+    supportVerbosity: true,
+    defaultVerbosity: "low",
+    webSearchToolType: "text_and_image",
+    toolMode: "code_mode_only",
+    multiAgentVersion,
   };
 }

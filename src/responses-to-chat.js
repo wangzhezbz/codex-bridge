@@ -1,5 +1,7 @@
+import { isDeepStrictEqual } from "node:util";
 import { asArray, stringifyJson } from "./json.js";
 import { normalizeAdapterProfile, reasoningParamsForAdapter } from "./adapter-profile.js";
+import { contextPolicyForRoute } from "./context-policy.js";
 import {
   buildToolContext,
   chatMessageFromToolOutput,
@@ -11,8 +13,6 @@ import {
 } from "./tools.js";
 
 const MAX_CHAT_DATA_IMAGE_URL_CHARS = 2_000_000;
-const CHAT_CONTEXT_INPUT_PERCENT = 65;
-const MIN_CHAT_CONTEXT_INPUT_TOKENS = 128;
 const OVERSIZED_IMAGE_PLACEHOLDER =
   "[image input omitted because it is too large for this chat provider]";
 const MCP_TOOL_GUIDANCE =
@@ -52,13 +52,20 @@ const ATTACHMENT_GUIDANCE =
   "If needed content is missing, ask the user to switch to a GPT/Responses model or provide text/OCR output.";
 const MAX_EXTRACTABLE_FILE_BYTES = 5_000_000;
 const MAX_EXTRACTED_FILE_TEXT_CHARS = 120_000;
+const UNNAMED_FILE_NAME = "未命名文件";
 const CHAT_PROMPT_CACHE_CONTROL = { type: "ephemeral" };
 const MAX_PROMPT_CACHE_BREAKPOINTS = 4;
+export const CODEXBRIDGE_CAPABILITY_TOOL_NAME = "codexbridge_capability";
 
-export function responsesToChatRequest(request, route, history) {
-  const { messages: sourceMessages, toolContext } =
-    responseRequestToChatSourceMessages(request, route, history);
-  const normalizedMessages = trimMessagesToRouteContext(sourceMessages, route);
+export function responsesToChatRequest(request, route, history, options = {}) {
+  const { messages: sourceMessages, messagesForHistory, toolContext } =
+    responseRequestToChatSourceMessages(request, route, history, options);
+  const contextPolicy = chatContextPolicyForRoute(route);
+  const sourceTokens = estimatedMessagesTokens(sourceMessages);
+  const normalizedMessages = trimMessagesToRouteContext(sourceMessages, route, {
+    contextPolicy,
+  });
+  const normalizedTokens = estimatedMessagesTokens(normalizedMessages);
 
   const body = {
     model: route.model,
@@ -110,37 +117,119 @@ export function responsesToChatRequest(request, route, history) {
     toolContext,
     toolDiagnostics: toolDiagnosticsFromContext(toolContext, resolvedToolChoice),
     wantsStream: Boolean(request.stream),
-    messagesForHistory: sourceMessages,
+    messagesForHistory: messagesForHistory || sourceMessages,
+    contextDecision: sourceTokens > contextPolicy.inputBudget
+      ? {
+          event: "context_truncation",
+          kind: "chat_payload",
+          policyId: contextPolicy.policyId,
+          policyVersion: contextPolicy.version,
+          inputBudget: contextPolicy.inputBudget,
+          beforeTokens: sourceTokens,
+          afterTokens: normalizedTokens,
+          preservedToolCount: preservedToolBoundaryCount(normalizedMessages),
+          outcome: "truncated",
+          reasonCode: "input_budget_exceeded",
+        }
+      : null,
   };
 }
 
-export function responseRequestToChatSourceMessages(request, route, history) {
-  const toolContext = buildToolContext(request.tools || [], { route });
+export function responseRequestToChatSourceMessages(request, route, history, options = {}) {
+  const toolContext = buildToolContext(responseToolsForChatRequest(request, options), { route });
   const priorMessages = history?.get?.(request.previous_response_id) || [];
-  const currentMessages = responseInputToChatMessages(
-    request.messages ?? request.input,
-    toolContext,
-    route,
+  const currentMessages = stripExactPersistedHistoryPrefix(
+    responseInputToChatMessages(
+      request.messages ?? request.input,
+      toolContext,
+      route,
+    ),
+    priorMessages,
   );
 
-  const messages = [];
+  const headerMessages = [];
   const instructions = systemInstructionsFromRequest(request);
   if (instructions) {
-    messages.push({ role: "system", content: instructions });
+    headerMessages.push({ role: "system", content: instructions });
   }
   const toolGuidance = toolGuidanceFromContext(toolContext, request);
   if (toolGuidance) {
-    messages.push({ role: "system", content: toolGuidance });
+    headerMessages.push({ role: "system", content: toolGuidance });
   }
   const attachmentGuidance = attachmentGuidanceFromRequest(request);
   if (attachmentGuidance) {
-    messages.push({ role: "system", content: attachmentGuidance });
+    headerMessages.push({ role: "system", content: attachmentGuidance });
   }
-  messages.push(...priorMessages, ...currentMessages);
-  const sourceMessages = sanitizeMessagesForRoute(normalizeToolCallPairs(messages, {
+  const historySourceMessages = sanitizeMessagesForRoute(normalizeToolCallPairs([
+    ...headerMessages,
+    ...priorMessages,
+    ...currentMessages,
+  ], {
     flattenToolCalls: shouldFlattenToolCallHistory(route),
   }), route);
-  return { messages: sourceMessages, toolContext };
+  const contextSwitchSummary = contextSwitchCompactionMessage(options.contextSwitchCompaction);
+  if (contextSwitchSummary && priorMessages.length > 0) {
+    const protectedMessages = Array.isArray(options.contextSwitchCompaction?.protectedMessages)
+      ? options.contextSwitchCompaction.protectedMessages
+      : [];
+    const compactedSourceMessages = sanitizeMessagesForRoute(normalizeToolCallPairs([
+      ...headerMessages,
+      contextSwitchSummary,
+      ...protectedMessages,
+      ...currentMessages,
+    ], {
+      flattenToolCalls: shouldFlattenToolCallHistory(route),
+    }), route);
+    return {
+      messages: compactedSourceMessages,
+      messagesForHistory: compactedSourceMessages,
+      toolContext,
+    };
+  }
+  return { messages: historySourceMessages, toolContext };
+}
+
+export function stripExactPersistedHistoryPrefix(currentMessages, priorMessages) {
+  if (
+    !Array.isArray(currentMessages) ||
+    !Array.isArray(priorMessages)
+  ) {
+    return currentMessages;
+  }
+  const comparablePriorMessages = priorMessages.slice(
+    firstNonSystemMessageIndex(priorMessages),
+  );
+  if (
+    comparablePriorMessages.length === 0 ||
+    currentMessages.length < comparablePriorMessages.length
+  ) {
+    return currentMessages;
+  }
+  for (let index = 0; index < comparablePriorMessages.length; index += 1) {
+    if (!isDeepStrictEqual(currentMessages[index], comparablePriorMessages[index])) {
+      return currentMessages;
+    }
+  }
+  return currentMessages.slice(comparablePriorMessages.length);
+}
+
+function firstNonSystemMessageIndex(messages) {
+  let index = 0;
+  while (index < messages.length && messages[index]?.role === "system") {
+    index += 1;
+  }
+  return index;
+}
+
+function contextSwitchCompactionMessage(compaction = null) {
+  const text = String(compaction?.summary || "").trim();
+  if (!text) {
+    return null;
+  }
+  return {
+    role: "user",
+    content: text,
+  };
 }
 
 export function responseInputToChatMessages(input, toolContext, route = {}) {
@@ -530,8 +619,8 @@ function normalizedInputAudio(part) {
 
 function unavailableAudioText(part) {
   const inputAudio = normalizedInputAudio(part);
-  const description = inputAudio.format ? `${inputAudio.format} audio` : "audio";
-  return `[audio input not forwarded to this chat provider: ${description}. Switch to an audio-capable GPT/Responses or chat route, or provide a transcript.]`;
+  const description = inputAudio.format ? `${inputAudio.format} 音频` : "音频";
+  return `[CodexBridge 当前不会把音频直接转发给这个 Chat 模型：${description}。请先提供文字转录后再继续。]`;
 }
 
 function audioFormatFromMime(mime) {
@@ -560,7 +649,7 @@ function filePartName(part) {
     part.name ||
     part.file_id ||
     part.id ||
-    "unnamed file"
+    UNNAMED_FILE_NAME
   );
 }
 
@@ -568,7 +657,7 @@ function filePartToChat(part, route = {}) {
   if (shouldForwardFilesToChat(route)) {
     const file = {};
     const filename = filePartName(part);
-    if (filename && filename !== "unnamed file") {
+    if (filename && filename !== UNNAMED_FILE_NAME) {
       file.filename = filename;
     }
     if (typeof part.file_id === "string" && part.file_id) {
@@ -786,9 +875,9 @@ function unavailableFileText(part) {
     String(part?.mime_type || part?.mimeType || ""),
     name,
   )
-    ? "PDF attachment"
-    : "File attachment";
-  return `${type} unavailable to this chat provider: ${name}. CodexBridge did not forward or extract readable text. Ask the user to switch to a GPT/Responses model or provide text/OCR output.`;
+    ? "PDF 附件"
+    : "文件附件";
+  return `${type}当前 Chat 模型不可用：${name}。CodexBridge 没有转发该文件，也没有提取到可读文本。请切换到 GPT/Responses 模型，或提供文本/OCR 内容。`;
 }
 
 function attachmentGuidanceFromRequest(request = {}) {
@@ -846,8 +935,14 @@ function toolGuidanceFromContext(toolContext, request = {}) {
     name.includes("browser") ||
     name.includes("chrome")
   );
+  const interactiveKind = interactivePluginKindForRequest(request);
+  const hasControlledBrowserBridge =
+    interactiveKind === "chrome" && Boolean(controlledBrowserCapabilityChatName(toolContext));
+  const needsBridgeCapabilityGuidance = names.includes(CODEXBRIDGE_CAPABILITY_TOOL_NAME);
   const needsInteractiveFallbackGuidance =
-    requestMentionsInteractivePluginWork(request) &&
+    Boolean(interactiveKind) &&
+    !hasControlledBrowserBridge &&
+    !needsBridgeCapabilityGuidance &&
     !chatNameForTool(toolContext, "mcp__node_repl__js");
   const needsCommandGuidance =
     names.some(isCommandToolName) && requestMentionsCommandWork(request);
@@ -855,6 +950,7 @@ function toolGuidanceFromContext(toolContext, request = {}) {
     names.some(isCommandToolName) && requestMentionsGitHubRepositoryInspection(request);
   const needsToolOutputContinuationGuidance = requestHasResponseToolOutput(request);
   return [
+    needsBridgeCapabilityGuidance ? bridgeCapabilityGuidanceFromContext(toolContext) : "",
     needsGuidance ? MCP_TOOL_GUIDANCE : "",
     needsInteractiveFallbackGuidance ? INTERACTIVE_CHAT_FALLBACK_GUIDANCE : "",
     needsCommandGuidance ? COMMAND_TOOL_GUIDANCE : "",
@@ -863,6 +959,685 @@ function toolGuidanceFromContext(toolContext, request = {}) {
   ]
     .filter(Boolean)
     .join(" ");
+}
+
+function bridgeCapabilityGuidanceFromContext(toolContext = {}) {
+  const bridgeTool = toolContext.chatTools?.find((tool) =>
+    tool?.function?.name === CODEXBRIDGE_CAPABILITY_TOOL_NAME
+  );
+  const properties = bridgeTool?.function?.parameters?.properties || {};
+  const capabilities = new Set(asArray(properties.capability?.enum).map((item) => String(item || "")));
+  const actions = new Set(asArray(properties.action?.enum).map((item) => String(item || "")));
+  const descriptions = [];
+  if (capabilities.has("browser") && actions.has("read_url")) {
+    descriptions.push("browser/read_url for reading an http or https webpage or safe bare domains");
+  }
+  if (capabilities.has("browser") && actions.has("open_url")) {
+    descriptions.push("browser/open_url for opening an http or https URL or safe bare domains in the system browser");
+  }
+  if (capabilities.has("web_search") && actions.has("search")) {
+    descriptions.push("web_search/search for searching the web through a configured search provider");
+  }
+  if (capabilities.has("webpage_screenshot") && actions.has("screenshot_url")) {
+    descriptions.push("webpage_screenshot/screenshot_url for capturing an http or https webpage or safe bare domains through a configured screenshot provider");
+  }
+  if (capabilities.has("ocr") && actions.has("extract_text")) {
+    descriptions.push("ocr/extract_text for extracting text from an http or https image URL or safe bare domains through a configured OCR provider");
+  }
+  if (capabilities.has("file_processing") && actions.has("extract_text")) {
+    descriptions.push("file_processing/extract_text for extracting text from an http or https file URL or explicit local file path through a configured file provider");
+  }
+  if (capabilities.has("file_processing") && actions.has("inspect_file")) {
+    descriptions.push("file_processing/inspect_file for inspecting metadata and a short preview of an explicit local text file path through a local_file provider");
+  }
+  if (capabilities.has("speech") && actions.has("synthesize")) {
+    descriptions.push("speech/synthesize for turning text into speech through a configured speech provider");
+  }
+  if (capabilities.has("video") && actions.has("generate")) {
+    descriptions.push("video/generate for generating video through a configured video provider");
+  }
+  if (capabilities.has("computer_use") && actions.has("list_apps")) {
+    descriptions.push("computer_use/list_apps for listing safe allowlisted local apps");
+  }
+  if (capabilities.has("computer_use") && actions.has("open_app")) {
+    descriptions.push("computer_use/open_app for opening an allowlisted local app by name");
+  }
+  if (capabilities.has("computer_use") && actions.has("screenshot_desktop")) {
+    descriptions.push("computer_use/screenshot_desktop for taking a safe desktop screenshot when the desktop executor is connected");
+  }
+  const available = descriptions.length > 0
+    ? descriptions.join(", ")
+    : "the capability/action pairs listed in this request's codexbridge_capability tool schema";
+  const filePathGuidance = capabilities.has("file_processing")
+    ? " For local_file file_processing providers, use path/filePath/localPath only for an explicit local file path provided in the current user request; never send local paths to remote file providers."
+    : "";
+  return `CodexBridge controlled capability guidance: use codexbridge_capability only for allowed tasks: ${available}.` +
+    filePathGuidance +
+    " Do not use shell commands for these controlled capability tasks or unsupported actions.";
+}
+
+function responseToolsForChatRequest(request = {}, options = {}) {
+  const tools = [...(request.tools || [])];
+  const requestedCapabilities = requestedBridgeCapabilitiesForRequest(request);
+  const requestedActions = requestedBridgeActionsForRequest(request, requestedCapabilities);
+  const bridgeTool = requestedCapabilities === null || requestedCapabilities.length > 0
+    ? bridgeCapabilityToolFromProviders(options.capabilityProviders, {
+      capabilities: requestedCapabilities,
+      actions: requestedActions,
+    })
+    : null;
+  if (bridgeTool) {
+    tools.push(bridgeTool);
+  }
+  return tools;
+}
+
+function requestWantsBridgeCapability(request = {}) {
+  if (bridgeToolChoiceSelected(request.tool_choice)) {
+    return true;
+  }
+  return requestedBridgeCapabilitiesForRequest(request).length > 0;
+}
+
+function requestedBridgeCapabilitiesForRequest(request = {}) {
+  if (bridgeToolChoiceSelected(request.tool_choice)) {
+    return null;
+  }
+  const text = requestCurrentUserText(request);
+  if (!text || isBridgeCapabilitySetupOrUiTask(text)) {
+    return [];
+  }
+  const capabilities = [];
+  if (requestMentionsInteractivePluginWork(request)) {
+    capabilities.push("computer_use", "browser");
+  }
+  if (textMentionsDesktopScreenshotWork(text)) {
+    capabilities.push("computer_use");
+  }
+  if (textMentionsWebSearchWork(text)) {
+    capabilities.push("web_search");
+  }
+  if (textMentionsBrowserWork(text) || textMentionsReadSearchResultWork(text)) {
+    capabilities.push("browser");
+  }
+  if (textMentionsWebpageScreenshotWork(text)) {
+    capabilities.push("webpage_screenshot");
+  }
+  if (textMentionsOcrWork(text)) {
+    capabilities.push("ocr");
+  }
+  if (textMentionsFileProcessingWork(text)) {
+    capabilities.push("file_processing");
+  }
+  if (textMentionsSpeechWork(text)) {
+    capabilities.push("speech");
+  }
+  if (textMentionsVideoWork(text)) {
+    capabilities.push("video");
+  }
+  return uniqueBridgeCapabilityValues(capabilities);
+}
+
+function requestedBridgeActionsForRequest(request = {}, capabilities = []) {
+  if (bridgeToolChoiceSelected(request.tool_choice)) {
+    return null;
+  }
+  if (!Array.isArray(capabilities) || capabilities.length === 0) {
+    return null;
+  }
+  const text = requestCurrentUserText(request);
+  const actions = [];
+  const scopedCapabilities = new Set();
+  if (capabilities.includes("browser")) {
+    const browserActions = [];
+    if (textMentionsBrowserReadWork(text) || textMentionsReadSearchResultWork(text)) {
+      browserActions.push("read_url");
+    }
+    if (textMentionsBrowserOpenWork(text)) {
+      browserActions.push("open_url");
+    }
+    if (browserActions.length > 0) {
+      scopedCapabilities.add("browser");
+      actions.push(...browserActions);
+    }
+  }
+  if (capabilities.includes("computer_use")) {
+    const computerActions = [];
+    if (textMentionsComputerAppLaunchWork(text)) {
+      computerActions.push("list_apps", "open_app");
+    }
+    if (textMentionsDesktopScreenshotWork(text)) {
+      computerActions.push("screenshot_desktop");
+    }
+    if (computerActions.length > 0) {
+      scopedCapabilities.add("computer_use");
+      actions.push(...computerActions);
+    }
+  }
+  if (capabilities.includes("file_processing")) {
+    const fileActions = [];
+    if (textMentionsFileInspectWork(text)) {
+      fileActions.push("inspect_file");
+    } else if (textMentionsFileProcessingWork(text)) {
+      fileActions.push("extract_text");
+    }
+    if (fileActions.length > 0) {
+      scopedCapabilities.add("file_processing");
+      actions.push(...fileActions);
+    }
+  }
+  if (scopedCapabilities.size === 0) {
+    return null;
+  }
+  for (const capability of capabilities) {
+    if (scopedCapabilities.has(capability)) {
+      continue;
+    }
+    const defaultActions = defaultBridgeActionsForUnscopedCapability(capability);
+    actions.push(...defaultActions);
+  }
+  return uniqueBridgeCapabilityValues(actions);
+}
+
+function defaultBridgeActionsForUnscopedCapability(capability = "") {
+  switch (capability) {
+    case "web_search":
+      return ["search"];
+    case "webpage_screenshot":
+      return ["screenshot_url"];
+    case "ocr":
+    case "file_processing":
+      return ["extract_text"];
+    case "speech":
+      return ["synthesize"];
+    case "video":
+      return ["generate"];
+    default:
+      return [];
+  }
+}
+
+function bridgeToolChoiceSelected(toolChoice) {
+  if (!toolChoice) {
+    return false;
+  }
+  if (typeof toolChoice === "string") {
+    return toolChoice === CODEXBRIDGE_CAPABILITY_TOOL_NAME;
+  }
+  if (typeof toolChoice !== "object") {
+    return false;
+  }
+  const name = String(toolChoice.name || toolChoice.function?.name || "").trim();
+  return name === CODEXBRIDGE_CAPABILITY_TOOL_NAME;
+}
+
+function isBridgeCapabilitySetupOrUiTask(text = "") {
+  const value = String(text || "");
+  const englishAction = "\\b(?:build|create|make|write|draft|implement|design|add|fix|configure|document)\\b";
+  const englishCapability = "\\b(?:browser|webpage|screenshot|search|ocr|file|speech|video|computer\\s*use)\\b";
+  const englishArtifact = "\\b(?:component|button|panel|page|screen|modal|form|toolbar|settings?|config|configuration|docs?|documentation|setup|provider|integration|api|schema|ui|ux|copy|wording|guide|workflow)\\b";
+  if (new RegExp(`${englishAction}.{0,32}${englishCapability}.{0,36}${englishArtifact}|${englishAction}.{0,32}${englishArtifact}.{0,36}${englishCapability}`, "i").test(value)) {
+    return true;
+  }
+  const chineseAction = "(?:帮我|给我|请|做|写|生成|创建|实现|开发|设计|添加|修复|配置|接入|优化)";
+  const chineseCapability = "(?:浏览器|网页|网站|截图|截屏|搜索|OCR|ocr|文件|语音|视频|Computer Use|电脑)";
+  const chineseArtifact = "(?:组件|按钮|面板|页面|弹窗|表单|设置|配置|文档|说明|供应商|接入|接口|功能|流程|方案|规范|文案)";
+  return new RegExp(`${chineseAction}.{0,24}${chineseCapability}.{0,28}${chineseArtifact}|${chineseAction}.{0,24}${chineseArtifact}.{0,28}${chineseCapability}`, "iu").test(value);
+}
+
+function textMentionsWebSearchWork(text = "") {
+  return /(?:\b(?:search|web\s*search|look\s*up|google|find\s+(?:online|on\s+the\s+web|latest))\b|搜索|搜一下|查一下|联网查|全网查|网上查)/i.test(String(text || ""));
+}
+
+function textMentionsBrowserWork(text = "") {
+  const value = String(text || "");
+  const hasUrl = textContainsUrlLikeTarget(value);
+  return /(?:\b(?:open|visit|browse|read)\b|打开|访问|浏览|读取).{0,32}(?:browser|webpage|web\s*page|site|website|url|link|网页|网站|链接|网址|浏览器)/i.test(value) ||
+    (hasUrl && /(?:\b(?:open|visit|browse|read)\b|打开|访问|浏览|读取)/i.test(value));
+}
+
+function textContainsUrlLikeTarget(text = "") {
+  return /https?:\/\/|www\.|(?:^|[\s，。；:：,.;:])[\w.-]+\.[a-z]{2,}(?:[\/\s，。；:：,.;:]|$)/i.test(String(text || ""));
+}
+
+function textMentionsReadSearchResultWork(text = "") {
+  const value = String(text || "");
+  return textMentionsWebSearchWork(value) &&
+    /\b(?:read|open|visit|browse)\b.{0,24}\b(?:best|top|first|result|results|page|article)\b/i.test(value);
+}
+
+function textMentionsBrowserReadWork(text = "") {
+  const value = String(text || "");
+  return /(?:\b(?:read|fetch|inspect|summarize|summarise)\b.{0,32}(?:browser|webpage|web\s*page|site|website|url|link|page|article)|(?:读取|阅读|查看|总结|概括).{0,32}(?:网页|网站|链接|网址|页面|文章))/i.test(value) ||
+    (textContainsUrlLikeTarget(value) && /\b(?:read|fetch|inspect|summarize|summarise)\b|读取|阅读|查看|总结|概括/i.test(value));
+}
+
+function textMentionsBrowserOpenWork(text = "") {
+  const value = String(text || "");
+  return /(?:\b(?:open|visit|browse)\b.{0,32}(?:browser|webpage|web\s*page|site|website|url|link|page)|(?:打开|访问|浏览).{0,32}(?:浏览器|网页|网站|链接|网址|页面))/i.test(value) ||
+    (textContainsUrlLikeTarget(value) && /\b(?:open|visit|browse)\b|打开|访问|浏览/i.test(value));
+}
+
+function textMentionsWebpageScreenshotWork(text = "") {
+  const value = String(text || "");
+  return /(?:\b(?:take|capture|get)\b.{0,24}\bscreenshot\b|\bscreenshot\b.{0,24}\b(?:of|for|from)\b|网页截图|网页截屏|页面截图|网站截图|截取.{0,12}(?:网页|页面|网站|截图|截屏))/i.test(value);
+}
+
+function textMentionsDesktopScreenshotWork(text = "") {
+  return /(?:\b(?:take|capture|get)\b.{0,24}\b(?:desktop|screen|display)\s+screenshot\b|\b(?:desktop|screen|display)\s+screenshot\b|桌面截图|屏幕截图|截取.{0,12}(?:桌面|屏幕|显示器))/i.test(String(text || ""));
+}
+
+function textMentionsComputerAppLaunchWork(text = "") {
+  const value = String(text || "");
+  return /(?:\b(?:open|launch|start|run)\b.{0,24}\b(?:app|application|notepad|calculator|paint|mspaint)\b|打开.{0,16}(?:应用|软件|记事本|计算器|画图)|启动.{0,16}(?:应用|软件|记事本|计算器|画图))/i.test(value);
+}
+
+function textMentionsOcrWork(text = "") {
+  return /(?:\bocr\b|extract.{0,24}text.{0,24}(?:image|screenshot|photo)|read.{0,24}text.{0,24}(?:image|screenshot|photo)|识别.{0,16}(?:图片|图像|截图|照片).{0,16}(?:文字|文本)|(?:图片|图像|截图|照片).{0,16}(?:文字|文本).{0,16}(?:识别|提取|读取))/i.test(String(text || ""));
+}
+
+function textMentionsFileProcessingWork(text = "") {
+  const value = String(text || "");
+  const hasLocalPath = /[A-Za-z]:\\|\\\\[^\\]+\\[^\\]+|\.(?:txt|md|json|csv|log|pdf|docx?|xlsx?|pptx?)\b/i.test(value);
+  return /(?:extract|read|inspect|parse).{0,24}(?:text|content|metadata)?.{0,24}(?:file|pdf|docx?|xlsx?|pptx?|report|url)/i.test(value) ||
+    /(?:读取|提取|检查|解析|查看).{0,24}(?:文件|PDF|报告|文档|表格|本地路径)/i.test(value) ||
+    hasLocalPath;
+}
+
+function textMentionsFileInspectWork(text = "") {
+  const value = String(text || "");
+  return /(?:\b(?:inspect|preview|stat)\b.{0,36}\b(?:file|metadata|info|path)\b|\b(?:file|metadata|info|path)\b.{0,36}\b(?:metadata|inspect|preview|stat|details?)\b|检查.{0,24}(?:文件|元数据|信息|路径)|预览.{0,24}(?:文件|内容)|查看.{0,24}(?:文件信息|文件元数据|文件属性))/i.test(value);
+}
+
+function textMentionsSpeechWork(text = "") {
+  return /(?:text\s*to\s*speech|tts|synthesize.{0,16}speech|read.{0,16}aloud|\bnarrate\b|\bvoice\s*over\b|语音合成|文字转语音|朗读)/i.test(String(text || ""));
+}
+
+function textMentionsVideoWork(text = "") {
+  const value = String(text || "");
+  if (/\b(?:component|button|panel|page|docs?|workflow|plan|script|copy)\b/i.test(value)) {
+    return false;
+  }
+  return /(?:generate|create|make|produce).{0,24}(?:video|clip|animation)|(?:生成|制作|做|创建).{0,24}(?:视频|动画|短片)/i.test(value);
+}
+
+function bridgeCapabilityToolFromProviders(providers = [], requestedScope = null) {
+  const allowedCapabilities = requestedBridgeCapabilitySet(requestedScope);
+  const allowedActions = requestedBridgeActionSet(requestedScope);
+  const support = bridgeCapabilitySupportFromProviders(providers, allowedCapabilities, allowedActions);
+  if (support.actions.length === 0) {
+    return null;
+  }
+  const inputProperties = bridgeCapabilityInputProperties(support);
+  return {
+    type: "function",
+    name: CODEXBRIDGE_CAPABILITY_TOOL_NAME,
+    description:
+      "Run a controlled CodexBridge capability through a local safe whitelist. " +
+      "Supported actions are browser/read_url, browser/open_url, web_search/search, webpage_screenshot/screenshot_url, ocr/extract_text, file_processing/extract_text, file_processing/inspect_file, speech/synthesize, video/generate, computer_use/list_apps, computer_use/open_app, and computer_use/screenshot_desktop when providers are configured.",
+    parameters: {
+      type: "object",
+      properties: {
+        capability: {
+          type: "string",
+          enum: support.capabilities,
+        },
+        action: {
+          type: "string",
+          enum: support.actions,
+        },
+        input: {
+          type: "object",
+          properties: inputProperties,
+        },
+        providerId: {
+          type: "string",
+          description: "Optional CodexBridge capability provider id.",
+        },
+      },
+      required: ["capability", "action", "input"],
+    },
+  };
+}
+
+function bridgeCapabilityInputProperties(support = {}) {
+  const capabilities = new Set(asArray(support.capabilities));
+  const actions = new Set(asArray(support.actions));
+  const properties = {};
+  if (
+    (capabilities.has("browser") && (actions.has("read_url") || actions.has("open_url"))) ||
+    (capabilities.has("webpage_screenshot") && actions.has("screenshot_url"))
+  ) {
+    properties.url = {
+      type: "string",
+      description: "The http or https URL to read, open, or capture. browser/read_url, browser/open_url, and webpage_screenshot/screenshot_url also accept safe bare domains, which CodexBridge normalizes to https.",
+    };
+  }
+  if (capabilities.has("web_search") && actions.has("search")) {
+    properties.query = {
+      type: "string",
+      description: "The search query to send to the configured web_search/search provider.",
+    };
+  }
+  if (capabilities.has("ocr") && actions.has("extract_text")) {
+    properties.imageUrl = {
+      type: "string",
+      description: "The http or https image URL to send to the configured ocr/extract_text provider. Safe bare domains are normalized to https.",
+    };
+  }
+  const hasFileProcessingAction = capabilities.has("file_processing") &&
+    (actions.has("extract_text") || actions.has("inspect_file"));
+  if (hasFileProcessingAction && support.remoteFileProcessing && actions.has("extract_text")) {
+    properties.fileUrl = {
+      type: "string",
+      description: "The http or https file URL to send to the configured file_processing/extract_text provider. Safe bare domains are normalized to https.",
+    };
+  }
+  if (hasFileProcessingAction && support.localFileProcessing) {
+    const fileActionLabel = actions.has("inspect_file") && !actions.has("extract_text")
+      ? "file_processing/inspect_file"
+      : "local_file file_processing provider";
+    properties.path = {
+      type: "string",
+      description: `An explicit local file path for a ${fileActionLabel}. Use only when the current user request includes that local path; never send local paths to remote file providers.`,
+    };
+    properties.filePath = {
+      type: "string",
+      description: `Alias for path when using a ${fileActionLabel} with an explicit local file path.`,
+    };
+    properties.localPath = {
+      type: "string",
+      description: `Alias for path when using a ${fileActionLabel} with an explicit local file path.`,
+    };
+  }
+  if (capabilities.has("speech") && actions.has("synthesize")) {
+    properties.text = {
+      type: "string",
+      description: "The text to send to the configured speech/synthesize provider.",
+    };
+  }
+  if (capabilities.has("video") && actions.has("generate")) {
+    properties.prompt = {
+      type: "string",
+      description: "The prompt to send to the configured video/generate provider.",
+    };
+  }
+  if (capabilities.has("computer_use") && actions.has("open_app")) {
+    properties.app = {
+      type: "string",
+      description: "The allowlisted local app name for computer_use/open_app, such as notepad, calculator, or paint.",
+    };
+  }
+  if (capabilities.has("computer_use") && actions.has("screenshot_desktop")) {
+    properties.displayId = {
+      type: "string",
+      description: "Optional desktop display id for computer_use/screenshot_desktop.",
+    };
+  }
+  return properties;
+}
+
+function bridgeCapabilitySupportFromProviders(providers = [], allowedCapabilities = null, allowedActions = null) {
+  const definitions = [
+    {
+      capability: "browser",
+      action: "read_url",
+      supported: providerSupportsBridgeBrowserRead,
+    },
+    {
+      capability: "browser",
+      action: "open_url",
+      supported: providerSupportsBridgeBrowserRead,
+    },
+    {
+      capability: "web_search",
+      action: "search",
+      supported: providerSupportsBridgeWebSearch,
+    },
+    {
+      capability: "webpage_screenshot",
+      action: "screenshot_url",
+      supported: providerSupportsBridgeWebpageScreenshot,
+    },
+    {
+      capability: "ocr",
+      action: "extract_text",
+      supported: providerSupportsBridgeOcr,
+    },
+    {
+      capability: "file_processing",
+      action: "extract_text",
+      supported: providerSupportsBridgeFileProcessing,
+    },
+    {
+      capability: "file_processing",
+      action: "inspect_file",
+      supported: providerSupportsBridgeFileInspect,
+    },
+    {
+      capability: "speech",
+      action: "synthesize",
+      supported: providerSupportsBridgeSpeech,
+    },
+    {
+      capability: "video",
+      action: "generate",
+      supported: providerSupportsBridgeVideo,
+    },
+    {
+      capability: "computer_use",
+      action: "list_apps",
+      supported: providerSupportsBridgeComputerUseOpenApp,
+    },
+    {
+      capability: "computer_use",
+      action: "open_app",
+      supported: providerSupportsBridgeComputerUseOpenApp,
+    },
+    {
+      capability: "computer_use",
+      action: "screenshot_desktop",
+      supported: providerSupportsBridgeComputerUseScreenshot,
+    },
+  ];
+  const supported = definitions.filter((definition) => {
+    if (allowedCapabilities?.size > 0 && !allowedCapabilities.has(definition.capability)) {
+      return false;
+    }
+    if (allowedActions?.size > 0 && !allowedActions.has(definition.action)) {
+      return false;
+    }
+    return asArray(providers).some((provider) => definition.supported(provider));
+  });
+  return {
+    capabilities: uniqueBridgeCapabilityValues(supported.map((definition) => definition.capability)),
+    actions: uniqueBridgeCapabilityValues(supported.map((definition) => definition.action)),
+    localFileProcessing: asArray(providers).some(providerSupportsBridgeLocalFileProcessing),
+    remoteFileProcessing: asArray(providers).some(providerSupportsBridgeRemoteFileProcessing),
+  };
+}
+
+function requestedBridgeCapabilitySet(capabilities = null) {
+  const values = Array.isArray(capabilities) ? capabilities : capabilities?.capabilities;
+  if (!Array.isArray(values)) {
+    return null;
+  }
+  return new Set(values.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean));
+}
+
+function requestedBridgeActionSet(scope = null) {
+  const values = scope?.actions;
+  if (!Array.isArray(values)) {
+    return null;
+  }
+  return new Set(values.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean));
+}
+
+function providerSupportsBridgeBrowserRead(provider = {}) {
+  if (!provider || typeof provider !== "object" || provider.enabled === false) {
+    return false;
+  }
+  const adapter = String(provider.adapter || "").trim().toLowerCase();
+  if (adapter !== "local_browser") {
+    return false;
+  }
+  return providerBridgeCapabilities(provider).includes("browser");
+}
+
+function providerSupportsBridgeWebSearch(provider = {}) {
+  if (!provider || typeof provider !== "object" || provider.enabled === false) {
+    return false;
+  }
+  const adapter = String(provider.adapter || "generic_http").trim().toLowerCase();
+  if (adapter !== "generic_http") {
+    return false;
+  }
+  if (!providerHasBridgeCapability(provider, "web_search")) {
+    return false;
+  }
+  const baseUrl = String(provider.baseUrl || "").trim();
+  const endpoint = String(provider.endpoint || "").trim();
+  return /^https?:\/\//i.test(baseUrl) && Boolean(endpoint);
+}
+
+function providerSupportsBridgeWebpageScreenshot(provider = {}) {
+  if (!provider || typeof provider !== "object" || provider.enabled === false) {
+    return false;
+  }
+  const adapter = String(provider.adapter || "generic_http").trim().toLowerCase();
+  if (adapter === "local_browser") {
+    return providerHasBridgeCapability(provider, "webpage_screenshot");
+  }
+  if (adapter !== "generic_http") {
+    return false;
+  }
+  if (!providerHasBridgeCapability(provider, "webpage_screenshot")) {
+    return false;
+  }
+  const baseUrl = String(provider.baseUrl || "").trim();
+  const endpoint = String(provider.endpoint || "").trim();
+  return /^https?:\/\//i.test(baseUrl) && Boolean(endpoint);
+}
+
+function providerSupportsBridgeOcr(provider = {}) {
+  if (!provider || typeof provider !== "object" || provider.enabled === false) {
+    return false;
+  }
+  const adapter = String(provider.adapter || "generic_http").trim().toLowerCase();
+  if (adapter !== "generic_http") {
+    return false;
+  }
+  if (!providerHasBridgeCapability(provider, "ocr")) {
+    return false;
+  }
+  const baseUrl = String(provider.baseUrl || "").trim();
+  const endpoint = String(provider.endpoint || "").trim();
+  return /^https?:\/\//i.test(baseUrl) && Boolean(endpoint);
+}
+
+function providerSupportsBridgeFileProcessing(provider = {}) {
+  if (!provider || typeof provider !== "object" || provider.enabled === false) {
+    return false;
+  }
+  const adapter = String(provider.adapter || "generic_http").trim().toLowerCase();
+  if (adapter === "local_file") {
+    return providerSupportsBridgeLocalFileProcessing(provider);
+  }
+  if (adapter !== "generic_http") {
+    return false;
+  }
+  return providerSupportsBridgeRemoteFileProcessing(provider);
+}
+
+function providerSupportsBridgeFileInspect(provider = {}) {
+  return providerSupportsBridgeLocalFileProcessing(provider);
+}
+
+function providerSupportsBridgeLocalFileProcessing(provider = {}) {
+  if (!provider || typeof provider !== "object" || provider.enabled === false) {
+    return false;
+  }
+  const adapter = String(provider.adapter || "generic_http").trim().toLowerCase();
+  return adapter === "local_file" && providerHasBridgeCapability(provider, "file_processing");
+}
+
+function providerSupportsBridgeRemoteFileProcessing(provider = {}) {
+  if (!provider || typeof provider !== "object" || provider.enabled === false) {
+    return false;
+  }
+  const adapter = String(provider.adapter || "generic_http").trim().toLowerCase();
+  if (adapter !== "generic_http") {
+    return false;
+  }
+  if (!providerHasBridgeCapability(provider, "file_processing")) {
+    return false;
+  }
+  const baseUrl = String(provider.baseUrl || "").trim();
+  const endpoint = String(provider.endpoint || "").trim();
+  return /^https?:\/\//i.test(baseUrl) && Boolean(endpoint);
+}
+
+function providerSupportsBridgeSpeech(provider = {}) {
+  if (!provider || typeof provider !== "object" || provider.enabled === false) {
+    return false;
+  }
+  const adapter = String(provider.adapter || "generic_http").trim().toLowerCase();
+  if (adapter !== "generic_http") {
+    return false;
+  }
+  if (!providerHasBridgeCapability(provider, "speech")) {
+    return false;
+  }
+  const baseUrl = String(provider.baseUrl || "").trim();
+  const endpoint = String(provider.endpoint || "").trim();
+  return /^https?:\/\//i.test(baseUrl) && Boolean(endpoint);
+}
+
+function providerSupportsBridgeVideo(provider = {}) {
+  if (!provider || typeof provider !== "object" || provider.enabled === false) {
+    return false;
+  }
+  const adapter = String(provider.adapter || "generic_http").trim().toLowerCase();
+  if (adapter !== "generic_http") {
+    return false;
+  }
+  if (!providerHasBridgeCapability(provider, "video")) {
+    return false;
+  }
+  const baseUrl = String(provider.baseUrl || "").trim();
+  const endpoint = String(provider.endpoint || "").trim();
+  return /^https?:\/\//i.test(baseUrl) && Boolean(endpoint);
+}
+
+function providerSupportsBridgeComputerUseOpenApp(provider = {}) {
+  if (!provider || typeof provider !== "object" || provider.enabled === false) {
+    return false;
+  }
+  const adapter = String(provider.adapter || "").trim().toLowerCase();
+  return adapter === "local_computer_use" && providerHasBridgeCapability(provider, "computer_use");
+}
+
+function providerSupportsBridgeComputerUseScreenshot(provider = {}) {
+  return providerSupportsBridgeComputerUseOpenApp(provider);
+}
+
+function providerHasBridgeCapability(provider = {}, capability = "") {
+  const target = String(capability || "").trim().toLowerCase();
+  return providerBridgeCapabilities(provider).includes(target);
+}
+
+function providerBridgeCapabilities(provider = {}) {
+  return [
+    provider.capability,
+    ...(Array.isArray(provider.capabilities) ? provider.capabilities : []),
+    ...(Array.isArray(provider.supports) ? provider.supports : []),
+  ]
+    .map((value) => String(value || "").trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function uniqueBridgeCapabilityValues(values = []) {
+  return [...new Set(values.filter(Boolean))];
 }
 
 function requestHasResponseToolOutput(request = {}) {
@@ -1008,8 +1783,21 @@ function chatToolChoice(toolChoice, toolContext, request = {}) {
 }
 
 function preferredToolChoiceForRequest(toolContext, request = {}) {
-  if (!requestMentionsInteractivePluginWork(request)) {
+  const interactiveKind = interactivePluginKindForRequest(request);
+  if (!interactiveKind) {
     return null;
+  }
+  if (interactiveKind === "chrome") {
+    const controlledBrowserName = controlledBrowserCapabilityChatName(toolContext);
+    if (controlledBrowserName) {
+      return { type: "function", function: { name: controlledBrowserName } };
+    }
+  }
+  if (interactiveKind === "computer") {
+    const controlledComputerName = controlledComputerCapabilityChatName(toolContext);
+    if (controlledComputerName) {
+      return { type: "function", function: { name: controlledComputerName } };
+    }
   }
   const nodeReplChatName = chatNameForTool(toolContext, "mcp__node_repl__js");
   if (nodeReplChatName) {
@@ -1020,6 +1808,51 @@ function preferredToolChoiceForRequest(toolContext, request = {}) {
     return { type: "function", function: { name: commandChatName } };
   }
   return null;
+}
+
+function controlledBrowserCapabilityChatName(toolContext) {
+  const bridgeName = chatNameForTool(toolContext, CODEXBRIDGE_CAPABILITY_TOOL_NAME);
+  if (!bridgeName) {
+    return "";
+  }
+  const bridgeTool = toolContext.chatTools.find((tool) =>
+    tool?.function?.name === bridgeName ||
+      toolContext.responseNameToChatName.get(CODEXBRIDGE_CAPABILITY_TOOL_NAME) === tool?.function?.name
+  );
+  if (!bridgeToolSupportsEnum(bridgeTool, "capability", "browser")) {
+    return "";
+  }
+  if (!bridgeToolSupportsEnum(bridgeTool, "action", "open_url")) {
+    return "";
+  }
+  return bridgeName;
+}
+
+function controlledComputerCapabilityChatName(toolContext) {
+  const bridgeName = chatNameForTool(toolContext, CODEXBRIDGE_CAPABILITY_TOOL_NAME);
+  if (!bridgeName) {
+    return "";
+  }
+  const bridgeTool = toolContext.chatTools.find((tool) =>
+    tool?.function?.name === bridgeName ||
+      toolContext.responseNameToChatName.get(CODEXBRIDGE_CAPABILITY_TOOL_NAME) === tool?.function?.name
+  );
+  if (!bridgeToolSupportsEnum(bridgeTool, "capability", "computer_use")) {
+    return "";
+  }
+  if (
+    !bridgeToolSupportsEnum(bridgeTool, "action", "list_apps") &&
+    !bridgeToolSupportsEnum(bridgeTool, "action", "open_app") &&
+    !bridgeToolSupportsEnum(bridgeTool, "action", "screenshot_desktop")
+  ) {
+    return "";
+  }
+  return bridgeName;
+}
+
+function bridgeToolSupportsEnum(tool, propertyName, expectedValue) {
+  const values = tool?.function?.parameters?.properties?.[propertyName]?.enum;
+  return Array.isArray(values) && values.includes(expectedValue);
 }
 
 function commandChatNameForToolContext(toolContext) {
@@ -1314,8 +2147,8 @@ function shouldFlattenToolCallHistory(route = {}) {
   }
 }
 
-function trimMessagesToRouteContext(messages, route = {}) {
-  const maxTokens = maxChatContextInputTokens(route);
+export function trimMessagesToRouteContext(messages, route = {}, options = {}) {
+  const maxTokens = options.contextPolicy?.inputBudget || maxChatContextInputTokens(route);
   if (!maxTokens || estimatedMessagesTokens(messages) <= maxTokens) {
     return messages;
   }
@@ -1384,19 +2217,38 @@ function trimMessagesToRouteContext(messages, route = {}) {
 }
 
 function maxChatContextInputTokens(route = {}) {
-  const contextWindow = Number(route.contextWindow || 0);
-  if (!Number.isFinite(contextWindow) || contextWindow <= 0) {
-    return 0;
-  }
-  const inputTokens = Math.floor(contextWindow * (CHAT_CONTEXT_INPUT_PERCENT / 100));
-  return Math.max(MIN_CHAT_CONTEXT_INPUT_TOKENS, inputTokens);
+  return chatContextPolicyForRoute(route).inputBudget;
 }
 
-function estimatedMessagesTokens(messages) {
+function chatContextPolicyForRoute(route = {}) {
+  return contextPolicyForRoute(route, {
+    defaultContextWindow: 258400,
+  });
+}
+
+export function estimatedMessagesTokens(messages) {
   return messages.reduce(
     (total, message) => total + estimatedMessageTokens(message),
     0,
   );
+}
+
+export function preservedToolBoundaryCount(messages = []) {
+  const outputIds = new Set(
+    (Array.isArray(messages) ? messages : [])
+      .filter((message) => message?.role === "tool" && message.tool_call_id)
+      .map((message) => String(message.tool_call_id)),
+  );
+  let count = 0;
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (message?.role !== "assistant" || !Array.isArray(message.tool_calls)) {
+      continue;
+    }
+    count += message.tool_calls.filter((toolCall) =>
+      outputIds.has(String(toolCall?.id || toolCall?.call_id || ""))
+    ).length;
+  }
+  return count;
 }
 
 function estimatedMessageTokens(message) {

@@ -24,11 +24,13 @@
           <button class="nav-item active" data-section="dashboard">概览</button>
           <button class="nav-item" data-section="preflight">体检</button>
           <button class="nav-item" data-section="models">模型</button>
+          <button class="nav-item" data-section="capabilities">能力</button>
           <button class="nav-item" data-section="stats">统计</button>
           <button class="nav-item" data-section="settings">设置</button>
           <button class="nav-item" data-section="resources">资源</button>
           <button class="nav-item" data-section="sessions">会话</button>
           <button class="nav-item" data-section="logs">日志</button>
+          <button class="nav-item" data-section="doubleQuota">双倍额度</button>
           <button class="nav-item" data-section="vvip">VVIP功能</button>
         </nav>
         <div class="sidebar-actions">
@@ -67,19 +69,31 @@
             <div class="request-detail-body" id="requestDetailBody"></div>
           </div>
         </div>
+        <div class="modal-backdrop hidden" id="resourceDetailDialog" aria-hidden="true">
+          <div class="resource-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="resourceDetailTitle">
+            <div class="update-dialog-header">
+              <div>
+                <h2 id="resourceDetailTitle">资源详情</h2>
+                <p>查看这个资源的真实来源、用途、状态和管理边界。</p>
+              </div>
+              <button class="ghost-button light small" id="closeResourceDetail" type="button">关闭</button>
+            </div>
+            <div class="resource-detail-body" id="resourceDetailBody"></div>
+          </div>
+        </div>
         <div class="modal-backdrop hidden" id="updateDialog" aria-hidden="true">
           <div class="update-dialog" role="dialog" aria-modal="true" aria-labelledby="updateDialogTitle">
             <div class="update-dialog-header">
               <div>
                 <h2 id="updateDialogTitle">发现新版本</h2>
-                <p id="updateDialogMessage">下载完成后会保存到更新目录。</p>
+                <p id="updateDialogMessage">下载完成后会自动启动安装或替换流程。</p>
               </div>
               <span class="status-pill" id="updateDialogVersion">-</span>
             </div>
             <div class="update-dialog-body">
               <span class="metric-label">更新包</span>
               <strong id="updateDialogAsset">-</strong>
-              <p>配置、密钥、统计和日志仍保存在用户数据目录。</p>
+              <p>配置、密钥、统计和日志仍保存在用户数据目录，安装完成后会启动新版。</p>
               <div class="update-progress hidden" id="updateProgress" aria-live="polite">
                 <div class="update-progress-head">
                   <span id="updateProgressText">等待下载</span>
@@ -92,7 +106,7 @@
             </div>
             <div class="update-dialog-actions">
               <button class="plain-button" id="cancelUpdate" type="button">稍后</button>
-              <button class="primary-button" id="confirmUpdate" type="button">下载更新包</button>
+              <button class="primary-button" id="confirmUpdate" type="button">下载并安装</button>
             </div>
           </div>
         </div>
@@ -151,11 +165,11 @@
                 <small>点击启动本地网关</small>
               </button>
               <div class="action-grid">
-                <button class="plain-button" id="restartCodex">重启 Codex</button>
-                <button class="plain-button" id="selectCodexDesktopExe">选择 Codex 启动项</button>
+                <button class="plain-button" id="restartCodex">重启 ChatGPT / Codex</button>
+                <button class="plain-button" id="selectCodexDesktopExe">选择 ChatGPT / Codex 启动项</button>
               </div>
               <div class="codex-path-row">
-                <span>Codex 路径</span>
+                <span>ChatGPT / Codex 路径</span>
                 <strong id="codexDesktopPath">自动查找</strong>
               </div>
               <div class="health-card" id="healthStatus">Router 健康检查：尚未检查</div>
@@ -186,9 +200,13 @@
             <div class="panel-header">
               <div>
                 <h2>启动体检</h2>
-                <p>一键检查 Codex、Router、模型目录、API Key、代理和备份状态。</p>
+                <p>只看 API Key、Router、路由健康、自动更新和备份状态。</p>
               </div>
-              <button class="primary-button small" id="runStartupCheck" type="button">重新体检</button>
+              <div class="header-actions">
+                <button class="ghost-button light small" id="copyPreflightDiagnostics" type="button">复制体检摘要</button>
+                <button class="ghost-button light small" id="savePreflightDiagnostics" type="button">导出体检报告</button>
+                <button class="primary-button small" id="runStartupCheck" type="button">重新体检</button>
+              </div>
             </div>
             <div class="check-summary" id="startupCheckSummary"></div>
             <div class="check-list" id="startupCheckList"></div>
@@ -202,7 +220,9 @@
                 <h2>模型栏选择</h2>
                 <p>选中的模型会写入 CodexBridge 模型目录。拖动上方模型可调整顺序，下方模型卡片负责加入或移除。</p>
               </div>
-              <div class="header-actions">
+              <div class="header-actions selection-tools">
+                <button class="ghost-button light small" id="cleanUnavailableModels" type="button">清理不可用模型</button>
+                <button class="ghost-button light small" id="restoreDefaultModels" type="button">恢复默认选择</button>
                 <button class="primary-button small" id="saveModelSelectionPanel">保存选择</button>
                 <button class="ghost-button light small" id="openConfigFolder">打开配置目录</button>
               </div>
@@ -211,6 +231,341 @@
             <div class="model-pool" id="modelPool"></div>
           </article>
 
+        </section>
+
+        <section class="section-panel hidden" id="capabilities">
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>模型能力诊断</h2>
+                <p>只展示当前模型真实能力、降级方式和已经接入的代理能力。</p>
+              </div>
+            </div>
+            <div class="capability-summary" id="capabilitySummary"></div>
+            <div class="capability-diagnostics" id="capabilityDiagnostics"></div>
+          </article>
+          <article class="panel image-provider-settings">
+            <div class="panel-header">
+              <div>
+                <h2>已接管能力：图片生成</h2>
+                <p>图片生成是当前已接入自动代理的能力。模型明确要生图时，会转给默认图片供应商并把结果保存到本地展示。</p>
+              </div>
+              <div class="image-provider-template-bar" aria-label="图片供应商模板">
+                <button class="ghost-button light small" id="fillSiliconFlowImageProvider" data-image-provider-template="siliconflow" type="button">硅基流动</button>
+                <button class="ghost-button light small" data-image-provider-template="zai" type="button">智谱 / Z.ai</button>
+                <button class="ghost-button light small" data-image-provider-template="openai" type="button">OpenAI</button>
+                <button class="ghost-button light small" data-image-provider-template="ark" type="button">火山方舟</button>
+                <button class="ghost-button light small" data-image-provider-template="generic" type="button">通用接口</button>
+              </div>
+            </div>
+            <div class="image-provider-layout">
+              <div class="image-provider-sidebar">
+                <div class="image-provider-guide">
+                  <strong>工作方式</strong>
+                  <span>选择默认代理后，明确“生成图片”的请求会转给这里；结果会保存到本地并在 Codex 里直接展示。</span>
+                </div>
+                <div class="image-provider-template-hint" id="imageProviderTemplateHint">
+                  <strong>先选一个模板</strong>
+                  <span>模板会自动填好 Base URL、Endpoint、模型名和返回字段路径；你只需要确认模型权限并填写 API Key。</span>
+                </div>
+                <div class="image-provider-list" id="imageProviderList"></div>
+              </div>
+              <form class="image-provider-form" id="imageProviderForm">
+                <input id="imageProviderId" type="hidden" />
+                <label>
+                  <span>供应商名称</span>
+                  <input id="imageProviderName" placeholder="例如 硅基流动 Kolors" />
+                </label>
+                <label>
+                  <span>接口模式</span>
+                  <select id="imageProviderAdapter">
+                    <option value="siliconflow_images">SiliconFlow 图片接口</option>
+                    <option value="zai_images">智谱 / Z.ai 图片接口</option>
+                    <option value="openai_images">OpenAI 图片接口</option>
+                    <option value="generic_template">通用图片接口</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Base URL</span>
+                  <input id="imageProviderBaseUrl" placeholder="https://api.siliconflow.cn/v1" />
+                </label>
+                <label>
+                  <span>Endpoint</span>
+                  <input id="imageProviderEndpoint" placeholder="/images/generations" />
+                </label>
+                <label>
+                  <span>图片模型名</span>
+                  <input id="imageProviderModel" placeholder="Kwai-Kolors/Kolors" />
+                </label>
+                <label>
+                  <span>尺寸，可选</span>
+                  <input id="imageProviderSize" placeholder="留空使用模型默认，例如 1024x1024" />
+                </label>
+                <label>
+                  <span>Key 名</span>
+                  <input id="imageProviderKeyEnv" placeholder="SILICONFLOW_API_KEY" />
+                </label>
+                <label>
+                  <span>API Key</span>
+                  <input id="imageProviderApiKey" type="password" placeholder="已保存可留空；新供应商请填写" />
+                </label>
+                <details class="image-provider-advanced">
+                  <summary>
+                    <span>高级参数</span>
+                    <small>采样步数、响应字段路径等供应商专属设置</small>
+                  </summary>
+                  <div class="form-row two">
+                    <label>
+                      <span>返回图片 URL 路径</span>
+                      <input id="imageProviderImageUrlPath" placeholder="data[0].url" />
+                    </label>
+                    <label>
+                      <span>返回 Base64 路径</span>
+                      <input id="imageProviderImageBase64Path" placeholder="data[0].b64_json" />
+                    </label>
+                  </div>
+                  <label>
+                    <span>附加参数 JSON，可选</span>
+                    <textarea id="imageProviderDefaults" rows="4" placeholder='例如 {"batch_size":1,"num_inference_steps":20,"guidance_scale":7.5}'></textarea>
+                  </label>
+                  <label>
+                    <span>请求体模板 JSON，可选</span>
+                    <textarea id="imageProviderRequestTemplate" rows="5" placeholder='例如 {"model":"{{model}}","prompt":"{{prompt}}","size":"{{size}}"}'></textarea>
+                  </label>
+                  <label>
+                    <span>Header JSON，可选</span>
+                    <textarea id="imageProviderHeaders" rows="3" placeholder='例如 {"x-api-key":"{{apiKey}}"}'></textarea>
+                  </label>
+                </details>
+                <div class="image-provider-market-fields">
+                  <label class="checkbox-field">
+                    <input id="imageProviderEnabled" type="checkbox" checked />
+                    <span>启用这个图片供应商</span>
+                    <small>关闭后不会被生图代理选中，但配置仍会保留。</small>
+                  </label>
+                  <label>
+                    <span>优先级</span>
+                    <input id="imageProviderPriority" type="number" step="1" placeholder="0" />
+                    <small>数字越大越靠前；默认供应商仍优先。</small>
+                  </label>
+                </div>
+                <label class="checkbox-field image-provider-default-row">
+                  <input id="imageProviderMakeDefault" type="checkbox" />
+                  <span>设为默认图片代理</span>
+                  <small>非 GPT 模型选择“继承默认”时会使用它。</small>
+                </label>
+                <section class="image-provider-test-box" aria-label="测试图片供应商">
+                  <label>
+                    <span>测试提示词</span>
+                    <input id="imageProviderTestPrompt" placeholder="例如 画一张 CodexBridge 多模型控制台的小图标" />
+                  </label>
+                  <button class="ghost-button light" id="testImageProvider" type="button">测试生图</button>
+                  <div class="image-provider-test-result" id="imageProviderTestResult" aria-live="polite"></div>
+                </section>
+                <div class="form-actions">
+                  <button class="primary-button" id="saveImageProvider" type="submit">保存图片供应商</button>
+                  <button class="plain-button" id="resetImageProviderForm" type="button">清空表单</button>
+                </div>
+              </form>
+            </div>
+            <div class="image-generation-history-panel">
+              <div class="panel-subheader">
+                <div>
+                  <h3>生成图片记录</h3>
+                  <p>查看已保存图片和失败测试。</p>
+                </div>
+                <div class="image-history-controls">
+                  <input id="imageHistorySearch" type="search" placeholder="搜索提示词、模型、供应商或文件路径" />
+                  <select id="imageHistoryFilter" aria-label="筛选生成图片记录">
+                    <option value="all">全部图片</option>
+                    <option value="asset">有本地图片</option>
+                    <option value="thumbnail">有缩略图</option>
+                    <option value="failed">测试失败</option>
+                  </select>
+                  <span id="imageHistorySummary">0 条记录</span>
+                  <button class="plain-button small" id="clearImageGenerationHistory" type="button">清理 30 天前图片</button>
+                </div>
+              </div>
+              <div class="image-generation-history" id="imageGenerationHistory"></div>
+            </div>
+          </article>
+          <article class="panel capability-experimental-area">
+            <section class="capability-provider-manager capability-experimental-panel" aria-label="能力供应商管理">
+              <div class="capability-provider-manager-head">
+                <div>
+                  <h3>实验能力供应商</h3>
+                  <p>这里配置 OCR、搜索、浏览器、网页截图、文件处理、Computer Use、语音和视频。实验能力供应商仅用于手动试运行，不会改变模型路由。</p>
+                </div>
+              </div>
+              <div class="capability-provider-manager-grid">
+                <div class="capability-provider-list" id="capabilityProviderList"></div>
+                <div class="capability-provider-template-bar" aria-label="能力供应商模板">
+                  <button class="ghost-button light small" data-capability-provider-template="ocr" type="button">OCR 模板</button>
+                  <button class="ghost-button light small" data-capability-provider-template="search" type="button">搜索模板</button>
+                  <button class="ghost-button light small" data-capability-provider-template="browser" type="button">本地 Chrome/浏览器</button>
+                  <button class="ghost-button light small" data-capability-provider-template="computerUse" type="button">Computer Use</button>
+                  <button class="ghost-button light small" data-capability-provider-template="screenshot" type="button">截图模板</button>
+                  <button class="ghost-button light small" data-capability-provider-template="localScreenshot" type="button">本地截图</button>
+                  <button class="ghost-button light small" data-capability-provider-template="localFile" type="button">本地文件</button>
+                  <button class="ghost-button light small" data-capability-provider-template="speech" type="button">语音模板</button>
+                  <button class="ghost-button light small" data-capability-provider-template="video" type="button">视频模板</button>
+                </div>
+                <form class="capability-provider-form" id="capabilityProviderForm">
+                  <input id="capabilityProviderId" type="hidden" />
+                  <label>
+                    <span>供应商名称</span>
+                    <input id="capabilityProviderName" placeholder="例如 Paddle OCR / Bocha Search" />
+                  </label>
+                  <label>
+                    <span>能力类型</span>
+                    <select id="capabilityProviderCapability">
+                      <option value="ocr">OCR</option>
+                      <option value="web_search">搜索</option>
+                      <option value="browser">浏览器</option>
+                      <option value="computer_use">Computer Use</option>
+                      <option value="file_processing">文件处理</option>
+                      <option value="webpage_screenshot">网页截图</option>
+                      <option value="speech">语音</option>
+                      <option value="video">视频</option>
+                    </select>
+                  </label>
+                  <fieldset class="capability-provider-extra" id="capabilityProviderExtraCapabilities">
+                    <legend>附加能力</legend>
+                    <label>
+                      <input type="checkbox" data-capability-provider-extra value="ocr" />
+                      <span>OCR</span>
+                    </label>
+                    <label>
+                      <input type="checkbox" data-capability-provider-extra value="web_search" />
+                      <span>搜索</span>
+                    </label>
+                    <label>
+                      <input type="checkbox" data-capability-provider-extra value="browser" />
+                      <span>浏览器</span>
+                    </label>
+                    <label>
+                      <input type="checkbox" data-capability-provider-extra value="computer_use" />
+                      <span>Computer Use</span>
+                    </label>
+                    <label>
+                      <input type="checkbox" data-capability-provider-extra value="file_processing" />
+                      <span>文件处理</span>
+                    </label>
+                    <label>
+                      <input type="checkbox" data-capability-provider-extra value="webpage_screenshot" />
+                      <span>网页截图</span>
+                    </label>
+                    <label>
+                      <input type="checkbox" data-capability-provider-extra value="speech" />
+                      <span>语音</span>
+                    </label>
+                    <label>
+                      <input type="checkbox" data-capability-provider-extra value="video" />
+                      <span>视频</span>
+                    </label>
+                  </fieldset>
+                  <label>
+                    <span>接口模式</span>
+                    <select id="capabilityProviderAdapter">
+                      <option value="generic_http">通用 HTTP 接口</option>
+                      <option value="local_browser">本地浏览器能力</option>
+                      <option value="local_computer_use">本地 Computer Use</option>
+                      <option value="local_file">本地文件处理</option>
+                    </select>
+                  </label>
+                  <div class="capability-provider-local-hint" id="capabilityProviderLocalHint" hidden>
+                    <strong>本地桥接能力</strong>
+                    <span>本地能力不需要 Base URL、Endpoint、模型名或 API Key；保存后由 CodexBridge 桌面端受控执行。</span>
+                  </div>
+                  <label data-remote-capability-field>
+                    <span>Base URL</span>
+                    <input id="capabilityProviderBaseUrl" placeholder="https://api.example.com/v1" />
+                  </label>
+                  <label data-remote-capability-field>
+                    <span>Endpoint</span>
+                    <input id="capabilityProviderEndpoint" placeholder="/ocr 或 /web-search" />
+                  </label>
+                  <label data-remote-capability-field>
+                    <span>模型名 / 引擎</span>
+                    <input id="capabilityProviderModel" placeholder="例如 ocr-v1，可选" />
+                  </label>
+                  <label data-remote-capability-field>
+                    <span>Key 名</span>
+                    <input id="capabilityProviderKeyEnv" placeholder="OCR_API_KEY" />
+                  </label>
+                  <label data-remote-capability-field>
+                    <span>API Key</span>
+                    <input id="capabilityProviderApiKey" type="password" placeholder="已保存可留空；新供应商请填写" />
+                  </label>
+                  <label class="wide-field" data-remote-capability-field>
+                    <span>默认请求参数 JSON</span>
+                    <textarea id="capabilityProviderDefaults" rows="4" spellcheck="false" placeholder='例如 {"voice":"warm","format":"mp3"}；会合并到每次能力请求里'></textarea>
+                  </label>
+                  <div class="capability-provider-market-fields">
+                    <label class="checkbox-field">
+                      <input id="capabilityProviderEnabled" type="checkbox" checked />
+                      <span>启用</span>
+                    </label>
+                    <label>
+                      <span>优先级</span>
+                      <input id="capabilityProviderPriority" type="number" step="1" placeholder="0" />
+                    </label>
+                  </div>
+                  <label class="checkbox-field capability-provider-default-row">
+                    <input id="capabilityProviderMakeDefault" type="checkbox" />
+                    <span>设为所选能力默认试运行供应商</span>
+                  </label>
+                  <div class="capability-provider-test-box">
+                    <div>
+                      <strong>能力体检</strong>
+                      <small>只测试这个供应商本身是否能通，不会改变模型路由，也不会自动让模型获得该能力。</small>
+                    </div>
+                    <button class="ghost-button light" id="testCapabilityProvider" type="button">测试能力</button>
+                    <div class="capability-provider-test-result" id="capabilityProviderTestResult" aria-live="polite"></div>
+                  </div>
+                  <div class="capability-provider-run-box">
+                    <div class="capability-provider-run-head">
+                      <div>
+                        <strong>试运行能力</strong>
+                        <small>手动调用一次当前供应商。结果只展示在这里，不会写入模型路由。</small>
+                      </div>
+                      <button class="ghost-button light" id="executeCapabilityProvider" type="button">试运行能力</button>
+                    </div>
+                    <div class="capability-provider-run-presets" id="capabilityProviderRunPresets" aria-label="常用动作"></div>
+                    <label class="wide-field">
+                      <span>请求输入 JSON</span>
+                      <textarea id="capabilityProviderRunInput" rows="5" spellcheck="false"></textarea>
+                    </label>
+                    <div class="capability-provider-run-result" id="capabilityProviderRunResult" aria-live="polite"></div>
+                  </div>
+                  <div class="form-actions">
+                    <button class="primary-button" id="saveCapabilityProvider" type="submit">保存能力供应商</button>
+                    <button class="ghost-button light" id="resetCapabilityProviderForm" type="button">清空表单</button>
+                  </div>
+                </form>
+              </div>
+            </section>
+            <section class="capability-execution-history-panel" aria-label="能力试运行记录">
+              <div class="panel-subheader">
+                <div>
+                  <h3>实验能力试运行记录</h3>
+                  <p>只记录手动测试和试运行结果，不代表模型已经自动接管这些能力。</p>
+                </div>
+                <div class="capability-history-controls">
+                  <input id="capabilityHistorySearch" type="search" placeholder="搜索供应商、模型、输出或文件路径" />
+                  <select id="capabilityHistoryFilter" aria-label="筛选能力记录">
+                    <option value="all">全部记录</option>
+                    <option value="success">只看成功</option>
+                    <option value="failed">只看失败</option>
+                    <option value="asset">有本地文件</option>
+                  </select>
+                  <span id="capabilityHistorySummary">0 条记录</span>
+                  <button class="ghost-button light small" id="clearCapabilityExecutionHistory" type="button">清理旧记录</button>
+                </div>
+              </div>
+              <div class="capability-execution-history" id="capabilityExecutionHistory"></div>
+            </section>
+          </article>
         </section>
 
         <section class="section-panel hidden" id="modelConfig">
@@ -318,7 +673,7 @@
                 <p>展示当前生效模型的请求、状态码、耗时和 token。</p>
               </div>
             </div>
-            <div class="grid five stat-summary">
+            <div class="grid six stat-summary">
               <article class="metric">
                 <span class="metric-label">总调用</span>
                 <strong id="statCalls">0</strong>
@@ -339,7 +694,53 @@
                 <span class="metric-label">输出 Token</span>
                 <strong id="statCompletion">0</strong>
               </article>
+              <article class="metric">
+                <span class="metric-label">预估费用</span>
+                <strong id="statCost">未设置</strong>
+              </article>
             </div>
+            <div class="usage-budget-controls">
+              <label>
+                <span>预算范围</span>
+                <select id="usageBudgetScope">
+                  <option value="global">全部模型</option>
+                  <option value="route">单个模型</option>
+                  <option value="provider">供应商</option>
+                </select>
+              </label>
+              <label>
+                <span>具体对象</span>
+                <select id="usageBudgetTarget"></select>
+              </label>
+              <label>
+                <span>每日 Token 上限</span>
+                <input id="usageDailyTokenLimit" type="number" min="0" step="1000" placeholder="不限制" />
+              </label>
+              <label>
+                <span>每日请求上限</span>
+                <input id="usageDailyCallLimit" type="number" min="0" step="1" placeholder="不限制" />
+              </label>
+              <label>
+                <span>每日费用上限</span>
+                <input id="usageDailyCostLimit" type="number" min="0" step="0.000001" placeholder="不限制" />
+              </label>
+              <label>
+                <span>输入单价 / 百万</span>
+                <input id="usageInputCostPerMillion" type="number" min="0" step="0.000001" placeholder="可选" />
+              </label>
+              <label>
+                <span>缓存单价 / 百万</span>
+                <input id="usageCacheCostPerMillion" type="number" min="0" step="0.000001" placeholder="默认同输入" />
+              </label>
+              <label>
+                <span>输出单价 / 百万</span>
+                <input id="usageOutputCostPerMillion" type="number" min="0" step="0.000001" placeholder="可选" />
+              </label>
+              <button class="plain-button" id="saveUsageBudgets" type="button">保存预算</button>
+            </div>
+            <p class="usage-budget-note">达到 80% 会提醒；超过每日上限后本地拦截，避免继续请求上游和消耗额度。</p>
+            <div class="usage-budget-alerts hidden" id="usageBudgetAlerts"></div>
+            <div class="usage-cost-estimate hidden" id="usageCostEstimate"></div>
             <div class="usage-chart" id="usageChart"></div>
             <div class="usage-table" id="usageTable"></div>
           </article>
@@ -365,9 +766,108 @@
                   <small>遇到 502、fetch failed 或 VPN/代理冲突时可开启；只影响 CodexBridge Router。</small>
                 </span>
               </label>
+              <label class="option-toggle">
+                <input id="localRateLimitEnabled" type="checkbox" />
+                <span>
+                  <strong>本地请求节奏</strong>
+                  <small>本地请求节奏（默认关闭）：开启后按路由配置的 RPM 间隔排队；供应商 429 冷却始终生效。</small>
+                </span>
+              </label>
+              <label class="option-toggle">
+                <input id="duplicateRequestProtection" type="checkbox" />
+                <span>
+                  <strong>重复请求保护</strong>
+                  <small>重复请求保护（默认关闭）：只拦截仍在执行中的完全相同请求，命中后返回本地结果；建议仅在客户端反复重连时开启。</small>
+                </span>
+              </label>
+              <label class="option-toggle">
+                <input id="interceptCodexAuxiliaryTasks" type="checkbox" />
+                <span>
+                  <strong>拦截 Codex 辅助任务</strong>
+                  <small>默认关闭。关闭时，Codex 压缩、自动检查等辅助请求会走下面选择的模型；开启后本地拦截，不请求上游。</small>
+                </span>
+              </label>
+              <label>
+                <span>辅助任务模型</span>
+                <select id="codexAuxiliaryModelId"></select>
+              </label>
+              <label class="option-toggle">
+                <input id="autoSelectModel" type="checkbox" />
+                <span>
+                  <strong>自动选模型</strong>
+                  <small>实验能力，默认关闭。关闭时不会接管用户手动选择；仅在用户明确开启后，才按任务类型推荐模型。</small>
+                </span>
+              </label>
+              <label class="option-toggle">
+                <input id="autoFailover" type="checkbox" />
+                <span>
+                  <strong>失败自动切换</strong>
+                  <small>实验能力，默认关闭。关闭时不会接管用户手动选择；仅在用户明确开启后，才会把 429、502、余额不足等请求切到备用模型。</small>
+                </span>
+              </label>
             </div>
+            <p class="smart-routing-safety-note">
+              下面的规则只有在上方“自动选模型”或“失败自动切换”开启时才生效；开关关闭时，CodexBridge 不会接管用户手动选择。
+            </p>
+            <div class="smart-routing-policy">
+              <div class="smart-routing-rule-grid">
+                <label>
+                  <span>代码任务</span>
+                  <select id="smartCodeMode">
+                    <option value="auto">自动判断</option>
+                    <option value="route">指定模型</option>
+                    <option value="off">不自动切换</option>
+                  </select>
+                  <select id="smartCodeRoute"></select>
+                </label>
+                <label>
+                  <span>长上下文</span>
+                  <select id="smartLongContextMode">
+                    <option value="auto">自动判断</option>
+                    <option value="route">指定模型</option>
+                    <option value="off">不自动切换</option>
+                  </select>
+                  <select id="smartLongContextRoute"></select>
+                </label>
+                <label>
+                  <span>生图请求</span>
+                  <select id="smartImageGenerationMode">
+                    <option value="auto">自动判断</option>
+                    <option value="route">指定模型</option>
+                    <option value="off">不自动切换</option>
+                  </select>
+                  <select id="smartImageGenerationRoute"></select>
+                </label>
+                <label>
+                  <span>普通聊天</span>
+                  <select id="smartOrdinaryChatMode">
+                    <option value="auto">自动判断</option>
+                    <option value="route">指定模型</option>
+                    <option value="off">不自动切换</option>
+                  </select>
+                  <select id="smartOrdinaryChatRoute"></select>
+                </label>
+              </div>
+              <div class="smart-routing-failover">
+                <label>
+                  <span>失败备用顺序</span>
+                  <select id="smartFailoverMode">
+                    <option value="auto">自动选择备用模型</option>
+                    <option value="ordered">按下面顺序切换</option>
+                    <option value="off">不自动切换</option>
+                  </select>
+                </label>
+                <div class="smart-routing-failover-grid">
+                  <select id="smartFailoverRoute1"></select>
+                  <select id="smartFailoverRoute2"></select>
+                  <select id="smartFailoverRoute3"></select>
+                </div>
+              </div>
+            </div>
+            <div class="model-reference-status" id="modelReferenceStatus" aria-live="polite"></div>
             <div class="settings-actions">
               <button class="primary-button" id="saveDesktopOptions" type="button">保存设置</button>
+              <button class="ghost-button light" id="repairModelReferences" type="button">修复失效模型引用</button>
             </div>
           </article>
           <article class="panel">
@@ -375,9 +875,17 @@
               <div>
                 <h2>配置档</h2>
                 <p>把当前模式、模型选择和基础设置保存成一个可快速切换的配置。</p>
+                <p class="config-package-note">配置包会带走模型、供应商、能力代理和预算；本地上传 Logo 会随配置包恢复；API Key、本机 ChatGPT / Codex 路径、本地文件路径和测试缓存不会导出。</p>
               </div>
-              <button class="primary-button small" id="saveConfigProfile" type="button">保存当前配置</button>
+              <div class="panel-actions">
+                <button class="ghost-button light small" id="importConfigPackage" type="button">导入配置包</button>
+                <button class="ghost-button light small" id="exportConfigPackageToSyncDir" type="button">导出到同步目录</button>
+                <button class="ghost-button light small" id="exportConfigPackage" type="button">导出配置包</button>
+                <button class="primary-button small" id="saveConfigProfile" type="button">保存当前配置</button>
+              </div>
             </div>
+            <div class="config-sync-status" id="configPackageSyncStatus" aria-live="polite"></div>
+            <div class="config-sync-status" id="configPackageImportBackupStatus" aria-live="polite"></div>
             <div class="profile-list" id="profileList"></div>
           </article>
           <article class="panel">
@@ -396,10 +904,53 @@
             <div class="panel-header">
               <div>
                 <h2>资源中心</h2>
-                <p>只读查看 Codex 当前资源，便于确认插件、MCP、技能、提示词和 AGENTS 规则有没有就位。</p>
+                <p>主列表只显示 Codex 当前确认可用的插件、MCP、技能和规则文件。</p>
               </div>
-              <button class="primary-button small" id="copyResourceDiagnostics" type="button">复制诊断</button>
+              <div class="header-actions">
+                <button class="ghost-button light small" id="refreshResources" type="button">刷新资源</button>
+                <button class="primary-button small" id="copyResourceDiagnostics" type="button">复制诊断</button>
+              </div>
             </div>
+            <div class="resource-controls" aria-label="资源筛选">
+              <label class="resource-search-control">
+                <span>搜索当前资源</span>
+                <div class="resource-search-row">
+                  <input id="resourceSearch" type="search" placeholder="输入名称、分类、能力、路径或诊断内容" autocomplete="off" />
+                </div>
+              </label>
+              <label>
+                <span>筛选状态</span>
+                <select id="resourceStatusFilter">
+                  <option value="all">全部资源</option>
+                  <option value="issues">只看提醒/失败</option>
+                  <option value="current">当前正常可用</option>
+                  <option value="not-current">未启用/缓存/需处理</option>
+                </select>
+              </label>
+            </div>
+            <details class="resource-advanced-controls">
+              <summary>高级资源诊断</summary>
+              <div class="resource-controls compact" aria-label="资源高级筛选">
+                <button class="ghost-button light small" id="refreshPluginMarketplaces" type="button">刷新插件市场</button>
+                <button class="ghost-button light small" id="searchPluginMarketplaces" type="button">搜索插件市场</button>
+              <label>
+                <span>来源范围</span>
+                <select id="resourceSourceFilter">
+                  <option value="all">全部来源</option>
+                  <option value="installed">已安装插件</option>
+                  <option value="marketplace">插件市场候选</option>
+                  <option value="cached">本地缓存</option>
+                  <option value="openai-curated">OpenAI 插件市场</option>
+                  <option value="openai-curated-remote">OpenAI 远程插件市场</option>
+                  <option value="openai-bundled">Codex 内置插件</option>
+                  <option value="personal">个人本地插件</option>
+                  <option value="claude-plugins-official">Claude 插件源</option>
+                </select>
+              </label>
+              </div>
+            </details>
+            <p class="resource-count-note">插件、应用和插件 MCP 对应当前 Codex 插件页；用户技能来自 Codex app-server skills/list，并按当前用户 CODEX_HOME 下的非系统技能统计。manifest 声明、磁盘技能文件、全局运行时 MCP 和缓存候选只放高级诊断。</p>
+            <p class="resource-count-note" id="resourceRefreshStatus">资源状态：尚未读取</p>
             <div class="resource-layout">
               <div class="resource-summary" id="resourceSummary"></div>
               <div class="resource-grid" id="resourceList"></div>
@@ -412,9 +963,39 @@
             <div class="panel-header">
               <div>
                 <h2>会话与项目</h2>
-                <p>查看本机 Codex 会话、来源项目和摘要，并把单个会话导出成 Markdown。</p>
+                <p>按项目查看本机 Codex 会话，也可以导出 Markdown。</p>
               </div>
-              <button class="ghost-button light small" id="recoverHistoryAccessSessions" type="button">找回历史对话</button>
+              <div class="header-actions">
+                <button class="ghost-button light small" id="recoverCodexProjects" type="button">恢复项目列表</button>
+                <button class="ghost-button light small" id="recoverHistoryAccessSessions" type="button">找回历史对话</button>
+              </div>
+            </div>
+            <div class="history-recovery-status hidden" id="historyRecoveryStatusPanel" aria-live="polite">
+              <div class="history-recovery-status-head">
+                <div>
+                  <strong id="historyRecoveryPhase">尚未生成恢复计划</strong>
+                  <p id="historyRecoveryMessage">点击“找回历史对话”后先扫描，不会立即写数据库。</p>
+                </div>
+                <button class="ghost-button light small hidden" id="retryHistoryRecovery" type="button">我已手动退出，重新检测</button>
+              </div>
+              <div class="history-recovery-metrics">
+                <span>计划新增<strong id="historyRecoveryPlanned">0</strong></span>
+                <span>实际新增<strong id="historyRecoveryInserted">0</strong></span>
+                <span>提交状态<strong id="historyRecoveryCommit">未开始</strong></span>
+                <span>回读目录<strong id="historyRecoveryCatalog">0</strong></span>
+                <span>回读侧栏<strong id="historyRecoverySidebar">0</strong></span>
+              </div>
+              <div class="history-recovery-path"><span>备份路径</span><code id="historyRecoveryBackup">尚未创建</code></div>
+              <div class="history-recovery-failure hidden" id="historyRecoveryFailure"></div>
+            </div>
+            <div class="session-search-row">
+              <label>
+                <span>搜索会话</span>
+                <input id="sessionSearch" placeholder="搜索项目、路径、会话标题、模型或摘要" />
+              </label>
+              <div class="session-search-actions">
+                <button class="ghost-button light small" id="clearSessionSearch" type="button">清空搜索</button>
+              </div>
             </div>
             <div class="session-list" id="sessionList"></div>
           </article>
@@ -430,6 +1011,97 @@
               <button class="primary-button small" id="copyDiagnostics">复制诊断信息</button>
             </div>
             <pre id="logOutput"></pre>
+          </article>
+        </section>
+
+        <section class="section-panel hidden" id="doubleQuota">
+          <article class="panel double-quota-hero">
+            <div class="panel-header">
+              <div>
+                <span class="double-quota-kicker">CHATGPT + CODEX</span>
+                <h2>双倍额度</h2>
+                <p>把你的 ChatGPT 网页会话接入 Codex，在保留当前模型 Router 的同时使用另一份订阅额度。</p>
+              </div>
+              <span class="status-pill muted" id="doubleQuotaStatus">正在读取</span>
+            </div>
+            <div class="double-quota-metrics">
+              <div>
+                <span>服务地址</span>
+                <strong id="doubleQuotaUrl">http://127.0.0.1:4317/</strong>
+              </div>
+              <div>
+                <span>嵌入版本</span>
+                <strong id="doubleQuotaVersion">-</strong>
+              </div>
+              <div>
+                <span>MCP</span>
+                <strong id="doubleQuotaMcpStatus">尚未安装</strong>
+              </div>
+            </div>
+          </article>
+
+          <div class="grid double-quota-grid">
+            <article class="panel">
+              <div class="panel-header">
+                <div>
+                  <h2>运行控制</h2>
+                  <p>默认端口为 4317。修改端口前请先停止服务。</p>
+                </div>
+              </div>
+              <div class="double-quota-service-banner" id="doubleQuotaServiceBanner">
+                <span class="double-quota-service-dot" aria-hidden="true"></span>
+                <div>
+                  <strong id="doubleQuotaServiceTitle">正在读取服务状态</strong>
+                  <span id="doubleQuotaServiceDetail">请稍候</span>
+                </div>
+              </div>
+              <label>
+                <span>服务端口</span>
+                <input id="doubleQuotaPort" type="number" min="1024" max="65535" value="4317" />
+              </label>
+              <div class="double-quota-actions">
+                <button class="ghost-button light" id="saveDoubleQuotaPort" type="button">保存端口</button>
+                <button class="primary-button" id="startDoubleQuota" type="button">启动服务</button>
+                <button class="ghost-button light" id="stopDoubleQuota" type="button">停止服务</button>
+                <button class="ghost-button light" id="openDoubleQuota" type="button">打开使用页面</button>
+              </div>
+              <p class="double-quota-note" id="doubleQuotaMessage">服务独立运行，不会改变 15722 模型 Router。</p>
+            </article>
+
+            <article class="panel">
+              <div class="panel-header">
+                <div>
+                  <h2>Chrome 扩展</h2>
+                  <p>首次使用需要在 Chrome 扩展管理页手动加载稳定扩展目录。</p>
+                </div>
+                <span class="status-pill muted" id="doubleQuotaExtensionState">正在检测</span>
+              </div>
+              <div class="double-quota-path">
+                <span>新版扩展目录</span>
+                <code id="doubleQuotaExtensionPath">尚未准备</code>
+              </div>
+              <p class="double-quota-note" id="doubleQuotaExtensionStatus">正在检测扩展状态。</p>
+              <ol class="double-quota-steps">
+                <li>点击“安装新版扩展”，程序会复制目录并打开 Chrome 扩展页。</li>
+                <li>如果仍显示旧版：移除旧扩展，再点“加载已解压的扩展程序”，粘贴上面的目录。</li>
+              </ol>
+              <div class="double-quota-actions">
+                <button class="primary-button" id="manageDoubleQuotaExtension" type="button">安装扩展</button>
+                <button class="ghost-button light" id="openDoubleQuotaExtensionManager" type="button">打开扩展管理</button>
+                <button class="ghost-button light" id="refreshDoubleQuotaExtension" type="button">重新检测</button>
+              </div>
+            </article>
+          </div>
+
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>Codex MCP</h2>
+                <p>只新增或修复 <code>mcp_servers.chatgpt_codex_bridge</code>，保留现有模型和其他 MCP 配置。</p>
+              </div>
+              <button class="primary-button" id="repairDoubleQuotaMcp" type="button">安装 / 修复 MCP</button>
+            </div>
+            <p class="double-quota-note">写入前会备份 config.toml；完成后不会自动关闭或重启 ChatGPT / Codex。</p>
           </article>
         </section>
 

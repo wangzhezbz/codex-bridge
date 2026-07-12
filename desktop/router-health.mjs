@@ -102,9 +102,9 @@ function healthErrorMessage(error) {
 
 function healthyMessage(modelCount, unhealthyRoutes) {
   if (unhealthyRoutes > 0) {
-    return `Router health OK: ${modelCount} models loaded, ${unhealthyRoutes} route(s) need attention`;
+    return `Router 健康检查通过：已加载 ${modelCount} 个模型，${unhealthyRoutes} 条路由需要关注`;
   }
-  return `Router health OK: ${modelCount} models loaded`;
+  return `Router 健康检查通过：已加载 ${modelCount} 个模型`;
 }
 
 function delay(ms) {

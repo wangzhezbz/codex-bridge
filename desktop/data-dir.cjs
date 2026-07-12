@@ -90,13 +90,13 @@ function migrateLegacyPortableData({ targetDir, legacyDirs = [] } = {}) {
       if (copied.copiedFiles > 0) {
         result.sourceDirs.push(legacyDir);
         result.messages.push(
-          `Migrated ${copied.copiedFiles} file(s) from legacy portable data: ${legacyDir}`,
+          `已从旧版免安装数据迁移 ${copied.copiedFiles} 个文件：${legacyDir}`,
         );
       }
       result.copiedFiles += copied.copiedFiles;
       result.skippedFiles += copied.skippedFiles;
     } catch (error) {
-      result.messages.push(`Could not migrate legacy portable data from ${legacyDir}: ${error.message}`);
+      result.messages.push(`旧版免安装数据迁移失败：${legacyDir}；${error.message}`);
     }
   }
   return result;
