@@ -1021,24 +1021,49 @@ function showMainWindow() {
 
 async function commitConfigMutation(settings, operation, payload = {}, options = {}) {
   const { commitThenPublishConfigMutation } = await import("./config-mutation-handler.mjs");
-  return commitThenPublishConfigMutation({
-    commit: () => settings.applyConfigMutationTransaction({
-      rootDir: dataRootDir,
-      homeDir: desktopHomeDir(),
-      operation,
-      payload,
-      verifyCommitted: options.verifyCommitted,
-    }),
-    onCommitted: (result) => {
-      appendRuntimeLog(
-        `config-transaction operation=${operation} revision=${result.configRevision} mode=${result.mode}`,
-      );
-    },
-    publish: options.publish === false ? undefined : () => broadcastState(),
-    onPostCommitError: (error, phase) => {
-      appendRuntimeLog(formatError(`configTransactionPostCommit:${phase}`, error));
-    },
-  });
+  try {
+    return await commitThenPublishConfigMutation({
+      commit: () => settings.applyConfigMutationTransaction({
+        rootDir: dataRootDir,
+        homeDir: desktopHomeDir(),
+        operation,
+        payload,
+        verifyCommitted: options.verifyCommitted,
+      }),
+      onCommitted: (result) => {
+        appendRuntimeLog(
+          `config-transaction operation=${operation} revision=${result.configRevision} mode=${result.mode}`,
+        );
+      },
+      publish: options.publish === false ? undefined : () => broadcastState(),
+      onPostCommitError: (error, phase) => {
+        appendRuntimeLog(formatError(`configTransactionPostCommit:${phase}`, error));
+      },
+    });
+  } catch (error) {
+    const failurePhase = safeConfigDiagnostic(error?.failurePhase, "unknown");
+    const causeCode = safeConfigDiagnostic(error?.causeCode || error?.code, "operation_failed");
+    appendRuntimeLog(
+      `config-transaction-failed operation=${operation} phase=${failurePhase} cause=${causeCode}`,
+    );
+    throw describeConfigMutationFailure(error, operation, failurePhase, causeCode);
+  }
+}
+
+function safeConfigDiagnostic(value, fallback) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return /^[a-z0-9_-]{1,80}$/.test(normalized) ? normalized : fallback;
+}
+
+function describeConfigMutationFailure(error, operation, failurePhase, causeCode) {
+  const described = new Error(
+    `配置保存失败（操作：${operation}；阶段：${failurePhase}；诊断码：${causeCode}）。请复制诊断信息后重试。`,
+  );
+  described.name = error?.name || "ConfigTransactionError";
+  described.code = error?.code || "config_transaction_failed";
+  described.failurePhase = failurePhase;
+  described.causeCode = causeCode;
+  return described;
 }
 
 ipcMain.handle("state:get", async (_event, options = {}) => {
@@ -1122,10 +1147,10 @@ ipcMain.handle("models:saveSelection", async (_event, selectedModelIds) => {
   const settings = await loadSettings();
   const committed = await commitConfigMutation(settings, "models:saveSelection", {
     selectedModelIds,
-  });
+  }, { publish: false });
   const saved = committed.selectedModelIds;
   appendLog(`Saved model selection: ${saved.join(", ")}.`);
-  return getStatePayload(settings);
+  return getStatePayload(settings, { lite: true });
 });
 
 ipcMain.handle("models:saveImageInput", async (_event, payload) => {
@@ -1530,13 +1555,16 @@ ipcMain.handle("logos:select", async (_event, payload = {}) => {
   return saved;
 });
 
-ipcMain.handle("customModel:save", async (_event, model) => {
+async function saveCustomModelFromIpc(model) {
   const settings = await loadSettings();
   const committed = await commitConfigMutation(settings, "customModel:save", { model });
   const saved = committed.result.saved;
   appendLog(`Saved custom model: ${saved.displayName}.`);
   return saved;
-});
+}
+
+ipcMain.handle("customModel:save", async (_event, model) => saveCustomModelFromIpc(model));
+ipcMain.handle("customModels:save", async (_event, model) => saveCustomModelFromIpc(model));
 
 ipcMain.handle("customModel:remove", async (_event, presetId) => {
   const settings = await loadSettings();

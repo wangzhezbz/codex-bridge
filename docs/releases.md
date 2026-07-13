@@ -22,6 +22,14 @@ sudo xattr -cr /Applications/CodexBridge.app
 
 [GitHub Releases](https://github.com/wangzhezbz/codex-bridge/releases)
 
+## v0.3.3
+
+- 修复 Windows 用户目录、中文用户名及目录联接场景下的配置写入与恢复失败。
+- 修复双倍额度服务因扩展目录不存在而无法启动，并让扩展准备失败降级为可诊断状态。
+- 修复旧版自定义模型保存入口、失效模型引用修复和模型选择保存失败。
+- 优化模型选择保存：提交成功后只回读轻量状态，不再同步扫描资源、会话和能力数据。
+- 补充配置事务、双倍额度服务、主进程 IPC 与 Renderer 回归测试。
+
 ## v0.3.2
 
 - 修复 CodexBridge 打开后长时间无响应的问题。

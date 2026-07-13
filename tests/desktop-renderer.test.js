@@ -696,6 +696,16 @@ test("desktop renderer gives stale model references direct repair actions", () =
   assert.doesNotMatch(mainSource, /syncRouteStateAfterMutation/);
 });
 
+test("smart routing options compare saved route ids against current route ids", () => {
+  const start = rendererSource.indexOf("function smartRoutingRouteOptions");
+  const end = rendererSource.indexOf("function populateSmartRoutingRouteSelect", start);
+  const body = rendererSource.slice(start, end);
+  assert.match(body, /state\?\.models/);
+  assert.match(body, /model\.id/);
+  assert.doesNotMatch(body, /state\?\.modelPresets/);
+  assert.doesNotMatch(body, /model\.presetId/);
+});
+
 test("desktop renderer sends an image-generation key with the same save mutation", () => {
   const start = rendererSource.indexOf("function saveImageGenerationSettings");
   const end = rendererSource.indexOf("function imageGenerationPayload", start);
@@ -1259,4 +1269,13 @@ test("desktop renderer provides request detail drilldown from usage events", () 
   assert.match(rendererSource, /\(\?:sk\|ak\)-/);
   assert.match(rendererSource, /\(\?:org\|proj\)-/);
   assert.match(cssSource, /\.request-detail-grid/);
+});
+
+test("model selection save merges the lightweight response without discarding loaded detail", () => {
+  const start = rendererSource.indexOf("function saveModelSelection(button)");
+  const end = rendererSource.indexOf("function startCustomModelEdit", start);
+  const body = rendererSource.slice(start, end);
+  assert.match(body, /const nextState = await api\.saveModelSelection\(draftSelection\);/);
+  assert.match(body, /state = mergeStateWithRetainedDetailSlices\(state, nextState\);/);
+  assert.doesNotMatch(body, /state = await api\.saveModelSelection\(draftSelection\);/);
 });

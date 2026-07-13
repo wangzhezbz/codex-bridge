@@ -11,6 +11,7 @@ const require = createRequire(import.meta.url);
 const {
   createChatgptBridgeService,
   extensionManagementAction,
+  uniqueResolvedPaths,
   upsertChatgptBridgeMcpConfig,
 } = require("../desktop/chatgpt-bridge-service.cjs");
 
@@ -98,6 +99,13 @@ test("double quota service exposes the embedded manifest and default stopped sta
   assert.equal(state.extensionManifestVersion, "0.1.1");
   assert.equal(state.extensionDisplayVersion, "0.1.1 - 20260712");
   assert.equal(state.ownedProcess, false);
+});
+
+test("Windows namespace and regular extension paths collapse to one deployment target", () => {
+  if (process.platform !== "win32") return;
+  const regular = "C:\\Users\\李\\AppData\\Roaming\\CodexBridge\\extensions\\chatgpt-codex-bridge";
+  const namespaced = `\\\\?\\${regular}`;
+  assert.deepEqual(uniqueResolvedPaths([regular, namespaced]), [regular]);
 });
 
 test("MCP host entry maps the current Codex task id into Bridge task scope", () => {
@@ -533,4 +541,37 @@ test("service starts and gracefully stops only its owned Electron-as-Node child"
   assert.equal(spawnArgs.options.windowsHide, true);
   assert.deepEqual(child.killSignals, ["SIGTERM"]);
   assert.equal(stopped.status, "stopped");
+});
+
+test("service start is not blocked when the optional Chrome extension refresh fails", async () => {
+  const dirs = fixture();
+  fs.mkdirSync(dirs.dataRootDir, { recursive: true });
+  fs.writeFileSync(path.join(dirs.dataRootDir, "extensions"), "blocks extension directory\n", "utf8");
+  let serviceAlive = false;
+  const child = new EventEmitter();
+  child.pid = 43211;
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = () => true;
+  let healthCalls = 0;
+  let spawnCalls = 0;
+  const service = createChatgptBridgeService({
+    ...dirs,
+    requestJson: async () => {
+      healthCalls += 1;
+      if (healthCalls >= 2) serviceAlive = true;
+      return serviceAlive ? compatibleHealth() : null;
+    },
+    spawnImpl() {
+      spawnCalls += 1;
+      return child;
+    },
+    delay: async () => {},
+  });
+
+  const started = await service.start();
+
+  assert.equal(spawnCalls, 1);
+  assert.equal(started.status, "running");
+  assert.match(started.extensionError, /extension|扩展|ENOTDIR|EEXIST/i);
 });

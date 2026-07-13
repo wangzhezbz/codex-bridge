@@ -196,7 +196,7 @@ test("rejects a target whose in-root parent junction resolves outside the allowe
   assert.equal(fs.existsSync(path.join(outsideDir, "must-not-write.json")), false);
 });
 
-test("rejects a configured allowed root that is itself a junction", async (t) => {
+test("accepts a configured allowed root that is itself a junction", async (t) => {
   const anchorDir = fs.mkdtempSync(
     path.join(os.tmpdir(), "codexbridge-config-coordinator-root-junction-anchor-"),
   );
@@ -219,7 +219,7 @@ test("rejects a configured allowed root that is itself a junction", async (t) =>
     journalDir: path.join(linkedRoot, ".transactions"),
   });
 
-  const error = await captureRejection(coordinator.runTransaction({
+  await coordinator.runTransaction({
     operation: "linked-root",
     prepare: async () => ({
       entries: [
@@ -231,9 +231,52 @@ test("rejects a configured allowed root that is itself a junction", async (t) =>
         },
       ],
     }),
-  }));
-  assert.equal(error.code, "config_transaction_failed");
-  assert.equal(fs.existsSync(path.join(physicalRoot, "config", "target.json")), false);
+  });
+  assert.equal(
+    fs.readFileSync(path.join(physicalRoot, "config", "target.json"), "utf8"),
+    "must-not-write",
+  );
+});
+
+test("an unrelated allowed-root junction does not block a regular-root transaction", async (t) => {
+  const regularRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), "codexbridge-config-coordinator-regular-root-"),
+  );
+  const anchorDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), "codexbridge-config-coordinator-unrelated-anchor-"),
+  );
+  const physicalRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), "codexbridge-config-coordinator-unrelated-physical-"),
+  );
+  const linkedRoot = path.join(anchorDir, "linked-root");
+  try {
+    fs.symlinkSync(physicalRoot, linkedRoot, "junction");
+  } catch (error) {
+    if (["EPERM", "EACCES", "UNKNOWN"].includes(error?.code)) {
+      t.skip(`junction creation unavailable: ${error.code}`);
+      return;
+    }
+    throw error;
+  }
+  const target = path.join(regularRoot, "config", "target.json");
+  const coordinator = createConfigWriteCoordinator({
+    allowedRoots: [regularRoot, linkedRoot],
+    journalDir: path.join(regularRoot, ".transactions"),
+  });
+
+  await coordinator.runTransaction({
+    operation: "regular-root-with-unrelated-linked-root",
+    prepare: async () => ({
+      entries: [{
+        id: "target",
+        target,
+        content: "saved",
+        validate: async () => {},
+      }],
+    }),
+  });
+
+  assert.equal(fs.readFileSync(target, "utf8"), "saved");
 });
 
 test("a configured allowed root may be missing until the first transaction creates it", async () => {

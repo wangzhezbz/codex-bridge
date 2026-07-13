@@ -35,6 +35,7 @@ function createChatgptBridgeService({
   const extensionManifest = readExtensionManifest(path.join(vendorDir, "chrome-extension", "manifest.json"));
   let child = null;
   let lastError = "";
+  let lastExtensionError = "";
   let lastExtensionDeployment = null;
 
   function loadConfig() {
@@ -159,6 +160,7 @@ function createChatgptBridgeService({
       extensionDiagnostics,
       extensionAction,
       extensionFiles,
+      extensionError: lastExtensionError,
       error: lastError,
       port: info.config.port,
       host: info.host,
@@ -187,9 +189,20 @@ function createChatgptBridgeService({
       throw new Error("请先停止双倍额度服务，再修改端口。");
     }
     saveConfig({ port: Number(port) });
-    await prepareExtension();
+    await prepareExtensionBestEffort("save-port");
     lastError = "";
     return getState();
+  }
+
+  async function prepareExtensionBestEffort(context) {
+    try {
+      await prepareExtension();
+      return true;
+    } catch (error) {
+      lastExtensionError = extensionErrorMessage(error);
+      log(`[double-quota] extension refresh skipped context=${context} error=${lastExtensionError}`);
+      return false;
+    }
   }
 
   async function prepareExtension() {
@@ -228,6 +241,7 @@ function createChatgptBridgeService({
       const failed = deploymentTargets.filter((target) => !target.verified).map((target) => target.path);
       throw new Error(`扩展文件复制后校验失败：${failed.join("；") || "没有可校验的目标目录"}`);
     }
+    lastExtensionError = "";
     return getState();
   }
 
@@ -273,7 +287,7 @@ function createChatgptBridgeService({
       return getState();
     }
 
-    await prepareExtension();
+    await prepareExtensionBestEffort("service-start");
     const info = runtimeInfo();
     if (!fs.existsSync(info.httpEntry)) {
       throw new Error("双倍额度服务入口不存在，请重新安装 CodexBridge。");
@@ -376,7 +390,7 @@ function extensionTargetDirectories(extensionDir, legacyExtensionDir, loadedExte
   if (extensionDirectoryStatus(legacyExtensionDir).complete) {
     targets.push(legacyExtensionDir);
   }
-  return [...new Set(targets.map((target) => path.resolve(target)))];
+  return uniqueResolvedPaths(targets);
 }
 
 function uniqueResolvedPaths(values = []) {
@@ -386,10 +400,29 @@ function uniqueResolvedPaths(values = []) {
     if (!candidate || !path.isAbsolute(candidate)) {
       continue;
     }
-    const resolved = path.resolve(candidate);
+    const resolved = resolvedFilesystemPath(candidate);
     result.set(resolved.toLowerCase(), resolved);
   }
   return [...result.values()];
+}
+
+function resolvedFilesystemPath(value) {
+  let candidate = String(value || "").trim();
+  if (process.platform === "win32") {
+    if (/^\\\\\?\\UNC\\/i.test(candidate)) {
+      candidate = `\\\\${candidate.slice(8)}`;
+    } else if (/^\\\\\?\\/i.test(candidate)) {
+      candidate = candidate.slice(4);
+    }
+  }
+  return path.resolve(candidate);
+}
+
+function extensionErrorMessage(error) {
+  const code = typeof error?.code === "string" && /^[A-Z0-9_]{1,40}$/i.test(error.code)
+    ? ` (${error.code})`
+    : "";
+  return `Chrome 扩展文件更新失败${code}，双倍额度服务仍可独立启动；请稍后使用“更新扩展”重试。`;
 }
 
 function verifyExtensionTarget(sourceDir, targetDir, configSource) {
@@ -742,5 +775,6 @@ function terminateOwnedChild(child, timeoutMs = 5000) {
 module.exports = {
   createChatgptBridgeService,
   extensionManagementAction,
+  uniqueResolvedPaths,
   upsertChatgptBridgeMcpConfig,
 };

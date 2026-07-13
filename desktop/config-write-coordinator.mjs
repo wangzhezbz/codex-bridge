@@ -536,20 +536,13 @@ export function createConfigWriteCoordinator({
 
   async function assertPhysicalPathAllowed(target) {
     const resolvedTarget = path.resolve(target);
-    const physicalRoots = [];
-    for (const root of configuration.allowedRoots) {
-      try {
-        const rootStats = await ops.lstat(root);
-        if (rootStats.isSymbolicLink?.()) {
-          throw unsafePathError("configured allowed roots must not be symbolic links");
-        }
-      } catch (error) {
-        if (!isMissingFileError(error)) {
-          throw error;
-        }
-      }
-      physicalRoots.push(await physicalPathIntent(root));
-    }
+    // Configured roots are explicit trust boundaries. Resolve them to their
+    // physical destinations so Windows junction-backed user directories work,
+    // while the physical-parent containment check below still rejects links
+    // inside a trusted root that escape to another location.
+    const physicalRoots = await Promise.all(
+      configuration.allowedRoots.map((root) => physicalPathIntent(root)),
+    );
     let targetStats;
     try {
       targetStats = await ops.lstat(resolvedTarget);

@@ -2262,14 +2262,14 @@ function normalizeSmartRoutingFailoverForUi(failover = {}) {
 }
 
 function smartRoutingRouteOptions() {
-  const models = Array.isArray(state?.modelPresets) ? state.modelPresets : [];
+  const models = Array.isArray(state?.models) ? state.models : [];
   const selected = new Set([...(draftSelection || []), ...(state?.selectedModelIds || [])]);
   return models
     .map((model) => ({
-      id: String(model.presetId || "").trim(),
-      label: model.displayName || model.model || model.presetId,
+      id: String(model.id || "").trim(),
+      label: model.displayName || model.model || model.id,
       detail: model.model || providerName(model.providerId) || "",
-      selected: selected.has(model.presetId),
+      selected: selected.has(model.id) || selected.has(model.model),
     }))
     .filter((model) => model.id)
     .sort((left, right) => Number(right.selected) - Number(left.selected) || left.label.localeCompare(right.label));
@@ -8416,7 +8416,8 @@ function toggleModel(presetId) {
 
 function saveModelSelection(button) {
   return runAction(button, async () => {
-    state = await api.saveModelSelection(draftSelection);
+    const nextState = await api.saveModelSelection(draftSelection);
+    state = mergeStateWithRetainedDetailSlices(state, nextState);
     draftSelection = [...state.selectedModelIds];
     render();
     showToast("模型选择已保存，并已更新 Router 配置。");

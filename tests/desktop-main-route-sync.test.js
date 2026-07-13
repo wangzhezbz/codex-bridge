@@ -61,6 +61,10 @@ test("model and route mutation IPC handlers converge through one shared configur
 
   for (const handlerName of ROUTE_MUTATION_HANDLERS) {
     const body = ipcHandlerBody(handlerName);
+    if (handlerName === "customModel:save") {
+      assert.match(body, /saveCustomModelFromIpc\s*\(/);
+      continue;
+    }
     assert.match(
       body,
       /\bcommitConfigMutation\s*\(/,
@@ -74,6 +78,7 @@ test("model and route mutation IPC handlers converge through one shared configur
     );
   }
   assert.doesNotMatch(mainSource, /async function syncRouteStateAfterMutation\b/);
+  assert.match(functionBody("saveCustomModelFromIpc"), /\bcommitConfigMutation\s*\(/);
   assert.match(mainSource, /commitThenPublishConfigMutation\s*\(/);
   assert.match(mainSource, /publish: options\.publish === false \? undefined : \(\) => broadcastState\(\)/);
 });
@@ -83,6 +88,31 @@ test("model selection derives the current mode only after entering the shared tr
   assert.doesNotMatch(body, /readRouterConfig\s*\(/);
   assert.doesNotMatch(body, /detectModeFromConfig\s*\(/);
   assert.doesNotMatch(body, /selectedModelIds\s*,\s*mode\s*[,}]/);
+});
+
+test("model selection save returns one lightweight snapshot instead of blocking on full desktop scans", () => {
+  const body = ipcHandlerBody("models:saveSelection");
+  assert.match(
+    body,
+    /commitConfigMutation\([\s\S]*?"models:saveSelection"[\s\S]*?\{\s*publish:\s*false\s*\}/,
+  );
+  assert.match(body, /return getStatePayload\(settings, \{ lite: true \}\);/);
+  assert.doesNotMatch(body, /return getStatePayload\(settings\);/);
+});
+
+test("custom model saves accept the legacy plural IPC channel", () => {
+  assert.match(mainSource, /ipcMain\.handle\("customModels:save"/);
+  const currentBody = ipcHandlerBody("customModel:save");
+  const legacyBody = ipcHandlerBody("customModels:save");
+  assert.match(currentBody, /saveCustomModelFromIpc\s*\(/);
+  assert.match(legacyBody, /saveCustomModelFromIpc\s*\(/);
+});
+
+test("configuration mutation failures preserve phase and cause diagnostics across IPC", () => {
+  const body = functionBody("commitConfigMutation");
+  assert.match(body, /describeConfigMutationFailure/);
+  assert.match(body, /failurePhase/);
+  assert.match(body, /causeCode/);
 });
 
 test("config package exports capture resource snapshots and config under one exclusive lease", () => {
