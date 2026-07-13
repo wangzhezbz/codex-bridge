@@ -1248,7 +1248,7 @@ export async function proxyResponsesApi(
   if (context.contextSwitchCompaction || shouldInlineLocalHistoryForResponses(requestBody, history)) {
     inlineLocalHistoryForResponsesPayload(payload, sourceMessages);
   }
-  normalizeCodexOpenAiBridgeCompactionPayload(payload, route, context);
+  normalizeBridgePlainCompactionPayload(payload, route, context);
 
   const upstreamPayload = filterPayloadForUpstream(
     payload,
@@ -1933,8 +1933,8 @@ function budgetResponsesCompactPayload(payload, route, history) {
   };
 }
 
-function normalizeCodexOpenAiBridgeCompactionPayload(payload, route = {}, context = {}) {
-  if (authModeForRoute(route) !== "codex_openai" || route.api !== "responses") {
+function normalizeBridgePlainCompactionPayload(payload, route = {}, context = {}) {
+  if (route.api !== "responses") {
     return;
   }
   const normalizedInput = normalizeBridgeCompactionInput(payload.input, context);
@@ -1962,7 +1962,7 @@ function normalizeBridgeCompactionInput(input, context = {}) {
     const text = String(item.encrypted_content || "");
     console.warn(
       `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
-        "!! compact-plaintext-context normalized bridge compaction for codex_openai",
+        "!! compact-plaintext-context normalized bridge compaction for responses upstream",
     );
     return {
       type: "message",
@@ -3065,7 +3065,7 @@ async function proxyResponsesCompact(requestBody, route, history, res, context =
   const budgeted = budgetResponsesCompactPayload(compactBody, route, history);
   const { sourceMessages, toolContext } = budgeted;
   logContextTruncationDecision(context, route, budgeted.contextDecision);
-  normalizeCodexOpenAiBridgeCompactionPayload(compactBody, route, context);
+  normalizeBridgePlainCompactionPayload(compactBody, route, context);
 
   const upstreamUrl = joinOpenAiEndpointUrl(responsesBaseUrlForRoute(route), "/responses");
   logRoute(context, route, upstreamUrl);
@@ -3083,7 +3083,7 @@ async function proxyResponsesCompact(requestBody, route, history, res, context =
     } else {
       const streamCompactBody = cloneJson(compactBody) || {};
       streamCompactBody.stream = true;
-      normalizeCodexOpenAiBridgeCompactionPayload(streamCompactBody, route, context);
+      normalizeBridgePlainCompactionPayload(streamCompactBody, route, context);
       console.warn(
         `[${new Date().toISOString()}] ${context.requestId || "req"} !! upstream ` +
           `route=${route.id} compact requires stream=true; retrying compact request as event stream`,

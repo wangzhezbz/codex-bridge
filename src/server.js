@@ -35,6 +35,7 @@ import {
 import { saveCapabilityAssetResult } from "./capability-assets.js";
 import { normalizeContextPolicyConfig } from "./context-policy.js";
 import { createPendingRequestGuard } from "./pending-request-guard.js";
+import { createCodexModelSelectionState } from "./codex-model-selection.js";
 
 const DEFAULT_JSON_BODY_LIMIT_BYTES = 25 * 1024 * 1024;
 const DEFAULT_RESPONSES_BODY_LIMIT_BYTES = 100 * 1024 * 1024;
@@ -111,6 +112,7 @@ export function createRouterServer(
   const routeHealth = createRouteHealthStore();
   const usageBudgetGuard = createUsageBudgetGuard();
   const pendingRequestGuard = createPendingRequestGuard();
+  const codexModelSelection = createCodexModelSelectionState();
   const socketsWithErrorHandler = new WeakSet();
 
   const server = http.createServer(async (req, res) => {
@@ -200,6 +202,30 @@ export function createRouterServer(
         isModelSettingsPath(url.pathname)
       ) {
         const body = await readJsonRequest(req, requestBodyLimitBytes(activeConfig, url.pathname));
+        const modelSettingResponseId = responseIdFromModelSettingsPath(url.pathname);
+        const previousResponse = modelSettingResponseId
+          ? history.getResponse(modelSettingResponseId)
+          : null;
+        const previousResponseMeta = modelSettingResponseId
+          ? history.getResponseMeta(modelSettingResponseId)
+          : null;
+        const modelSetting = codexModelSelection.recordModelSetting({
+          headers: req.headers,
+          pathname: url.pathname,
+          body,
+          previousModel:
+            previousResponseMeta?.routeId ||
+            previousResponseMeta?.routeSnapshot?.id ||
+            previousResponse?.model ||
+            "",
+        });
+        if (modelSetting.recorded) {
+          console.log(
+            `[${new Date().toISOString()}] model-setting selected_model=${safeLogValue(modelSetting.selectedModel)} ` +
+              `previous_model=${safeLogValue(modelSetting.previousModel || "-")} ` +
+              `scope=${safeLogValue(modelSetting.scope)}`,
+          );
+        }
         jsonResponse(res, 200, {
           ok: true,
           object: "codexbridge.model_settings",
@@ -215,6 +241,21 @@ export function createRouterServer(
         isResponsesPostPath(url.pathname)
       ) {
         const body = await readJsonRequest(req, requestBodyLimitBytes(activeConfig, url.pathname));
+        const modelSetting = codexModelSelection.applyToRequest({
+          headers: req.headers,
+          body,
+          configuredModelIds: activeConfig.models
+            .filter((model) => model.enabled !== false)
+            .map((model) => model.id),
+        });
+        if (modelSetting.changed) {
+          console.warn(
+            `[${new Date().toISOString()}] model-setting-reconnect ` +
+              `stale_model=${safeLogValue(modelSetting.requestedModel)} ` +
+              `selected_model=${safeLogValue(modelSetting.selectedModel)} ` +
+              `scope=${safeLogValue(modelSetting.scope)}`,
+          );
+        }
         const requestedModel = body.model || "";
         const requestId = makeRequestId();
         const isCodexClient = isCodexClientRequest(req);
@@ -3085,6 +3126,13 @@ function isModelSettingsPath(pathname) {
 
 function responseIdFromItemPath(pathname) {
   const match = pathname.match(/^\/(?:v1\/)?responses\/([^/]+)$/);
+  return match?.[1] ? decodeURIComponent(match[1]) : "";
+}
+
+function responseIdFromModelSettingsPath(pathname) {
+  const match = pathname.match(
+    /^\/(?:v1\/)?responses\/([^/]+)(?:\/model_settings)?$/,
+  );
   return match?.[1] ? decodeURIComponent(match[1]) : "";
 }
 

@@ -629,6 +629,96 @@ test("codex_openai responses routes send bridge compact summaries as text contex
   }
 });
 
+test("custom API-key responses routes send bridge compact summaries as text context", async () => {
+  let upstreamBody;
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/responses");
+    upstreamBody = await readJson(req);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: "resp_custom_compacted_context",
+        object: "response",
+        status: "completed",
+        model: "zode-responses-model",
+        output: [
+          {
+            id: "msg_custom_compacted_context",
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [
+              {
+                type: "output_text",
+                text: "custom compacted context accepted",
+                annotations: [],
+              },
+            ],
+          },
+        ],
+        output_text: "custom compacted context accepted",
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "zode-responses-model",
+    models: [
+      {
+        id: "zode-responses-model",
+        displayName: "Zode Responses Model",
+        provider: "custom",
+        api: "responses",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "zode-responses-model",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  try {
+    const response = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+        "user-agent": "Codex Desktop/0.142.3",
+      },
+      body: JSON.stringify({
+        model: "zode-responses-model",
+        stream: false,
+        input: [
+          {
+            id: "cmp_bridge_plain_summary_custom",
+            type: "compaction",
+            encrypted_content: `${COMPACT_SUMMARY_PREFIX}\nImportant summary for Zode after compact.`,
+          },
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "continue after compact" }],
+          },
+        ],
+      }),
+    });
+
+    assert.equal(response.statusCode, 200);
+    assert.match(response.body, /custom compacted context accepted/);
+    const raw = JSON.stringify(upstreamBody);
+    assert.doesNotMatch(raw, /"encrypted_content"/);
+    assert.doesNotMatch(raw, /"type":"compaction"/);
+    assert.match(raw, /Important summary for Zode after compact/);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
 test("server reports local request body limit with compact guidance", async () => {
   let upstreamCalls = 0;
   const upstream = http.createServer(async (_req, res) => {
@@ -5429,6 +5519,139 @@ test("server accepts Codex Desktop per-response model setting updates without an
   } finally {
     await close(router);
     await close(upstream);
+  }
+});
+
+test("server applies a Codex Desktop model setting change to stale reconnect requests", async () => {
+  __resetRateLimiterForTests();
+  let kimiCalls = 0;
+  let gptCalls = 0;
+  const kimiUpstream = http.createServer(async (req, res) => {
+    kimiCalls += 1;
+    await readJson(req);
+    res.writeHead(429, {
+      "content-type": "application/json",
+      "retry-after": "0.001",
+    });
+    res.end(JSON.stringify({ error: { message: "Kimi organization TPD rate limit" } }));
+  });
+  const gptUpstream = http.createServer(async (req, res) => {
+    gptCalls += 1;
+    const body = await readJson(req);
+    assert.equal(body.model, "gpt-5.6-sol");
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    writeResponseCompletedSse(res, {
+      id: `resp_gpt_after_stale_kimi_reconnect_${gptCalls}`,
+      object: "response",
+      status: "completed",
+      model: "gpt-5.6-sol",
+      output: [
+        {
+          type: "message",
+          role: "assistant",
+          content: [
+            {
+              type: "output_text",
+              text: `gpt handled stale reconnect ${gptCalls}`,
+            },
+          ],
+        },
+      ],
+    });
+  });
+
+  await listen(kimiUpstream);
+  await listen(gptUpstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    clientAuth: { allowOpenAiBearer: true },
+    defaultModel: "kimi-k2-6",
+    models: [
+      {
+        id: "kimi-k2-6",
+        displayName: "Kimi K2.6",
+        provider: "kimi",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(kimiUpstream)}/v1`,
+        model: "kimi-k2-6",
+        apiKey: "kimi-key",
+      },
+      {
+        id: "gpt-5.6-sol",
+        displayName: "GPT-5.6-Sol",
+        provider: "codex",
+        api: "responses",
+        baseUrl: `${serverUrl(gptUpstream)}/v1`,
+        model: "gpt-5.6-sol",
+        authMode: "codex_openai",
+      },
+    ],
+  });
+
+  await listen(router);
+  const headers = {
+    "content-type": "application/json",
+    authorization: "Bearer codex-openai-token",
+    "user-agent": "Codex Desktop/0.144.0-alpha.4",
+    "x-codex-thread-id": "thread_kimi_to_gpt_reconnect",
+    "x-codex-window-id": "window_kimi_to_gpt_reconnect",
+    "x-codex-turn-state": "turn_reconnecting_after_rate_limit",
+  };
+  const input = [
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "continue after switching to GPT" }],
+    },
+  ];
+
+  try {
+    const first = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "kimi-k2-6",
+        stream: true,
+        input,
+      }),
+    });
+    assert.equal(first.statusCode, 200);
+    assert.match(first.body, /Kimi K2\.6/);
+    assert.equal(kimiCalls, 1);
+    assert.equal(gptCalls, 0);
+
+    const setting = await fetchJson(`${serverUrl(router)}/v1/responses`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({
+        model: "gpt-5.6-sol",
+        model_reasoning_effort: "high",
+      }),
+    });
+    assert.equal(setting.ok, true);
+    assert.equal(setting.model, "gpt-5.6-sol");
+
+    const reconnect = await requestText(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "kimi-k2-6",
+        stream: true,
+        previous_response_id: "resp_after_kimi_rate_limit",
+        input,
+      }),
+    });
+    assert.equal(reconnect.statusCode, 200);
+    assert.match(reconnect.body, /gpt handled stale reconnect 1/);
+    assert.equal(kimiCalls, 1);
+    assert.equal(gptCalls, 1);
+  } finally {
+    await close(router);
+    await close(kimiUpstream);
+    await close(gptUpstream);
+    __resetRateLimiterForTests();
   }
 });
 
