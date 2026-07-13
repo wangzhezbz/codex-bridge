@@ -22,6 +22,15 @@ sudo xattr -cr /Applications/CodexBridge.app
 
 [GitHub Releases](https://github.com/wangzhezbz/codex-bridge/releases)
 
+## v0.3.2
+
+- 修复 CodexBridge 打开后长时间无响应的问题。
+- 将 Codex CLI、prompt-input 和 app-server 资源探测移至独立 Worker，长扫描期间不再阻塞桌面主线程。
+- Router 启动和停止不再等待完整资源扫描或占用配置事务队列。
+- 状态广播固定使用轻量快照，避免进入资源页后所有后续广播都重复执行完整扫描。
+- 取消启动时自动逐项目恢复，保留会话页的显式手动恢复入口。
+- 完整 Router、Desktop、历史恢复、打包后 Windows smoke 均已通过。
+
 ## v0.3.1
 
 - 兼容新版 ChatGPT/Codex 桌面端，并保留旧版 Codex 启动支持。

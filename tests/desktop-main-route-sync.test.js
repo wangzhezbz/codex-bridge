@@ -149,18 +149,23 @@ test("pending configuration journals recover before the desktop window exposes m
   );
 });
 
-test("state snapshots and success broadcasts read one complete queued generation with a non-throwing fallback", () => {
+test("state snapshots keep slow desktop discovery outside the configuration transaction queue", () => {
   assert.match(
     mainSource,
     /createResilientStateReader\s*\(/,
   );
-  assert.match(mainSource, /readSnapshot:[\s\S]*?settings\.runSharedConfigExclusive\(\(\) =>[\s\S]*?buildStatePayload\(settings, options\)/);
+  assert.match(mainSource, /readSnapshot:\s*\(options = \{\}\) => buildStatePayload\(settings, options\)/);
+  assert.doesNotMatch(
+    mainSource,
+    /readSnapshot:[\s\S]*?settings\.runSharedConfigExclusive\(\(\) =>[\s\S]*?buildStatePayload\(settings, options\)/,
+  );
+  assert.match(mainSource, /await runCodexResourceSnapshotWorker\s*\(/);
   assert.match(mainSource, /createFallbackSnapshot:\s*buildStateUnavailablePayload/);
   assert.match(mainSource, /reportFailure:[\s\S]*?appendRuntimeLog\(/);
-  assert.match(mainSource, /function buildStatePayload\(settings, options = \{\}\)/);
+  assert.match(mainSource, /async function buildStatePayload\(settings, options = \{\}\)/);
   assert.match(
     mainSource,
-    /async function broadcastState\(\)[\s\S]*?await getStatePayload\(settings/,
+    /async function broadcastState\(\)[\s\S]*?await getStatePayload\(settings, \{ lite: true \}\)/,
   );
 });
 
@@ -380,9 +385,13 @@ test("desktop main has no dead destructive Codex history sync logging path", () 
 test("detailed resource refresh bypasses only the Codex resource snapshot cache", () => {
   assert.match(
     mainSource,
-    /readCodexResourceSnapshots\s*\(\s*\{\s*forceRefresh:\s*Boolean\(options\.forceResourceRefresh\)[\s\S]*?desktopOptions/,
+    /runCodexResourceSnapshotWorker\s*\(\s*\{\s*forceRefresh:\s*Boolean\(options\.forceResourceRefresh\)[\s\S]*?desktopOptions/,
   );
   assert.doesNotMatch(mainSource, /readCodex(?:CliResource|PromptInput)Snapshot\s*\(\s*\)/);
+});
+
+test("desktop verification includes the resource snapshot worker", () => {
+  assert.match(packageJson.scripts["check:syntax"], /desktop\/resource-snapshot-worker\.cjs/);
 });
 
 test("desktop automatically refreshes ChatGPT resources when the resource page opens", () => {
@@ -393,10 +402,11 @@ test("desktop automatically refreshes ChatGPT resources when the resource page o
   );
 });
 
-test("deferred startup automatically restores only history-only ChatGPT projects", () => {
-  assert.match(mainSource, /scheduleDeferredStartupWork[\s\S]*?autoRecoverCodexProjectsOnStartup\(\)/);
-  assert.match(mainSource, /async function autoRecoverCodexProjectsOnStartup\b/);
-  assert.match(mainSource, /autoLaunchRoots/);
+test("deferred startup never auto-launches ChatGPT projects or polls the session database", () => {
+  const body = functionBody("scheduleDeferredStartupWork");
+  assert.doesNotMatch(body, /autoRecoverCodexProjectsOnStartup\(\)/);
+  assert.doesNotMatch(mainSource, /async function autoRecoverCodexProjectsOnStartup\b/);
+  assert.doesNotMatch(mainSource, /let autoProjectRecoveryFinished\b/);
 });
 
 test("startup check reuses one shared CLI and prompt-input resource snapshot", () => {

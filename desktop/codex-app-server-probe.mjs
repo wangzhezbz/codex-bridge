@@ -120,7 +120,7 @@ send({
   method: "initialize",
   id: 0,
   params: {
-    clientInfo: { name: "codexbridge", title: "CodexBridge", version: "0.3.1" },
+    clientInfo: { name: "codexbridge", title: "CodexBridge", version: "0.3.2" },
     capabilities: { experimentalApi: true },
   },
 });

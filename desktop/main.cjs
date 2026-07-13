@@ -102,9 +102,7 @@ let desktopSmokeLoadHookRegistered = false;
 let localExecutorServer = null;
 let localExecutorUrl = "";
 let localExecutorToken = "";
-let rendererNeedsDetailedState = false;
 let deferredStartupScheduled = false;
-let autoProjectRecoveryFinished = false;
 let legacyDataMigration = { copiedFiles: 0, skippedFiles: 0, sourceDirs: [], messages: [] };
 let legacyDataMigrationPromise = null;
 let legacyDataMigrationFinished = !app.isPackaged || Boolean(process.env.CODEXBRIDGE_DATA_DIR);
@@ -577,9 +575,6 @@ function scheduleDeferredStartupWork() {
     repairManagedCodexCompatibilityOnStartup().catch((error) =>
       appendRuntimeLog(formatError("codexCompatibilityRepair", error)),
     );
-    autoRecoverCodexProjectsOnStartup().catch((error) =>
-      appendRuntimeLog(formatError("codexProjectAutoRecovery", error)),
-    );
     resumePendingCodexHistoryRecoveryOnStartup().catch((error) =>
       appendRuntimeLog(formatError("codexHistoryRecoveryWorker", error)),
     );
@@ -605,28 +600,6 @@ async function resumePendingCodexHistoryRecoveryOnStartup() {
     pending = flow.status();
   }
   return flow.status();
-}
-
-async function autoRecoverCodexProjectsOnStartup() {
-  if (autoProjectRecoveryFinished || process.env.CODEXBRIDGE_DESKTOP_SMOKE === "1") {
-    return { ok: true, skipped: true, reason: "already_finished_or_smoke" };
-  }
-  autoProjectRecoveryFinished = true;
-  const settings = await loadSettings();
-  const plan = settings.codexProjectRecoveryPlan({
-    homeDir: desktopHomeDir(),
-    limit: SESSION_CENTER_LIMIT,
-  });
-  const autoLaunchRoots = Array.isArray(plan.autoLaunchRoots) ? plan.autoLaunchRoots : [];
-  if (!autoLaunchRoots.length) {
-    return { ok: true, skipped: true, reason: "no_history_only_projects", plan };
-  }
-  const result = await recoverCodexProjectsFromPlan({
-    ...plan,
-    launchRoots: autoLaunchRoots,
-  }, { waitForActivation: true });
-  appendRuntimeLog(`ChatGPT project auto-sync requested ${result.launched || 0} history-only projects`);
-  return result;
 }
 
 async function repairManagedCodexCompatibilityOnStartup() {
@@ -702,6 +675,32 @@ function runLegacyDataMigrationWorker({ targetDir, execPath } = {}) {
     worker.once("exit", (code) => {
       if (!settled && code !== 0) {
         reject(new Error(`Legacy data migration worker exited with code ${code}`));
+      }
+    });
+  });
+}
+
+function runCodexResourceSnapshotWorker(options = {}) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(path.join(__dirname, "resource-snapshot-worker.cjs"), {
+      workerData: { options },
+    });
+    let settled = false;
+    worker.once("message", (message) => {
+      settled = true;
+      if (message?.ok) {
+        resolve(message.result || {});
+        return;
+      }
+      reject(new Error(message?.error || "Codex resource snapshot worker failed"));
+    });
+    worker.once("error", (error) => {
+      settled = true;
+      reject(error);
+    });
+    worker.once("exit", (code) => {
+      if (!settled && code !== 0) {
+        reject(new Error(`Codex resource snapshot worker exited with code ${code}`));
       }
     });
   });
@@ -1045,7 +1044,6 @@ async function commitConfigMutation(settings, operation, payload = {}, options =
 ipcMain.handle("state:get", async (_event, options = {}) => {
   const settings = await loadSettings();
   if (!options?.lite) {
-    rendererNeedsDetailedState = true;
     markStartupOnce("deferred-scan-start");
   }
   const payload = getStatePayload(settings, options || {});
@@ -4623,12 +4621,7 @@ function formatError(prefix, error) {
 async function broadcastState() {
   try {
     const settings = await loadSettings();
-    const payload = await getStatePayload(settings, { lite: !rendererNeedsDetailedState });
-    if (rendererNeedsDetailedState && payload?.codexResources?.pluginPage) {
-      appendRuntimeLog(
-        `[resource-flow] stage=broadcastState apps=${payload.codexResources.pluginPage.summary?.apps ?? "unavailable"} app_ids=${(payload.codexResources.pluginPage.apps || []).map((item) => item.id).join(",")} snapshot=${payload.codexResources.pluginPage.snapshot?.state || "unknown"}`,
-      );
-    }
+    const payload = await getStatePayload(settings, { lite: true });
     sendToRenderer("state:update", payload);
   } catch {
     appendRuntimeLog("State broadcast failed; the committed operation remains successful.");
@@ -4638,9 +4631,7 @@ async function broadcastState() {
 async function getStatePayload(settings, options = {}) {
   if (!statePayloadReader) {
     statePayloadReader = createResilientStateReader({
-      readSnapshot: (options = {}) => settings.runSharedConfigExclusive(() =>
-        buildStatePayload(settings, options)
-      ),
+      readSnapshot: (options = {}) => buildStatePayload(settings, options),
       createFallbackSnapshot: buildStateUnavailablePayload,
       reportFailure: () => {
         appendRuntimeLog("State snapshot unavailable; serving the last complete snapshot.");
@@ -4704,7 +4695,7 @@ function buildStateUnavailablePayload() {
   };
 }
 
-function buildStatePayload(settings, options = {}) {
+async function buildStatePayload(settings, options = {}) {
   const lite = Boolean(options.lite);
   const includeSettingsDetail = !lite || Boolean(options.settingsDetail);
   const config = settings.readRouterConfig(dataRootDir);
@@ -4726,10 +4717,11 @@ function buildStatePayload(settings, options = {}) {
     ? null
     : smokeResourceSnapshotPath
       ? JSON.parse(fs.readFileSync(smokeResourceSnapshotPath, "utf8"))
-      : settings.readCodexResourceSnapshots({
+      : await runCodexResourceSnapshotWorker({
           forceRefresh: Boolean(options.forceResourceRefresh),
           desktopOptions,
           homeDir,
+          rootDir: appRootDir,
         });
   const codexCliSnapshot = codexResourceSnapshots?.codexCliSnapshot || null;
   const codexPromptInputSnapshot = codexResourceSnapshots?.codexPromptInputSnapshot || null;
