@@ -82,6 +82,7 @@ test("double quota is a dedicated desktop page backed by narrow IPC methods", ()
   );
   assert.match(extensionUpdateHandler, /requestedAction === "reinstall"[\s\S]*api\.copyText\(doubleQuotaState\.extensionDir\)/);
   assert.match(extensionUpdateHandler, /requestedAction === "reinstall"[\s\S]*api\.openDoubleQuotaExtensionManager\(\)/);
+  assert.match(extensionUpdateHandler, /extensionUpdate\?\.status === "failed"[\s\S]*throw new Error/);
   assert.match(mainSource, /App Paths\\\\chrome\.exe/);
   assert.match(mainSource, /\["--new-window", "chrome:\/\/extensions\/"\]/);
   assert.match(mainSource, /clipboard\.writeText\("chrome:\/\/extensions\/"\)/);
@@ -754,7 +755,7 @@ test("desktop renderer keeps heavy startup data lazy and dense pages folded", ()
   assert.match(mainSource, /markStartupOnce\("deferred-scan-start"\)/);
   assert.match(mainSource, /getStatePayload\(settings, \{ lite: true \}\)/);
   assert.match(mainSource, /lite \? null : settings\.listCodexSessionTree/);
-  assert.match(mainSource, /const codexResourceSnapshots = lite[\s\S]*?: await runCodexResourceSnapshotWorker\(\{[\s\S]*?forceRefresh: Boolean\(options\.forceResourceRefresh\),[\s\S]*?\}\);/);
+  assert.match(mainSource, /const codexResourceSnapshots = lite[\s\S]*?: await readCodexResourceSnapshotsRetained\(\{[\s\S]*?forceRefresh: Boolean\(options\.forceResourceRefresh\),[\s\S]*?\}\);/);
   assert.match(mainSource, /const codexCliSnapshot = codexResourceSnapshots\?\.codexCliSnapshot \|\| null;/);
   assert.match(mainSource, /const codexPromptInputSnapshot = codexResourceSnapshots\?\.codexPromptInputSnapshot \|\| null;/);
   assert.match(rendererSource, /refresh\(\{ lite: true \}\)/);

@@ -5486,7 +5486,7 @@ export function listCodexResources({
   const chatGptPluginPageSnapshot = {
     state: appServerSnapshot?.stale === true
       ? "cached"
-      : appServerSnapshot
+      : ["plugins", "apps", "skills"].some((kind) => appServerSnapshot?.[kind]?.ok === true)
         ? "authoritative"
         : "unavailable",
     source: appServerSnapshot?.snapshotSource || "unavailable",
@@ -15230,6 +15230,8 @@ export async function applyConfigMutationTransaction({
   coordinator = sharedConfigWriteCoordinator,
   verifyCommitted,
   now,
+  managedTomlRetryDelays = [100, 250, 500],
+  waitForManagedTomlRetry = ({ delayMs }) => new Promise((resolve) => setTimeout(resolve, delayMs)),
 } = {}) {
   if (typeof rootDir !== "string" || !rootDir.trim()) {
     throw new TypeError("rootDir is required.");
@@ -15260,7 +15262,12 @@ export async function applyConfigMutationTransaction({
 
   const transactionResult = await coordinator.runTransaction({
     operation,
-    prepare: ({ configRevision }) => {
+    prepare: async ({ configRevision }) => {
+      const retryDelays = Array.isArray(managedTomlRetryDelays)
+        ? managedTomlRetryDelays.map(Number).filter((value) => Number.isFinite(value) && value >= 0)
+        : [];
+      for (let managedTomlAttempt = 0; ; managedTomlAttempt += 1) {
+        try {
       const snapshot = captureStableConfigMutationSnapshot(rootDir, homeDir);
       const preparedAt = configMutationNow({ now });
       const mutated = mutateConfigState(
@@ -15455,6 +15462,17 @@ export async function applyConfigMutationTransaction({
           },
         },
       };
+        } catch (error) {
+          if (error?.code !== "managed_toml_invalid" || managedTomlAttempt >= retryDelays.length) {
+            throw error;
+          }
+          await waitForManagedTomlRetry({
+            attempt: managedTomlAttempt + 1,
+            delayMs: retryDelays[managedTomlAttempt],
+            error,
+          });
+        }
+      }
     },
     verifyCommitted: transactionVerifier,
   });

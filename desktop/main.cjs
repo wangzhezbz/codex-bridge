@@ -43,6 +43,10 @@ const { classifyRouterProcessOutput } = require("./router-start-diagnostics.cjs"
 const { runRouterStartForIpc } = require("./router-start-result.cjs");
 const { readBoundedRegularUtf8File } = require("./safe-import-file.cjs");
 const { createChatgptBridgeService } = require("./chatgpt-bridge-service.cjs");
+const {
+  hasCodexResourceAuthority,
+  retainCodexResourceSnapshots,
+} = require("./resource-snapshot-retention.cjs");
 
 if (shouldDisableChromiumSandbox()) {
   app.commandLine.appendSwitch("no-sandbox");
@@ -105,6 +109,7 @@ let localExecutorToken = "";
 let deferredStartupScheduled = false;
 let legacyDataMigration = { copiedFiles: 0, skippedFiles: 0, sourceDirs: [], messages: [] };
 let legacyDataMigrationPromise = null;
+let lastCodexResourceSnapshots = null;
 let legacyDataMigrationFinished = !app.isPackaged || Boolean(process.env.CODEXBRIDGE_DATA_DIR);
 const startupStartedAt = Date.now();
 const startupMarkers = new Set();
@@ -704,6 +709,19 @@ function runCodexResourceSnapshotWorker(options = {}) {
       }
     });
   });
+}
+
+async function readCodexResourceSnapshotsRetained(options = {}) {
+  let fresh = await runCodexResourceSnapshotWorker(options);
+  if (!lastCodexResourceSnapshots && !hasCodexResourceAuthority(fresh)) {
+    await delay(350);
+    fresh = await runCodexResourceSnapshotWorker(options);
+  }
+  const retained = retainCodexResourceSnapshots(fresh, lastCodexResourceSnapshots);
+  if (hasCodexResourceAuthority(retained)) {
+    lastCodexResourceSnapshots = retained;
+  }
+  return retained;
 }
 
 async function initUsageStore() {
@@ -2274,9 +2292,11 @@ ipcMain.handle("doubleQuota:prepareExtension", async () => {
 
 ipcMain.handle("doubleQuota:manageExtension", async () => {
   const result = await getChatgptBridgeService().manageExtension();
-  appendLog(result.extensionUpdate?.completed
-    ? `双倍额度扩展已更新并连接：${result.extensionDir}`
-    : `双倍额度扩展文件已更新，等待 Chrome 手动重新加载：${result.extensionDir}`);
+  appendLog(result.extensionUpdate?.status === "failed"
+    ? `双倍额度扩展更新失败：${result.extensionUpdate.error || "unknown"}`
+    : result.extensionUpdate?.completed
+      ? `双倍额度扩展已更新并连接：${result.extensionDir}`
+      : `双倍额度扩展文件已更新，等待 Chrome 手动重新加载：${result.extensionDir}`);
   return result;
 });
 
@@ -4745,7 +4765,7 @@ async function buildStatePayload(settings, options = {}) {
     ? null
     : smokeResourceSnapshotPath
       ? JSON.parse(fs.readFileSync(smokeResourceSnapshotPath, "utf8"))
-      : await runCodexResourceSnapshotWorker({
+      : await readCodexResourceSnapshotsRetained({
           forceRefresh: Boolean(options.forceResourceRefresh),
           desktopOptions,
           homeDir,

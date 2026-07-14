@@ -217,6 +217,60 @@ test("double quota prepares a stable extension with the configured origin", asyn
   );
 });
 
+test("extension deployment does not depend on recursive cpSync and completes in a Chinese user data path", async () => {
+  const dirs = fixture();
+  const dataRootDir = path.join(dirs.root, "用户李", "data");
+  const service = createChatgptBridgeService({
+    ...dirs,
+    dataRootDir,
+    requestJson: async () => null,
+  });
+  const originalCpSync = fs.cpSync;
+  fs.cpSync = () => {
+    const error = new Error("simulated recursive copy failure");
+    error.code = "EIO";
+    throw error;
+  };
+  try {
+    const state = await service.prepareExtension();
+    assert.equal(state.extensionReady, true);
+    for (const fileName of ["manifest.json", "background.js", "content-script.js", "bridge-config.js"]) {
+      assert.equal(fs.existsSync(path.join(state.extensionDir, fileName)), true, fileName);
+    }
+  } finally {
+    fs.cpSync = originalCpSync;
+  }
+});
+
+test("extension management returns a safe failed state instead of leaking a Windows EIO path", async () => {
+  const dirs = fixture();
+  const dataRootDir = path.join(dirs.root, "用户李", "data");
+  const service = createChatgptBridgeService({
+    ...dirs,
+    dataRootDir,
+    requestJson: async () => null,
+  });
+  const originalWriteFileSync = fs.writeFileSync;
+  fs.writeFileSync = (target, ...args) => {
+    if (String(target).includes(`${path.sep}extensions${path.sep}chatgpt-codex-bridge${path.sep}`)) {
+      const error = new Error(`simulated failure at ${target}`);
+      error.code = "EIO";
+      throw error;
+    }
+    return originalWriteFileSync(target, ...args);
+  };
+  try {
+    const state = await service.manageExtension();
+    assert.equal(state.extensionUpdate.status, "failed");
+    assert.equal(state.extensionUpdate.completed, false);
+    assert.equal(state.extensionUpdate.manualReloadRequired, false);
+    assert.match(state.extensionUpdate.error, /Chrome 扩展文件更新失败 \(EIO\)/);
+    assert.doesNotMatch(state.extensionUpdate.error, /用户李|AppData|extensions/);
+  } finally {
+    fs.writeFileSync = originalWriteFileSync;
+  }
+});
+
 test("double quota updates both the canonical and an existing legacy Chrome extension directory", async () => {
   const dirs = fixture();
   const legacyDir = path.join(dirs.dataRootDir, "chatgpt-bridge-extension");

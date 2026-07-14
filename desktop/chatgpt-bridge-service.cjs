@@ -227,9 +227,7 @@ function createChatgptBridgeService({
     );
     const deploymentTargets = [];
     for (const targetDir of targetDirs) {
-      fs.mkdirSync(targetDir, { recursive: true });
-      fs.cpSync(sourceDir, targetDir, { recursive: true, force: true });
-      writeFileAtomic(path.join(targetDir, "bridge-config.js"), configSource);
+      deployExtensionFiles(sourceDir, targetDir, configSource);
       deploymentTargets.push(verifyExtensionTarget(sourceDir, targetDir, configSource));
     }
     lastExtensionDeployment = {
@@ -247,7 +245,23 @@ function createChatgptBridgeService({
 
   async function manageExtension() {
     const before = await getState();
-    let current = await prepareExtension();
+    let current;
+    try {
+      current = await prepareExtension();
+    } catch (error) {
+      lastExtensionError = extensionErrorMessage(error);
+      log(`[double-quota] extension update failed error=${lastExtensionError}`);
+      return {
+        ...(await getState()),
+        extensionUpdate: {
+          status: "failed",
+          completed: false,
+          manualReloadRequired: false,
+          updatedDirectories: [],
+          error: lastExtensionError,
+        },
+      };
+    }
     for (let attempt = 0; attempt < 20 && current.extensionAction?.complete !== true; attempt += 1) {
       if (
         before.extensionAction?.id === "reinstall" ||
@@ -446,6 +460,35 @@ function verifyExtensionTarget(sourceDir, targetDir, configSource) {
     verified: mismatches.length === 0,
     mismatches,
   };
+}
+
+function deployExtensionFiles(sourceDir, targetDir, configSource) {
+  for (const relativePath of listRegularFiles(sourceDir)) {
+    if (relativePath.toLowerCase() === "bridge-config.js") {
+      continue;
+    }
+    const sourcePath = path.join(sourceDir, relativePath);
+    const targetPath = path.join(targetDir, relativePath);
+    const content = withTransientFsRetry(() => fs.readFileSync(sourcePath));
+    withTransientFsRetry(() => writeFileAtomic(targetPath, content));
+  }
+  withTransientFsRetry(() => writeFileAtomic(path.join(targetDir, "bridge-config.js"), configSource));
+}
+
+function withTransientFsRetry(operation, attempts = 4) {
+  let lastError;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return operation();
+    } catch (error) {
+      lastError = error;
+      if (!["EIO", "EBUSY", "EPERM"].includes(String(error?.code || "")) || attempt + 1 >= attempts) {
+        throw error;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 40 * (attempt + 1));
+    }
+  }
+  throw lastError;
 }
 
 function listRegularFiles(rootDir, relativeDir = "") {
@@ -717,8 +760,17 @@ function extensionManagementAction({
 function writeFileAtomic(target, content) {
   fs.mkdirSync(path.dirname(target), { recursive: true });
   const temp = `${target}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(temp, content, "utf8");
-  fs.renameSync(temp, target);
+  try {
+    fs.writeFileSync(temp, content, Buffer.isBuffer(content) ? undefined : "utf8");
+    fs.renameSync(temp, target);
+  } catch (error) {
+    try {
+      fs.unlinkSync(temp);
+    } catch {
+      // The explicit temporary file may not exist when the write itself failed.
+    }
+    throw error;
+  }
 }
 
 function timestampForFile() {

@@ -151,6 +151,74 @@ test("provider and typed key commit with one revision across sources, Router, ca
   assertSecretAbsentFromNonSecretTargets(workspace, SECRET_VALUE);
 });
 
+test("provider save retries a transient half-written managed TOML snapshot", async () => {
+  const workspace = makeWorkspace("provider-transient-managed-toml");
+  const target = settings.codexConfigPath(workspace.homeDir);
+  const validConfig = fs.readFileSync(target);
+  fs.writeFileSync(target, '# 用户自己的注释\n# >>> CodexBridge managed config\nmodel = "partial"\n', "utf8");
+  let retryCount = 0;
+
+  const result = await settings.applyConfigMutationTransaction({
+    ...workspace,
+    coordinator: coordinatorFor(workspace),
+    operation: "providers:save",
+    payload: {
+      provider: {
+        id: "deepseek",
+        name: "DeepSeek Retry",
+        baseUrl: "https://retry.example/v1",
+        api: "chat_completions",
+        keyEnv: "DEEPSEEK_API_KEY",
+      },
+    },
+    waitForManagedTomlRetry: async () => {
+      retryCount += 1;
+      fs.writeFileSync(target, validConfig);
+    },
+  });
+
+  assert.equal(retryCount, 1);
+  assert.equal(result.result.saved.name, "DeepSeek Retry");
+  assert.match(fs.readFileSync(target, "utf8"), /# >>> CodexBridge managed config/);
+});
+
+test("provider save does not overwrite a persistently malformed managed TOML block", async () => {
+  const workspace = makeWorkspace("provider-persistent-invalid-managed-toml");
+  const target = settings.codexConfigPath(workspace.homeDir);
+  const malformed = '# 用户自己的注释\n# >>> CodexBridge managed config\nmodel = "partial"\n';
+  fs.writeFileSync(target, malformed, "utf8");
+  let retryCount = 0;
+
+  await assert.rejects(
+    settings.applyConfigMutationTransaction({
+      ...workspace,
+      coordinator: coordinatorFor(workspace),
+      operation: "providers:save",
+      payload: {
+        provider: {
+          id: "deepseek",
+          name: "DeepSeek Persistent Invalid",
+          baseUrl: "https://persistent-invalid.example/v1",
+          api: "chat_completions",
+          keyEnv: "DEEPSEEK_API_KEY",
+        },
+      },
+      managedTomlRetryDelays: [0, 0, 0],
+      waitForManagedTomlRetry: async () => {
+        retryCount += 1;
+      },
+    }),
+    (error) => {
+      assert.equal(error.code, "config_transaction_failed");
+      assert.equal(error.causeCode, "managed_toml_invalid");
+      return true;
+    },
+  );
+
+  assert.equal(retryCount, 3);
+  assert.equal(fs.readFileSync(target, "utf8"), malformed);
+});
+
 test("post-commit IPC metadata is frozen into the transaction result", async () => {
   const workspace = makeWorkspace("postcommit-metadata");
   const coordinator = coordinatorFor(workspace);

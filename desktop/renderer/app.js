@@ -963,6 +963,11 @@ els.manageDoubleQuotaExtension?.addEventListener("click", (event) =>
     const requestedAction = doubleQuotaState?.extensionAction?.id || "install";
     doubleQuotaState = await api.manageDoubleQuotaExtension();
     renderDoubleQuota();
+    if (doubleQuotaState.extensionUpdate?.status === "failed") {
+      throw new Error(
+        doubleQuotaState.extensionUpdate.error || "Chrome 扩展更新失败，请稍后重试。",
+      );
+    }
     if (doubleQuotaState.extensionUpdate?.manualReloadRequired) {
       if (requestedAction === "reinstall") {
         await api.copyText(doubleQuotaState.extensionDir);

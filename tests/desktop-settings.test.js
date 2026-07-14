@@ -14470,6 +14470,34 @@ test("resource read status distinguishes successful empty authorities from unava
   assert.equal(unavailable.readStatus.marketplaces.state, "ok");
 });
 
+test("plugin page snapshot is unavailable when every app-server authority failed", () => {
+  const rootDir = makeTempProject();
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-resource-all-failed-"));
+  fs.mkdirSync(path.join(homeDir, ".codex"), { recursive: true });
+  fs.writeFileSync(path.join(homeDir, ".codex", "config.toml"), "", "utf8");
+  const failedKind = { ok: false, items: [], code: "probe_failed", error: "probe failed" };
+
+  const resources = listCodexResources({
+    rootDir,
+    homeDir,
+    codexCliSnapshot: {
+      plugins: { ...failedKind, installed: failedKind, available: failedKind },
+      mcpServers: failedKind,
+    },
+    codexPromptInputSnapshot: failedKind,
+    codexAppServerSnapshot: {
+      ok: false,
+      plugins: failedKind,
+      apps: failedKind,
+      skills: failedKind,
+      snapshotSource: "codex-app-server",
+      refreshedAt: "2026-07-14T00:00:00.000Z",
+    },
+  });
+
+  assert.equal(resources.pluginPage.snapshot.state, "unavailable");
+});
+
 test("resource preflight and support diagnostics preserve unknown authoritative counts", () => {
   const rootDir = makeTempProject();
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-unknown-preflight-"));

@@ -415,8 +415,9 @@ test("desktop main has no dead destructive Codex history sync logging path", () 
 test("detailed resource refresh bypasses only the Codex resource snapshot cache", () => {
   assert.match(
     mainSource,
-    /runCodexResourceSnapshotWorker\s*\(\s*\{\s*forceRefresh:\s*Boolean\(options\.forceResourceRefresh\)[\s\S]*?desktopOptions/,
+    /readCodexResourceSnapshotsRetained\s*\(\s*\{\s*forceRefresh:\s*Boolean\(options\.forceResourceRefresh\)[\s\S]*?desktopOptions/,
   );
+  assert.match(mainSource, /retainCodexResourceSnapshots\(fresh, lastCodexResourceSnapshots\)/);
   assert.doesNotMatch(mainSource, /readCodex(?:CliResource|PromptInput)Snapshot\s*\(\s*\)/);
 });
 
