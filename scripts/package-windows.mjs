@@ -55,6 +55,7 @@ const appPaths = await packager({
     /^\/\.codex(?:\/|$)/,
     /^\/\.superpowers(?:\/|$)/,
     /^\/\.tmp(?:\/|$)/,
+    /^\/\.tmp-release-/,
     /^\/\.tmp-updates-/,
     /^\/\.tmp-electron-packager(?:\/|$)/,
     /^\/AGENTS\.md$/,

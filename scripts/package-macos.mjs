@@ -58,6 +58,7 @@ const appPaths = await packager({
     /^\/\.codex(?:\/|$)/,
     /^\/\.superpowers(?:\/|$)/,
     /^\/\.tmp(?:\/|$)/,
+    /^\/\.tmp-release-/,
     /^\/\.tmp-electron-packager(?:\/|$)/,
     /^\/AGENTS\.md$/,
     /^\/Start-CodexBridge\.cmd$/,

@@ -367,6 +367,7 @@ test("Windows release archive uses formal portable package naming", () => {
   assert.match(artifactsScript, /CodexBridge\.nsi/);
   assert.match(artifactsScript, /--portable-only/);
   assert.match(packager, /\\\.tmp-updates-/);
+  assert.match(packager, /\\\.tmp-release-/);
   assert.match(workflow, /Smoke test Windows release archive/);
   assert.match(workflow, /CodexBridge\.exe/);
   assert.match(workflow, /Join-Path \$extractPath "\.codexbridge-portable"/);
@@ -385,6 +386,7 @@ test("Windows release archive uses formal portable package naming", () => {
   assert.match(packager, /\^\\\/\\\.codex/);
   assert.match(packager, /\^\\\/\\\.superpowers/);
   assert.match(packager, /\^\\\/\\\.tmp/);
+  assert.match(packager, /\\\.tmp-release-/);
 });
 
 test("Windows packaged smoke validates the app in the real user data filesystem", () => {
