@@ -353,8 +353,6 @@ test("explicit first install rejects unmanaged TOML that already owns a managed 
     'model_providers = { user = { name = "User provider" } }\n',
     '"model_providers" = {}\n',
     '"model\\u005fproviders" = {}\n',
-    '[model_providers]\nuser = { name = "User provider" }\n',
-    '["model\\u005fproviders"]\nuser = { name = "User provider" }\n',
     '[[model_providers]]\nname = "User provider"\n',
     'model_providers.codexbridge.base_url = "https://user.invalid/v1"\n',
     '[model_providers.codexbridge]\nbase_url = "https://user.invalid/v1"\n',
@@ -381,6 +379,28 @@ test("explicit first install rejects unmanaged TOML that already owns a managed 
     );
     assert.equal(managedBlockBuilds, 0, currentToml);
   }
+});
+
+test("explicit first install preserves a shared model_providers table owned by other providers", () => {
+  const currentToml = [
+    "[model_providers]",
+    'user = { name = "User provider", base_url = "https://user.invalid/v1" }',
+    "",
+  ].join("\n");
+  const spec = validDraftSpec({
+    codexConfig: {
+      ...validDraftSpec().codexConfig,
+      currentBytes: Buffer.from(currentToml, "utf8"),
+    },
+    allowManagedBlockInsert: true,
+  });
+
+  const draft = buildConfigMutationDraft(spec);
+  const codexEntry = materializeConfigMutationEntries(draft).find(({ id }) => id === "codexConfig");
+  const nextToml = codexEntry.content.toString("utf8");
+
+  assert.match(nextToml, /\[model_providers\]\nuser = \{ name = "User provider"/);
+  assert.match(nextToml, /# >>> CodexBridge managed config/);
 });
 
 test("explicit first install preserves non-conflicting top-level, comments, plugins, and MCP bytes exactly", () => {

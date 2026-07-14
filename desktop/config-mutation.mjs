@@ -335,6 +335,14 @@ function isCodexBridgeOwnedTomlPath(pathSegments) {
   );
 }
 
+function tomlTableConflictsWithCodexBridge(pathSegments, { arrayTable = false } = {}) {
+  return !(
+    !arrayTable &&
+    pathSegments.length === 1 &&
+    pathSegments[0] === "model_providers"
+  ) && isCodexBridgeOwnedTomlPath(pathSegments);
+}
+
 function unmanagedTomlHasCodexBridgeConflict(bytes) {
   let currentTable = [];
   for (const line of tomlLines(bytes)) {
@@ -346,7 +354,9 @@ function unmanagedTomlHasCodexBridgeConflict(bytes) {
       const tableKey = tomlTableKey(text);
       if (tableKey) {
         currentTable = tableKey;
-        if (isCodexBridgeOwnedTomlPath(tableKey)) {
+        if (tomlTableConflictsWithCodexBridge(tableKey, {
+          arrayTable: text.startsWith("[["),
+        })) {
           return true;
         }
       }
