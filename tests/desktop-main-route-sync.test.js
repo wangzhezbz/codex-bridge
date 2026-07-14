@@ -1086,6 +1086,44 @@ test("restart planning stops only the selected desktop brand and ignores a stale
   assert.deepEqual(plan.blockedReasons, []);
 });
 
+test("restart planning activates a trusted Store app through its shell target instead of the protected executable", () => {
+  const {
+    buildOpenAIDesktopRestartPlan,
+    classifyOpenAIDesktopProcess,
+  } = require(desktopCompatPath);
+  const executablePath = "C:\\Program Files\\WindowsApps\\OpenAI.ChatGPT_2.0.0.0_x64__2p2nqsd0c76g0\\app\\ChatGPT.exe";
+  const shellTarget = "shell:AppsFolder\\OpenAI.ChatGPT_2p2nqsd0c76g0!App";
+  const process = classifyOpenAIDesktopProcess({
+    name: "ChatGPT.exe",
+    processId: 73,
+    executablePath,
+  });
+
+  const plan = buildOpenAIDesktopRestartPlan(
+    [process],
+    [{ target: shellTarget, source: "shell" }],
+    { isLaunchable: () => true },
+  );
+
+  assert.equal(plan.launchTarget, shellTarget);
+  assert.equal(plan.brand, "ChatGPT");
+  assert.deepEqual(plan.processesToStop.map((item) => item.processId), [73]);
+});
+
+test("restart planning never launches a protected Store executable directly when shell activation is unavailable", () => {
+  const { buildOpenAIDesktopRestartPlan } = require(desktopCompatPath);
+  const executablePath = "C:\\Program Files\\WindowsApps\\OpenAI.ChatGPT_2.0.0.0_x64__2p2nqsd0c76g0\\app\\ChatGPT.exe";
+
+  const plan = buildOpenAIDesktopRestartPlan(
+    [],
+    [{ target: executablePath, source: "restricted" }],
+    { isLaunchable: () => true },
+  );
+
+  assert.equal(plan.launchTarget, "");
+  assert.equal(plan.brand, "");
+});
+
 test("mac desktop compatibility prefers ChatGPT and falls back to legacy Codex", () => {
   assert.equal(fs.existsSync(desktopCompatPath), true);
   const {

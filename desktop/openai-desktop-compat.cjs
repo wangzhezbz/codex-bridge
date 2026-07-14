@@ -248,13 +248,7 @@ function buildOpenAIDesktopRestartPlan(
       .map((item) => ({ target: item.executablePath, source: "running" })),
     ...(Array.isArray(candidateEntries) ? candidateEntries : []),
   ]);
-  const launchTarget = launchEntries.find((entry) => {
-    try {
-      return isLaunchable(entry.target);
-    } catch {
-      return false;
-    }
-  })?.target || "";
+  const launchTarget = selectOpenAIDesktopLaunchEntry(launchEntries, isLaunchable)?.target || "";
   const brand = openAIDesktopBrand(launchTarget);
   const processesToStop = brand
     ? authorizedProcesses.filter((item) => item?.recognized && item?.brand === brand)
@@ -269,6 +263,39 @@ function buildOpenAIDesktopRestartPlan(
       processesToStop.filter((item) => !item.safeToStop).map((item) => item.reason).filter(Boolean),
     )],
   };
+}
+
+function selectOpenAIDesktopLaunchEntry(entries = [], isLaunchable = () => true) {
+  const candidates = Array.isArray(entries) ? entries : [];
+  const attemptedTargets = new Set();
+  for (const entry of candidates) {
+    const storeIdentity = openAIDesktopStoreIdentityFromExecutablePath(entry?.target);
+    const candidate = storeIdentity
+      ? candidates.find((other) => {
+          const shellIdentity = openAIDesktopStoreIdentityFromShellTarget(other?.target);
+          return shellIdentity &&
+            shellIdentity.brand === storeIdentity.brand &&
+            shellIdentity.packageName === storeIdentity.packageName &&
+            shellIdentity.publisherId === storeIdentity.publisherId;
+        })
+      : entry;
+    if (!candidate) {
+      continue;
+    }
+    const key = String(candidate.target || "").toLowerCase();
+    if (!key || attemptedTargets.has(key)) {
+      continue;
+    }
+    attemptedTargets.add(key);
+    try {
+      if (isLaunchable(candidate.target)) {
+        return candidate;
+      }
+    } catch {
+      // Try the next independently verified candidate.
+    }
+  }
+  return null;
 }
 
 function prioritizeOpenAIDesktopCandidates(entries = []) {
