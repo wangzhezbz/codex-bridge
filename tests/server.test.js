@@ -11316,7 +11316,7 @@ test("responses-routed remote compact v2 uses local summary context when upstrea
   }
 });
 
-test("responses-routed remote compact v2 keeps upstream stream enabled when required", async () => {
+test("codex_openai compact v2 preserves the native opaque compaction item", async () => {
   let upstreamBody;
   let upstreamCalls = 0;
   const upstream = http.createServer(async (req, res) => {
@@ -11330,26 +11330,18 @@ test("responses-routed remote compact v2 keeps upstream stream enabled when requ
     }
 
     const response = {
-      id: "resp_native_stream_compact_summary",
+      id: "resp_native_stream_compaction",
       object: "response",
       status: "completed",
       model: "gpt-5.5",
       output: [
         {
-          id: "msg_native_stream_compact",
-          type: "message",
-          role: "assistant",
-          status: "completed",
-          content: [
-            {
-              type: "output_text",
-              text: "Summary: streamed compact response works.",
-              annotations: [],
-            },
-          ],
+          id: "cmp_native_stream_compact",
+          type: "compaction",
+          encrypted_content: "opaque-openai-compaction-v2",
         },
       ],
-      output_text: "Summary: streamed compact response works.",
+      output_text: "",
       usage: {
         input_tokens: 21,
         output_tokens: 7,
@@ -11407,8 +11399,81 @@ test("responses-routed remote compact v2 keeps upstream stream enabled when requ
     assert.equal(upstreamCalls, 1);
     assert.equal(upstreamBody.stream, true);
     assert.equal(upstreamBody.max_output_tokens, undefined);
-    assert.match(text, /Summary: streamed compact response works/);
-    assert.equal((text.match(/"type":"compaction"/g) || []).length, 3);
+    assert.deepEqual(upstreamBody.input.at(-1), { type: "compaction_trigger" });
+    assert.match(text, /opaque-openai-compaction-v2/);
+    assert.doesNotMatch(text, new RegExp(COMPACT_SUMMARY_PREFIX));
+    assert.equal((text.match(/"type":"compaction"/g) || []).length, 1);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("codex_openai compact v1 forwards the native endpoint and opaque compaction item", async () => {
+  let upstreamBody;
+  let upstreamUrl;
+  const upstream = http.createServer(async (req, res) => {
+    upstreamUrl = req.url;
+    upstreamBody = await readJson(req);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      id: "resp_native_compaction_v1",
+      object: "response",
+      status: "completed",
+      model: "gpt-5.5",
+      output: [
+        {
+          id: "cmp_native_compaction_v1",
+          type: "compaction",
+          encrypted_content: "opaque-openai-compaction-v1",
+        },
+      ],
+      output_text: "",
+    }));
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    clientAuth: { allowOpenAiBearer: true },
+    defaultModel: "gpt-5.5",
+    models: [
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        api: "responses",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "gpt-5.5",
+        authMode: "codex_openai",
+      },
+    ],
+  });
+
+  await listen(router);
+  try {
+    const response = await fetchJson(`${serverUrl(router)}/v1/responses/compact`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer codex-token",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: "compact this official history",
+          },
+        ],
+      }),
+    });
+    assert.equal(upstreamUrl, "/v1/responses/compact");
+    assert.equal(upstreamBody.model, "gpt-5.5");
+    assert.equal(response.output[0].type, "compaction");
+    assert.equal(response.output[0].encrypted_content, "opaque-openai-compaction-v1");
   } finally {
     await close(router);
     await close(upstream);

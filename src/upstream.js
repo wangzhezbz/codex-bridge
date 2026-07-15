@@ -253,6 +253,13 @@ export async function handleResponsesRequest(
     if (compactKind && route.api === "chat_completions") {
       return await proxyChatCompact(requestBody, route, history, res, requestContext);
     }
+    if (
+      compactKind &&
+      route.api === "responses" &&
+      authModeForRoute(route) === "codex_openai"
+    ) {
+      return await proxyResponsesApi(requestBody, route, history, res, requestContext);
+    }
     if (compactKind && route.api === "responses") {
       return await proxyResponsesCompact(requestBody, route, history, res, requestContext);
     }
