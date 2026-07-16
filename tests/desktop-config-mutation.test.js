@@ -8,6 +8,7 @@ import {
   buildConfigMutationDraft,
   inspectManagedCodexTomlBlock,
   materializeConfigMutationEntries,
+  repairMalformedManagedCodexToml,
   removeManagedCodexTomlBlock,
   replaceManagedCodexTomlBlock,
   validateConfigMutationDraft,
@@ -98,6 +99,51 @@ test("managed TOML replacement rejects duplicate, partial, reversed, nested, and
   assert.throws(
     () => replaceManagedCodexTomlBlock(Buffer.from(""), `${managedBlock()}\n${CODEXBRIDGE_MANAGED_TOML_END}`),
     (error) => error?.code === "managed_toml_replacement_invalid",
+  );
+});
+
+test("malformed managed TOML repair removes only Bridge-owned fragments and preserves unrelated bytes", () => {
+  const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+  const original = Buffer.concat([
+    bom,
+    Buffer.from([
+      "# 用户自己的注释",
+      'model = "gpt-5.5"',
+      'sandbox_mode = "workspace-write"',
+      CODEXBRIDGE_MANAGED_TOML_START,
+      'model = "cb-broken"',
+      'model_catalog_json = "C:/broken/catalog.json"',
+      'openai_base_url = "http://127.0.0.1:15722/v1"',
+      "# CodexBridge router original backup v1",
+      "",
+      '[plugins."keep@openai-curated"]',
+      "enabled = true # 保留",
+      "",
+      "[mcp_servers.node_repl]",
+      'command = "node"',
+      "",
+    ].join("\r\n"), "utf8"),
+  ]);
+
+  const repaired = repairMalformedManagedCodexToml(original);
+  const text = repaired.toString("utf8");
+
+  assert.deepEqual(repaired.subarray(0, bom.length), bom);
+  assert.equal(inspectManagedCodexTomlBlock(repaired).state, "unmanaged");
+  assert.doesNotMatch(text, /CodexBridge managed config|CodexBridge router original backup/);
+  assert.match(text, /^model\s*=\s*"gpt-5\.5"$/m);
+  assert.match(text, /^sandbox_mode\s*=\s*"workspace-write"$/m);
+  assert.doesNotMatch(text, /cb-broken|^model_catalog_json\s*=|^openai_base_url\s*=/m);
+  assert.match(text, /# 用户自己的注释/);
+  assert.match(text, /\[plugins\."keep@openai-curated"\]/);
+  assert.match(text, /enabled = true # 保留/);
+  assert.match(text, /\[mcp_servers\.node_repl\]/);
+});
+
+test("malformed managed TOML repair refuses input without a Bridge marker", () => {
+  assert.throws(
+    () => repairMalformedManagedCodexToml(Buffer.from('model = "user-model"\n')),
+    (error) => error?.code === "managed_toml_repair_not_needed",
   );
 });
 

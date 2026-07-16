@@ -9,9 +9,17 @@ const CODEXBRIDGE_MANAGED_TOP_LEVEL_KEYS = new Set([
   "model",
   "model_catalog_json",
   "model_reasoning_effort",
+  "model_context_window",
+  "model_max_output_tokens",
+  "model_auto_compact_token_limit",
   "sandbox_mode",
   "approval_policy",
+  "disable_response_storage",
+  "network_access",
+  "openai_base_url",
+  "windows_wsl_setup_acknowledged",
 ]);
+const CODEXBRIDGE_ROUTER_ORIGINAL_MARKER = "# CodexBridge router original backup v1";
 const draftState = new WeakMap();
 const candidateState = new WeakMap();
 
@@ -203,6 +211,85 @@ export function removeManagedCodexTomlBlock(content) {
     bytes.subarray(0, inspected.startOffset),
     bytes.subarray(inspected.endOffset),
   ]);
+}
+
+export function repairMalformedManagedCodexToml(content) {
+  const bytes = safeBytes(content, "managed_toml_invalid");
+  try {
+    inspectManagedToml(bytes);
+  } catch (error) {
+    if (error?.code !== "managed_toml_invalid") {
+      throw error;
+    }
+    const lines = tomlLines(bytes);
+    if (!lines.some((line) => isMarkerLike(line.text))) {
+      throw error;
+    }
+    const firstManagedMarker = lines.find((line) => isMarkerLike(line.text));
+    let insideManagedRegion = normalizedMarkerLine(firstManagedMarker?.text).includes("<<<");
+    const kept = [];
+    let currentTable = [];
+    let dropCurrentTable = false;
+    for (const line of lines) {
+      const text = normalizedMarkerLine(line.text);
+      if (isMarkerLike(line.text)) {
+        if (text.includes("<<<")) {
+          insideManagedRegion = false;
+        }
+        if (text.includes(">>>") || (!text.includes("<<<") && !text.includes(">>>"))) {
+          insideManagedRegion = true;
+        }
+        continue;
+      }
+      if (text === CODEXBRIDGE_ROUTER_ORIGINAL_MARKER) {
+        continue;
+      }
+      if (text.startsWith("[")) {
+        const tableKey = tomlTableKey(text);
+        if (tableKey) {
+          currentTable = tableKey;
+          dropCurrentTable =
+            tableKey[0] === "model_providers" && tableKey[1] === "codexbridge";
+          if (insideManagedRegion && !dropCurrentTable) {
+            insideManagedRegion = false;
+          }
+        }
+      }
+      let remove = dropCurrentTable;
+      if (!remove && text && !text.startsWith("#") && !text.startsWith("[")) {
+        const assignmentKey = tomlAssignmentKey(text);
+        const keyPath = assignmentKey ? parseTomlDottedKey(assignmentKey) : null;
+        const fullPath = keyPath ? [...currentTable, ...keyPath] : [];
+        const explicitCodexBridgeProvider =
+          fullPath[0] === "model_providers" && fullPath[1] === "codexbridge";
+        remove = Boolean(
+          keyPath &&
+            (explicitCodexBridgeProvider ||
+              (insideManagedRegion &&
+                unmanagedAssignmentConflictsWithCodexBridge(currentTable, keyPath))),
+        );
+      }
+      if (!remove) {
+        kept.push(bytes.subarray(line.start, line.newlineEnd));
+      }
+    }
+    let repaired = Buffer.concat(kept);
+    const hadBom = bytes.subarray(0, UTF8_BOM.length).equals(UTF8_BOM);
+    if (hadBom && !repaired.subarray(0, UTF8_BOM.length).equals(UTF8_BOM)) {
+      repaired = Buffer.concat([UTF8_BOM, repaired]);
+    }
+    if (inspectManagedToml(repaired).state !== "unmanaged") {
+      throw configMutationError(
+        "managed_toml_repair_unsafe",
+        "Malformed managed TOML could not be repaired safely",
+      );
+    }
+    return repaired;
+  }
+  throw configMutationError(
+    "managed_toml_repair_not_needed",
+    "Managed TOML does not require repair",
+  );
 }
 
 function decodeTomlQuotedKey(raw, quote) {

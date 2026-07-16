@@ -1899,6 +1899,32 @@ test("startup check summarizes Codex, router, catalog, keys, proxy, and backups"
   assert.doesNotMatch(JSON.stringify(check.items), /Model catalog|Start Router|No proxy environment/i);
 });
 
+test("startup check reports a malformed CodexBridge managed TOML block as a failure", () => {
+  const rootDir = makeTempProject();
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-invalid-managed-toml-"));
+  const codexDir = path.join(homeDir, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(codexDir, "config.toml"),
+    '# >>> CodexBridge managed config\nmodel = "cb-stale"\n',
+    "utf8",
+  );
+
+  const check = buildStartupCheck(rootDir, {
+    homeDir,
+    config: { port: 15722, models: [] },
+    codexCliSnapshot: codexCliAuthoritySnapshot(),
+    codexPromptInputSnapshot: codexPromptSkillsSnapshot(),
+  });
+  const item = check.items.find((entry) => entry.id === "codex_config");
+
+  assert.equal(item.status, "fail");
+  assert.match(item.detail, /CodexBridge.*(?:不完整|损坏|无效)/);
+  assert.match(item.action, /启动 Router.*自动修复|自动修复.*启动 Router/);
+  assert.equal(check.summary.ok, false);
+  assert.ok(check.summary.fail >= 1);
+});
+
 test("startup check accepts discoverable Codex Desktop shortcuts without a saved launch target", () => {
   const rootDir = makeTempProject();
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));

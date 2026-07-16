@@ -219,6 +219,57 @@ test("provider save does not overwrite a persistently malformed managed TOML blo
   assert.equal(fs.readFileSync(target, "utf8"), malformed);
 });
 
+test("Router start repairs a persistent malformed managed block, keeps a forensic backup, and stop restores valid user TOML", async () => {
+  const workspace = makeWorkspace("router-start-repairs-invalid-managed-toml");
+  const target = settings.codexConfigPath(workspace.homeDir);
+  const malformed = Buffer.from([
+    "# user comment",
+    'model = "gpt-5.5"',
+    'sandbox_mode = "workspace-write"',
+    "# >>> CodexBridge managed config",
+    'model = "cb-stale"',
+    'openai_base_url = "http://127.0.0.1:15722/v1"',
+    "",
+    '[plugins."keep@openai-curated"]',
+    "enabled = true",
+    "",
+  ].join("\r\n"), "utf8");
+  fs.writeFileSync(target, malformed);
+  const coordinator = coordinatorFor(workspace);
+
+  await settings.applyConfigMutationTransaction({
+    ...workspace,
+    coordinator,
+    operation: "router:start",
+    managedTomlRetryDelays: [],
+  });
+
+  const running = fs.readFileSync(target, "utf8");
+  assert.equal((running.match(/# >>> CodexBridge managed config/g) || []).length, 1);
+  assert.match(running, /\[plugins\."keep@openai-curated"\]/);
+  assert.equal((running.match(/127\.0\.0\.1:15722\/v1/g) || []).length, 1);
+
+  const originalBackup = fs.readFileSync(settings.codexRouterOriginalPath(workspace.homeDir), "utf8");
+  assert.doesNotMatch(originalBackup, /CodexBridge managed config|openai_base_url/);
+  assert.match(originalBackup, /^model\s*=\s*"gpt-5\.5"$/m);
+  assert.match(originalBackup, /^sandbox_mode\s*=\s*"workspace-write"$/m);
+  assert.match(originalBackup, /\[plugins\."keep@openai-curated"\]/);
+
+  const forensicBackups = fs.readdirSync(path.dirname(target))
+    .filter((name) => /^config\.toml\.managed-invalid\..+\.bak$/.test(name));
+  assert.equal(forensicBackups.length, 1);
+  assert.deepEqual(fs.readFileSync(path.join(path.dirname(target), forensicBackups[0])), malformed);
+
+  const stopped = await settings.removeManagedCodexConfigTransaction({
+    homeDir: workspace.homeDir,
+    coordinator,
+  });
+  assert.equal(stopped.reason, "router_original_restored");
+  assert.equal(fs.readFileSync(target, "utf8"), originalBackup);
+  assert.doesNotMatch(fs.readFileSync(target, "utf8"), /CodexBridge managed config/);
+  assert.match(fs.readFileSync(target, "utf8"), /^model\s*=\s*"gpt-5\.5"$/m);
+});
+
 test("post-commit IPC metadata is frozen into the transaction result", async () => {
   const workspace = makeWorkspace("postcommit-metadata");
   const coordinator = coordinatorFor(workspace);

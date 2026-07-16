@@ -32,6 +32,7 @@ import {
   buildConfigMutationDraft,
   inspectManagedCodexTomlBlock,
   materializeConfigMutationEntries,
+  repairMalformedManagedCodexToml,
   removeUnmanagedCodexBridgeConflicts,
   removeManagedCodexTomlBlock,
   replaceManagedCodexTomlBlock,
@@ -2154,13 +2155,7 @@ export function buildStartupCheck(rootDir, {
   const backups = listCodexBackups({ homeDir });
   const proxyKeys = proxyEnvironmentKeys(proxyEnv);
   const items = [
-    checkItem({
-      id: "codex_config",
-      label: "Codex 配置",
-      status: fs.existsSync(codexConfig) ? "pass" : "warn",
-      detail: fs.existsSync(codexConfig) ? codexConfig : "还没有找到 Codex config.toml。",
-      action: "启动一次 Router 会自动写入 CodexBridge 配置。",
-    }),
+    codexConfigPreflightItem(codexConfig),
     checkItem({
       id: "model_catalog",
       label: "模型目录",
@@ -2263,6 +2258,39 @@ export function buildStartupCheck(rootDir, {
     summary,
     items,
   };
+}
+
+function codexConfigPreflightItem(target) {
+  if (!fs.existsSync(target)) {
+    return checkItem({
+      id: "codex_config",
+      label: "Codex 配置",
+      status: "warn",
+      detail: "还没有找到 Codex config.toml。",
+      action: "启动一次 Router 会自动写入 CodexBridge 配置。",
+    });
+  }
+  try {
+    inspectManagedCodexTomlBlock(fs.readFileSync(target));
+    return checkItem({
+      id: "codex_config",
+      label: "Codex 配置",
+      status: "pass",
+      detail: target,
+      action: "Codex 配置结构正常。",
+    });
+  } catch (error) {
+    if (error?.code !== "managed_toml_invalid") {
+      throw error;
+    }
+    return checkItem({
+      id: "codex_config",
+      label: "Codex 配置",
+      status: "fail",
+      detail: "Codex 配置中的 CodexBridge 管理块不完整或无效。",
+      action: "启动 Router 时会先备份原文件并自动修复；如仍失败，请复制诊断信息。",
+    });
+  }
 }
 
 function codexDesktopPreflightItem({
@@ -15181,22 +15209,36 @@ function managedCodexMutationPlan({
   currentBytes,
   currentExists,
 }) {
-  const inspected = inspectManagedCodexTomlBlock(currentBytes);
   const install = shouldInstallManagedCodexBlock(operation);
+  let workingBytes = currentBytes;
+  let repairedMalformed = false;
+  let inspected;
+  try {
+    inspected = inspectManagedCodexTomlBlock(workingBytes);
+  } catch (error) {
+    if (operation !== "router:start" || error?.code !== "managed_toml_invalid") {
+      throw error;
+    }
+    workingBytes = repairMalformedManagedCodexToml(currentBytes);
+    inspected = inspectManagedCodexTomlBlock(workingBytes);
+    repairedMalformed = true;
+  }
   const includeCodexConfig = install || inspected.state === "managed";
   if (!includeCodexConfig) {
     return {
       includeCodexConfig: false,
       allowManagedBlockInsert: false,
       block: "",
-      baseBytes: currentBytes,
+      baseBytes: workingBytes,
       preserveOriginal: false,
+      repairedMalformed,
     };
   }
-  const currentSettings = currentCodexModelSettings(currentBytes.toString("utf8"));
+  const currentSettings = currentCodexModelSettings(workingBytes.toString("utf8"));
   const requestedModel = currentSettings.model || routerConfig.defaultModel;
   const resolvedModel = resolveCodexBridgeModelForCatalog(catalog, requestedModel).model;
   const preserveOriginal = install && inspected.state === "unmanaged" && currentExists;
+  const originalBackupBytes = repairedMalformed ? workingBytes : currentBytes;
   let block = buildCodexToml({
     rootDir: state.rootDir,
     homeDir: state.homeDir,
@@ -15216,9 +15258,11 @@ function managedCodexMutationPlan({
     allowManagedBlockInsert: install,
     block,
     baseBytes: preserveOriginal
-      ? removeUnmanagedCodexBridgeConflicts(currentBytes)
-      : currentBytes,
+      ? removeUnmanagedCodexBridgeConflicts(workingBytes)
+      : workingBytes,
     preserveOriginal,
+    originalBackupBytes,
+    repairedMalformed,
   };
 }
 
@@ -15398,18 +15442,33 @@ export async function applyConfigMutationTransaction({
         entries.push({
           id: "codexRouterOriginal",
           target: backupTarget,
-          content: currentCodexBytes,
+          content: managedPlan.originalBackupBytes,
           sensitive: true,
           expectedOriginal: backupOriginal === null
             ? { exists: false }
             : { exists: true, bytes: backupOriginal },
           validate: ({ content }) => {
             const candidate = Buffer.isBuffer(content) ? content : Buffer.from(content);
-            if (!candidate.equals(currentCodexBytes)) {
+            if (!candidate.equals(managedPlan.originalBackupBytes)) {
               throw new Error("Codex Router original backup candidate changed");
             }
           },
         });
+        if (managedPlan.repairedMalformed) {
+          const malformedBackupTarget = nextCodexRestoreBackupPath(
+            codexConfigPath(homeDir),
+            "managed-invalid",
+          );
+          entries.push({
+            id: "codexManagedInvalidBackup",
+            target: malformedBackupTarget,
+            content: currentCodexBytes,
+            sensitive: true,
+            mode: 0o600,
+            expectedOriginal: { exists: false },
+            validate: validateExactCodexRestoreCandidate(currentCodexBytes),
+          });
+        }
       }
       if (operation === "logos:select") {
         const logoTarget = path.resolve(String(payload.logoTarget || ""));
@@ -16434,6 +16493,7 @@ export function listCodexBackups({ homeDir = os.homedir() } = {}) {
   }
   const patterns = [
     { kind: "codexbridge", pattern: /^config\.toml\.codexbridge\..+\.bak$/ },
+    { kind: "managed_invalid", pattern: /^config\.toml\.managed-invalid\..+\.bak$/ },
     { kind: "before_restore", pattern: /^config\.toml\.before-restore\..+\.bak$/ },
     { kind: "history_access", pattern: /^config\.toml\.history-access\..+\.bak$/ },
   ];
