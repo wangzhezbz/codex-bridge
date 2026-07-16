@@ -53,6 +53,12 @@ export const PROVIDERS = [
     docsUrl: "https://www.kimi.com/code/docs/en/",
     baseUrl: "https://api.moonshot.cn/v1",
     authMode: "api_key",
+    supportsBaseUrlOverride: true,
+    baseUrlPresets: [
+      "https://api.moonshot.cn/v1",
+      "https://api.moonshot.ai/v1",
+      "https://api.kimi.com/coding/v1",
+    ],
     description: "Kimi / Moonshot Open Platform。",
   },
   {

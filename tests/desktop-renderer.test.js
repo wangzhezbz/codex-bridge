@@ -29,3 +29,14 @@ test("desktop renderer exposes update from sidebar without a dedicated page", ()
   assert.match(rendererSource, /api\.installUpdate\(\)/);
   assert.match(rendererSource, /window\.confirm/);
 });
+
+test("desktop renderer wires Kimi provider baseUrl override UI", () => {
+  assert.match(preloadSource, /setProviderBaseUrl: \(payload\) => ipcRenderer\.invoke\("providers:setBaseUrl", payload\)/);
+  assert.match(preloadSource, /resetProviderBaseUrl: \(payload\) => ipcRenderer\.invoke\("providers:resetBaseUrl", payload\)/);
+  assert.match(rendererSource, /data-save-provider-base-url/);
+  assert.match(rendererSource, /data-reset-provider-base-url/);
+  assert.match(rendererSource, /api\.setProviderBaseUrl\(/);
+  assert.match(rendererSource, /api\.resetProviderBaseUrl\(/);
+  assert.match(rendererSource, /supportsBaseUrlOverride/);
+  assert.match(rendererSource, /isLikelyHttpUrl/);
+});

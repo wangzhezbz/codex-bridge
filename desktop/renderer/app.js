@@ -305,6 +305,9 @@ function renderProviders() {
     const keyButton = provider.keyUrl
       ? `<button class="plain-button small" data-open-url="${escapeHtml(provider.keyUrl)}">获取 API Key</button>`
       : "";
+    const baseUrlControl = provider.supportsBaseUrlOverride
+      ? renderProviderBaseUrlControl(provider)
+      : "";
     return `
       <article class="provider-card" data-provider-id="${escapeHtml(provider.id)}">
         <div class="provider-head">
@@ -315,6 +318,7 @@ function renderProviders() {
           <span class="tag ${saved ? "ok" : ""}">${status}</span>
         </div>
         ${keyControl}
+        ${baseUrlControl}
         <div class="provider-actions">
           ${saveButton}
           ${keyButton}
@@ -346,6 +350,91 @@ function renderProviders() {
   });
   els.providerGrid.querySelectorAll("[data-save-provider]").forEach((button) => {
     button.addEventListener("click", () => saveProviderSecret(button));
+  });
+  els.providerGrid.querySelectorAll("[data-save-provider-base-url]").forEach((button) => {
+    button.addEventListener("click", () => saveProviderBaseUrl(button));
+  });
+  els.providerGrid.querySelectorAll("[data-reset-provider-base-url]").forEach((button) => {
+    button.addEventListener("click", () => resetProviderBaseUrl(button));
+  });
+  els.providerGrid.querySelectorAll("[data-base-url-input]").forEach((input) => {
+    input.addEventListener("blur", () => {
+      const trimmed = String(input.value || "").trim();
+      input.classList.toggle("invalid", Boolean(trimmed) && !isLikelyHttpUrl(trimmed));
+    });
+  });
+}
+
+function renderProviderBaseUrlControl(provider) {
+  const placeholder = String(provider.baseUrl || "");
+  const presets = Array.isArray(provider.baseUrlPresets) ? provider.baseUrlPresets : [];
+  const presetOptions = presets
+    .filter((value, index, list) => value && list.indexOf(value) === index)
+    .map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`)
+    .join("");
+  const datalistId = `baseUrlPresets-${escapeHtml(provider.id)}`;
+  const datalist = presets.length
+    ? `<datalist id="${datalistId}">${presetOptions}</datalist>`
+    : "";
+  return `
+    <label class="base-url-control">
+      <span>Base URL <small class="base-url-status ${provider.baseUrlOverride ? "overridden" : "default"}" data-provider-id="${escapeHtml(provider.id)}">${provider.baseUrlOverride ? "已覆盖默认" : "默认"}</small></span>
+      <div class="base-url-row">
+        <input
+          type="url"
+          data-base-url-input
+          data-provider-id="${escapeHtml(provider.id)}"
+          list="${datalistId}"
+          placeholder="${escapeHtml(placeholder)}"
+          value="${escapeHtml(provider.baseUrl || "")}"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button class="primary-button small" type="button" data-save-provider-base-url="${escapeHtml(provider.id)}">保存</button>
+        <button class="ghost-button light small" type="button" data-reset-provider-base-url="${escapeHtml(provider.id)}" ${provider.baseUrlOverride ? "" : "disabled"}>恢复默认</button>
+      </div>
+      ${datalist}
+      <small class="base-url-hint">常见端点：<code>https://api.moonshot.cn/v1</code> · <code>https://api.moonshot.ai/v1</code> · <code>https://api.kimi.com/coding/v1</code>。Anthropic 兼容端点 <code>/coding/v1/messages</code> 暂不支持。</small>
+    </label>
+  `;
+}
+
+function isLikelyHttpUrl(value) {
+  if (!value) {
+    return false;
+  }
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function saveProviderBaseUrl(button) {
+  return runAction(button, async () => {
+    const providerId = button.dataset.saveProviderBaseUrl;
+    const card = button.closest(".provider-card");
+    const input = card.querySelector("[data-base-url-input]");
+    const trimmed = String(input?.value || "").trim().replace(/\/+$/, "");
+    if (!trimmed) {
+      throw new Error("Base URL 不能为空。点「恢复默认」可清除覆盖。");
+    }
+    if (!isLikelyHttpUrl(trimmed)) {
+      throw new Error("Base URL 必须是有效的 http(s) 链接。");
+    }
+    await api.setProviderBaseUrl({ providerId, baseUrl: trimmed });
+    await refresh();
+    showToast("Base URL 已保存，路由配置已同步。");
+  });
+}
+
+function resetProviderBaseUrl(button) {
+  return runAction(button, async () => {
+    const providerId = button.dataset.resetProviderBaseUrl;
+    await api.resetProviderBaseUrl({ providerId });
+    await refresh();
+    showToast("Base URL 已恢复为默认。");
   });
 }
 

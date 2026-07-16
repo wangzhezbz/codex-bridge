@@ -253,6 +253,7 @@ ipcMain.handle("state:get", async () => {
     customModels: settings.readCustomModels(dataRootDir),
     imageGenerationOverrides: settings.readModelImageGenerationOverrides(dataRootDir),
     secretStatus: settings.secretStatus(dataRootDir),
+    providerOverrides: settings.readProviderOverrides(dataRootDir),
     desktopOptions: settings.loadDesktopOptions(dataRootDir),
     diagnostics,
     lastHealth,
@@ -343,6 +344,31 @@ ipcMain.handle("models:saveImageGeneration", async (_event, payload) => {
   appendLog(
     `Updated image generation provider: ${saved.presetId} -> ${saved.imageGeneration.mode}.`,
   );
+  broadcastState();
+  return getStatePayload(settings);
+});
+
+ipcMain.handle("providers:setBaseUrl", async (_event, payload) => {
+  const settings = await loadSettings();
+  const providerId = String(payload?.providerId || "");
+  const baseUrl = String(payload?.baseUrl || "");
+  const saved = settings.setProviderBaseUrlOverride(dataRootDir, providerId, baseUrl);
+  const config = settings.readRouterConfig(dataRootDir);
+  const mode = settings.detectModeFromConfig(config);
+  settings.writeRouterConfigFromSelection(dataRootDir, mode);
+  appendLog(`Updated ${saved.providerId} baseUrl -> ${saved.baseUrl}.`);
+  broadcastState();
+  return getStatePayload(settings);
+});
+
+ipcMain.handle("providers:resetBaseUrl", async (_event, payload) => {
+  const settings = await loadSettings();
+  const providerId = String(payload?.providerId || "");
+  const saved = settings.resetProviderBaseUrlOverride(dataRootDir, providerId);
+  const config = settings.readRouterConfig(dataRootDir);
+  const mode = settings.detectModeFromConfig(config);
+  settings.writeRouterConfigFromSelection(dataRootDir, mode);
+  appendLog(`Reset ${saved.providerId} baseUrl to default (${saved.baseUrl}).`);
   broadcastState();
   return getStatePayload(settings);
 });
@@ -948,6 +974,7 @@ async function getStatePayload(settings) {
     customModels: settings.readCustomModels(dataRootDir),
     imageGenerationOverrides: settings.readModelImageGenerationOverrides(dataRootDir),
     secretStatus: settings.secretStatus(dataRootDir),
+    providerOverrides: settings.readProviderOverrides(dataRootDir),
     desktopOptions: settings.loadDesktopOptions(dataRootDir),
     diagnostics,
     lastHealth,
