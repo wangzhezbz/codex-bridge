@@ -933,6 +933,32 @@ test("chat conversion adapts Codex reasoning requests by provider", () => {
   assert.deepEqual(custom.body.extra_body, { enable_thinking: true });
 });
 
+test("custom Volcano Ark chat models do not receive unsupported Codex reasoning parameters", () => {
+  const converted = responsesToChatRequest(
+    {
+      input: "continue the task",
+      reasoning: { effort: "high", summary: "auto" },
+      reasoning_effort: "high",
+      thinking: { type: "enabled", keep: "all" },
+    },
+    {
+      id: "cb-custom-volcengine-kimi-k2-7-code",
+      provider: "volcengine",
+      providerFamily: "doubao",
+      custom: true,
+      api: "chat_completions",
+      baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
+      model: "kimi-k2.7-code",
+    },
+    new ResponseHistory(),
+  );
+
+  assert.equal(converted.body.model, "kimi-k2.7-code");
+  assert.equal(converted.body.reasoning, undefined);
+  assert.equal(converted.body.reasoning_effort, undefined);
+  assert.equal(converted.body.thinking, undefined);
+});
+
 test("chat conversion trims old history to fit the upstream model context window", () => {
   const history = new ResponseHistory();
   history.record("resp_long", [

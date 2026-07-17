@@ -72,7 +72,7 @@ export function normalizeAdapterProfile(route = {}) {
   const api = route.api === "responses" ? "responses" : "chat_completions";
   const authMode = String(route.authMode || route.auth_mode || "");
   const adapterId = adapterIdForRoute({ ...route, providerFamily, api });
-  const customConservative = Boolean(route.custom) || providerFamily === "custom";
+  const customConservative = providerFamily === "custom";
   const inputModalities = Array.isArray(route.inputModalities)
     ? route.inputModalities
     : [];
@@ -444,9 +444,12 @@ export function reasoningParamsForAdapter(request = {}, route = {}, options = {}
 }
 
 function providerFamilyForRoute(route = {}) {
+  const explicitProviderFamily = String(route.providerFamily || "").trim().toLowerCase();
+  if (explicitProviderFamily) {
+    return explicitProviderFamily;
+  }
   const raw = String(
-    route.providerFamily ||
-      route.provider ||
+    route.provider ||
       route.providerId ||
       route.sourcePresetId ||
       route.baseUrl ||
@@ -454,7 +457,6 @@ function providerFamilyForRoute(route = {}) {
       "",
   ).toLowerCase();
 
-  if (route.custom || raw.includes("custom")) return "custom";
   if (raw.includes("codex") || raw.includes("openai") || raw.includes("chatgpt.com")) {
     return "openai";
   }
@@ -468,6 +470,7 @@ function providerFamilyForRoute(route = {}) {
   if (raw.includes("siliconflow")) return "siliconflow";
   if (raw.includes("gemini") || raw.includes("google")) return "gemini";
   if (raw.includes("baidu") || raw.includes("qianfan")) return "baidu";
+  if (route.custom || raw.includes("custom")) return "custom";
   return "openai-compatible";
 }
 

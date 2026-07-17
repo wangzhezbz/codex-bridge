@@ -520,6 +520,54 @@ test("all generated selected routes preserve provider identity for adapter profi
   }
 });
 
+test("custom Volcano Ark models inherit the Doubao adapter contract", () => {
+  const rootDir = mkdtempSync(join(tmpdir(), "codexbridge-custom-volcengine-"));
+  const custom = saveCustomModel(rootDir, {
+    providerId: "volcengine",
+    providerName: "火山方舟",
+    displayName: "Kimi K2.7 Code (Ark)",
+    baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
+    model: "kimi-k2.7-code",
+    api: "chat_completions",
+    apiKeyEnv: "VOLCENGINE_API_KEY",
+  });
+  saveSelection(rootDir, [custom.presetId]);
+
+  const route = buildRouterConfigFromSelection(rootDir, "hybrid").models[0];
+  const profile = normalizeAdapterProfile(route);
+
+  assert.equal(route.custom, true);
+  assert.equal(route.provider, "volcengine");
+  assert.equal(route.providerFamily, "doubao");
+  assert.equal(profile.providerFamily, "doubao");
+  assert.equal(profile.adapterId, "chat-doubao");
+  assert.equal(profile.customConservative, false);
+  assert.equal(profile.dropParams.includes("reasoning"), true);
+  assert.equal(profile.capabilities.reasoning.params.includes("reasoning"), false);
+});
+
+test("standalone custom models infer the Volcano adapter from the Ark Base URL", () => {
+  const rootDir = mkdtempSync(join(tmpdir(), "codexbridge-custom-ark-url-"));
+  const custom = saveCustomModel(rootDir, {
+    providerName: "火山方舟",
+    displayName: "Ark Custom Coder",
+    baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
+    model: "custom-ark-coder",
+    api: "chat_completions",
+    apiKeyEnv: "VOLCENGINE_API_KEY",
+  });
+  saveSelection(rootDir, [custom.presetId]);
+
+  const route = buildRouterConfigFromSelection(rootDir, "hybrid").models[0];
+  const profile = normalizeAdapterProfile(route);
+
+  assert.match(route.provider, /^custom-/);
+  assert.equal(route.providerFamily, "doubao");
+  assert.equal(profile.providerFamily, "doubao");
+  assert.equal(profile.adapterId, "chat-doubao");
+  assert.equal(profile.dropParams.includes("reasoning"), true);
+});
+
 test("custom model generated route remains conservative until image input is enabled", () => {
   const rootDir = mkdtempSync(join(tmpdir(), "codexbridge-custom-profile-"));
   const custom = saveCustomModel(rootDir, {

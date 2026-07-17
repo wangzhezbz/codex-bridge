@@ -17802,6 +17802,7 @@ function providerFamilyForRoute(model = {}, provider) {
     return model.providerFamily;
   }
   const providerId = String(model.providerId || model.provider || provider?.id || "").toLowerCase();
+  const baseUrl = String(model.baseUrl || provider?.baseUrl || "").toLowerCase();
   if (providerId === "codex" || providerId === "openai") {
     return "openai";
   }
@@ -17814,7 +17815,11 @@ function providerFamilyForRoute(model = {}, provider) {
   if (providerId === "minimax") {
     return "minimax";
   }
-  if (providerId === "volcengine") {
+  if (
+    providerId === "volcengine" ||
+    baseUrl.includes("ark.cn-") ||
+    baseUrl.includes("volces.com")
+  ) {
     return "doubao";
   }
   if (providerId === "qwen") {
