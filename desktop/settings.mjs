@@ -10541,12 +10541,57 @@ export function modelCatalog(rootDir, state = null) {
   const customModels = state && Object.prototype.hasOwnProperty.call(state, "customModels")
     ? state.customModels
     : readCustomModels(rootDir);
-  return [...effectiveBuiltInModels(rootDir, providers, state), ...customModels]
+  return [
+    ...effectiveBuiltInModels(rootDir, providers, state),
+    ...effectiveCustomModels(rootDir, customModels, providers, state),
+  ]
     .map((model) => applyProviderSettingsToModel(model, providerMap.get(model.providerId)))
     .map((model) => modelWithDefaultCapabilities(model))
     .map((model) => applyModelImageInputOverride(model, imageInputOverrides))
     .map((model) => applyModelCapabilityOverride(model, capabilityOverrides))
     .map((model) => withCapabilityStatus(model));
+}
+
+function effectiveCustomModels(rootDir, customModels, providers = providerCatalog(rootDir), state = null) {
+  const directory = state && Object.prototype.hasOwnProperty.call(state, "modelDirectory")
+    ? state.modelDirectory
+    : readModelDirectory(rootDir);
+  const providersById = new Map(providers.map((provider) => [provider.id, provider]));
+  const modelsByCustomProvider = new Map();
+  const unchanged = [];
+
+  for (const model of customModels) {
+    const provider = providersById.get(model.providerId);
+    if (!provider?.custom) {
+      unchanged.push(model);
+      continue;
+    }
+    const models = modelsByCustomProvider.get(model.providerId) || [];
+    models.push(model);
+    modelsByCustomProvider.set(model.providerId, models);
+  }
+
+  const usedPresetIds = new Set([
+    ...MODEL_PRESETS.map((model) => model.presetId),
+    ...customModels.map((model) => model.presetId),
+  ]);
+  const refreshed = [];
+  for (const [providerId, seedModels] of modelsByCustomProvider.entries()) {
+    const provider = providersById.get(providerId);
+    const entry = directory.providers?.[providerId];
+    if (!provider || !entry) {
+      refreshed.push(...seedModels);
+      continue;
+    }
+    refreshed.push(...modelsForProviderDirectoryEntry(
+      provider,
+      entry,
+      seedModels,
+      usedPresetIds,
+    ));
+  }
+
+  return [...unchanged, ...refreshed];
 }
 
 function effectiveBuiltInModels(rootDir, providers = providerCatalog(rootDir), state = null) {
@@ -10583,7 +10628,7 @@ function modelsForProviderDirectoryEntry(provider, entry, presets, usedPresetIds
   const models = [];
   for (const remoteModel of entry.models || []) {
     const upstreamModel = String(remoteModel?.id || "").trim();
-    if (!upstreamModel) {
+    if (!upstreamModel || !providerDirectoryModelSupportsConfiguredApi(provider, remoteModel)) {
       continue;
     }
     const exact = exactTemplates.get(providerModelKey(providerId, upstreamModel));
@@ -10593,14 +10638,20 @@ function modelsForProviderDirectoryEntry(provider, entry, presets, usedPresetIds
     );
     usedPresetIds.add(presetId);
     const dropParams = exact?.dropParams || fallbackTemplate?.dropParams || [];
+    const displayName = exact?.displayName || providerDirectoryModelDisplayName(
+      provider,
+      remoteModel,
+      upstreamModel,
+    );
+    const api = providerDirectoryModelApi(provider, entry, remoteModel, exact, fallbackTemplate);
     models.push({
       ...(exact || {}),
       presetId,
       providerId,
       providerName: provider.name || entry.providerName || providerId,
-      displayName: exact?.displayName || `${provider.shortName || provider.name || providerId} ${upstreamModel}`,
-      description: exact?.description || `${upstreamModel} synced from ${provider.name || providerId}.`,
-      api: provider.api || exact?.api || fallbackTemplate?.api || "chat_completions",
+      displayName,
+      description: exact?.description || `${displayName} (${upstreamModel}) synced from ${provider.name || providerId}.`,
+      api,
       baseUrl: provider.baseUrl || entry.baseUrl || fallbackTemplate?.baseUrl || "",
       model: upstreamModel,
       authMode: provider.authMode || "api_key",
@@ -10615,7 +10666,7 @@ function modelsForProviderDirectoryEntry(provider, entry, presets, usedPresetIds
         : exact ? {} : { inputModalities: ["text"] }),
       ...(Array.isArray(dropParams) && dropParams.length ? { dropParams: [...dropParams] } : {}),
       synced: true,
-      custom: false,
+      custom: Boolean(provider.custom || exact?.custom || fallbackTemplate?.custom),
     });
   }
   return models;
@@ -10636,8 +10687,14 @@ function applyProviderSettingsToModel(model, provider) {
     if (provider.baseUrl) {
       next.baseUrl = provider.baseUrl;
     }
-    if (provider.api && !model.custom) {
-      next.api = provider.api;
+    if (!model.custom) {
+      next.api = providerDirectoryModelApi(
+        provider,
+        { baseUrl: provider.baseUrl || model.baseUrl || "" },
+        { id: model.model || "" },
+        model,
+        model,
+      );
     }
   }
   if (provider.keyEnv) {
@@ -10713,7 +10770,11 @@ function syncedProviderModels(rootDir) {
     const template = providerDefaultModelTemplate(providerId);
     for (const remoteModel of entry.models || []) {
       const upstreamModel = String(remoteModel?.id || "").trim();
-      if (!upstreamModel || builtinUpstreamKeys.has(providerModelKey(providerId, upstreamModel))) {
+      if (
+        !upstreamModel
+        || !providerDirectoryModelSupportsConfiguredApi(provider, remoteModel)
+        || builtinUpstreamKeys.has(providerModelKey(providerId, upstreamModel))
+      ) {
         continue;
       }
       const presetId = uniqueSyncedPresetId(
@@ -10721,13 +10782,15 @@ function syncedProviderModels(rootDir) {
         usedPresetIds,
       );
       usedPresetIds.add(presetId);
+      const displayName = providerDirectoryModelDisplayName(provider, remoteModel, upstreamModel);
+      const api = providerDirectoryModelApi(provider, entry, remoteModel, null, template);
       synced.push({
         presetId,
         providerId,
         providerName: provider.name || entry.providerName || providerId,
-        displayName: `${provider.shortName || provider.name || providerId} ${upstreamModel}`,
-        description: `${upstreamModel} synced from ${provider.name || providerId}.`,
-        api: template?.api || "chat_completions",
+        displayName,
+        description: `${displayName} (${upstreamModel}) synced from ${provider.name || providerId}.`,
+        api,
         baseUrl: entry.baseUrl || provider.baseUrl,
         model: upstreamModel,
         authMode: provider.authMode || "api_key",
@@ -10745,6 +10808,96 @@ function syncedProviderModels(rootDir) {
   }
 
   return synced;
+}
+
+function providerDirectoryModelSupportsConfiguredApi(provider = {}, remoteModel = {}) {
+  const metadata = [
+    remoteModel.modelType,
+    remoteModel.taskType,
+    remoteModel.endpointType,
+    remoteModel.category,
+    ...(Array.isArray(remoteModel.capabilities) ? remoteModel.capabilities : []),
+  ]
+    .map((value) => String(value || "").trim().toLowerCase())
+    .filter(Boolean)
+    .join(" ");
+  if (/(^|\W)(chat|text[_ -]?generation|language[_ -]?model|llm)(\W|$)/i.test(metadata)) {
+    return true;
+  }
+  if (/(^|\W)(embedding|rerank|image[_ -]?generation|video[_ -]?generation|speech|audio|tts|asr|3d|realtime)(\W|$)/i.test(metadata)) {
+    return false;
+  }
+
+  const id = String(remoteModel.id || "").trim().toLowerCase();
+  return !/(^|[-_./])(text[-_.]?embedding|embedding|embeddings|embed|rerank|reranker|seedream|seedance|seededit|imagegen|image[-_.]?generation|gpt[-_.]?image|dall[-_.]?e|stable[-_.]?diffusion|video[-_.]?generation|cogvideo|tts|asr|whisper|transcription|transcribe|moderation|realtime|3d)([-_./]|$)/i.test(id);
+}
+
+function providerDirectoryModelApi(provider = {}, entry = {}, remoteModel = {}, exact = null, fallback = null) {
+  if (provider.id === "volcengine") {
+    const baseUrl = String(provider.baseUrl || entry.baseUrl || "").trim().replace(/\/+$/, "");
+    const modelId = String(remoteModel.id || "").trim().toLowerCase();
+    if (/\/api\/coding\/v3$/i.test(baseUrl) || /^(?:glm-5\.2|glm-latest)$/i.test(modelId)) {
+      return "responses";
+    }
+  }
+  return provider.api || exact?.api || fallback?.api || "chat_completions";
+}
+
+function providerDirectoryModelDisplayName(provider = {}, remoteModel = {}, upstreamModel = "") {
+  const explicit = String(remoteModel.displayName || "").trim();
+  if (explicit && explicit.toLowerCase() !== String(upstreamModel).trim().toLowerCase()) {
+    return explicit;
+  }
+  if (provider.id === "volcengine") {
+    return readableVolcanoModelName(upstreamModel);
+  }
+  return `${provider.shortName || provider.name || provider.id || "Model"} ${upstreamModel}`.trim();
+}
+
+function readableVolcanoModelName(upstreamModel) {
+  const raw = String(upstreamModel || "").trim();
+  if (!raw) {
+    return "Volcano Ark Model";
+  }
+  if (/^ep[-_]/i.test(raw)) {
+    return `Ark Endpoint ${raw.slice(3)}`;
+  }
+
+  let core = raw;
+  let releaseDate = "";
+  const dateMatch = core.match(/[-_](\d{2})(\d{2})(\d{2})$/);
+  if (dateMatch) {
+    releaseDate = `20${dateMatch[1]}-${dateMatch[2]}-${dateMatch[3]}`;
+    core = core.slice(0, -dateMatch[0].length);
+  }
+
+  const sourceTokens = core.split(/[-_]+/).filter(Boolean);
+  const tokens = [];
+  for (let index = 0; index < sourceTokens.length; index += 1) {
+    const token = sourceTokens[index];
+    if (/^\d+$/.test(token) && /^\d+$/.test(sourceTokens[index + 1] || "")) {
+      const versionParts = [token];
+      while (/^\d+$/.test(sourceTokens[index + 1] || "")) {
+        versionParts.push(sourceTokens[index + 1]);
+        index += 1;
+      }
+      tokens.push(versionParts.join("."));
+      continue;
+    }
+    if (/^\d+k$/i.test(token) || /^\d+b$/i.test(token)) {
+      tokens.push(token.toUpperCase());
+      continue;
+    }
+    if (/^v\d+(?:\.\d+)+$/i.test(token)) {
+      tokens.push(`v${token.slice(1)}`);
+      continue;
+    }
+    tokens.push(token.toLowerCase() === "glm"
+      ? "GLM"
+      : token.charAt(0).toUpperCase() + token.slice(1));
+  }
+  const readable = tokens.join(" ") || raw;
+  return releaseDate ? `${readable} · ${releaseDate}` : readable;
 }
 
 function providerModelKey(providerId, upstreamModel) {
@@ -17402,10 +17555,7 @@ function toTomlString(value) {
 }
 
 function currentSelectableModels(rootDir, mode) {
-  const models = [
-    ...effectiveBuiltInModels(rootDir),
-    ...readCustomModels(rootDir),
-  ];
+  const models = modelCatalog(rootDir);
   if (mode === MODE_ALL_API) {
     return models.filter((model) => (model.authMode || "api_key") !== "codex_openai");
   }
@@ -17524,6 +17674,15 @@ function providerIdForUnavailableSelection(
   );
   if (known?.providerId) {
     return known.providerId;
+  }
+  const custom = readCustomModels(rootDir).find((model) =>
+    model.presetId === id ||
+    model.model === id ||
+    `cb-${model.presetId}` === id ||
+    `cb-${model.model}` === id
+  );
+  if (custom?.providerId) {
+    return custom.providerId;
   }
   if (!id.startsWith("remote-")) {
     return "";
@@ -18279,7 +18438,30 @@ function modelDirectoryEndpointForProvider(provider = {}) {
   if (!baseUrl || !isValidHttpUrl(baseUrl)) {
     return "";
   }
-  return `${baseUrl}/models`;
+  try {
+    const parsed = new URL(baseUrl);
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    const endpointSuffix = [
+      "/v1/responses/compact",
+      "/responses/compact",
+      "/v1/chat/completions",
+      "/chat/completions",
+      "/v1/responses",
+      "/responses",
+    ].find((suffix) => pathname.toLowerCase().endsWith(suffix));
+    if (endpointSuffix) {
+      const prefix = pathname.slice(0, -endpointSuffix.length).replace(/\/+$/, "");
+      const versionPrefix = endpointSuffix.startsWith("/v1/") ? "/v1" : "";
+      parsed.pathname = `${prefix}${versionPrefix}/models`;
+    } else {
+      parsed.pathname = `${pathname}/models`;
+    }
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    return `${baseUrl}/models`;
+  }
 }
 
 function providerLogoExtension(sourcePath) {
@@ -18316,11 +18498,35 @@ function normalizeProviderModelList(body) {
       if (item.object) {
         model.object = String(item.object);
       }
-      if (item.owned_by) {
-        model.ownedBy = String(item.owned_by);
+      if (item.owned_by || item.ownedBy) {
+        model.ownedBy = String(item.owned_by || item.ownedBy);
       }
       if (Number.isFinite(Number(item.created))) {
         model.created = Number(item.created);
+      }
+      const displayName = String(
+        item.display_name || item.displayName || item.title || (item.id ? item.name : "") || "",
+      ).trim();
+      if (displayName) {
+        model.displayName = displayName;
+      }
+      for (const [target, aliases] of Object.entries({
+        modelType: ["model_type", "modelType", "type"],
+        taskType: ["task_type", "taskType"],
+        endpointType: ["endpoint_type", "endpointType"],
+        category: ["category"],
+      })) {
+        const value = aliases
+          .map((key) => item[key])
+          .find((candidate) => typeof candidate === "string" && candidate.trim());
+        if (value) {
+          model[target] = value.trim();
+        }
+      }
+      if (Array.isArray(item.capabilities)) {
+        model.capabilities = item.capabilities
+          .filter((value) => typeof value === "string" && value.trim())
+          .map((value) => value.trim());
       }
     }
     models.push(model);

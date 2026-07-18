@@ -161,6 +161,9 @@ test("deferred startup repairs managed Codex provider compatibility", () => {
 
 test("pending configuration journals recover before the desktop window exposes mutation IPC", () => {
   assert.match(mainSource, /await recoverPendingConfigTransactions\(\)/);
+  assert.match(mainSource, /recoverConfigTransactionsAtStartup\s*\(\s*\{/);
+  assert.match(mainSource, /summarizeConfigRecoveryError\(error\)/);
+  assert.match(mainSource, /config-recovery retry attempt=/);
   const recoveryIndex = mainSource.indexOf("await recoverPendingConfigTransactions()");
   const createWindowIndex = mainSource.indexOf("createWindow();", recoveryIndex);
   assert.ok(recoveryIndex >= 0 && createWindowIndex > recoveryIndex);

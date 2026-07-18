@@ -8,6 +8,7 @@ import { pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { createConfigWriteCoordinator } from "../desktop/config-write-coordinator.mjs";
 import { hiddenPluginNamesFromDesktopSelectorSource } from "../desktop/codex-desktop-plugin-page-policy.mjs";
+import { normalizeAdapterProfile } from "../src/adapter-profile.js";
 import {
   MODE_ALL_API,
   MODE_HYBRID,
@@ -12453,6 +12454,323 @@ test("provider model directory refresh replaces built-in provider models with th
   assert.equal(synced.apiKeyEnv, "DEEPSEEK_API_KEY");
   assert.equal(synced.custom, false);
   assert.deepEqual(after, before);
+});
+
+test("custom intermediary model refresh replaces its seed model with the remote directory", async () => {
+  const rootDir = makeTempProject();
+  const seed = saveCustomModel(rootDir, {
+    providerId: "custom-relay",
+    providerName: "Custom Relay",
+    displayName: "Relay Seed",
+    model: "relay-seed",
+    baseUrl: "https://relay.example/v1",
+    api: "responses",
+    keyEnv: "CUSTOM_RELAY_API_KEY",
+  });
+  saveSecrets(rootDir, { CUSTOM_RELAY_API_KEY: "relay-secret" });
+  saveSelection(rootDir, [seed.presetId], MODE_HYBRID);
+
+  const result = await refreshProviderModelDirectory(rootDir, "custom-relay", {
+    now: () => "2026-07-18T12:00:00.000Z",
+    fetchImpl: async (url, options) => {
+      assert.equal(url, "https://relay.example/v1/models");
+      assert.equal(options.headers.Authorization, "Bearer relay-secret");
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          object: "list",
+          data: [
+            { id: "relay-model-a", display_name: "Relay Model A" },
+            { id: "relay-model-b" },
+          ],
+        }),
+      };
+    },
+  });
+
+  const relayModels = modelCatalog(rootDir)
+    .filter((model) => model.providerId === "custom-relay");
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(relayModels.map((model) => model.model), [
+    "relay-model-a",
+    "relay-model-b",
+  ]);
+  assert.equal(relayModels.some((model) => model.presetId === seed.presetId), false);
+  assert.equal(relayModels[0].displayName, "Relay Model A");
+  assert.equal(relayModels[0].api, "responses");
+  assert.equal(relayModels[0].baseUrl, "https://relay.example/v1");
+  assert.equal(relayModels[0].apiKeyEnv, "CUSTOM_RELAY_API_KEY");
+  assert.equal(relayModels[0].custom, true);
+
+  assert.deepEqual(readSelection(rootDir, MODE_HYBRID), [relayModels[0].presetId]);
+  const [route] = buildRouterConfigFromSelection(rootDir, MODE_HYBRID).models;
+  assert.equal(route.model, "relay-model-a");
+  assert.equal(route.api, "responses");
+  assert.equal(route.baseUrl, "https://relay.example/v1");
+  assert.equal(route.apiKeyEnv, "CUSTOM_RELAY_API_KEY");
+  assert.equal(route.custom, true);
+});
+
+test("custom intermediary model refresh accepts a full OpenAI-compatible endpoint as Base URL", async () => {
+  const rootDir = makeTempProject();
+  saveCustomModel(rootDir, {
+    providerId: "custom-full-endpoint",
+    providerName: "Custom Full Endpoint",
+    displayName: "Endpoint Seed",
+    model: "endpoint-seed",
+    baseUrl: "https://relay.example/v1/chat/completions",
+    api: "chat_completions",
+    keyEnv: "CUSTOM_FULL_ENDPOINT_API_KEY",
+  });
+  saveSecrets(rootDir, { CUSTOM_FULL_ENDPOINT_API_KEY: "endpoint-secret" });
+
+  const result = await refreshProviderModelDirectory(rootDir, "custom-full-endpoint", {
+    fetchImpl: async (url) => {
+      assert.equal(url, "https://relay.example/v1/models");
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ data: [{ id: "endpoint-model" }] }),
+      };
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(
+    modelCatalog(rootDir)
+      .filter((model) => model.providerId === "custom-full-endpoint")
+      .map((model) => model.model),
+    ["endpoint-model"],
+  );
+});
+
+test("Volcano Ark model refresh keeps non-chat identities out of the chat model catalog", async () => {
+  const rootDir = makeTempProject();
+  saveSecrets(rootDir, { ARK_API_KEY: "ark-secret" });
+
+  const result = await refreshProviderModelDirectory(rootDir, "volcengine", {
+    now: () => "2026-07-18T08:00:00.000Z",
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: [
+          { id: "doubao-seed-2-0-pro-260215" },
+          { id: "mistral-7b-instruct-v0.2" },
+          { id: "doubao-embedding-text-240515" },
+          { id: "doubao-seedream-4-0-250828" },
+          { id: "doubao-seedance-1-5-pro-251215" },
+        ],
+      }),
+    }),
+  });
+
+  const rawIds = readModelDirectory(rootDir).providers.volcengine.models.map((model) => model.id);
+  const chatIds = modelCatalog(rootDir)
+    .filter((model) => model.providerId === "volcengine")
+    .map((model) => model.model);
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(rawIds, [
+    "doubao-seed-2-0-pro-260215",
+    "mistral-7b-instruct-v0.2",
+    "doubao-embedding-text-240515",
+    "doubao-seedream-4-0-250828",
+    "doubao-seedance-1-5-pro-251215",
+  ]);
+  assert.deepEqual(chatIds, [
+    "doubao-seed-2-0-pro-260215",
+    "mistral-7b-instruct-v0.2",
+  ]);
+});
+
+test("Volcano Ark model refresh uses readable names without changing upstream model IDs", async () => {
+  const rootDir = makeTempProject();
+  saveSecrets(rootDir, { ARK_API_KEY: "ark-secret" });
+
+  await refreshProviderModelDirectory(rootDir, "volcengine", {
+    now: () => "2026-07-18T08:00:00.000Z",
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: [
+          { id: "doubao-seed-2-0-pro-260215" },
+          { id: "mistral-7b-instruct-v0.2" },
+          { id: "ep-20260718-test", display_name: "客服知识库模型" },
+        ],
+      }),
+    }),
+  });
+
+  const models = modelCatalog(rootDir).filter((model) => model.providerId === "volcengine");
+  const doubao = models.find((model) => model.model === "doubao-seed-2-0-pro-260215");
+  const mistral = models.find((model) => model.model === "mistral-7b-instruct-v0.2");
+  const endpoint = models.find((model) => model.model === "ep-20260718-test");
+
+  assert.equal(doubao.displayName, "Doubao Seed 2.0 Pro · 2026-02-15");
+  assert.equal(mistral.displayName, "Mistral 7B Instruct v0.2");
+  assert.equal(endpoint.displayName, "客服知识库模型");
+  assert.equal(endpoint.model, "ep-20260718-test");
+  assert.equal(readModelDirectory(rootDir).providers.volcengine.models[2].displayName, "客服知识库模型");
+
+  saveSelection(rootDir, [doubao.presetId], MODE_HYBRID);
+  const route = buildRouterConfigFromSelection(rootDir, MODE_HYBRID).models[0];
+  assert.equal(route.provider, "volcengine");
+  assert.equal(route.providerFamily, "doubao");
+  assert.equal(route.api, "chat_completions");
+  assert.equal(route.model, "doubao-seed-2-0-pro-260215");
+  const profile = normalizeAdapterProfile(route);
+  assert.equal(profile.adapterId, "chat-doubao");
+  assert.equal(profile.dropParams.includes("reasoning"), true);
+});
+
+test("Volcano Ark GLM 5.2 refresh uses Responses without changing ordinary Doubao chat routes", async () => {
+  const rootDir = makeTempProject();
+  saveSecrets(rootDir, { ARK_API_KEY: "ark-secret" });
+
+  await refreshProviderModelDirectory(rootDir, "volcengine", {
+    now: () => "2026-07-18T09:00:00.000Z",
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: [
+          { id: "glm-5.2" },
+          { id: "doubao-seed-2-0-pro-260215" },
+        ],
+      }),
+    }),
+  });
+
+  const models = modelCatalog(rootDir).filter((model) => model.providerId === "volcengine");
+  const glm = models.find((model) => model.model === "glm-5.2");
+  const doubao = models.find((model) => model.model === "doubao-seed-2-0-pro-260215");
+
+  assert.equal(glm.displayName, "GLM 5.2");
+  assert.equal(glm.api, "responses");
+  assert.equal(glm.baseUrl, "https://ark.cn-beijing.volces.com/api/v3");
+  assert.equal(doubao.api, "chat_completions");
+
+  saveSelection(rootDir, [glm.presetId], MODE_HYBRID);
+  const route = buildRouterConfigFromSelection(rootDir, MODE_HYBRID).models[0];
+  assert.equal(route.model, "glm-5.2");
+  assert.equal(route.api, "responses");
+  assert.equal(route.baseUrl, "https://ark.cn-beijing.volces.com/api/v3");
+  assert.equal(normalizeAdapterProfile(route).adapterId, "responses-native");
+
+  const codingRootDir = makeTempProject();
+  saveSecrets(codingRootDir, { ARK_API_KEY: "coding-plan-secret" });
+  saveProviderOverride(codingRootDir, "volcengine", {
+    baseUrl: "https://ark.cn-beijing.volces.com/api/coding/v3",
+  });
+  await refreshProviderModelDirectory(codingRootDir, "volcengine", {
+    now: () => "2026-07-18T09:05:00.000Z",
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: [
+          { id: "glm-5.2" },
+          { id: "doubao-seed-2.0-code" },
+        ],
+      }),
+    }),
+  });
+  const codingModels = modelCatalog(codingRootDir)
+    .filter((model) => model.providerId === "volcengine");
+  assert.equal(codingModels.find((model) => model.model === "glm-5.2")?.api, "responses");
+  assert.equal(codingModels.find((model) => model.model === "doubao-seed-2.0-code")?.api, "responses");
+  assert.ok(codingModels.every((model) => model.baseUrl === "https://ark.cn-beijing.volces.com/api/coding/v3"));
+});
+
+test("saved Volcano provider settings cannot demote GLM 5.2 or Coding Plan routes to Chat", async () => {
+  const rootDir = makeTempProject();
+  saveSecrets(rootDir, { ARK_API_KEY: "ark-secret" });
+  saveProviderOverride(rootDir, "volcengine", {
+    baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
+    api: "chat_completions",
+  });
+  await refreshProviderModelDirectory(rootDir, "volcengine", {
+    now: () => "2026-07-18T09:10:00.000Z",
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ data: [{ id: "glm-5.2" }, { id: "doubao-seed-2-0-pro-260215" }] }),
+    }),
+  });
+
+  let models = modelCatalog(rootDir).filter((model) => model.providerId === "volcengine");
+  const glmModel = models.find((model) => model.model === "glm-5.2");
+  const doubaoModel = models.find((model) => model.model === "doubao-seed-2-0-pro-260215");
+  assert.equal(glmModel?.api, "responses");
+  assert.equal(doubaoModel?.api, "chat_completions");
+  saveSelection(rootDir, [glmModel.presetId, doubaoModel.presetId], MODE_HYBRID);
+  let routes = buildRouterConfigFromSelection(rootDir, MODE_HYBRID).models;
+  assert.equal(routes.find((route) => route.model === "glm-5.2")?.api, "responses");
+  assert.equal(routes.find((route) => route.model === "doubao-seed-2-0-pro-260215")?.api, "chat_completions");
+
+  saveProviderOverride(rootDir, "volcengine", {
+    baseUrl: "https://ark.cn-beijing.volces.com/api/coding/v3",
+    api: "chat_completions",
+  });
+  models = modelCatalog(rootDir).filter((model) => model.providerId === "volcengine");
+  assert.ok(models.length > 0);
+  assert.ok(models.every((model) => model.api === "responses"));
+  saveSelection(rootDir, models.map((model) => model.presetId), MODE_HYBRID);
+  routes = buildRouterConfigFromSelection(rootDir, MODE_HYBRID).models;
+  assert.ok(routes.length > 0);
+  assert.ok(routes.every((route) => route.api === "responses"));
+});
+
+test("provider model refresh keeps obvious non-chat endpoints out of every chat model catalog", async () => {
+  const openaiRoot = makeTempProject();
+  saveSecrets(openaiRoot, { OPENAI_API_KEY: "openai-secret" });
+  await refreshProviderModelDirectory(openaiRoot, "openai", {
+    now: () => "2026-07-18T09:20:00.000Z",
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: [
+          { id: "gpt-4.1" },
+          { id: "text-embedding-3-large" },
+          { id: "gpt-image-1" },
+          { id: "whisper-1" },
+          { id: "omni-moderation-latest" },
+        ],
+      }),
+    }),
+  });
+  assert.deepEqual(
+    modelCatalog(openaiRoot).filter((model) => model.providerId === "openai").map((model) => model.model),
+    ["gpt-4.1"],
+  );
+
+  const qwenRoot = makeTempProject();
+  saveSecrets(qwenRoot, { DASHSCOPE_API_KEY: "qwen-secret" });
+  await refreshProviderModelDirectory(qwenRoot, "qwen", {
+    now: () => "2026-07-18T09:25:00.000Z",
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: [
+          { id: "qwen3-coder-plus" },
+          { id: "qwen3-vl-plus" },
+          { id: "text-embedding-v4" },
+          { id: "gte-rerank-v2" },
+          { id: "qwen-tts-latest" },
+        ],
+      }),
+    }),
+  });
+  assert.deepEqual(
+    modelCatalog(qwenRoot).filter((model) => model.providerId === "qwen").map((model) => model.model),
+    ["qwen3-coder-plus", "qwen3-vl-plus"],
+  );
 });
 
 test("provider overrides update provider catalog and generated routes", () => {

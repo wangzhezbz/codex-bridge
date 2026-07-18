@@ -6361,8 +6361,7 @@ function bindProviderRefreshButtons(root) {
 
 async function saveProviderSettingsBeforeRemoteAction(button) {
   const card = button.closest(".provider-editor-card");
-  const apiKey = card?.querySelector("[data-key-env]")?.value.trim();
-  if (!card || !apiKey) {
+  if (!card) {
     return null;
   }
   return saveProviderSettingsFromCard(card);

@@ -44,6 +44,10 @@ const { runRouterStartForIpc } = require("./router-start-result.cjs");
 const { readBoundedRegularUtf8File } = require("./safe-import-file.cjs");
 const { createChatgptBridgeService } = require("./chatgpt-bridge-service.cjs");
 const {
+  recoverConfigTransactionsAtStartup,
+  summarizeConfigRecoveryError,
+} = require("./config-recovery-startup.cjs");
+const {
   hasCodexResourceAuthority,
   retainCodexResourceSnapshots,
 } = require("./resource-snapshot-retention.cjs");
@@ -544,9 +548,16 @@ async function loadRouterLifecycleController() {
 function recoverPendingConfigTransactions() {
   if (!configRecoveryPromise) {
     configRecoveryPromise = loadSettings().then((settings) =>
-      settings.recoverSharedConfigTransactions({
-        rootDir: dataRootDir,
-        homeDir: os.homedir(),
+      recoverConfigTransactionsAtStartup({
+        recover: () => settings.recoverSharedConfigTransactions({
+          rootDir: dataRootDir,
+          homeDir: os.homedir(),
+        }),
+        onRetry: ({ attempt, delayMs, code }) => {
+          appendRuntimeLog(
+            `config-recovery retry attempt=${attempt} delayMs=${delayMs} code=${code}`,
+          );
+        },
       }),
     );
   }
@@ -861,8 +872,8 @@ app.whenReady().then(async () => {
   } catch (error) {
     appendRuntimeLog(formatError("configRecovery", error));
     dialog.showErrorBox(
-      "CodexBridge configuration recovery required",
-      `Configuration recovery did not complete safely (${error?.code || "unknown"}). CodexBridge will not open mutation controls.`,
+      "CodexBridge 配置恢复未完成",
+      summarizeConfigRecoveryError(error),
     );
     managedQuitReady = true;
     isQuitting = true;

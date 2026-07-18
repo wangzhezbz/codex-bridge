@@ -520,6 +520,17 @@ test("desktop renderer gates remote provider actions behind API keys", () => {
   assert.match(rendererSource, /saveProviderSettingsFromCard/);
 });
 
+test("provider model refresh saves edited custom intermediary settings even when the key is already stored", () => {
+  const start = rendererSource.indexOf("async function saveProviderSettingsBeforeRemoteAction");
+  const end = rendererSource.indexOf("\nfunction renderProviderEditor", start);
+  const handler = rendererSource.slice(start, end);
+
+  assert.notEqual(start, -1);
+  assert.doesNotMatch(handler, /!apiKey/);
+  assert.match(handler, /if \(!card\)/);
+  assert.match(handler, /return saveProviderSettingsFromCard\(card\)/);
+});
+
 test("desktop renderer gives custom providers the same key, context, and test controls", () => {
   assert.match(htmlSource, /id="customApiKey"/);
   assert.match(htmlSource, /id="customContextWindow"/);
