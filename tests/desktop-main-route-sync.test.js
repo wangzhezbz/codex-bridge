@@ -1132,10 +1132,12 @@ test("mac desktop compatibility prefers ChatGPT and falls back to legacy Codex",
   const {
     macOpenAIDesktopCommandPlan,
     macOpenAIDesktopCandidates,
+    parseMacOpenAIDesktopProcesses,
     isKnownMacOpenAIDesktopApp,
     selectMacOpenAIDesktopApp,
   } = require(desktopCompatPath);
   assert.equal(typeof macOpenAIDesktopCommandPlan, "function");
+  assert.equal(typeof parseMacOpenAIDesktopProcesses, "function");
   assert.equal(typeof isKnownMacOpenAIDesktopApp, "function");
   const candidates = macOpenAIDesktopCandidates("/Users/tester");
   assert.deepEqual(
@@ -1206,6 +1208,58 @@ test("mac desktop compatibility prefers ChatGPT and falls back to legacy Codex",
       launch: { command: "open", args: ["/Applications/ChatGPT.app"] },
     },
   );
+  assert.deepEqual(
+    parseMacOpenAIDesktopProcesses([
+      "  101 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+      "  102 /Applications/ChatGPT.app/Contents/Frameworks/ChatGPT Helper.app/Contents/MacOS/ChatGPT Helper --type=renderer",
+      "  103 /Applications/CodexBridge.app/Contents/MacOS/CodexBridge /Applications/CodexBridge.app/Contents/MacOS/CodexBridge",
+      "  104 /Applications/Codex.app/Contents/MacOS/Codex /Applications/Codex.app/Contents/MacOS/Codex",
+      "  105 /Users/Test User/Applications/ChatGPT.app/Contents/MacOS/ChatGPT /Users/Test User/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+    ].join("\n")),
+    [
+      {
+        appName: "ChatGPT",
+        appPath: "/Applications/ChatGPT.app",
+        commandLine: "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+        executablePath: "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+        processId: 101,
+        recognized: true,
+        safeToStop: true,
+      },
+      {
+        appName: "Codex",
+        appPath: "/Applications/Codex.app",
+        commandLine: "/Applications/Codex.app/Contents/MacOS/Codex /Applications/Codex.app/Contents/MacOS/Codex",
+        executablePath: "/Applications/Codex.app/Contents/MacOS/Codex",
+        processId: 104,
+        recognized: true,
+        safeToStop: true,
+      },
+      {
+        appName: "ChatGPT",
+        appPath: "/Users/Test User/Applications/ChatGPT.app",
+        commandLine: "/Users/Test User/Applications/ChatGPT.app/Contents/MacOS/ChatGPT /Users/Test User/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+        executablePath: "/Users/Test User/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+        processId: 105,
+        recognized: true,
+        safeToStop: true,
+      },
+    ],
+  );
+});
+
+test("complete history recovery supports macOS process checks, quit, and app-bundle restart", () => {
+  const stopBody = functionBody("stopOpenAIDesktopForSidebarRecovery");
+  const listBody = functionBody("listRunningCodexDesktopProcesses");
+  const launchBody = functionBody("launchCodexDesktopTarget");
+
+  assert.doesNotMatch(stopBody, /仅支持 Windows/);
+  assert.match(stopBody, /process\.platform === "darwin"/);
+  assert.match(stopBody, /stopMacOpenAIDesktopForSidebarRecovery/);
+  assert.match(listBody, /process\.platform === "darwin"/);
+  assert.match(listBody, /listMacOpenAIDesktopProcessesWithPs/);
+  assert.match(launchBody, /launchKind === "mac_app"/);
+  assert.match(launchBody, /runCommandCapture\("open", \[launchPath\]\)/);
 });
 
 test("desktop main wires safe dual-brand restart without image-name killing", () => {

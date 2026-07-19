@@ -475,6 +475,39 @@ function macOpenAIDesktopCommandPlan(candidate = {}) {
   };
 }
 
+function parseMacOpenAIDesktopProcesses(output = "") {
+  const processes = [];
+  for (const rawLine of String(output || "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || excludedOpenAIDesktopVariant(line)) {
+      continue;
+    }
+    const match = line.match(
+      /^(\d+)\s+(.+?\/(ChatGPT|Codex)\.app\/Contents\/MacOS\/\3)(?:\s+(.*))?$/,
+    );
+    if (!match) {
+      continue;
+    }
+    const processId = Number(match[1]);
+    const executablePath = match[2];
+    const appName = match[3];
+    const appPath = executablePath.slice(0, executablePath.indexOf("/Contents/MacOS/"));
+    if (!Number.isInteger(processId) || processId <= 0 || !isOpenAIDesktopLaunchTarget(appPath)) {
+      continue;
+    }
+    processes.push({
+      appName,
+      appPath,
+      commandLine: [executablePath, match[4] || ""].filter(Boolean).join(" "),
+      executablePath,
+      processId,
+      recognized: true,
+      safeToStop: true,
+    });
+  }
+  return processes;
+}
+
 function runCommandCaptureWithTimeout(command, args = [], options = {}) {
   const spawnImpl = typeof options.spawnImpl === "function" ? options.spawnImpl : nodeSpawn;
   const timeoutMs = Number.isFinite(Number(options.timeoutMs)) && Number(options.timeoutMs) > 0
@@ -744,6 +777,7 @@ module.exports = {
   isKnownMacOpenAIDesktopApp,
   macOpenAIDesktopCommandPlan,
   macOpenAIDesktopCandidates,
+  parseMacOpenAIDesktopProcesses,
   openAIDesktopLaunchKind,
   openAIDesktopStorePackageFamily,
   openAIDesktopTargetFromShortcutResolution,

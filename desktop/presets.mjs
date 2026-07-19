@@ -170,6 +170,19 @@ export const PROVIDERS = [
 ];
 
 export const MODEL_PRESETS = [
+  route(
+    "codex-gpt-5-6",
+    "codex",
+    "GPT-5.6（订阅兼容）",
+    "gpt-5.6",
+    "responses",
+    372000,
+    imageInput(codexFastMode({
+      ...codex56Metadata("medium", true, "v2"),
+      description: "ChatGPT 订阅兼容入口：当账号不支持显式 GPT-5.6-Sol 时使用。请求官方通用 gpt-5.6，由 Codex 按当前账号能力提供可用的 GPT-5.6 配置，不固定为 Sol、Terra 或 Luna。",
+      userDescription: "供不支持 GPT-5.6-Sol 的 ChatGPT 订阅账号使用；这是通用 GPT-5.6，不固定为 Sol、Terra 或 Luna。",
+    })),
+  ),
   route("codex-gpt-5-6-sol", "codex", "GPT-5.6-Sol", "gpt-5.6-sol", "responses", 372000, imageInput(codexFastMode(codex56Metadata("low", true, "v2")))),
   route("codex-gpt-5-6-terra", "codex", "GPT-5.6-Terra", "gpt-5.6-terra", "responses", 372000, imageInput(codexFastMode(codex56Metadata("medium", true, "v2")))),
   route("codex-gpt-5-6-luna", "codex", "GPT-5.6-Luna", "gpt-5.6-luna", "responses", 372000, imageInput(codexFastMode(codex56Metadata("medium", false, "v1")))),

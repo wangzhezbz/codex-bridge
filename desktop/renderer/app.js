@@ -4646,7 +4646,7 @@ function renderHistoryRecoveryStatus() {
   const phase = String(status.phase || "idle");
   const awaitingManualExit = phase === "awaiting_manual_exit";
   const failed = status.ok === false && (phase === "failed" || awaitingManualExit);
-  const succeeded = status.ok === true && phase === "restarted";
+  const succeeded = status.ok === true && (phase === "restarted" || phase === "completed");
   const phaseLabels = {
     idle: "尚未生成恢复计划",
     planned: "只完成扫描，尚未迁移",
@@ -4654,6 +4654,7 @@ function renderHistoryRecoveryStatus() {
     awaiting_manual_exit: "自动退出失败，尚未迁移",
     migrating: "正在迁移",
     verified: "迁移已提交并回读验证",
+    completed: "迁移成功，请手动打开 ChatGPT / Codex",
     restarted: "迁移成功并已重新启动",
     failed: "迁移失败",
   };
@@ -4676,7 +4677,7 @@ function renderHistoryRecoveryStatus() {
 }
 
 function applyVerifiedHistoryRecoverySummary(result = {}) {
-  if (!(result?.ok && result?.phase === "restarted" && state?.codexSessionTree?.summary)) {
+  if (!(result?.ok && ["restarted", "completed"].includes(result?.phase) && state?.codexSessionTree?.summary)) {
     return;
   }
   const previousSummary = state.codexSessionTree.summary;
@@ -4753,7 +4754,8 @@ function renderSessions() {
     : "";
   const classificationNote = sessionClassificationNote(tree);
   const recoveryResult = projectRecoveryResultPanel(lastProjectRecoveryResult);
-  const verifiedRecovery = historyRecoveryStatus?.ok === true && historyRecoveryStatus?.phase === "restarted"
+  const verifiedRecovery = historyRecoveryStatus?.ok === true &&
+    ["restarted", "completed"].includes(historyRecoveryStatus?.phase)
     ? historyRecoveryStatus
     : null;
   const sessionSummary = verifiedRecovery
@@ -7187,6 +7189,9 @@ function modelCard(model, selected, includeControls = true) {
 }
 
 function modelFriendlySummary(model) {
+  if (model.userDescription) {
+    return model.userDescription;
+  }
   const modalities = new Set(inputModalitiesForModel(model));
   const parts = [
     model.api === "responses" ? "Responses" : "Chat",
@@ -7203,6 +7208,9 @@ function modelFriendlySummary(model) {
 }
 
 function modelCatalogSummary(model) {
+  if (model.userDescription) {
+    return model.userDescription;
+  }
   const modalities = new Set(inputModalitiesForModel(model));
   const parts = [model.api === "responses" ? "Responses" : "Chat"];
   if (modalities.has("image")) {

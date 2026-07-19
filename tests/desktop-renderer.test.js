@@ -14,6 +14,11 @@ const mainSource = readFileSync(resolve(__dirname, "../desktop/main.cjs"), "utf8
 const kimiLogoSource = readFileSync(resolve(__dirname, "../desktop/renderer/assets/providers/kimi.svg"), "utf8");
 const defaultLogoSource = readFileSync(resolve(__dirname, "../desktop/renderer/assets/providers/default.svg"), "utf8");
 
+test("model cards show a dedicated user description when a preset provides one", () => {
+  assert.match(rendererSource, /function modelFriendlySummary\(model\)[\s\S]*?model\.userDescription/);
+  assert.match(rendererSource, /function modelCatalogSummary\(model\)[\s\S]*?model\.userDescription/);
+});
+
 test("double quota is a dedicated desktop page backed by narrow IPC methods", () => {
   assert.match(htmlSource, /data-section="doubleQuota">双倍额度<\/button>/);
   assert.match(htmlSource, /<section class="section-panel hidden" id="doubleQuota">/);
@@ -1269,6 +1274,8 @@ test("session page keeps a visible two-phase recovery result and manual-exit ret
   assert.match(rendererSource, /const sessionSummary = verifiedRecovery/);
   assert.match(rendererSource, /formatNumber\(sessionSummary\?\.catalogThreads/);
   assert.match(rendererSource, /const latestStatus = await api\.historyRecoveryStatus\(\)/);
+  assert.match(rendererSource, /phase === "completed"/);
+  assert.match(rendererSource, /completed: "迁移成功，请手动打开 ChatGPT \/ Codex"/);
 });
 
 test("desktop renderer provides request detail drilldown from usage events", () => {

@@ -23,6 +23,7 @@ const {
   isKnownMacOpenAIDesktopApp,
   macOpenAIDesktopCommandPlan,
   macOpenAIDesktopCandidates,
+  parseMacOpenAIDesktopProcesses,
   openAIDesktopLaunchKind,
   openAIDesktopStorePackageFamily,
   openAIDesktopTargetFromShortcutResolution,
@@ -365,7 +366,12 @@ async function loadCodexHistoryRecoveryFlow() {
             return { ok: true, launchTarget: launchTarget || "history-recovery-e2e", simulated: true };
           }
           if (!launchTarget) {
-            throw new Error("没有保存可验证的 ChatGPT / Codex 启动项，迁移已完成但无法自动重启。");
+            return {
+              ok: true,
+              skipped: true,
+              manualRestartRequired: true,
+              message: "迁移已完成，但没有保存可验证的启动项；请手动打开 ChatGPT / Codex。",
+            };
           }
           await launchCodexDesktopTarget(launchTarget);
           return { ok: true, launchTarget };
@@ -3018,17 +3024,36 @@ async function waitForCodexProjectRootActive(settings, root, {
 }
 
 async function stopOpenAIDesktopForSidebarRecovery(settings) {
+  if (process.platform === "darwin") {
+    return stopMacOpenAIDesktopForSidebarRecovery(settings);
+  }
   if (process.platform !== "win32") {
-    throw new Error("完整会话侧栏恢复目前仅支持 Windows。");
+    return {
+      ok: false,
+      stopped: 0,
+      launchTarget: "",
+      failureCode: "unsupported_platform",
+      message: "完整会话侧栏恢复目前支持 Windows 和 macOS。",
+    };
   }
   const desktopOptions = settings.loadDesktopOptions(dataRootDir);
   const candidateEntries = await codexDesktopLaunchCandidateEntries(desktopOptions);
+  const runningProcesses = await listRunningCodexDesktopProcesses();
   const restartPlan = buildOpenAIDesktopRestartPlan(
-    await listRunningCodexDesktopProcesses(),
+    runningProcesses,
     candidateEntries,
     { isLaunchable: isLaunchableCodexDesktopTarget },
   );
   if (!restartPlan.launchTarget) {
+    if (!runningProcesses.length) {
+      return {
+        ok: true,
+        stopped: 0,
+        launchTarget: "",
+        manualRestartRequired: true,
+        message: "ChatGPT / Codex 已退出，可以迁移；完成后请手动重新打开。",
+      };
+    }
     return {
       ok: false,
       stopped: 0,
@@ -3054,6 +3079,68 @@ async function stopOpenAIDesktopForSidebarRecovery(settings) {
     ...stopResult,
     launchTarget: restartPlan.launchTarget,
     appName: restartPlan.brand || "ChatGPT / Codex",
+  };
+}
+
+async function stopMacOpenAIDesktopForSidebarRecovery(settings) {
+  const desktopOptions = settings.loadDesktopOptions(dataRootDir);
+  const runningProcesses = await listMacOpenAIDesktopProcessesWithPs();
+  const installedApp = await locateMacOpenAIDesktopApp(desktopOptions);
+  const preferredRunning = runningProcesses.find((item) => item.appName === "ChatGPT") ||
+    runningProcesses[0] || null;
+  const launchTarget = installedApp?.appPath || preferredRunning?.appPath || "";
+  const appName = installedApp?.appName || preferredRunning?.appName || "ChatGPT / Codex";
+  if (!runningProcesses.length) {
+    return {
+      ok: true,
+      stopped: 0,
+      launchTarget,
+      appName,
+      manualRestartRequired: !launchTarget,
+      message: launchTarget
+        ? "ChatGPT / Codex 已退出，可以安全迁移。"
+        : "ChatGPT / Codex 已退出，可以迁移；完成后请手动重新打开。",
+    };
+  }
+
+  const appsToQuit = [...new Map(runningProcesses.map((item) => [
+    `${item.appName}\n${item.appPath}`,
+    { appName: item.appName, appPath: item.appPath },
+  ])).values()];
+  for (const desktopApp of appsToQuit) {
+    const commandPlan = macOpenAIDesktopCommandPlan(desktopApp);
+    if (!commandPlan) {
+      continue;
+    }
+    await runCommandCapture(commandPlan.quit.command, commandPlan.quit.args);
+  }
+
+  const deadline = Date.now() + 8000;
+  let remaining = runningProcesses;
+  while (Date.now() < deadline) {
+    await delay(250);
+    remaining = await listMacOpenAIDesktopProcessesWithPs();
+    if (!remaining.length) {
+      return {
+        ok: true,
+        stopped: runningProcesses.length,
+        failed: 0,
+        failedProcessIds: [],
+        launchTarget,
+        appName,
+        manualRestartRequired: !launchTarget,
+      };
+    }
+  }
+  return {
+    ok: false,
+    stopped: Math.max(0, runningProcesses.length - remaining.length),
+    failed: remaining.length,
+    failedProcessIds: remaining.map((item) => item.processId).filter(Boolean),
+    launchTarget,
+    appName,
+    failureCode: "desktop_stop_failed",
+    message: `未能完全退出 ChatGPT / Codex（PID ${remaining.map((item) => item.processId).filter(Boolean).join(", ") || "unknown"}）；为防止状态被覆盖，尚未执行会话迁移。`,
   };
 }
 
@@ -3231,6 +3318,13 @@ async function launchCodexDesktopTarget(launchPath) {
   }
   const isShortcut = launchKind === "shortcut";
   const isShellTarget = launchKind === "shell";
+  if (launchKind === "mac_app") {
+    const result = await runCommandCapture("open", [launchPath]);
+    if (!result.ok) {
+      throw new Error(`未能打开 ChatGPT / Codex：${launchPath}`);
+    }
+    return;
+  }
   if (isShortcut || isShellTarget) {
     await spawnDetachedWithConfirmation("explorer.exe", [launchPath], {
         detached: true,
@@ -3247,6 +3341,12 @@ async function launchCodexDesktopTarget(launchPath) {
 }
 
 async function listRunningCodexDesktopProcesses() {
+  if (process.platform === "darwin") {
+    return listMacOpenAIDesktopProcessesWithPs();
+  }
+  if (process.platform !== "win32") {
+    return [];
+  }
   const providers = [
     listCodexDesktopProcessesWithPowerShell,
     listCodexDesktopProcessesWithWmic,
@@ -3259,6 +3359,14 @@ async function listRunningCodexDesktopProcesses() {
     }
   }
   return [];
+}
+
+async function listMacOpenAIDesktopProcessesWithPs() {
+  const result = await runCommandCapture("ps", ["-axo", "pid=,comm=,args="]);
+  if (!result.ok) {
+    throw new Error("无法读取 macOS 的 ChatGPT / Codex 进程，已停止会话迁移以保护历史数据。");
+  }
+  return parseMacOpenAIDesktopProcesses(result.stdout);
 }
 
 async function listCodexDesktopProcessesWithPowerShell() {

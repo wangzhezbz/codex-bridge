@@ -175,3 +175,79 @@ test("history recovery resumes a persisted pending plan after Bridge restarts", 
   assert.equal(previewCalls, 1);
   assert.equal(durableState.current.phase, "restarted");
 });
+
+test("history recovery remains successful when migration is verified but desktop must be reopened manually", async () => {
+  const flow = createCodexHistoryRecoveryFlow({
+    preview: async () => ({
+      ok: true,
+      summary: {
+        activeUserThreads: 54,
+        catalogThreads: 1,
+        sidebarThreads: 54,
+        plannedInserts: 53,
+      },
+    }),
+    stopDesktop: async () => ({ ok: true, launchTarget: "" }),
+    listProcesses: async () => [],
+    probeCatalogWritable: async () => ({ ok: true }),
+    apply: async () => ({
+      ok: true,
+      backupDir: "/Users/tester/.codex/codexbridge-history-recovery/fixture",
+      applied: { inserted: 53, updated: 0 },
+      after: { summary: { catalogThreads: 54, sidebarThreads: 54 } },
+      verification: {
+        expectedActiveUserThreads: 54,
+        catalogActiveUserThreads: 54,
+        sidebarActiveUserThreads: 54,
+        consistent: true,
+      },
+    }),
+    backupExists: async () => true,
+    restartDesktop: async () => ({
+      ok: true,
+      skipped: true,
+      manualRestartRequired: true,
+    }),
+    recoverProjects: async () => ({ ok: true }),
+  });
+
+  await flow.prepare();
+  const result = await flow.execute();
+
+  assert.equal(result.ok, true);
+  assert.equal(result.phase, "completed");
+  assert.equal(result.actualInserted, 53);
+  assert.equal(result.commitStatus, "verified");
+  assert.match(result.message, /手动打开/);
+});
+
+test("history recovery refuses to write when the desktop process probe fails", async () => {
+  let applyCalls = 0;
+  const flow = createCodexHistoryRecoveryFlow({
+    preview: async () => ({
+      ok: true,
+      summary: { activeUserThreads: 2, catalogThreads: 1, sidebarThreads: 2, plannedInserts: 1 },
+    }),
+    stopDesktop: async () => ({ ok: true, launchTarget: "" }),
+    listProcesses: async () => {
+      throw new Error("ps unavailable");
+    },
+    probeCatalogWritable: async () => ({ ok: true }),
+    apply: async () => {
+      applyCalls += 1;
+      return { ok: true };
+    },
+    backupExists: async () => true,
+    restartDesktop: async () => ({ ok: true }),
+    recoverProjects: async () => ({ ok: true }),
+  });
+
+  await flow.prepare();
+  const result = await flow.execute();
+
+  assert.equal(result.ok, false);
+  assert.equal(result.phase, "failed");
+  assert.equal(result.failureCode, "process_check_failed");
+  assert.match(result.failureReason, /ps unavailable/);
+  assert.equal(applyCalls, 0);
+});

@@ -1272,6 +1272,186 @@ test("codex_openai responses use ChatGPT Codex backend and forward Codex headers
   }
 });
 
+test("codex_openai keeps explicit gpt-5.6-sol and surfaces account rejection without silent aliasing", async () => {
+  const originalBackend = process.env.CODEXBRIDGE_CHATGPT_CODEX_BASE_URL;
+  const seenModels = [];
+
+  const upstream = httpServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    seenModels.push(body.model);
+
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      detail: "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.",
+    }));
+  });
+
+  try {
+    await listen(upstream);
+    process.env.CODEXBRIDGE_CHATGPT_CODEX_BASE_URL = `${serverUrl(upstream)}/backend-api/codex`;
+
+    await assert.rejects(
+      proxyResponsesApi(
+        {
+          model: "gpt-5.6-sol",
+          input: "hello",
+          stream: true,
+        },
+        {
+          id: "cb-gpt-5-6-sol",
+          displayName: "GPT-5.6-Sol",
+          api: "responses",
+          baseUrl: "https://api.openai.com/v1",
+          model: "gpt-5.6-sol",
+          authMode: "codex_openai",
+        },
+        collectResponse(),
+        {
+          clientAuth: {
+            kind: "codex_openai",
+            bearerToken: "codex-openai-token",
+          },
+        },
+      ),
+      (error) => error instanceof UpstreamHttpError && error.statusCode === 400,
+    );
+
+    assert.deepEqual(seenModels, ["gpt-5.6-sol"]);
+  } finally {
+    await close(upstream);
+    if (originalBackend === undefined) {
+      delete process.env.CODEXBRIDGE_CHATGPT_CODEX_BASE_URL;
+    } else {
+      process.env.CODEXBRIDGE_CHATGPT_CODEX_BASE_URL = originalBackend;
+    }
+  }
+});
+
+test("codex_openai sends the explicitly selected generic gpt-5.6 model unchanged", async () => {
+  const originalBackend = process.env.CODEXBRIDGE_CHATGPT_CODEX_BASE_URL;
+  const seenModels = [];
+  const upstream = httpServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    seenModels.push(JSON.parse(Buffer.concat(chunks).toString("utf8")).model);
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    res.write("event: response.completed\n");
+    res.write(`data: ${JSON.stringify({
+      type: "response.completed",
+      response: { id: "resp_generic_56", status: "completed", model: "gpt-5.6", output: [] },
+    })}\n\n`);
+    res.end("data: [DONE]\n\n");
+  });
+
+  try {
+    await listen(upstream);
+    process.env.CODEXBRIDGE_CHATGPT_CODEX_BASE_URL = `${serverUrl(upstream)}/backend-api/codex`;
+    const res = collectResponse();
+    await proxyResponsesApi(
+      { model: "gpt-5.6", input: "hello", stream: true },
+      {
+        id: "cb-gpt-5-6",
+        displayName: "GPT-5.6（订阅兼容）",
+        api: "responses",
+        baseUrl: "https://api.openai.com/v1",
+        model: "gpt-5.6",
+        authMode: "codex_openai",
+      },
+      res,
+      { clientAuth: { kind: "codex_openai", bearerToken: "codex-openai-token" } },
+    );
+    assert.deepEqual(seenModels, ["gpt-5.6"]);
+    assert.equal(res.statusCode, 200);
+    assert.match(res.body(), /resp_generic_56/);
+  } finally {
+    await close(upstream);
+    if (originalBackend === undefined) delete process.env.CODEXBRIDGE_CHATGPT_CODEX_BASE_URL;
+    else process.env.CODEXBRIDGE_CHATGPT_CODEX_BASE_URL = originalBackend;
+  }
+});
+
+test("codex_openai does not retry unrelated gpt-5.6-sol HTTP 400 errors", async () => {
+  const originalBackend = process.env.CODEXBRIDGE_CHATGPT_CODEX_BASE_URL;
+  let requestCount = 0;
+  const upstream = httpServer(async (_req, res) => {
+    requestCount += 1;
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ detail: "Invalid request parameter." }));
+  });
+
+  try {
+    await listen(upstream);
+    process.env.CODEXBRIDGE_CHATGPT_CODEX_BASE_URL = `${serverUrl(upstream)}/backend-api/codex`;
+
+    await assert.rejects(
+      proxyResponsesApi(
+        { model: "gpt-5.6-sol", input: "hello", stream: true },
+        {
+          id: "cb-gpt-5-6-sol",
+          api: "responses",
+          baseUrl: "https://api.openai.com/v1",
+          model: "gpt-5.6-sol",
+          authMode: "codex_openai",
+        },
+        collectResponse(),
+        {
+          clientAuth: {
+            kind: "codex_openai",
+            bearerToken: "codex-openai-token",
+          },
+        },
+      ),
+      (error) => error instanceof UpstreamHttpError && error.statusCode === 400,
+    );
+    assert.equal(requestCount, 1);
+  } finally {
+    await close(upstream);
+    if (originalBackend === undefined) {
+      delete process.env.CODEXBRIDGE_CHATGPT_CODEX_BASE_URL;
+    } else {
+      process.env.CODEXBRIDGE_CHATGPT_CODEX_BASE_URL = originalBackend;
+    }
+  }
+});
+
+test("API-key Responses routes never apply the ChatGPT subscription model alias", async () => {
+  let requestCount = 0;
+  const upstream = httpServer(async (_req, res) => {
+    requestCount += 1;
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      detail: "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.",
+    }));
+  });
+
+  try {
+    await listen(upstream);
+    await assert.rejects(
+      proxyResponsesApi(
+        { model: "gpt-5.6-sol", input: "hello", stream: true },
+        {
+          id: "custom-gpt-5-6-sol",
+          api: "responses",
+          baseUrl: `${serverUrl(upstream)}/v1`,
+          model: "gpt-5.6-sol",
+          authMode: "api_key",
+          apiKey: "test-key",
+        },
+        collectResponse(),
+        {},
+      ),
+      (error) => error instanceof UpstreamHttpError && error.statusCode === 400,
+    );
+    assert.equal(requestCount, 1);
+  } finally {
+    await close(upstream);
+  }
+});
+
 test("responses stream logs token usage from completed SSE event", async () => {
   const originalBackend = process.env.CODEXBRIDGE_CHATGPT_CODEX_BASE_URL;
   const originalLog = console.log;

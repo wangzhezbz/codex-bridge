@@ -87,16 +87,32 @@ export function createCodexHistoryRecoveryFlow({
       try {
         stopResult = await stopDesktop();
       } catch (error) {
-        stopResult = { ok: false, message: error?.message || String(error) };
+        stopResult = {
+          ok: false,
+          failureCode: error?.code || "desktop_stop_failed",
+          message: error?.message || String(error),
+        };
       }
       launchTarget = String(stopResult?.launchTarget || launchTarget || "");
       if (stopResult?.ok !== true) {
-        return await failForRunningDesktop("desktop_stop_failed", stopResult?.message || "未能完全退出 ChatGPT / Codex。");
+        return await failForRunningDesktop(
+          stopResult?.failureCode || stopResult?.code || "desktop_stop_failed",
+          stopResult?.message || "未能完全退出 ChatGPT / Codex。",
+        );
       }
     }
 
     recordPhase("process_check", current);
-    const running = normalizeProcesses(await listProcesses());
+    let running;
+    try {
+      running = normalizeProcesses(await listProcesses());
+    } catch (error) {
+      return failStatus(
+        "failed",
+        "process_check_failed",
+        `无法确认 ChatGPT / Codex 是否已完全退出：${error?.message || String(error)}`,
+      );
+    }
     if (running.length) {
       return failStatus("awaiting_manual_exit", "desktop_processes_running", "仍检测到 ChatGPT / Codex 进程，请手动完全退出后重新检测。", {
         runningProcessIds: running.map((item) => item.processId).filter(Boolean),
@@ -165,26 +181,41 @@ export function createCodexHistoryRecoveryFlow({
       return failStatus("failed", "restart_failed", restartResult?.message || "迁移成功，但重新启动 ChatGPT / Codex 失败。", { commitStatus: "verified" });
     }
 
+    const manualRestartRequired = restartResult?.skipped === true ||
+      restartResult?.manualRestartRequired === true;
     let projectRecovery = null;
-    try {
-      projectRecovery = await recoverProjects();
-    } catch (error) {
-      return failStatus("failed", "project_recovery_failed", error?.message || String(error), { commitStatus: "verified" });
+    if (!manualRestartRequired) {
+      try {
+        projectRecovery = await recoverProjects();
+      } catch (error) {
+        return failStatus("failed", "project_recovery_failed", error?.message || String(error), { commitStatus: "verified" });
+      }
     }
     current = {
       ...current,
       ok: true,
-      phase: "restarted",
+      phase: manualRestartRequired ? "completed" : "restarted",
       restartResult,
       projectRecovery,
-      message: `历史目录已迁移并回读验证，实际新增 ${current.actualInserted} 条；ChatGPT / Codex 已重新启动。`,
+      message: manualRestartRequired
+        ? `历史目录已迁移并回读验证，实际新增 ${current.actualInserted} 条；请手动打开 ChatGPT / Codex。`
+        : `历史目录已迁移并回读验证，实际新增 ${current.actualInserted} 条；ChatGPT / Codex 已重新启动。`,
     };
     persist();
     return status();
   }
 
   async function failForRunningDesktop(code, message) {
-    const running = normalizeProcesses(await listProcesses());
+    let running;
+    try {
+      running = normalizeProcesses(await listProcesses());
+    } catch (error) {
+      return failStatus(
+        "failed",
+        "process_check_failed",
+        `无法确认 ChatGPT / Codex 是否已完全退出：${error?.message || String(error)}`,
+      );
+    }
     return failStatus("awaiting_manual_exit", code, message, {
       runningProcessIds: running.map((item) => item.processId).filter(Boolean),
     });

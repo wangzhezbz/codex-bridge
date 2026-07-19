@@ -9338,6 +9338,7 @@ test("native GPT subscription presets advertise Codex fast mode", () => {
   ];
 
   for (const presetId of [
+    "codex-gpt-5-6",
     "codex-gpt-5-6-sol",
     "codex-gpt-5-6-terra",
     "codex-gpt-5-6-luna",
@@ -9354,6 +9355,7 @@ test("native GPT subscription presets advertise Codex fast mode", () => {
 test("native GPT subscription presets use the Codex desktop context window", () => {
   const byId = new Map(MODEL_PRESETS.map((model) => [model.presetId, model]));
 
+  assert.equal(byId.get("codex-gpt-5-6")?.contextWindow, 372000);
   assert.equal(byId.get("codex-gpt-5-6-sol")?.contextWindow, 372000);
   assert.equal(byId.get("codex-gpt-5-6-terra")?.contextWindow, 372000);
   assert.equal(byId.get("codex-gpt-5-6-luna")?.contextWindow, 372000);
@@ -9364,10 +9366,15 @@ test("native GPT subscription presets use the Codex desktop context window", () 
 
 test("native GPT 5.6 presets expose current Codex reasoning and Responses Lite metadata", () => {
   const byId = new Map(MODEL_PRESETS.map((model) => [model.presetId, model]));
+  const compatible = byId.get("codex-gpt-5-6");
   const sol = byId.get("codex-gpt-5-6-sol");
   const terra = byId.get("codex-gpt-5-6-terra");
   const luna = byId.get("codex-gpt-5-6-luna");
 
+  assert.equal(compatible?.model, "gpt-5.6");
+  assert.equal(compatible?.displayName, "GPT-5.6（订阅兼容）");
+  assert.match(compatible?.userDescription || "", /ChatGPT 订阅账号/);
+  assert.match(compatible?.userDescription || "", /不固定为 Sol、Terra 或 Luna/);
   assert.equal(sol?.model, "gpt-5.6-sol");
   assert.equal(terra?.model, "gpt-5.6-terra");
   assert.equal(luna?.model, "gpt-5.6-luna");
@@ -9380,7 +9387,7 @@ test("native GPT 5.6 presets expose current Codex reasoning and Responses Lite m
   assert.deepEqual(luna?.supportedReasoningLevels.map((item) => item.effort), [
     "low", "medium", "high", "xhigh", "max",
   ]);
-  for (const preset of [sol, terra, luna]) {
+  for (const preset of [compatible, sol, terra, luna]) {
     assert.equal(preset?.useResponsesLite, true);
     assert.equal(preset?.supportsReasoningSummaries, true);
     assert.equal(preset?.defaultReasoningSummary, "none");
@@ -9388,6 +9395,19 @@ test("native GPT 5.6 presets expose current Codex reasoning and Responses Lite m
     assert.equal(preset?.defaultVerbosity, "low");
     assert.equal(preset?.webSearchToolType, "text_and_image");
   }
+});
+
+test("buildRouterConfigFromSelection exposes the explicit GPT 5.6 subscription-compatible route", () => {
+  const rootDir = makeTempProject();
+  saveSelection(rootDir, ["codex-gpt-5-6"], MODE_HYBRID);
+
+  const config = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
+
+  assert.equal(config.models.length, 1);
+  assert.equal(config.models[0].id, "cb-gpt-5-6");
+  assert.equal(config.models[0].model, "gpt-5.6");
+  assert.equal(config.models[0].displayName, "GPT-5.6（订阅兼容）");
+  assert.match(config.models[0].description || "", /账号不支持显式 GPT-5.6-Sol/);
 });
 
 test("built-in catalog does not recommend the private Fenno GPT provider", () => {
@@ -12511,6 +12531,60 @@ test("custom intermediary model refresh replaces its seed model with the remote 
   assert.equal(route.baseUrl, "https://relay.example/v1");
   assert.equal(route.apiKeyEnv, "CUSTOM_RELAY_API_KEY");
   assert.equal(route.custom, true);
+});
+
+test("custom intermediary model refresh exposes every compatible remote model instead of keeping the two saved seeds", async () => {
+  const rootDir = makeTempProject();
+  for (const model of ["gpt-5.6-sol", "gpt-5.5"]) {
+    saveCustomModel(rootDir, {
+      providerId: "custom-pptoken",
+      providerName: "PPToken",
+      displayName: model,
+      model,
+      baseUrl: "https://api.pptoken.org/v1",
+      api: "responses",
+      keyEnv: "CUSTOM_PPTOKEN_API_KEY",
+    });
+  }
+  saveSecrets(rootDir, { CUSTOM_PPTOKEN_API_KEY: "pptoken-secret" });
+
+  const remoteIds = [
+    "gpt-5.6-sol",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.3",
+    "o3",
+    "o4-mini",
+    "codex-mini-latest",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4o",
+    "gpt-4o-mini",
+    "claude-sonnet-4",
+    "gemini-2.5-pro",
+  ];
+  const result = await refreshProviderModelDirectory(rootDir, "custom-pptoken", {
+    now: () => "2026-07-18T13:00:00.000Z",
+    fetchImpl: async (url, options) => {
+      assert.equal(url, "https://api.pptoken.org/v1/models");
+      assert.equal(options.headers.Authorization, "Bearer pptoken-secret");
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ data: remoteIds.map((id) => ({ id })) }),
+      };
+    },
+  });
+
+  const visibleModels = modelCatalog(rootDir)
+    .filter((model) => model.providerId === "custom-pptoken");
+
+  assert.equal(result.ok, true);
+  assert.equal(result.count, 13);
+  assert.equal(visibleModels.length, 13);
+  assert.deepEqual(visibleModels.map((model) => model.model), remoteIds);
+  assert.ok(visibleModels.every((model) => model.api === "responses"));
+  assert.ok(visibleModels.every((model) => model.custom === true));
 });
 
 test("custom intermediary model refresh accepts a full OpenAI-compatible endpoint as Base URL", async () => {
