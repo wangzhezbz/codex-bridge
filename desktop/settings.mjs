@@ -10684,7 +10684,7 @@ function applyProviderSettingsToModel(model, provider) {
     logoUrl: provider.logoUrl ?? model.logoUrl,
   };
   if ((next.authMode || provider.authMode || "api_key") !== "codex_openai") {
-    if (provider.baseUrl) {
+    if (provider.baseUrl && (!model.custom || !model.baseUrl)) {
       next.baseUrl = provider.baseUrl;
     }
     if (!model.custom) {
@@ -10697,11 +10697,11 @@ function applyProviderSettingsToModel(model, provider) {
       );
     }
   }
-  if (provider.keyEnv) {
+  if (provider.keyEnv && (!model.custom || !(model.keyEnv || model.apiKeyEnv))) {
     next.keyEnv = provider.keyEnv;
     next.apiKeyEnv = provider.keyEnv;
   }
-  if (provider.authMode) {
+  if (provider.authMode && !model.authMode) {
     next.authMode = provider.authMode;
   }
   return next;
@@ -17858,7 +17858,7 @@ function builtInVisionPresetIds() {
 
 function codexBridgeRouteIdForModel(model = {}) {
   const upstreamModel = String(model.model || "").trim();
-  if ((model.providerId === "codex" || model.authMode === "codex_openai") && upstreamModel) {
+  if (model.authMode === "codex_openai" && upstreamModel) {
     return `${CODEX_BRIDGE_MODEL_ID_PREFIX}${slugify(upstreamModel)}`;
   }
   const source = model.presetId || upstreamModel || model.displayName || "model";

@@ -2173,9 +2173,6 @@ ipcMain.handle("codex:select-exe", async () => {
     return { canceled: true };
   }
   const selectedPath = result.filePaths[0];
-  if (!isOpenAIDesktopLaunchTarget(selectedPath)) {
-    throw new Error("Please choose ChatGPT.exe, Codex.exe, or a compatible ChatGPT / Codex shortcut (not ChatGPT Classic or CodexBridge).");
-  }
   if (!fs.existsSync(selectedPath)) {
     throw new Error(`ChatGPT / Codex Desktop launch target does not exist: ${selectedPath}`);
   }
@@ -2184,6 +2181,8 @@ ipcMain.handle("codex:select-exe", async () => {
     if (!(await verifiedOpenAIDesktopShortcutLaunchTarget(resolution))) {
       throw new Error("The selected shortcut does not resolve to ChatGPT / Codex Desktop or a compatible Store app entry.");
     }
+  } else if (!isOpenAIDesktopLaunchTarget(selectedPath)) {
+    throw new Error("Please choose ChatGPT.exe, Codex.exe, or a compatible ChatGPT / Codex shortcut (not ChatGPT Classic or CodexBridge).");
   }
   const settings = await loadSettings();
   const savePayload = /\.exe$/i.test(selectedPath)

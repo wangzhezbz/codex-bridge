@@ -151,6 +151,58 @@ test("provider and typed key commit with one revision across sources, Router, ca
   assertSecretAbsentFromNonSecretTargets(workspace, SECRET_VALUE);
 });
 
+test("a custom API-key model using the codex provider id does not collide with the native subscription route", async () => {
+  const workspace = makeWorkspace("custom-codex-provider-route-id");
+  fs.writeFileSync(
+    settings.selectionPath(workspace.rootDir),
+    `${JSON.stringify({ mode: settings.MODE_HYBRID, selectedModelIds: ["codex-gpt-5-6-sol"] }, null, 2)}\n`,
+    "utf8",
+  );
+  fs.writeFileSync(
+    settings.routerConfigPath(workspace.rootDir),
+    `${JSON.stringify({ mode: settings.MODE_HYBRID, models: [] }, null, 2)}\n`,
+    "utf8",
+  );
+  fs.writeFileSync(
+    settings.codexConfigPath(workspace.homeDir),
+    settings.buildCodexToml({
+      ...workspace,
+      mode: settings.MODE_HYBRID,
+      model: "cb-gpt-5-6-sol",
+    }),
+    "utf8",
+  );
+  const custom = settings.saveCustomModel(workspace.rootDir, {
+    providerId: "codex",
+    providerName: "GPT Custom Relay",
+    displayName: "Custom GPT-5.6 Sol",
+    model: "gpt-5.6-sol",
+    baseUrl: "https://relay.example/v1",
+    api: "responses",
+    keyEnv: "GPT_API_KEY",
+  });
+
+  const committed = await settings.applyConfigMutationTransaction({
+    ...workspace,
+    coordinator: coordinatorFor(workspace),
+    operation: "models:saveSelection",
+    payload: {
+      selectedModelIds: ["codex-gpt-5-6-sol", custom.presetId],
+    },
+  });
+
+  assert.deepEqual(committed.selectedModelIds, ["codex-gpt-5-6-sol", custom.presetId]);
+  assert.deepEqual(
+    committed.routerConfig.models.map((model) => model.id),
+    ["cb-gpt-5-6-sol", `cb-${custom.presetId}`],
+  );
+  assert.equal(new Set(committed.routerConfig.models.map((model) => model.id)).size, 2);
+  const customRoute = committed.routerConfig.models.find((model) => model.sourcePresetId === custom.presetId);
+  assert.equal(customRoute.authMode, "api_key");
+  assert.equal(customRoute.baseUrl, "https://relay.example/v1");
+  assert.equal(customRoute.apiKeyEnv, "GPT_API_KEY");
+});
+
 test("provider save retries a transient half-written managed TOML snapshot", async () => {
   const workspace = makeWorkspace("provider-transient-managed-toml");
   const target = settings.codexConfigPath(workspace.homeDir);

@@ -115,6 +115,19 @@ test("configuration mutation failures preserve phase and cause diagnostics acros
   assert.match(body, /causeCode/);
 });
 
+test("manual shortcut selection resolves the shortcut target before rejecting its display name", () => {
+  const body = ipcHandlerBody("codex:select-exe");
+  const shortcutBranch = body.indexOf('if (/\\.lnk$/i.test(selectedPath))');
+  const directTargetCheck = body.indexOf('if (!isOpenAIDesktopLaunchTarget(selectedPath))');
+
+  assert.ok(shortcutBranch >= 0, "the selector must handle Windows shortcuts explicitly");
+  assert.ok(
+    directTargetCheck === -1 || shortcutBranch < directTargetCheck,
+    "an arbitrary shortcut filename must not be rejected before its resolved target is verified",
+  );
+  assert.match(body, /verifiedOpenAIDesktopShortcutLaunchTarget\(resolution\)/);
+});
+
 test("config package exports capture resource snapshots and config under one exclusive lease", () => {
   for (const handlerName of ["configPackage:export", "configPackage:exportToSyncDir"]) {
     const body = ipcHandlerBody(handlerName);
