@@ -139,6 +139,19 @@ test("project and Windows CI gates include the complete desktop refresh flow", (
   );
 });
 
+test("Windows CI runs OS integration tests in the user profile temp directory", () => {
+  const workflow = fs.readFileSync(
+    path.join(process.cwd(), ".github", "workflows", "desktop-portable.yml"),
+    "utf8",
+  );
+
+  assert.match(workflow, /Join-Path \$env:USERPROFILE "AppData\\Local\\Temp"/);
+  assert.match(workflow, /"TEMP=\$userTemp"/);
+  assert.match(workflow, /"TMP=\$userTemp"/);
+  assert.doesNotMatch(workflow, /"TEMP=\$env:RUNNER_TEMP"/);
+  assert.doesNotMatch(workflow, /"TMP=\$env:RUNNER_TEMP"/);
+});
+
 test("desktop security policy runs in the fixed syntax and desktop gates", () => {
   const packageJson = JSON.parse(
     fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8"),
