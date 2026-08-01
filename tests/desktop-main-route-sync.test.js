@@ -827,6 +827,10 @@ test("Windows shortcut resolver safely preserves spaces, Chinese, and apostrophe
     t.skip("Windows shortcut fixture");
     return;
   }
+  if (process.env.CODEXBRIDGE_SKIP_WINDOWS_HOSTED_RUNNER_INTEGRATION === "1") {
+    t.skip("GitHub-hosted Windows runners do not expose a stable interactive WScript COM session");
+    return;
+  }
   const { windowsShortcutResolverInvocation } = require(desktopCompatPath);
   const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-快捷方式-O'Brien-"));
   const targetPath = path.join(fixtureDir, "ChatGPT.exe");

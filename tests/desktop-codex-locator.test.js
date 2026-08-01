@@ -195,7 +195,11 @@ test("default shortcut resolver binds special paths out of band", () => {
 });
 
 test("default shortcut resolver opens a real lnk whose path has spaces, Chinese, and an apostrophe", {
-  skip: process.platform !== "win32",
+  skip: process.platform !== "win32"
+    ? "Windows-only integration test"
+    : process.env.CODEXBRIDGE_SKIP_WINDOWS_HOSTED_RUNNER_INTEGRATION === "1"
+      ? "GitHub-hosted Windows runners do not expose a stable interactive WScript COM session"
+      : false,
 }, (t) => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codex-locator-"));
   const installRoot = path.join(tempRoot, "含 空格's ChatGPT");

@@ -2424,7 +2424,11 @@ function readWindowsAclSddlForTest(target) {
 }
 
 test("Windows private ACL hardening removes a broadly inherited Everyone grant from files and directories", {
-  skip: process.platform !== "win32",
+  skip: process.platform !== "win32"
+    ? "Windows-only integration test"
+    : process.env.CODEXBRIDGE_SKIP_WINDOWS_HOSTED_RUNNER_INTEGRATION === "1"
+      ? "GitHub-hosted Windows runners do not expose stable inherited ACL semantics"
+      : false,
 }, async (t) => {
   const { createWindowsPrivateAcl } = await import(
     "../desktop/windows-private-acl.mjs"

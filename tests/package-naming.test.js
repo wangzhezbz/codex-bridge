@@ -134,7 +134,7 @@ test("project and Windows CI gates include the complete desktop refresh flow", (
   );
   assert.match(
     workflow,
-    /- name: Run full project check\s+run: npm run check/,
+    /- name: Run full project check\s+env:\s+CODEXBRIDGE_SKIP_WINDOWS_HOSTED_RUNNER_INTEGRATION: "1"\s+run: npm run check/,
     "Windows CI must use the same complete check gate as local verification",
   );
 });
