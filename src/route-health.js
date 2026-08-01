@@ -12,6 +12,10 @@ const ERROR_TYPES = {
     type: "billing_error",
     code: "upstream_billing_error",
   },
+  subscriptionQuota: {
+    type: "subscription_quota_exhausted",
+    code: "upstream_subscription_quota_exhausted",
+  },
   compact: {
     type: "compact_unsupported",
     code: "upstream_compact_unsupported",
@@ -148,11 +152,23 @@ export function classifyUpstreamError(error, context = {}) {
 }
 
 function classifyBase({ error, statusCode, haystack, context }) {
+  if (isSubscriptionQuotaExhausted(statusCode, haystack)) {
+    return ERROR_TYPES.subscriptionQuota;
+  }
   if (error?.code === "provider_rate_limited" || statusCode === 429) {
     return ERROR_TYPES.rateLimit;
   }
   if (error?.code === "upstream_network_error" || error?.name === "UpstreamNetworkError") {
     return ERROR_TYPES.network;
+  }
+  if (
+    error?.code === "upstream_response_too_large" ||
+    error?.name === "UpstreamResponseTooLargeError"
+  ) {
+    return {
+      type: "upstream_response_too_large",
+      code: "upstream_response_too_large",
+    };
   }
   if (isProviderUnavailableError(statusCode, haystack)) {
     return ERROR_TYPES.providerUnavailable;
@@ -232,6 +248,13 @@ function isBillingError(statusCode, haystack) {
   return (
     statusCode === 402 ||
     /insufficient (balance|quota|credit)|balance insufficient|quota exceeded|quota exhausted|credit exhausted|balance exhausted|insufficient_balance|insufficient_quota|billing|payment required|余额不足|额度不足|欠费/.test(haystack)
+  );
+}
+
+function isSubscriptionQuotaExhausted(statusCode, haystack) {
+  return (
+    [402, 403, 429].includes(statusCode) &&
+    /the usage limit has been reached|codex and work usage (?:limit|quota)|usage (?:limit|quota) (?:has been )?(?:reached|exhausted)/.test(haystack)
   );
 }
 

@@ -450,7 +450,16 @@ function positiveCostNumber(value) {
 
 function retryableErrorReason(error = {}) {
   const status = Number(error.statusCode || error.status || error.response?.status || 0);
-  const message = String(error.message || error.bodyText || error.body || "").toLowerCase();
+  const message = [error.message, error.bodyText, error.body]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  if (
+    [402, 403, 429].includes(status) &&
+    /the usage limit has been reached|codex and work usage (?:limit|quota)|usage (?:limit|quota) (?:has been )?(?:reached|exhausted)/.test(message)
+  ) {
+    return "quota_or_balance";
+  }
   if (status === 429 || /rate.?limit|too many requests|限流/.test(message)) {
     return "rate_limited";
   }

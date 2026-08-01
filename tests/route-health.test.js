@@ -153,6 +153,15 @@ test("classifyUpstreamError keeps P0 route stability failures distinct from rate
   });
   assert.equal(rateLimited.type, "rate_limit");
   assert.equal(rateLimited.code, "upstream_rate_limit");
+
+  const subscriptionQuota = classifyUpstreamError({
+    statusCode: 429,
+    bodyText: JSON.stringify({
+      detail: "The usage limit has been reached",
+    }),
+  });
+  assert.equal(subscriptionQuota.type, "subscription_quota_exhausted");
+  assert.equal(subscriptionQuota.code, "upstream_subscription_quota_exhausted");
 });
 
 test("route health snapshot reports degraded routes and recovers after success", () => {

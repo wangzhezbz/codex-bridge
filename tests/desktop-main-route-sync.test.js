@@ -65,6 +65,14 @@ test("model and route mutation IPC handlers converge through one shared configur
       assert.match(body, /saveCustomModelFromIpc\s*\(/);
       continue;
     }
+    if (handlerName === "providers:refreshModels") {
+      assert.match(body, /loadProviderModelRefreshFlow\s*\(/);
+      assert.match(
+        mainSource,
+        /createProviderModelRefreshFlow[\s\S]*?commitCandidate:\s*\(result\)\s*=>\s*commitConfigMutation\s*\(/,
+      );
+      continue;
+    }
     assert.match(
       body,
       /\bcommitConfigMutation\s*\(/,
@@ -233,6 +241,9 @@ test("post-commit logging cannot turn a durable mutation into an IPC failure", (
 
 test("provider model refresh keeps its CAS fingerprint inside Main", () => {
   const body = ipcHandlerBody("providers:refreshModels");
+  assert.match(body, /loadProviderModelRefreshFlow\s*\(/);
+  assert.match(body, /refreshFlow\.refresh\s*\(/);
+  assert.doesNotMatch(body, /fetchProviderModelDirectoryCandidate\s*\(/);
   assert.match(body, /providerFingerprint:\s*_providerFingerprint/);
   assert.match(body, /result:\s*publicResult/);
   assert.doesNotMatch(body, /return\s*\{\s*result\s*,/);
@@ -344,11 +355,10 @@ test("IPC and tray Router stop delegate cleanup-first confirmed lifecycle stop",
   assert.match(functionBody("stopRouterFromTray"), /return stopRouterWithManagedConfigCleanup\(/);
 });
 
-test("confirmed Router stop logs managed configuration cleanup failures as warnings", () => {
+test("Router stop keeps the process alive when managed configuration cleanup fails", () => {
   const controllerBody = functionBody("loadRouterLifecycleController");
-  assert.match(controllerBody, /publishStopped:\s*async \(\{ cleanup, warning \}\) =>/);
-  assert.match(controllerBody, /warning\?\.code === "managed_config_cleanup_failed"/);
-  assert.match(controllerBody, /Router stop confirmed, but managed configuration cleanup failed/);
+  assert.match(controllerBody, /publishStopped:\s*async \(\{ cleanup \}\) =>/);
+  assert.doesNotMatch(controllerBody, /Router stop confirmed, but managed configuration cleanup failed/);
   assert.match(controllerBody, /publishStopped:[\s\S]*?void broadcastState\(\)/);
 });
 
@@ -361,13 +371,17 @@ test("normal tray and update quit delegate late-safe cleanup without before-quit
   const quitBody = functionBody("requestManagedAppQuit");
   assert.match(quitBody, /^function requestManagedAppQuit\([^)]*\)\s*\{\s*cancelRouterRestartTimer\(\);/);
   assert.match(quitBody, /return \(await loadRouterLifecycleController\(\)\)\.quit\(\{ reason \}\);/);
+  assert.doesNotMatch(quitBody, /chatgptBridgeService\.stop\(\)/);
   assert.doesNotMatch(quitBody, /\bkill\s*\(/);
 
   const controllerBody = functionBody("loadRouterLifecycleController");
   assert.match(controllerBody, /quitCleanupTimeoutMs:\s*MANAGED_QUIT_CLEANUP_TIMEOUT_MS/);
   assert.match(controllerBody, /onQuitCleanupTimeout:/);
   assert.match(controllerBody, /onQuitCleanupLateSuccess:/);
-  assert.match(controllerBody, /onQuitReady:[\s\S]*?managedQuitReady = true/);
+  assert.match(
+    controllerBody,
+    /onQuitReady:\s*async[\s\S]*?chatgptBridgeService\.stop\(\)[\s\S]*?managedQuitReady = true/,
+  );
   assert.match(controllerBody, /quitApp:[\s\S]*?app\.quit\(\)/);
 
   const trayMenu = functionBody("refreshTrayMenu");
@@ -391,6 +405,21 @@ test("Router watchdog uses declared lifecycle state and every explicit shutdown 
   );
   assert.match(functionBody("stopRouterWithManagedConfigCleanup"), /cancelRouterRestartTimer\(\)/);
   assert.match(functionBody("requestManagedAppQuit"), /cancelRouterRestartTimer\(\)/);
+});
+
+test("Router watchdog exhaustion restores managed configuration and retries recovery failures", () => {
+  const watchdogBody = functionBody("scheduleRouterRestart");
+  const recoveryBody = functionBody("recoverRouterConfigAfterWatchdogExhaustion");
+  const retryBody = functionBody("scheduleRouterConfigRecoveryRetry");
+
+  assert.match(watchdogBody, /recoverRouterConfigAfterWatchdogExhaustion\(\)/);
+  assert.match(
+    recoveryBody,
+    /stopRouterWithManagedConfigCleanup\(\{ source: "watchdog-exhausted" \}\)/,
+  );
+  assert.match(recoveryBody, /scheduleRouterConfigRecoveryRetry\(\)/);
+  assert.match(retryBody, /ROUTER_CONFIG_RECOVERY_RETRY_MS/);
+  assert.match(retryBody, /recoverRouterConfigAfterWatchdogExhaustion\(\)/);
 });
 
 test("Router lifecycle publishes a defined stopped health snapshot", () => {
@@ -476,13 +505,13 @@ test("desktop smoke treats unreadable resource authorities as unknown instead of
   assert.doesNotMatch(mainSource, /Number\(expectedResourceSummary\.(?:plugins|mcpServers|skills|marketplaces)\s*\|\|\s*0\)/);
 });
 
-test("desktop smoke verifies the ChatGPT plugin-page application count in rendered order", () => {
+test("desktop smoke verifies all resource counts in rendered order for deterministic snapshots", () => {
   assert.match(
     mainSource,
-    /\["plugins",\s*"apps",\s*"mcpServers",\s*"skills",\s*"marketplaces"\]\.map/,
+    /\[\s*"plugins",\s*"apps",\s*"mcpServers",\s*"skills",\s*"marketplaces",\s*"prompts",\s*"agentFiles",\s*\]\.map/,
   );
-  assert.match(mainSource, /values\.length\s*>=\s*5/);
-  assert.match(mainSource, /\.slice\(0,\s*5\)/);
+  assert.match(mainSource, /resourceValues\.length\s*<\s*7/);
+  assert.match(mainSource, /if\s*\(exactResourceSummaryRequired\)/);
 });
 
 test("config package export and import preview preserve unknown Codex resource counts", () => {
@@ -623,8 +652,17 @@ test("desktop launch target compatibility keeps explicit priority and excludes C
   );
   assert.equal(isOpenAIDesktopLaunchTarget("C:\\Menu\\ChatGPT.lnk"), true);
   assert.equal(isOpenAIDesktopLaunchTarget("shell:AppsFolder\\OpenAI.ChatGPT_2p2nqsd0c76g0!App"), true);
+  assert.equal(
+    isOpenAIDesktopLaunchTarget("shell:AppsFolder\\com.openai.codex"),
+    true,
+    "the current ChatGPT desktop registers the exact Win32 Start app id com.openai.codex",
+  );
+  assert.equal(isOpenAIDesktopLaunchTarget("shell:AppsFolder\\com.openai.chatgpt"), true);
   assert.equal(isOpenAIDesktopLaunchTarget("shell:AppsFolder\\OpenAI.ChatGPT_untrusted!App"), false);
   assert.equal(isOpenAIDesktopLaunchTarget("shell:AppsFolder\\Evil.ChatGPT_evil!App"), false);
+  assert.equal(isOpenAIDesktopLaunchTarget("shell:AppsFolder\\evil.com.openai.codex"), false);
+  assert.equal(isOpenAIDesktopLaunchTarget("shell:AppsFolder\\com.openai.codex.classic"), false);
+  assert.equal(isOpenAIDesktopLaunchTarget("shell:AppsFolder\\com.openai.codexbridge"), false);
   assert.equal(isOpenAIDesktopLaunchTarget("C:\\Apps\\ChatGPT Classic\\ChatGPT.exe"), false);
   assert.equal(isOpenAIDesktopLaunchTarget("C:\\Apps\\ChatGPT\\Classic\\ChatGPT.exe"), false);
   assert.equal(isOpenAIDesktopLaunchTarget("C:\\Apps\\CodexBridge\\CodexBridge.exe"), false);
@@ -637,6 +675,11 @@ test("desktop launch target compatibility keeps explicit priority and excludes C
   assert.equal(
     openAIDesktopStorePackageFamily("shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App"),
     "OpenAI.Codex_2p2nqsd0c76g0",
+  );
+  assert.equal(
+    openAIDesktopStorePackageFamily("shell:AppsFolder\\com.openai.codex"),
+    "",
+    "a registered Win32 Start app id is launchable but is not an AppX package family",
   );
   assert.equal(openAIDesktopStorePackageFamily("shell:AppsFolder\\Evil.ChatGPT_evil!App"), "");
   assert.equal(
@@ -723,6 +766,14 @@ test("desktop launch target compatibility keeps explicit priority and excludes C
     ),
     "shell:AppsFolder\\OpenAI.ChatGPT_2p2nqsd0c76g0!App",
     "an installed official Store shell target does not require a direct filesystem launch path",
+  );
+  assert.equal(
+    validatedOpenAIDesktopTargetFromShortcutResolution({
+      targetPath: "C:\\Windows\\explorer.exe",
+      arguments: "shell:AppsFolder\\com.openai.codex",
+    }),
+    "shell:AppsFolder\\com.openai.codex",
+    "the exact registered Win32 Start app id is valid without an AppX installation lookup",
   );
   for (const shortcutPath of [
     "C:\\Users\\Test User\\Start Menu\\ChatGPT.lnk",

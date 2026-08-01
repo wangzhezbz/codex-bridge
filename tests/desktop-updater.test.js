@@ -31,24 +31,28 @@ const release = {
       browser_download_url:
         "https://github.com/wangzhezbz/codex-bridge/releases/download/v0.1.66/CodexBridge-Windows-x64-Setup.exe",
       size: 146000000,
+      digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     },
     {
       name: "CodexBridge-Windows-x64-Portable.zip",
       browser_download_url:
         "https://github.com/wangzhezbz/codex-bridge/releases/download/v0.1.66/CodexBridge-Windows-x64-Portable.zip",
       size: 144000000,
+      digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     },
     {
       name: "CodexBridge-macOS-arm64-Portable.zip",
       browser_download_url:
         "https://github.com/wangzhezbz/codex-bridge/releases/download/v0.1.66/CodexBridge-macOS-arm64-Portable.zip",
       size: 115000000,
+      digest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     },
     {
       name: "CodexBridge-macOS-x64-Portable.zip",
       browser_download_url:
         "https://github.com/wangzhezbz/codex-bridge/releases/download/v0.1.66/CodexBridge-macOS-x64-Portable.zip",
       size: 121000000,
+      digest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
     },
   ],
 };
@@ -127,7 +131,52 @@ test("updater plans a direct install from the latest matching release asset", ()
   assert.equal(plan.latestVersion, "0.1.66");
   assert.equal(plan.asset.name, "CodexBridge-Windows-x64-Setup.exe");
   assert.equal(plan.asset.kind, "installer");
+  assert.equal(
+    plan.asset.sha256,
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  );
   assert.match(plan.asset.downloadUrl, /v0\.1\.66/);
+});
+
+test("updater refuses automatic installation when the selected release asset has no trusted SHA-256 digest", () => {
+  const releaseWithoutDigest = {
+    ...release,
+    assets: release.assets.map(({ digest: _digest, ...asset }) => asset),
+  };
+
+  const plan = planReleaseUpdate({
+    currentVersion: "0.1.65",
+    platform: "win32",
+    arch: "x64",
+    installKind: "installed",
+    release: releaseWithoutDigest,
+  });
+
+  assert.equal(plan.ok, false);
+  assert.equal(plan.updateAvailable, false);
+  assert.equal(plan.asset, undefined);
+  assert.match(plan.message, /SHA-256/);
+});
+
+test("updater refuses malformed or non-SHA-256 release digests", () => {
+  const releaseWithMalformedDigest = {
+    ...release,
+    assets: release.assets.map((asset, index) => index === 0
+      ? { ...asset, digest: "sha512:not-a-trusted-sha256" }
+      : asset),
+  };
+
+  const plan = planReleaseUpdate({
+    currentVersion: "0.1.65",
+    platform: "win32",
+    arch: "x64",
+    installKind: "installed",
+    release: releaseWithMalformedDigest,
+  });
+
+  assert.equal(plan.ok, false);
+  assert.equal(plan.updateAvailable, false);
+  assert.match(plan.message, /SHA-256/);
 });
 
 test("updater marks Windows setup as primary while preserving portable fallback metadata", () => {
@@ -313,10 +362,11 @@ test("updater falls back to GitHub latest redirect when release API is rate limi
     arch: "x64",
     release: latest,
   });
-  assert.equal(plan.ok, true);
-  assert.equal(plan.updateAvailable, true);
+  assert.equal(plan.ok, false);
+  assert.equal(plan.updateAvailable, false);
   assert.equal(plan.latestVersion, "0.1.94");
-  assert.equal(plan.asset.kind, "installer");
+  assert.equal(plan.asset, undefined);
+  assert.match(plan.message, /SHA-256/);
 });
 
 test("updater reports release API and latest-page fallback failures in Chinese", async () => {
@@ -356,19 +406,85 @@ test("updater rejects downloaded installer and portable assets with invalid file
   fs.writeFileSync(installerPath, "<!doctype html><title>502 Bad Gateway</title>");
   fs.writeFileSync(portablePath, "<!doctype html><title>502 Bad Gateway</title>");
 
-  assert.throws(
-    () => validateDownloadedReleaseAsset(installerPath, { kind: "installer", name: "CodexBridge-Windows-x64-Setup.exe" }),
+  await assert.rejects(
+    async () => validateDownloadedReleaseAsset(installerPath, {
+      kind: "installer",
+      name: "CodexBridge-Windows-x64-Setup.exe",
+      sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }),
     /invalid.*installer.*header/i,
   );
-  assert.throws(
-    () => validateDownloadedReleaseAsset(portablePath, { kind: "portable", name: "CodexBridge-Windows-x64-Portable.zip" }),
+  await assert.rejects(
+    async () => validateDownloadedReleaseAsset(portablePath, {
+      kind: "portable",
+      name: "CodexBridge-Windows-x64-Portable.zip",
+      sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    }),
     /invalid.*portable.*header/i,
   );
 
-  fs.writeFileSync(installerPath, Buffer.from([0x4d, 0x5a, 0x90, 0x00]));
-  fs.writeFileSync(portablePath, Buffer.from([0x50, 0x4b, 0x03, 0x04]));
-  assert.equal(validateDownloadedReleaseAsset(installerPath, { kind: "installer", name: "CodexBridge-Windows-x64-Setup.exe" }).ok, true);
-  assert.equal(validateDownloadedReleaseAsset(portablePath, { kind: "portable", name: "CodexBridge-Windows-x64-Portable.zip" }).ok, true);
+  fs.writeFileSync(
+    installerPath,
+    Buffer.concat([
+      Buffer.from([0x4d, 0x5a, 0x90, 0x00]),
+      Buffer.from("signed installer payload"),
+    ]),
+  );
+  fs.writeFileSync(
+    portablePath,
+    Buffer.concat([
+      Buffer.from([0x50, 0x4b, 0x03, 0x04]),
+      Buffer.from("signed portable payload"),
+    ]),
+  );
+  assert.equal((await validateDownloadedReleaseAsset(installerPath, {
+    kind: "installer",
+    name: "CodexBridge-Windows-x64-Setup.exe",
+    sha256: "b38a46aee5fb4a5c300773996ccd68fe4627f59db8fb8ef8e52ad26793366eea",
+  })).ok, true);
+  assert.equal((await validateDownloadedReleaseAsset(portablePath, {
+    kind: "portable",
+    name: "CodexBridge-Windows-x64-Portable.zip",
+    sha256: "0c080cdf8b045f23e0ee0088aa508c2462038f848f7221bac0f2dd59cf0fc574",
+  })).ok, true);
+});
+
+test("updater rejects a tampered package even when its executable header is valid", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-updates-digest-"));
+  const packagePath = path.join(root, "CodexBridge-Windows-x64-Setup.exe");
+  fs.writeFileSync(
+    packagePath,
+    Buffer.concat([
+      Buffer.from([0x4d, 0x5a, 0x90, 0x00]),
+      Buffer.from("signed installer payload"),
+    ]),
+  );
+  const asset = {
+    kind: "installer",
+    name: "CodexBridge-Windows-x64-Setup.exe",
+    sha256: "b38a46aee5fb4a5c300773996ccd68fe4627f59db8fb8ef8e52ad26793366eea",
+  };
+
+  assert.equal((await validateDownloadedReleaseAsset(packagePath, asset)).ok, true);
+  fs.appendFileSync(packagePath, "tampered");
+  await assert.rejects(
+    async () => validateDownloadedReleaseAsset(packagePath, asset),
+    /SHA-256.*mismatch/i,
+  );
+});
+
+test("updater refuses a valid-looking package when the trusted digest is missing", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-updates-no-digest-"));
+  const packagePath = path.join(root, "CodexBridge-Windows-x64-Portable.zip");
+  fs.writeFileSync(packagePath, Buffer.from([0x50, 0x4b, 0x03, 0x04]));
+
+  await assert.rejects(
+    async () => validateDownloadedReleaseAsset(packagePath, {
+      kind: "portable",
+      name: "CodexBridge-Windows-x64-Portable.zip",
+    }),
+    /missing.*SHA-256/i,
+  );
 });
 
 test("updater cleans old managed update artifacts while keeping the newest package", async () => {

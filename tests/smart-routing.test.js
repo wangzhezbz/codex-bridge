@@ -491,6 +491,20 @@ test("selectFailoverRoute chooses a compatible backup for retryable provider err
   assert.equal(result.originalRoute.id, "cb-chat");
 });
 
+test("selectFailoverRoute distinguishes ChatGPT subscription exhaustion from request rate limiting", () => {
+  const result = selectFailoverRoute({
+    ...baseConfig,
+    smartRouting: { autoFailover: true },
+  }, baseConfig.models[0], {
+    statusCode: 429,
+    message: "Upstream returned HTTP 429",
+    bodyText: JSON.stringify({ detail: "The usage limit has been reached" }),
+  });
+
+  assert.equal(result.route.id, "cb-long");
+  assert.equal(result.reason, "quota_or_balance");
+});
+
 test("selectFailoverRoute does not downgrade long-context routes to smaller backups", () => {
   const result = selectFailoverRoute({
     ...baseConfig,

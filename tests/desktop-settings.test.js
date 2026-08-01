@@ -60,6 +60,7 @@ import {
   modelDirectoryPath,
   modelImageGenerationPath,
   desktopOptionsPath,
+  providerOverridesPath,
   providerCatalog,
   prepareRouterStartConfig,
   previewConfigPackageImport,
@@ -215,6 +216,7 @@ test("buildCodexToml uses an authenticated local provider without requiring Chat
     mode: MODE_ALL_API,
     port: 15722,
     homeDir,
+    authToken: "cbr_test_token",
   });
   const catalogFile = toFixtureTomlPath(path.join(homeDir, ".codex", "codexbridge-model-catalog.json"));
 
@@ -224,7 +226,7 @@ test("buildCodexToml uses an authenticated local provider without requiring Chat
   assert.match(toml, /model_providers\.codexbridge\.requires_openai_auth = false/);
   assert.match(
     toml,
-    /model_providers\.codexbridge\.http_headers = \{ Authorization = "Bearer sk-local-codex-router" \}/,
+    /model_providers\.codexbridge\.http_headers = \{ Authorization = "Bearer cbr_test_token" \}/,
   );
   assert.doesNotMatch(toml, /openai_base_url/);
   assert.doesNotMatch(toml, /experimental_bearer_token/);
@@ -318,10 +320,13 @@ test("saveSecrets records only non-empty values", () => {
   });
 
   assert.deepEqual(secretStatus(rootDir), {
+    ANTHROPIC_API_KEY: false,
     ARK_API_KEY: false,
     DASHSCOPE_API_KEY: false,
     DEEPSEEK_API_KEY: false,
+    GEMINI_API_KEY: false,
     HUNYUAN_API_KEY: false,
+    KIMI_CODE_API_KEY: false,
     MIMO_API_KEY: false,
     MINIMAX_API_KEY: false,
     MOONSHOT_API_KEY: true,
@@ -330,6 +335,7 @@ test("saveSecrets records only non-empty values", () => {
     QIANFAN_API_KEY: false,
     SILICONFLOW_API_KEY: false,
     STEPFUN_API_KEY: false,
+    XAI_API_KEY: false,
     ZHIPUAI_API_KEY: false,
   });
 
@@ -340,10 +346,13 @@ test("saveSecrets records only non-empty values", () => {
   });
 
   assert.deepEqual(secretStatus(rootDir), {
+    ANTHROPIC_API_KEY: false,
     ARK_API_KEY: false,
     DASHSCOPE_API_KEY: false,
     DEEPSEEK_API_KEY: true,
+    GEMINI_API_KEY: false,
     HUNYUAN_API_KEY: false,
+    KIMI_CODE_API_KEY: false,
     MIMO_API_KEY: false,
     MINIMAX_API_KEY: false,
     MOONSHOT_API_KEY: true,
@@ -352,6 +361,7 @@ test("saveSecrets records only non-empty values", () => {
     QIANFAN_API_KEY: false,
     SILICONFLOW_API_KEY: false,
     STEPFUN_API_KEY: false,
+    XAI_API_KEY: false,
     ZHIPUAI_API_KEY: false,
   });
 });
@@ -590,6 +600,31 @@ test("router config uses the configured desktop router port", () => {
   assert.equal(config.port, 15999);
 });
 
+test("desktop persists an unpredictable Router token and keeps the all-api Codex provider in sync", () => {
+  const rootDir = makeTempProject();
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-router-token-"));
+
+  const first = writeRouterConfigFromSelection(rootDir, MODE_ALL_API);
+  const second = writeRouterConfigFromSelection(rootDir, MODE_ALL_API);
+  const toml = buildCodexToml({
+    rootDir,
+    homeDir,
+    mode: MODE_ALL_API,
+    port: second.port,
+    authToken: second.authToken,
+  });
+
+  assert.match(first.authToken, /^cbr_[a-f0-9]{32}$/);
+  assert.notEqual(first.authToken, "sk-local-codex-router");
+  assert.equal(first.clientAuth.allowOpenAiBearer, false);
+  assert.equal(second.authToken, first.authToken);
+  assert.match(
+    toml,
+    new RegExp(`Authorization = "Bearer ${escapeRegExp(second.authToken)}"`),
+  );
+  assert.doesNotMatch(toml, /sk-local-codex-router/);
+});
+
 test("router config exports smart routing switches and keeps them disabled by default", () => {
   const rootDir = makeTempProject();
   let config = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
@@ -710,9 +745,9 @@ test("router config repairs stale auxiliary and smart routing route references",
     JSON.stringify({
       version: 1,
       providers: {
-        kimi: {
-          providerId: "kimi",
-          providerName: "Kimi",
+        "kimi-code": {
+          providerId: "kimi-code",
+          providerName: "Kimi Code",
           baseUrl: "https://api.kimi.com/coding/v1",
           models: [{ id: "kimi-for-coding" }],
         },
@@ -722,22 +757,22 @@ test("router config repairs stale auxiliary and smart routing route references",
   );
   fs.writeFileSync(
     selectionPath(rootDir),
-    JSON.stringify({ selectedModelIds: ["kimi-k2-7-code"] }, null, 2),
+    JSON.stringify({ selectedModelIds: ["kimi-code-k3"] }, null, 2),
     "utf8",
   );
   saveDesktopOptions(rootDir, {
     interceptCodexAuxiliaryTasks: true,
-    codexAuxiliaryModelId: "cb-kimi-k2-7-code",
+    codexAuxiliaryModelId: "cb-kimi-code-k3",
     autoSelectModel: true,
     autoFailover: true,
     smartRouting: {
       autoSelectRules: {
-        code: { mode: "route", routeId: "cb-kimi-k2-7-code" },
+        code: { mode: "route", routeId: "cb-kimi-code-k3" },
         longContext: { mode: "route", routeId: "cb-missing-model" },
       },
       failover: {
         mode: "ordered",
-        routeIds: ["cb-missing-model", "cb-kimi-k2-7-code"],
+        routeIds: ["cb-missing-model", "cb-kimi-code-k3"],
       },
     },
   });
@@ -746,11 +781,11 @@ test("router config repairs stale auxiliary and smart routing route references",
 
   assert.deepEqual(config.codexAuxiliaryTasks, {
     intercept: true,
-    routeId: "cb-remote-kimi-kimi-for-coding",
+    routeId: "cb-kimi-code-for-coding",
   });
   assert.deepEqual(config.smartRouting.autoSelectRules.code, {
     mode: "route",
-    routeId: "cb-remote-kimi-kimi-for-coding",
+    routeId: "cb-kimi-code-for-coding",
   });
   assert.deepEqual(config.smartRouting.autoSelectRules.longContext, {
     mode: "auto",
@@ -758,13 +793,13 @@ test("router config repairs stale auxiliary and smart routing route references",
   });
   assert.deepEqual(config.smartRouting.failover, {
     mode: "ordered",
-    routeIds: ["cb-remote-kimi-kimi-for-coding"],
+    routeIds: ["cb-kimi-code-for-coding"],
   });
 
   const saved = loadDesktopOptions(rootDir);
-  assert.equal(saved.codexAuxiliaryModelId, "cb-remote-kimi-kimi-for-coding");
-  assert.equal(saved.smartRouting.autoSelectRules.code.routeId, "cb-remote-kimi-kimi-for-coding");
-  assert.deepEqual(saved.smartRouting.failover.routeIds, ["cb-remote-kimi-kimi-for-coding"]);
+  assert.equal(saved.codexAuxiliaryModelId, "cb-kimi-code-for-coding");
+  assert.equal(saved.smartRouting.autoSelectRules.code.routeId, "cb-kimi-code-for-coding");
+  assert.deepEqual(saved.smartRouting.failover.routeIds, ["cb-kimi-code-for-coding"]);
 });
 
 test("model reference status reports stale selection, auxiliary, smart routing, and failover refs", () => {
@@ -775,9 +810,9 @@ test("model reference status reports stale selection, auxiliary, smart routing, 
     JSON.stringify({
       version: 1,
       providers: {
-        kimi: {
-          providerId: "kimi",
-          providerName: "Kimi",
+        "kimi-code": {
+          providerId: "kimi-code",
+          providerName: "Kimi Code",
           baseUrl: "https://api.kimi.com/coding/v1",
           models: [{ id: "kimi-for-coding" }],
         },
@@ -787,20 +822,20 @@ test("model reference status reports stale selection, auxiliary, smart routing, 
   );
   fs.writeFileSync(
     selectionPath(rootDir),
-    JSON.stringify({ selectedModelIds: ["kimi-k2-7-code"] }, null, 2),
+    JSON.stringify({ selectedModelIds: ["kimi-code-k3"] }, null, 2),
     "utf8",
   );
   saveDesktopOptions(rootDir, {
     interceptCodexAuxiliaryTasks: true,
-    codexAuxiliaryModelId: "cb-kimi-k2-7-code",
+    codexAuxiliaryModelId: "cb-kimi-code-k3",
     smartRouting: {
       autoSelectRules: {
-        code: { mode: "route", routeId: "cb-kimi-k2-7-code" },
+        code: { mode: "route", routeId: "cb-kimi-code-k3" },
         longContext: { mode: "route", routeId: "cb-missing-model" },
       },
       failover: {
         mode: "ordered",
-        routeIds: ["cb-missing-model", "cb-kimi-k2-7-code"],
+        routeIds: ["cb-missing-model", "cb-kimi-code-k3"],
       },
     },
   });
@@ -809,17 +844,17 @@ test("model reference status reports stale selection, auxiliary, smart routing, 
 
   assert.equal(status.ok, false);
   assert.equal(status.issueCount, 6);
-  assert.deepEqual(status.rawSelectedModelIds, ["kimi-k2-7-code"]);
-  assert.deepEqual(status.selectedModelIds, ["remote-kimi-kimi-for-coding"]);
+  assert.deepEqual(status.rawSelectedModelIds, ["kimi-code-k3"]);
+  assert.deepEqual(status.selectedModelIds, ["kimi-code-for-coding"]);
   assert.deepEqual(
     status.issues.map((issue) => [issue.kind, issue.value, issue.repairedValue]),
     [
-      ["selection", "kimi-k2-7-code", "remote-kimi-kimi-for-coding"],
-      ["codex_auxiliary", "cb-kimi-k2-7-code", "cb-remote-kimi-kimi-for-coding"],
-      ["smart_route", "cb-kimi-k2-7-code", "cb-remote-kimi-kimi-for-coding"],
+      ["selection", "kimi-code-k3", "kimi-code-for-coding"],
+      ["codex_auxiliary", "cb-kimi-code-k3", "cb-kimi-code-for-coding"],
+      ["smart_route", "cb-kimi-code-k3", "cb-kimi-code-for-coding"],
       ["smart_route", "cb-missing-model", ""],
       ["smart_failover", "cb-missing-model", ""],
-      ["smart_failover", "cb-kimi-k2-7-code", "cb-remote-kimi-kimi-for-coding"],
+      ["smart_failover", "cb-kimi-code-k3", "cb-kimi-code-for-coding"],
     ],
   );
 });
@@ -832,9 +867,9 @@ test("repairDesktopModelReferences returns before and after model reference stat
     JSON.stringify({
       version: 1,
       providers: {
-        kimi: {
-          providerId: "kimi",
-          providerName: "Kimi",
+        "kimi-code": {
+          providerId: "kimi-code",
+          providerName: "Kimi Code",
           baseUrl: "https://api.kimi.com/coding/v1",
           models: [{ id: "kimi-for-coding" }],
         },
@@ -844,23 +879,23 @@ test("repairDesktopModelReferences returns before and after model reference stat
   );
   fs.writeFileSync(
     routerConfigPath(rootDir),
-    JSON.stringify({ mode: MODE_HYBRID, models: [{ id: "cb-kimi-k2-7-code" }] }, null, 2),
+    JSON.stringify({ mode: MODE_HYBRID, models: [{ id: "cb-kimi-code-k3" }] }, null, 2),
     "utf8",
   );
   fs.writeFileSync(
     selectionPath(rootDir),
-    JSON.stringify({ selectedModelIds: ["kimi-k2-7-code"] }, null, 2),
+    JSON.stringify({ selectedModelIds: ["kimi-code-k3"] }, null, 2),
     "utf8",
   );
   saveDesktopOptions(rootDir, {
-    codexAuxiliaryModelId: "cb-kimi-k2-7-code",
+    codexAuxiliaryModelId: "cb-kimi-code-k3",
     smartRouting: {
       autoSelectRules: {
-        code: { mode: "route", routeId: "cb-kimi-k2-7-code" },
+        code: { mode: "route", routeId: "cb-kimi-code-k3" },
       },
       failover: {
         mode: "ordered",
-        routeIds: ["cb-missing-model", "cb-kimi-k2-7-code"],
+        routeIds: ["cb-missing-model", "cb-kimi-code-k3"],
       },
     },
   });
@@ -871,9 +906,9 @@ test("repairDesktopModelReferences returns before and after model reference stat
   assert.equal(repair.beforeStatus.issueCount, 5);
   assert.equal(repair.afterStatus.ok, true);
   assert.equal(repair.afterStatus.issueCount, 0);
-  assert.deepEqual(repair.selectedModelIds, ["remote-kimi-kimi-for-coding"]);
-  assert.equal(repair.codexAuxiliaryModelId, "cb-remote-kimi-kimi-for-coding");
-  assert.deepEqual(repair.smartRouting.failover.routeIds, ["cb-remote-kimi-kimi-for-coding"]);
+  assert.deepEqual(repair.selectedModelIds, ["kimi-code-for-coding"]);
+  assert.equal(repair.codexAuxiliaryModelId, "cb-kimi-code-for-coding");
+  assert.deepEqual(repair.smartRouting.failover.routeIds, ["cb-kimi-code-for-coding"]);
 });
 
 test("repairDesktopModelReferences repairs stale model references stored in config profiles", () => {
@@ -884,9 +919,9 @@ test("repairDesktopModelReferences repairs stale model references stored in conf
     JSON.stringify({
       version: 1,
       providers: {
-        kimi: {
-          providerId: "kimi",
-          providerName: "Kimi",
+        "kimi-code": {
+          providerId: "kimi-code",
+          providerName: "Kimi Code",
           baseUrl: "https://api.kimi.com/coding/v1",
           models: [{ id: "kimi-for-coding" }],
         },
@@ -903,17 +938,17 @@ test("repairDesktopModelReferences repairs stale model references stored in conf
           id: "old-kimi-profile",
           name: "Old Kimi",
           mode: MODE_HYBRID,
-          selectedModelIds: ["kimi-k2.7-code"],
+          selectedModelIds: ["kimi-code-k3"],
           desktopOptions: {
-            codexAuxiliaryModelId: "cb-kimi-k2.7-code",
+            codexAuxiliaryModelId: "cb-kimi-code-k3",
             smartRouting: {
               autoSelectRules: {
-                code: { mode: "route", routeId: "cb-kimi-k2.7-code" },
+                code: { mode: "route", routeId: "cb-kimi-code-k3" },
                 longContext: { mode: "route", routeId: "cb-missing-model" },
               },
               failover: {
                 mode: "ordered",
-                routeIds: ["cb-missing-model", "cb-kimi-k2.7-code"],
+                routeIds: ["cb-missing-model", "cb-kimi-code-k3"],
               },
             },
           },
@@ -927,11 +962,11 @@ test("repairDesktopModelReferences repairs stale model references stored in conf
   const [profile] = loadConfigProfiles(rootDir);
 
   assert.equal(repair.profileReferenceRepairCount, 1);
-  assert.deepEqual(profile.selectedModelIds, ["remote-kimi-kimi-for-coding"]);
-  assert.equal(profile.desktopOptions.codexAuxiliaryModelId, "cb-remote-kimi-kimi-for-coding");
+  assert.deepEqual(profile.selectedModelIds, ["kimi-code-for-coding"]);
+  assert.equal(profile.desktopOptions.codexAuxiliaryModelId, "cb-kimi-code-for-coding");
   assert.deepEqual(profile.desktopOptions.smartRouting.autoSelectRules.code, {
     mode: "route",
-    routeId: "cb-remote-kimi-kimi-for-coding",
+    routeId: "cb-kimi-code-for-coding",
   });
   assert.deepEqual(profile.desktopOptions.smartRouting.autoSelectRules.longContext, {
     mode: "auto",
@@ -939,7 +974,7 @@ test("repairDesktopModelReferences repairs stale model references stored in conf
   });
   assert.deepEqual(profile.desktopOptions.smartRouting.failover, {
     mode: "ordered",
-    routeIds: ["cb-remote-kimi-kimi-for-coding"],
+    routeIds: ["cb-kimi-code-for-coding"],
   });
 });
 
@@ -951,9 +986,9 @@ test("synchronizeRouteState repairs stale desktop references and refreshes the i
     JSON.stringify({
       version: 1,
       providers: {
-        kimi: {
-          providerId: "kimi",
-          providerName: "Kimi",
+        "kimi-code": {
+          providerId: "kimi-code",
+          providerName: "Kimi Code",
           baseUrl: "https://api.kimi.com/coding/v1",
           models: [{ id: "kimi-for-coding" }],
         },
@@ -963,23 +998,23 @@ test("synchronizeRouteState repairs stale desktop references and refreshes the i
   );
   fs.writeFileSync(
     routerConfigPath(rootDir),
-    JSON.stringify({ mode: MODE_HYBRID, models: [{ id: "cb-kimi-k2-7-code" }] }, null, 2),
+    JSON.stringify({ mode: MODE_HYBRID, models: [{ id: "cb-kimi-code-k3" }] }, null, 2),
     "utf8",
   );
   fs.writeFileSync(
     selectionPath(rootDir),
-    JSON.stringify({ selectedModelIds: ["kimi-k2-7-code"] }, null, 2),
+    JSON.stringify({ selectedModelIds: ["kimi-code-k3"] }, null, 2),
     "utf8",
   );
   saveDesktopOptions(rootDir, {
-    codexAuxiliaryModelId: "cb-kimi-k2-7-code",
+    codexAuxiliaryModelId: "cb-kimi-code-k3",
     smartRouting: {
       autoSelectRules: {
-        code: { mode: "route", routeId: "cb-kimi-k2-7-code" },
+        code: { mode: "route", routeId: "cb-kimi-code-k3" },
       },
       failover: {
         mode: "ordered",
-        routeIds: ["cb-missing-model", "cb-kimi-k2-7-code"],
+        routeIds: ["cb-missing-model", "cb-kimi-code-k3"],
       },
     },
   });
@@ -988,14 +1023,14 @@ test("synchronizeRouteState repairs stale desktop references and refreshes the i
   fs.mkdirSync(codexDir, { recursive: true });
   fs.writeFileSync(
     path.join(codexDir, "config.toml"),
-    buildCodexToml({ rootDir, mode: MODE_HYBRID, homeDir, model: "cb-kimi-k2-7-code" }),
+    buildCodexToml({ rootDir, mode: MODE_HYBRID, homeDir, model: "cb-kimi-code-k3" }),
     "utf8",
   );
   fs.writeFileSync(
     path.join(codexDir, "models_cache.json"),
     JSON.stringify({
       models: [
-        { slug: "cb-kimi-k2-7-code", display_name: "Stale Kimi", codexbridge_cache_entry: true },
+        { slug: "cb-kimi-code-k3", display_name: "Stale Kimi Code", codexbridge_cache_entry: true },
       ],
     }, null, 2),
     "utf8",
@@ -1019,13 +1054,13 @@ test("synchronizeRouteState repairs stale desktop references and refreshes the i
   assert.equal(result.ok, true);
   assert.equal(result.beforeStatus.ok, false);
   assert.equal(result.afterStatus.ok, true);
-  assert.deepEqual(result.selectedModelIds, ["remote-kimi-kimi-for-coding"]);
-  assert.equal(result.config.defaultModel, "cb-remote-kimi-kimi-for-coding");
+  assert.deepEqual(result.selectedModelIds, ["kimi-code-for-coding"]);
+  assert.equal(result.config.defaultModel, "cb-kimi-code-for-coding");
   assert.equal(result.catalog.skipped, false);
-  assert.equal(catalogSlugs.includes("cb-remote-kimi-kimi-for-coding"), true);
-  assert.equal(catalogSlugs.includes("cb-kimi-k2-7-code"), false);
-  assert.deepEqual(nativeCache.models.map((model) => model.slug), ["cb-kimi-k2-7-code"]);
-  assert.equal(loadDesktopOptions(rootDir).codexAuxiliaryModelId, "cb-remote-kimi-kimi-for-coding");
+  assert.equal(catalogSlugs.includes("cb-kimi-code-for-coding"), true);
+  assert.equal(catalogSlugs.includes("cb-kimi-code-k3"), false);
+  assert.deepEqual(nativeCache.models.map((model) => model.slug), ["cb-kimi-code-k3"]);
+  assert.equal(loadDesktopOptions(rootDir).codexAuxiliaryModelId, "cb-kimi-code-for-coding");
 });
 
 test("router config builds from repaired selected model ids instead of stale saved ids", () => {
@@ -1036,9 +1071,9 @@ test("router config builds from repaired selected model ids instead of stale sav
     JSON.stringify({
       version: 1,
       providers: {
-        kimi: {
-          providerId: "kimi",
-          providerName: "Kimi",
+        "kimi-code": {
+          providerId: "kimi-code",
+          providerName: "Kimi Code",
           baseUrl: "https://api.kimi.com/coding/v1",
           models: [{ id: "kimi-for-coding" }],
         },
@@ -1048,15 +1083,15 @@ test("router config builds from repaired selected model ids instead of stale sav
   );
   fs.writeFileSync(
     selectionPath(rootDir),
-    JSON.stringify({ selectedModelIds: ["kimi-k2-7-code"] }, null, 2),
+    JSON.stringify({ selectedModelIds: ["kimi-code-k3"] }, null, 2),
     "utf8",
   );
 
   const config = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
 
-  assert.deepEqual(readSelection(rootDir, MODE_HYBRID), ["remote-kimi-kimi-for-coding"]);
-  assert.equal(config.defaultModel, "cb-remote-kimi-kimi-for-coding");
-  assert.equal(config.models[0].sourcePresetId, "remote-kimi-kimi-for-coding");
+  assert.deepEqual(readSelection(rootDir, MODE_HYBRID), ["kimi-code-for-coding"]);
+  assert.equal(config.defaultModel, "cb-kimi-code-for-coding");
+  assert.equal(config.models[0].sourcePresetId, "kimi-code-for-coding");
 });
 
 test("router config repairs stale selected upstream model names after provider sync", () => {
@@ -1070,7 +1105,7 @@ test("router config repairs stale selected upstream model names after provider s
         kimi: {
           providerId: "kimi",
           providerName: "Kimi",
-          baseUrl: "https://api.kimi.com/coding/v1",
+          baseUrl: "https://api.moonshot.cn/v1",
           models: [{ id: "moonshotai/Kimi-K2.6" }],
         },
       },
@@ -1103,9 +1138,9 @@ test("provider save repairs stale selected model before refreshing router config
     JSON.stringify({
       version: 1,
       providers: {
-        kimi: {
-          providerId: "kimi",
-          providerName: "Kimi",
+        "kimi-code": {
+          providerId: "kimi-code",
+          providerName: "Kimi Code",
           baseUrl: "https://api.kimi.com/coding/v1",
           models: [{ id: "kimi-for-coding" }],
         },
@@ -1115,12 +1150,12 @@ test("provider save repairs stale selected model before refreshing router config
   );
   fs.writeFileSync(
     routerConfigPath(rootDir),
-    JSON.stringify({ mode: MODE_HYBRID, models: [{ id: "cb-kimi-k2-7-code" }] }, null, 2),
+    JSON.stringify({ mode: MODE_HYBRID, models: [{ id: "cb-kimi-code-k3" }] }, null, 2),
     "utf8",
   );
   fs.writeFileSync(
     selectionPath(rootDir),
-    JSON.stringify({ selectedModelIds: ["kimi-k2-7-code"] }, null, 2),
+    JSON.stringify({ selectedModelIds: ["kimi-code-k3"] }, null, 2),
     "utf8",
   );
 
@@ -1130,8 +1165,8 @@ test("provider save repairs stale selected model before refreshing router config
     api: "chat_completions",
   }));
 
-  assert.deepEqual(readSelection(rootDir, MODE_HYBRID), ["remote-kimi-kimi-for-coding"]);
-  assert.equal(readRouterConfig(rootDir).models[0].id, "cb-remote-kimi-kimi-for-coding");
+  assert.deepEqual(readSelection(rootDir, MODE_HYBRID), ["kimi-code-for-coding"]);
+  assert.equal(readRouterConfig(rootDir).models[0].id, "cb-kimi-code-for-coding");
 });
 
 test("provider reset clears overrides and repairs stale references", () => {
@@ -1142,9 +1177,9 @@ test("provider reset clears overrides and repairs stale references", () => {
     JSON.stringify({
       version: 1,
       providers: {
-        kimi: {
-          providerId: "kimi",
-          providerName: "Kimi",
+        "kimi-code": {
+          providerId: "kimi-code",
+          providerName: "Kimi Code",
           baseUrl: "https://api.kimi.com/coding/v1",
           models: [{ id: "kimi-for-coding" }],
         },
@@ -1154,29 +1189,29 @@ test("provider reset clears overrides and repairs stale references", () => {
   );
   fs.writeFileSync(
     routerConfigPath(rootDir),
-    JSON.stringify({ mode: MODE_HYBRID, models: [{ id: "cb-kimi-k2-7-code" }] }, null, 2),
+    JSON.stringify({ mode: MODE_HYBRID, models: [{ id: "cb-kimi-code-k3" }] }, null, 2),
     "utf8",
   );
   fs.writeFileSync(
     selectionPath(rootDir),
-    JSON.stringify({ selectedModelIds: ["kimi-k2-7-code"] }, null, 2),
+    JSON.stringify({ selectedModelIds: ["kimi-code-k3"] }, null, 2),
     "utf8",
   );
-  saveProviderOverride(rootDir, "kimi", {
-    name: "kimi-k2-7-code",
-    shortName: "Kimicode",
+  saveProviderOverride(rootDir, "kimi-code", {
+    name: "Kimi Code Custom",
+    shortName: "Kimi Code",
     baseUrl: "https://api.kimi.com/coding/v1",
     api: "chat_completions",
   });
-  assert.equal(providerCatalog(rootDir).find((provider) => provider.id === "kimi").name, "kimi-k2-7-code");
+  assert.equal(providerCatalog(rootDir).find((provider) => provider.id === "kimi-code").name, "Kimi Code Custom");
 
-  const result = resetProviderOverride(rootDir, "kimi");
+  const result = resetProviderOverride(rootDir, "kimi-code");
 
   assert.equal(result.removed, true);
-  assert.equal(readProviderOverrides(rootDir).kimi, undefined);
-  assert.notEqual(providerCatalog(rootDir).find((provider) => provider.id === "kimi").name, "kimi-k2-7-code");
-  assert.deepEqual(readSelection(rootDir, MODE_HYBRID), ["remote-kimi-kimi-for-coding"]);
-  assert.equal(readRouterConfig(rootDir).models[0].id, "cb-remote-kimi-kimi-for-coding");
+  assert.equal(readProviderOverrides(rootDir)["kimi-code"], undefined);
+  assert.notEqual(providerCatalog(rootDir).find((provider) => provider.id === "kimi-code").name, "Kimi Code Custom");
+  assert.deepEqual(readSelection(rootDir, MODE_HYBRID), ["kimi-code-for-coding"]);
+  assert.equal(readRouterConfig(rootDir).models[0].id, "cb-kimi-code-for-coding");
 });
 
 test("router config exports local rate limit switch disabled by default", () => {
@@ -2190,9 +2225,9 @@ test("startup check reports stale model references as a user-visible warning", (
     JSON.stringify({
       version: 1,
       providers: {
-        kimi: {
-          providerId: "kimi",
-          providerName: "Kimi",
+        "kimi-code": {
+          providerId: "kimi-code",
+          providerName: "Kimi Code",
           baseUrl: "https://api.kimi.com/coding/v1",
           models: [{ id: "kimi-for-coding" }],
         },
@@ -2202,11 +2237,11 @@ test("startup check reports stale model references as a user-visible warning", (
   );
   fs.writeFileSync(
     selectionPath(rootDir),
-    JSON.stringify({ selectedModelIds: ["kimi-k2-7-code"] }, null, 2),
+    JSON.stringify({ selectedModelIds: ["kimi-code-k3"] }, null, 2),
     "utf8",
   );
   saveDesktopOptions(rootDir, {
-    codexAuxiliaryModelId: "cb-kimi-k2-7-code",
+    codexAuxiliaryModelId: "cb-kimi-code-k3",
   });
 
   const check = buildStartupCheck(rootDir, {
@@ -3858,9 +3893,9 @@ test("config profiles repair stale selected and desktop model references when sa
     JSON.stringify({
       version: 1,
       providers: {
-        kimi: {
-          providerId: "kimi",
-          providerName: "Kimi",
+        "kimi-code": {
+          providerId: "kimi-code",
+          providerName: "Kimi Code",
           baseUrl: "https://api.kimi.com/coding/v1",
           models: [{ id: "kimi-for-coding" }],
         },
@@ -3872,27 +3907,27 @@ test("config profiles repair stale selected and desktop model references when sa
   const saved = saveConfigProfile(rootDir, {
     name: "Kimi repaired profile",
     mode: MODE_HYBRID,
-    selectedModelIds: ["kimi-k2-7-code"],
+    selectedModelIds: ["kimi-code-k3"],
     desktopOptions: {
-      codexAuxiliaryModelId: "cb-kimi-k2-7-code",
+      codexAuxiliaryModelId: "cb-kimi-code-k3",
       smartRouting: {
         autoSelectRules: {
-          code: { mode: "route", routeId: "cb-kimi-k2-7-code" },
+          code: { mode: "route", routeId: "cb-kimi-code-k3" },
           longContext: { mode: "route", routeId: "cb-missing-model" },
         },
         failover: {
           mode: "ordered",
-          routeIds: ["cb-missing-model", "cb-kimi-k2-7-code"],
+          routeIds: ["cb-missing-model", "cb-kimi-code-k3"],
         },
       },
     },
   });
 
-  assert.deepEqual(saved.selectedModelIds, ["remote-kimi-kimi-for-coding"]);
-  assert.equal(saved.desktopOptions.codexAuxiliaryModelId, "cb-remote-kimi-kimi-for-coding");
+  assert.deepEqual(saved.selectedModelIds, ["kimi-code-for-coding"]);
+  assert.equal(saved.desktopOptions.codexAuxiliaryModelId, "cb-kimi-code-for-coding");
   assert.deepEqual(saved.desktopOptions.smartRouting.autoSelectRules.code, {
     mode: "route",
-    routeId: "cb-remote-kimi-kimi-for-coding",
+    routeId: "cb-kimi-code-for-coding",
   });
   assert.deepEqual(saved.desktopOptions.smartRouting.autoSelectRules.longContext, {
     mode: "auto",
@@ -3900,7 +3935,7 @@ test("config profiles repair stale selected and desktop model references when sa
   });
   assert.deepEqual(saved.desktopOptions.smartRouting.failover, {
     mode: "ordered",
-    routeIds: ["cb-remote-kimi-kimi-for-coding"],
+    routeIds: ["cb-kimi-code-for-coding"],
   });
 });
 
@@ -9290,7 +9325,7 @@ test("provider catalog includes additional domestic OpenAI-compatible providers"
   assert.equal(byId.get("xiaomi")?.baseUrl, "https://api.xiaomimimo.com/v1");
   assert.equal(byId.get("minimax")?.baseUrl, "https://api.minimaxi.com/v1");
   assert.equal(byId.get("stepfun")?.baseUrl, "https://api.stepfun.ai/step_plan/v1");
-  assert.equal(byId.get("qianfan")?.baseUrl, "https://api.baiduqianfan.ai/v1");
+  assert.equal(byId.get("qianfan")?.baseUrl, "https://qianfan.baidubce.com/v2");
   assert.equal(byId.get("hunyuan")?.baseUrl, "https://api.hunyuan.cloud.tencent.com/v1");
   assert.equal(byId.get("volcengine")?.baseUrl, "https://ark.cn-beijing.volces.com/api/v3");
 });
@@ -9304,6 +9339,14 @@ test("model presets include extra domestic coding and general models", () => {
   assert.ok(presetIds.has("qianfan-ernie-4-0-turbo-8k"));
   assert.ok(presetIds.has("hunyuan-turbos-latest"));
   assert.ok(presetIds.has("doubao-seed-1-8"));
+});
+
+test("built-in DeepSeek presets do not expose the retired deepseek-reasoner alias", () => {
+  const retired = MODEL_PRESETS.filter((preset) =>
+    preset.providerId === "deepseek" && preset.model === "deepseek-reasoner"
+  );
+
+  assert.deepEqual(retired, []);
 });
 
 test("vision-capable presets advertise image input and text-only presets stay text-only", () => {
@@ -9570,9 +9613,9 @@ test("stale selected built-in model is replaced by the synced provider model", (
     JSON.stringify({
       version: 1,
       providers: {
-        kimi: {
-          providerId: "kimi",
-          providerName: "Kimi",
+        "kimi-code": {
+          providerId: "kimi-code",
+          providerName: "Kimi Code",
           baseUrl: "https://api.kimi.com/coding/v1",
           models: [{ id: "kimi-for-coding" }],
         },
@@ -9582,7 +9625,7 @@ test("stale selected built-in model is replaced by the synced provider model", (
   );
   fs.writeFileSync(
     selectionPath(rootDir),
-    JSON.stringify({ selectedModelIds: ["kimi-k2-7-code"] }, null, 2),
+    JSON.stringify({ selectedModelIds: ["kimi-code-k3"] }, null, 2),
     "utf8",
   );
   fs.writeFileSync(
@@ -9591,19 +9634,19 @@ test("stale selected built-in model is replaced by the synced provider model", (
     "utf8",
   );
 
-  assert.doesNotThrow(() => saveProviderOverride(rootDir, "kimi", {
-    name: "Kimicode",
+  assert.doesNotThrow(() => saveProviderOverride(rootDir, "kimi-code", {
+    name: "Kimi Code",
     baseUrl: "https://api.kimi.com/coding/v1",
     api: "chat_completions",
   }));
 
   const config = readRouterConfig(rootDir);
   assert.equal(config.models.length, 1);
-  assert.equal(config.models[0].sourcePresetId, "remote-kimi-kimi-for-coding");
+  assert.equal(config.models[0].sourcePresetId, "kimi-code-for-coding");
   assert.equal(config.models[0].model, "kimi-for-coding");
   assert.deepEqual(
     JSON.parse(fs.readFileSync(selectionPath(rootDir), "utf8")).selectedModelIds,
-    ["remote-kimi-kimi-for-coding"],
+    ["kimi-code-for-coding"],
   );
 });
 
@@ -9639,7 +9682,7 @@ test("all-api defaults use public API presets only", () => {
   const config = buildRouterConfigFromSelection(rootDir, MODE_ALL_API);
 
   assert.equal(config.mode, MODE_ALL_API);
-  assert.equal(config.clientAuth.allowOpenAiBearer, true);
+  assert.equal(config.clientAuth.allowOpenAiBearer, false);
   assert.equal(config.models.length, 5);
   assert.equal(config.models.some((model) => model.baseUrl.includes("fenno.ai")), false);
   assert.equal(config.models.some((model) => model.apiKeyEnv === "FENNO_API_KEY"), false);
@@ -12202,6 +12245,308 @@ test("provider model directory refresh sends the saved API key", async () => {
   assert.equal(JSON.stringify(directory).includes("DEEPSEEK_API_KEY"), false);
 });
 
+test("Kimi and Kimi Code are separate built-in providers with independent endpoints and credentials", () => {
+  const rootDir = makeTempProject();
+  const providers = providerCatalog(rootDir);
+  const kimi = providers.find((provider) => provider.id === "kimi");
+  const kimiCode = providers.find((provider) => provider.id === "kimi-code");
+
+  assert.ok(kimi);
+  assert.ok(kimiCode);
+  assert.equal(kimi.baseUrl, "https://api.moonshot.cn/v1");
+  assert.equal(kimi.keyEnv, "MOONSHOT_API_KEY");
+  assert.equal(kimiCode.baseUrl, "https://api.kimi.com/coding/v1");
+  assert.equal(kimiCode.keyEnv, "KIMI_CODE_API_KEY");
+});
+
+test("built-in Kimi refresh stays on the Moonshot catalog and does not inject Kimi Code models", async () => {
+  const rootDir = makeTempProject();
+  saveSecrets(rootDir, { MOONSHOT_API_KEY: "moonshot-secret" });
+
+  const result = await refreshProviderModelDirectory(rootDir, "kimi", {
+    now: () => "2026-07-29T01:02:03.000Z",
+    fetchImpl: async (url, options) => {
+      assert.equal(url, "https://api.moonshot.cn/v1/models");
+      assert.equal(options.headers.Authorization, "Bearer moonshot-secret");
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          data: [
+            { id: "kimi-k2.6", object: "model" },
+            { id: "kimi-k2.5", object: "model" },
+          ],
+        }),
+      };
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.models.map((model) => model.id), [
+    "kimi-k2.6",
+    "kimi-k2.5",
+  ]);
+  assert.equal(result.models.some((model) => model.id === "k3"), false);
+});
+
+test("built-in Kimi Code refresh uses its own catalog and keeps current official model ids visible", async () => {
+  const rootDir = makeTempProject();
+  saveSecrets(rootDir, { KIMI_CODE_API_KEY: "kimi-code-secret" });
+
+  const result = await refreshProviderModelDirectory(rootDir, "kimi-code", {
+    now: () => "2026-07-29T01:02:03.000Z",
+    fetchImpl: async (url, options) => {
+      assert.equal(url, "https://api.kimi.com/coding/v1/models");
+      assert.equal(options.headers.Authorization, "Bearer kimi-code-secret");
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          data: [
+            { id: "kimi-for-coding", object: "model" },
+          ],
+        }),
+      };
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.models.map((model) => model.id), [
+    "k3",
+    "k3-256k",
+    "kimi-for-coding",
+    "kimi-for-coding-highspeed",
+  ]);
+  assert.deepEqual(
+    modelCatalog(rootDir)
+      .filter((model) => model.providerId === "kimi-code")
+      .map((model) => model.model),
+    [
+      "k3",
+      "k3-256k",
+      "kimi-for-coding",
+      "kimi-for-coding-highspeed",
+    ],
+  );
+});
+
+test("a saved Kimi Moonshot override is preserved instead of being migrated to Kimi Code", async () => {
+  const rootDir = makeTempProject();
+  saveSecrets(rootDir, { MOONSHOT_API_KEY: "moonshot-secret" });
+  saveProviderOverride(rootDir, "kimi", {
+    name: "Kimi / Moonshot",
+    shortName: "Kimi",
+    baseUrl: "https://api.moonshot.cn/v1",
+    keyUrl: "https://platform.kimi.com/console/api-keys",
+    docsUrl: "https://www.kimi.com/code/docs/en/",
+    keyEnv: "MOONSHOT_API_KEY",
+    keyLabel: "Kimi API Key",
+  });
+
+  const result = await refreshProviderModelDirectory(rootDir, "kimi", {
+    fetchImpl: async (url) => {
+      assert.equal(url, "https://api.moonshot.cn/v1/models");
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ data: [{ id: "kimi-k2.6" }] }),
+      };
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.models.map((model) => model.id), ["kimi-k2.6"]);
+  assert.equal(result.models.some((model) => model.id === "k3"), false);
+});
+
+test("legacy Kimi overrides that point at the Kimi Code endpoint migrate to the separate provider", () => {
+  const rootDir = makeTempProject();
+  const target = providerOverridesPath(rootDir);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, `${JSON.stringify({
+    version: 1,
+    providers: {
+      kimi: {
+        id: "kimi",
+        name: "Kimi",
+        baseUrl: "https://api.kimi.com/coding/v1/",
+        keyEnv: "MOONSHOT_API_KEY",
+        keyLabel: "Kimi API Key",
+      },
+    },
+  }, null, 2)}\n`, "utf8");
+
+  const overrides = readProviderOverrides(rootDir);
+  const providers = providerCatalog(rootDir);
+
+  assert.equal(overrides.kimi, undefined);
+  assert.equal(overrides["kimi-code"].id, "kimi-code");
+  assert.equal(overrides["kimi-code"].baseUrl, "https://api.kimi.com/coding/v1");
+  assert.equal(overrides["kimi-code"].keyEnv, "KIMI_CODE_API_KEY");
+  assert.equal(
+    providers.find((provider) => provider.id === "kimi").baseUrl,
+    "https://api.moonshot.cn/v1",
+  );
+  assert.equal(
+    providers.find((provider) => provider.id === "kimi-code").baseUrl,
+    "https://api.kimi.com/coding/v1",
+  );
+});
+
+test("legacy Kimi model directory entries from the coding endpoint migrate without mixing Moonshot", () => {
+  const rootDir = makeTempProject();
+  const target = modelDirectoryPath(rootDir);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, `${JSON.stringify({
+    version: 1,
+    providers: {
+      kimi: {
+        providerId: "kimi",
+        providerName: "Kimi",
+        baseUrl: "https://api.kimi.com/coding/v1",
+        endpoint: "https://api.kimi.com/coding/v1/models",
+        models: [{ id: "kimi-for-coding" }],
+      },
+    },
+  }, null, 2)}\n`, "utf8");
+
+  const directory = readModelDirectory(rootDir);
+  const models = modelCatalog(rootDir);
+
+  assert.equal(directory.providers.kimi, undefined);
+  assert.equal(directory.providers["kimi-code"].providerId, "kimi-code");
+  assert.deepEqual(directory.providers["kimi-code"].models.map((model) => model.id), [
+    "kimi-for-coding",
+  ]);
+  assert.equal(
+    models.some((model) =>
+      model.providerId === "kimi-code"
+      && model.presetId === "kimi-code-for-coding"
+      && model.model === "kimi-for-coding"
+    ),
+    true,
+  );
+  assert.equal(
+    models.filter((model) => model.providerId === "kimi").some((model) =>
+      model.model === "kimi-for-coding"
+    ),
+    false,
+  );
+});
+
+test("legacy Kimi Code model references repair to the new provider without changing Moonshot choices", () => {
+  const rootDir = makeTempProject();
+  const directoryTarget = modelDirectoryPath(rootDir);
+  fs.mkdirSync(path.dirname(directoryTarget), { recursive: true });
+  fs.writeFileSync(directoryTarget, `${JSON.stringify({
+    version: 1,
+    providers: {
+      kimi: {
+        providerId: "kimi",
+        providerName: "Kimi",
+        baseUrl: "https://api.kimi.com/coding/v1",
+        models: [{ id: "kimi-for-coding" }],
+      },
+    },
+  }, null, 2)}\n`, "utf8");
+  fs.writeFileSync(selectionPath(rootDir), `${JSON.stringify({
+    selectedModelIds: [
+      "remote-kimi-kimi-for-coding",
+      "kimi-k2-6",
+    ],
+  }, null, 2)}\n`, "utf8");
+  saveDesktopOptions(rootDir, {
+    codexAuxiliaryModelId: "cb-remote-kimi-kimi-for-coding",
+    smartRouting: {
+      autoSelect: true,
+      autoSelectRules: {
+        code: {
+          mode: "route",
+          routeId: "cb-remote-kimi-kimi-for-coding",
+        },
+      },
+      failover: {
+        enabled: true,
+        routeIds: ["cb-remote-kimi-kimi-for-coding"],
+      },
+    },
+  });
+
+  const repair = repairDesktopModelReferences(rootDir);
+
+  assert.deepEqual(repair.selectedModelIds, [
+    "kimi-code-for-coding",
+    "kimi-k2-6",
+  ]);
+  assert.equal(repair.codexAuxiliaryModelId, "cb-kimi-code-for-coding");
+  assert.equal(
+    repair.smartRouting.autoSelectRules.code.routeId,
+    "cb-kimi-code-for-coding",
+  );
+  assert.deepEqual(repair.smartRouting.failover.routeIds, [
+    "cb-kimi-code-for-coding",
+  ]);
+});
+
+test("provider model directory refresh uses the configured proxy path", async () => {
+  const rootDir = makeTempProject();
+  saveSecrets(rootDir, { DEEPSEEK_API_KEY: "deepseek-secret" });
+  const previousProxy = process.env.CODEXBRIDGE_HTTPS_PROXY;
+  process.env.CODEXBRIDGE_HTTPS_PROXY = "http://127.0.0.1:19876";
+
+  try {
+    const result = await refreshProviderModelDirectory(rootDir, "deepseek", {
+      fetchImpl: async (_url, options) => {
+        assert.ok(options.dispatcher, "model directory refresh should use the shared proxy dispatcher");
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: [{ id: "deepseek-chat" }] }),
+        };
+      },
+    });
+
+    assert.equal(result.ok, true);
+  } finally {
+    if (previousProxy === undefined) {
+      delete process.env.CODEXBRIDGE_HTTPS_PROXY;
+    } else {
+      process.env.CODEXBRIDGE_HTTPS_PROXY = previousProxy;
+    }
+  }
+});
+
+test("provider model directory refresh classifies fetch failures and preserves cached models", async () => {
+  const rootDir = makeTempProject();
+  saveSecrets(rootDir, { DEEPSEEK_API_KEY: "deepseek-secret" });
+  await refreshProviderModelDirectory(rootDir, "deepseek", {
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ data: [{ id: "deepseek-chat" }] }),
+    }),
+  });
+
+  const networkError = new TypeError("fetch failed", {
+    cause: Object.assign(new Error("connect timed out with private upstream details"), {
+      code: "UND_ERR_CONNECT_TIMEOUT",
+    }),
+  });
+  const result = await refreshProviderModelDirectory(rootDir, "deepseek", {
+    fetchImpl: async () => {
+      throw networkError;
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.cached, true);
+  assert.deepEqual(result.models.map((model) => model.id), ["deepseek-chat"]);
+  assert.match(result.error, /无法连接模型服务/);
+  assert.match(result.error, /provider_models_connect_timeout/);
+  assert.doesNotMatch(result.error, /private upstream details|fetch failed/);
+  assert.ok(result.error.length <= 240);
+});
+
 test("provider model directory refresh rejects oversized responses before reading the body", async () => {
   const rootDir = makeTempProject();
   saveSecrets(rootDir, { DEEPSEEK_API_KEY: "deepseek-secret" });
@@ -13059,6 +13404,69 @@ test("provider connection test can use a typed unsaved API key", async () => {
   assert.equal(result.ok, true);
   assert.equal(result.providerId, "deepseek");
   assert.equal(result.status, 200);
+});
+
+test("Claude, Grok, and Gemini are independent built-in providers", () => {
+  const providers = providerCatalog(makeTempProject());
+  const anthropic = providers.find((provider) => provider.id === "anthropic");
+  const xai = providers.find((provider) => provider.id === "xai");
+  const gemini = providers.find((provider) => provider.id === "gemini");
+
+  assert.deepEqual(
+    [anthropic?.keyEnv, xai?.keyEnv, gemini?.keyEnv],
+    ["ANTHROPIC_API_KEY", "XAI_API_KEY", "GEMINI_API_KEY"],
+  );
+  assert.equal(anthropic?.api, "anthropic_messages");
+  assert.equal(anthropic?.authMode, "anthropic_api_key");
+  assert.equal(xai?.api, "chat_completions");
+  assert.equal(gemini?.api, "chat_completions");
+  assert.equal(
+    MODEL_PRESETS.some((model) =>
+      model.providerId === "anthropic" &&
+      model.model === "claude-sonnet-4-6" &&
+      model.api === "anthropic_messages"),
+    true,
+  );
+  assert.equal(
+    MODEL_PRESETS.some((model) => model.providerId === "xai" && model.model === "grok-4.5"),
+    true,
+  );
+  assert.equal(
+    MODEL_PRESETS.some((model) => model.providerId === "gemini" && model.model === "gemini-3.5-flash"),
+    true,
+  );
+});
+
+test("Anthropic model refresh uses native Anthropic authentication headers", async () => {
+  const rootDir = makeTempProject();
+  saveSecrets(rootDir, { ANTHROPIC_API_KEY: "anthropic-secret" });
+  let seen = null;
+
+  const result = await refreshProviderModelDirectory(rootDir, "anthropic", {
+    fetchImpl: async (url, options) => {
+      seen = { url, options };
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          data: [
+            {
+              id: "claude-sonnet-4-6",
+              display_name: "Claude Sonnet 4.6",
+              type: "model",
+            },
+          ],
+          has_more: false,
+        }),
+      };
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(seen.url, "https://api.anthropic.com/v1/models");
+  assert.equal(seen.options.headers["x-api-key"], "anthropic-secret");
+  assert.equal(seen.options.headers["anthropic-version"], "2023-06-01");
+  assert.equal(seen.options.headers.Authorization, undefined);
 });
 
 test("provider connection diagnostics validate key, model names, and response format", async () => {

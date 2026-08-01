@@ -5698,6 +5698,44 @@ body.resizing-usage-column {
   grid-template-columns: minmax(0, 1fr);
 }
 
+.double-quota-extension-health {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.double-quota-extension-health > div {
+  padding: 12px 14px;
+  border: 1px solid rgba(130, 157, 166, 0.28);
+  border-radius: 10px;
+  background: rgba(246, 249, 250, 0.9);
+}
+
+.double-quota-extension-health span,
+.double-quota-extension-health strong {
+  display: block;
+}
+
+.double-quota-extension-health span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.double-quota-extension-health strong {
+  margin-top: 4px;
+  color: #0a7766;
+}
+
+.double-quota-extension-health strong.muted {
+  color: var(--muted);
+}
+
+.double-quota-extension-health strong.failed {
+  color: #b7342a;
+}
+
 .double-quota-actions {
   display: flex;
   flex-wrap: wrap;
@@ -5770,6 +5808,10 @@ body.resizing-usage-column {
 
 @media (max-width: 1120px) {
   .double-quota-metrics {
+    grid-template-columns: 1fr;
+  }
+
+  .double-quota-extension-health {
     grid-template-columns: 1fr;
   }
 }

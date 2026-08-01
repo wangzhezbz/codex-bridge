@@ -1,5 +1,5 @@
 if (typeof importScripts === "function") {
-  importScripts("bridge-config.js");
+  importScripts("bridge-config.js", "bridge-auth.js");
 }
 
 const DEFAULT_BRIDGE_ORIGIN = String(globalThis.CODEX_BRIDGE_CONFIG?.origin || "").replace(/\/+$/, "");
@@ -122,9 +122,9 @@ function failWatch(watch, error) {
 async function importDownloadedItem(watch, item) {
   const response = await fetch(`${watch.bridgeOrigin}/api/downloads/import`, {
     method: "POST",
-    headers: {
+    headers: globalThis.CODEX_BRIDGE_AUTH.authorizedHeaders({
       "Content-Type": "application/json"
-    },
+    }),
     body: JSON.stringify({
       syncJobId: watch.syncJobId || null,
       localPath: item.filename,
@@ -144,9 +144,9 @@ async function importDownloadedItem(watch, item) {
 async function importFetchedItem(watch, item) {
   const response = await fetch(`${watch.bridgeOrigin}/api/downloads/import`, {
     method: "POST",
-    headers: {
+    headers: globalThis.CODEX_BRIDGE_AUTH.authorizedHeaders({
       "Content-Type": "application/json"
-    },
+    }),
     body: JSON.stringify({
       syncJobId: watch.syncJobId || null,
       filename: item.filename || watch.expectedFilename || "gpt-artifact",

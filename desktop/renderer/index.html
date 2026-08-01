@@ -1077,13 +1077,27 @@
                 <span class="status-pill muted" id="doubleQuotaExtensionState">正在检测</span>
               </div>
               <div class="double-quota-path">
-                <span>新版扩展目录</span>
+                <span>固定安装目录</span>
                 <code id="doubleQuotaExtensionPath">尚未准备</code>
+              </div>
+              <div class="double-quota-extension-health" aria-label="扩展安装状态">
+                <div>
+                  <span>扩展文件</span>
+                  <strong id="doubleQuotaExtensionDiskState">正在检测</strong>
+                </div>
+                <div>
+                  <span>Chrome 安装</span>
+                  <strong id="doubleQuotaExtensionBrowserState">正在检测</strong>
+                </div>
+                <div>
+                  <span>实时连接</span>
+                  <strong id="doubleQuotaExtensionRuntimeState">正在检测</strong>
+                </div>
               </div>
               <p class="double-quota-note" id="doubleQuotaExtensionStatus">正在检测扩展状态。</p>
               <ol class="double-quota-steps">
-                <li>点击“安装新版扩展”，程序会复制目录并打开 Chrome 扩展页。</li>
-                <li>如果仍显示旧版：移除旧扩展，再点“加载已解压的扩展程序”，粘贴上面的目录。</li>
+                <li>点击安装后，CodexBridge 会复制并校验扩展文件，再打开 Chrome 扩展页。</li>
+                <li>首次安装需开启“开发者模式”，点击“加载已解压的扩展程序”，粘贴已复制的目录。</li>
               </ol>
               <div class="double-quota-actions">
                 <button class="primary-button" id="manageDoubleQuotaExtension" type="button">安装扩展</button>

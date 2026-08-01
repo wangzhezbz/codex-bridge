@@ -1,4 +1,5 @@
 import { tryParseJson } from "./json.js";
+import { normalizeResponsesObject } from "./responses-object.js";
 
 const RESPONSES_TERMINAL_TYPES = new Set([
   "response.completed",
@@ -179,24 +180,6 @@ function usageObjectFromValue(value) {
     if (candidate && typeof candidate === "object") {
       return candidate;
     }
-  }
-  return null;
-}
-
-function normalizeResponsesObject(value) {
-  if (!value || typeof value !== "object" || typeof value.id !== "string" || !value.id) {
-    return null;
-  }
-  if (value.object === "response") {
-    return value;
-  }
-  if (
-    value.status ||
-    value.output ||
-    typeof value.output_text === "string" ||
-    value.usage
-  ) {
-    return { object: "response", ...value };
   }
   return null;
 }

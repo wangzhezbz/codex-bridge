@@ -473,6 +473,11 @@ export function createConfigWriteCoordinator({
       "privateAcl.securePath is required on Windows",
     );
   }
+
+  async function readExactPathIdentity(filePath) {
+    const stats = await ops.lstat(filePath, { bigint: true });
+    return statsIdentity(stats);
+  }
   const exclusiveContext = new AsyncLocalStorage();
   const coordinatorToken = Object.freeze({});
   let configuration = null;
@@ -1050,15 +1055,16 @@ export function createConfigWriteCoordinator({
         throw new Error("transaction journal source is not one private regular file");
       }
     }
+    const identityBeforeRead = await readExactPathIdentity(journalPath);
     const bytes = contentBytes(await ops.readFile(journalPath));
     if (bytes.length > MAX_JOURNAL_BYTES) {
       throw new Error("transaction journal exceeds the size limit");
     }
     const after = await ops.lstat(journalPath);
+    const identityAfterRead = await readExactPathIdentity(journalPath);
     if (
       after.isSymbolicLink?.() ||
-      String(after.dev) !== String(before.dev) ||
-      String(after.ino) !== String(before.ino) ||
+      identityAfterRead !== identityBeforeRead ||
       after.size !== before.size
     ) {
       throw new Error("transaction journal changed while being read");
@@ -1090,6 +1096,9 @@ export function createConfigWriteCoordinator({
     ) {
       throw new Error("transaction journal directory must be a private directory");
     }
+    const identityBeforeSecure = await readExactPathIdentity(
+      configuration.journalDir,
+    );
     await ops.chmod(configuration.journalDir, 0o700);
     if (platform === "win32") {
       await windowsPrivateAcl.securePath(configuration.journalDir, {
@@ -1098,10 +1107,13 @@ export function createConfigWriteCoordinator({
     }
     await ops.syncDirectory(configuration.journalDir);
     const secured = await ops.lstat(configuration.journalDir);
+    const identityAfterSecure = await readExactPathIdentity(
+      configuration.journalDir,
+    );
     if (
       secured.isSymbolicLink?.() ||
       (typeof secured.isDirectory === "function" && !secured.isDirectory()) ||
-      statsIdentity(secured) !== statsIdentity(stats) ||
+      identityAfterSecure !== identityBeforeSecure ||
       (platform !== "win32" && (secured.mode & 0o077) !== 0)
     ) {
       throw new Error("transaction journal directory permissions are not private");
@@ -1135,6 +1147,7 @@ export function createConfigWriteCoordinator({
     ) {
       throw new Error("transaction staging path must be a private directory");
     }
+    const identityBeforeSecure = await readExactPathIdentity(stagingDirectory);
     await ops.chmod(stagingDirectory, 0o700);
     if (platform === "win32") {
       await windowsPrivateAcl.securePath(stagingDirectory, {
@@ -1144,10 +1157,11 @@ export function createConfigWriteCoordinator({
     await ops.syncDirectory(stagingDirectory);
     await ops.syncDirectory(path.dirname(stagingDirectory));
     const after = await ops.lstat(stagingDirectory);
+    const identityAfterSecure = await readExactPathIdentity(stagingDirectory);
     if (
       after.isSymbolicLink?.() ||
       (typeof after.isDirectory === "function" && !after.isDirectory()) ||
-      statsIdentity(after) !== statsIdentity(before) ||
+      identityAfterSecure !== identityBeforeSecure ||
       (platform !== "win32" && (after.mode & 0o077) !== 0)
     ) {
       throw new Error("transaction staging directory changed while securing it");

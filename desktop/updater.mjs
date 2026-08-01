@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
+import { createHash, timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import { fetchInitWithProxy, proxyLogLabel } from "../src/proxy.js";
 
@@ -173,6 +174,20 @@ export function planReleaseUpdate({
       message: `最新版本没有找到当前系统的更新包：${expectedNames}`,
     };
   }
+  const updateAvailable = isNewerVersion(latestVersion, currentVersion);
+  const assetSha256 = releaseAssetSha256(asset);
+  if (updateAvailable && !assetSha256) {
+    return {
+      ok: false,
+      updateAvailable: false,
+      currentVersion: normalizeVersion(currentVersion),
+      latestVersion,
+      releaseUrl: release.html_url || "",
+      message:
+        `更新包 ${asset.name} 缺少可信的 GitHub SHA-256 digest；` +
+        "CodexBridge 已阻止自动下载和安装。",
+    };
+  }
 
   const fallbackCandidate = candidate.kind === "installer"
     ? assetCandidates.find((assetInfo) =>
@@ -183,7 +198,6 @@ export function planReleaseUpdate({
   const fallbackAsset = fallbackCandidate
     ? releaseAssets.find((item) => item?.name === fallbackCandidate.name)
     : null;
-  const updateAvailable = isNewerVersion(latestVersion, currentVersion);
   const installMode = candidate.kind === "installer"
     ? "windows_setup"
     : platform === "win32" || platform === "darwin"
@@ -215,10 +229,33 @@ export function validateDownloadedReleaseAsset(filePath, asset = {}) {
   if (!stat.isFile() || stat.size <= 0) {
     throw new Error(`Downloaded ${asset?.name || "release asset"} is empty or not a file.`);
   }
+  const expectedSha256 = normalizeSha256(asset?.sha256);
+  if (!expectedSha256) {
+    throw new Error(
+      `Downloaded ${asset?.name || "release asset"} is missing a trusted SHA-256 digest.`,
+    );
+  }
   const headerBuffer = Buffer.alloc(4);
   const fd = fsSync.openSync(resolved, "r");
+  const hash = createHash("sha256");
   try {
     fsSync.readSync(fd, headerBuffer, 0, headerBuffer.length, 0);
+    const chunk = Buffer.allocUnsafe(1024 * 1024);
+    let position = 0;
+    while (position < stat.size) {
+      const bytesRead = fsSync.readSync(
+        fd,
+        chunk,
+        0,
+        Math.min(chunk.length, stat.size - position),
+        position,
+      );
+      if (bytesRead <= 0) {
+        break;
+      }
+      hash.update(chunk.subarray(0, bytesRead));
+      position += bytesRead;
+    }
   } finally {
     fsSync.closeSync(fd);
   }
@@ -230,12 +267,23 @@ export function validateDownloadedReleaseAsset(filePath, asset = {}) {
   if (kind === "portable" && !headerHex.startsWith("504b")) {
     throw new Error(`Downloaded portable package has an invalid portable header: ${headerHex || "empty"}.`);
   }
+  const actualSha256 = hash.digest("hex");
+  if (!timingSafeEqual(
+    Buffer.from(actualSha256, "hex"),
+    Buffer.from(expectedSha256, "hex"),
+  )) {
+    throw new Error(
+      `Downloaded ${asset?.name || "release asset"} SHA-256 mismatch: ` +
+      `expected ${expectedSha256}, got ${actualSha256}.`,
+    );
+  }
   return {
     ok: true,
     path: resolved,
     size: stat.size,
     headerHex,
     kind,
+    sha256: actualSha256,
   };
 }
 
@@ -452,7 +500,19 @@ function releaseAssetPayload(asset, assetInfo) {
     kind: assetInfo.kind,
     size: Number(asset.size || 0),
     downloadUrl: asset.browser_download_url,
+    sha256: releaseAssetSha256(asset),
   };
+}
+
+function releaseAssetSha256(asset = {}) {
+  const digest = String(asset?.digest || "").trim();
+  const match = digest.match(/^sha256:([a-f0-9]{64})$/i);
+  return match ? match[1].toLowerCase() : "";
+}
+
+function normalizeSha256(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return /^[a-f0-9]{64}$/.test(normalized) ? normalized : "";
 }
 
 function legacyPlanReleaseUpdate({

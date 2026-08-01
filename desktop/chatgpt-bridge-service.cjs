@@ -7,7 +7,7 @@ const { spawn } = require("node:child_process");
 const SERVICE_NAME = "chatgpt-codex-bridge";
 const PROTOCOL_VERSION = 1;
 const DEFAULT_PORT = 4317;
-const EXTENSION_MANAGER_REVISION = "stable-dir-migration-v1";
+const EXTENSION_MANAGER_REVISION = "verified-stable-dir-v2";
 
 function createChatgptBridgeService({
   appRootDir,
@@ -30,13 +30,17 @@ function createChatgptBridgeService({
   const bridgeDataDir = path.join(dataRootDir, "chatgpt-bridge");
   const extensionDir = path.join(dataRootDir, "extensions", "chatgpt-codex-bridge");
   const legacyExtensionDir = path.join(dataRootDir, "chatgpt-bridge-extension");
+  const extensionDeploymentReceiptPath = path.join(bridgeDataDir, "extension-deployment.json");
   const codexConfigPath = path.join(homeDir, ".codex", "config.toml");
   const manifest = readAndValidateManifest(manifestPath);
   const extensionManifest = readExtensionManifest(path.join(vendorDir, "chrome-extension", "manifest.json"));
   let child = null;
   let lastError = "";
   let lastExtensionError = "";
-  let lastExtensionDeployment = null;
+  let lastExtensionDeployment = readExtensionDeploymentReceipt(
+    extensionDeploymentReceiptPath,
+    extensionDir,
+  );
 
   function loadConfig() {
     let saved = {};
@@ -45,9 +49,16 @@ function createChatgptBridgeService({
     } catch {
       saved = {};
     }
-    return {
+    const config = {
       port: validPort(saved.port) ? Number(saved.port) : Number(manifest.defaults?.port || DEFAULT_PORT),
+      authToken: /^[a-f0-9]{64}$/.test(String(saved.authToken || ""))
+        ? String(saved.authToken)
+        : crypto.randomBytes(32).toString("hex"),
     };
+    if (config.authToken !== saved.authToken || config.port !== saved.port) {
+      saveConfig(config);
+    }
+    return config;
   }
 
   function saveConfig(config) {
@@ -106,7 +117,10 @@ function createChatgptBridgeService({
 
   async function probeDiagnostics() {
     const info = runtimeInfo();
-    const response = await requestJson(info.diagnosticsUrl, { timeoutMs: 1800 });
+    const response = await requestJson(info.diagnosticsUrl, {
+      timeoutMs: 1800,
+      headers: { "X-CodexBridge-Token": info.config.authToken },
+    });
     return response && typeof response === "object"
       ? { reachable: true, response }
       : { reachable: false, response: null };
@@ -123,27 +137,51 @@ function createChatgptBridgeService({
     const status = health.compatible
       ? ownedProcess ? "running" : "attached"
       : ownedProcess ? "starting" : lastError ? "error" : "stopped";
-    const extensionFiles = extensionDirectoryStatus(extensionDir);
+    const extensionSourceDir = path.join(vendorDir, manifest.extensionDir || "chrome-extension");
+    const extensionConfigSource = bridgeExtensionConfigSource(info.origin, info.config.authToken);
+    const extensionDisk = extensionDirectoryStatus(extensionDir, {
+      sourceDir: extensionSourceDir,
+      configSource: extensionConfigSource,
+      expectedManifest: extensionManifest,
+    });
+    const extensionFiles = extensionDisk;
     const chromeInstallations = discoverChromeBridgeExtensionInstallations(chromeUserDataDir);
     const extensionDiagnostics = diagnosticsStatus.response?.extension || {};
-    const extensionLoadedDirs = uniqueResolvedPaths(
+    const extensionRegisteredDirs = uniqueResolvedPaths(
       chromeInstallations.map((entry) => entry.path),
     );
     const extensionChromeIds = [...new Set(chromeInstallations.map((entry) => entry.id).filter(Boolean))];
-    const extensionUpdateDirs = extensionTargetDirectories(
-      extensionDir,
-      legacyExtensionDir,
-      extensionLoadedDirs,
+    const registeredStable = extensionRegisteredDirs.some(
+      (candidate) => sameResolvedPath(candidate, extensionDir),
     );
+    const extensionBrowser = {
+      status: registeredStable
+        ? "registered_current_path"
+        : extensionRegisteredDirs.length > 0
+          ? "registered_other_path"
+          : "not_registered",
+      registeredStable,
+      registrations: chromeInstallations,
+      registeredDirs: extensionRegisteredDirs,
+    };
+    const expectedExtensionProtocol =
+      extensionDiagnostics.expectedVersion ||
+      versionStatus.response?.extensionProtocolVersion ||
+      "";
+    const extensionRuntime = extensionRuntimeStatus(
+      extensionDiagnostics,
+      expectedExtensionProtocol,
+    );
+    const extensionUpdateDirs = [path.resolve(extensionDir)];
     const extensionAction = extensionManagementAction({
       ...extensionDiagnostics,
-      expectedVersion:
-        extensionDiagnostics.expectedVersion ||
-        versionStatus.response?.extensionProtocolVersion ||
-        "",
-      localComplete: extensionFiles.complete,
-      loadedExtensionDetected: extensionLoadedDirs.length > 0,
+      expectedVersion: expectedExtensionProtocol,
+      diskVerified: extensionDisk.verified,
+      registeredStable,
     });
+    lastExtensionDeployment =
+      readExtensionDeploymentReceipt(extensionDeploymentReceiptPath, extensionDir) ||
+      lastExtensionDeployment;
     return {
       available: true,
       status,
@@ -160,6 +198,9 @@ function createChatgptBridgeService({
       extensionDiagnostics,
       extensionAction,
       extensionFiles,
+      extensionDisk,
+      extensionBrowser,
+      extensionRuntime,
       extensionError: lastExtensionError,
       error: lastError,
       port: info.config.port,
@@ -170,12 +211,16 @@ function createChatgptBridgeService({
       vendorDir,
       dataDir: bridgeDataDir,
       extensionDir,
-      extensionLoadedDirs,
+      extensionRegisteredDirs,
+      // Backward compatible alias. These are Chrome registration hints, not proof
+      // that the extension is enabled or connected.
+      extensionLoadedDirs: extensionRegisteredDirs,
       extensionChromeIds,
       extensionUpdateDirs,
       extensionManagerRevision: EXTENSION_MANAGER_REVISION,
       extensionDeployment: lastExtensionDeployment,
-      extensionReady: extensionFiles.complete,
+      extensionDeploymentReceiptPath,
+      extensionReady: extensionDisk.verified,
       mcpInstalled: hasChatgptBridgeMcpConfig(codexConfigPath),
       codexConfigPath,
     };
@@ -188,7 +233,7 @@ function createChatgptBridgeService({
     if (child) {
       throw new Error("请先停止双倍额度服务，再修改端口。");
     }
-    saveConfig({ port: Number(port) });
+    saveConfig({ ...loadConfig(), port: Number(port) });
     await prepareExtensionBestEffort("save-port");
     lastError = "";
     return getState();
@@ -211,40 +256,34 @@ function createChatgptBridgeService({
     if (!fs.existsSync(path.join(sourceDir, "manifest.json"))) {
       throw new Error("双倍额度 Chrome 扩展不完整，缺少 manifest.json。");
     }
-    const configSource = [
-      "globalThis.CODEX_BRIDGE_CONFIG = Object.freeze({",
-      `  origin: ${JSON.stringify(info.origin)}`,
-      "});",
-      "",
-    ].join("\n");
-    const loadedExtensionDirs = uniqueResolvedPaths(
-      discoverChromeBridgeExtensionInstallations(chromeUserDataDir).map((entry) => entry.path),
-    );
-    const targetDirs = extensionTargetDirectories(
-      extensionDir,
-      legacyExtensionDir,
-      loadedExtensionDirs,
-    );
-    const deploymentTargets = [];
-    for (const targetDir of targetDirs) {
-      deployExtensionFiles(sourceDir, targetDir, configSource);
-      deploymentTargets.push(verifyExtensionTarget(sourceDir, targetDir, configSource));
-    }
-    lastExtensionDeployment = {
+    const configSource = bridgeExtensionConfigSource(info.origin, info.config.authToken);
+    deployExtensionFiles(sourceDir, extensionDir, configSource);
+    const deploymentTargets = [
+      verifyExtensionTarget(sourceDir, extensionDir, configSource),
+    ];
+    const receipt = {
+      schemaVersion: 1,
       updatedAt: new Date().toISOString(),
+      target: path.resolve(extensionDir),
+      version: extensionManifest.version,
+      displayVersion: extensionManifest.versionName,
+      origin: info.origin,
       verified: deploymentTargets.length > 0 && deploymentTargets.every((target) => target.verified),
       targets: deploymentTargets,
     };
-    if (!lastExtensionDeployment.verified) {
+    if (!receipt.verified) {
       const failed = deploymentTargets.filter((target) => !target.verified).map((target) => target.path);
       throw new Error(`扩展文件复制后校验失败：${failed.join("；") || "没有可校验的目标目录"}`);
     }
+    lastExtensionDeployment = persistExtensionDeploymentReceipt(
+      extensionDeploymentReceiptPath,
+      receipt,
+    );
     lastExtensionError = "";
     return getState();
   }
 
   async function manageExtension() {
-    const before = await getState();
     let current;
     try {
       current = await prepareExtension();
@@ -262,28 +301,19 @@ function createChatgptBridgeService({
         },
       };
     }
-    for (let attempt = 0; attempt < 20 && current.extensionAction?.complete !== true; attempt += 1) {
-      if (
-        before.extensionAction?.id === "reinstall" ||
-        (before.extensionAction?.id === "install" && before.extensionDiagnostics?.connected !== true)
-      ) {
-        break;
-      }
-      await delay(750);
-      current = await getState();
-    }
     const completed = current.extensionAction?.complete === true;
     return {
       ...current,
       extensionUpdate: {
         status: completed
           ? "updated"
-          : before.extensionAction?.id === "reinstall"
-            ? "reinstall_required"
-            : "manual_action_required",
+          : "files_ready",
         completed,
         manualReloadRequired: !completed,
-        updatedDirectories: current.extensionUpdateDirs,
+        updatedDirectories: [path.resolve(extensionDir)],
+        requestedAction: current.extensionAction?.id || "install",
+        diskVerified: current.extensionDisk?.verified === true,
+        receiptPath: extensionDeploymentReceiptPath,
       },
     };
   }
@@ -315,6 +345,7 @@ function createChatgptBridgeService({
         ELECTRON_RUN_AS_NODE: "1",
         BRIDGE_HOST: info.host,
         BRIDGE_PORT: String(info.config.port),
+        BRIDGE_AUTH_TOKEN: info.config.authToken,
         BRIDGE_DATA_DIR: bridgeDataDir,
         BRIDGE_EXTENSION_DIR: extensionDir,
         BRIDGE_ROUTER_V2: "0",
@@ -597,6 +628,7 @@ function isVerifiedBridgeExtensionDirectory(candidate) {
       manifest.name === "Codex GPT Bridge" &&
       manifest.background?.service_worker === "background.js" &&
       scripts.includes("bridge-config.js") &&
+      scripts.includes("bridge-auth.js") &&
       scripts.includes("content-script.js");
   } catch {
     return false;
@@ -692,16 +724,56 @@ function hasChatgptBridgeMcpConfig(configPath) {
   }
 }
 
-function extensionDirectoryStatus(extensionDir) {
-  const requiredFiles = ["manifest.json", "background.js", "content-script.js", "bridge-config.js"];
+function bridgeExtensionConfigSource(origin, authToken) {
+  return [
+    "globalThis.CODEX_BRIDGE_CONFIG = Object.freeze({",
+    `  origin: ${JSON.stringify(origin)},`,
+    `  authToken: ${JSON.stringify(authToken)}`,
+    "});",
+    "",
+  ].join("\n");
+}
+
+function extensionDirectoryStatus(extensionDir, {
+  sourceDir = "",
+  configSource = "",
+  expectedManifest = null,
+} = {}) {
+  const requiredFiles = ["manifest.json", "background.js", "content-script.js", "bridge-auth.js", "bridge-config.js"];
   const files = Object.fromEntries(requiredFiles.map((fileName) => [
     fileName,
     fs.existsSync(path.join(extensionDir, fileName)),
   ]));
+  const complete = requiredFiles.every((fileName) => files[fileName]);
+  let manifest = null;
+  if (files["manifest.json"]) {
+    try {
+      manifest = readExtensionManifest(path.join(extensionDir, "manifest.json"));
+    } catch {
+      manifest = null;
+    }
+  }
+  let verification = { verified: false, mismatches: [] };
+  if (complete && sourceDir && configSource && fs.existsSync(sourceDir)) {
+    verification = verifyExtensionTarget(sourceDir, extensionDir, configSource);
+  }
+  const expectedVersion = String(expectedManifest?.version || "").trim();
+  const versionMatches = !expectedVersion || manifest?.version === expectedVersion;
+  const verified = complete && verification.verified && versionMatches;
   return {
-    complete: requiredFiles.every((fileName) => files[fileName]),
+    status: !complete
+      ? Object.values(files).some(Boolean) ? "incomplete" : "missing"
+      : verified ? "current" : "outdated",
+    complete,
+    verified,
     files,
     requiredFiles,
+    version: manifest?.version || "",
+    displayVersion: manifest?.versionName || manifest?.version || "",
+    mismatches: [
+      ...verification.mismatches,
+      ...(versionMatches ? [] : ["manifest.version"]),
+    ],
   };
 }
 
@@ -710,35 +782,33 @@ function extensionManagementAction({
   expectedVersion = "",
   connected = false,
   needsReload = false,
-  localComplete = false,
-  loadedExtensionDetected = false,
+  diskVerified = false,
+  registeredStable = false,
 } = {}) {
   const current = String(version || "").trim();
   const expected = String(expectedVersion || "").trim();
-  if (!current) {
+  if (!diskVerified) {
     return {
       id: "install",
       label: "安装扩展",
       complete: false,
-      detail: localComplete
-        ? "固定扩展目录已准备，但尚未检测到 Chrome 扩展连接。"
-        : "未检测到扩展，请安装内置扩展。",
+      detail: "扩展文件尚未完整安装，请部署内置扩展。",
     };
   }
-  if (!loadedExtensionDetected && (current !== expected || needsReload)) {
-    return {
-      id: "reinstall",
-      label: "安装新版扩展",
-      complete: false,
-      detail: "检测到旧扩展仍在运行，但 Chrome 没有暴露其磁盘目录；需要重新加载固定安装目录。",
-    };
-  }
-  if (!expected || current !== expected || needsReload) {
+  if (current && (!expected || current !== expected || needsReload)) {
     return {
       id: "update",
       label: "更新扩展",
       complete: false,
-      detail: `当前扩展 ${current}，需要 ${expected || "当前内置版本"}。`,
+      detail: `当前运行协议 ${current}，需要 ${expected || "当前内置版本"}。`,
+    };
+  }
+  if (!registeredStable && !connected) {
+    return {
+      id: "load",
+      label: "在 Chrome 中安装",
+      complete: false,
+      detail: "扩展文件已安装，但 Chrome 尚未登记固定扩展目录。",
     };
   }
   if (!connected) {
@@ -746,14 +816,69 @@ function extensionManagementAction({
       id: "repair",
       label: "修复扩展",
       complete: false,
-      detail: "扩展版本一致，但当前未连接 Bridge。",
+      detail: "Chrome 已登记扩展，但当前没有收到扩展实时连接。",
     };
   }
   return {
     id: "current",
     label: "扩展已是最新",
     complete: true,
-    detail: "扩展版本一致且连接正常。",
+    detail: "扩展文件、Chrome 登记和实时连接均正常。",
+  };
+}
+
+function extensionRuntimeStatus(extensionDiagnostics = {}, expectedVersion = "") {
+  const version = String(extensionDiagnostics.version || "").trim();
+  const expected = String(
+    extensionDiagnostics.expectedVersion || expectedVersion || "",
+  ).trim();
+  const connected = extensionDiagnostics.connected === true;
+  const stale = Boolean(
+    extensionDiagnostics.needsReload === true ||
+    (version && expected && version !== expected),
+  );
+  return {
+    status: stale ? "stale" : connected ? "connected" : "not_connected",
+    connected,
+    stale,
+    needsReload: extensionDiagnostics.needsReload === true,
+    version,
+    expectedVersion: expected,
+    sourceDir: String(extensionDiagnostics.sourceDir || "").trim(),
+  };
+}
+
+function sameResolvedPath(left, right) {
+  if (!left || !right) return false;
+  return resolvedFilesystemPath(left).toLowerCase() === resolvedFilesystemPath(right).toLowerCase();
+}
+
+function readExtensionDeploymentReceipt(receiptPath, extensionDir) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+    if (
+      parsed?.schemaVersion !== 1 ||
+      parsed?.verified !== true ||
+      !sameResolvedPath(parsed?.target, extensionDir)
+    ) {
+      return null;
+    }
+    return {
+      ...parsed,
+      persisted: true,
+      receiptPath: path.resolve(receiptPath),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function persistExtensionDeploymentReceipt(receiptPath, receipt) {
+  writeFileAtomic(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`);
+  return {
+    ...receipt,
+    persisted: true,
+    receiptPath: path.resolve(receiptPath),
   };
 }
 
@@ -777,9 +902,9 @@ function timestampForFile() {
   return new Date().toISOString().replaceAll(":", "").replaceAll(".", "-");
 }
 
-function requestJsonOverHttp(url, { timeoutMs = 1200 } = {}) {
+function requestJsonOverHttp(url, { timeoutMs = 1200, headers = {} } = {}) {
   return new Promise((resolve) => {
-    const request = http.get(url, { timeout: timeoutMs }, (response) => {
+    const request = http.get(url, { timeout: timeoutMs, headers }, (response) => {
       const chunks = [];
       response.on("data", (chunk) => chunks.push(chunk));
       response.on("end", () => {

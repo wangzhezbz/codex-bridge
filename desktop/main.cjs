@@ -1,4 +1,15 @@
-const { app, BrowserWindow, Menu, Tray, clipboard, desktopCapturer, dialog, ipcMain, screen, shell } = require("electron");
+const {
+  app,
+  BrowserWindow,
+  Menu,
+  Tray,
+  clipboard,
+  desktopCapturer,
+  dialog,
+  ipcMain: electronIpcMain,
+  screen,
+  shell,
+} = require("electron");
 const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
@@ -7,6 +18,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { Readable, Transform } = require("node:stream");
 const { pipeline } = require("node:stream/promises");
+const { pathToFileURL } = require("node:url");
 const { Worker } = require("node:worker_threads");
 const { resolveDataRootDir } = require("./data-dir.cjs");
 const { createDesktopLocalCapabilityExecutor } = require("./local-capabilities.cjs");
@@ -38,6 +50,7 @@ const {
   windowsShortcutResolverInvocation,
 } = require("./openai-desktop-compat.cjs");
 const { appendBoundedLog } = require("./runtime-log.cjs");
+const { formatRendererConsoleError } = require("./renderer-console-message.cjs");
 const { createResilientStateReader } = require("./resilient-state.cjs");
 const { createRouterRestartBudget } = require("./router-restart-budget.cjs");
 const { classifyRouterProcessOutput } = require("./router-start-diagnostics.cjs");
@@ -52,8 +65,13 @@ const {
   hasCodexResourceAuthority,
   retainCodexResourceSnapshots,
 } = require("./resource-snapshot-retention.cjs");
+const {
+  createTrustedIpcRegistrar,
+  installRendererNavigationGuards,
+  shouldDisableChromiumSandbox,
+} = require("./window-security.cjs");
 
-if (shouldDisableChromiumSandbox()) {
+if (shouldDisableChromiumSandbox({ env: process.env, platform: process.platform })) {
   app.commandLine.appendSwitch("no-sandbox");
   app.commandLine.appendSwitch("disable-gpu-sandbox");
 }
@@ -70,6 +88,8 @@ if (!hasSingleInstanceLock) {
 
 const appRootDir = path.resolve(__dirname, "..");
 const appIconPath = path.join(__dirname, "assets", "codexbridge-icon.png");
+const rendererEntryPath = path.join(__dirname, "renderer", "index.html");
+const rendererEntryUrl = pathToFileURL(rendererEntryPath).href;
 const trayIconPath = process.platform === "win32"
   ? path.join(__dirname, "assets", "codexbridge-icon.ico")
   : appIconPath;
@@ -88,10 +108,15 @@ let configRecoveryPromise;
 let configRecoveryComplete = false;
 let updaterPromise;
 let mainWindow;
+const ipcMain = createTrustedIpcRegistrar(electronIpcMain, () => ({
+  trustedWebContents: mainWindow?.webContents,
+  trustedRendererUrl: rendererEntryUrl,
+}));
 let routerProcess = null;
 let chatgptBridgeService = null;
 let routerLifecyclePromise = null;
 let codexHistoryRecoveryFlowPromise = null;
+let providerModelRefreshFlowPromise = null;
 let statePayloadReader = null;
 let logLines = [];
 let smokeErrors = [];
@@ -106,6 +131,8 @@ let tray = null;
 let isQuitting = false;
 let managedQuitReady = false;
 let routerRestartTimer = null;
+let routerConfigRecoveryTimer = null;
+let routerConfigRecoveryInFlight = false;
 let launchedUpdateLoadHookRegistered = false;
 let desktopSmokeLoadHookRegistered = false;
 let localExecutorServer = null;
@@ -122,6 +149,7 @@ const ROUTER_RESTART_MAX_ATTEMPTS = 12;
 const ROUTER_RESTART_BASE_DELAY_MS = 1500;
 const ROUTER_RESTART_MAX_DELAY_MS = 30000;
 const ROUTER_RESTART_STABLE_WINDOW_MS = 60000;
+const ROUTER_CONFIG_RECOVERY_RETRY_MS = 5000;
 const ROUTER_SPAWN_TIMEOUT_MS = 5000;
 const ROUTER_GRACEFUL_STOP_TIMEOUT_MS = 2000;
 const ROUTER_FORCE_STOP_TIMEOUT_MS = 3000;
@@ -152,19 +180,6 @@ function desktopHomeDir() {
   return smokeHome && path.isAbsolute(smokeHome)
     ? path.resolve(smokeHome)
     : os.homedir();
-}
-
-function shouldDisableChromiumSandbox() {
-  if (process.env.CODEXBRIDGE_CHROMIUM_SANDBOX === "1") {
-    return false;
-  }
-  if (process.env.CODEXBRIDGE_NO_SANDBOX === "0") {
-    return false;
-  }
-  if (process.env.CODEXBRIDGE_NO_SANDBOX === "1") {
-    return true;
-  }
-  return process.platform === "win32";
 }
 
 async function capturePageScreenshot({ url = "", viewport = "desktop", fullPage = false } = {}) {
@@ -323,6 +338,24 @@ function loadSettings() {
   return settingsPromise;
 }
 
+async function loadProviderModelRefreshFlow() {
+  if (!providerModelRefreshFlowPromise) {
+    providerModelRefreshFlowPromise = Promise.all([
+      loadSettings(),
+      import("./provider-model-refresh-flow.mjs"),
+    ]).then(([settings, { createProviderModelRefreshFlow }]) =>
+      createProviderModelRefreshFlow({
+        fetchCandidate: (providerId) =>
+          settings.fetchProviderModelDirectoryCandidate(dataRootDir, providerId),
+        commitCandidate: (result) =>
+          commitConfigMutation(settings, "providers:refreshModels", {
+            refreshResult: result,
+          }),
+      }));
+  }
+  return providerModelRefreshFlowPromise;
+}
+
 async function loadCodexHistoryRecoveryFlow() {
   if (!codexHistoryRecoveryFlowPromise) {
     codexHistoryRecoveryFlowPromise = Promise.all([
@@ -478,15 +511,9 @@ async function loadRouterLifecycleController() {
         void broadcastState();
         refreshTrayMenu().catch((error) => appendRuntimeLog(formatError("refreshTrayMenu", error)));
       },
-      publishStopped: async ({ cleanup, warning }) => {
+      publishStopped: async ({ cleanup }) => {
         lastHealth = stoppedRouterHealth();
-        if (warning?.code === "managed_config_cleanup_failed") {
-          appendLog(
-            `Router stop confirmed, but managed configuration cleanup failed; cause=${warning.causeCode || cleanup?.causeCode || "operation_failed"}.`,
-          );
-        } else {
-          appendLog("Router stop confirmed after managed configuration cleanup.");
-        }
+        appendLog("Router stop confirmed after managed configuration cleanup.");
         void broadcastState();
         refreshTrayMenu().catch((error) => appendRuntimeLog(formatError("refreshTrayMenu", error)));
       },
@@ -539,7 +566,14 @@ async function loadRouterLifecycleController() {
         isQuitting = false;
         appendRuntimeLog(formatError("managedQuit", error));
       },
-      onQuitReady: () => {
+      onQuitReady: async () => {
+        if (chatgptBridgeService) {
+          try {
+            await chatgptBridgeService.stop();
+          } catch (error) {
+            appendRuntimeLog(formatError("doubleQuotaStopOnQuit", error));
+          }
+        }
         cancelRouterRestartTimer();
         managedQuitReady = true;
       },
@@ -803,8 +837,19 @@ function createWindow() {
     icon: appIconPath,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
+      sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      webviewTag: false,
+    },
+  });
+
+  installRendererNavigationGuards(mainWindow.webContents, {
+    trustedRendererUrl: rendererEntryUrl,
+    onBlocked: ({ kind }) => {
+      appendRuntimeLog(`Blocked untrusted renderer ${kind}.`);
     },
   });
 
@@ -816,9 +861,10 @@ function createWindow() {
     recordDesktopError(`Renderer process gone: ${details.reason} exitCode=${details.exitCode}`);
   });
 
-  mainWindow.webContents.on("console-message", (_event, level, message, line, sourceId) => {
-    if (level >= 2) {
-      recordDesktopError(`Renderer console error: ${message} (${sourceId}:${line})`);
+  mainWindow.webContents.on("console-message", (details) => {
+    const errorMessage = formatRendererConsoleError(details);
+    if (errorMessage) {
+      recordDesktopError(errorMessage);
     }
   });
 
@@ -831,7 +877,7 @@ function createWindow() {
   });
 
   registerWindowLoadHooks();
-  mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
+  mainWindow.loadFile(rendererEntryPath);
 }
 
 function registerWindowLoadHooks() {
@@ -1497,16 +1543,8 @@ ipcMain.handle("models:resetCapabilities", async (_event, presetId) => {
 
 ipcMain.handle("providers:refreshModels", async (_event, providerId) => {
   const settings = await loadSettings();
-  const result = await settings.fetchProviderModelDirectoryCandidate(
-    dataRootDir,
-    String(providerId || ""),
-  );
-  let committed = null;
-  if (result.ok) {
-    committed = await commitConfigMutation(settings, "providers:refreshModels", {
-      refreshResult: result,
-    });
-  }
+  const refreshFlow = await loadProviderModelRefreshFlow();
+  const { result } = await refreshFlow.refresh(String(providerId || ""));
   appendLog(
     result.ok
       ? `Refreshed model directory: ${result.providerId} (${result.count || 0} models).`
@@ -2318,16 +2356,34 @@ ipcMain.handle("doubleQuota:manageExtension", async () => {
 
 ipcMain.handle("doubleQuota:openExtensionManager", async () => {
   clipboard.writeText("chrome://extensions/");
+  const state = await getChatgptBridgeService().getState();
   const chromePath = await findChromeExecutablePath();
   if (!chromePath) {
     throw new Error("未找到 Chrome 安装位置。请在 Chrome 地址栏手动输入 chrome://extensions/。");
   }
-  await spawnDetachedWithConfirmation(chromePath, ["--new-window", "chrome://extensions/"], {
+  const chromeArgs = ["chrome://extensions/"];
+  const registeredProfile = state.extensionBrowser?.registrations?.find(
+    (entry) => entry?.profileDir,
+  )?.profileDir;
+  const profileName = registeredProfile ? path.basename(registeredProfile) : "";
+  if (profileName && /^(Default|Guest Profile|System Profile|Profile \d+)$/.test(profileName)) {
+    chromeArgs.unshift(`--profile-directory=${profileName}`);
+  }
+  await spawnDetachedWithConfirmation(chromePath, chromeArgs, {
     detached: true,
     stdio: "ignore",
     windowsHide: true,
   });
-  return getChatgptBridgeService().getState();
+  return {
+    ...(await getChatgptBridgeService().getState()),
+    extensionManager: {
+      attempted: true,
+      url: "chrome://extensions/",
+      urlCopied: true,
+      chromePath,
+      profileName,
+    },
+  };
 });
 
 async function findChromeExecutablePath() {
@@ -2843,13 +2899,6 @@ async function requestManagedAppQuit(reason = "application") {
   if (managedQuitReady) {
     app.quit();
     return { ok: true, alreadyReady: true };
-  }
-  if (chatgptBridgeService) {
-    try {
-      await chatgptBridgeService.stop();
-    } catch (error) {
-      appendRuntimeLog(formatError("doubleQuotaStopOnQuit", error));
-    }
   }
   return (await loadRouterLifecycleController()).quit({ reason });
 }
@@ -4141,10 +4190,11 @@ function scheduleRouterRestart(exitCode) {
       ok: false,
       status: 0,
       models: [],
-      message: "Router stopped and automatic restart attempts were exhausted.",
+      message: "Router stopped after repeated restart failures; restoring the original Codex configuration.",
       checkedAt: new Date().toISOString(),
     };
     broadcastState();
+    void recoverRouterConfigAfterWatchdogExhaustion();
     return;
   }
   const delayMs = Math.min(ROUTER_RESTART_BASE_DELAY_MS * attempt.attempt, ROUTER_RESTART_MAX_DELAY_MS);
@@ -4175,10 +4225,53 @@ function scheduleRouterRestart(exitCode) {
   }, delayMs);
 }
 
+async function recoverRouterConfigAfterWatchdogExhaustion() {
+  if (isQuitting || routerProcess || routerConfigRecoveryInFlight) {
+    return { ok: false, skipped: true };
+  }
+  routerConfigRecoveryInFlight = true;
+  appendLog("Router watchdog recovery is restoring the original Codex configuration.");
+  try {
+    const result = await stopRouterWithManagedConfigCleanup({ source: "watchdog-exhausted" });
+    appendLog("Router watchdog recovery restored the original Codex configuration.");
+    return result;
+  } catch (error) {
+    appendRuntimeLog(formatError("routerWatchdogConfigRecovery", error));
+    lastHealth = {
+      ok: false,
+      status: 0,
+      models: [],
+      message: "Router stopped and Codex configuration recovery is retrying.",
+      checkedAt: new Date().toISOString(),
+      recoveryPending: true,
+    };
+    void broadcastState();
+    scheduleRouterConfigRecoveryRetry();
+    return { ok: false, error };
+  } finally {
+    routerConfigRecoveryInFlight = false;
+  }
+}
+
+function scheduleRouterConfigRecoveryRetry() {
+  if (isQuitting || routerProcess || routerConfigRecoveryTimer) {
+    return;
+  }
+  routerConfigRecoveryTimer = setTimeout(() => {
+    routerConfigRecoveryTimer = null;
+    void recoverRouterConfigAfterWatchdogExhaustion();
+  }, ROUTER_CONFIG_RECOVERY_RETRY_MS);
+  routerConfigRecoveryTimer.unref?.();
+}
+
 function cancelRouterRestartTimer({ resetAttempts = true } = {}) {
   if (routerRestartTimer) {
     clearTimeout(routerRestartTimer);
     routerRestartTimer = null;
+  }
+  if (routerConfigRecoveryTimer) {
+    clearTimeout(routerConfigRecoveryTimer);
+    routerConfigRecoveryTimer = null;
   }
   routerRestartBudget.cancel({ resetAttempts });
 }
@@ -5063,8 +5156,36 @@ function emptyUsageSummary() {
 
 async function runDesktopSmokeChecks() {
   try {
+    const windowPreferences = mainWindow.webContents.getLastWebPreferences();
+    if (
+      windowPreferences.sandbox !== true ||
+      windowPreferences.contextIsolation !== true ||
+      windowPreferences.nodeIntegration !== false ||
+      windowPreferences.webSecurity !== true
+    ) {
+      throw new Error("Desktop window security preferences are not enforced.");
+    }
+    if (
+      process.env.CODEXBRIDGE_NO_SANDBOX !== "1" &&
+      app.commandLine.hasSwitch("no-sandbox")
+    ) {
+      throw new Error("Chromium sandbox was disabled without explicit operator opt-out.");
+    }
+    let blockedNavigation = false;
+    mainWindow.webContents.emit("will-navigate", {
+      preventDefault() {
+        blockedNavigation = true;
+      },
+    }, "https://codexbridge.invalid/untrusted-navigation-smoke");
+    if (!blockedNavigation) {
+      throw new Error("Untrusted main-window navigation was not blocked.");
+    }
+    const exactResourceSummaryRequired = Boolean(
+      String(process.env.CODEXBRIDGE_DESKTOP_SMOKE_RESOURCE_SNAPSHOT || "").trim(),
+    );
     const result = await mainWindow.webContents.executeJavaScript(`
       (async () => {
+        const exactResourceSummaryRequired = ${JSON.stringify(exactResourceSummaryRequired)};
         const required = [
           "#runStartupCheck",
           "#routerToggle",
@@ -5097,6 +5218,7 @@ async function runDesktopSmokeChecks() {
           "#resourceList",
           "#resourceSearch",
           "#resourceStatusFilter",
+          "#refreshResources",
           "#sessionList",
           "#recoverCodexProjects",
           "#recoverHistoryAccessSessions",
@@ -5179,10 +5301,25 @@ async function runDesktopSmokeChecks() {
           throw new Error("Resource search or filter controls missing");
         }
         await waitFor(
-          () => document.querySelectorAll("#resourceSummary article strong").length >= 5,
+          () => document.querySelectorAll("#resourceSummary article strong").length >= 7,
           60000,
           "resource summary initial render",
         );
+        const resourceRefreshButton = document.querySelector("#refreshResources");
+        resourceRefreshButton.click();
+        await waitFor(
+          () => !resourceRefreshButton.disabled && !resourceRefreshButton.classList.contains("loading"),
+          60000,
+          "resource refresh action",
+        );
+        const resourceValues = Array.from(document.querySelectorAll("#resourceSummary article strong"))
+          .map((node) => String(node.textContent || "").replace(/,/g, "").trim());
+        if (
+          resourceValues.length < 7 ||
+          resourceValues.some((value) => !value || /^(?:undefined|null|nan)$/i.test(value))
+        ) {
+          throw new Error("Resource summary rendered invalid values: " + resourceValues.join("/"));
+        }
         const resourceState = await window.codexBridge.getState({ lite: false });
         const rawResources = resourceState?.codexResources || {};
         const expectedResourceSummary = {
@@ -5193,7 +5330,15 @@ async function runDesktopSmokeChecks() {
           ...(rawResources.readStatus || {}),
           ...(rawResources.pluginPage?.readStatus || {}),
         };
-        const expectedResourceValues = ["plugins", "apps", "mcpServers", "skills", "marketplaces"].map((key) => {
+        const expectedResourceValues = [
+          "plugins",
+          "apps",
+          "mcpServers",
+          "skills",
+          "marketplaces",
+          "prompts",
+          "agentFiles",
+        ].map((key) => {
           const value = expectedResourceSummary[key];
           const status = expectedResourceReadStatus[key];
           const readState = String(status?.state || "").trim().toLowerCase();
@@ -5208,25 +5353,14 @@ async function runDesktopSmokeChecks() {
           const count = Number(value);
           return Number.isFinite(count) && count >= 0 ? String(count) : "无法读取";
         });
-        try {
+        if (exactResourceSummaryRequired) {
           await waitFor(() => {
             const values = Array.from(document.querySelectorAll("#resourceSummary article strong"))
               .map((node) => String(node.textContent || "").replace(/,/g, "").trim());
-            return values.length >= 5 &&
+            return values.length >= expectedResourceValues.length &&
               expectedResourceValues.every((expected, index) => values[index] === expected);
           }, 15000, "resource summary render");
-        } catch (error) {
-          const values = Array.from(document.querySelectorAll("#resourceSummary article strong"))
-            .map((node) => String(node.textContent || "").replace(/,/g, "").trim());
-          throw new Error(
-            String(error?.message || "Resource summary did not render") +
-            "; expected=" + expectedResourceValues.join("/") +
-            " actual=" + values.join("/"),
-          );
         }
-        const resourceValues = Array.from(document.querySelectorAll("#resourceSummary article strong"))
-          .slice(0, 5)
-          .map((node) => String(node.textContent || "").replace(/,/g, "").trim());
         document.querySelector('[data-section="sessions"]').click();
         if (document.querySelector("#sessions").classList.contains("hidden")) {
           throw new Error("Sessions nav did not activate");

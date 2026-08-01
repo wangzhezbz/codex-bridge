@@ -14,6 +14,7 @@ import {
   adapterContractForRoute,
   filterPayloadForAdapter,
   normalizeAdapterProfile,
+  reasoningParamsForAdapter,
 } from "../src/adapter-profile.js";
 import { routeCapabilityMatrix, routeCapabilitySummary } from "../src/route-capability-matrix.js";
 
@@ -36,6 +37,58 @@ test("adapter profiles classify native responses routes", () => {
   assert.equal(profile.supportsFiles, "native");
   assert.equal(profile.supportsResponsePreviousId, true);
   assert.ok(profile.safeParams.includes("previous_response_id"));
+});
+
+test("DeepSeek V4 Flash preset uses a stateless native Responses contract", () => {
+  const preset = MODEL_PRESETS.find((route) => route.presetId === "deepseek-v4-flash");
+  assert.ok(preset);
+
+  const profile = normalizeAdapterProfile(preset);
+  assert.equal(preset.api, "responses");
+  assert.equal(preset.contextWindow, 1048576);
+  assert.equal(profile.adapterId, "responses-native");
+  assert.equal(profile.providerFamily, "deepseek");
+  assert.equal(profile.supportsResponsePreviousId, false);
+  assert.equal(profile.supportsFiles, "text-placeholder");
+  assert.equal(profile.supportsImages, "none");
+});
+
+test("adapter profiles classify Anthropic Messages as a native provider contract", () => {
+  const profile = normalizeAdapterProfile({
+    id: "claude-sonnet-4-6",
+    provider: "anthropic",
+    api: "anthropic_messages",
+    model: "claude-sonnet-4-6",
+    baseUrl: "https://api.anthropic.com/v1",
+    authMode: "anthropic_api_key",
+    contextWindow: 200000,
+    inputModalities: ["text", "image"],
+  });
+
+  assert.equal(profile.api, "anthropic_messages");
+  assert.equal(profile.providerFamily, "anthropic");
+  assert.equal(profile.adapterId, "messages-anthropic");
+  assert.equal(profile.supportsTools, "native");
+  assert.equal(profile.supportsImages, "native");
+  assert.equal(profile.supportsFiles, "text-placeholder");
+  assert.equal(profile.supportsResponsePreviousId, false);
+  assert.ok(profile.safeParams.includes("system"));
+  assert.ok(profile.safeParams.includes("max_tokens"));
+  assert.equal(profile.maxToolContinuationTurns, 5);
+});
+
+test("Anthropic Messages protocol remains Anthropic behind a local relay URL", () => {
+  const profile = normalizeAdapterProfile({
+    id: "local-claude",
+    api: "anthropic_messages",
+    model: "claude-sonnet-4-6",
+    baseUrl: "http://127.0.0.1:3456/v1",
+    authMode: "anthropic_api_key",
+    inputModalities: ["text"],
+  });
+
+  assert.equal(profile.providerFamily, "anthropic");
+  assert.equal(profile.adapterId, "messages-anthropic");
 });
 
 test("adapter contracts expose a stable v1 route boundary", () => {
@@ -520,6 +573,47 @@ test("all generated selected routes preserve provider identity for adapter profi
   }
 });
 
+test("generated built-in routes keep provider-specific reasoning parameter contracts", () => {
+  const rootDir = mkdtempSync(join(tmpdir(), "codexbridge-provider-reasoning-"));
+  saveSelection(rootDir, [
+    "glm-4-6",
+    "openrouter-sonnet",
+    "siliconflow-qwen3-coder",
+  ]);
+
+  const routes = new Map(
+    buildRouterConfigFromSelection(rootDir, "hybrid").models
+      .map((route) => [route.sourcePresetId, route]),
+  );
+  const request = {
+    reasoning_effort: "high",
+    thinking_budget: 8192,
+  };
+
+  assert.equal(routes.get("glm-4-6")?.providerFamily, "zhipu");
+  assert.deepEqual(reasoningParamsForAdapter(request, routes.get("glm-4-6")), {
+    enable_thinking: true,
+    thinking_budget: 8192,
+  });
+
+  assert.equal(routes.get("openrouter-sonnet")?.providerFamily, "openrouter");
+  assert.deepEqual(reasoningParamsForAdapter(request, routes.get("openrouter-sonnet")), {
+    reasoning: {
+      effort: "high",
+      max_tokens: 8192,
+    },
+  });
+
+  assert.equal(routes.get("siliconflow-qwen3-coder")?.providerFamily, "siliconflow");
+  assert.deepEqual(
+    reasoningParamsForAdapter(request, routes.get("siliconflow-qwen3-coder")),
+    {
+      enable_thinking: true,
+      thinking_budget: 8192,
+    },
+  );
+});
+
 test("custom Volcano Ark models inherit the Doubao adapter contract", () => {
   const rootDir = mkdtempSync(join(tmpdir(), "codexbridge-custom-volcengine-"));
   const custom = saveCustomModel(rootDir, {
@@ -615,6 +709,30 @@ const BUILT_IN_PROVIDER_CONTRACTS = {
     supportsFiles: "native",
     supportsResponsePreviousId: true,
   },
+  anthropic: {
+    providerFamily: "anthropic",
+    adapterId: "messages-anthropic",
+    api: "anthropic_messages",
+    supportsTools: "native",
+    supportsFiles: "text-placeholder",
+    supportsResponsePreviousId: false,
+  },
+  xai: {
+    providerFamily: "xai",
+    adapterId: "chat-xai",
+    api: "chat_completions",
+    supportsTools: "chat-functions",
+    supportsFiles: "text-placeholder",
+    supportsResponsePreviousId: false,
+  },
+  gemini: {
+    providerFamily: "gemini",
+    adapterId: "chat-gemini",
+    api: "chat_completions",
+    supportsTools: "chat-functions",
+    supportsFiles: "text-placeholder",
+    supportsResponsePreviousId: false,
+  },
   deepseek: {
     providerFamily: "deepseek",
     adapterId: "chat-deepseek",
@@ -624,6 +742,14 @@ const BUILT_IN_PROVIDER_CONTRACTS = {
     supportsResponsePreviousId: false,
   },
   kimi: {
+    providerFamily: "kimi",
+    adapterId: "chat-kimi",
+    api: "chat_completions",
+    supportsTools: "chat-functions",
+    supportsFiles: "text-placeholder",
+    supportsResponsePreviousId: false,
+  },
+  "kimi-code": {
     providerFamily: "kimi",
     adapterId: "chat-kimi",
     api: "chat_completions",
@@ -718,7 +844,9 @@ function expectedImageSupport(profileApi, inputModalities) {
     return "none";
   }
 
-  return profileApi === "responses" ? "native" : "chat-image-url";
+  return profileApi === "responses" || profileApi === "anthropic_messages"
+    ? "native"
+    : "chat-image-url";
 }
 
 const BUILT_IN_PROVIDER_IDS = [...new Set(MODEL_PRESETS.map((route) => route.providerId))].sort();
@@ -741,6 +869,9 @@ test("built-in presets cover required provider categories", () => {
 
   for (const required of [
     "responses-native",
+    "messages-anthropic",
+    "chat-xai",
+    "chat-gemini",
     "chat-deepseek",
     "chat-kimi",
     "chat-minimax",
@@ -759,6 +890,17 @@ for (const route of MODEL_PRESETS) {
   MODEL_PRESETS_BY_PROVIDER_ID.set(route.providerId, routes);
 }
 
+const BUILT_IN_PRESET_CONTRACT_OVERRIDES = {
+  "deepseek-v4-flash": {
+    providerFamily: "deepseek",
+    adapterId: "responses-native",
+    api: "responses",
+    supportsTools: "native",
+    supportsFiles: "text-placeholder",
+    supportsResponsePreviousId: false,
+  },
+};
+
 for (const [providerId, expected] of Object.entries(BUILT_IN_PROVIDER_CONTRACTS)) {
   test(`built-in preset contract: ${providerId}`, () => {
     const routes = MODEL_PRESETS_BY_PROVIDER_ID.get(providerId);
@@ -766,19 +908,20 @@ for (const [providerId, expected] of Object.entries(BUILT_IN_PROVIDER_CONTRACTS)
 
     for (const route of routes) {
       const profile = normalizeAdapterProfile(route);
+      const routeExpected = BUILT_IN_PRESET_CONTRACT_OVERRIDES[route.presetId] || expected;
 
-      assert.equal(profile.providerFamily, expected.providerFamily, `${route.presetId} providerFamily`);
-      assert.equal(profile.adapterId, expected.adapterId, `${route.presetId} adapterId`);
-      assert.equal(profile.api, expected.api, `${route.presetId} api`);
-      assert.equal(profile.supportsTools, expected.supportsTools, `${route.presetId} supportsTools`);
-      assert.equal(profile.supportsFiles, expected.supportsFiles, `${route.presetId} supportsFiles`);
-      assert.equal(profile.supportsResponsePreviousId, expected.supportsResponsePreviousId, `${route.presetId} supportsResponsePreviousId`);
+      assert.equal(profile.providerFamily, routeExpected.providerFamily, `${route.presetId} providerFamily`);
+      assert.equal(profile.adapterId, routeExpected.adapterId, `${route.presetId} adapterId`);
+      assert.equal(profile.api, routeExpected.api, `${route.presetId} api`);
+      assert.equal(profile.supportsTools, routeExpected.supportsTools, `${route.presetId} supportsTools`);
+      assert.equal(profile.supportsFiles, routeExpected.supportsFiles, `${route.presetId} supportsFiles`);
+      assert.equal(profile.supportsResponsePreviousId, routeExpected.supportsResponsePreviousId, `${route.presetId} supportsResponsePreviousId`);
       assert.equal(profile.supportsImages, expectedImageSupport(profile.api, route.inputModalities), `${route.presetId} supportsImages`);
-      assert.equal(profile.capabilities.providerFamily, expected.providerFamily, `${route.presetId} capabilities.providerFamily`);
-      assert.equal(profile.capabilities.api, expected.api, `${route.presetId} capabilities.api`);
-      assert.equal(profile.capabilities.tools, expected.supportsTools, `${route.presetId} capabilities.tools`);
-      assert.equal(profile.capabilities.files, expected.supportsFiles, `${route.presetId} capabilities.files`);
-      assert.equal(profile.capabilities.previousResponseId, expected.supportsResponsePreviousId, `${route.presetId} capabilities.previousResponseId`);
+      assert.equal(profile.capabilities.providerFamily, routeExpected.providerFamily, `${route.presetId} capabilities.providerFamily`);
+      assert.equal(profile.capabilities.api, routeExpected.api, `${route.presetId} capabilities.api`);
+      assert.equal(profile.capabilities.tools, routeExpected.supportsTools, `${route.presetId} capabilities.tools`);
+      assert.equal(profile.capabilities.files, routeExpected.supportsFiles, `${route.presetId} capabilities.files`);
+      assert.equal(profile.capabilities.previousResponseId, routeExpected.supportsResponsePreviousId, `${route.presetId} capabilities.previousResponseId`);
       assert.equal(profile.capabilities.images, expectedImageSupport(profile.api, route.inputModalities), `${route.presetId} capabilities.images`);
       assert.equal(profile.capabilities.contextWindow, profile.contextWindow, `${route.presetId} capabilities.contextWindow`);
       assert.equal(profile.capabilities.catalogContextWindow, profile.catalogContextWindow, `${route.presetId} capabilities.catalogContextWindow`);

@@ -4,6 +4,10 @@ const path = require("node:path");
 
 const DESKTOP_APP_IMAGE_NAMES = Object.freeze(["ChatGPT.exe", "Codex.exe"]);
 const OFFICIAL_OPENAI_DESKTOP_PUBLISHER_IDS = new Set(["2p2nqsd0c76g0"]);
+const OFFICIAL_OPENAI_DESKTOP_WIN32_APP_IDS = new Set([
+  "com.openai.codex",
+  "com.openai.chatgpt",
+]);
 const SOURCE_PRIORITY = Object.freeze({
   running: 0,
   saved: 1,
@@ -76,6 +80,9 @@ function isOpenAIDesktopShellTarget(value) {
     return false;
   }
   const appId = target.replace(/^shell:AppsFolder\\/i, "");
+  if (OFFICIAL_OPENAI_DESKTOP_WIN32_APP_IDS.has(appId.toLowerCase())) {
+    return true;
+  }
   const match = appId.match(
     /^(?:OpenAI\.ChatGPT(?:-Desktop)?|OpenAI\.Codex(?:-Desktop)?)_([^!\\]+)!/i,
   );
@@ -367,6 +374,9 @@ function validatedOpenAIDesktopTargetFromShortcutResolution(
     return launchTarget;
   }
   if (isOpenAIDesktopShellTarget(launchTarget)) {
+    if (!openAIDesktopStorePackageFamily(launchTarget)) {
+      return launchTarget;
+    }
     return storeInstalled ? launchTarget : "";
   }
   try {

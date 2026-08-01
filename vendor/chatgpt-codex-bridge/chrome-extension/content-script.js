@@ -134,10 +134,10 @@ async function withPreSendTimeout(job, operation) {
 
 async function bridgeApi(path, options = {}) {
   const response = await fetch(`${BRIDGE_ORIGIN}${path}`, {
-    headers: {
+    headers: globalThis.CODEX_BRIDGE_AUTH.authorizedHeaders({
       "Content-Type": "application/json",
       ...(options.headers || {})
-    },
+    }),
     ...options
   });
 

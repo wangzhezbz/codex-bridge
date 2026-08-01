@@ -724,10 +724,10 @@ function validateProviderOverrides(value, path, context) {
       result.logoUrl = normalizeLogoUrl(override.logoUrl, `${overridePath}.logoUrl`, context);
     }
     if (Object.hasOwn(override, "api")) {
-      result.api = normalizeEnum(override.api, new Set(["responses", "chat_completions"]), `${overridePath}.api`, context);
+      result.api = normalizeEnum(override.api, new Set(["responses", "chat_completions", "anthropic_messages"]), `${overridePath}.api`, context);
     }
     if (Object.hasOwn(override, "authMode")) {
-      result.authMode = normalizeEnum(override.authMode, new Set(["codex_openai", "api_key"]), `${overridePath}.authMode`, context);
+      result.authMode = normalizeEnum(override.authMode, new Set(["codex_openai", "api_key", "anthropic_api_key"]), `${overridePath}.authMode`, context);
     }
     if (Object.hasOwn(override, "custom")) {
       result.custom = normalizeBoolean(override.custom, `${overridePath}.custom`, context);

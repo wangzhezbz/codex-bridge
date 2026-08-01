@@ -10,6 +10,7 @@ import * as settings from "../desktop/settings.mjs";
 const API_MODEL_ID = "deepseek-v4-pro";
 const API_ROUTE_ID = "cb-deepseek-v4-pro";
 const SECRET_VALUE = "test-only-provider-key-must-not-leak";
+const ROUTER_AUTH_TOKEN = "cbr_00000000000000000000000000000000";
 
 function makeWorkspace(label) {
   const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), `codexbridge-config-${label}-root-`));
@@ -25,7 +26,11 @@ function makeWorkspace(label) {
   );
   fs.writeFileSync(
     settings.routerConfigPath(rootDir),
-    `${JSON.stringify({ mode: settings.MODE_ALL_API, models: [] }, null, 2)}\n`,
+    `${JSON.stringify({
+      mode: settings.MODE_ALL_API,
+      authToken: ROUTER_AUTH_TOKEN,
+      models: [],
+    }, null, 2)}\n`,
     "utf8",
   );
   const managed = settings.buildCodexToml({
@@ -33,6 +38,7 @@ function makeWorkspace(label) {
     homeDir,
     mode: settings.MODE_ALL_API,
     model: API_ROUTE_ID,
+    authToken: ROUTER_AUTH_TOKEN,
   });
   fs.writeFileSync(
     settings.codexConfigPath(homeDir),
@@ -149,6 +155,109 @@ test("provider and typed key commit with one revision across sources, Router, ca
   assert.match(toml, /# 用户自己的注释\r\nuser_setting = "preserve-byte-for-byte"\r\n/);
   assert.match(toml, new RegExp(`model = "${API_ROUTE_ID}"`));
   assertSecretAbsentFromNonSecretTargets(workspace, SECRET_VALUE);
+});
+
+test("legacy Kimi Code endpoint migration copies its old key once without changing Moonshot defaults", async () => {
+  const workspace = makeWorkspace("legacy-kimi-code-provider");
+  const legacyKimiCodeKey = "legacy-kimi-code-key";
+  fs.writeFileSync(
+    settings.providerOverridesPath(workspace.rootDir),
+    `${JSON.stringify({
+      version: 1,
+      providers: {
+        kimi: {
+          id: "kimi",
+          name: "Kimi",
+          baseUrl: "https://api.kimi.com/coding/v1",
+          keyEnv: "MOONSHOT_API_KEY",
+          keyLabel: "Kimi API Key",
+        },
+      },
+    }, null, 2)}\n`,
+    "utf8",
+  );
+  fs.writeFileSync(
+    settings.secretsPath(workspace.rootDir),
+    `${JSON.stringify({
+      DEEPSEEK_API_KEY: SECRET_VALUE,
+      MOONSHOT_API_KEY: legacyKimiCodeKey,
+    }, null, 2)}\n`,
+    "utf8",
+  );
+
+  await settings.applyConfigMutationTransaction({
+    ...workspace,
+    coordinator: coordinatorFor(workspace),
+    operation: "providers:save",
+    payload: {
+      provider: {
+        id: "deepseek",
+        baseUrl: "https://api.deepseek.com/v1",
+        keyEnv: "DEEPSEEK_API_KEY",
+      },
+    },
+  });
+
+  const providers = settings.providerCatalog(workspace.rootDir);
+  const secrets = settings.loadSecrets(workspace.rootDir);
+  const overrides = settings.readProviderOverrides(workspace.rootDir);
+  assert.equal(overrides.kimi, undefined);
+  assert.equal(overrides["kimi-code"].baseUrl, "https://api.kimi.com/coding/v1");
+  assert.equal(secrets.MOONSHOT_API_KEY, legacyKimiCodeKey);
+  assert.equal(secrets.KIMI_CODE_API_KEY, legacyKimiCodeKey);
+  assert.equal(
+    providers.find((provider) => provider.id === "kimi").baseUrl,
+    "https://api.moonshot.cn/v1",
+  );
+  assert.equal(
+    providers.find((provider) => provider.id === "kimi-code").keyEnv,
+    "KIMI_CODE_API_KEY",
+  );
+});
+
+test("legacy Kimi Code migration preserves an existing dedicated Kimi Code key", async () => {
+  const workspace = makeWorkspace("legacy-kimi-code-existing-key");
+  fs.writeFileSync(
+    settings.providerOverridesPath(workspace.rootDir),
+    `${JSON.stringify({
+      version: 1,
+      providers: {
+        kimi: {
+          id: "kimi",
+          name: "Kimi",
+          baseUrl: "https://api.kimi.com/coding/v1",
+          keyEnv: "MOONSHOT_API_KEY",
+        },
+      },
+    }, null, 2)}\n`,
+    "utf8",
+  );
+  fs.writeFileSync(
+    settings.secretsPath(workspace.rootDir),
+    `${JSON.stringify({
+      DEEPSEEK_API_KEY: SECRET_VALUE,
+      MOONSHOT_API_KEY: "legacy-key",
+      KIMI_CODE_API_KEY: "dedicated-key",
+    }, null, 2)}\n`,
+    "utf8",
+  );
+
+  await settings.applyConfigMutationTransaction({
+    ...workspace,
+    coordinator: coordinatorFor(workspace),
+    operation: "providers:save",
+    payload: {
+      provider: {
+        id: "deepseek",
+        baseUrl: "https://api.deepseek.com/v1",
+        keyEnv: "DEEPSEEK_API_KEY",
+      },
+    },
+  });
+
+  const secrets = settings.loadSecrets(workspace.rootDir);
+  assert.equal(secrets.MOONSHOT_API_KEY, "legacy-key");
+  assert.equal(secrets.KIMI_CODE_API_KEY, "dedicated-key");
 });
 
 test("a custom API-key model using the codex provider id does not collide with the native subscription route", async () => {
@@ -1086,6 +1195,108 @@ test("a stale remote model refresh cannot resurrect an edited provider", async (
   assert.equal(
     settings.readModelDirectory(workspace.rootDir).providers.deepseek,
     undefined,
+  );
+});
+
+test("a current remote model refresh commits through the shared config transaction", async () => {
+  const workspace = makeWorkspace("current-provider-refresh");
+  const coordinator = coordinatorFor(workspace);
+  await settings.applyConfigMutationTransaction({
+    ...workspace,
+    coordinator,
+    operation: "providers:save",
+    payload: {
+      provider: {
+        id: "deepseek",
+        baseUrl: "https://current-refresh.example/v1",
+        keyEnv: "DEEPSEEK_API_KEY",
+        apiKey: SECRET_VALUE,
+      },
+    },
+  });
+  const refresh = await settings.fetchProviderModelDirectoryCandidate(
+    workspace.rootDir,
+    "deepseek",
+    {
+      fetchImpl: async () => new Response(JSON.stringify({
+        data: [{ id: "deepseek-current-model" }],
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+      now: () => "2026-07-11T00:00:00.000Z",
+    },
+  );
+  assert.equal(refresh.ok, true);
+
+  const committed = await settings.applyConfigMutationTransaction({
+    ...workspace,
+    coordinator,
+    operation: "providers:refreshModels",
+    payload: { refreshResult: refresh },
+  });
+
+  assert.equal(committed.result.refresh.ok, true);
+  assert.equal(committed.result.refresh.count, 1);
+  assert.equal(
+    settings.readModelDirectory(workspace.rootDir).providers.deepseek.models[0].id,
+    "deepseek-current-model",
+  );
+});
+
+test("a current custom intermediary model refresh commits through the shared config transaction", async () => {
+  const workspace = makeWorkspace("current-custom-provider-refresh");
+  const coordinator = coordinatorFor(workspace);
+  await settings.applyConfigMutationTransaction({
+    ...workspace,
+    coordinator,
+    operation: "customModel:save",
+    payload: {
+      model: {
+        providerId: "custom-refresh-relay",
+        providerName: "Custom Refresh Relay",
+        displayName: "Relay Seed",
+        model: "relay-seed",
+        baseUrl: "https://relay-refresh.example/v1",
+        api: "responses",
+        keyEnv: "CUSTOM_REFRESH_RELAY_KEY",
+        apiKey: SECRET_VALUE,
+      },
+    },
+  });
+  const refresh = await settings.fetchProviderModelDirectoryCandidate(
+    workspace.rootDir,
+    "custom-refresh-relay",
+    {
+      fetchImpl: async () => new Response(JSON.stringify({
+        data: [
+          { id: "relay-current-model-a" },
+          { id: "relay-current-model-b" },
+        ],
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+      now: () => "2026-07-11T00:00:00.000Z",
+    },
+  );
+  assert.equal(refresh.ok, true);
+
+  const committed = await settings.applyConfigMutationTransaction({
+    ...workspace,
+    coordinator,
+    operation: "providers:refreshModels",
+    payload: { refreshResult: refresh },
+  });
+
+  assert.equal(committed.result.refresh.ok, true);
+  assert.equal(committed.result.refresh.count, 2);
+  assert.deepEqual(
+    settings.readModelDirectory(workspace.rootDir)
+      .providers["custom-refresh-relay"]
+      .models
+      .map((model) => model.id),
+    ["relay-current-model-a", "relay-current-model-b"],
   );
 });
 

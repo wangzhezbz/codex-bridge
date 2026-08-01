@@ -56,6 +56,23 @@ const CHAT_SAFE_PARAMS = [
   "extra_body",
 ];
 
+const ANTHROPIC_MESSAGES_SAFE_PARAMS = [
+  "model",
+  "messages",
+  "system",
+  "max_tokens",
+  "stream",
+  "tools",
+  "tool_choice",
+  "temperature",
+  "top_p",
+  "top_k",
+  "stop_sequences",
+  "metadata",
+  "service_tier",
+  "thinking",
+];
+
 const CHAT_REASONING_PARAMS = [
   "reasoning",
   "reasoning_effort",
@@ -69,7 +86,11 @@ const OMIT_VALUE = Symbol("codexbridge_omit_payload_value");
 
 export function normalizeAdapterProfile(route = {}) {
   const providerFamily = providerFamilyForRoute(route);
-  const api = route.api === "responses" ? "responses" : "chat_completions";
+  const api = route.api === "responses"
+    ? "responses"
+    : route.api === "anthropic_messages"
+      ? "anthropic_messages"
+      : "chat_completions";
   const authMode = String(route.authMode || route.auth_mode || "");
   const adapterId = adapterIdForRoute({ ...route, providerFamily, api });
   const customConservative = providerFamily === "custom";
@@ -87,14 +108,19 @@ export function normalizeAdapterProfile(route = {}) {
     route.catalogContextWindow,
     contextWindow,
   );
-  const supportsTools = api === "responses" ? "native" : "chat-functions";
-  const supportsMcpNamespaces = true;
-  const supportsFiles = api === "responses"
+  const supportsTools = api === "responses" || api === "anthropic_messages"
     ? "native"
-    : customConservative
-      ? "none"
-      : "text-placeholder";
-  const supportsResponsePreviousId = api === "responses";
+    : "chat-functions";
+  const supportsMcpNamespaces = true;
+  const supportsFiles = route.supportsFiles || route.fileSupport || (
+    api === "responses"
+      ? "native"
+      : customConservative
+        ? "none"
+        : "text-placeholder"
+  );
+  const supportsResponsePreviousId =
+    api === "responses" && route.supportsResponsePreviousId !== false;
   const supportsPromptCaching = route.supportsPromptCaching || "unknown";
   const dropParams = normalizedDropParams(route, {
     api,
@@ -133,11 +159,15 @@ export function normalizeAdapterProfile(route = {}) {
       ? authMode === "codex_openai"
         ? CODEX_OPENAI_RESPONSES_SAFE_PARAMS
         : RESPONSES_SAFE_PARAMS
-      : CHAT_SAFE_PARAMS,
+      : api === "anthropic_messages"
+        ? ANTHROPIC_MESSAGES_SAFE_PARAMS
+        : CHAT_SAFE_PARAMS,
     dropParams,
     maxToolContinuationTurns: positiveInteger(
       route.maxToolContinuationTurns ?? route.max_tool_continuation_turns,
-      api === "chat_completions" ? DEFAULT_CHAT_TOOL_TURNS : 0,
+      api === "chat_completions" || api === "anthropic_messages"
+        ? DEFAULT_CHAT_TOOL_TURNS
+        : 0,
     ),
     upstreamTimeoutMs: positiveInteger(
       route.upstreamTimeoutMs ?? route.upstream_timeout_ms,
@@ -234,12 +264,16 @@ export function adapterIdForRoute(route = {}) {
   if (route.api === "responses") {
     return "responses-native";
   }
+  if (route.api === "anthropic_messages" || providerFamily === "anthropic") {
+    return "messages-anthropic";
+  }
   if (providerFamily === "deepseek") return "chat-deepseek";
   if (providerFamily === "kimi") return "chat-kimi";
   if (providerFamily === "minimax") return "chat-minimax";
   if (providerFamily === "doubao") return "chat-doubao";
   if (providerFamily === "qwen") return "chat-qwen";
   if (providerFamily === "gemini") return "chat-gemini";
+  if (providerFamily === "xai") return "chat-xai";
   if (providerFamily === "custom") return "custom-conservative";
   return "chat-openai-compatible";
 }
@@ -448,6 +482,11 @@ function providerFamilyForRoute(route = {}) {
   if (explicitProviderFamily) {
     return explicitProviderFamily;
   }
+  const api = String(route.api || "").trim().toLowerCase();
+  const authMode = String(route.authMode || route.auth_mode || "").trim().toLowerCase();
+  if (api === "anthropic_messages" || authMode === "anthropic_api_key") {
+    return "anthropic";
+  }
   const raw = String(
     route.provider ||
       route.providerId ||
@@ -460,6 +499,8 @@ function providerFamilyForRoute(route = {}) {
   if (raw.includes("codex") || raw.includes("openai") || raw.includes("chatgpt.com")) {
     return "openai";
   }
+  if (raw.includes("anthropic") || raw.includes("claude")) return "anthropic";
+  if (raw.includes("xai") || raw.includes("grok")) return "xai";
   if (raw.includes("deepseek")) return "deepseek";
   if (raw.includes("kimi") || raw.includes("moonshot")) return "kimi";
   if (raw.includes("minimax")) return "minimax";
@@ -478,7 +519,7 @@ function imageSupportForRoute(route, api, inputModalities, customConservative) {
   if (!inputModalities.includes("image")) {
     return "none";
   }
-  if (api === "responses") {
+  if (api === "responses" || api === "anthropic_messages") {
     return "native";
   }
   return "chat-image-url";
@@ -505,6 +546,9 @@ function reasoningCapabilityForRoute(route, api, providerFamily, customConservat
   });
   if (api === "responses") {
     return { mode: "responses-native", params };
+  }
+  if (api === "anthropic_messages") {
+    return { mode: "anthropic-messages", params };
   }
   if (supportsDeepSeekThinkingParams(route, providerFamily)) {
     return { mode: "deepseek-thinking", params };
@@ -563,6 +607,9 @@ function parameterCapabilityForRoute(api, providerFamily, customConservative) {
   if (api === "responses") {
     return { mode: "responses-native" };
   }
+  if (api === "anthropic_messages") {
+    return { mode: "anthropic-messages" };
+  }
   if (customConservative) {
     return { mode: "openai-compatible-passthrough" };
   }
@@ -584,6 +631,9 @@ function normalizedDropParams(route, context = {}) {
 function reasoningParameterAllowList(route, context = {}) {
   if (context.api === "responses") {
     return ["reasoning"];
+  }
+  if (context.api === "anthropic_messages") {
+    return ["thinking"];
   }
   if (context.customConservative) {
     return CHAT_REASONING_PARAMS;

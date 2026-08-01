@@ -46,12 +46,12 @@ function smokeProviderSaveAfterStaleSelection() {
   seedSyncedKimiDirectory(rootDir);
   fs.writeFileSync(
     routerConfigPath(rootDir),
-    JSON.stringify({ mode: MODE_HYBRID, models: [{ id: "cb-kimi-k2-7-code" }] }, null, 2),
+    JSON.stringify({ mode: MODE_HYBRID, models: [{ id: "cb-remote-kimi-kimi-for-coding" }] }, null, 2),
     "utf8",
   );
   fs.writeFileSync(
     selectionPath(rootDir),
-    JSON.stringify({ selectedModelIds: ["kimi-k2-7-code"] }, null, 2),
+    JSON.stringify({ selectedModelIds: ["remote-kimi-kimi-for-coding"] }, null, 2),
     "utf8",
   );
 
@@ -66,8 +66,8 @@ function smokeProviderSaveAfterStaleSelection() {
   });
 
   return assertSmokeState(rootDir, sync, {
-    selectedModelIds: ["remote-kimi-kimi-for-coding"],
-    defaultModel: "cb-remote-kimi-kimi-for-coding",
+    selectedModelIds: ["kimi-code-for-coding"],
+    defaultModel: "cb-kimi-code-for-coding",
   });
 }
 
@@ -109,17 +109,17 @@ function smokeConfigPackageImportWithOldModelId() {
     includesSecrets: false,
     selection: {
       mode: MODE_HYBRID,
-      selectedModelIds: ["kimi-k2-7-code"],
+      selectedModelIds: ["remote-kimi-kimi-for-coding"],
     },
     desktopOptions: {
-      codexAuxiliaryModelId: "cb-kimi-k2-7-code",
+      codexAuxiliaryModelId: "cb-remote-kimi-kimi-for-coding",
       smartRouting: {
         autoSelectRules: {
-          code: { mode: "route", routeId: "cb-kimi-k2-7-code" },
+          code: { mode: "route", routeId: "cb-remote-kimi-kimi-for-coding" },
         },
         failover: {
           mode: "ordered",
-          routeIds: ["cb-kimi-k2-7-code"],
+          routeIds: ["cb-remote-kimi-kimi-for-coding"],
         },
       },
     },
@@ -132,9 +132,9 @@ function smokeConfigPackageImportWithOldModelId() {
   });
 
   return assertSmokeState(rootDir, sync, {
-    selectedModelIds: ["remote-kimi-kimi-for-coding"],
-    defaultModel: "cb-remote-kimi-kimi-for-coding",
-    auxiliaryRouteId: "cb-remote-kimi-kimi-for-coding",
+    selectedModelIds: ["kimi-code-for-coding"],
+    defaultModel: "cb-kimi-code-for-coding",
+    auxiliaryRouteId: "cb-kimi-code-for-coding",
   });
 }
 
@@ -146,25 +146,25 @@ function smokeConfigProfileSaveWithOldModelId() {
     id: "old-kimi-profile",
     name: "Old Kimi",
     mode: MODE_HYBRID,
-    selectedModelIds: ["kimi-k2-7-code"],
+    selectedModelIds: ["remote-kimi-kimi-for-coding"],
     desktopOptions: {
-      codexAuxiliaryModelId: "cb-kimi-k2-7-code",
+      codexAuxiliaryModelId: "cb-remote-kimi-kimi-for-coding",
       smartRouting: {
         autoSelectRules: {
-          code: { mode: "route", routeId: "cb-kimi-k2-7-code" },
+          code: { mode: "route", routeId: "cb-remote-kimi-kimi-for-coding" },
         },
         failover: {
           mode: "ordered",
-          routeIds: ["cb-kimi-k2-7-code"],
+          routeIds: ["cb-remote-kimi-kimi-for-coding"],
         },
       },
     },
   });
   const [profile] = loadConfigProfiles(rootDir);
 
-  assertArrayEqual(saved.selectedModelIds, ["remote-kimi-kimi-for-coding"], "saved.selectedModelIds");
-  assertEqual(saved.desktopOptions.codexAuxiliaryModelId, "cb-remote-kimi-kimi-for-coding", "saved.desktopOptions.codexAuxiliaryModelId");
-  assertArrayEqual(profile.selectedModelIds, ["remote-kimi-kimi-for-coding"], "profile.selectedModelIds");
+  assertArrayEqual(saved.selectedModelIds, ["kimi-code-for-coding"], "saved.selectedModelIds");
+  assertEqual(saved.desktopOptions.codexAuxiliaryModelId, "cb-kimi-code-for-coding", "saved.desktopOptions.codexAuxiliaryModelId");
+  assertArrayEqual(profile.selectedModelIds, ["kimi-code-for-coding"], "profile.selectedModelIds");
   return {
     selectedModelIds: saved.selectedModelIds,
     defaultModel: "",
@@ -179,30 +179,30 @@ function smokeCodexModelCatalogRefreshAfterRouteSync() {
   seedSyncedKimiDirectory(rootDir);
   fs.writeFileSync(
     routerConfigPath(rootDir),
-    JSON.stringify({ mode: MODE_HYBRID, models: [{ id: "cb-kimi-k2-7-code" }] }, null, 2),
+    JSON.stringify({ mode: MODE_HYBRID, models: [{ id: "cb-remote-kimi-kimi-for-coding" }] }, null, 2),
     "utf8",
   );
   fs.writeFileSync(
     selectionPath(rootDir),
-    JSON.stringify({ selectedModelIds: ["kimi-k2-7-code"] }, null, 2),
+    JSON.stringify({ selectedModelIds: ["remote-kimi-kimi-for-coding"] }, null, 2),
     "utf8",
   );
   saveDesktopOptions(rootDir, {
-    codexAuxiliaryModelId: "cb-kimi-k2-7-code",
+    codexAuxiliaryModelId: "cb-remote-kimi-kimi-for-coding",
   });
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-route-sync-home-"));
   const codexDir = path.join(homeDir, ".codex");
   fs.mkdirSync(codexDir, { recursive: true });
   fs.writeFileSync(
     path.join(codexDir, "config.toml"),
-    buildCodexToml({ rootDir, mode: MODE_HYBRID, homeDir, model: "cb-kimi-k2-7-code" }),
+    buildCodexToml({ rootDir, mode: MODE_HYBRID, homeDir, model: "cb-remote-kimi-kimi-for-coding" }),
     "utf8",
   );
   fs.writeFileSync(
     path.join(codexDir, "models_cache.json"),
     JSON.stringify({
       models: [
-        { slug: "cb-kimi-k2-7-code", display_name: "Old Kimi", codexbridge_cache_entry: true },
+        { slug: "cb-remote-kimi-kimi-for-coding", display_name: "Old Kimi Code", codexbridge_cache_entry: true },
       ],
     }, null, 2),
     "utf8",
@@ -218,13 +218,13 @@ function smokeCodexModelCatalogRefreshAfterRouteSync() {
   const cacheSlugs = cache.models.map((model) => model.slug);
 
   assertEqual(sync.catalog?.skipped, false, "sync.catalog.skipped");
-  assertEqual(catalogSlugs.includes("cb-remote-kimi-kimi-for-coding"), true, "catalog includes repaired model");
-  assertEqual(catalogSlugs.includes("cb-kimi-k2-7-code"), false, "catalog removes stale model");
-  assertEqual(cacheSlugs.includes("cb-kimi-k2-7-code"), true, "native Codex cache remains untouched");
+  assertEqual(catalogSlugs.includes("cb-kimi-code-for-coding"), true, "catalog includes repaired model");
+  assertEqual(catalogSlugs.includes("cb-remote-kimi-kimi-for-coding"), false, "catalog removes stale model");
+  assertEqual(cacheSlugs.includes("cb-remote-kimi-kimi-for-coding"), true, "native Codex cache remains untouched");
   return assertSmokeState(rootDir, sync, {
-    selectedModelIds: ["remote-kimi-kimi-for-coding"],
-    defaultModel: "cb-remote-kimi-kimi-for-coding",
-    auxiliaryRouteId: "cb-remote-kimi-kimi-for-coding",
+    selectedModelIds: ["kimi-code-for-coding"],
+    defaultModel: "cb-kimi-code-for-coding",
+    auxiliaryRouteId: "cb-kimi-code-for-coding",
   });
 }
 

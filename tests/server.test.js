@@ -115,6 +115,118 @@ test("router handles late client socket errors without crashing", () => {
   assert.equal(socket.destroyed, true);
 });
 
+test("router rejects browser origins unless they are explicitly trusted", async () => {
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    models: [],
+  });
+  await listen(router);
+
+  try {
+    const response = await fetch(`${serverUrl(router)}/health`, {
+      headers: {
+        origin: "https://evil.example",
+      },
+    });
+
+    assert.equal(response.status, 403);
+    assert.equal(response.headers.get("access-control-allow-origin"), null);
+    const body = await response.json();
+    assert.equal(body.error?.code, "origin_not_allowed");
+  } finally {
+    await close(router);
+  }
+});
+
+test("router echoes an explicitly trusted browser origin without wildcard CORS", async () => {
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    clientAuth: {
+      allowedOrigins: ["https://trusted.example"],
+    },
+    models: [],
+  });
+  await listen(router);
+
+  try {
+    const response = await fetch(`${serverUrl(router)}/v1/responses`, {
+      method: "OPTIONS",
+      headers: {
+        origin: "https://trusted.example",
+        "access-control-request-method": "POST",
+        "access-control-request-headers": "authorization,content-type",
+      },
+    });
+
+    assert.equal(response.status, 204);
+    assert.equal(
+      response.headers.get("access-control-allow-origin"),
+      "https://trusted.example",
+    );
+    assert.equal(response.headers.get("vary"), "Origin");
+    assert.notEqual(response.headers.get("access-control-allow-origin"), "*");
+  } finally {
+    await close(router);
+  }
+});
+
+test("router resolves its local token from authTokenEnv and rejects other bearer values", async () => {
+  const envName = `CODEXBRIDGE_TEST_ROUTER_TOKEN_${process.pid}`;
+  const originalValue = process.env[envName];
+  process.env[envName] = "router-token-from-env";
+  const router = createRouterServer({
+    mode: "all_api",
+    host: "127.0.0.1",
+    port: 0,
+    authTokenEnv: envName,
+    clientAuth: {
+      allowOpenAiBearer: false,
+    },
+    defaultModel: "api-model",
+    models: [
+      {
+        id: "api-model",
+        displayName: "API Model",
+        api: "responses",
+        baseUrl: "http://127.0.0.1:9/v1",
+        model: "api-model",
+        authMode: "api_key",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+  await listen(router);
+
+  try {
+    const response = await fetch(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer wrong-token",
+      },
+      body: JSON.stringify({
+        model: "api-model",
+        input: "hello",
+      }),
+    });
+
+    assert.equal(response.status, 401);
+    const body = await response.json();
+    assert.equal(body.error?.code, "invalid_router_token");
+  } finally {
+    await close(router);
+    if (originalValue === undefined) {
+      delete process.env[envName];
+    } else {
+      process.env[envName] = originalValue;
+    }
+  }
+});
+
 test("server exposes health, models, catalog, and converted responses", async () => {
   const upstream = http.createServer(async (req, res) => {
     assert.equal(req.url, "/v1/chat/completions");
@@ -3864,9 +3976,13 @@ test("codex_openai routes accept Codex bearer even when legacy config omits clie
 
 test("invalid router token response explains how to refresh CodexBridge config", async () => {
   const router = createRouterServer({
+    mode: "all_api",
     host: "127.0.0.1",
     port: 0,
     authToken: "router-token",
+    clientAuth: {
+      allowOpenAiBearer: true,
+    },
     defaultModel: "deepseek-v4-pro",
     models: [
       {
@@ -10119,6 +10235,7 @@ test("server accepts completed Responses SSE wrapped in a non-2xx upstream statu
   const router = createRouterServer({
     host: "127.0.0.1",
     port: 0,
+    authToken: "client-key",
     defaultModel: "cb-custom-model-gpt-5-4",
     models: [
       {

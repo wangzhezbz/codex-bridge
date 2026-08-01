@@ -76,18 +76,86 @@ test("duplicate request protection is disabled by default in both bundled router
   }
 });
 
-test("desktop disables Chromium sandbox before app startup on Windows", () => {
-  const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
-  const sandboxSwitchIndex = main.indexOf('app.commandLine.appendSwitch("no-sandbox")');
-  const readyIndex = main.indexOf("app.whenReady()");
+test("bundled router examples require an external local token instead of publishing a shared secret", () => {
+  for (const fileName of ["router.config.example.json", "router.config.hybrid.example.json"]) {
+    const configPath = path.join(process.cwd(), "config", fileName);
+    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
 
-  assert.notEqual(sandboxSwitchIndex, -1);
-  assert.notEqual(readyIndex, -1);
-  assert.ok(
-    sandboxSwitchIndex < readyIndex,
-    "Chromium sandbox must be disabled before app.whenReady() for affected Windows machines",
+    assert.equal(config.authToken, undefined);
+    assert.equal(config.authTokenEnv, "CODEXBRIDGE_ROUTER_TOKEN");
+  }
+  const allApiConfig = JSON.parse(
+    fs.readFileSync(
+      path.join(process.cwd(), "config", "router.config.example.json"),
+      "utf8",
+    ),
   );
-  assert.match(main, /CODEXBRIDGE_CHROMIUM_SANDBOX/);
+  assert.equal(allApiConfig.clientAuth.allowOpenAiBearer, false);
+});
+
+test("bundled router examples use stateless native Responses for DeepSeek V4 Flash", () => {
+  for (const fileName of ["router.config.example.json", "router.config.hybrid.example.json"]) {
+    const configPath = path.join(process.cwd(), "config", fileName);
+    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    const flash = config.models.find((model) => model.model === "deepseek-v4-flash");
+
+    assert.ok(flash, `${fileName} must include DeepSeek V4 Flash`);
+    assert.equal(flash.api, "responses");
+    assert.equal(flash.baseUrl, "https://api.deepseek.com");
+    assert.equal(flash.contextWindow, 1048576);
+    assert.equal(flash.supportsResponsePreviousId, false);
+    assert.equal(flash.supportsFiles, "text-placeholder");
+  }
+});
+
+test("project and Windows CI gates include the complete desktop refresh flow", () => {
+  const packageJson = JSON.parse(
+    fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8"),
+  );
+  const workflow = fs.readFileSync(
+    path.join(process.cwd(), ".github", "workflows", "desktop-portable.yml"),
+    "utf8",
+  );
+
+  assert.match(
+    packageJson.scripts["check:syntax"],
+    /desktop\/provider-model-refresh-flow\.mjs/,
+    "the new desktop flow module must be syntax checked",
+  );
+  assert.match(
+    packageJson.scripts["check:syntax"],
+    /tests\/provider-model-refresh-flow\.test\.js/,
+    "the new desktop flow test must be syntax checked",
+  );
+  assert.match(
+    packageJson.scripts["test:desktop"],
+    /tests\/provider-model-refresh-flow\.test\.js/,
+    "the new desktop flow test must run in the full project gate",
+  );
+  assert.match(
+    workflow,
+    /- name: Run full project check\s+run: npm run check/,
+    "Windows CI must use the same complete check gate as local verification",
+  );
+});
+
+test("desktop security policy runs in the fixed syntax and desktop gates", () => {
+  const packageJson = JSON.parse(
+    fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8"),
+  );
+
+  assert.match(
+    packageJson.scripts["check:syntax"],
+    /desktop\/window-security\.cjs/,
+  );
+  assert.match(
+    packageJson.scripts["check:syntax"],
+    /tests\/desktop-window-security\.test\.js/,
+  );
+  assert.match(
+    packageJson.scripts["test:desktop"],
+    /tests\/desktop-window-security\.test\.js/,
+  );
 });
 
 test("desktop quit path does not send renderer updates after the window is destroyed", () => {
@@ -231,6 +299,9 @@ test("desktop smoke checks cover capability diagnostics and project recovery", (
   assert.match(smoke, /"#usageBudgetTarget"/);
   assert.match(smoke, /"#resourceSearch"/);
   assert.match(smoke, /"#resourceStatusFilter"/);
+  assert.match(smoke, /"#refreshResources"/);
+  assert.match(smoke, /exactResourceSummaryRequired/);
+  assert.match(smoke, /resourceRefreshButton\.click\(\)/);
   assert.match(smoke, /"#exportConfigPackage"/);
   assert.match(smoke, /"#importConfigPackage"/);
   assert.match(smoke, /"data-export-all-sessions"/);

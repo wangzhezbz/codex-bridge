@@ -775,7 +775,12 @@ function managedTomlString(assignments, path) {
   return values.length === 1 ? parseTomlStringValue(values[0]) : null;
 }
 
-function managedTomlProviderContractIsValid({ assignments, mode, routerPort }) {
+function managedTomlProviderContractIsValid({
+  assignments,
+  mode,
+  routerPort,
+  routerAuthToken,
+}) {
   const providerPath = ["model_providers", "codexbridge"];
   const headerPath = [...providerPath, "http_headers"];
   const port = Number(routerPort);
@@ -814,13 +819,20 @@ function managedTomlProviderContractIsValid({ assignments, mode, routerPort }) {
   if (headerAssignments.length !== 1) {
     return false;
   }
+  const expectedAuthorization = `Bearer ${String(routerAuthToken || "").trim()}`;
+  if (expectedAuthorization === "Bearer ") {
+    return false;
+  }
   const [header] = headerAssignments;
   if (sameTomlPath(header.path, headerPath)) {
-    return /^\{\s*Authorization\s*=\s*"Bearer sk-local-codex-router"\s*\}$/.test(header.value);
+    const match = header.value.match(
+      /^\{\s*Authorization\s*=\s*("(?:[^"\\]|\\.)*")\s*\}$/,
+    );
+    return Boolean(match) && parseTomlStringValue(match[1]) === expectedAuthorization;
   }
   return (
     sameTomlPath(header.path, [...headerPath, "Authorization"]) &&
-    parseTomlStringValue(header.value) === "Bearer sk-local-codex-router"
+    parseTomlStringValue(header.value) === expectedAuthorization
   );
 }
 
@@ -887,6 +899,7 @@ function validateCrossFileState(state, contentById) {
       assignments: managedAssignments,
       mode: state.mode,
       routerPort: routerConfig?.port,
+      routerAuthToken: routerConfig?.authToken,
     }))
   ) {
     throw configMutationError("config_draft_inconsistent", "Configuration draft is inconsistent");

@@ -37,12 +37,13 @@ function fixture() {
       version: "0.1.1",
       version_name: "0.1.1 - 20260712",
       background: { service_worker: "background.js" },
-      content_scripts: [{ js: ["bridge-config.js", "content-script.js"] }],
+      content_scripts: [{ js: ["bridge-config.js", "bridge-auth.js", "content-script.js"] }],
     }),
     "utf8",
   );
   fs.writeFileSync(path.join(vendorDir, "chrome-extension", "background.js"), "// background\n", "utf8");
   fs.writeFileSync(path.join(vendorDir, "chrome-extension", "content-script.js"), "// content\n", "utf8");
+  fs.writeFileSync(path.join(vendorDir, "chrome-extension", "bridge-auth.js"), "// auth\n", "utf8");
   fs.writeFileSync(path.join(vendorDir, "chrome-extension", "bridge-config.js"), "// config\n", "utf8");
   fs.writeFileSync(
     path.join(vendorDir, "embedded-manifest.json"),
@@ -151,8 +152,8 @@ test("double quota state reads the service version and extension protocol indepe
   const requested = [];
   const service = createChatgptBridgeService({
     ...dirs,
-    requestJson: async (url) => {
-      requested.push(url);
+    requestJson: async (url, options) => {
+      requested.push({ url, options });
       if (url.endsWith("/health")) return compatibleHealth();
       if (url.endsWith("/version")) return compatibleVersion();
       return null;
@@ -161,11 +162,18 @@ test("double quota state reads the service version and extension protocol indepe
 
   const state = await service.getState();
 
-  assert.deepEqual(requested, [
+  const savedConfig = JSON.parse(
+    fs.readFileSync(path.join(dirs.dataRootDir, "config", "double-quota.json"), "utf8"),
+  );
+  assert.deepEqual(requested.map((entry) => entry.url), [
     "http://127.0.0.1:4317/health",
     "http://127.0.0.1:4317/version",
     "http://127.0.0.1:4317/api/diagnostics/status",
   ]);
+  assert.equal(
+    requested[2].options.headers["X-CodexBridge-Token"],
+    savedConfig.authToken,
+  );
   assert.equal(state.serviceVersion, "0.1.0");
   assert.equal(state.extensionProtocolVersion, "v20260712-preference-verify");
   assert.equal(state.versionCompatible, true);
@@ -173,11 +181,11 @@ test("double quota state reads the service version and extension protocol indepe
 
 test("double quota extension management exposes install, update, repair, and current states", async () => {
   const scenarios = [
-    { extension: { version: null, expectedVersion: "v2", connected: false, needsReload: false, loadedExtensionDetected: false }, action: "install", label: "安装扩展" },
-    { extension: { version: "v1", expectedVersion: "v2", connected: true, needsReload: true, loadedExtensionDetected: true }, action: "update", label: "更新扩展" },
-    { extension: { version: "v2", expectedVersion: "v2", connected: false, needsReload: false, loadedExtensionDetected: true }, action: "repair", label: "修复扩展" },
-    { extension: { version: "v2", expectedVersion: "v2", connected: true, needsReload: false, loadedExtensionDetected: true }, action: "current", label: "扩展已是最新" },
-    { extension: { version: "v1", expectedVersion: "v2", connected: true, needsReload: true, loadedExtensionDetected: false }, action: "reinstall", label: "安装新版扩展" },
+    { extension: { diskVerified: false, version: "", expectedVersion: "v2", connected: false, needsReload: false, registeredStable: false }, action: "install", label: "安装扩展" },
+    { extension: { diskVerified: true, version: "v1", expectedVersion: "v2", connected: true, needsReload: true, registeredStable: true }, action: "update", label: "更新扩展" },
+    { extension: { diskVerified: true, version: "v2", expectedVersion: "v2", connected: false, needsReload: false, registeredStable: true }, action: "repair", label: "修复扩展" },
+    { extension: { diskVerified: true, version: "v2", expectedVersion: "v2", connected: true, needsReload: false, registeredStable: true }, action: "current", label: "扩展已是最新" },
+    { extension: { diskVerified: true, version: "", expectedVersion: "v2", connected: false, needsReload: false, registeredStable: false }, action: "load", label: "在 Chrome 中安装" },
   ];
 
   for (const scenario of scenarios) {
@@ -208,13 +216,40 @@ test("double quota prepares a stable extension with the configured origin", asyn
   assert.equal(state.extensionReady, true);
   assert.match(state.extensionDir, /extensions[\\/]chatgpt-codex-bridge$/);
   assert.equal(fs.existsSync(path.join(state.extensionDir, "manifest.json")), true);
-  for (const fileName of ["manifest.json", "background.js", "content-script.js", "bridge-config.js"]) {
+  for (const fileName of ["manifest.json", "background.js", "content-script.js", "bridge-auth.js", "bridge-config.js"]) {
     assert.equal(fs.existsSync(path.join(state.extensionDir, fileName)), true, fileName);
   }
   assert.match(
     fs.readFileSync(path.join(state.extensionDir, "bridge-config.js"), "utf8"),
     /http:\/\/127\.0\.0\.1:54318/,
   );
+});
+
+test("double quota persists one auth token and deploys it only through extension config", async () => {
+  const dirs = fixture();
+  const first = createChatgptBridgeService({ ...dirs, requestJson: async () => null });
+
+  const firstState = await first.prepareExtension();
+  const configPath = path.join(dirs.dataRootDir, "config", "double-quota.json");
+  assert.equal(fs.existsSync(configPath), true);
+  const savedConfig = JSON.parse(
+    fs.readFileSync(configPath, "utf8"),
+  );
+  const extensionConfig = fs.readFileSync(
+    path.join(firstState.extensionDir, "bridge-config.js"),
+    "utf8",
+  );
+
+  assert.match(savedConfig.authToken, /^[a-f0-9]{64}$/);
+  assert.match(extensionConfig, new RegExp(`authToken: ${JSON.stringify(savedConfig.authToken)}`));
+  assert.equal(Object.hasOwn(firstState, "authToken"), false);
+
+  const second = createChatgptBridgeService({ ...dirs, requestJson: async () => null });
+  await second.prepareExtension();
+  const restoredConfig = JSON.parse(
+    fs.readFileSync(configPath, "utf8"),
+  );
+  assert.equal(restoredConfig.authToken, savedConfig.authToken);
 });
 
 test("extension deployment does not depend on recursive cpSync and completes in a Chinese user data path", async () => {
@@ -234,7 +269,7 @@ test("extension deployment does not depend on recursive cpSync and completes in 
   try {
     const state = await service.prepareExtension();
     assert.equal(state.extensionReady, true);
-    for (const fileName of ["manifest.json", "background.js", "content-script.js", "bridge-config.js"]) {
+    for (const fileName of ["manifest.json", "background.js", "content-script.js", "bridge-auth.js", "bridge-config.js"]) {
       assert.equal(fs.existsSync(path.join(state.extensionDir, fileName)), true, fileName);
     }
   } finally {
@@ -271,7 +306,7 @@ test("extension management returns a safe failed state instead of leaking a Wind
   }
 });
 
-test("double quota updates both the canonical and an existing legacy Chrome extension directory", async () => {
+test("double quota writes only the canonical extension directory and leaves legacy copies untouched", async () => {
   const dirs = fixture();
   const legacyDir = path.join(dirs.dataRootDir, "chatgpt-bridge-extension");
   fs.mkdirSync(legacyDir, { recursive: true });
@@ -284,15 +319,12 @@ test("double quota updates both the canonical and an existing legacy Chrome exte
   const state = await service.prepareExtension();
 
   assert.match(state.extensionDir, /extensions[\\/]chatgpt-codex-bridge$/);
-  assert.deepEqual(state.extensionUpdateDirs.sort(), [legacyDir, state.extensionDir].sort());
-  assert.equal(fs.readFileSync(path.join(legacyDir, "background.js"), "utf8"), "// background\n");
-  assert.match(
-    fs.readFileSync(path.join(legacyDir, "bridge-config.js"), "utf8"),
-    /http:\/\/127\.0\.0\.1:54319/,
-  );
+  assert.deepEqual(state.extensionUpdateDirs, [state.extensionDir]);
+  assert.equal(fs.readFileSync(path.join(legacyDir, "background.js"), "utf8"), "legacy\n");
+  assert.equal(fs.readFileSync(path.join(legacyDir, "bridge-config.js"), "utf8"), "legacy\n");
 });
 
-test("double quota updates the real unpacked extension path recorded by the active Chrome profile", async () => {
+test("double quota treats Chrome preference paths as registration evidence without overwriting them", async () => {
   const dirs = fixture();
   const chromeUserDataDir = path.join(dirs.root, "chrome-user-data");
   const profileDir = path.join(chromeUserDataDir, "Default");
@@ -305,11 +337,11 @@ test("double quota updates the real unpacked extension path recorded by the acti
       manifest_version: 3,
       name: "Codex GPT Bridge",
       background: { service_worker: "background.js" },
-      content_scripts: [{ js: ["bridge-config.js", "content-script.js"] }],
+      content_scripts: [{ js: ["bridge-config.js", "bridge-auth.js", "content-script.js"] }],
     }),
     "utf8",
   );
-  for (const fileName of ["background.js", "content-script.js", "bridge-config.js"]) {
+  for (const fileName of ["background.js", "content-script.js", "bridge-auth.js", "bridge-config.js"]) {
     fs.writeFileSync(path.join(loadedDir, fileName), "OLD-CHROME-COPY\n", "utf8");
   }
   fs.writeFileSync(
@@ -334,13 +366,10 @@ test("double quota updates the real unpacked extension path recorded by the acti
 
   const state = await service.prepareExtension();
 
-  assert.deepEqual(state.extensionLoadedDirs, [loadedDir]);
-  assert.ok(state.extensionUpdateDirs.includes(loadedDir));
-  assert.equal(fs.readFileSync(path.join(loadedDir, "background.js"), "utf8"), "// background\n");
-  assert.match(
-    fs.readFileSync(path.join(loadedDir, "bridge-config.js"), "utf8"),
-    /http:\/\/127\.0\.0\.1:4317/,
-  );
+  assert.deepEqual(state.extensionRegisteredDirs, [loadedDir]);
+  assert.deepEqual(state.extensionUpdateDirs, [state.extensionDir]);
+  assert.equal(fs.readFileSync(path.join(loadedDir, "background.js"), "utf8"), "OLD-CHROME-COPY\n");
+  assert.equal(fs.readFileSync(path.join(loadedDir, "bridge-config.js"), "utf8"), "OLD-CHROME-COPY\n");
 });
 
 test("double quota also reads unpacked extension paths stored in a direct Chrome Preferences profile", async () => {
@@ -355,11 +384,11 @@ test("double quota also reads unpacked extension paths stored in a direct Chrome
       manifest_version: 3,
       name: "Codex GPT Bridge",
       background: { service_worker: "background.js" },
-      content_scripts: [{ js: ["bridge-config.js", "content-script.js"] }],
+      content_scripts: [{ js: ["bridge-config.js", "bridge-auth.js", "content-script.js"] }],
     }),
     "utf8",
   );
-  for (const fileName of ["background.js", "content-script.js", "bridge-config.js"]) {
+  for (const fileName of ["background.js", "content-script.js", "bridge-auth.js", "bridge-config.js"]) {
     fs.writeFileSync(path.join(loadedDir, fileName), "OLD-PREFERENCES-COPY\n", "utf8");
   }
   fs.writeFileSync(
@@ -381,9 +410,9 @@ test("double quota also reads unpacked extension paths stored in a direct Chrome
 
   const state = await service.prepareExtension();
 
-  assert.deepEqual(state.extensionLoadedDirs, [loadedDir]);
+  assert.deepEqual(state.extensionRegisteredDirs, [loadedDir]);
   assert.deepEqual(state.extensionChromeIds, ["ponmlkjihgfedcbaponmlkjihgfedcba"]);
-  assert.equal(fs.readFileSync(path.join(loadedDir, "content-script.js"), "utf8"), "// content\n");
+  assert.equal(fs.readFileSync(path.join(loadedDir, "content-script.js"), "utf8"), "OLD-PREFERENCES-COPY\n");
 });
 
 test("double quota recognizes a verified unpacked extension when Chrome uses a different location enum", async () => {
@@ -411,7 +440,7 @@ test("double quota recognizes a verified unpacked extension when Chrome uses a d
 
   const state = await service.getState();
 
-  assert.deepEqual(state.extensionLoadedDirs, [loadedDir]);
+  assert.deepEqual(state.extensionRegisteredDirs, [loadedDir]);
   assert.deepEqual(state.extensionChromeIds, ["abcdefghijklmnopabcdefghijklmnop"]);
 });
 
@@ -443,11 +472,11 @@ test("double quota does not mistake the service extension source directory for C
 
   const state = await service.prepareExtension();
 
-  assert.deepEqual(state.extensionLoadedDirs, []);
-  assert.equal(state.extensionAction.id, "reinstall");
-  assert.ok(state.extensionUpdateDirs.includes(state.extensionDir));
+  assert.deepEqual(state.extensionRegisteredDirs, []);
+  assert.equal(state.extensionAction.id, "update");
+  assert.deepEqual(state.extensionUpdateDirs, [state.extensionDir]);
   assert.equal(fs.readFileSync(path.join(loadedDir, "background.js"), "utf8"), "OLD-DIAGNOSTICS-COPY\n");
-  assert.equal(state.extensionManagerRevision, "stable-dir-migration-v1");
+  assert.equal(state.extensionManagerRevision, "verified-stable-dir-v2");
   assert.equal(state.extensionDeployment.verified, true);
   assert.equal(
     state.extensionDeployment.targets.find((target) => target.path === state.extensionDir)?.verified,
@@ -456,7 +485,7 @@ test("double quota does not mistake the service extension source directory for C
   assert.match(state.extensionDeployment.updatedAt, /^\d{4}-\d{2}-\d{2}T/);
 });
 
-test("double quota update waits for the connected extension to reload before requiring manual Chrome action", async () => {
+test("double quota update returns immediately after verified deployment instead of polling Chrome", async () => {
   const dirs = fixture();
   const profileDir = path.join(dirs.chromeUserDataDir, "Default");
   const loadedDir = path.join(dirs.root, "reloadable-chrome-extension");
@@ -476,9 +505,7 @@ test("double quota update waits for the connected extension to reload before req
       if (url.endsWith("/version")) return compatibleVersion();
       if (url.endsWith("/api/diagnostics/status")) {
         diagnosticsReads += 1;
-        return diagnosticsReads < 3
-          ? { extension: { version: "v20260711-router-v2-safety", expectedVersion: "v20260712-preference-verify", connected: true, needsReload: true } }
-          : { extension: { version: "v20260712-preference-verify", expectedVersion: "v20260712-preference-verify", connected: true, needsReload: false } };
+        return { extension: { version: "v20260711-router-v2-safety", expectedVersion: "v20260712-preference-verify", connected: true, needsReload: true } };
       }
       return null;
     },
@@ -486,10 +513,42 @@ test("double quota update waits for the connected extension to reload before req
 
   const state = await service.manageExtension();
 
-  assert.equal(state.extensionAction.id, "current");
-  assert.equal(state.extensionUpdate.status, "updated");
-  assert.equal(state.extensionUpdate.manualReloadRequired, false);
-  assert.ok(diagnosticsReads >= 3);
+  assert.equal(state.extensionAction.id, "update");
+  assert.equal(state.extensionUpdate.status, "files_ready");
+  assert.equal(state.extensionUpdate.manualReloadRequired, true);
+  assert.equal(state.extensionUpdate.diskVerified, true);
+  assert.equal(diagnosticsReads, 1);
+});
+
+test("verified extension deployment receipt survives service recreation", async () => {
+  const dirs = fixture();
+  const first = createChatgptBridgeService({ ...dirs, requestJson: async () => null });
+
+  const installed = await first.prepareExtension();
+  assert.equal(installed.extensionDisk.status, "current");
+  assert.equal(installed.extensionDisk.verified, true);
+  assert.equal(installed.extensionDeployment.persisted, true);
+  assert.equal(fs.existsSync(installed.extensionDeployment.receiptPath), true);
+
+  const second = createChatgptBridgeService({ ...dirs, requestJson: async () => null });
+  const restored = await second.getState();
+  assert.equal(restored.extensionDisk.status, "current");
+  assert.equal(restored.extensionDisk.verified, true);
+  assert.equal(restored.extensionDeployment.persisted, true);
+  assert.equal(restored.extensionDeployment.target, restored.extensionDir);
+});
+
+test("disk installation, Chrome registration, and runtime connection are reported separately", async () => {
+  const dirs = fixture();
+  const service = createChatgptBridgeService({ ...dirs, requestJson: async () => null });
+  await service.prepareExtension();
+
+  const state = await service.getState();
+
+  assert.equal(state.extensionDisk.status, "current");
+  assert.equal(state.extensionBrowser.status, "not_registered");
+  assert.equal(state.extensionRuntime.status, "not_connected");
+  assert.equal(state.extensionAction.id, "load");
 });
 
 test("MCP repair preserves unrelated Codex configuration and is idempotent", async () => {
@@ -591,6 +650,10 @@ test("service starts and gracefully stops only its owned Electron-as-Node child"
   assert.deepEqual(spawnArgs.args, [path.join(dirs.vendorDir, "src", "index.js")]);
   assert.equal(spawnArgs.options.env.ELECTRON_RUN_AS_NODE, "1");
   assert.equal(spawnArgs.options.env.BRIDGE_PORT, "4317");
+  const savedConfig = JSON.parse(
+    fs.readFileSync(path.join(dirs.dataRootDir, "config", "double-quota.json"), "utf8"),
+  );
+  assert.equal(spawnArgs.options.env.BRIDGE_AUTH_TOKEN, savedConfig.authToken);
   assert.equal(spawnArgs.options.env.BRIDGE_ROUTER_V2, "0");
   assert.equal(spawnArgs.options.windowsHide, true);
   assert.deepEqual(child.killSignals, ["SIGTERM"]);

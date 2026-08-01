@@ -1,6 +1,7 @@
 ﻿import { createServer } from "node:http";
 import { copyFile, readFile, stat } from "node:fs/promises";
 import { execFile } from "node:child_process";
+import { timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -117,6 +118,76 @@ const EXPECTED_EXTENSION_VERSION = EXTENSION_PROTOCOL_VERSION;
 const COMPATIBLE_EXTENSION_VERSIONS = new Set([
   EXPECTED_EXTENSION_VERSION
 ]);
+const RESPONSE_CORS_HEADERS = Symbol("responseCorsHeaders");
+const REQUEST_JSON_BODY_LIMIT = Symbol("requestJsonBodyLimit");
+const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]"]);
+const DEFAULT_MAX_JSON_BODY_BYTES = 32 * 1024 * 1024;
+
+function requestHasAllowedLoopbackHost(request) {
+  const rawHost = String(request.headers.host || "").trim();
+  if (!rawHost) {
+    return false;
+  }
+  try {
+    const hostUrl = new URL(`http://${rawHost}`);
+    const requestedPort = Number.parseInt(hostUrl.port || "80", 10);
+    return (
+      LOOPBACK_HOSTNAMES.has(hostUrl.hostname.toLowerCase()) &&
+      requestedPort === request.socket.localPort
+    );
+  } catch {
+    return false;
+  }
+}
+
+function corsPolicyForRequest(request) {
+  const origin = String(request.headers.origin || "").trim();
+  if (!origin) {
+    return { allowed: true, headers: {}, requiresApiToken: false };
+  }
+
+  let originUrl;
+  try {
+    originUrl = new URL(origin);
+  } catch {
+    return { allowed: false, headers: {}, requiresApiToken: false };
+  }
+
+  const isChatGpt = originUrl.origin === "https://chatgpt.com";
+  const isChromeExtension =
+    originUrl.protocol === "chrome-extension:" &&
+    /^[a-p]{32}$/.test(originUrl.hostname) &&
+    origin === `chrome-extension://${originUrl.hostname}`;
+  const isSameBridgeOrigin =
+    originUrl.protocol === "http:" &&
+    originUrl.host === request.headers.host &&
+    originUrl.origin === origin;
+
+  if (!isChatGpt && !isChromeExtension && !isSameBridgeOrigin) {
+    return { allowed: false, headers: {}, requiresApiToken: false };
+  }
+
+  return {
+    allowed: true,
+    requiresApiToken: !isSameBridgeOrigin,
+    headers: {
+      "Access-Control-Allow-Origin": origin,
+      "Access-Control-Allow-Headers": "Content-Type, X-CodexBridge-Token",
+      "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
+      "Vary": "Origin"
+    }
+  };
+}
+
+function bridgeTokensMatch(expected, actual) {
+  const expectedBytes = Buffer.from(String(expected || ""), "utf8");
+  const actualBytes = Buffer.from(String(actual || ""), "utf8");
+  return (
+    expectedBytes.length > 0 &&
+    expectedBytes.length === actualBytes.length &&
+    timingSafeEqual(expectedBytes, actualBytes)
+  );
+}
 
 function normalizedChatgptPageUrl(value = "") {
   try {
@@ -140,9 +211,7 @@ function sendJson(response, status, value) {
   response.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "Content-Type",
-    "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS"
+    ...(response[RESPONSE_CORS_HEADERS] || {})
   });
   response.end(JSON.stringify(value, null, 2));
 }
@@ -151,9 +220,7 @@ function sendText(response, status, text, contentType = "text/plain; charset=utf
   response.writeHead(status, {
     "Content-Type": contentType,
     "Cache-Control": "no-store",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "Content-Type",
-    "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS"
+    ...(response[RESPONSE_CORS_HEADERS] || {})
   });
   response.end(text);
 }
@@ -161,7 +228,7 @@ function sendText(response, status, text, contentType = "text/plain; charset=utf
 function sendBinary(response, status, body, headers = {}) {
   response.writeHead(status, {
     "Cache-Control": "no-store",
-    "Access-Control-Allow-Origin": "*",
+    ...(response[RESPONSE_CORS_HEADERS] || {}),
     ...headers
   });
   response.end(body);
@@ -244,8 +311,22 @@ async function saveArtifactWithNativeDialog(artifact) {
 }
 
 async function readJsonBody(request) {
+  const maxBytes = Number(request[REQUEST_JSON_BODY_LIMIT]) || DEFAULT_MAX_JSON_BODY_BYTES;
+  const declaredBytes = Number(request.headers["content-length"] || 0);
+  if (Number.isFinite(declaredBytes) && declaredBytes > maxBytes) {
+    const error = new Error("JSON request body is too large");
+    error.statusCode = 413;
+    throw error;
+  }
   const chunks = [];
+  let receivedBytes = 0;
   for await (const chunk of request) {
+    receivedBytes += chunk.length;
+    if (receivedBytes > maxBytes) {
+      const error = new Error("JSON request body is too large");
+      error.statusCode = 413;
+      throw error;
+    }
     chunks.push(chunk);
   }
   const raw = Buffer.concat(chunks).toString("utf8");
@@ -4546,6 +4627,13 @@ async function handleApi(request, response, options) {
 
 export function createHttpServer(options = {}) {
   const env = options.env || process.env;
+  const authToken = String(options.authToken || env.BRIDGE_AUTH_TOKEN || "").trim();
+  const configuredMaxJsonBodyBytes = Number(
+    options.maxJsonBodyBytes || env.BRIDGE_MAX_JSON_BODY_BYTES || DEFAULT_MAX_JSON_BODY_BYTES,
+  );
+  const maxJsonBodyBytes = Number.isSafeInteger(configuredMaxJsonBodyBytes) && configuredMaxJsonBodyBytes > 0
+    ? configuredMaxJsonBodyBytes
+    : DEFAULT_MAX_JSON_BODY_BYTES;
   const storeRoot = resolveBridgeDataDir({
     storeRoot: options.storeRoot,
     env,
@@ -4575,11 +4663,40 @@ export function createHttpServer(options = {}) {
 
   return createServer(async (request, response) => {
     try {
+      if (!requestHasAllowedLoopbackHost(request)) {
+        response.writeHead(403, {
+          "Content-Type": "application/json; charset=utf-8",
+          "Cache-Control": "no-store"
+        });
+        response.end(JSON.stringify({ error: "Bridge Host is not allowed" }, null, 2));
+        return;
+      }
+      const corsPolicy = corsPolicyForRequest(request);
+      if (!corsPolicy.allowed) {
+        response.writeHead(403, {
+          "Content-Type": "application/json; charset=utf-8",
+          "Cache-Control": "no-store"
+        });
+        response.end(JSON.stringify({ error: "Browser origin is not allowed" }, null, 2));
+        return;
+      }
+      response[RESPONSE_CORS_HEADERS] = corsPolicy.headers;
       if (request.method === "OPTIONS") {
         sendText(response, 204, "");
         return;
       }
       const requestUrl = new URL(request.url, "http://127.0.0.1");
+      request[REQUEST_JSON_BODY_LIMIT] = maxJsonBodyBytes;
+      const sensitiveImport = requestUrl.pathname === "/api/downloads/import";
+      if (
+        requestUrl.pathname.startsWith("/api/") &&
+        authToken &&
+        (corsPolicy.requiresApiToken || sensitiveImport) &&
+        !bridgeTokensMatch(authToken, request.headers["x-codexbridge-token"])
+      ) {
+        sendJson(response, 401, { error: "Bridge authentication is required" });
+        return;
+      }
       if (request.method === "GET" && requestUrl.pathname === "/health") {
         sendJson(response, 200, healthPayload());
         return;
@@ -4601,7 +4718,8 @@ export function createHttpServer(options = {}) {
       }
       await serveStatic(requestUrl, response);
     } catch (error) {
-      sendJson(response, 500, {
+      const statusCode = Number(error?.statusCode);
+      sendJson(response, statusCode >= 400 && statusCode <= 599 ? statusCode : 500, {
         error: error.message
       });
     }

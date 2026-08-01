@@ -120,6 +120,22 @@ export function createRouterServer(
       const url = new URL(req.url || "/", "http://127.0.0.1");
       logAccess(req, url);
       const activeConfig = currentConfig(config);
+      const originPolicy = requestOriginPolicy(req, activeConfig);
+      if (!originPolicy.ok) {
+        jsonResponse(
+          res,
+          403,
+          openAiError(
+            "Browser origin is not allowed to access CodexBridge Router.",
+            403,
+            "origin_not_allowed",
+          ),
+        );
+        return;
+      }
+      if (originPolicy.origin) {
+        applyCorsResponseHeaders(res, originPolicy.origin);
+      }
 
       if (req.method === "OPTIONS") {
         writeCors(res);
@@ -824,7 +840,10 @@ export function createRouterServer(
 }
 
 function localChatHistoryProblem(body, route, history) {
-  if (!body?.previous_response_id || route?.api === "responses") {
+  if (!body?.previous_response_id) {
+    return null;
+  }
+  if (route?.api === "responses" && route?.supportsResponsePreviousId !== false) {
     return null;
   }
   const historyHealth = history?.health?.();
@@ -2879,17 +2898,29 @@ function logAccess(req, url) {
 function authorizeClient(req, config, route) {
   const bearerToken = bearerTokenFromHeader(req.headers.authorization);
   if (!config.authToken) {
-    if (bearerToken) {
+    if (config.clientAuth?.allowUnauthenticatedLoopback === true) {
+      return { ok: true, kind: bearerToken ? "codex_openai" : "none", bearerToken };
+    }
+    if (
+      bearerToken &&
+      (
+        authModeForRoute(route) === "codex_openai" ||
+        (config.mode !== "all_api" && config.clientAuth?.allowOpenAiBearer)
+      )
+    ) {
       return { ok: true, kind: "codex_openai", bearerToken };
     }
-    return { ok: true, kind: "none" };
+    return { ok: false, kind: "missing" };
   }
   if (bearerToken && bearerToken === config.authToken) {
     return { ok: true, kind: "local", bearerToken };
   }
   if (
     bearerToken &&
-    (config.clientAuth?.allowOpenAiBearer || authModeForRoute(route) === "codex_openai")
+    (
+      authModeForRoute(route) === "codex_openai" ||
+      (config.mode !== "all_api" && config.clientAuth?.allowOpenAiBearer)
+    )
   ) {
     return { ok: true, kind: "codex_openai", bearerToken };
   }
@@ -2898,7 +2929,20 @@ function authorizeClient(req, config, route) {
 
 function currentConfig(config) {
   const loadedConfig = config.__path ? loadConfig(config.__path) : config;
-  return applyGlobalRateLimitConfig(normalizeContextPolicyConfig(loadedConfig));
+  return applyGlobalRateLimitConfig(
+    normalizeContextPolicyConfig(resolveRouterAuthToken(loadedConfig)),
+  );
+}
+
+function resolveRouterAuthToken(config = {}) {
+  const authTokenEnv = nonEmptyString(config.authTokenEnv);
+  if (!authTokenEnv) {
+    return config;
+  }
+  return {
+    ...config,
+    authToken: nonEmptyString(process.env[authTokenEnv]),
+  };
 }
 
 function applyGlobalRateLimitConfig(config = {}) {
@@ -2979,9 +3023,42 @@ function handleClientSocketError(error, socket) {
   socket.destroy();
 }
 
+function requestOriginPolicy(req, config = {}) {
+  const rawOrigin = String(req.headers.origin || "").trim();
+  if (!rawOrigin) {
+    return { ok: true, origin: "" };
+  }
+  const origin = normalizedWebOrigin(rawOrigin);
+  if (!origin) {
+    return { ok: false, origin: "" };
+  }
+  const allowedOrigins = Array.isArray(config.clientAuth?.allowedOrigins)
+    ? config.clientAuth.allowedOrigins
+        .map((value) => normalizedWebOrigin(value))
+        .filter(Boolean)
+    : [];
+  return {
+    ok: allowedOrigins.includes(origin),
+    origin,
+  };
+}
+
+function normalizedWebOrigin(value) {
+  try {
+    const origin = new URL(String(value || "").trim()).origin;
+    return origin === "null" ? "" : origin;
+  } catch {
+    return "";
+  }
+}
+
+function applyCorsResponseHeaders(res, origin) {
+  res.setHeader("access-control-allow-origin", origin);
+  res.setHeader("vary", "Origin");
+}
+
 function writeCors(res) {
   res.writeHead(204, {
-    "access-control-allow-origin": "*",
     "access-control-allow-methods": "GET,POST,PATCH,PUT,OPTIONS",
     "access-control-allow-headers": "authorization,content-type",
   });

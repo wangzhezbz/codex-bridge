@@ -128,11 +128,12 @@ function requestScopeKeys(headers, body) {
 }
 
 function clientScopeKeys(headers) {
-  return [
-    scopeKey("thread", headerValue(headers, "x-codex-thread-id")),
-    scopeKey("window", headerValue(headers, "x-codex-window-id")),
-    scopeKey("installation", headerValue(headers, "x-codex-installation-id")),
-  ];
+  const thread = scopeKey("thread", headerValue(headers, "x-codex-thread-id"));
+  if (thread) {
+    return [thread];
+  }
+  const window = scopeKey("window", headerValue(headers, "x-codex-window-id"));
+  return window ? [window] : [];
 }
 
 function modelSettingsResponseId(pathname) {

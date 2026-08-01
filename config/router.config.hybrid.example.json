@@ -2,7 +2,7 @@
   "mode": "hybrid",
   "host": "127.0.0.1",
   "port": 15722,
-  "authToken": "sk-local-codex-router",
+  "authTokenEnv": "CODEXBRIDGE_ROUTER_TOKEN",
   "clientAuth": {
     "allowOpenAiBearer": true
   },
@@ -87,18 +87,16 @@
     {
       "id": "gpt-5.3-codex",
       "displayName": "DeepSeek V4 Flash",
-      "description": "DeepSeek V4 Flash through Chat Completions conversion.",
-      "api": "chat_completions",
-      "baseUrl": "https://api.deepseek.com/v1",
+      "description": "DeepSeek V4 Flash through the native Responses API.",
+      "api": "responses",
+      "baseUrl": "https://api.deepseek.com",
       "model": "deepseek-v4-flash",
       "authMode": "api_key",
       "apiKeyEnv": "DEEPSEEK_API_KEY",
-      "contextWindow": 1000000,
-      "priority": 3,
-      "dropParams": [
-        "response_format",
-        "parallel_tool_calls"
-      ]
+      "contextWindow": 1048576,
+      "supportsResponsePreviousId": false,
+      "supportsFiles": "text-placeholder",
+      "priority": 3
     },
     {
       "id": "gpt-5.2",

@@ -4,6 +4,7 @@ import {
   contextPolicyForRoute as defaultContextPolicyForRoute,
 } from "./context-policy.js";
 import { normalizeAdapterProfile } from "./adapter-profile.js";
+import { stableStringify } from "./stable-json.js";
 
 export const ROUTE_SNAPSHOT_VERSION = 1;
 
@@ -240,19 +241,6 @@ function defaultCompactContractForRoute(route) {
 
 function sameValue(left, right) {
   return stableStringify(left) === stableStringify(right);
-}
-
-function stableStringify(value) {
-  if (value === null || typeof value !== "object") {
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map(stableStringify).join(",")}]`;
-  }
-  return `{${Object.keys(value)
-    .sort()
-    .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)
-    .join(",")}}`;
 }
 
 function invalid(code) {

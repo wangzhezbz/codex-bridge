@@ -10,6 +10,7 @@ import {
   createHistoryRecoveryE2EFixture,
   historyRecoveryFixtureCounts,
 } from "./history-recovery-e2e-fixture.mjs";
+import { assertWindowsPackageFilePaths } from "./package-content-policy.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const appDir = newestPackagedAppDir();
@@ -23,6 +24,7 @@ assert.ok(fs.existsSync(exePath), `missing packaged exe: ${exePath}`);
 assert.ok(fs.existsSync(path.join(appRoot, "src", "server.js")), "missing packaged router script");
 
 try {
+  const packageContent = assertWindowsPackageFilePaths(listRegularFilePaths(appRoot));
   const desktopSmoke = await smokeDesktop(exePath);
   const routerSmoke = await smokeRouter(exePath, appRoot);
   writeSmokeReport({
@@ -31,6 +33,7 @@ try {
     durationMs: Date.now() - smokeStartedAt,
     appPath: appDir,
     exePath,
+    packageContent,
     desktopSmoke,
     routerSmoke,
   });
@@ -47,6 +50,24 @@ try {
 }
 
 console.log(`Packaged smoke passed: ${exePath}`);
+
+function listRegularFilePaths(rootDir) {
+  const pending = [rootDir];
+  const files = [];
+  while (pending.length) {
+    const currentDir = pending.pop();
+    for (const entry of fs.readdirSync(currentDir, { withFileTypes: true })) {
+      const fullPath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        pending.push(fullPath);
+      } else if (entry.isFile()) {
+        files.push(path.relative(rootDir, fullPath).split(path.sep).join("/"));
+      }
+    }
+  }
+  files.sort();
+  return files;
+}
 
 function newestPackagedAppDir() {
   const explicitAppDir = String(process.env.CODEXBRIDGE_PACKAGED_APP_DIR || "").trim();

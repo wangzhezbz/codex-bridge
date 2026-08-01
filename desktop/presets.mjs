@@ -24,6 +24,45 @@ export const PROVIDERS = [
     description: "OpenAI 官方 API。",
   },
   {
+    id: "anthropic",
+    name: "Anthropic Claude",
+    shortName: "Claude",
+    keyEnv: "ANTHROPIC_API_KEY",
+    keyLabel: "Anthropic API Key",
+    keyUrl: "https://console.anthropic.com/settings/keys",
+    docsUrl: "https://platform.claude.com/docs/en/api/messages",
+    baseUrl: "https://api.anthropic.com/v1",
+    api: "anthropic_messages",
+    authMode: "anthropic_api_key",
+    description: "Anthropic Claude native Messages API.",
+  },
+  {
+    id: "xai",
+    name: "xAI Grok",
+    shortName: "Grok",
+    keyEnv: "XAI_API_KEY",
+    keyLabel: "xAI API Key",
+    keyUrl: "https://console.x.ai/",
+    docsUrl: "https://docs.x.ai/developers/",
+    baseUrl: "https://api.x.ai/v1",
+    api: "chat_completions",
+    authMode: "api_key",
+    description: "xAI Grok OpenAI-compatible API.",
+  },
+  {
+    id: "gemini",
+    name: "Google Gemini",
+    shortName: "Gemini",
+    keyEnv: "GEMINI_API_KEY",
+    keyLabel: "Gemini API Key",
+    keyUrl: "https://aistudio.google.com/apikey",
+    docsUrl: "https://ai.google.dev/gemini-api/docs/openai",
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+    api: "chat_completions",
+    authMode: "api_key",
+    description: "Google Gemini OpenAI-compatible API.",
+  },
+  {
     id: "deepseek",
     name: "DeepSeek",
     shortName: "DeepSeek",
@@ -42,10 +81,22 @@ export const PROVIDERS = [
     keyEnv: "MOONSHOT_API_KEY",
     keyLabel: "Kimi API Key",
     keyUrl: "https://platform.kimi.com/console/api-keys",
-    docsUrl: "https://www.kimi.com/code/docs/en/",
+    docsUrl: "https://platform.kimi.com/docs/api/list-models",
     baseUrl: "https://api.moonshot.cn/v1",
     authMode: "api_key",
-    description: "Kimi / Moonshot Open Platform。",
+    description: "Kimi / Moonshot Open Platform API。",
+  },
+  {
+    id: "kimi-code",
+    name: "Kimi Code",
+    shortName: "Kimi Code",
+    keyEnv: "KIMI_CODE_API_KEY",
+    keyLabel: "Kimi Code API Key",
+    keyUrl: "https://platform.kimi.com/console/api-keys",
+    docsUrl: "https://www.kimi.com/code/docs/en/",
+    baseUrl: "https://api.kimi.com/coding/v1",
+    authMode: "api_key",
+    description: "Kimi Code 编程订阅 API，与 Kimi / Moonshot API 独立配置。",
   },
   {
     id: "xiaomi",
@@ -91,7 +142,7 @@ export const PROVIDERS = [
     keyLabel: "Qianfan API Key",
     keyUrl: "https://console.bce.baidu.com/qianfan/ais/console/applicationConsole",
     docsUrl: "https://intl.cloud.baidu.com/en/doc/qianfan/s/qm8qxemze-intl-en",
-    baseUrl: "https://api.baiduqianfan.ai/v1",
+    baseUrl: "https://qianfan.baidubce.com/v2",
     authMode: "api_key",
     description: "Baidu Qianfan OpenAI-compatible API.",
   },
@@ -191,14 +242,28 @@ export const MODEL_PRESETS = [
   route("codex-gpt-5-4-mini", "codex", "GPT-5.4-Mini", "gpt-5.4-mini", "responses", 258400, imageInput()),
   route("openai-gpt-4-1", "openai", "OpenAI GPT-4.1", "gpt-4.1", "responses", 1047576, imageInput()),
   route("openai-gpt-4-1-mini", "openai", "OpenAI GPT-4.1 Mini", "gpt-4.1-mini", "responses", 1047576, imageInput()),
+  route("anthropic-claude-sonnet-4-6", "anthropic", "Claude Sonnet 4.6", "claude-sonnet-4-6", "anthropic_messages", 200000, imageInput({
+    dropParams: ["response_format", "parallel_tool_calls"],
+  })),
+  route("anthropic-claude-opus-4-6", "anthropic", "Claude Opus 4.6", "claude-opus-4-6", "anthropic_messages", 200000, imageInput({
+    dropParams: ["response_format", "parallel_tool_calls"],
+  })),
+  route("xai-grok-4-5", "xai", "Grok 4.5", "grok-4.5", "chat_completions", 500000, imageInput({
+    dropParams: ["response_format", "parallel_tool_calls"],
+  })),
+  route("gemini-3-5-flash", "gemini", "Gemini 3.5 Flash", "gemini-3.5-flash", "chat_completions", 1048576, imageInput({
+    dropParams: ["response_format", "parallel_tool_calls"],
+  })),
+  route("gemini-3-1-flash-lite", "gemini", "Gemini 3.1 Flash Lite", "gemini-3.1-flash-lite", "chat_completions", 1048576, imageInput({
+    dropParams: ["response_format", "parallel_tool_calls"],
+  })),
   route("deepseek-v4-pro", "deepseek", "DeepSeek V4 Pro", "deepseek-v4-pro", "chat_completions", 1000000, {
     dropParams: ["response_format", "parallel_tool_calls"],
   }),
-  route("deepseek-v4-flash", "deepseek", "DeepSeek V4 Flash", "deepseek-v4-flash", "chat_completions", 1000000, {
-    dropParams: ["response_format", "parallel_tool_calls"],
-  }),
-  route("deepseek-r1", "deepseek", "DeepSeek R1", "deepseek-reasoner", "chat_completions", 64000, {
-    dropParams: ["response_format", "parallel_tool_calls"],
+  route("deepseek-v4-flash", "deepseek", "DeepSeek V4 Flash", "deepseek-v4-flash", "responses", 1048576, {
+    baseUrl: "https://api.deepseek.com",
+    supportsFiles: "text-placeholder",
+    supportsResponsePreviousId: false,
   }),
   route("kimi-k2-7-code", "kimi", "Kimi K2.7 Code", "kimi-k2.7-code", "chat_completions", 258400, imageInput({
     dropParams: ["response_format", "parallel_tool_calls"],
@@ -206,6 +271,18 @@ export const MODEL_PRESETS = [
   route("kimi-k2-6", "kimi", "Kimi K2.6", "kimi-k2.6", "chat_completions", 258400, imageInput({
     dropParams: ["response_format", "parallel_tool_calls"],
   })),
+  route("kimi-code-k3", "kimi-code", "Kimi K3", "k3", "chat_completions", 258400, {
+    dropParams: ["response_format", "parallel_tool_calls"],
+  }),
+  route("kimi-code-k3-256k", "kimi-code", "Kimi K3 256K", "k3-256k", "chat_completions", 258400, {
+    dropParams: ["response_format", "parallel_tool_calls"],
+  }),
+  route("kimi-code-for-coding", "kimi-code", "Kimi For Coding", "kimi-for-coding", "chat_completions", 258400, {
+    dropParams: ["response_format", "parallel_tool_calls"],
+  }),
+  route("kimi-code-for-coding-highspeed", "kimi-code", "Kimi For Coding Highspeed", "kimi-for-coding-highspeed", "chat_completions", 258400, {
+    dropParams: ["response_format", "parallel_tool_calls"],
+  }),
   route("xiaomi-mimo-v2-5-pro", "xiaomi", "MiMo V2.5 Pro", "mimo-v2.5-pro", "chat_completions", 258400, imageInput({
     dropParams: ["response_format", "parallel_tool_calls"],
   })),

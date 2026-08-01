@@ -27,6 +27,7 @@ function managedBlock({
   catalogPath = "C:/Temp/codex-catalog.json",
   mode = "hybrid",
   port = 15722,
+  authToken = "sk-local-codex-router",
 } = {}) {
   const providerLines = mode === "all_api"
     ? [
@@ -34,7 +35,7 @@ function managedBlock({
         `model_providers.codexbridge.base_url = "http://127.0.0.1:${port}/v1"`,
         'model_providers.codexbridge.wire_api = "responses"',
         "model_providers.codexbridge.requires_openai_auth = false",
-        'model_providers.codexbridge.http_headers = { Authorization = "Bearer sk-local-codex-router" }',
+        `model_providers.codexbridge.http_headers = { Authorization = "Bearer ${authToken}" }`,
       ]
     : [
         'model_provider = "openai"',
@@ -251,6 +252,7 @@ function validDraftSpec(overrides = {}) {
         configRevision,
         mode,
         port: options.routerPort,
+        authToken: "sk-local-codex-router",
         defaultModel: "cb-route-a",
         models: [
           { id: "cb-route-a", sourcePresetId: selection.selectedModelIds[0] },
@@ -274,6 +276,7 @@ function validDraftSpec(overrides = {}) {
         catalogPath: codexCatalogTarget.replaceAll("\\", "/"),
         mode: routerConfig.mode,
         port: routerConfig.port,
+        authToken: routerConfig.authToken,
       });
     },
     ...overrides,
@@ -651,7 +654,7 @@ test("whole-draft validation enforces the hybrid managed provider contract", () 
   }
 });
 
-test("whole-draft validation requires the fixed local Authorization header only in all_api mode", () => {
+test("whole-draft validation requires the Router-synchronized Authorization header only in all_api mode", () => {
   assert.equal(validateConfigMutationDraft(buildConfigMutationDraft(validDraftSpec({ mode: "all_api" }))), true);
 
   const mutations = [

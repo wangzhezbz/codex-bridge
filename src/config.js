@@ -38,12 +38,12 @@ export function validateConfig(config) {
     if (seen.has(model.id)) {
       throw new Error(`模型 ID 重复：${model.id}`);
     }
-    if (!["responses", "chat_completions"].includes(model.api)) {
+    if (!["responses", "chat_completions", "anthropic_messages"].includes(model.api)) {
       throw new Error(`模型 ${model.id} 使用了不支持的接口类型：${model.api}`);
     }
     if (
       model.authMode &&
-      !["api_key", "codex_openai"].includes(model.authMode)
+      !["api_key", "codex_openai", "anthropic_api_key"].includes(model.authMode)
     ) {
       throw new Error(`模型 ${model.id} 使用了不支持的鉴权模式：${model.authMode}`);
     }

@@ -2,6 +2,7 @@ import { packager } from "@electron/packager";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { WINDOWS_PACKAGE_HARDENING_RULES } from "./package-content-policy.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const packageJson = JSON.parse(
@@ -75,6 +76,7 @@ const appPaths = await packager({
     /^\/config\/router\.config\.json$/,
     /^\/config\/secrets\.local\.json$/,
     /^\/model-catalog\.json$/,
+    ...WINDOWS_PACKAGE_HARDENING_RULES.map((rule) => rule.pattern),
   ],
 });
 

@@ -467,6 +467,43 @@ test("persistent history rejects a missing local chat chain before any upstream 
   }
 });
 
+test("persistent history rejects a missing stateless Responses chain before upstream", async () => {
+  const fixture = historyFixture();
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (_req, res) => {
+    upstreamCalls += 1;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(nativeResponse("resp_must_not_run", "unexpected")));
+  });
+  let router;
+  try {
+    await listen(upstream);
+    const config = mixedRouterConfig("http://127.0.0.1:1", serverUrl(upstream));
+    const route = config.models.find((model) => model.id === "cb-native-history");
+    route.provider = "deepseek";
+    route.model = "deepseek-v4-flash";
+    route.supportsResponsePreviousId = false;
+    config.defaultModel = route.id;
+    router = createRouterServer(config, { historyPath: fixture.historyPath });
+    await listen(router);
+
+    const result = await postResponses(router, {
+      model: route.id,
+      stream: false,
+      previous_response_id: "resp_missing_stateless_history",
+      input: "must not lose context silently",
+    });
+
+    assert.equal(result.status, 409, JSON.stringify(result.body));
+    assert.equal(result.body.error?.code, "local_history_unavailable");
+    assert.equal(upstreamCalls, 0);
+  } finally {
+    await closeIfListening(router);
+    await closeIfListening(upstream);
+    cleanupHistoryFixture(fixture);
+  }
+});
+
 test("persistent history refreshes its sliding TTL on lookup", () => {
   const fixture = historyFixture();
   let now = 10_000;

@@ -19,6 +19,10 @@ const CLI_NOT_FOUND = Object.freeze({
 });
 
 const OFFICIAL_OPENAI_DESKTOP_PUBLISHER_IDS = new Set(["2p2nqsd0c76g0"]);
+const OFFICIAL_OPENAI_DESKTOP_WIN32_APP_IDS = new Set([
+  "com.openai.codex",
+  "com.openai.chatgpt",
+]);
 
 export function locateOpenAIDesktopSync(options = {}) {
   const platform = options?.platform || process.platform;
@@ -411,6 +415,15 @@ function locateCliFromDesktopEntry(entry, {
     return null;
   }
   if (/^shell:/i.test(target)) {
+    if (isOfficialOpenAIDesktopWin32ShellTarget(target)) {
+      return {
+        found: false,
+        cliTarget: "",
+        desktopTarget: target,
+        source: entry.source,
+        kind: "shell_app",
+      };
+    }
     const installLocation = budget.take()
       ? storeInstallLocation(storeResolver(target))
       : "";
@@ -625,6 +638,9 @@ function isSupportedDesktopLaunchTarget(value, platform = process.platform) {
     return false;
   }
   if (/^shell:/i.test(target)) {
+    if (isOfficialOpenAIDesktopWin32ShellTarget(target)) {
+      return true;
+    }
     const match = target.match(
       /^shell:AppsFolder\\OpenAI\.(?:ChatGPT|Codex)(?:-Desktop)?_([^!\\]+)!/i,
     );
@@ -636,6 +652,15 @@ function isSupportedDesktopLaunchTarget(value, platform = process.platform) {
     return baseName === "chatgpt.app" || baseName === "codex.app";
   }
   return baseName === "chatgpt.exe" || baseName === "codex.exe";
+}
+
+function isOfficialOpenAIDesktopWin32ShellTarget(value) {
+  const target = String(value || "").trim();
+  if (!/^shell:AppsFolder\\/i.test(target) || isExcludedDesktopIdentity(target)) {
+    return false;
+  }
+  const appId = target.replace(/^shell:AppsFolder\\/i, "").trim().toLowerCase();
+  return OFFICIAL_OPENAI_DESKTOP_WIN32_APP_IDS.has(appId);
 }
 
 function desktopIdentityPriority(value) {

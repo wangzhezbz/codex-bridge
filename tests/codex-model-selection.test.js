@@ -61,6 +61,86 @@ test("explicit model settings repair only stale reconnects in the same Codex thr
   assert.equal(otherThreadBody.model, "kimi-k2-6");
 });
 
+test("explicit model settings do not leak across Codex tasks that share an installation", () => {
+  const state = createCodexModelSelectionState();
+  const configuredModelIds = ["kimi-k2-6", "gpt-5.6-sol"];
+  const firstTaskHeaders = {
+    "x-codex-thread-id": "thread-installation-first",
+    "x-codex-window-id": "window-installation-first",
+    "x-codex-installation-id": "shared-installation",
+    "x-codex-turn-state": "reconnecting",
+  };
+  const secondTaskHeaders = {
+    "x-codex-thread-id": "thread-installation-second",
+    "x-codex-window-id": "window-installation-second",
+    "x-codex-installation-id": "shared-installation",
+    "x-codex-turn-state": "reconnecting",
+  };
+
+  state.applyToRequest({
+    headers: firstTaskHeaders,
+    body: { model: "kimi-k2-6" },
+    configuredModelIds,
+  });
+  state.recordModelSetting({
+    headers: firstTaskHeaders,
+    pathname: "/v1/responses",
+    body: { model: "gpt-5.6-sol" },
+  });
+
+  const secondTaskBody = {
+    model: "kimi-k2-6",
+    previous_response_id: "resp_second_task",
+  };
+  const result = state.applyToRequest({
+    headers: secondTaskHeaders,
+    body: secondTaskBody,
+    configuredModelIds,
+  });
+
+  assert.equal(result.changed, false);
+  assert.equal(secondTaskBody.model, "kimi-k2-6");
+});
+
+test("explicit model settings do not leak across Codex threads in the same window", () => {
+  const state = createCodexModelSelectionState();
+  const configuredModelIds = ["deepseek-v4-pro", "gpt-5.6-sol"];
+  const firstTaskHeaders = {
+    "x-codex-thread-id": "thread-window-first",
+    "x-codex-window-id": "shared-window",
+    "x-codex-turn-state": "reconnecting",
+  };
+  const secondTaskHeaders = {
+    "x-codex-thread-id": "thread-window-second",
+    "x-codex-window-id": "shared-window",
+    "x-codex-turn-state": "reconnecting",
+  };
+
+  state.applyToRequest({
+    headers: firstTaskHeaders,
+    body: { model: "deepseek-v4-pro" },
+    configuredModelIds,
+  });
+  state.recordModelSetting({
+    headers: firstTaskHeaders,
+    pathname: "/v1/responses",
+    body: { model: "gpt-5.6-sol" },
+  });
+
+  const secondTaskBody = {
+    model: "deepseek-v4-pro",
+    previous_response_id: "resp_same_window_other_thread",
+  };
+  const result = state.applyToRequest({
+    headers: secondTaskHeaders,
+    body: secondTaskBody,
+    configuredModelIds,
+  });
+
+  assert.equal(result.changed, false);
+  assert.equal(secondTaskBody.model, "deepseek-v4-pro");
+});
+
 test("explicit model settings do not rewrite a normal new request", () => {
   const state = createCodexModelSelectionState();
   const headers = { "x-codex-thread-id": "thread-normal-new-request" };

@@ -128,6 +128,10 @@ test("desktop-only discovery accepts supported exe, app, Store, and resolved sho
     shellAppCandidates: [storeTarget],
     resolveStoreInstall: () => "C:\\Store\\ChatGPT",
   }).launchTarget, storeTarget);
+  const registeredWin32Target = "shell:AppsFolder\\com.openai.codex";
+  assert.equal(locateDesktop({
+    shellAppCandidates: [registeredWin32Target],
+  }).launchTarget, registeredWin32Target);
   assert.equal(locateDesktop({
     shellAppCandidates: ["shell:AppsFolder\\OpenAI.ChatGPT_untrusted!App"],
     resolveStoreInstall: () => "",

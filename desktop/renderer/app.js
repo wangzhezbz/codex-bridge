@@ -788,6 +788,9 @@ const els = {
   doubleQuotaExtensionPath: document.querySelector("#doubleQuotaExtensionPath"),
   doubleQuotaExtensionStatus: document.querySelector("#doubleQuotaExtensionStatus"),
   doubleQuotaExtensionState: document.querySelector("#doubleQuotaExtensionState"),
+  doubleQuotaExtensionDiskState: document.querySelector("#doubleQuotaExtensionDiskState"),
+  doubleQuotaExtensionBrowserState: document.querySelector("#doubleQuotaExtensionBrowserState"),
+  doubleQuotaExtensionRuntimeState: document.querySelector("#doubleQuotaExtensionRuntimeState"),
   saveDoubleQuotaPort: document.querySelector("#saveDoubleQuotaPort"),
   startDoubleQuota: document.querySelector("#startDoubleQuota"),
   stopDoubleQuota: document.querySelector("#stopDoubleQuota"),
@@ -960,7 +963,6 @@ els.openDoubleQuota?.addEventListener("click", (event) =>
 
 els.manageDoubleQuotaExtension?.addEventListener("click", (event) =>
   runAction(event.currentTarget, async () => {
-    const requestedAction = doubleQuotaState?.extensionAction?.id || "install";
     doubleQuotaState = await api.manageDoubleQuotaExtension();
     renderDoubleQuota();
     if (doubleQuotaState.extensionUpdate?.status === "failed") {
@@ -968,22 +970,13 @@ els.manageDoubleQuotaExtension?.addEventListener("click", (event) =>
         doubleQuotaState.extensionUpdate.error || "Chrome 扩展更新失败，请稍后重试。",
       );
     }
-    if (doubleQuotaState.extensionUpdate?.manualReloadRequired) {
-      if (requestedAction === "reinstall") {
-        await api.copyText(doubleQuotaState.extensionDir);
-        await api.openDoubleQuotaExtensionManager();
-      } else if (requestedAction === "install") {
-        await api.openFolder(doubleQuotaState.extensionDir);
-      }
-      showToast(requestedAction === "reinstall"
-        ? "Chrome 未提供旧扩展目录。请移除旧扩展，再加载刚打开的固定安装目录。"
-        : requestedAction === "install"
-          ? "新版扩展已复制，请在 Chrome 中加载上面的稳定目录。"
-          : "新版文件已覆盖到 Chrome 实际加载目录；请点击旁边的“打开扩展管理”后手动重新加载。",
-      );
-    } else {
-      showToast("扩展已更新并重新连接。无需手动操作。");
-    }
+    await api.copyText(doubleQuotaState.extensionDir);
+    await api.openDoubleQuotaExtensionManager();
+    showToast(
+      doubleQuotaState.extensionBrowser?.registeredStable
+        ? "扩展文件已安装并校验。请在 Chrome 扩展页点击该扩展的“重新加载”。"
+        : "扩展文件已安装并校验，目录已复制。请在 Chrome 扩展页加载该目录。",
+    );
     await refreshDoubleQuotaState();
   }),
 );
@@ -992,7 +985,7 @@ els.openDoubleQuotaExtensionManager?.addEventListener("click", (event) =>
   runAction(event.currentTarget, async () => {
     doubleQuotaState = await api.openDoubleQuotaExtensionManager();
     renderDoubleQuota();
-    showToast("扩展管理地址已复制。如果打开空白页，请粘贴到 Chrome 地址栏并回车。");
+    showToast("已打开 Chrome 扩展管理页；地址也已复制，可直接粘贴到地址栏。");
   }),
 );
 
@@ -2082,45 +2075,68 @@ function renderDoubleQuota() {
   if (document.activeElement !== els.doubleQuotaPort && current.port) {
     els.doubleQuotaPort.value = String(current.port);
   }
-  const loadedExtensionDir = current.extensionLoadedDirs?.[0] || "";
+  const extensionDisk = current.extensionDisk || {};
+  const extensionBrowser = current.extensionBrowser || {};
+  const extensionRuntime = current.extensionRuntime || {};
   const extensionDisplayVersion = String(current.extensionDisplayVersion || current.extensionManifestVersion || "").trim();
-  els.doubleQuotaExtensionPath.textContent = loadedExtensionDir || (current.extensionReady
-    ? current.extensionDir
-    : current.extensionDir || "尚未准备稳定扩展目录");
+  els.doubleQuotaExtensionPath.textContent = current.extensionDir || "尚未准备固定安装目录";
   const extensionAction = current.extensionAction || {};
-  const extensionDiagnostics = current.extensionDiagnostics || {};
   if (els.doubleQuotaExtensionState) {
-    const extensionCurrent = extensionAction.id === "current";
-    const extensionOld = Boolean(extensionDiagnostics.version) && !extensionCurrent;
-    els.doubleQuotaExtensionState.textContent = extensionCurrent
-      ? "新版已连接"
-      : extensionOld
-        ? "旧版未生效"
+    els.doubleQuotaExtensionState.textContent = extensionRuntime.connected
+      ? "已连接"
+      : extensionDisk.verified
+        ? "文件已安装"
         : "尚未安装";
-    els.doubleQuotaExtensionState.classList.toggle("muted", !extensionCurrent && !extensionOld);
-    els.doubleQuotaExtensionState.classList.toggle("failed", extensionOld);
+    els.doubleQuotaExtensionState.classList.toggle("muted", !extensionRuntime.connected);
+    els.doubleQuotaExtensionState.classList.toggle(
+      "failed",
+      extensionDisk.status === "incomplete" || extensionRuntime.stale === true,
+    );
   }
+  setDoubleQuotaExtensionLayerState(
+    els.doubleQuotaExtensionDiskState,
+    extensionDisk.verified ? "已安装并校验" : extensionDisk.status === "incomplete" ? "文件不完整" : "尚未安装",
+    { muted: !extensionDisk.verified, failed: extensionDisk.status === "incomplete" },
+  );
+  setDoubleQuotaExtensionLayerState(
+    els.doubleQuotaExtensionBrowserState,
+    extensionBrowser.registeredStable
+      ? "已加载固定目录"
+      : extensionBrowser.status === "registered_other_path"
+        ? "仍加载旧目录"
+        : "等待 Chrome 加载",
+    {
+      muted: !extensionBrowser.registeredStable,
+      failed: extensionBrowser.status === "registered_other_path",
+    },
+  );
+  setDoubleQuotaExtensionLayerState(
+    els.doubleQuotaExtensionRuntimeState,
+    extensionRuntime.connected ? "已连接" : extensionRuntime.stale ? "版本待刷新" : "尚未连接",
+    { muted: !extensionRuntime.connected, failed: extensionRuntime.stale === true },
+  );
   if (els.manageDoubleQuotaExtension) {
     els.manageDoubleQuotaExtension.textContent = extensionAction.label || "安装扩展";
     els.manageDoubleQuotaExtension.disabled = extensionAction.complete === true;
   }
   if (els.doubleQuotaExtensionStatus) {
     const deploymentVerified = current.extensionDeployment?.verified === true;
-    const statusMessage = extensionAction.id === "current"
+    const statusMessage = extensionRuntime.connected
       ? "扩展已连接，可以正常使用。"
-      : extensionAction.id === "reinstall"
-        ? "Chrome 仍在使用旧版扩展。点击“安装新版扩展”，然后按页面提示重新加载一次。"
-        : extensionAction.id === "update"
-          ? "新版扩展文件已准备好，请在 Chrome 扩展页点击“重新加载”。"
-          : extensionAction.id === "repair"
-            ? "扩展没有连接，请确认扩展已启用，然后重新检测。"
-            : deploymentVerified
-              ? "扩展文件已准备好，请在 Chrome 中完成安装。"
-              : "正在准备扩展文件。";
+      : extensionRuntime.stale
+        ? "Chrome 中的扩展版本未刷新，请在扩展页点击“重新加载”。"
+        : extensionBrowser.registeredStable
+          ? "Chrome 已加载固定目录，但服务尚未收到连接；请确认扩展已启用并重新加载。"
+          : deploymentVerified
+            ? "扩展文件已安装并校验，等待在 Chrome 中加载。"
+            : "点击安装扩展，程序会部署并校验内置文件。";
     els.doubleQuotaExtensionStatus.textContent = extensionDisplayVersion
       ? `内置扩展 ${extensionDisplayVersion}。${statusMessage}`
       : statusMessage;
-    els.doubleQuotaExtensionStatus.classList.toggle("failed", extensionAction.complete !== true);
+    els.doubleQuotaExtensionStatus.classList.toggle(
+      "failed",
+      extensionDisk.status === "incomplete" || extensionRuntime.stale === true,
+    );
   }
   els.doubleQuotaMessage.textContent = current.error || current.message ||
     (current.externalProcess
@@ -2132,6 +2148,16 @@ function renderDoubleQuota() {
   els.stopDoubleQuota.textContent = current.running ? "停止服务" : "服务已停止";
   els.openDoubleQuota.disabled = !current.running;
   els.saveDoubleQuotaPort.disabled = Boolean(current.running);
+}
+
+function setDoubleQuotaExtensionLayerState(element, text, {
+  muted = false,
+  failed = false,
+} = {}) {
+  if (!element) return;
+  element.textContent = text;
+  element.classList.toggle("muted", muted);
+  element.classList.toggle("failed", failed);
 }
 
 function renderCodexAuxiliaryTaskSettings() {

@@ -105,8 +105,13 @@ model_providers.codexbridge.name = "CodexBridge"
 model_providers.codexbridge.base_url = "http://127.0.0.1:15722/v1"
 model_providers.codexbridge.wire_api = "responses"
 model_providers.codexbridge.requires_openai_auth = false
-model_providers.codexbridge.http_headers = { Authorization = "Bearer sk-local-codex-router" }
+model_providers.codexbridge.http_headers = { Authorization = "Bearer <same-random-token-as-router-config>" }
 ```
+
+The desktop manager generates this local Router token automatically. When running from
+source with the example config, set `CODEXBRIDGE_ROUTER_TOKEN` to a random value and use
+that same value in the Codex provider header. Requests fail closed when the variable is
+missing.
 
 ### Hybrid / 混合模式
 

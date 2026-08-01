@@ -115,6 +115,25 @@ export function createRouterLifecycleController(dependencies = {}) {
     }
   }
 
+  async function cleanupManagedConfigOrThrow(reason) {
+    try {
+      return await deps.cleanupManagedConfig({ reason });
+    } catch (error) {
+      try {
+        await deps.onInternalError(error, "managed_cleanup");
+      } catch {
+        // Cleanup diagnostics must never hide the lifecycle safety failure.
+      }
+      const cleanupError = lifecycleError(
+        "ROUTER_CONFIG_CLEANUP_FAILED",
+        "Router managed configuration cleanup failed; Router was kept running to avoid a dead local route.",
+      );
+      cleanupError.cause = error;
+      cleanupError.causeCode = safeCauseCode(error?.causeCode || error?.code);
+      throw cleanupError;
+    }
+  }
+
   async function runStart(token, options) {
     let prepared = null;
     let child = null;
@@ -203,29 +222,35 @@ export function createRouterLifecycleController(dependencies = {}) {
     } catch (error) {
       phase = "start_failed";
       const rollbackErrors = [];
-      if (child && !hasProcessExited(child)) {
-        try {
-          await deps.terminateProcess(child, { reason: "start_failed" });
-        } catch (stopError) {
-          rollbackErrors.push({ phase: "process_stop", error: stopError });
-        }
-      }
-      if (child && hasProcessExited(child)) {
-        clearActiveProcess(child);
-      }
-      if (executorEnsureAttempted && !executorWasRunning) {
-        try {
-          await deps.stopLocalExecutor({ reason: "start_failed" });
-        } catch (executorError) {
-          rollbackErrors.push({ phase: "executor_stop", error: executorError });
-        }
-      }
+      let managedConfigRestored = !prepared;
       if (prepared) {
         try {
           await deps.cleanupManagedConfig({ reason: "start_failed" });
+          managedConfigRestored = true;
         } catch (cleanupError) {
           rollbackErrors.push({ phase: "managed_cleanup", error: cleanupError });
         }
+      }
+      if (managedConfigRestored) {
+        if (child && !hasProcessExited(child)) {
+          try {
+            await deps.terminateProcess(child, { reason: "start_failed" });
+          } catch (stopError) {
+            rollbackErrors.push({ phase: "process_stop", error: stopError });
+          }
+        }
+        if (child && hasProcessExited(child)) {
+          clearActiveProcess(child);
+        }
+        if (!activeProcess && executorEnsureAttempted && !executorWasRunning) {
+          try {
+            await deps.stopLocalExecutor({ reason: "start_failed" });
+          } catch (executorError) {
+            rollbackErrors.push({ phase: "executor_stop", error: executorError });
+          }
+        }
+      } else if (child && hasProcessExited(child)) {
+        clearActiveProcess(child);
       }
       phase = activeProcess ? "stop_failed" : "stopped";
       safeInvoke(deps.onStartFailed, error, { rollbackErrors, options });
@@ -248,27 +273,7 @@ export function createRouterLifecycleController(dependencies = {}) {
     const previousPhase = phase;
     phase = "stopping";
     try {
-      let cleanup;
-      let warning = null;
-      try {
-        cleanup = await deps.cleanupManagedConfig({ reason: options.source || "stop" });
-      } catch (error) {
-        try {
-          await deps.onInternalError(error, "managed_cleanup");
-        } catch {
-          // Cleanup diagnostics must not block an explicit Router stop.
-        }
-        cleanup = {
-          ok: false,
-          removed: false,
-          reason: "cleanup_failed",
-          causeCode: safeCauseCode(error?.causeCode || error?.code),
-        };
-        warning = {
-          code: "managed_config_cleanup_failed",
-          causeCode: cleanup.causeCode,
-        };
-      }
+      const cleanup = await cleanupManagedConfigOrThrow(options.source || "stop");
       const child = activeProcess;
       if (child) {
         await deps.terminateProcess(child, { reason: "stop" });
@@ -282,8 +287,8 @@ export function createRouterLifecycleController(dependencies = {}) {
       }
       await deps.stopLocalExecutor({ reason: "stop" });
       phase = "stopped";
-      await runBestEffort(deps.publishStopped, "publish_stopped", { cleanup, warning, options });
-      return { ok: true, cleanup, warning };
+      await runBestEffort(deps.publishStopped, "publish_stopped", { cleanup, options });
+      return { ok: true, cleanup, warning: null };
     } catch (error) {
       phase = activeProcess
         ? previousPhase === "running" ? "running" : "stop_failed"
@@ -296,29 +301,9 @@ export function createRouterLifecycleController(dependencies = {}) {
     phase = "quit_cleanup";
     try {
       const cleanupPromise = Promise.resolve().then(() =>
-        deps.cleanupManagedConfig({ reason: options.reason || "quit" })
+        cleanupManagedConfigOrThrow(options.reason || "quit")
       );
-      let cleanup;
-      let warning = null;
-      try {
-        cleanup = await awaitCleanupWithTimeoutNotice(cleanupPromise, options);
-      } catch (error) {
-        try {
-          await deps.onInternalError(error, "managed_cleanup");
-        } catch {
-          // Cleanup diagnostics must not block an explicit application quit.
-        }
-        cleanup = {
-          ok: false,
-          removed: false,
-          reason: "cleanup_failed",
-          causeCode: safeCauseCode(error?.causeCode || error?.code),
-        };
-        warning = {
-          code: "managed_config_cleanup_failed",
-          causeCode: cleanup.causeCode,
-        };
-      }
+      const cleanup = await awaitCleanupWithTimeoutNotice(cleanupPromise, options);
       const child = activeProcess;
       if (child) {
         await deps.terminateProcess(child, { reason: "quit" });
@@ -332,9 +317,9 @@ export function createRouterLifecycleController(dependencies = {}) {
       }
       await deps.stopLocalExecutor({ reason: "quit" });
       phase = "quit_ready";
-      await deps.onQuitReady({ cleanup, warning, options });
-      await deps.quitApp({ cleanup, warning, options });
-      return { ok: true, cleanup, warning };
+      await deps.onQuitReady({ cleanup, options });
+      await deps.quitApp({ cleanup, options });
+      return { ok: true, cleanup, warning: null };
     } catch (error) {
       phase = activeProcess ? "running" : "stopped";
       safeInvoke(deps.onQuitFailed, error, options);

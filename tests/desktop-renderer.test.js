@@ -33,6 +33,9 @@ test("double quota is a dedicated desktop page backed by narrow IPC methods", ()
     "doubleQuotaServiceTitle",
     "doubleQuotaServiceDetail",
     "doubleQuotaExtensionState",
+    "doubleQuotaExtensionDiskState",
+    "doubleQuotaExtensionBrowserState",
+    "doubleQuotaExtensionRuntimeState",
     "doubleQuotaPort",
     "saveDoubleQuotaPort",
     "startDoubleQuota",
@@ -69,13 +72,15 @@ test("double quota is a dedicated desktop page backed by narrow IPC methods", ()
   assert.match(rendererSource, /extensionProtocolVersion/);
   assert.match(rendererSource, /extensionAction\.label/);
   assert.match(rendererSource, /api\.manageDoubleQuotaExtension\(\)/);
-  assert.match(rendererSource, /extensionLoadedDirs\?\.\[0\]/);
+  assert.match(rendererSource, /current\.extensionDisk/);
+  assert.match(rendererSource, /current\.extensionBrowser/);
+  assert.match(rendererSource, /current\.extensionRuntime/);
   assert.match(rendererSource, /doubleQuotaServiceBanner\.classList\.toggle\("running"/);
   assert.match(rendererSource, /doubleQuotaServiceTitle\.textContent/);
   assert.match(rendererSource, /doubleQuotaServiceDetail\.textContent/);
   assert.match(rendererSource, /extensionDeployment\?\.verified/);
-  assert.match(rendererSource, /doubleQuotaExtensionState\.textContent[\s\S]*?"新版已连接"/);
-  assert.match(rendererSource, /doubleQuotaExtensionState\.textContent[\s\S]*?"旧版未生效"/);
+  assert.match(rendererSource, /doubleQuotaExtensionState\.textContent[\s\S]*?"已连接"/);
+  assert.match(rendererSource, /doubleQuotaExtensionState\.textContent[\s\S]*?"文件已安装"/);
   assert.match(rendererSource, /current\.extensionDisplayVersion/);
   assert.doesNotMatch(rendererSource, /管理链路|extensionManagerRevision/);
   assert.doesNotMatch(rendererSource, /extensionDeployment\.updatedAt/);
@@ -85,11 +90,12 @@ test("double quota is a dedicated desktop page backed by narrow IPC methods", ()
     rendererSource.indexOf('els.manageDoubleQuotaExtension?.addEventListener'),
     rendererSource.indexOf('els.openDoubleQuotaExtensionManager?.addEventListener'),
   );
-  assert.match(extensionUpdateHandler, /requestedAction === "reinstall"[\s\S]*api\.copyText\(doubleQuotaState\.extensionDir\)/);
-  assert.match(extensionUpdateHandler, /requestedAction === "reinstall"[\s\S]*api\.openDoubleQuotaExtensionManager\(\)/);
+  assert.match(extensionUpdateHandler, /api\.copyText\(doubleQuotaState\.extensionDir\)[\s\S]*api\.openDoubleQuotaExtensionManager\(\)/);
+  assert.doesNotMatch(extensionUpdateHandler, /requestedAction === "reinstall"/);
   assert.match(extensionUpdateHandler, /extensionUpdate\?\.status === "failed"[\s\S]*throw new Error/);
   assert.match(mainSource, /App Paths\\\\chrome\.exe/);
-  assert.match(mainSource, /\["--new-window", "chrome:\/\/extensions\/"\]/);
+  assert.match(mainSource, /const chromeArgs = \["chrome:\/\/extensions\/"\]/);
+  assert.doesNotMatch(mainSource, /"--new-window", "chrome:\/\/extensions\/"/);
   assert.match(mainSource, /clipboard\.writeText\("chrome:\/\/extensions\/"\)/);
   assert.match(
     rendererSource,

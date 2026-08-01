@@ -11,6 +11,7 @@ const API_MODEL_ID = "deepseek-v4-pro";
 const API_ROUTE_ID = "cb-deepseek-v4-pro";
 const SUBSCRIPTION_MODEL_ID = "codex-gpt-5-5";
 const SUBSCRIPTION_ROUTE_ID = "cb-gpt-5-5";
+const ROUTER_AUTH_TOKEN = "cbr_00000000000000000000000000000000";
 
 function makeWorkspace(label) {
   const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), `codexbridge-mode-${label}-root-`));
@@ -55,6 +56,7 @@ function seedCommittedState(workspace, {
   fs.writeFileSync(targets.routerConfigPath, jsonText({
     mode,
     configRevision: revision,
+    authToken: ROUTER_AUTH_TOKEN,
     defaultModel: routeIds[0],
     models: selectedModelIds.map((sourcePresetId, index) => ({
       id: routeIds[index],
@@ -70,6 +72,7 @@ function seedCommittedState(workspace, {
     homeDir,
     mode,
     model: routeIds[0],
+    authToken: ROUTER_AUTH_TOKEN,
   });
   fs.writeFileSync(
     targets.codexConfigPath,
@@ -185,10 +188,14 @@ test("hybrid to all-api commits four consistent targets with one published revis
     revision: result.revision,
   });
   assert.match(state.toml, /model_providers\.codexbridge\.requires_openai_auth = false/);
+  assert.match(state.routerConfig.authToken, /^cbr_[a-f0-9]{32}$/);
   assert.match(
     state.toml,
-    /model_providers\.codexbridge\.http_headers = \{ Authorization = "Bearer sk-local-codex-router" \}/,
+    new RegExp(
+      `model_providers\\.codexbridge\\.http_headers = \\{ Authorization = "Bearer ${state.routerConfig.authToken}" \\}`,
+    ),
   );
+  assert.doesNotMatch(state.toml, /sk-local-codex-router/);
 });
 
 test("all-api to hybrid preserves the OpenAI history namespace and proxies its base URL", async () => {

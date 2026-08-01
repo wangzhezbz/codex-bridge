@@ -70,7 +70,7 @@ test("process exit before health is final rejects start without publish or watch
   health.resolve({ ok: true });
 });
 
-test("stop cleanup failure cannot block confirmed Router shutdown", async () => {
+test("stop cleanup failure keeps Router alive and reports a retryable lifecycle error", async () => {
   const child = new FakeChild({
     onKill: (target) => queueMicrotask(() => target.exitNow(0)),
   });
@@ -92,15 +92,19 @@ test("stop cleanup failure cannot block confirmed Router shutdown", async () => 
   });
 
   await harness.controller.start();
-  const stopped = await harness.controller.stop({ source: "test" });
+  await assert.rejects(
+    harness.controller.stop({ source: "test" }),
+    (error) => {
+      assert.equal(error.code, "ROUTER_CONFIG_CLEANUP_FAILED");
+      assert.equal(error.causeCode, "ebusy");
+      return true;
+    },
+  );
 
-  assert.equal(stopped.ok, true);
-  assert.equal(stopped.cleanup.ok, false);
-  assert.equal(stopped.cleanup.causeCode, "ebusy");
-  assert.equal(stopped.warning.code, "managed_config_cleanup_failed");
-  assert.equal(child.killCalls.length, 1);
-  assert.equal(publishStopped, 1);
-  assert.equal(harness.controller.snapshot().hasProcess, false);
+  assert.equal(child.killCalls.length, 0);
+  assert.equal(publishStopped, 0);
+  assert.equal(harness.controller.snapshot().phase, "running");
+  assert.equal(harness.controller.snapshot().hasProcess, true);
   assert.deepEqual(internalErrors, ["managed_cleanup:config_transaction_failed"]);
 });
 
@@ -196,6 +200,60 @@ test("ready publication failure cannot tear down a healthy Router", async () => 
   assert.equal(harness.controller.snapshot().hasProcess, true);
   assert.equal(child.killCalls.length, 0);
   assert.deepEqual(internalErrors, ["publish_ready:injected ready publication failure"]);
+});
+
+test("failed start restores managed configuration before stopping its child and executor", async () => {
+  const child = new FakeChild();
+  const events = [];
+  const harness = createHarness({
+    spawnRouter: () => child,
+    checkHealth: async () => ({ ok: false, message: "injected unhealthy child" }),
+    cleanupManagedConfig: async () => {
+      events.push("cleanup");
+      return { removed: true };
+    },
+    terminateProcess: async (target) => {
+      events.push("process-stop");
+      target.exitNow(0);
+    },
+    stopLocalExecutor: async () => events.push("executor-stop"),
+  });
+
+  await assert.rejects(harness.controller.start(), { code: "ROUTER_START_HEALTH_FAILED" });
+
+  assert.deepEqual(events, ["cleanup", "process-stop", "executor-stop"]);
+  assert.equal(harness.controller.snapshot().phase, "stopped");
+  assert.equal(harness.controller.snapshot().hasProcess, false);
+});
+
+test("failed start keeps its live child and executor when managed configuration cannot be restored", async () => {
+  const child = new FakeChild();
+  const events = [];
+  const harness = createHarness({
+    spawnRouter: () => child,
+    checkHealth: async () => ({ ok: false, message: "injected unhealthy child" }),
+    cleanupManagedConfig: async () => {
+      events.push("cleanup");
+      throw Object.assign(new Error("injected cleanup failure"), {
+        code: "config_transaction_failed",
+      });
+    },
+    terminateProcess: async () => events.push("process-stop"),
+    stopLocalExecutor: async () => events.push("executor-stop"),
+  });
+
+  await assert.rejects(
+    harness.controller.start(),
+    (error) => {
+      assert.equal(error.code, "ROUTER_START_ROLLBACK_FAILED");
+      assert.deepEqual(error.rollbackPhases, ["managed_cleanup"]);
+      return true;
+    },
+  );
+
+  assert.deepEqual(events, ["cleanup"]);
+  assert.equal(harness.controller.snapshot().phase, "stop_failed");
+  assert.equal(harness.controller.snapshot().hasProcess, true);
 });
 
 test("a failed start rollback cannot spawn a second Router while the first child is still alive", async () => {
@@ -353,7 +411,7 @@ test("quit timeout keeps Router alive, then late cleanup success completes stop 
   assert.deepEqual(events, ["timeout", "ready-to-quit", "quit"]);
 });
 
-test("quit cleanup rejection becomes a warning and still terminates Router and exits", async () => {
+test("quit cleanup rejection cancels exit and keeps Router alive", async () => {
   const child = new FakeChild({
     onKill: (target) => queueMicrotask(() => target.exitNow(0)),
   });
@@ -371,17 +429,20 @@ test("quit cleanup rejection becomes a warning and still terminates Router and e
   });
 
   await harness.controller.start();
-  const result = await harness.controller.quit({ reason: "test" });
-  assert.equal(result.ok, true);
-  assert.equal(result.cleanup.ok, false);
-  assert.equal(result.warning.code, "managed_config_cleanup_failed");
-  assert.equal(result.warning.causeCode, "cleanup_rejected");
-  assert.equal(child.killCalls.length, 1);
-  assert.equal(harness.controller.snapshot().hasProcess, false);
+  await assert.rejects(
+    harness.controller.quit({ reason: "test" }),
+    (error) => {
+      assert.equal(error.code, "ROUTER_CONFIG_CLEANUP_FAILED");
+      assert.equal(error.causeCode, "cleanup_rejected");
+      return true;
+    },
+  );
+  assert.equal(child.killCalls.length, 0);
+  assert.equal(harness.controller.snapshot().phase, "running");
+  assert.equal(harness.controller.snapshot().hasProcess, true);
   assert.deepEqual(events, [
     "managed_cleanup:CLEANUP_REJECTED",
-    "ready:managed_config_cleanup_failed:cleanup_rejected",
-    "quit",
+    "failed:ROUTER_CONFIG_CLEANUP_FAILED",
   ]);
 });
 

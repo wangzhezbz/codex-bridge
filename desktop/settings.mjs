@@ -19,10 +19,10 @@ import {
   runCapabilityProxy,
 } from "../src/capability-proxy.js";
 import { buildModelCatalog } from "../src/model-catalog.js";
-import { proxySettingsForUrl } from "../src/proxy.js";
+import { fetchInitWithProxy, proxySettingsForUrl } from "../src/proxy.js";
 import { routeDecisionSummaryForLog } from "../src/route-trace.js";
 import {
-  CODEX_BRIDGE_LOCAL_AUTH_TOKEN,
+  CODEX_BRIDGE_LEGACY_LOCAL_AUTH_TOKEN,
   CODEX_BRIDGE_PROVIDER_ID,
   codexBridgeProviderIdForMode,
   codexBridgeProviderTomlLinesForMode,
@@ -10418,7 +10418,23 @@ export function readProviderOverrides(rootDir) {
   for (const [providerId, value] of Object.entries(source)) {
     const normalized = normalizeProviderOverride(value);
     if (normalized) {
-      overrides[providerId] = normalized;
+      const legacyKimiCode = isLegacyKimiCodeProvider(providerId, normalized);
+      const targetProviderId = legacyKimiCode ? "kimi-code" : providerId;
+      if (legacyKimiCode && overrides[targetProviderId]) {
+        continue;
+      }
+      overrides[targetProviderId] = legacyKimiCode
+        ? {
+            ...normalized,
+            id: "kimi-code",
+            name: normalized.name === "Kimi" ? "Kimi Code" : normalized.name,
+            shortName: normalized.shortName === "Kimi" ? "Kimi Code" : normalized.shortName,
+            keyEnv: "KIMI_CODE_API_KEY",
+            keyLabel: normalized.keyLabel === "Kimi API Key"
+              ? "Kimi Code API Key"
+              : normalized.keyLabel,
+          }
+        : normalized;
     }
   }
   return overrides;
@@ -10726,10 +10742,10 @@ function normalizeProviderOverride(input = {}) {
       }
     }
   }
-  if (input.api === "responses" || input.api === "chat_completions") {
+  if (["responses", "chat_completions", "anthropic_messages"].includes(input.api)) {
     result.api = input.api;
   }
-  if (input.authMode === "codex_openai" || input.authMode === "api_key") {
+  if (["codex_openai", "api_key", "anthropic_api_key"].includes(input.authMode)) {
     result.authMode = input.authMode;
   }
   if (typeof input.custom === "boolean") {
@@ -10739,6 +10755,40 @@ function normalizeProviderOverride(input = {}) {
     result.updatedAt = input.updatedAt.trim();
   }
   return Object.keys(result).length ? result : null;
+}
+
+function isKimiCodeBaseUrl(value) {
+  const source = String(value || "").trim();
+  if (!source) {
+    return false;
+  }
+  try {
+    const parsed = new URL(source);
+    return parsed.protocol === "https:"
+      && parsed.hostname.toLowerCase() === "api.kimi.com"
+      && parsed.pathname.replace(/\/+$/, "").toLowerCase() === "/coding/v1";
+  } catch {
+    return false;
+  }
+}
+
+function isLegacyKimiCodeProvider(providerId, value = {}) {
+  return String(providerId || value?.id || "").trim() === "kimi"
+    && isKimiCodeBaseUrl(value?.baseUrl);
+}
+
+function legacyKimiCodeProviderOverride(rootDir) {
+  const saved = readJsonIfExists(providerOverridesPath(rootDir), {});
+  const source = saved?.providers && typeof saved.providers === "object"
+    ? saved.providers
+    : saved;
+  if (!source || typeof source !== "object" || Array.isArray(source)) {
+    return null;
+  }
+  const legacy = normalizeProviderOverride(source.kimi);
+  return legacy && isLegacyKimiCodeProvider("kimi", legacy)
+    ? legacy
+    : null;
 }
 
 function applyProviderOverride(provider, override) {
@@ -11153,16 +11203,14 @@ export async function fetchProviderModelDirectoryCandidate(rootDir, providerId, 
   });
 
   try {
-    const headers = { Accept: "application/json" };
-    if (apiKey) {
-      headers.Authorization = `Bearer ${apiKey}`;
-    }
-    const response = await Promise.race([
-      Promise.resolve().then(() => fetchImpl(endpoint, {
+    const headers = providerApiHeaders(provider, apiKey);
+    const requestInit = fetchInitWithProxy(endpoint, {
         method: "GET",
         headers,
         ...(controller ? { signal: controller.signal } : {}),
-      })),
+      });
+    const response = await Promise.race([
+      Promise.resolve().then(() => fetchImpl(endpoint, requestInit)),
       deadline,
     ]);
     if (!response?.ok) {
@@ -11181,7 +11229,10 @@ export async function fetchProviderModelDirectoryCandidate(rootDir, providerId, 
         "Provider model directory returned invalid JSON or an unsupported response shape.",
       );
     }
-    const models = normalizeProviderModelList(body.json || {});
+    const models = mergeOfficialProviderDirectoryModels(
+      provider,
+      normalizeProviderModelList(body.json || {}),
+    );
     const entry = {
       providerId: id,
       providerName: provider.name || id,
@@ -11319,10 +11370,7 @@ export async function testProviderConnection(rootDir, providerInput, {
     "pass",
     apiKey ? `已带上 ${keyEnv || "API Key"} 请求。` : "这个供应商不需要 API Key。",
   );
-  const headers = { Accept: "application/json" };
-  if (apiKey) {
-    headers.Authorization = `Bearer ${apiKey}`;
-  }
+  const headers = providerApiHeaders(provider, apiKey);
   try {
     const response = await fetchImpl(endpoint, {
       method: "GET",
@@ -14326,9 +14374,9 @@ function buildRouterConfigCandidate(rootDir, {
     mode,
     host: "127.0.0.1",
     port: desktopOptions.routerPort,
-    authToken: "sk-local-codex-router",
+    authToken: routerAuthToken(rootDir, state),
     clientAuth: {
-      allowOpenAiBearer: true,
+      allowOpenAiBearer: mode === MODE_HYBRID,
     },
     defaultModel: routes[0].id,
     catalog: {
@@ -14358,6 +14406,27 @@ function buildRouterConfigCandidate(rootDir, {
     desktopOptions,
     routerConfig,
   };
+}
+
+const generatedRouterAuthTokens = new Map();
+
+function routerAuthToken(rootDir, state = null) {
+  const rootKey = path.resolve(rootDir);
+  const currentConfig = state && Object.prototype.hasOwnProperty.call(state, "routerConfig")
+    ? state.routerConfig
+    : readRouterConfig(rootDir);
+  const currentToken = String(currentConfig?.authToken || "").trim();
+  if (currentToken && currentToken !== CODEX_BRIDGE_LEGACY_LOCAL_AUTH_TOKEN) {
+    generatedRouterAuthTokens.set(rootKey, currentToken);
+    return currentToken;
+  }
+  if (!generatedRouterAuthTokens.has(rootKey)) {
+    generatedRouterAuthTokens.set(
+      rootKey,
+      `cbr_${randomUUID().replaceAll("-", "")}`,
+    );
+  }
+  return generatedRouterAuthTokens.get(rootKey);
 }
 
 export function buildModeSwitchCandidates({
@@ -14402,6 +14471,7 @@ export function buildModeSwitchCandidates({
     homeDir,
     mode,
     port: routerConfig.port || 15722,
+    authToken: routerConfig.authToken,
     ...currentSettings,
     model: resolvedModel,
   });
@@ -14448,6 +14518,7 @@ export function buildModeSwitchCandidates({
           catalogTarget: targets.codexCatalogPath,
           mode,
           port: routerConfig.port || 15722,
+          authToken: routerConfig.authToken,
           routeModelIds,
         });
         validateModeSwitchCrossFileCandidates(context.entries, {
@@ -14637,14 +14708,30 @@ function readConfigMutationState(rootDir, homeDir) {
   const selectedModelIds = Array.isArray(selectionDocument?.selectedModelIds)
     ? selectionDocument.selectedModelIds.map((id) => String(id || "").trim()).filter(Boolean)
     : readSelection(rootDir, mode);
+  const secrets = loadSecrets(rootDir);
+  const providerOverrides = readProviderOverrides(rootDir);
+  const pendingSourceMigrations = [];
+  const legacyKimiCode = legacyKimiCodeProviderOverride(rootDir);
+  if (legacyKimiCode) {
+    pendingSourceMigrations.push("providerOverrides");
+    const legacyKeyEnv = String(legacyKimiCode.keyEnv || "MOONSHOT_API_KEY").trim();
+    if (
+      !secrets.KIMI_CODE_API_KEY
+      && legacyKeyEnv
+      && secrets[legacyKeyEnv]
+    ) {
+      secrets.KIMI_CODE_API_KEY = secrets[legacyKeyEnv];
+      pendingSourceMigrations.push("secrets");
+    }
+  }
   return {
     mode,
     selectedModelIds,
-    secrets: loadSecrets(rootDir),
+    secrets,
     desktopOptions: loadDesktopOptions(rootDir),
     configProfiles: loadConfigProfiles(rootDir),
     customModels: readCustomModels(rootDir),
-    providerOverrides: readProviderOverrides(rootDir),
+    providerOverrides,
     modelImageInput: readModelImageInputOverrides(rootDir),
     modelCapabilities: readModelCapabilityOverrides(rootDir),
     modelDirectory: readModelDirectory(rootDir),
@@ -14652,6 +14739,7 @@ function readConfigMutationState(rootDir, homeDir) {
     imageProviderConfig: readImageProviderConfig(rootDir),
     modelImageGeneration: readModelImageGenerationOverrides(rootDir),
     routerConfig,
+    pendingSourceMigrations,
   };
 }
 
@@ -14966,7 +15054,12 @@ function configPackageReferenceError(section) {
 
 function mutateConfigState(rootDir, baseState, operation, payload = {}, options = {}) {
   const state = cloneConfigMutationState(baseState);
-  const touched = new Set();
+  const touched = new Set(
+    Array.isArray(state.pendingSourceMigrations)
+      ? state.pendingSourceMigrations
+      : [],
+  );
+  delete state.pendingSourceMigrations;
   let operationResult = {};
 
   if (operation === "configPackage:import" || operation === "configPackage:restoreLatestImportBackup") {
@@ -15397,6 +15490,7 @@ function managedCodexMutationPlan({
     homeDir: state.homeDir,
     mode: state.mode,
     port: routerConfig.port || 15722,
+    authToken: routerConfig.authToken,
     ...currentSettings,
     model: resolvedModel,
   });
@@ -15922,6 +16016,7 @@ function validateModeSwitchCodexCandidate(content, {
   catalogTarget,
   mode,
   port,
+  authToken,
   routeModelIds,
 }) {
   validateCodexBridgeWrittenConfig({ target, content, mode, port });
@@ -15945,7 +16040,7 @@ function validateModeSwitchCodexCandidate(content, {
     `model_providers.${CODEX_BRIDGE_PROVIDER_ID}.requires_openai_auth`,
   );
   const headerPattern = new RegExp(
-    `^\\s*model_providers\\.${escapeRegex(CODEX_BRIDGE_PROVIDER_ID)}\\.http_headers\\s*=\\s*\\{\\s*Authorization\\s*=\\s*"Bearer ${escapeRegex(CODEX_BRIDGE_LOCAL_AUTH_TOKEN)}"\\s*}\\s*$`,
+    `^\\s*model_providers\\.${escapeRegex(CODEX_BRIDGE_PROVIDER_ID)}\\.http_headers\\s*=\\s*\\{\\s*Authorization\\s*=\\s*"Bearer ${escapeRegex(authToken)}"\\s*}\\s*$`,
     "m",
   );
   if (mode === MODE_HYBRID) {
@@ -15961,7 +16056,7 @@ function validateModeSwitchCodexCandidate(content, {
     return;
   }
   if (requiresOpenAiAuth !== false || !headerPattern.test(content)) {
-    throw new Error("All-API Codex candidate must use the fixed local Router header.");
+    throw new Error("All-API Codex candidate must use the synchronized local Router header.");
   }
 }
 
@@ -16009,6 +16104,14 @@ function validateModeSwitchCrossFileCandidates(entries, {
   );
   if (!routeModelIds.includes(readTopLevelTomlString(codexConfig, "model"))) {
     throw new Error("Mode transaction Codex model is not present in the Router candidates.");
+  }
+  if (
+    mode === MODE_ALL_API &&
+    !new RegExp(
+      `Authorization\\s*=\\s*"Bearer ${escapeRegex(routerConfig.authToken)}"`,
+    ).test(codexConfig)
+  ) {
+    throw new Error("Mode transaction Router and Codex candidates disagree on the local token.");
   }
 }
 
@@ -16075,6 +16178,7 @@ export function buildCodexToml({
   rootDir,
   mode = MODE_HYBRID,
   port = 15722,
+  authToken = "",
   model = DEFAULT_CODEX_BRIDGE_MODEL_ID,
   reasoningEffort = "medium",
   sandboxMode = "danger-full-access",
@@ -16085,6 +16189,7 @@ export function buildCodexToml({
   const providerLines = codexBridgeProviderTomlLinesForMode({
     port,
     mode,
+    authToken,
   });
   return [
     CODEX_BRIDGE_MANAGED_START,
@@ -16395,6 +16500,7 @@ export function applyCodexConfig({
     rootDir,
     mode,
     port,
+    authToken: readRouterConfig(rootDir)?.authToken || "",
     homeDir,
     ...currentSettings,
     model: resolvedModel,
@@ -17603,7 +17709,7 @@ function normalizeSelection(rootDir, selectedModelIds, mode) {
   }
   const unique = [];
   for (const id of selectedModelIds || []) {
-    const selectedId = String(id || "").trim();
+    const selectedId = normalizeLegacyKimiCodeModelReference(id);
     if (!selectedId || unique.includes(selectedId)) {
       continue;
     }
@@ -17639,7 +17745,7 @@ function repairSelectionAgainstModels(
   }
   const repaired = [];
   for (const id of selectedModelIds || []) {
-    const selectedId = String(id || "").trim();
+    const selectedId = normalizeLegacyKimiCodeModelReference(id);
     if (!selectedId || repaired.includes(selectedId)) {
       continue;
     }
@@ -17665,7 +17771,7 @@ function providerIdForUnavailableSelection(
   presetId,
   providers = providerCatalog(rootDir),
 ) {
-  const id = String(presetId || "").trim();
+  const id = normalizeLegacyKimiCodeModelReference(presetId);
   const known = MODEL_PRESETS.find((model) =>
     model.presetId === id ||
     model.model === id ||
@@ -17693,6 +17799,23 @@ function providerIdForUnavailableSelection(
     .filter(Boolean)
     .sort((a, b) => b.length - a.length)
     .find((providerId) => suffix === providerId || suffix.startsWith(`${providerId}-`)) || "";
+}
+
+const LEGACY_KIMI_CODE_MODEL_REFERENCES = new Map([
+  ["remote-kimi-k3", "kimi-code-k3"],
+  ["remote-kimi-k3-256k", "kimi-code-k3-256k"],
+  ["remote-kimi-kimi-for-coding", "kimi-code-for-coding"],
+  ["remote-kimi-kimi-for-coding-highspeed", "kimi-code-for-coding-highspeed"],
+]);
+
+function normalizeLegacyKimiCodeModelReference(value) {
+  const id = String(value || "").trim();
+  const hasRoutePrefix = id.startsWith(CODEX_BRIDGE_MODEL_ID_PREFIX);
+  const sourceId = hasRoutePrefix
+    ? id.slice(CODEX_BRIDGE_MODEL_ID_PREFIX.length)
+    : id;
+  const migrated = LEGACY_KIMI_CODE_MODEL_REFERENCES.get(sourceId) || sourceId;
+  return hasRoutePrefix ? `${CODEX_BRIDGE_MODEL_ID_PREFIX}${migrated}` : migrated;
 }
 
 function normalizeDesktopRouteReferences(
@@ -17763,7 +17886,7 @@ function resolveDesktopRouteReference(
   routes = [],
   providers = providerCatalog(rootDir),
 ) {
-  const id = String(routeId || "").trim();
+  const id = normalizeLegacyKimiCodeModelReference(routeId);
   if (!id) {
     return "";
   }
@@ -17968,6 +18091,15 @@ function providerFamilyForRoute(model = {}, provider) {
   if (providerId === "deepseek") {
     return "deepseek";
   }
+  if (providerId === "anthropic") {
+    return "anthropic";
+  }
+  if (providerId === "xai") {
+    return "xai";
+  }
+  if (providerId === "gemini") {
+    return "gemini";
+  }
   if (providerId === "kimi" || providerId === "moonshot") {
     return "kimi";
   }
@@ -17987,7 +18119,16 @@ function providerFamilyForRoute(model = {}, provider) {
   if (providerId === "qianfan") {
     return "baidu";
   }
-  if (providerId === "xiaomi" || providerId === "stepfun" || providerId === "hunyuan" || providerId === "zhipu" || providerId === "openrouter" || providerId === "siliconflow") {
+  if (providerId === "zhipu") {
+    return "zhipu";
+  }
+  if (providerId === "openrouter") {
+    return "openrouter";
+  }
+  if (providerId === "siliconflow") {
+    return "siliconflow";
+  }
+  if (providerId === "xiaomi" || providerId === "stepfun" || providerId === "hunyuan") {
     return "openai-compatible";
   }
   if (Boolean(model.custom) || String(model.providerName || provider?.name || "").toLowerCase().includes("custom")) {
@@ -18417,9 +18558,17 @@ function normalizeModelDirectory(saved) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
       continue;
     }
-    providers[providerId] = {
-      providerId,
-      providerName: String(entry.providerName || providerId).trim(),
+    const legacyKimiCode = isLegacyKimiCodeProvider(providerId, entry);
+    const targetProviderId = legacyKimiCode ? "kimi-code" : providerId;
+    if (legacyKimiCode && providers[targetProviderId]) {
+      continue;
+    }
+    const providerName = String(entry.providerName || targetProviderId).trim();
+    providers[targetProviderId] = {
+      providerId: targetProviderId,
+      providerName: legacyKimiCode && providerName === "Kimi"
+        ? "Kimi Code"
+        : providerName,
       baseUrl: String(entry.baseUrl || "").trim(),
       endpoint: String(entry.endpoint || "").trim(),
       source: String(entry.source || "remote").trim(),
@@ -18474,7 +18623,23 @@ function providerLogoExtension(sourcePath) {
 
 function providerRequiresApiKey(provider = {}) {
   const authMode = provider.authMode || "api_key";
-  return authMode === "api_key" && Boolean(provider.keyEnv || provider.apiKeyEnv);
+  return ["api_key", "anthropic_api_key"].includes(authMode)
+    && Boolean(provider.keyEnv || provider.apiKeyEnv);
+}
+
+function providerApiHeaders(provider = {}, apiKey = "") {
+  const headers = { Accept: "application/json" };
+  if (!apiKey) return headers;
+  if (
+    (provider.authMode || "") === "anthropic_api_key"
+    || provider.api === "anthropic_messages"
+  ) {
+    headers["x-api-key"] = apiKey;
+    headers["anthropic-version"] = provider.anthropicVersion || "2023-06-01";
+    return headers;
+  }
+  headers.Authorization = `Bearer ${apiKey}`;
+  return headers;
 }
 
 function normalizeProviderModelList(body) {
@@ -18532,6 +18697,53 @@ function normalizeProviderModelList(body) {
     models.push(model);
   }
   return models;
+}
+
+function mergeOfficialProviderDirectoryModels(provider = {}, remoteModels = []) {
+  const officialModels = officialProviderDirectoryModels(provider);
+  if (!officialModels.length) {
+    return remoteModels;
+  }
+  const byId = new Map();
+  for (const model of [...officialModels, ...remoteModels]) {
+    const id = String(model?.id || "").trim();
+    if (!id) {
+      continue;
+    }
+    byId.set(id, {
+      ...(byId.get(id) || {}),
+      ...model,
+      id,
+    });
+  }
+  return [...byId.values()];
+}
+
+function officialProviderDirectoryModels(provider = {}) {
+  if (String(provider.id || "").trim() !== "kimi-code") {
+    return [];
+  }
+  try {
+    const baseUrl = new URL(String(provider.baseUrl || "").trim());
+    if (
+      baseUrl.hostname.toLowerCase() !== "api.kimi.com"
+      || !/^\/coding\/v1\/?$/i.test(baseUrl.pathname)
+    ) {
+      return [];
+    }
+  } catch {
+    return [];
+  }
+  return [
+    { id: "k3", displayName: "Kimi K3", modelType: "chat" },
+    { id: "k3-256k", displayName: "Kimi K3 256K", modelType: "chat" },
+    { id: "kimi-for-coding", displayName: "Kimi For Coding", modelType: "chat" },
+    {
+      id: "kimi-for-coding-highspeed",
+      displayName: "Kimi For Coding Highspeed",
+      modelType: "chat",
+    },
+  ];
 }
 
 function providerModelRefreshKey(rootDir, providerId) {
@@ -18594,13 +18806,49 @@ function modelDirectoryRefreshErrorMessage(error, { secretValues = [] } = {}) {
     error?.message || String(error),
     secretValues,
   );
+  const causeCode = String(error?.cause?.code || error?.code || "").trim().toUpperCase();
   if (error?.code === "provider_response_too_large") {
-    return `模型列表响应过大，CodexBridge 已停止读取，避免卡住或写入异常模型缓存。${safeMessage}`.trim();
+    return "模型列表响应过大（too large），CodexBridge 已停止读取，原有模型列表已保留。";
   }
   if (error?.code === "provider_model_directory_timeout") {
-    return "Provider model directory request timed out.";
+    return "模型服务响应超时，请检查 Base URL、网络或系统代理后重试；原有模型列表已保留。（诊断码：provider_models_timeout）";
   }
-  return safeMessage;
+  if ([
+    "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_HEADERS_TIMEOUT",
+    "ETIMEDOUT",
+  ].includes(causeCode)) {
+    return "无法连接模型服务：连接超时。请检查 Base URL、网络或系统代理后重试；原有模型列表已保留。（诊断码：provider_models_connect_timeout）";
+  }
+  if ([
+    "ENOTFOUND",
+    "EAI_AGAIN",
+  ].includes(causeCode)) {
+    return "无法连接模型服务：域名解析失败。请检查 Base URL、DNS 或系统代理后重试；原有模型列表已保留。（诊断码：provider_models_dns_error）";
+  }
+  if ([
+    "CERT_HAS_EXPIRED",
+    "DEPTH_ZERO_SELF_SIGNED_CERT",
+    "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+    "ERR_TLS_CERT_ALTNAME_INVALID",
+  ].includes(causeCode)) {
+    return "无法连接模型服务：HTTPS 证书校验失败。请检查 Base URL、证书或代理后重试；原有模型列表已保留。（诊断码：provider_models_tls_error）";
+  }
+  if (
+    safeMessage.toLowerCase() === "fetch failed" ||
+    [
+      "ECONNREFUSED",
+      "ECONNRESET",
+      "EHOSTUNREACH",
+      "ENETUNREACH",
+      "UND_ERR_SOCKET",
+    ].includes(causeCode)
+  ) {
+    return "无法连接模型服务。请检查 Base URL、网络、DNS 或系统代理后重试；原有模型列表已保留。（诊断码：provider_models_network_error）";
+  }
+  return safeMessage.length > 320
+    ? `${safeMessage.slice(0, 317)}...`
+    : safeMessage;
 }
 
 function redactKnownSecretValues(value, secretValues = []) {

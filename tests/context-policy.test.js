@@ -221,6 +221,7 @@ test("server runtime inherits the same explicit 90/70 catalog policy it publishe
   const config = {
     host: "127.0.0.1",
     port: 0,
+    authToken: "router-token",
     defaultModel: route.id,
     catalog: {
       contextWindow: 1_000,
@@ -241,7 +242,10 @@ test("server runtime inherits the same explicit 90/70 catalog policy it publishe
 
     const response = await fetch(`${serverUrl(router)}/v1/responses`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
       body: JSON.stringify({
         model: route.id,
         input: `catalog runtime sentinel ${"oversized context ".repeat(1_000)}`,
