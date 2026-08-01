@@ -422,7 +422,9 @@ function codex56Metadata(defaultReasoningLevel, includeUltra, multiAgentVersion)
     supportedReasoningLevels,
     useResponsesLite: true,
     supportsReasoningSummaries: true,
-    defaultReasoningSummary: "none",
+    // Keep long reasoning turns visibly active instead of hiding every
+    // reasoning-summary delta until the first answer token arrives.
+    defaultReasoningSummary: "auto",
     supportVerbosity: true,
     defaultVerbosity: "low",
     webSearchToolType: "text_and_image",

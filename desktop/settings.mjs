@@ -18048,6 +18048,8 @@ function routeForSelectedModel(
     "supportsResponsePreviousId",
     "defaultReasoningLevel",
     "supportedReasoningLevels",
+    "supportsReasoningSummaries",
+    "defaultReasoningSummary",
     "additionalSpeedTiers",
     "serviceTiers",
     "maxToolContinuationTurns",

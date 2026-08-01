@@ -9451,7 +9451,7 @@ test("native GPT 5.6 presets expose current Codex reasoning and Responses Lite m
   for (const preset of [compatible, sol, terra, luna]) {
     assert.equal(preset?.useResponsesLite, true);
     assert.equal(preset?.supportsReasoningSummaries, true);
-    assert.equal(preset?.defaultReasoningSummary, "none");
+    assert.equal(preset?.defaultReasoningSummary, "auto");
     assert.equal(preset?.supportVerbosity, true);
     assert.equal(preset?.defaultVerbosity, "low");
     assert.equal(preset?.webSearchToolType, "text_and_image");
@@ -9725,6 +9725,22 @@ test("all-api Codex-visible model catalog keeps provider display names", () => {
   assert.equal(names.get("cb-deepseek-v4-pro"), "DeepSeek V4 Pro");
   assert.equal(names.get("cb-kimi-k2-7-code"), "Kimi K2.7 Code");
   assert.equal(catalog.models.some((model) => model.display_name === "自定义"), false);
+});
+
+test("Codex-visible GPT 5.6 catalog enables automatic reasoning summaries", () => {
+  const rootDir = makeTempProject();
+  saveSelection(rootDir, ["codex-gpt-5-6-sol"], MODE_HYBRID);
+  writeRouterConfigFromSelection(rootDir, MODE_HYBRID);
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-home-"));
+
+  applyCodexConfig({ rootDir, mode: MODE_HYBRID, homeDir });
+
+  const catalogFile = path.join(homeDir, ".codex", "codexbridge-model-catalog.json");
+  const catalog = JSON.parse(fs.readFileSync(catalogFile, "utf8"));
+  const model = catalog.models.find((item) => item.slug === "cb-gpt-5-6-sol");
+
+  assert.equal(model?.supports_reasoning_summaries, true);
+  assert.equal(model?.default_reasoning_summary, "auto");
 });
 
 test("Codex-visible model catalog keeps tool and MCP capability metadata in both modes", () => {

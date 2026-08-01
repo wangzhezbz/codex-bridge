@@ -2578,6 +2578,92 @@ test("codex_openai responses use ChatGPT Codex backend and forward Codex headers
   }
 });
 
+test("codex_openai forwards GPT reasoning summaries before answer text completes", async () => {
+  const originalBackend = process.env.CODEXBRIDGE_CHATGPT_CODEX_BASE_URL;
+  let upstreamResponse = null;
+  let proxyPromise = null;
+
+  const upstream = httpServer(async (req, res) => {
+    await readRequestJson(req);
+    upstreamResponse = res;
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    res.write(
+      "event: response.reasoning_summary_text.delta\n" +
+        `data: ${JSON.stringify({
+          type: "response.reasoning_summary_text.delta",
+          delta: "checking the project",
+        })}\n\n`,
+    );
+  });
+
+  try {
+    await listen(upstream);
+    process.env.CODEXBRIDGE_CHATGPT_CODEX_BASE_URL = `${serverUrl(upstream)}/backend-api/codex`;
+
+    const res = collectResponse();
+    proxyPromise = proxyResponsesApi(
+      { model: "gpt-5.6-sol", input: "inspect it", stream: true },
+      {
+        id: "gpt-5.6-sol",
+        api: "responses",
+        baseUrl: "https://api.openai.com/v1",
+        model: "gpt-5.6-sol",
+        authMode: "codex_openai",
+      },
+      new ResponseHistory(),
+      res,
+      {
+        clientAuth: {
+          kind: "codex_openai",
+          bearerToken: "codex-openai-token",
+        },
+      },
+    );
+
+    await waitFor(
+      () => res.body().includes("response.reasoning_summary_text.delta"),
+      500,
+    );
+    assert.match(res.body(), /checking the project/);
+    assert.doesNotMatch(res.body(), /response\.output_text\.delta/);
+    assert.doesNotMatch(res.body(), /response\.completed/);
+
+    upstreamResponse.write(
+      "event: response.output_text.delta\n" +
+        `data: ${JSON.stringify({
+          type: "response.output_text.delta",
+          delta: "final answer",
+        })}\n\n`,
+    );
+    upstreamResponse.write(
+      "event: response.completed\n" +
+        `data: ${JSON.stringify({
+          type: "response.completed",
+          response: {
+            id: "resp_gpt_summary_stream",
+            status: "completed",
+            model: "gpt-5.6-sol",
+            output: [],
+          },
+        })}\n\n`,
+    );
+    upstreamResponse.end("data: [DONE]\n\n");
+    await proxyPromise;
+
+    assert.match(res.body(), /final answer/);
+    assert.match(res.body(), /response\.completed/);
+  } finally {
+    if (originalBackend === undefined) {
+      delete process.env.CODEXBRIDGE_CHATGPT_CODEX_BASE_URL;
+    } else {
+      process.env.CODEXBRIDGE_CHATGPT_CODEX_BASE_URL = originalBackend;
+    }
+    upstreamResponse?.end();
+    await proxyPromise?.catch(() => {});
+    await close(upstream);
+  }
+});
+
 test("codex_openai keeps explicit gpt-5.6-sol and surfaces account rejection without silent aliasing", async () => {
   const originalBackend = process.env.CODEXBRIDGE_CHATGPT_CODEX_BASE_URL;
   const seenModels = [];
