@@ -10562,10 +10562,24 @@ export function modelCatalog(rootDir, state = null) {
     ...effectiveCustomModels(rootDir, customModels, providers, state),
   ]
     .map((model) => applyProviderSettingsToModel(model, providerMap.get(model.providerId)))
+    .map((model) => withoutGptInOfficialModelDisplayName(model))
     .map((model) => modelWithDefaultCapabilities(model))
     .map((model) => applyModelImageInputOverride(model, imageInputOverrides))
     .map((model) => applyModelCapabilityOverride(model, capabilityOverrides))
     .map((model) => withCapabilityStatus(model));
+}
+
+function withoutGptInOfficialModelDisplayName(model = {}) {
+  if (!["codex", "openai"].includes(model.providerId)) {
+    return model;
+  }
+  const displayName = String(model.displayName || "")
+    .replace(/\bGPT[\s_.-]*(?=\d)/gi, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  return displayName === model.displayName
+    ? model
+    : { ...model, displayName };
 }
 
 function effectiveCustomModels(rootDir, customModels, providers = providerCatalog(rootDir), state = null) {

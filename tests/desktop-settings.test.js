@@ -9341,6 +9341,24 @@ test("model presets include extra domestic coding and general models", () => {
   assert.ok(presetIds.has("doubao-seed-1-8"));
 });
 
+test("GPT subscription and OpenAI presets omit GPT from display names without changing upstream model ids", () => {
+  const official = MODEL_PRESETS
+    .filter((model) => ["codex", "openai"].includes(model.providerId))
+    .map((model) => [model.presetId, model.displayName, model.model]);
+
+  assert.deepEqual(official, [
+    ["codex-gpt-5-6", "5.6（订阅兼容）", "gpt-5.6"],
+    ["codex-gpt-5-6-sol", "5.6-Sol", "gpt-5.6-sol"],
+    ["codex-gpt-5-6-terra", "5.6-Terra", "gpt-5.6-terra"],
+    ["codex-gpt-5-6-luna", "5.6-Luna", "gpt-5.6-luna"],
+    ["codex-gpt-5-5", "5.5", "gpt-5.5"],
+    ["codex-gpt-5-4", "5.4", "gpt-5.4"],
+    ["codex-gpt-5-4-mini", "5.4-Mini", "gpt-5.4-mini"],
+    ["openai-gpt-4-1", "OpenAI 4.1", "gpt-4.1"],
+    ["openai-gpt-4-1-mini", "OpenAI 4.1 Mini", "gpt-4.1-mini"],
+  ]);
+});
+
 test("built-in DeepSeek presets do not expose the retired deepseek-reasoner alias", () => {
   const retired = MODEL_PRESETS.filter((preset) =>
     preset.providerId === "deepseek" && preset.model === "deepseek-reasoner"
@@ -9415,7 +9433,7 @@ test("native GPT 5.6 presets expose current Codex reasoning and Responses Lite m
   const luna = byId.get("codex-gpt-5-6-luna");
 
   assert.equal(compatible?.model, "gpt-5.6");
-  assert.equal(compatible?.displayName, "GPT-5.6（订阅兼容）");
+  assert.equal(compatible?.displayName, "5.6（订阅兼容）");
   assert.match(compatible?.userDescription || "", /ChatGPT 订阅账号/);
   assert.match(compatible?.userDescription || "", /不固定为 Sol、Terra 或 Luna/);
   assert.equal(sol?.model, "gpt-5.6-sol");
@@ -9449,8 +9467,8 @@ test("buildRouterConfigFromSelection exposes the explicit GPT 5.6 subscription-c
   assert.equal(config.models.length, 1);
   assert.equal(config.models[0].id, "cb-gpt-5-6");
   assert.equal(config.models[0].model, "gpt-5.6");
-  assert.equal(config.models[0].displayName, "GPT-5.6（订阅兼容）");
-  assert.match(config.models[0].description || "", /账号不支持显式 GPT-5.6-Sol/);
+  assert.equal(config.models[0].displayName, "5.6（订阅兼容）");
+  assert.match(config.models[0].description || "", /账号不支持显式 5.6-Sol/);
 });
 
 test("built-in catalog does not recommend the private Fenno GPT provider", () => {
@@ -9703,7 +9721,7 @@ test("all-api Codex-visible model catalog keeps provider display names", () => {
   const names = new Map(catalog.models.map((model) => [model.slug, model.display_name]));
 
   assert.match(written, new RegExp(`model_catalog_json = "${escapeRegExp(toFixtureTomlPath(catalogFile))}"`));
-  assert.equal(names.get("cb-openai-gpt-4-1"), "OpenAI GPT-4.1");
+  assert.equal(names.get("cb-openai-gpt-4-1"), "OpenAI 4.1");
   assert.equal(names.get("cb-deepseek-v4-pro"), "DeepSeek V4 Pro");
   assert.equal(names.get("cb-kimi-k2-7-code"), "Kimi K2.7 Code");
   assert.equal(catalog.models.some((model) => model.display_name === "自定义"), false);
@@ -13192,6 +13210,25 @@ test("provider model refresh keeps obvious non-chat endpoints out of every chat 
   );
 });
 
+test("synced OpenAI models omit GPT from display names while retaining gpt upstream ids", async () => {
+  const rootDir = makeTempProject();
+  saveSecrets(rootDir, { OPENAI_API_KEY: "openai-secret" });
+  await refreshProviderModelDirectory(rootDir, "openai", {
+    now: () => "2026-08-02T10:00:00.000Z",
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ data: [{ id: "gpt-4.1" }, { id: "gpt-4o" }] }),
+    }),
+  });
+
+  const models = modelCatalog(rootDir).filter((model) => model.providerId === "openai");
+  assert.deepEqual(
+    models.map((model) => [model.displayName, model.model]),
+    [["OpenAI 4.1", "gpt-4.1"], ["OpenAI 4o", "gpt-4o"]],
+  );
+});
+
 test("provider overrides update provider catalog and generated routes", () => {
   const rootDir = makeTempProject();
   const saved = saveProviderOverride(rootDir, "deepseek", {
@@ -14291,7 +14328,7 @@ test("applyCodexConfig writes a Codex-visible model catalog next to config.toml"
   assert.match(written, new RegExp(`model_catalog_json = "${escapeRegExp(toFixtureTomlPath(catalogFile))}"`));
   assert.doesNotMatch(written, new RegExp(escapeRegExp(path.resolve(rootDir))));
   assert.equal(catalog.models[0].slug, "cb-gpt-5-5");
-  assert.equal(catalog.models[0].display_name, "GPT-5.5");
+  assert.equal(catalog.models[0].display_name, "5.5");
   const bySlug = new Map(catalog.models.map((model) => [model.slug, model]));
   assert.equal(bySlug.get("cb-deepseek-v4-pro")?.id, "cb-deepseek-v4-pro");
   assert.equal(bySlug.get("cb-deepseek-v4-pro")?.object, "model");

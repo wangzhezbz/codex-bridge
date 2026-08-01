@@ -139,6 +139,22 @@ test("project and Windows CI gates include the complete desktop refresh flow", (
   );
 });
 
+test("embedded Bridge model selector omits GPT from labels without changing model values", () => {
+  const html = fs.readFileSync(
+    path.join(process.cwd(), "vendor", "chatgpt-codex-bridge", "public", "index.html"),
+    "utf8",
+  );
+  const visibleModels = [...html.matchAll(/<option value="(gpt-[^"]+)">([^<]+)<\/option>/g)]
+    .map((match) => [match[1], match[2].trim()]);
+
+  assert.deepEqual(visibleModels, [
+    ["gpt-5.6-sol", "5.6 Sol"],
+    ["gpt-5.5", "5.5"],
+    ["gpt-5.4", "5.4"],
+    ["gpt-5.3", "5.3"],
+  ]);
+});
+
 test("Windows CI runs OS integration tests in the user profile temp directory", () => {
   const workflow = fs.readFileSync(
     path.join(process.cwd(), ".github", "workflows", "desktop-portable.yml"),

@@ -20,8 +20,8 @@
   "models": [
     {
       "id": "gpt-5.5",
-      "displayName": "GPT-5.5",
-      "description": "GPT-5.5 through Codex/OpenAI authentication.",
+      "displayName": "5.5",
+      "description": "5.5 through Codex/OpenAI authentication.",
       "api": "responses",
       "baseUrl": "https://chatgpt.com/backend-api/codex",
       "model": "gpt-5.5",
@@ -45,8 +45,8 @@
     },
     {
       "id": "gpt-5.4",
-      "displayName": "GPT-5.4",
-      "description": "GPT-5.4 through Codex/OpenAI authentication.",
+      "displayName": "5.4",
+      "description": "5.4 through Codex/OpenAI authentication.",
       "api": "responses",
       "baseUrl": "https://chatgpt.com/backend-api/codex",
       "model": "gpt-5.4",
