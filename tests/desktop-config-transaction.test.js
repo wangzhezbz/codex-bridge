@@ -11,6 +11,9 @@ const API_MODEL_ID = "deepseek-v4-pro";
 const API_ROUTE_ID = "cb-deepseek-v4-pro";
 const SECRET_VALUE = "test-only-provider-key-must-not-leak";
 const ROUTER_AUTH_TOKEN = "cbr_00000000000000000000000000000000";
+const noOpPrivateAcl = Object.freeze({
+  async securePath() {},
+});
 
 function makeWorkspace(label) {
   const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), `codexbridge-config-${label}-root-`));
@@ -50,7 +53,10 @@ function makeWorkspace(label) {
 
 function coordinatorFor({ rootDir, homeDir, fileOps } = {}) {
   const journalDir = path.join(rootDir, ".config-transactions");
-  const coordinator = createConfigWriteCoordinator({ fileOps });
+  const coordinator = createConfigWriteCoordinator({
+    fileOps,
+    privateAcl: noOpPrivateAcl,
+  });
   if (typeof coordinator.configure === "function") {
     coordinator.configure({ allowedRoots: [rootDir, homeDir], journalDir });
   }
@@ -59,7 +65,10 @@ function coordinatorFor({ rootDir, homeDir, fileOps } = {}) {
 
 function codexRestoreCoordinatorFor(homeDir, fileOps) {
   const codexDir = path.join(homeDir, ".codex");
-  const coordinator = createConfigWriteCoordinator({ fileOps });
+  const coordinator = createConfigWriteCoordinator({
+    fileOps,
+    privateAcl: noOpPrivateAcl,
+  });
   coordinator.configure({
     allowedRoots: [codexDir],
     journalDir: path.join(codexDir, ".restore-transactions"),

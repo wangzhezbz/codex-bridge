@@ -5,13 +5,25 @@ import os from "node:os";
 import path from "node:path";
 
 import * as settings from "../desktop/settings.mjs";
-import { createConfigWriteCoordinator } from "../desktop/config-write-coordinator.mjs";
+import {
+  createConfigWriteCoordinator as createProductionConfigWriteCoordinator,
+} from "../desktop/config-write-coordinator.mjs";
 
 const API_MODEL_ID = "deepseek-v4-pro";
 const API_ROUTE_ID = "cb-deepseek-v4-pro";
 const SUBSCRIPTION_MODEL_ID = "codex-gpt-5-5";
 const SUBSCRIPTION_ROUTE_ID = "cb-gpt-5-5";
 const ROUTER_AUTH_TOKEN = "cbr_00000000000000000000000000000000";
+const noOpPrivateAcl = Object.freeze({
+  async securePath() {},
+});
+
+function createConfigWriteCoordinator(options = {}) {
+  return createProductionConfigWriteCoordinator({
+    privateAcl: noOpPrivateAcl,
+    ...options,
+  });
+}
 
 function makeWorkspace(label) {
   const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), `codexbridge-mode-${label}-root-`));

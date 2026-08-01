@@ -845,7 +845,7 @@ test("Windows shortcut resolver safely preserves spaces, Chinese, and apostrophe
       // Keep the explicit fixture directory if it is unexpectedly non-empty.
     }
   });
-  fs.writeFileSync(targetPath, "fixture", "utf8");
+  fs.copyFileSync(process.execPath, targetPath);
   execFileSync("powershell.exe", [
     "-NoProfile",
     "-ExecutionPolicy",

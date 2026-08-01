@@ -206,7 +206,7 @@ test("default shortcut resolver opens a real lnk whose path has spaces, Chinese,
 
   fs.mkdirSync(installRoot);
   fs.mkdirSync(resourcesDir);
-  fs.writeFileSync(desktopTarget, "");
+  fs.copyFileSync(process.execPath, desktopTarget);
   fs.writeFileSync(cliTarget, "");
   const canonicalDesktopTarget = fs.realpathSync.native(desktopTarget);
   const canonicalCliTarget = fs.realpathSync.native(cliTarget);
