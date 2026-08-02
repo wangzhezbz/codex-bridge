@@ -7205,6 +7205,137 @@ test("streaming chat image rejection is isolated for later conversation turns", 
   assert.match(JSON.stringify(chatBodies[2].messages), /continue after streamed image failure/);
 });
 
+test("chat-routed remote compact v2 may exceed the ordinary Responses body limit", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (_req, res) => {
+    upstreamCalls += 1;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: "chatcmpl_large_compact_v2",
+        object: "chat.completion",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: "Summary: the oversized local compact request was accepted.",
+            },
+          },
+        ],
+      }),
+    );
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    requestBodyLimitBytes: 512,
+    responsesRequestBodyLimitBytes: 512,
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  try {
+    const requestBody = JSON.stringify({
+      model: "deepseek-v4-pro",
+      stream: true,
+      input: [
+        {
+          type: "message",
+          role: "user",
+          content: `context before compact ${"x".repeat(1200)}`,
+        },
+        { type: "compaction_trigger" },
+      ],
+    });
+    assert.ok(Buffer.byteLength(requestBody) > 512);
+
+    const response = await fetch(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: requestBody,
+    });
+    const text = await response.text();
+
+    assert.equal(response.status, 200, text);
+    assert.match(text, /oversized local compact request was accepted/);
+    assert.equal(upstreamCalls, 1);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("chat-routed remote compact v2 still obeys its compact body hard limit", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (_req, res) => {
+    upstreamCalls += 1;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ id: "chatcmpl_unused", choices: [] }));
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    responsesRequestBodyLimitBytes: 512,
+    responsesCompactRequestBodyLimitBytes: 1024,
+    defaultModel: "deepseek-v4-pro",
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        api: "chat_completions",
+        baseUrl: `${serverUrl(upstream)}/v1`,
+        model: "deepseek-v4-pro",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+
+  await listen(router);
+  try {
+    const response = await fetch(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-pro",
+        input: [
+          { type: "message", role: "user", content: "x".repeat(1600) },
+          { type: "compaction_trigger" },
+        ],
+      }),
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 413);
+    assert.equal(body.error.code, "request_body_too_large");
+    assert.equal(upstreamCalls, 0);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
 test("chat-routed remote compact v2 returns a single compaction SSE item", async () => {
   let upstreamBody;
   const upstream = http.createServer(async (req, res) => {
@@ -11688,7 +11819,7 @@ test("responses-routed remote compact v2 retries as stream when an api-key upstr
   }
 });
 
-test("chat-routed responses compact endpoint returns compaction JSON", async () => {
+test("chat-routed responses compact endpoint may exceed the ordinary body limit", async () => {
   const upstream = http.createServer(async (_req, res) => {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(
@@ -11712,6 +11843,8 @@ test("chat-routed responses compact endpoint returns compaction JSON", async () 
     host: "127.0.0.1",
     port: 0,
     authToken: "router-token",
+    responsesRequestBodyLimitBytes: 512,
+    responsesCompactRequestBodyLimitBytes: 4096,
     defaultModel: "deepseek-v4-pro",
     models: [
       {
@@ -11736,7 +11869,7 @@ test("chat-routed responses compact endpoint returns compaction JSON", async () 
       },
       body: JSON.stringify({
         model: "deepseek-v4-pro",
-        input: "compact this history",
+        input: `compact this history ${"x".repeat(1200)}`,
       }),
     });
     assert.equal(response.object, "response");

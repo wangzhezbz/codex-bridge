@@ -30,10 +30,18 @@ export function asArray(value) {
 }
 
 export async function readJsonRequest(req, limitBytes = 25 * 1024 * 1024) {
+  const result = await readJsonRequestWithMetadata(req, limitBytes);
+  return result.body;
+}
+
+export async function readJsonRequestWithMetadata(req, limitBytes = 25 * 1024 * 1024) {
   const decodedBody = await readRequestBuffer(req, limitBytes);
   const text = decodedBody.toString("utf8");
   try {
-    return text ? JSON.parse(text) : {};
+    return {
+      body: text ? JSON.parse(text) : {},
+      decodedBytes: decodedBody.length,
+    };
   } catch (cause) {
     const error = new Error("Request body is not valid JSON");
     error.statusCode = 400;
@@ -41,6 +49,15 @@ export async function readJsonRequest(req, limitBytes = 25 * 1024 * 1024) {
     error.cause = cause;
     throw error;
   }
+}
+
+export function requestBodyTooLargeError(limitBytes, actualBytes) {
+  const error = new Error(`Request body exceeds ${limitBytes} bytes`);
+  error.statusCode = 413;
+  error.code = "request_body_too_large";
+  error.limitBytes = limitBytes;
+  error.actualBytes = actualBytes;
+  return error;
 }
 
 export async function readImageEditRequest(req, limitBytes = 100 * 1024 * 1024) {
@@ -97,12 +114,7 @@ async function readRequestBuffer(req, limitBytes) {
   for await (const chunk of req) {
     size += chunk.length;
     if (size > limitBytes) {
-      const error = new Error(`Request body exceeds ${limitBytes} bytes`);
-      error.statusCode = 413;
-      error.code = "request_body_too_large";
-      error.limitBytes = limitBytes;
-      error.actualBytes = size;
-      throw error;
+      throw requestBodyTooLargeError(limitBytes, size);
     }
     chunks.push(chunk);
   }
@@ -110,12 +122,7 @@ async function readRequestBuffer(req, limitBytes) {
   const rawBody = Buffer.concat(chunks);
   const decodedBody = decodeRequestBody(rawBody, req.headers?.["content-encoding"]);
   if (decodedBody.length > limitBytes) {
-    const error = new Error(`Request body exceeds ${limitBytes} bytes`);
-    error.statusCode = 413;
-    error.code = "request_body_too_large";
-    error.limitBytes = limitBytes;
-    error.actualBytes = decodedBody.length;
-    throw error;
+    throw requestBodyTooLargeError(limitBytes, decodedBody.length);
   }
 
   return decodedBody;

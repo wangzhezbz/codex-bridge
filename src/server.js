@@ -10,6 +10,8 @@ import {
   openAiError,
   readImageEditRequest,
   readJsonRequest,
+  readJsonRequestWithMetadata,
+  requestBodyTooLargeError,
 } from "./json.js";
 import { buildModelCatalog, openAiModelsList } from "./model-catalog.js";
 import { isResponsesCompactPath, requestHasCompactionTrigger } from "./compact.js";
@@ -40,6 +42,7 @@ import { createCodexModelSelectionState } from "./codex-model-selection.js";
 
 const DEFAULT_JSON_BODY_LIMIT_BYTES = 25 * 1024 * 1024;
 const DEFAULT_RESPONSES_BODY_LIMIT_BYTES = 100 * 1024 * 1024;
+const DEFAULT_RESPONSES_COMPACT_BODY_LIMIT_BYTES = 200 * 1024 * 1024;
 const DEFAULT_CAPABILITY_PROVIDER_RESPONSE_MAX_BYTES = 8 * 1024 * 1024;
 const BENIGN_ROUTER_PROCESS_ERROR_CODES = new Set([
   "ECONNRESET",
@@ -257,7 +260,19 @@ export function createRouterServer(
         req.method === "POST" &&
         isResponsesPostPath(url.pathname)
       ) {
-        const body = await readJsonRequest(req, requestBodyLimitBytes(activeConfig, url.pathname));
+        const ordinaryBodyLimitBytes = requestBodyLimitBytes(activeConfig, url.pathname);
+        const compactBodyLimitBytes = responsesCompactRequestBodyLimitBytes(
+          activeConfig,
+          url.pathname,
+        );
+        const { body, decodedBytes } = await readJsonRequestWithMetadata(
+          req,
+          compactBodyLimitBytes,
+        );
+        const compactKind = compactKindForRequest(url.pathname, body);
+        if (!compactKind && decodedBytes > ordinaryBodyLimitBytes) {
+          throw requestBodyTooLargeError(ordinaryBodyLimitBytes, decodedBytes);
+        }
         const modelSetting = codexModelSelection.applyToRequest({
           headers: req.headers,
           body,
@@ -276,7 +291,6 @@ export function createRouterServer(
         const requestedModel = body.model || "";
         const requestId = makeRequestId();
         const isCodexClient = isCodexClientRequest(req);
-        const compactKind = compactKindForRequest(url.pathname, body);
         let route;
         let routeSelection;
         let routePlan;
@@ -2895,6 +2909,18 @@ function requestBodyLimitBytes(config = {}, pathname = "") {
     return DEFAULT_RESPONSES_BODY_LIMIT_BYTES;
   }
   return DEFAULT_JSON_BODY_LIMIT_BYTES;
+}
+
+function responsesCompactRequestBodyLimitBytes(config = {}, pathname = "") {
+  const ordinaryLimit = requestBodyLimitBytes(config, pathname);
+  const configured = Number(
+    config.responsesCompactRequestBodyLimitBytes ??
+      config.responses_compact_request_body_limit_bytes,
+  );
+  const compactLimit = Number.isFinite(configured) && configured > 0
+    ? Math.floor(configured)
+    : DEFAULT_RESPONSES_COMPACT_BODY_LIMIT_BYTES;
+  return Math.max(ordinaryLimit, compactLimit);
 }
 
 export function startServer(config = loadConfig()) {

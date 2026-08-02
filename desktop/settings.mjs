@@ -4695,10 +4695,20 @@ function usageDiagnosticsLines(usageSummary = null) {
 function requestLimitDiagnosticsSummary(config = {}) {
   const configuredRequestLimit = configuredRequestLimitBytes(config, "requestBodyLimitBytes");
   const configuredResponsesLimit = configuredRequestLimitBytes(config, "responsesRequestBodyLimitBytes");
+  const configuredCompactLimit = configuredRequestLimitBytes(
+    config,
+    "responsesCompactRequestBodyLimitBytes",
+  );
   const requestBodyLimitBytes = configuredRequestLimit || 25 * 1024 * 1024;
+  const responsesRequestBodyLimitBytes =
+    configuredResponsesLimit || configuredRequestLimit || 100 * 1024 * 1024;
   return {
     requestBodyLimitBytes,
-    responsesRequestBodyLimitBytes: configuredResponsesLimit || configuredRequestLimit || 100 * 1024 * 1024,
+    responsesRequestBodyLimitBytes,
+    responsesCompactRequestBodyLimitBytes: Math.max(
+      responsesRequestBodyLimitBytes,
+      configuredCompactLimit || 200 * 1024 * 1024,
+    ),
   };
 }
 
@@ -4707,6 +4717,7 @@ function requestLimitDiagnosticsLines(config = {}) {
   return [
     `- requestBodyLimitBytes: ${formatBytes(summary.requestBodyLimitBytes)}`,
     `- responsesRequestBodyLimitBytes: ${formatBytes(summary.responsesRequestBodyLimitBytes)}`,
+    `- responsesCompactRequestBodyLimitBytes: ${formatBytes(summary.responsesCompactRequestBodyLimitBytes)}`,
   ];
 }
 
