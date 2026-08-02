@@ -8,6 +8,7 @@ import { ResponseHistory } from "./history.js";
 import {
   jsonResponse,
   openAiError,
+  readImageEditRequest,
   readJsonRequest,
 } from "./json.js";
 import { buildModelCatalog, openAiModelsList } from "./model-catalog.js";
@@ -566,12 +567,19 @@ export function createRouterServer(
 
       if (
         req.method === "POST" &&
-        isImageGenerationsPostPath(url.pathname)
+        (isImageGenerationsPostPath(url.pathname) || isImageEditsPostPath(url.pathname))
       ) {
-        const body = await readJsonRequest(req, requestBodyLimitBytes(activeConfig, url.pathname));
+        const isImageEdit = isImageEditsPostPath(url.pathname);
+        const body = isImageEdit
+          ? await readImageEditRequest(req, requestBodyLimitBytes(activeConfig, url.pathname))
+          : await readJsonRequest(req, requestBodyLimitBytes(activeConfig, url.pathname));
         const route = defaultEnabledRoute(activeConfig);
         if (!route) {
-          jsonResponse(res, 404, openAiError("No enabled model route is available for image generation.", 404));
+          jsonResponse(
+            res,
+            404,
+            openAiError(`No enabled model route is available for image ${isImageEdit ? "editing" : "generation"}.`, 404),
+          );
           return;
         }
         const clientAuth = authorizeClient(req, activeConfig, route);
@@ -582,7 +590,7 @@ export function createRouterServer(
         const requestId = makeRequestId();
         const clientAbort = clientAbortContext(req, res);
         console.log(
-          `[${new Date().toISOString()}] ${requestId} <- /v1/images/generations ` +
+          `[${new Date().toISOString()}] ${requestId} <- ${url.pathname} ` +
           `model=${body.model || "(default)"} route=${route.id} provider=${providerLogLabel(route)} ` +
           `client_auth=${clientAuth.kind} upstream_auth=${authModeForRoute(route)}`,
         );
@@ -595,9 +603,14 @@ export function createRouterServer(
               activeConfig,
           };
           const upstream = isNativeCodexImageRoute(route)
-            ? await proxyNativeCodexImageGeneration(body, route, history, requestContext)
+            ? await proxyNativeCodexImageRequest(body, route, history, requestContext, {
+                action: isImageEdit ? "edit" : "generate",
+              })
             : await callJsonUpstream(
-                joinUpstreamUrl(responsesBaseUrlForRoute(route), "/images/generations"),
+                joinUpstreamUrl(
+                  responsesBaseUrlForRoute(route),
+                  isImageEdit ? "/images/edits" : "/images/generations",
+                ),
                 { ...route, api: "images" },
                 body,
                 requestContext,
@@ -2856,18 +2869,29 @@ function attachClientSocketErrorHandler(socket, socketsWithErrorHandler) {
 }
 
 function requestBodyLimitBytes(config = {}, pathname = "") {
-  const configured = isResponsesPostPath(pathname)
+  const isImageEdit = isImageEditsPostPath(pathname);
+  const isResponsesRequest = isResponsesPostPath(pathname);
+  const configured = isImageEdit
     ? Number(
-        config.responsesRequestBodyLimitBytes ??
+        config.imageEditRequestBodyLimitBytes ??
+          config.image_edit_request_body_limit_bytes ??
+          config.responsesRequestBodyLimitBytes ??
           config.responses_request_body_limit_bytes ??
           config.requestBodyLimitBytes ??
           config.request_body_limit_bytes,
       )
+    : isResponsesRequest
+      ? Number(
+          config.responsesRequestBodyLimitBytes ??
+            config.responses_request_body_limit_bytes ??
+            config.requestBodyLimitBytes ??
+            config.request_body_limit_bytes,
+        )
     : Number(config.requestBodyLimitBytes ?? config.request_body_limit_bytes);
   if (Number.isFinite(configured) && configured > 0) {
     return Math.floor(configured);
   }
-  if (isResponsesPostPath(pathname)) {
+  if (isImageEdit || isResponsesRequest) {
     return DEFAULT_RESPONSES_BODY_LIMIT_BYTES;
   }
   return DEFAULT_JSON_BODY_LIMIT_BYTES;
@@ -3113,6 +3137,10 @@ function isImageGenerationsPostPath(pathname) {
   return ["/v1/images/generations", "/images/generations"].includes(pathname);
 }
 
+function isImageEditsPostPath(pathname) {
+  return ["/v1/images/edits", "/images/edits"].includes(pathname);
+}
+
 function defaultEnabledRoute(config = {}) {
   const models = Array.isArray(config.models) ? config.models.filter((model) => model?.enabled !== false) : [];
   return models.find((model) => model.id === config.defaultModel) || models[0] || null;
@@ -3122,16 +3150,21 @@ function isNativeCodexImageRoute(route = {}) {
   return route.api === "responses" && authModeForRoute(route) === "codex_openai";
 }
 
-async function proxyNativeCodexImageGeneration(body, route, history, context) {
+async function proxyNativeCodexImageRequest(body, route, history, context, options = {}) {
+  const action = options.action === "edit" ? "edit" : "generate";
+  const content = [{ type: "input_text", text: String(body?.prompt || "") }];
+  if (action === "edit") {
+    content.push(...nativeImageEditInputs(body));
+  }
   const buffered = createBufferedResponse();
   await proxyResponsesApi(
     {
       model: route.id || route.model,
       input: [{
         role: "user",
-        content: [{ type: "input_text", text: String(body?.prompt || "") }],
+        content,
       }],
-      tools: [{ type: "image_generation", action: "generate", partial_images: 1 }],
+      tools: [{ type: "image_generation", action, partial_images: 1 }],
       store: false,
       stream: false,
     },
@@ -3157,6 +3190,42 @@ async function proxyNativeCodexImageGeneration(body, route, history, context) {
     created: Math.floor(Date.now() / 1000),
     data,
   };
+}
+
+function nativeImageEditInputs(body = {}) {
+  if (body.mask !== undefined && body.mask !== null && body.mask !== "") {
+    const error = new Error("Native ChatGPT image editing does not support mask inputs through the Responses image_generation tool.");
+    error.statusCode = 400;
+    error.code = "native_image_edit_mask_unsupported";
+    throw error;
+  }
+
+  const candidates = Array.isArray(body.images)
+    ? body.images
+    : body.image === undefined
+      ? []
+      : Array.isArray(body.image)
+        ? body.image
+        : [body.image];
+  const inputs = candidates.flatMap((candidate) => {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return [{ type: "input_image", image_url: candidate.trim() }];
+    }
+    if (typeof candidate?.image_url === "string" && candidate.image_url.trim()) {
+      return [{ type: "input_image", image_url: candidate.image_url.trim() }];
+    }
+    if (typeof candidate?.file_id === "string" && candidate.file_id.trim()) {
+      return [{ type: "input_image", file_id: candidate.file_id.trim() }];
+    }
+    return [];
+  });
+  if (!inputs.length) {
+    const error = new Error("Image edits require at least one reference image.");
+    error.statusCode = 400;
+    error.code = "image_edit_reference_required";
+    throw error;
+  }
+  return inputs;
 }
 
 function createBufferedResponse() {

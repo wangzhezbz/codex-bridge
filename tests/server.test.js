@@ -11822,6 +11822,328 @@ test("GPT native image generation recovers the final image from response.output_
   }
 });
 
+test("GPT 5.6 Sol native image edits keep reference images on the selected Responses route", async () => {
+  let upstreamBody;
+  const expectedImage = "ZWRpdGVkLWltYWdl";
+  const referenceImage = "data:image/png;base64,cmVmZXJlbmNlLWltYWdl";
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/responses");
+    upstreamBody = await readJson(req);
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    res.write(`event: response.output_item.done\ndata: ${JSON.stringify({
+      type: "response.output_item.done",
+      output_index: 0,
+      item: {
+        id: "ig_native_edit_done",
+        type: "image_generation_call",
+        status: "completed",
+        result: expectedImage,
+        revised_prompt: "edited from the supplied reference",
+      },
+    })}\n\n`);
+    res.write(`event: response.completed\ndata: ${JSON.stringify({
+      type: "response.completed",
+      response: {
+        id: "resp_native_edit_done",
+        object: "response",
+        status: "completed",
+        model: "gpt-5.6-sol",
+        output: [],
+        usage: { input_tokens: 12, output_tokens: 2, total_tokens: 14 },
+      },
+    })}\n\n`);
+    res.end("data: [DONE]\n\n");
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    clientAuth: { allowOpenAiBearer: true },
+    defaultModel: "cb-gpt-5-6-sol",
+    models: [{
+      id: "cb-gpt-5-6-sol",
+      displayName: "5.6-Sol",
+      provider: "codex",
+      api: "responses",
+      baseUrl: `${serverUrl(upstream)}/v1`,
+      model: "gpt-5.6-sol",
+      authMode: "codex_openai",
+    }],
+  });
+  await listen(router);
+
+  try {
+    const response = await fetch(`${serverUrl(router)}/v1/images/edits`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer codex-token",
+      },
+      body: JSON.stringify({
+        model: "gpt-image-1.5",
+        prompt: "keep the subject and change the background",
+        images: [{ image_url: referenceImage }],
+      }),
+    });
+    const text = await response.text();
+    assert.equal(response.status, 200, text);
+    const payload = JSON.parse(text);
+    assert.equal(payload.data[0].b64_json, expectedImage);
+    assert.equal(upstreamBody.model, "gpt-5.6-sol");
+    assert.equal(upstreamBody.store, false);
+    assert.deepEqual(upstreamBody.input, [{
+      role: "user",
+      content: [
+        { type: "input_text", text: "keep the subject and change the background" },
+        { type: "input_image", image_url: referenceImage },
+      ],
+    }]);
+    assert.deepEqual(upstreamBody.tools, [{
+      type: "image_generation",
+      action: "edit",
+      partial_images: 1,
+    }]);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("native image edits accept OpenAI multipart uploads on the non-v1 alias", async () => {
+  let upstreamBody;
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/responses");
+    upstreamBody = await readJson(req);
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    res.write(`event: response.output_item.done\ndata: ${JSON.stringify({
+      type: "response.output_item.done",
+      output_index: 0,
+      item: {
+        id: "ig_native_multipart_edit_done",
+        type: "image_generation_call",
+        status: "completed",
+        result: "bXVsdGlwYXJ0LWVkaXQ=",
+      },
+    })}\n\n`);
+    res.write(`event: response.completed\ndata: ${JSON.stringify({
+      type: "response.completed",
+      response: {
+        id: "resp_native_multipart_edit_done",
+        object: "response",
+        status: "completed",
+        model: "gpt-5.6-sol",
+        output: [],
+      },
+    })}\n\n`);
+    res.end("data: [DONE]\n\n");
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    clientAuth: { allowOpenAiBearer: true },
+    defaultModel: "cb-gpt-5-6-sol",
+    models: [{
+      id: "cb-gpt-5-6-sol",
+      displayName: "5.6-Sol",
+      provider: "codex",
+      api: "responses",
+      baseUrl: `${serverUrl(upstream)}/v1`,
+      model: "gpt-5.6-sol",
+      authMode: "codex_openai",
+    }],
+  });
+  await listen(router);
+
+  try {
+    const form = new FormData();
+    form.append("model", "gpt-image-1.5");
+    form.append("prompt", "turn the reference into a watercolor");
+    form.append("image", new Blob([Buffer.from("reference-png")], { type: "image/png" }), "reference.png");
+    const response = await fetch(`${serverUrl(router)}/images/edits`, {
+      method: "POST",
+      headers: { authorization: "Bearer codex-token" },
+      body: form,
+    });
+    const text = await response.text();
+    assert.equal(response.status, 200, text);
+    assert.equal(JSON.parse(text).data[0].b64_json, "bXVsdGlwYXJ0LWVkaXQ=");
+    assert.deepEqual(upstreamBody.input[0].content, [
+      { type: "input_text", text: "turn the reference into a watercolor" },
+      { type: "input_image", image_url: "data:image/png;base64,cmVmZXJlbmNlLXBuZw==" },
+    ]);
+    assert.equal(upstreamBody.tools[0].action, "edit");
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("API-key image edits stay on the selected provider edit endpoint", async () => {
+  let upstreamBody;
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/images/edits");
+    assert.equal(req.headers.authorization, "Bearer provider-key");
+    upstreamBody = await readJson(req);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ created: 123, data: [{ b64_json: "YXBpLWtleS1lZGl0" }] }));
+  });
+
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "api-key-image-route",
+    models: [{
+      id: "api-key-image-route",
+      displayName: "Image API route",
+      provider: "openai",
+      api: "responses",
+      baseUrl: `${serverUrl(upstream)}/v1`,
+      model: "gpt-image-1.5",
+      apiKey: "provider-key",
+      authMode: "api_key",
+    }],
+  });
+  await listen(router);
+
+  try {
+    const requestBody = {
+      model: "gpt-image-1.5",
+      prompt: "edit without changing providers",
+      images: [{ image_url: "https://images.example/reference.png" }],
+      size: "1024x1024",
+    };
+    const response = await fetch(`${serverUrl(router)}/v1/images/edits`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer router-token",
+      },
+      body: JSON.stringify(requestBody),
+    });
+    const text = await response.text();
+    assert.equal(response.status, 200, text);
+    assert.equal(JSON.parse(text).data[0].b64_json, "YXBpLWtleS1lZGl0");
+    assert.deepEqual(upstreamBody, requestBody);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("API-key image edits normalize multipart files before forwarding to the edit endpoint", async () => {
+  let upstreamBody;
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, "/v1/images/edits");
+    upstreamBody = await readJson(req);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ created: 124, data: [{ b64_json: "bXVsdGlwYXJ0LWFwaS1rZXk=" }] }));
+  });
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "api-key-image-route",
+    models: [{
+      id: "api-key-image-route",
+      provider: "openai",
+      api: "responses",
+      baseUrl: `${serverUrl(upstream)}/v1`,
+      model: "gpt-image-1.5",
+      apiKey: "provider-key",
+      authMode: "api_key",
+    }],
+  });
+  await listen(router);
+
+  try {
+    const form = new FormData();
+    form.append("model", "gpt-image-1.5");
+    form.append("prompt", "masked provider edit");
+    form.append("n", "2");
+    form.append("image[]", new Blob([Buffer.from("provider-reference")], { type: "image/png" }), "reference.png");
+    form.append("mask", new Blob([Buffer.from("provider-mask")], { type: "image/png" }), "mask.png");
+    const response = await fetch(`${serverUrl(router)}/v1/images/edits`, {
+      method: "POST",
+      headers: { authorization: "Bearer router-token" },
+      body: form,
+    });
+    const text = await response.text();
+    assert.equal(response.status, 200, text);
+    assert.deepEqual(upstreamBody, {
+      model: "gpt-image-1.5",
+      prompt: "masked provider edit",
+      n: 2,
+      images: [{ image_url: "data:image/png;base64,cHJvdmlkZXItcmVmZXJlbmNl" }],
+      mask: { image_url: "data:image/png;base64,cHJvdmlkZXItbWFzaw==" },
+    });
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("native image edits reject masks instead of silently changing semantics or providers", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamCalls += 1;
+    res.writeHead(500).end();
+  });
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "cb-gpt-5-6-sol",
+    models: [{
+      id: "cb-gpt-5-6-sol",
+      displayName: "5.6-Sol",
+      provider: "codex",
+      api: "responses",
+      baseUrl: `${serverUrl(upstream)}/v1`,
+      model: "gpt-5.6-sol",
+      authMode: "codex_openai",
+      imageGeneration: {
+        enabled: true,
+        mode: "custom",
+        baseUrl: "http://127.0.0.1:1/v1",
+        endpoint: "/images/generations",
+        model: "must-not-be-used",
+      },
+    }],
+  });
+  await listen(router);
+
+  try {
+    const response = await fetch(`${serverUrl(router)}/v1/images/edits`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer codex-token",
+      },
+      body: JSON.stringify({
+        prompt: "edit only inside the mask",
+        images: [{ image_url: "data:image/png;base64,aW1hZ2U=" }],
+        mask: { image_url: "data:image/png;base64,bWFzaw==" },
+      }),
+    });
+    const payload = await response.json();
+    assert.equal(response.status, 400);
+    assert.equal(payload.error.code, "native_image_edit_mask_unsupported");
+    assert.equal(upstreamCalls, 0);
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
 function snapshotEnv(keys) {
   return Object.fromEntries(keys.map((key) => [key, process.env[key]]));
 }

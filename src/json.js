@@ -30,6 +30,68 @@ export function asArray(value) {
 }
 
 export async function readJsonRequest(req, limitBytes = 25 * 1024 * 1024) {
+  const decodedBody = await readRequestBuffer(req, limitBytes);
+  const text = decodedBody.toString("utf8");
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch (cause) {
+    const error = new Error("Request body is not valid JSON");
+    error.statusCode = 400;
+    error.code = "invalid_json_body";
+    error.cause = cause;
+    throw error;
+  }
+}
+
+export async function readImageEditRequest(req, limitBytes = 100 * 1024 * 1024) {
+  const contentType = String(req.headers?.["content-type"] || "").toLowerCase();
+  if (!contentType.startsWith("multipart/form-data")) {
+    return readJsonRequest(req, limitBytes);
+  }
+
+  const decodedBody = await readRequestBuffer(req, limitBytes);
+  let form;
+  try {
+    const request = new Request("http://127.0.0.1/images/edits", {
+      method: "POST",
+      headers: { "content-type": req.headers["content-type"] },
+      body: decodedBody,
+    });
+    form = await request.formData();
+  } catch (cause) {
+    const error = new Error("Request body is not valid multipart form data");
+    error.statusCode = 400;
+    error.code = "invalid_multipart_body";
+    error.cause = cause;
+    throw error;
+  }
+
+  const body = {};
+  const images = [];
+  for (const [rawKey, value] of form.entries()) {
+    const key = rawKey === "image[]" || rawKey === "images[]" ? "image" : rawKey;
+    if (isFormFile(value)) {
+      const dataUrl = await formFileDataUrl(value);
+      if (key === "image" || key === "images") {
+        images.push({ image_url: dataUrl });
+      } else if (key === "mask") {
+        body.mask = { image_url: dataUrl };
+      }
+      continue;
+    }
+    if (key === "image" || key === "images") {
+      images.push(...normalizeTextImageReferences(value));
+      continue;
+    }
+    body[key] = normalizeMultipartScalar(key, value);
+  }
+  if (images.length) {
+    body.images = images;
+  }
+  return body;
+}
+
+async function readRequestBuffer(req, limitBytes) {
   let size = 0;
   const chunks = [];
   for await (const chunk of req) {
@@ -56,15 +118,44 @@ export async function readJsonRequest(req, limitBytes = 25 * 1024 * 1024) {
     throw error;
   }
 
-  const text = decodedBody.toString("utf8");
-  try {
-    return text ? JSON.parse(text) : {};
-  } catch (cause) {
-    const error = new Error("Request body is not valid JSON");
-    error.statusCode = 400;
-    error.cause = cause;
-    throw error;
+  return decodedBody;
+}
+
+function isFormFile(value) {
+  return value && typeof value === "object" && typeof value.arrayBuffer === "function";
+}
+
+async function formFileDataUrl(file) {
+  const mimeType = String(file.type || "application/octet-stream");
+  const bytes = Buffer.from(await file.arrayBuffer());
+  return `data:${mimeType};base64,${bytes.toString("base64")}`;
+}
+
+function normalizeTextImageReferences(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return [];
   }
+  if (text.startsWith("[") || text.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(text);
+      return Array.isArray(parsed) ? parsed : [parsed];
+    } catch {
+      // Preserve a non-JSON URL/data URL below so validation can report it consistently.
+    }
+  }
+  return [{ image_url: text }];
+}
+
+function normalizeMultipartScalar(key, value) {
+  const text = String(value ?? "");
+  if (["n", "output_compression", "partial_images"].includes(key) && /^\d+$/.test(text)) {
+    return Number(text);
+  }
+  if (key === "stream" && ["true", "false"].includes(text.toLowerCase())) {
+    return text.toLowerCase() === "true";
+  }
+  return text;
 }
 
 function decodeRequestBody(body, contentEncoding = "") {
