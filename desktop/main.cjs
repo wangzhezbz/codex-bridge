@@ -58,6 +58,10 @@ const { runRouterStartForIpc } = require("./router-start-result.cjs");
 const { readBoundedRegularUtf8File } = require("./safe-import-file.cjs");
 const { createChatgptBridgeService } = require("./chatgpt-bridge-service.cjs");
 const {
+  chromeExtensionManagerPlan,
+  parseChromeExtensionManagerResult,
+} = require("./chrome-extension-manager.cjs");
+const {
   recoverConfigTransactionsAtStartup,
   summarizeConfigRecoveryError,
 } = require("./config-recovery-startup.cjs");
@@ -2321,6 +2325,12 @@ ipcMain.handle("doubleQuota:start", async () => {
   return result;
 });
 
+ipcMain.handle("doubleQuota:restart", async () => {
+  const result = await getChatgptBridgeService().restart();
+  appendLog(`双倍额度服务已重启：${result.url}`);
+  return result;
+});
+
 ipcMain.handle("doubleQuota:stop", async () => {
   const result = await getChatgptBridgeService().stop();
   appendLog(result.externalProcess
@@ -2361,27 +2371,39 @@ ipcMain.handle("doubleQuota:openExtensionManager", async () => {
   if (!chromePath) {
     throw new Error("未找到 Chrome 安装位置。请在 Chrome 地址栏手动输入 chrome://extensions/。");
   }
-  const chromeArgs = ["chrome://extensions/"];
   const registeredProfile = state.extensionBrowser?.registrations?.find(
     (entry) => entry?.profileDir,
   )?.profileDir;
   const profileName = registeredProfile ? path.basename(registeredProfile) : "";
-  if (profileName && /^(Default|Guest Profile|System Profile|Profile \d+)$/.test(profileName)) {
-    chromeArgs.unshift(`--profile-directory=${profileName}`);
-  }
-  await spawnDetachedWithConfirmation(chromePath, chromeArgs, {
+  const managerPlan = chromeExtensionManagerPlan({ profileName, env: process.env });
+  await spawnDetachedWithConfirmation(chromePath, managerPlan.launchArgs, {
     detached: true,
     stdio: "ignore",
     windowsHide: true,
   });
+  const navigation = await runCommandCapture(
+    managerPlan.navigationCommand,
+    managerPlan.navigationArgs,
+    { env: managerPlan.navigationEnv, timeoutMs: 12000 },
+  );
+  let navigationResult;
+  try {
+    navigationResult = parseChromeExtensionManagerResult(navigation);
+  } catch {
+    throw new Error("Chrome 已打开，但扩展管理页自动跳转失败。地址已复制，请在 Chrome 地址栏粘贴并回车。");
+  }
   return {
     ...(await getChatgptBridgeService().getState()),
     extensionManager: {
       attempted: true,
-      url: "chrome://extensions/",
-      urlCopied: true,
+      url: managerPlan.url,
+      urlCopied: managerPlan.urlCopied,
       chromePath,
       profileName,
+      navigation: "address_bar",
+      activated: navigationResult.activated,
+      navigated: navigationResult.navigated,
+      title: navigationResult.title,
     },
   };
 });
@@ -2612,6 +2634,7 @@ ipcMain.handle("updates:install", async () => {
   if (!app.isPackaged) {
     throw new Error("开发模式不能直接替换程序目录，请使用打包版测试更新。");
   }
+  await getChatgptBridgeService().assertMaintenanceSafe("更新");
   emitUpdateProgress({
     phase: "checking",
     downloadedBytes: 0,

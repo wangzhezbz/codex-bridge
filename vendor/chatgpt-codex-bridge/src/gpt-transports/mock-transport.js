@@ -1,6 +1,16 @@
 const TRANSPORT_ID = "mock";
 const VALID_STATUSES = new Set(["queued", "running", "succeeded", "failed", "cancelled"]);
 
+function throwIfAborted(signal) {
+  if (!signal?.aborted) {
+    return;
+  }
+  const error = new Error(signal.reason instanceof Error ? signal.reason.message : "Mock GPT transport submission aborted");
+  error.name = "AbortError";
+  error.code = "ABORT_ERR";
+  throw error;
+}
+
 function nowIso(clock) {
   const value = clock();
   if (value instanceof Date) {
@@ -61,9 +71,11 @@ export function createMockGptTransport(options = {}) {
   const submissions = [];
 
   async function submit(kind, input = {}) {
+    throwIfAborted(input.signal);
     const sequence = submissions.length + 1;
     const stageId = String(input.stageId || `stage-${sequence}`);
-    const payload = clonePayload(input);
+    const { signal: _signal, ...serializableInput } = input;
+    const payload = clonePayload(serializableInput);
     const requestId = String(
       input.requestId || requestIdFactory({ sequence, kind, stageId, payload })
     ).trim();
@@ -103,7 +115,9 @@ export function createMockGptTransport(options = {}) {
   function requestRecord(requestId) {
     const record = requests.get(requestId);
     if (!record) {
-      throw new Error(`Mock GPT transport request not found: ${requestId}`);
+      const error = new Error(`Mock GPT transport request not found: ${requestId}`);
+      error.code = "ENOENT";
+      throw error;
     }
     return record;
   }

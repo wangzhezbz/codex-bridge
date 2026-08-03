@@ -1,8 +1,20 @@
 import { getArtifact } from "../artifact-store.js";
+import path from "node:path";
+
 import { queueArtifactForGptAnalysis, waitForSyncJobResult } from "../gpt-file-analysis.js";
 import { createSyncJob, failSyncJob, getSyncJob } from "../sync-store.js";
 
 const TRANSPORT_ID = "web-sync";
+
+function throwIfAborted(signal) {
+  if (!signal?.aborted) {
+    return;
+  }
+  const error = new Error(signal.reason instanceof Error ? signal.reason.message : "GPT transport submission aborted");
+  error.name = "AbortError";
+  error.code = "ABORT_ERR";
+  throw error;
+}
 
 function errorText(value) {
   if (value == null) {
@@ -38,8 +50,55 @@ function requireFunction(value, name) {
   return value;
 }
 
+function assertAuthoritativeWorkspaceScope(input = {}, platform = process.platform) {
+  const workspace = input.workspace || {};
+  const metadata = input.metadata || {};
+  for (const [metadataField, workspaceField, label, normalize] of [
+    ["projectId", "projectId", "projectId", normalizeText],
+    ["conversationId", "conversationId", "conversationId", normalizeText],
+    ["currentCodexThreadId", "currentCodexThreadId", "codexThreadId", normalizeText],
+    ["targetRepo", "targetRepo", "targetRepo", normalizeRepo],
+    ["chatgptProjectUrl", "chatgptProjectUrl", "chatgptProjectUrl", normalizeProjectUrl]
+  ]) {
+    const metadataValue = normalize(metadata[metadataField], platform);
+    const workspaceValue = normalize(workspace[workspaceField], platform);
+    if (metadataValue && workspaceValue && metadataValue !== workspaceValue) {
+      throw new Error(`web-sync Router scope mismatch: ${label}`);
+    }
+  }
+}
+
+function normalizeText(value) {
+  return String(value || "").trim();
+}
+
+function normalizeRepo(value, platform = process.platform) {
+  const text = normalizeText(value);
+  if (!text) {
+    return "";
+  }
+  const resolved = path.resolve(text);
+  return platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function normalizeProjectUrl(value) {
+  const text = normalizeText(value);
+  if (!text) {
+    return "";
+  }
+  try {
+    const url = new URL(text);
+    url.search = "";
+    url.hash = "";
+    return url.href.replace(/\/+$/, "");
+  } catch {
+    return text.replace(/[?#].*$/, "").replace(/\/+$/, "");
+  }
+}
+
 export function createWebSyncTransport(options = {}) {
   const storeRoot = options.storeRoot;
+  const platform = options.platform || process.platform;
   const enqueueText = requireFunction(
     options.enqueueText ||
       (async (input = {}) => {
@@ -50,10 +109,14 @@ export function createWebSyncTransport(options = {}) {
           projectUrl: workspace.chatgptProjectUrl,
           targetRepo: workspace.targetRepo,
           conversationId: workspace.conversationId,
+          projectId: workspace.projectId || null,
+          codexThreadId: workspace.currentCodexThreadId || null,
           userText: input.text || input.payloadText,
           payloadText: input.payloadText || input.text,
           modePreference: input.modePreference,
           modelPreference: input.modelPreference,
+          routerTerminalSignalRequired: Boolean(input.metadata?.routerRunId),
+          routerRunId: input.metadata?.routerRunId || null,
           sourceMessageId: input.sourceMessageId
         });
         return { syncJob };
@@ -82,7 +145,8 @@ export function createWebSyncTransport(options = {}) {
           modelPreference: input.modelPreference,
           from: input.from || "codex",
           source: input.source || "router_v2",
-          metadata: input.metadata || {}
+          metadata: input.metadata || {},
+          scopePlatform: platform
         });
       }),
     "enqueueArtifacts"
@@ -147,7 +211,10 @@ export function createWebSyncTransport(options = {}) {
   }
 
   async function submit(enqueue, input) {
+    throwIfAborted(input?.signal);
+    assertAuthoritativeWorkspaceScope(input, platform);
     const raw = await enqueue(input);
+    throwIfAborted(input?.signal);
     const job = syncJobFrom(raw);
     if (!job?.id) {
       throw new Error("web-sync transport enqueue did not return a sync job id");
@@ -163,6 +230,7 @@ export function createWebSyncTransport(options = {}) {
 
   return {
     id: TRANSPORT_ID,
+    preservesConversationContext: true,
     async submitText(input = {}) {
       return submit(enqueueText, input);
     },

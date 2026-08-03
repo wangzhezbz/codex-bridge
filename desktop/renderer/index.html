@@ -1018,9 +1018,9 @@
           <article class="panel double-quota-hero">
             <div class="panel-header">
               <div>
-                <span class="double-quota-kicker">CHATGPT + CODEX</span>
+                <span class="double-quota-kicker">G某T + CODEX</span>
                 <h2>双倍额度</h2>
-                <p>把你的 ChatGPT 网页会话接入 Codex，在保留当前模型 Router 的同时使用另一份订阅额度。</p>
+                <p>把你的 G某T 网页会话接入 Codex，在保留当前模型 Router 的同时使用另一份订阅额度。</p>
               </div>
               <span class="status-pill muted" id="doubleQuotaStatus">正在读取</span>
             </div>
@@ -1030,8 +1030,24 @@
                 <strong id="doubleQuotaUrl">http://127.0.0.1:4317/</strong>
               </div>
               <div>
+                <span>服务版本</span>
+                <strong id="doubleQuotaServiceVersion">-</strong>
+              </div>
+              <div>
+                <span>Bridge 协议</span>
+                <strong id="doubleQuotaProtocolVersion">-</strong>
+              </div>
+              <div>
+                <span>扩展协议</span>
+                <strong id="doubleQuotaExtensionProtocol">-</strong>
+              </div>
+              <div>
                 <span>嵌入版本</span>
-                <strong id="doubleQuotaVersion">-</strong>
+                <strong id="doubleQuotaEmbeddedVersion">-</strong>
+              </div>
+              <div>
+                <span>服务来源</span>
+                <strong id="doubleQuotaServiceSource">-</strong>
               </div>
               <div>
                 <span>MCP</span>
@@ -1045,7 +1061,7 @@
               <div class="panel-header">
                 <div>
                   <h2>运行控制</h2>
-                  <p>默认端口为 4317。修改端口前请先停止服务。</p>
+                  <p>默认端口为 4317。运行中修改端口不会自动重启，重启服务后生效。</p>
                 </div>
               </div>
               <div class="double-quota-service-banner" id="doubleQuotaServiceBanner">
@@ -1062,8 +1078,8 @@
               <div class="double-quota-actions">
                 <button class="ghost-button light" id="saveDoubleQuotaPort" type="button">保存端口</button>
                 <button class="primary-button" id="startDoubleQuota" type="button">启动服务</button>
+                <button class="ghost-button light" id="restartDoubleQuota" type="button">重启服务</button>
                 <button class="ghost-button light" id="stopDoubleQuota" type="button">停止服务</button>
-                <button class="ghost-button light" id="openDoubleQuota" type="button">打开使用页面</button>
               </div>
               <p class="double-quota-note" id="doubleQuotaMessage">服务独立运行，不会改变 15722 模型 Router。</p>
             </article>
@@ -1095,12 +1111,16 @@
                 </div>
               </div>
               <p class="double-quota-note" id="doubleQuotaExtensionStatus">正在检测扩展状态。</p>
-              <ol class="double-quota-steps">
-                <li>点击安装后，CodexBridge 会复制并校验扩展文件，再打开 Chrome 扩展页。</li>
-                <li>首次安装需开启“开发者模式”，点击“加载已解压的扩展程序”，粘贴已复制的目录。</li>
-              </ol>
+              <div class="double-quota-extension-guide hidden" id="doubleQuotaExtensionGuide">
+                <strong>请在刚打开的 Chrome 页面完成一次安装</strong>
+                <ol class="double-quota-steps">
+                  <li>打开右上角“开发者模式”。</li>
+                  <li>点击“加载已解压的扩展程序”，扩展目录已经复制，可直接粘贴选择。</li>
+                  <li>回到这里点击“重新检测”，确认 Chrome 安装状态。</li>
+                </ol>
+              </div>
               <div class="double-quota-actions">
-                <button class="primary-button" id="manageDoubleQuotaExtension" type="button">安装扩展</button>
+                <button class="primary-button" id="manageDoubleQuotaExtension" type="button">开始安装</button>
                 <button class="ghost-button light" id="openDoubleQuotaExtensionManager" type="button">打开扩展管理</button>
                 <button class="ghost-button light" id="refreshDoubleQuotaExtension" type="button">重新检测</button>
               </div>
@@ -1115,7 +1135,7 @@
               </div>
               <button class="primary-button" id="repairDoubleQuotaMcp" type="button">安装 / 修复 MCP</button>
             </div>
-            <p class="double-quota-note">写入前会备份 config.toml；完成后不会自动关闭或重启 ChatGPT / Codex。</p>
+            <p class="double-quota-note">写入前会备份 config.toml；完成后不会自动关闭或重启 G某T / Codex。</p>
           </article>
         </section>
 

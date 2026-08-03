@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
-  "name": "Codex GPT Bridge",
-  "version": "0.1.1",
-  "version_name": "0.1.1 - 20260712",
-  "description": "Sync Codex workbench messages with a bound GPT session.",
+  "name": "Codex G某T Bridge",
+  "version": "0.1.57",
+  "version_name": "0.1.57 - 20260801",
+  "description": "Sync Codex workbench messages with a bound G某T session.",
   "permissions": [
     "downloads",
     "debugger",
     "scripting",
+    "storage",
     "tabs"
   ],
   "host_permissions": [
@@ -20,7 +21,7 @@
   "content_scripts": [
     {
       "matches": ["https://chatgpt.com/*"],
-      "js": ["bridge-config.js", "bridge-auth.js", "content-script.js"],
+      "js": ["bridge-config.js", "content-script.js"],
       "run_at": "document_idle"
     }
   ]

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CodexBridge Chrome Extension Installer</title>
+    <style>
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        font: 16px/1.7 system-ui, sans-serif;
+        color: #18322d;
+        background: #f4faf8;
+      }
+      main {
+        width: min(620px, calc(100vw - 64px));
+        padding: 32px;
+        border: 1px solid #cfe2dc;
+        border-radius: 16px;
+        background: white;
+        box-shadow: 0 16px 48px rgba(16, 56, 48, 0.12);
+      }
+      code { user-select: all; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>正在打开 Chrome 扩展管理</h1>
+      <p>如果页面没有自动跳转，请在地址栏粘贴下面的地址并回车：</p>
+      <p><code>chrome://extensions/</code></p>
+      <p>地址已经复制到剪贴板。</p>
+    </main>
+  </body>
+</html>

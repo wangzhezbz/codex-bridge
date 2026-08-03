@@ -27,6 +27,8 @@ test("double quota is a dedicated desktop page backed by narrow IPC methods", ()
   const section = htmlSource.slice(sectionStart, sectionEnd);
   assert.match(section, /<h2>双倍额度<\/h2>/);
   assert.doesNotMatch(section, /GPT Bridge/i);
+  assert.match(section, /G某T/);
+  assert.doesNotMatch(section, /CHATGPT|ChatGPT/);
   for (const id of [
     "doubleQuotaStatus",
     "doubleQuotaServiceBanner",
@@ -37,10 +39,15 @@ test("double quota is a dedicated desktop page backed by narrow IPC methods", ()
     "doubleQuotaExtensionBrowserState",
     "doubleQuotaExtensionRuntimeState",
     "doubleQuotaPort",
+    "doubleQuotaServiceVersion",
+    "doubleQuotaProtocolVersion",
+    "doubleQuotaExtensionProtocol",
+    "doubleQuotaEmbeddedVersion",
+    "doubleQuotaServiceSource",
     "saveDoubleQuotaPort",
     "startDoubleQuota",
+    "restartDoubleQuota",
     "stopDoubleQuota",
-    "openDoubleQuota",
     "manageDoubleQuotaExtension",
     "openDoubleQuotaExtensionManager",
     "refreshDoubleQuotaExtension",
@@ -53,8 +60,8 @@ test("double quota is a dedicated desktop page backed by narrow IPC methods", ()
     ["getDoubleQuotaState", "doubleQuota:getState"],
     ["saveDoubleQuotaPort", "doubleQuota:savePort"],
     ["startDoubleQuota", "doubleQuota:start"],
+    ["restartDoubleQuota", "doubleQuota:restart"],
     ["stopDoubleQuota", "doubleQuota:stop"],
-    ["openDoubleQuota", "doubleQuota:open"],
     ["prepareDoubleQuotaExtension", "doubleQuota:prepareExtension"],
     ["manageDoubleQuotaExtension", "doubleQuota:manageExtension"],
     ["openDoubleQuotaExtensionManager", "doubleQuota:openExtensionManager"],
@@ -66,7 +73,13 @@ test("double quota is a dedicated desktop page backed by narrow IPC methods", ()
 
   assert.match(rendererSource, /async function refreshDoubleQuotaState\b/);
   assert.match(rendererSource, /sectionId === "doubleQuota"[\s\S]*refreshDoubleQuotaState/);
+  assert.equal(
+    (rendererSource.match(/api\.getDoubleQuotaState\(\)/g) || []).length,
+    1,
+    "double quota detection must stay lazy and only run through the page activation refresh",
+  );
   assert.match(rendererSource, /api\.startDoubleQuota\(\)/);
+  assert.match(rendererSource, /api\.restartDoubleQuota\(\)/);
   assert.match(rendererSource, /api\.stopDoubleQuota\(\)/);
   assert.match(rendererSource, /api\.repairDoubleQuotaMcp\(\)/);
   assert.match(rendererSource, /extensionProtocolVersion/);
@@ -75,16 +88,20 @@ test("double quota is a dedicated desktop page backed by narrow IPC methods", ()
   assert.match(rendererSource, /current\.extensionDisk/);
   assert.match(rendererSource, /current\.extensionBrowser/);
   assert.match(rendererSource, /current\.extensionRuntime/);
+  assert.match(rendererSource, /current\.extensionInstallation/);
   assert.match(rendererSource, /doubleQuotaServiceBanner\.classList\.toggle\("running"/);
   assert.match(rendererSource, /doubleQuotaServiceTitle\.textContent/);
   assert.match(rendererSource, /doubleQuotaServiceDetail\.textContent/);
   assert.match(rendererSource, /extensionDeployment\?\.verified/);
   assert.match(rendererSource, /doubleQuotaExtensionState\.textContent[\s\S]*?"已连接"/);
-  assert.match(rendererSource, /doubleQuotaExtensionState\.textContent[\s\S]*?"文件已安装"/);
+  assert.match(rendererSource, /doubleQuotaExtensionState\.textContent[\s\S]*?"已安装"/);
   assert.match(rendererSource, /current\.extensionDisplayVersion/);
   assert.doesNotMatch(rendererSource, /管理链路|extensionManagerRevision/);
   assert.doesNotMatch(rendererSource, /extensionDeployment\.updatedAt/);
   assert.match(rendererSource, /api\.openDoubleQuotaExtensionManager\(\)/);
+  assert.doesNotMatch(section, /打开使用页面/);
+  assert.doesNotMatch(section, /打开扩展目录/);
+  assert.match(mainSource, /getChatgptBridgeService\(\)\.assertMaintenanceSafe\("更新"\)/);
   assert.doesNotMatch(htmlSource, /class="grid two double-quota-grid"/);
   const extensionUpdateHandler = rendererSource.slice(
     rendererSource.indexOf('els.manageDoubleQuotaExtension?.addEventListener'),
@@ -94,9 +111,11 @@ test("double quota is a dedicated desktop page backed by narrow IPC methods", ()
   assert.doesNotMatch(extensionUpdateHandler, /requestedAction === "reinstall"/);
   assert.match(extensionUpdateHandler, /extensionUpdate\?\.status === "failed"[\s\S]*throw new Error/);
   assert.match(mainSource, /App Paths\\\\chrome\.exe/);
-  assert.match(mainSource, /const chromeArgs = \["chrome:\/\/extensions\/"\]/);
-  assert.doesNotMatch(mainSource, /"--new-window", "chrome:\/\/extensions\/"/);
+  assert.match(mainSource, /chromeExtensionManagerPlan/);
+  assert.doesNotMatch(mainSource, /const chromeArgs = \["chrome:\/\/extensions\/"\]/);
   assert.match(mainSource, /clipboard\.writeText\("chrome:\/\/extensions\/"\)/);
+  assert.match(section, /id="doubleQuotaExtensionGuide"/);
+  assert.match(section, /加载已解压的扩展程序/);
   assert.match(
     rendererSource,
     /STATE_UNAVAILABLE_READ_ONLY_API_METHODS = new Set\(\[[\s\S]*?"getDoubleQuotaState"/,

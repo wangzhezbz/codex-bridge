@@ -25,6 +25,7 @@ assert.ok(fs.existsSync(path.join(appRoot, "src", "server.js")), "missing packag
 
 try {
   const packageContent = assertWindowsPackageFilePaths(listRegularFilePaths(appRoot));
+  const embeddedBridgeSmoke = await smokeEmbeddedBridge(exePath, appRoot);
   const desktopSmoke = await smokeDesktop(exePath);
   const routerSmoke = await smokeRouter(exePath, appRoot);
   writeSmokeReport({
@@ -34,6 +35,7 @@ try {
     appPath: appDir,
     exePath,
     packageContent,
+    embeddedBridgeSmoke,
     desktopSmoke,
     routerSmoke,
   });
@@ -47,6 +49,94 @@ try {
     error: error?.message || String(error),
   });
   throw error;
+}
+
+async function smokeEmbeddedBridge(exePath, appRoot) {
+  const startedAt = Date.now();
+  const bridgeRoot = path.join(appRoot, "vendor", "chatgpt-codex-bridge");
+  const embeddedManifestPath = path.join(bridgeRoot, "embedded-manifest.json");
+  const extensionManifestPath = path.join(bridgeRoot, "chrome-extension", "manifest.json");
+  const entryPath = path.join(bridgeRoot, "src", "index.js");
+  const embedded = JSON.parse(fs.readFileSync(embeddedManifestPath, "utf8"));
+  const extension = JSON.parse(fs.readFileSync(extensionManifestPath, "utf8"));
+  assert.equal(embedded.version, "0.1.0");
+  assert.equal(embedded.protocolVersion, 1);
+  assert.equal(embedded.security?.apiTokenHeader, "X-Bridge-Token");
+  assert.equal(extension.version, "0.1.57");
+  assert.ok(fs.existsSync(path.join(bridgeRoot, "public", "bridge-api-client.js")));
+  assert.ok(fs.existsSync(path.join(bridgeRoot, "public", "visible-branding.js")));
+  assert.equal(fs.existsSync(path.join(bridgeRoot, "chrome-extension", "bridge-auth.js")), false);
+  const dependencyVersions = {
+    mcpSdk: packagedDependencyVersion(appRoot, "@modelcontextprotocol", "sdk"),
+    honoNodeServer: packagedDependencyVersion(appRoot, "@hono", "node-server"),
+    hono: packagedDependencyVersion(appRoot, "hono"),
+    fastUri: packagedDependencyVersion(appRoot, "fast-uri"),
+  };
+  assertDependencyVersionAtLeast(dependencyVersions.mcpSdk, "1.30.0", "@modelcontextprotocol/sdk");
+  assertDependencyVersionAtLeast(dependencyVersions.honoNodeServer, "2.0.5", "@hono/node-server");
+  assertDependencyVersionAtLeast(dependencyVersions.hono, "4.12.27", "hono");
+  assertDependencyVersionAtLeast(dependencyVersions.fastUri, "3.1.4", "fast-uri");
+
+  const port = await findFreePort();
+  const child = spawn(exePath, [entryPath], {
+    cwd: bridgeRoot,
+    env: {
+      ...process.env,
+      ELECTRON_RUN_AS_NODE: "1",
+      BRIDGE_HOST: "127.0.0.1",
+      BRIDGE_PORT: String(port),
+      BRIDGE_API_TOKEN: "a".repeat(64),
+      BRIDGE_DATA_DIR: path.join(os.tmpdir(), `codexbridge-embedded-smoke-${process.pid}-${Date.now()}`),
+      BRIDGE_ROUTER_V2: "1",
+      BRIDGE_GPT_TRANSPORT: "web-sync",
+    },
+    windowsHide: true,
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk.toString("utf8"); });
+  child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+  try {
+    const health = await waitForEmbeddedBridge(port, 15000);
+    const version = await httpGetJson(`http://127.0.0.1:${port}/version`);
+    assert.equal(version.service, "chatgpt-codex-bridge");
+    assert.equal(version.version, "0.1.0");
+    assert.equal(version.protocolVersion, 1);
+    assert.equal(version.extensionProtocolVersion, "v20260801-adaptive-office-wait");
+    return {
+      ok: true,
+      durationMs: Date.now() - startedAt,
+      health,
+      version,
+      dependencyVersions,
+    };
+  } catch (error) {
+    throw new Error(
+      `packaged Embedded Bridge smoke failed: ${error.message}\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+    );
+  } finally {
+    child.kill("SIGTERM");
+  }
+}
+
+function packagedDependencyVersion(appRoot, ...segments) {
+  const packagePath = path.join(appRoot, "node_modules", ...segments, "package.json");
+  return String(JSON.parse(fs.readFileSync(packagePath, "utf8")).version || "");
+}
+
+function assertDependencyVersionAtLeast(actual, minimum, name) {
+  const actualParts = String(actual).split(".").map((value) => Number.parseInt(value, 10));
+  const minimumParts = String(minimum).split(".").map((value) => Number.parseInt(value, 10));
+  let comparison = 0;
+  for (const index of [0, 1, 2]) {
+    const left = actualParts[index] || 0;
+    const right = minimumParts[index] || 0;
+    if (left !== right) {
+      comparison = left - right;
+      break;
+    }
+  }
+  assert.ok(comparison >= 0, `packaged ${name} ${actual} is below required ${minimum}`);
 }
 
 console.log(`Packaged smoke passed: ${exePath}`);
@@ -455,6 +545,26 @@ async function waitForHealth(port, timeoutMs) {
     }
   }
   throw lastError || new Error("health check timed out");
+}
+
+async function waitForEmbeddedBridge(port, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      const body = await httpGetJson(`http://127.0.0.1:${port}/health`);
+      assert.equal(body.ok, true);
+      assert.equal(body.service, "chatgpt-codex-bridge");
+      assert.equal(body.status, "ready");
+      assert.equal(body.version, "0.1.0");
+      assert.equal(body.protocolVersion, 1);
+      return body;
+    } catch (error) {
+      lastError = error;
+      await sleep(250);
+    }
+  }
+  throw lastError || new Error("Embedded Bridge health check timed out");
 }
 
 function httpGetJson(url) {

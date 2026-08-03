@@ -8,7 +8,7 @@ export const BRIDGE_RULES_VERSION = "2026-07-01-auto-delegate-v3";
 export const CODEX_DELEGATION_FILE = "AGENTS.md";
 export const CODEX_DELEGATION_BEGIN = "<!-- BEGIN CODEXBRIDGE CODEX DELEGATION -->";
 export const CODEX_DELEGATION_END = "<!-- END CODEXBRIDGE CODEX DELEGATION -->";
-export const CODEX_DELEGATION_VERSION = "2026-07-11-router-run-v4";
+export const CODEX_DELEGATION_VERSION = "2026-08-02-per-call-thread-v3";
 
 export function bridgeRulesPathForTarget(targetRepo) {
   return path.join(path.resolve(targetRepo), BRIDGE_RULES_FILE);
@@ -79,22 +79,26 @@ export function buildCodexDelegationInstructions({
   projectId,
   chatgptProjectUrl,
   conversationId,
+  currentCodexThreadId,
   targetRepo
 } = {}) {
   const bridgeProjectLine = projectId ? `- Bridge project: ${projectId}` : null;
   const projectLine = chatgptProjectUrl ? `- Bound GPT session: ${chatgptProjectUrl}` : null;
   const conversationLine = conversationId ? `- Bridge conversation: ${conversationId}` : null;
+  const threadLine = currentCodexThreadId
+    ? `- Bound Codex thread: ${currentCodexThreadId}`
+    : null;
   const targetLine = targetRepo ? `- Bound local project root: ${path.resolve(targetRepo)}` : null;
-  const hasExactRouterScope = Boolean(projectId && conversationId);
+  const hasExactRouterScope = Boolean(projectId && conversationId && currentCodexThreadId);
   const scopeLine = hasExactRouterScope
-    ? `- Required MCP scope for Router V2: include both \`projectId: "${projectId}"\` and \`conversationId: "${conversationId}"\` in every Router call.`
+    ? `- Required MCP scope for Router V2: include \`projectId: "${projectId}"\`, \`conversationId: "${conversationId}"\`, and \`currentCodexThreadId: "${currentCodexThreadId}"\` in every Router call.`
     : conversationId
-      ? `- Required MCP scope: include \`conversationId: "${conversationId}"\` in every legacy Bridge MCP call for this project; Router V2 additionally requires the bound projectId.`
-      : "- Required MCP scope: use the exact bound project and conversation; Router V2 requires both `projectId` and `conversationId`.";
+      ? `- Required MCP scope: include \`conversationId: "${conversationId}"\` in every legacy Bridge MCP call for this project; Router V2 additionally requires the bound projectId and currentCodexThreadId.`
+      : "- Required MCP scope: use the exact bound project, conversation, and Codex thread; Router V2 requires `projectId`, `conversationId`, and `currentCodexThreadId`.";
   const scopeCallText = hasExactRouterScope
-    ? "both the exact `projectId` and `conversationId`"
-    : "the exact bound scope (`projectId` and `conversationId` are both required by Router V2)";
-  const contextLines = [bridgeProjectLine, projectLine, conversationLine, targetLine].filter(Boolean);
+    ? "the exact `projectId`, `conversationId`, and `currentCodexThreadId`"
+    : "the exact bound scope (`projectId`, `conversationId`, and `currentCodexThreadId` are required by Router V2)";
+  const contextLines = [bridgeProjectLine, projectLine, conversationLine, threadLine, targetLine].filter(Boolean);
 
   return [
     CODEX_DELEGATION_BEGIN,
@@ -119,12 +123,28 @@ export function buildCodexDelegationInstructions({
     `- Never call Router V2 tools without ${scopeCallText}; incomplete or unscoped calls are rejected so another Codex project or conversation cannot leak into this room.`,
     "- For multi-step creative requests, send only the current stage chosen by Bridge. Do not summarize, combine, or pre-complete later stages locally.",
     "",
+    "### Same-turn semantic routing",
+    "- During the same Codex inference that reads the user's request, decide whether the work is `codex_only`, `gpt_only`, or `gpt_then_codex`, and include that compact structured judgment as `routingProposal` when calling `delegate_current_request`.",
+    "- Do not call a second model to create `routingProposal`. This is part of the same Codex inference and should add only a small structured tool argument.",
+    "- Include `version: \"1\"`, `routeKind`, and `confidence` from 0 to 1. Add ordered `stages` only when the task genuinely has dependent steps; each stage must name `actor: \"codex\"` or `actor: \"gpt\"`.",
+    "- Assign writing, design, image/poster generation, visual judgment, and downloadable Office/content generation stages to `gpt`. Assign `codex` only to concrete local actions such as editing project files, running commands/tests, integrating returned artifacts, or low-cost verification.",
+    "- Put only the current GPT stage in `payloadText`. Later GPT stages belong in later stage instructions so Router V2 can wait for dependencies instead of combining prompts.",
+    "- Bridge code remains authoritative for explicit user overrides, binding scope, confidence fallback, stage ordering, cancellation, and project isolation.",
+    "",
+    "### Existing result revisions",
+    "- When the user asks to adjust an answer or artifact that already exists, do not restart any earlier outline, chapter, image, poster, or file-generation stage.",
+    "- A small mechanical edit such as deleting one sentence, replacing a label, or changing simple formatting is `codex_only`.",
+    "- A substantial rewrite, expansion, tone change, or video-ready copy edit is `gpt_only` with `workType: \"existing_result_revision\"`; send only the user's incremental revision request and do not add old workflow stages.",
+    "- An existing-result revision must not regenerate images, posters, files, or other artifacts unless the user explicitly requests a new artifact.",
+    "- If the prior `runId` is unavailable, call `get_router_run_status` with the exact project and conversation scope before reading room messages or creating another run.",
+    "- If the recovered Router Run already succeeded, consume its stored reply and artifacts. Do not restart or continue an earlier completed stage.",
+    "",
     "### Default delegation",
     "- Before answering the user about images, screenshots, attachments, PDFs, Word, PPT, Excel, PSD, long writing, copywriting, visual direction, image generation, Office/file generation, research, brainstorming, or other high-cost content judgment, call the MCP tool `delegate_current_request` with the required scope.",
     "- This is a hard gate, not a suggestion: for GPT-suitable work, delegate first and do not start drafting, designing, generating, or judging the content locally before GPT returns.",
     "- If the MCP tool is unavailable or fails to load, stop instead of doing the GPT-suitable work yourself. Tell the user `Bridge MCP is not loaded in this Codex window`, then ask them to restart/open a fresh Codex window or explicitly override with `让 Codex 做` / `不要交给 GPT`.",
     "- For requests like `写一篇玄幻穿越小说`, `先做前十集大纲`, `写第一章`, or `生成小说海报`, call `delegate_current_request` before producing any outline, chapter text, prompt, poster concept, or image.",
-    "- If the result contains a `routerRun`, continue that same persisted workflow with `continue_router_run`, passing its `runId`, `projectId`, and `conversationId`. Do not call `delegate_current_request` again to advance it, because that would create a new run.",
+    "- If the result contains a `routerRun`, continue that same persisted workflow with `continue_router_run`, passing its `runId`, `projectId`, `conversationId`, and `currentCodexThreadId`. Do not call `delegate_current_request` again to advance it, because that would create a new run.",
     "- If the returned route contains `sequentialPlan`, treat it as a staged workflow. Only consume the current successful stage and let `continue_router_run` advance the next dependency; never pack all stages into one GPT prompt.",
     "- When the user gives a local file directly to Codex, pass the file path through `localPath` or `localFiles`. Local file analysis waits for GPT by default so Codex answers with GPT's result instead of Codex's own visual/content judgment; use `waitForGpt: false` only for an explicit queue-only handoff.",
     "- Forward the user's original wording for image/file analysis. Do not add inferred observations, assumed fields, or leading descriptions such as what the screenshot probably contains.",
@@ -258,7 +278,10 @@ export async function ensureCodexDelegationInstructions(input = {}) {
     "explicit queue-only handoff",
     "Forward the user's original wording",
     "Required MCP scope",
-    "unscoped calls are rejected"
+    "unscoped calls are rejected",
+    "routingProposal",
+    "same Codex inference",
+    "Do not call a second model"
   ];
   if (input.chatgptProjectUrl) {
     requiredDelegationSnippets.push(`Bound GPT session: ${input.chatgptProjectUrl}`);
@@ -273,6 +296,12 @@ export async function ensureCodexDelegationInstructions(input = {}) {
   if (input.conversationId) {
     requiredDelegationSnippets.push(`Bridge conversation: ${input.conversationId}`);
     requiredDelegationSnippets.push(`conversationId: "${input.conversationId}"`);
+  }
+  if (input.currentCodexThreadId) {
+    requiredDelegationSnippets.push(`Bound Codex thread: ${input.currentCodexThreadId}`);
+    requiredDelegationSnippets.push(
+      `currentCodexThreadId: "${input.currentCodexThreadId}"`
+    );
   }
   if (input.targetRepo) {
     requiredDelegationSnippets.push(`Bound local project root: ${path.resolve(input.targetRepo)}`);

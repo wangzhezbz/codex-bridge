@@ -11,8 +11,9 @@
     "package:user": "node scripts/create-user-package.js",
     "package:embedded": "node scripts/create-embedded-package.js",
     "smoke:product": "node scripts/product-smoke.js",
+    "smoke:semantic-router": "node scripts/semantic-router-smoke.js",
     "acceptance:contract": "node scripts/acceptance-contract.js",
-    "test": "node --test"
+    "test": "node --max-old-space-size=4096 --test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

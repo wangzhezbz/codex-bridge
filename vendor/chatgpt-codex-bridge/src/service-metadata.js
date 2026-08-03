@@ -1,7 +1,7 @@
 export const SERVICE_NAME = "chatgpt-codex-bridge";
 export const SERVICE_VERSION = "0.1.0";
 export const SERVICE_PROTOCOL_VERSION = 1;
-export const EXTENSION_PROTOCOL_VERSION = "v20260712-preference-verify";
+export const EXTENSION_PROTOCOL_VERSION = "v20260801-adaptive-office-wait";
 
 export function healthPayload() {
   return {

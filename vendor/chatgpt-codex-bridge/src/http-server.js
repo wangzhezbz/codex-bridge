@@ -1,7 +1,7 @@
 ﻿import { createServer } from "node:http";
 import { copyFile, readFile, stat } from "node:fs/promises";
 import { execFile } from "node:child_process";
-import { timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -19,11 +19,13 @@ import {
   createProject,
   deleteProject,
   ensureProjectForWorkspace,
+  getProject,
   listProjects,
   selectProject,
   updateProject
 } from "./project-store.js";
 import {
+  backfillSyncJobRouterScope,
   claimNextSyncJob,
   completeSyncJob,
   createSyncJob,
@@ -32,7 +34,13 @@ import {
   listSyncJobs,
   markSyncJobPreSendRefresh,
   markSyncJobRecoveryIssued,
-  markSyncJobSent
+  markSyncJobRouterTerminalReconciled,
+  markSyncJobTerminalMessageProjected,
+  markSyncJobSent,
+  recordSyncJobRouterTerminalReconciliationFailure,
+  reopenFailedSyncJobForCapture,
+  reopenFailedSyncJobForResend,
+  withSyncJobRouterTerminalReconciliationLease
 } from "./sync-store.js";
 import {
   getArtifact,
@@ -112,81 +120,217 @@ const UNSENT_RUNNING_SYNC_STALE_MS = 60 * 1000;
 const READY_PAGE_SENT_SYNC_STALE_MS = 90 * 1000;
 const RUNNING_SYNC_STALE_MS = 6 * 60 * 1000;
 const READY_PAGE_IMAGE_SENT_SYNC_STALE_MS = RUNNING_SYNC_STALE_MS;
+const CAPTURE_EXISTING_REPLY_MIN_AGE_MS = 10 * 1000;
+const ACTIVE_JOB_HEARTBEAT_GRACE_MS = 15 * 60 * 1000;
+const RECOVERY_REISSUE_MS = 2 * 60 * 1000;
+const MAX_RECOVERY_RELOAD_ATTEMPTS = 6;
 const MANUAL_CANCEL_STOP_RECOVERY_MS = 10 * 60 * 1000;
 const ORPHAN_GENERATION_STOP_RECOVERY_MS = 30 * 60 * 1000;
+const AUTO_OPEN_PENDING_JOB_MAX_AGE_MS = 5 * 60 * 1000;
 const EXPECTED_EXTENSION_VERSION = EXTENSION_PROTOCOL_VERSION;
 const COMPATIBLE_EXTENSION_VERSIONS = new Set([
   EXPECTED_EXTENSION_VERSION
 ]);
-const RESPONSE_CORS_HEADERS = Symbol("responseCorsHeaders");
-const REQUEST_JSON_BODY_LIMIT = Symbol("requestJsonBodyLimit");
-const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]"]);
-const DEFAULT_MAX_JSON_BODY_BYTES = 32 * 1024 * 1024;
+const SYNC_JOB_MESSAGE_PROJECTION_LOCKS = new Map();
+const ROUTER_TERMINAL_RECONCILIATION_LOCKS = new Map();
+const RESPONSE_CORS_HEADERS = Symbol("bridgeResponseCorsHeaders");
+const REQUEST_MAX_JSON_BODY_BYTES = Symbol("bridgeMaxJsonBodyBytes");
+const DEFAULT_MAX_JSON_BODY_BYTES = 64 * 1024 * 1024;
+const BROWSER_MUTATION_METHODS = new Set(["POST", "PATCH", "PUT", "DELETE"]);
+const EXTENSION_ORIGIN_PATTERN = /^chrome-extension:\/\/[a-p]{32}$/;
 
-function requestHasAllowedLoopbackHost(request) {
-  const rawHost = String(request.headers.host || "").trim();
-  if (!rawHost) {
-    return false;
+function requestOrigin(request) {
+  return String(request.headers.origin || "").trim();
+}
+
+function trustedBrowserOrigin(request, origin) {
+  if (!origin) {
+    return true;
+  }
+  if (EXTENSION_ORIGIN_PATTERN.test(origin)) {
+    return true;
   }
   try {
-    const hostUrl = new URL(`http://${rawHost}`);
-    const requestedPort = Number.parseInt(hostUrl.port || "80", 10);
-    return (
-      LOOPBACK_HOSTNAMES.has(hostUrl.hostname.toLowerCase()) &&
-      requestedPort === request.socket.localPort
-    );
+    const parsed = new URL(origin);
+    return parsed.protocol === "http:" && parsed.host === String(request.headers.host || "");
   } catch {
     return false;
   }
 }
 
-function corsPolicyForRequest(request) {
-  const origin = String(request.headers.origin || "").trim();
+function corsHeadersForOrigin(origin) {
   if (!origin) {
-    return { allowed: true, headers: {}, requiresApiToken: false };
+    return {};
   }
-
-  let originUrl;
-  try {
-    originUrl = new URL(origin);
-  } catch {
-    return { allowed: false, headers: {}, requiresApiToken: false };
-  }
-
-  const isChatGpt = originUrl.origin === "https://chatgpt.com";
-  const isChromeExtension =
-    originUrl.protocol === "chrome-extension:" &&
-    /^[a-p]{32}$/.test(originUrl.hostname) &&
-    origin === `chrome-extension://${originUrl.hostname}`;
-  const isSameBridgeOrigin =
-    originUrl.protocol === "http:" &&
-    originUrl.host === request.headers.host &&
-    originUrl.origin === origin;
-
-  if (!isChatGpt && !isChromeExtension && !isSameBridgeOrigin) {
-    return { allowed: false, headers: {}, requiresApiToken: false };
-  }
-
   return {
-    allowed: true,
-    requiresApiToken: !isSameBridgeOrigin,
-    headers: {
-      "Access-Control-Allow-Origin": origin,
-      "Access-Control-Allow-Headers": "Content-Type, X-CodexBridge-Token",
-      "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
-      "Vary": "Origin"
-    }
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Headers": "Content-Type, X-Bridge-Token, X-Bridge-Scope",
+    "Access-Control-Allow-Methods": "GET,POST,PATCH,PUT,DELETE,OPTIONS",
+    Vary: "Origin"
   };
 }
 
-function bridgeTokensMatch(expected, actual) {
-  const expectedBytes = Buffer.from(String(expected || ""), "utf8");
-  const actualBytes = Buffer.from(String(actual || ""), "utf8");
-  return (
-    expectedBytes.length > 0 &&
-    expectedBytes.length === actualBytes.length &&
-    timingSafeEqual(expectedBytes, actualBytes)
+function requestTokenMatches(request, expectedToken) {
+  const actual = Buffer.from(String(request.headers["x-bridge-token"] || ""), "utf8");
+  const expected = Buffer.from(String(expectedToken || ""), "utf8");
+  return actual.length > 0 && actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+function requestBodyLimit(options = {}, env = process.env) {
+  const configured = Number(options.maxJsonBodyBytes ?? env.BRIDGE_MAX_JSON_BODY_BYTES);
+  return Number.isFinite(configured) && configured > 0
+    ? Math.floor(configured)
+    : DEFAULT_MAX_JSON_BODY_BYTES;
+}
+
+function createScopeToken(input, signingKey) {
+  const payload = Buffer.from(
+    JSON.stringify({
+      version: 1,
+      currentCodexThreadId: String(input.currentCodexThreadId || "").trim(),
+      projectId: String(input.projectId || "").trim() || null,
+      conversationId: String(input.conversationId || "").trim() || null,
+      issuedAt: new Date().toISOString()
+    }),
+    "utf8"
+  ).toString("base64url");
+  const signature = createHmac("sha256", signingKey).update(payload).digest("base64url");
+  return `${payload}.${signature}`;
+}
+
+function readScopeToken(token, signingKey) {
+  const [payload, signature, extra] = String(token || "").split(".");
+  if (!payload || !signature || extra) {
+    return null;
+  }
+  const expected = createHmac("sha256", signingKey).update(payload).digest();
+  let actual;
+  try {
+    actual = Buffer.from(signature, "base64url");
+  } catch {
+    return null;
+  }
+  if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
+    return null;
+  }
+  try {
+    const value = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    const currentCodexThreadId = String(value?.currentCodexThreadId || "").trim();
+    if (value?.version !== 1 || !currentCodexThreadId) {
+      return null;
+    }
+    return {
+      currentCodexThreadId,
+      projectId: String(value.projectId || "").trim() || null,
+      conversationId: String(value.conversationId || "").trim() || null
+    };
+  } catch {
+    return null;
+  }
+}
+
+function requestScope(request, requestUrl, signingKey) {
+  const token = String(
+    request.headers["x-bridge-scope"] ||
+      requestUrl.searchParams.get("scope") ||
+      ""
+  ).trim();
+  if (!token) {
+    return {
+      supplied: false,
+      token: null,
+      value: null
+    };
+  }
+  return {
+    supplied: true,
+    token,
+    value: readScopeToken(token, signingKey)
+  };
+}
+
+function responseCorsHeaders(response) {
+  return response[RESPONSE_CORS_HEADERS] || {};
+}
+
+export async function __withSyncJobMessageProjectionLock(key, operation) {
+  const previous = SYNC_JOB_MESSAGE_PROJECTION_LOCKS.get(key) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => {
+    release = resolve;
+  });
+  SYNC_JOB_MESSAGE_PROJECTION_LOCKS.set(key, current);
+  await previous.catch(() => {});
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (SYNC_JOB_MESSAGE_PROJECTION_LOCKS.get(key) === current) {
+      SYNC_JOB_MESSAGE_PROJECTION_LOCKS.delete(key);
+    }
+  }
+}
+
+function routerAbortError(signal) {
+  const reason = signal?.reason;
+  const error = new Error(
+    reason instanceof Error && reason.message
+      ? reason.message
+      : "Router terminal reconciliation aborted"
   );
+  error.name = "AbortError";
+  error.code = "ABORT_ERR";
+  return error;
+}
+
+function throwIfRouterAborted(signal) {
+  if (signal?.aborted) {
+    throw routerAbortError(signal);
+  }
+}
+
+async function awaitRouterLockWithAbort(value, signal) {
+  throwIfRouterAborted(signal);
+  if (!signal) {
+    return value;
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(routerAbortError(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve(value).then(
+      (result) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(result);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      }
+    );
+  });
+}
+
+async function withRouterTerminalReconciliationLock(key, operation, options = {}) {
+  const signal = options.signal;
+  throwIfRouterAborted(signal);
+  const previous = ROUTER_TERMINAL_RECONCILIATION_LOCKS.get(key) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => {
+    release = resolve;
+  });
+  ROUTER_TERMINAL_RECONCILIATION_LOCKS.set(key, current);
+  try {
+    await awaitRouterLockWithAbort(previous.catch(() => {}), signal);
+    throwIfRouterAborted(signal);
+    const result = await operation();
+    throwIfRouterAborted(signal);
+    return result;
+  } finally {
+    release();
+    if (ROUTER_TERMINAL_RECONCILIATION_LOCKS.get(key) === current) {
+      ROUTER_TERMINAL_RECONCILIATION_LOCKS.delete(key);
+    }
+  }
 }
 
 function normalizedChatgptPageUrl(value = "") {
@@ -211,16 +355,37 @@ function sendJson(response, status, value) {
   response.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
-    ...(response[RESPONSE_CORS_HEADERS] || {})
+    ...responseCorsHeaders(response)
   });
   response.end(JSON.stringify(value, null, 2));
+}
+
+function requestErrorStatus(error) {
+  if (Number.isInteger(error?.statusCode)) {
+    return error.statusCode;
+  }
+  const message = String(error?.message || "");
+  if (
+    /scope mismatch/i.test(message) ||
+    /bound to another Codex thread/i.test(message) ||
+    /belong to different projects/i.test(message)
+  ) {
+    return 409;
+  }
+  if (
+    /scope is required/i.test(message) ||
+    /requires both projectId and conversationId/i.test(message)
+  ) {
+    return 400;
+  }
+  return 500;
 }
 
 function sendText(response, status, text, contentType = "text/plain; charset=utf-8") {
   response.writeHead(status, {
     "Content-Type": contentType,
     "Cache-Control": "no-store",
-    ...(response[RESPONSE_CORS_HEADERS] || {})
+    ...responseCorsHeaders(response)
   });
   response.end(text);
 }
@@ -228,7 +393,7 @@ function sendText(response, status, text, contentType = "text/plain; charset=utf
 function sendBinary(response, status, body, headers = {}) {
   response.writeHead(status, {
     "Cache-Control": "no-store",
-    ...(response[RESPONSE_CORS_HEADERS] || {}),
+    ...responseCorsHeaders(response),
     ...headers
   });
   response.end(body);
@@ -311,19 +476,13 @@ async function saveArtifactWithNativeDialog(artifact) {
 }
 
 async function readJsonBody(request) {
-  const maxBytes = Number(request[REQUEST_JSON_BODY_LIMIT]) || DEFAULT_MAX_JSON_BODY_BYTES;
-  const declaredBytes = Number(request.headers["content-length"] || 0);
-  if (Number.isFinite(declaredBytes) && declaredBytes > maxBytes) {
-    const error = new Error("JSON request body is too large");
-    error.statusCode = 413;
-    throw error;
-  }
   const chunks = [];
-  let receivedBytes = 0;
+  const maxBytes = request[REQUEST_MAX_JSON_BODY_BYTES] || DEFAULT_MAX_JSON_BODY_BYTES;
+  let totalBytes = 0;
   for await (const chunk of request) {
-    receivedBytes += chunk.length;
-    if (receivedBytes > maxBytes) {
-      const error = new Error("JSON request body is too large");
+    totalBytes += chunk.length;
+    if (totalBytes > maxBytes) {
+      const error = new Error(`JSON request body exceeds the ${maxBytes} byte limit`);
       error.statusCode = 413;
       throw error;
     }
@@ -692,11 +851,50 @@ function hasNegativeArtifactSignal(text = "") {
   );
 }
 
+function hasExplicitNoImageRequestSignal(text = "") {
+  const clauses = String(text || "").split(/[，。！？!?；;\n]+/u);
+  return clauses.some((clause) => {
+    const chineseNoImage =
+      /(?:(?:不要|别|无需|不需要|禁止|避免)\s*|不\s*(?=(?:再|提前)?(?:生成|制作|创建|绘制|画|设计)))(?:再|提前)?\s*(?:(?:生成|制作|创建|绘制|画|设计)\s*)?(?:任何|任意|新的?)?\s*(?:生图|配图|图片|图像|照片|海报|封面|图标|logo|插画|视觉)/iu.test(
+        clause
+      );
+    const englishNoImage =
+      /\b(?:do not|don't|without|no need to|avoid)\s+(?:(?:generate|create|draw|make|design)\s+)?(?:any\s+|a\s+|an\s+|new\s+)?(?:images?|pictures?|photos?|posters?|covers?|icons?|logos?|illustrations?)\b/iu.test(
+        clause
+      );
+    return chineseNoImage || englishNoImage;
+  });
+}
+
 function hasArtifactReplySignal(text = "") {
   return (
     /\b(?:generated|created|attached|download|downloadable|saved|file card|here is)\b/i.test(text) ||
     /\u5df2\u751f\u6210|\u751f\u6210\u4e86|\u5df2\u521b\u5efa|\u521b\u5efa\u4e86|\u53ef\u4e0b\u8f7d|\u4e0b\u8f7d|\u9644\u4ef6|\u6587\u4ef6\u5361\u7247|\u6587\u4ef6/.test(text)
   );
+}
+
+function hasArtifactOrganizationSuggestion(text = "") {
+  return /(?:建议|可(?:以)?|后续).{0,80}(?:拆分|整理|保存|写入|放入|归档).{0,80}(?:Markdown|文件|文档)|(?:Markdown|文件|文档).{0,80}(?:命名|结构|目录|整理方式)/isu.test(
+    text
+  );
+}
+
+async function hideSupersededSyncFailureMessages(storeRoot, job = {}) {
+  if (!job?.id) {
+    return;
+  }
+  const messages = await listRoomMessages(storeRoot, {
+    conversationId: job.conversationId || null,
+    includeHidden: true
+  });
+  for (const message of messages) {
+    if (
+      message?.metadata?.syncJobId === job.id &&
+      message?.metadata?.syncStatus === "failed"
+    ) {
+      await hideRoomMessage(storeRoot, message.id);
+    }
+  }
 }
 
 function hasArtifactRequestSignal(job = {}) {
@@ -723,8 +921,10 @@ function inferMissingArtifactErrors(replyText, artifactIds = [], artifactErrors 
     return [];
   }
 
-  const requiresImageArtifact = job.kind === "image_request";
   const jobText = `${job.userText || ""} ${job.payloadText || ""}`;
+  const requiresImageArtifact =
+    job.kind === "image_request" &&
+    !hasExplicitNoImageRequestSignal(jobText);
   if (
     job.kind === "codex_file_analysis" &&
     Array.isArray(job.inputArtifacts) &&
@@ -735,6 +935,14 @@ function inferMissingArtifactErrors(replyText, artifactIds = [], artifactErrors 
   }
 
   if (hasNegativeArtifactSignal(replyText) && !requiresImageArtifact) {
+    return [];
+  }
+
+  if (
+    !requiresImageArtifact &&
+    !hasArtifactRequestSignal(job) &&
+    hasArtifactOrganizationSuggestion(replyText)
+  ) {
     return [];
   }
 
@@ -1060,6 +1268,22 @@ function extensionVersionFromWorkerId(workerId = "") {
   return match?.[1] || value || null;
 }
 
+function extensionWorkerClientId(workerId = "") {
+  const segment = String(workerId || "").split(":").at(-1) || "";
+  return /^tab_[a-z0-9_-]+$/i.test(segment) ? segment : "";
+}
+
+function sameExtensionWorkerController(leftWorkerId, rightWorkerId) {
+  if (!leftWorkerId || !rightWorkerId) {
+    return false;
+  }
+  if (leftWorkerId === rightWorkerId) {
+    return true;
+  }
+  const leftClientId = extensionWorkerClientId(leftWorkerId);
+  return Boolean(leftClientId && leftClientId === extensionWorkerClientId(rightWorkerId));
+}
+
 function hasExplicitExtensionVersion(workerId = "") {
   return /(clean-capture-\d+|v\d{8}[-\w]*)/i.test(workerId || "");
 }
@@ -1070,6 +1294,27 @@ function extensionNeedsReload(version) {
 
 function isExpectedExtensionVersion(workerId = "") {
   return extensionVersionFromWorkerId(workerId) === EXPECTED_EXTENSION_VERSION;
+}
+
+function syncJobAcceptsWorkerMutation(job = null, workerId = "") {
+  const ownerWorkerIds = [job?.workerId, job?._bridgeRecoveryWorkerId].filter(Boolean);
+  if (!ownerWorkerIds.some((ownerWorkerId) => isExpectedExtensionVersion(ownerWorkerId))) {
+    return true;
+  }
+  return ownerWorkerIds.some((ownerWorkerId) =>
+    sameExtensionWorkerController(ownerWorkerId, workerId)
+  );
+}
+
+function rejectUnownedSyncJobMutation(response, job = null, workerId = "") {
+  if (syncJobAcceptsWorkerMutation(job, workerId)) {
+    return false;
+  }
+  sendJson(response, 409, {
+    error: "GPT sync job belongs to another extension tab",
+    code: "sync_job_worker_mismatch"
+  });
+  return true;
 }
 
 function isCompatibleExtensionVersion(workerId = "") {
@@ -1201,8 +1446,72 @@ function extensionProjectMatches(workspace = null, heartbeat = null) {
   return chatgptUrlsMatch(workspace.chatgptProjectUrl, heartbeat.href);
 }
 
+function activeJobOwnsDelayedHeartbeat(workspace = null, heartbeat = null, activeSyncJob = null) {
+  const pageStatus = heartbeat?.pageStatus || null;
+  const pageWasReadyBeforeGeneration =
+    pageStatus?.state === "ready" && (!pageStatus.code || pageStatus.code === "ready");
+  const pageWasAlreadyWorking =
+    pageStatus?.state === "working" && ["bridge_busy", "active_generation"].includes(pageStatus.code);
+  return Boolean(
+    heartbeat &&
+      heartbeat.connected === false &&
+      Number.isFinite(heartbeat.ageMs) &&
+      heartbeat.ageMs <= ACTIVE_JOB_HEARTBEAT_GRACE_MS &&
+      extensionProjectMatches(workspace, heartbeat) === true &&
+      activeSyncJob?.status === "running" &&
+      Boolean(activeSyncJob.sentAt) &&
+      Boolean(activeSyncJob.workerId) &&
+      activeSyncJob.workerId === heartbeat.workerId &&
+      (pageWasReadyBeforeGeneration || pageWasAlreadyWorking)
+  );
+}
+
+function heartbeatWithActiveJobGrace(workspace = null, heartbeat = null, activeSyncJob = null) {
+  if (!activeJobOwnsDelayedHeartbeat(workspace, heartbeat, activeSyncJob)) {
+    return heartbeat;
+  }
+  return {
+    ...heartbeat,
+    connected: true,
+    rawConnected: false,
+    heartbeatDelayed: true,
+    connectionState: "busy_heartbeat_delayed"
+  };
+}
+
 function heartbeatCanControlWorkspace(heartbeat = null, workspace = null) {
   return Boolean(isCompatibleExtensionVersion(heartbeat?.workerId) && extensionProjectMatches(workspace, heartbeat));
+}
+
+async function getHeartbeatWorkspaceBinding(storeRoot, heartbeat = null) {
+  const activeWorkspace = await getWorkspaceBinding(storeRoot);
+  const pageUrl = heartbeat?.href || heartbeat?.projectUrl || null;
+  if (!pageUrl) {
+    return activeWorkspace;
+  }
+
+  const { projects } = await listProjects(storeRoot);
+  const project = projects.find(
+    (candidate) =>
+      candidate.chatgptProjectUrl &&
+      chatgptUrlsMatch(candidate.chatgptProjectUrl, pageUrl)
+  );
+  if (!project) {
+    return activeWorkspace;
+  }
+
+  return {
+    ...(activeWorkspace.projectId === project.id ? activeWorkspace : {}),
+    projectId: project.id,
+    chatgptProjectUrl: project.chatgptProjectUrl,
+    targetRepo: project.targetRepo,
+    conversationId: project.conversationId,
+    currentCodexThreadId: project.currentCodexThreadId || null,
+    modePreference: project.modePreference || null,
+    modelPreference: project.modelPreference || null,
+    preferenceUpdatedAt: project.preferenceUpdatedAt || project.updatedAt || null,
+    updatedAt: project.updatedAt || null
+  };
 }
 
 function shortChatgptPath(value = "") {
@@ -1250,6 +1559,9 @@ function formatAge(ageMs) {
 }
 
 function heartbeatConnectionDetail(heartbeat = null) {
+  if (heartbeat?.heartbeatDelayed) {
+    return "绑定页面正在执行当前任务，网页生成期间扩展心跳暂时延迟（" + formatAge(heartbeat.ageMs) + "）";
+  }
   if (heartbeat?.connected) {
     return shortChatgptPath(heartbeat.href);
   }
@@ -1322,7 +1634,7 @@ function buildConnectionStatus({ workspace, heartbeat, extensionVersion, project
     {
       id: "extension-connected",
       label: "Bridge 扩展",
-      state: heartbeat?.connected ? "passed" : "blocked",
+      state: heartbeat?.heartbeatDelayed ? "working" : heartbeat?.connected ? "passed" : "blocked",
       detail: heartbeatConnectionDetail(heartbeat)
     },
     {
@@ -1617,6 +1929,16 @@ function buildWorkflowStatus({ workspace, heartbeat, extensionVersion, projectMa
     };
   }
 
+  if (heartbeat?.heartbeatDelayed && activeSyncJob?.status === "running") {
+    return {
+      level: "working",
+      label: "GPT 处理中",
+      title: "GPT 正在处理",
+      detail: heartbeatConnectionDetail(heartbeat) + "；当前任务仍由同一个扩展页面持有。",
+      nextStep: "继续等待当前结果；Bridge 不会把生成中的页面误判为断开。"
+    };
+  }
+
   const pageWorkflowStatus = workflowStatusFromPageStatus(pageStatus, { activeSyncJob });
   if (pageWorkflowStatus) {
     return pageWorkflowStatus;
@@ -1715,7 +2037,12 @@ function isReadyPageSentSyncStale(job, heartbeat = null) {
 }
 
 function isRetryableSyncJob(job, { heartbeat = null } = {}) {
-  return job?.status === "failed" || isRunningSyncStale(job) || isReadyPageSentSyncStale(job, heartbeat);
+  return (
+    job?.status === "failed" ||
+    isUnsentRunningSyncStale(job) ||
+    isRunningSyncStale(job) ||
+    isReadyPageSentSyncStale(job, heartbeat)
+  );
 }
 
 function isImageGenerationSyncJob(job = null) {
@@ -1964,7 +2291,58 @@ async function buildSequentialContinuation(storeRoot, before, sourceMessage, rep
   return { message, job };
 }
 
-async function getScopedWorkspaceBinding(storeRoot, currentCodexThreadId = null) {
+async function getScopedWorkspaceBinding(storeRoot, currentCodexThreadId = null, projectId = null) {
+  const requestedProjectId = String(projectId || "").trim();
+  if (requestedProjectId) {
+    let project = null;
+    try {
+      project = await getProject(storeRoot, requestedProjectId);
+    } catch {
+      return {
+        workspace: {
+          projectId: null,
+          chatgptProjectUrl: null,
+          targetRepo: null,
+          conversationId: null
+        },
+        scopedOut: true,
+        outOfScopeProjectId: requestedProjectId
+      };
+    }
+    if (
+      currentCodexThreadId &&
+      project.currentCodexThreadId !== currentCodexThreadId
+    ) {
+      return {
+        workspace: {
+          projectId: null,
+          chatgptProjectUrl: null,
+          targetRepo: null,
+          conversationId: null
+        },
+        scopedOut: true,
+        outOfScopeProjectId: project.id
+      };
+    }
+    const activeWorkspace = await getWorkspaceBinding(storeRoot);
+    return {
+      workspace: {
+        ...(activeWorkspace.projectId === project.id ? activeWorkspace : {}),
+        projectId: project.id,
+        chatgptProjectUrl: project.chatgptProjectUrl,
+        targetRepo: project.targetRepo,
+        conversationId: project.conversationId,
+        currentCodexThreadId: project.currentCodexThreadId || null,
+        modePreference: project.modePreference || null,
+        modelPreference: project.modelPreference || null,
+        preferenceUpdatedAt: project.preferenceUpdatedAt || project.updatedAt || null,
+        updatedAt: project.updatedAt || null
+      },
+      scopedOut: false,
+      outOfScopeProjectId: null
+    };
+  }
+
   const workspace = await getWorkspaceBinding(storeRoot);
   if (!currentCodexThreadId || !workspace.projectId) {
     return { workspace, scopedOut: false, outOfScopeProjectId: null };
@@ -2295,6 +2673,19 @@ function heartbeatShowsActiveGeneration(heartbeat = null) {
   return pageStatus?.code === "active_generation" || pageStatus?.recoveryAction === "wait_for_generation";
 }
 
+function recoveryReloadAvailable(job = null) {
+  if (!job?._bridgeRecoveryIssued) {
+    return true;
+  }
+  const issuedAtMs = timestampMs(job._bridgeRecoveryIssuedAt);
+  const attempts = Math.max(1, Number(job._bridgeRecoveryAttempts || 0));
+  return (
+    attempts < MAX_RECOVERY_RELOAD_ATTEMPTS &&
+    issuedAtMs !== null &&
+    Date.now() - issuedAtMs >= RECOVERY_REISSUE_MS
+  );
+}
+
 function buildWorkspacePreferences(workspace = null) {
   const preferences = normalizeChatGptPreferences(workspace || {});
   if (!workspace?.chatgptProjectUrl || (!preferences.modePreference && !preferences.modelPreference)) {
@@ -2328,7 +2719,27 @@ function buildExtensionRecovery(syncJobs = [], heartbeat = null, workspace = nul
     return null;
   }
 
-  if (recoveryJob._bridgeRecoveryIssued) {
+  if (
+    job?.status === "running" &&
+    job.sentAt
+  ) {
+    if (
+      syncJobSentAgeMs(job) < CAPTURE_EXISTING_REPLY_MIN_AGE_MS ||
+      heartbeatShowsActiveGeneration(heartbeat) ||
+      !recoveryReloadAvailable(job)
+    ) {
+      return null;
+    }
+    return {
+      action: "capture_existing_reply",
+      reason: "Check for the existing scoped reply without waiting for the original page waiter",
+      projectUrl,
+      job,
+      resendIfPromptMissing: false
+    };
+  }
+
+  if (!recoveryReloadAvailable(recoveryJob)) {
     return null;
   }
 
@@ -2360,11 +2771,17 @@ function buildExtensionRecovery(syncJobs = [], heartbeat = null, workspace = nul
   }
 
   if (isRunningSyncStale(job) || isReadyPageSentSyncStale(job, heartbeat) || isUnsentRunningSyncStale(job)) {
+    const canCaptureExistingReply =
+      Boolean(job.sentAt) &&
+      Boolean(job._bridgeRecoveryIssued) &&
+      heartbeat?.pageStatus?.state === "ready";
     return {
-      action: "reload",
-      reason: job.sentAt
-        ? "GPT has not returned after receiving the job"
-        : "GPT page did not submit the claimed job",
+      action: canCaptureExistingReply ? "capture_existing_reply" : "reload",
+      reason: canCaptureExistingReply
+        ? "GPT page is ready after a reload, so capture the existing scoped reply without resending"
+        : job.sentAt
+          ? "GPT has not returned after receiving the job"
+          : "GPT page did not submit the claimed job",
       projectUrl,
       job,
       resendIfPromptMissing: !job.sentAt || !isExpectedExtensionVersion(heartbeat?.workerId || "")
@@ -2376,14 +2793,81 @@ function buildExtensionRecovery(syncJobs = [], heartbeat = null, workspace = nul
 
 async function buildExtensionRecoveryForHeartbeat(storeRoot, syncJobs = [], heartbeat = null, workspace = null) {
   const recovery = buildExtensionRecovery(syncJobs, heartbeat, workspace);
-  if (recovery?.job?.id && recovery.action === "reload") {
-    await markSyncJobRecoveryIssued(storeRoot, recovery.job.id, { action: recovery.action });
-    recovery.job = {
+  if (
+    recovery?.job?.workerId &&
+    heartbeat?.workerId &&
+    !sameExtensionWorkerController(recovery.job.workerId, heartbeat.workerId)
+  ) {
+    const ownerHeartbeat = (await listExtensionHeartbeats(storeRoot, {
+      includeDisconnected: true
+    })).find(
+      (candidate) =>
+        candidate.connected &&
+        sameExtensionWorkerController(candidate.workerId, recovery.job.workerId)
+    );
+    if (ownerHeartbeat) {
+      return null;
+    }
+  }
+  if (
+    recovery?.job?.id &&
+    ["reload", "capture_existing_reply"].includes(recovery.action)
+  ) {
+    const marked = await markSyncJobRecoveryIssued(storeRoot, recovery.job.id, {
+      action: recovery.action,
+      workerId: heartbeat?.workerId || null
+    });
+    const recoveryWorkerId =
+      marked?._bridgeRecoveryWorkerId ||
+      heartbeat?.workerId ||
+      recovery.job._bridgeRecoveryWorkerId ||
+      recovery.job.workerId ||
+      null;
+    recovery.workerId = recoveryWorkerId;
+    recovery.job = marked || {
       ...recovery.job,
-      _bridgeRecoveryIssued: true
+      _bridgeRecoveryIssued: true,
+      _bridgeRecoveryWorkerId: recoveryWorkerId
     };
   }
   return recovery;
+}
+
+function buildPendingProjectOpenTarget(syncJobs = [], heartbeats = [], heartbeat = null) {
+  const activeUrl = heartbeat?.href || "";
+  const connectedHeartbeats = heartbeats.filter((candidate) => candidate.connected);
+  const candidates = syncJobs
+    .filter((job) => {
+      if (
+        job.status !== "pending" ||
+        job.claimedAt ||
+        job.sentAt ||
+        !job.projectUrl ||
+        chatgptUrlsMatch(job.projectUrl, activeUrl)
+      ) {
+        return false;
+      }
+      const createdAtMs = Date.parse(job.createdAt || "");
+      if (
+        !Number.isFinite(createdAtMs) ||
+        Date.now() - createdAtMs > AUTO_OPEN_PENDING_JOB_MAX_AGE_MS
+      ) {
+        return false;
+      }
+      return !connectedHeartbeats.some((candidate) =>
+        chatgptUrlsMatch(candidate.href || "", job.projectUrl)
+      );
+    })
+    .sort((left, right) => String(left.createdAt || "").localeCompare(String(right.createdAt || "")));
+  const job = candidates[0];
+  if (!job) {
+    return null;
+  }
+  return {
+    action: "open_project_tab",
+    jobId: job.id,
+    projectUrl: job.projectUrl
+  };
 }
 
 function withBridgeRecoveryNonce(projectUrl = "") {
@@ -2461,9 +2945,10 @@ async function buildDiagnosticsSnapshot({
   storeRoot,
   runnerMode,
   currentCodexThreadId,
-  extensionSourceDir = DEFAULT_CHROME_EXTENSION_DIR
+  extensionSourceDir = DEFAULT_CHROME_EXTENSION_DIR,
+  workspace: workspaceOverride = null
 }) {
-  const workspace = await getWorkspaceBinding(storeRoot);
+  const workspace = workspaceOverride || await getWorkspaceBinding(storeRoot);
   const syncJobs = await listSyncJobs(storeRoot);
   const workspaceSyncJobs = syncJobsForWorkspace(syncJobs, workspace);
   const userVisibleSyncJobs = visibleSyncJobs(workspaceSyncJobs);
@@ -2472,9 +2957,10 @@ async function buildDiagnosticsSnapshot({
     conversationId: workspace.conversationId
   });
   const heartbeats = await listExtensionHeartbeats(storeRoot, { includeDisconnected: true });
-  const heartbeat = selectExtensionHeartbeat(heartbeats, workspace) || (await getExtensionHeartbeat(storeRoot));
+  const rawHeartbeat = selectExtensionHeartbeat(heartbeats, workspace) || (await getExtensionHeartbeat(storeRoot));
   const latestSyncJob = userVisibleSyncJobs[0] || null;
   const activeSyncJob = selectActiveSyncJob(workspaceSyncJobs);
+  const heartbeat = heartbeatWithActiveJobGrace(workspace, rawHeartbeat, activeSyncJob);
   const latestArtifact = artifacts[0] || null;
   const workerId = heartbeat?.workerId || activeSyncJob?.workerId || latestSyncJob?.workerId || null;
   const extensionVersion = extensionVersionFromWorkerId(workerId);
@@ -2518,6 +3004,11 @@ async function buildDiagnosticsSnapshot({
   const activeSyncJobWithProgress = decorateSyncJob(activeSyncJob, { heartbeat, workspace });
   const visibleWorkflowStatus = gptVisibleStatusObject(workflowStatus);
   const visibleHeartbeat = gptVisibleHeartbeat(heartbeat);
+  const latestIdleReason = latestSyncJobWithProgress
+    ? latestSyncJobWithProgress.status === "succeeded"
+      ? latestSyncJobWithProgress.progress?.message || "最近一次 GPT 同步已完成。"
+      : "当前没有进行中的同步任务。"
+    : "暂无同步记录。";
   const idleStatus =
     visibleWorkflowStatus?.level === "blocked"
       ? {
@@ -2528,7 +3019,7 @@ async function buildDiagnosticsSnapshot({
         }
       : {
           state: "idle",
-          reason: "暂无同步记录。"
+          reason: latestIdleReason
         };
 
   return {
@@ -2555,6 +3046,9 @@ async function buildDiagnosticsSnapshot({
       heartbeat: visibleHeartbeat,
       pageStatus: visibleHeartbeat?.pageStatus || null,
       connected: Boolean(visibleHeartbeat?.connected),
+      rawConnected: Boolean(rawHeartbeat?.connected),
+      heartbeatDelayed: Boolean(visibleHeartbeat?.heartbeatDelayed),
+      connectionState: visibleHeartbeat?.connectionState || (visibleHeartbeat?.connected ? "connected" : "disconnected"),
       href: visibleHeartbeat?.href || null,
       title: visibleHeartbeat?.title || null
     },
@@ -2935,13 +3429,495 @@ async function handleApi(request, response, options) {
   const parts = requestUrl.pathname.split("/").filter(Boolean);
   const storeRoot = options.storeRoot;
   const currentCodexThreadId = options.currentCodexThreadId || null;
+  const pageScope = options.requestScope || null;
   const extensionSourceDir = options.extensionSourceDir || DEFAULT_CHROME_EXTENSION_DIR;
+  const bridgeToolOptions = {
+    storeRoot,
+    runnerMode: options.runnerMode,
+    currentCodexThreadId,
+    env: options.env,
+    routerV2Enabled: options.routerV2Enabled,
+    semanticRouterEnabled: options.semanticRouterEnabled,
+    semanticRouterMinConfidence: options.semanticRouterMinConfidence,
+    gptTransportRegistry: options.gptTransportRegistry,
+    gptTransportId: options.gptTransportId,
+    routerRunStore: options.routerRunStore,
+    routerOrchestrator: options.routerOrchestrator
+  };
+
+  function pageScopedProjectId(requestedProjectId = null) {
+    const requested = String(requestedProjectId || "").trim() || null;
+    const bound = String(pageScope?.projectId || "").trim() || null;
+    if (bound && requested && bound !== requested) {
+      throw new Error("Bridge page scope mismatch: projectId belongs to another project");
+    }
+    return bound || requested;
+  }
+
+  function routerTerminalReconciliationNow() {
+    const value = typeof options.routerTerminalReconciliationClock === "function"
+      ? options.routerTerminalReconciliationClock()
+      : new Date();
+    const date = value instanceof Date ? value : new Date(value);
+    if (Number.isNaN(date.getTime())) {
+      throw new Error("Router terminal reconciliation clock returned an invalid date");
+    }
+    return date;
+  }
+
+  function isRecoverableRouterRunWait(job = {}) {
+    return ["run_missing", "router_disabled"].includes(
+      job.routerTerminalReconciliationFailureKind
+    );
+  }
+
+  function routerTerminalReconciliationAborted() {
+    const background = options.routerTerminalBackgroundTasks;
+    return background?.discardWrites === true || background?.abortController?.signal.aborted === true;
+  }
+
+  async function runRouterTerminalWrite(operation) {
+    const background = options.routerTerminalBackgroundTasks;
+    if (routerTerminalReconciliationAborted()) {
+      return null;
+    }
+    let writePromise;
+    writePromise = Promise.resolve()
+      .then(() => {
+        if (routerTerminalReconciliationAborted()) {
+          return null;
+        }
+        return operation();
+      })
+      .finally(() => background?.writes.delete(writePromise));
+    background?.writes.add(writePromise);
+    return writePromise;
+  }
+
+  async function reconcileRouterTransportTerminal(job) {
+    if (
+      !job?.id ||
+      job.routerTerminalSignalRequired !== true ||
+      !job.conversationId ||
+      !job.targetRepo
+    ) {
+      return null;
+    }
+    const lockKey = `${path.resolve(storeRoot)}\n${job.id}`;
+    const signal = options.routerTerminalBackgroundTasks?.abortController?.signal;
+    return withRouterTerminalReconciliationLock(lockKey, () =>
+      withSyncJobRouterTerminalReconciliationLease(storeRoot, job.id, async () => {
+      const current = await getSyncJob(storeRoot, job.id);
+      if (
+        current.routerTerminalSignalPending !== true ||
+        current.routerTerminalSignalRequired !== true ||
+        !["succeeded", "failed"].includes(current.status) ||
+        !current.conversationId ||
+        !current.targetRepo
+      ) {
+        return null;
+      }
+      const now = routerTerminalReconciliationNow();
+      if (
+        (current.routerTerminalReconciliationQuarantinedAt &&
+          !isRecoverableRouterRunWait(current)) ||
+        (current.routerTerminalReconciliationNextAttemptAt &&
+          Date.parse(current.routerTerminalReconciliationNextAttemptAt) > now.getTime())
+      ) {
+        return null;
+      }
+      const failureOptions = {
+        baseDelayMs: options.routerTerminalReconciliationBaseDelayMs,
+        maxDelayMs: options.routerTerminalReconciliationMaxDelayMs,
+        maxAttempts: options.routerTerminalReconciliationMaxAttempts,
+        now
+      };
+      try {
+        const result = await createBridgeTools(bridgeToolOptions)
+          .handleGptTransportTerminal({
+            requestId: current.id,
+            routerRunId: current.routerRunId,
+            projectId: current.projectId,
+            conversationId: current.conversationId,
+            codexThreadId: current.codexThreadId,
+            targetRepo: current.targetRepo,
+            routerTerminalScopeVersion: current.routerTerminalScopeVersion,
+            signal: options.routerTerminalBackgroundTasks?.abortController?.signal
+          });
+        if (routerTerminalReconciliationAborted()) {
+          return null;
+        }
+        if (result?.matched === true) {
+          await runRouterTerminalWrite(async () => {
+            if (
+              result.routerRun &&
+              (!current.projectId || !current.codexThreadId)
+            ) {
+              await backfillSyncJobRouterScope(storeRoot, current.id, {
+                routerRunId: result.routerRun.id,
+                projectId: result.routerRun.projectId,
+                conversationId: result.routerRun.conversationId,
+                codexThreadId: result.routerRun.codexThreadId,
+                targetRepo: result.routerRun.targetRepo
+              });
+            }
+            await markSyncJobRouterTerminalReconciled(storeRoot, current.id);
+          });
+        } else {
+          const reason = result?.reason || "router_run_not_found";
+          const failureKind = reason === "router_run_not_found"
+            ? "run_missing"
+            : reason === "router_v2_disabled"
+              ? "router_disabled"
+              : "exception";
+          await runRouterTerminalWrite(() =>
+            recordSyncJobRouterTerminalReconciliationFailure(storeRoot, current.id, {
+              ...failureOptions,
+              error: reason,
+              failureKind
+            })
+          );
+        }
+        return result;
+      } catch (error) {
+        if (routerTerminalReconciliationAborted()) {
+          return null;
+        }
+        await runRouterTerminalWrite(() =>
+          recordSyncJobRouterTerminalReconciliationFailure(storeRoot, current.id, {
+            ...failureOptions,
+            error,
+            failureKind: "exception"
+          })
+        );
+        console.error(
+          `[bridge] Router terminal signal failed for ${current.id}: ${error.message}`
+        );
+        return null;
+      }
+    }, { signal }), { signal });
+  }
+
+  function scheduleRouterTransportTerminalReconciliation(job) {
+    const background = options.routerTerminalBackgroundTasks;
+    const key = `${path.resolve(storeRoot)}\n${job?.id || "unknown"}`;
+    if (background?.closing) {
+      return null;
+    }
+    const existing = background?.byKey.get(key);
+    if (existing) {
+      existing.replayRequested = true;
+      existing.latestJob = job;
+      return existing.task;
+    }
+    const entry = {
+      task: null,
+      replayRequested: false,
+      latestJob: job
+    };
+    let task;
+    task = Promise.resolve()
+      .then(() => reconcileRouterTransportTerminal(job))
+      .catch((error) => {
+        if (routerTerminalReconciliationAborted()) {
+          return;
+        }
+        console.error(
+          `[bridge] Router terminal reconciliation background task failed for ${job?.id || "unknown"}: ${error.message}`
+        );
+      })
+      .finally(() => {
+        background?.tasks.delete(task);
+        if (background?.byKey.get(key) === entry) {
+          background.byKey.delete(key);
+        }
+        if (entry.replayRequested && !background?.closing) {
+          scheduleRouterTransportTerminalReconciliation(entry.latestJob);
+        }
+      });
+    entry.task = task;
+    background?.tasks.add(task);
+    background?.byKey.set(key, entry);
+    return task;
+  }
+
+  async function reconcilePendingRouterTransportTerminals(projectUrl) {
+    const now = routerTerminalReconciliationNow().getTime();
+    const pending = (await listSyncJobs(storeRoot))
+      .filter(
+        (job) =>
+          job.routerTerminalSignalPending === true &&
+          job.routerTerminalSignalRequired === true &&
+          (job.status === "succeeded" || job.status === "failed") &&
+          job.conversationId &&
+          job.targetRepo &&
+          (!job.routerTerminalReconciliationQuarantinedAt ||
+            isRecoverableRouterRunWait(job)) &&
+          (!job.routerTerminalReconciliationNextAttemptAt ||
+            Date.parse(job.routerTerminalReconciliationNextAttemptAt) <= now) &&
+          chatgptUrlsMatch(job.projectUrl, projectUrl)
+      )
+      .reverse();
+    for (const job of pending) {
+      scheduleRouterTransportTerminalReconciliation(job);
+    }
+  }
+
+  async function reconcileSuccessfulSyncJobMessageProjectionLocked(jobId) {
+    const job = await getSyncJob(storeRoot, jobId);
+    if (
+      !job?.id ||
+      !job.conversationId ||
+      job.status !== "succeeded" ||
+      job.kind === "preference_sync"
+    ) {
+      return {
+        chatgptMessage: null,
+        roomMessage: null
+      };
+    }
+
+      const artifactIds = Array.isArray(job.artifactIds) ? job.artifactIds : [];
+      const artifacts = await loadArtifactsByIds(storeRoot, artifactIds);
+      const visibleReplyText =
+        artifactIds.length > 0 && artifacts.length === artifactIds.length && artifacts.every(isImageArtifactLike)
+          ? "已捕获 " + artifacts.length + " 张图片"
+          : summarizeVisibleReplyWithArtifacts(
+              sanitizeVisibleChatGptReply(job.replyText || "", job),
+              artifacts,
+              job.replyText || "",
+              job
+            );
+      const existingChatMessages = await listChatMessages(storeRoot, {
+        conversationId: job.conversationId
+      });
+      let chatgptMessage = existingChatMessages.find(
+        (message) =>
+          message.role === "chatgpt" &&
+          message.kind === "chatgpt_reply" &&
+          message.metadata?.syncJobId === job.id
+      ) || null;
+      if (!chatgptMessage) {
+        chatgptMessage = await appendChatMessage(storeRoot, {
+          role: "chatgpt",
+          kind: "chatgpt_reply",
+          text: visibleReplyText,
+          metadata: {
+            conversationId: job.conversationId,
+            syncJobId: job.id,
+            source: "chatgpt_project",
+            artifactIds,
+            projectArtifacts: job.projectArtifacts || [],
+            projectArtifactErrors: job.projectArtifactErrors || []
+          }
+        });
+      }
+
+      let roomMessage = null;
+      if (job.kind === "chat_message" || job.sourceMessageId) {
+        const existingRoomMessages = await listRoomMessages(storeRoot, {
+          conversationId: job.conversationId,
+          includeHidden: true
+        });
+        roomMessage = existingRoomMessages.find(
+          (message) =>
+            message.from === "gpt" &&
+            message.metadata?.syncJobId === job.id &&
+            message.metadata?.syncStatus !== "failed"
+        ) || null;
+        if (!roomMessage) {
+          roomMessage = await appendRoomMessage(storeRoot, {
+            conversationId: job.conversationId,
+            from: "gpt",
+            to: ["user"],
+            text: visibleReplyText,
+            metadata: {
+              syncJobId: job.id,
+              artifactIds,
+              artifactErrors: job.artifactErrors || [],
+              projectArtifacts: job.projectArtifacts || [],
+              projectArtifactErrors: job.projectArtifactErrors || [],
+              sourceMessageId: job.sourceMessageId || null,
+              source: "chatgpt_project",
+              imageBatchParentJobId: job._bridgeImageBatchParentJobId || null,
+              imageBatchCapturedTotal:
+                job._bridgeImageBatchParentJobId ||
+                Number(job._bridgeImageBatchAttempt || 0) > 0 ||
+                Number(job._bridgeImageBatchTotal || 0) > 0
+                  ? artifactIds.length || null
+                  : null
+            }
+          });
+        }
+      }
+
+      await markSyncJobTerminalMessageProjected(storeRoot, job.id, "succeeded");
+      return { chatgptMessage, roomMessage };
+  }
+
+  async function reconcileSuccessfulSyncJobMessageProjection(job) {
+    if (!job?.id) {
+      return {
+        chatgptMessage: null,
+        roomMessage: null
+      };
+    }
+    const lockKey = `${path.resolve(storeRoot)}\n${job.id}`;
+    return __withSyncJobMessageProjectionLock(lockKey, () =>
+      reconcileSuccessfulSyncJobMessageProjectionLocked(job.id)
+    );
+  }
+
+  async function reconcileFailedSyncJobMessageProjectionLocked(jobId) {
+    const job = await getSyncJob(storeRoot, jobId);
+    if (
+      !job?.id ||
+      !job.conversationId ||
+      job.status !== "failed" ||
+      job.kind === "preference_sync" ||
+      job.errorCode === "manual_cancelled"
+    ) {
+      return {
+        chatgptMessage: null,
+        roomMessage: null
+      };
+    }
+
+      const visibleErrorText = visibleSyncFailureText(job.error, job.errorCode);
+      const artifactIds = Array.isArray(job.artifactIds) ? job.artifactIds : [];
+      const artifactErrors = Array.isArray(job.artifactErrors) ? job.artifactErrors : [];
+      const existingChatMessages = await listChatMessages(storeRoot, {
+        conversationId: job.conversationId
+      });
+      let chatgptMessage = existingChatMessages.find(
+        (message) =>
+          message.role === "chatgpt" &&
+          message.kind === "chatgpt_error" &&
+          message.metadata?.syncJobId === job.id &&
+          message.metadata?.syncStatus === "failed"
+      ) || null;
+      if (!chatgptMessage) {
+        chatgptMessage = await appendChatMessage(storeRoot, {
+          role: "chatgpt",
+          kind: "chatgpt_error",
+          text: visibleErrorText,
+          metadata: {
+            conversationId: job.conversationId,
+            syncJobId: job.id,
+            syncStatus: "failed",
+            error: job.error,
+            syncErrorCode: job.errorCode || null,
+            syncRecoveryAction: job.recoveryAction || null,
+            ...(artifactErrors.length > 0 ? { artifactErrors } : {}),
+            source: "chatgpt_project"
+          }
+        });
+      }
+
+      let roomMessage = null;
+      if (job.kind === "chat_message" || job.sourceMessageId) {
+        const existingRoomMessages = await listRoomMessages(storeRoot, {
+          conversationId: job.conversationId,
+          includeHidden: true
+        });
+        roomMessage = existingRoomMessages.find(
+          (message) =>
+            message.from === "gpt" &&
+            message.metadata?.syncJobId === job.id &&
+            message.metadata?.syncStatus === "failed"
+        ) || null;
+        if (!roomMessage) {
+          roomMessage = await appendRoomMessage(storeRoot, {
+            conversationId: job.conversationId,
+            from: "gpt",
+            to: ["user"],
+            text: visibleErrorText,
+            metadata: {
+              syncJobId: job.id,
+              syncStatus: "failed",
+              error: job.error,
+              syncErrorCode: job.errorCode || null,
+              syncRecoveryAction: job.recoveryAction || null,
+              ...(job.errorCode === "missing_download" || artifactIds.length > 0
+                ? { artifactIds }
+                : {}),
+              ...(artifactErrors.length > 0 ? { artifactErrors } : {}),
+              sourceMessageId: job.sourceMessageId || null,
+              source: "chatgpt_project"
+            }
+          });
+        }
+      }
+
+      await markSyncJobTerminalMessageProjected(storeRoot, job.id, "failed");
+      return { chatgptMessage, roomMessage };
+  }
+
+  async function reconcileFailedSyncJobMessageProjection(job) {
+    if (!job?.id) {
+      return {
+        chatgptMessage: null,
+        roomMessage: null
+      };
+    }
+    const lockKey = `${path.resolve(storeRoot)}\n${job.id}`;
+    return __withSyncJobMessageProjectionLock(lockKey, () =>
+      reconcileFailedSyncJobMessageProjectionLocked(job.id)
+    );
+  }
+
+  async function failSyncJobAndProject(jobId, input) {
+    const lockKey = `${path.resolve(storeRoot)}\n${jobId}`;
+    return __withSyncJobMessageProjectionLock(lockKey, async () => {
+      const job = await failSyncJob(storeRoot, jobId, input);
+      const projection = job.status === "failed"
+        ? await reconcileFailedSyncJobMessageProjectionLocked(job.id)
+        : { chatgptMessage: null, roomMessage: null };
+      return { job, ...projection };
+    });
+  }
+
+  async function completeSyncJobAndProject(jobId, input) {
+    const lockKey = `${path.resolve(storeRoot)}\n${jobId}`;
+    return __withSyncJobMessageProjectionLock(lockKey, async () => {
+      const job = await completeSyncJob(storeRoot, jobId, input);
+      const projection = job.status === "succeeded"
+        ? await reconcileSuccessfulSyncJobMessageProjectionLocked(job.id)
+        : { chatgptMessage: null, roomMessage: null };
+      return { job, ...projection };
+    });
+  }
+
+  async function reconcilePendingSyncJobMessageProjections(projectUrl) {
+    const pending = (await listSyncJobs(storeRoot))
+      .filter(
+        (job) =>
+          job.terminalMessageProjectionPending === true &&
+          (job.status === "succeeded" || job.status === "failed") &&
+          chatgptUrlsMatch(job.projectUrl, projectUrl)
+      )
+      .reverse();
+    for (const job of pending) {
+      try {
+        if (job.status === "succeeded") {
+          await reconcileSuccessfulSyncJobMessageProjection(job);
+        } else {
+          await reconcileFailedSyncJobMessageProjection(job);
+        }
+      } catch (error) {
+        console.error(
+          `[bridge] Terminal message projection failed for ${job.id}: ${error.message}`
+        );
+      }
+    }
+  }
 
   if (request.method === "GET" && requestUrl.pathname === "/api/config") {
     sendJson(response, 200, {
       runnerMode: options.runnerMode,
       autoExecutesCodex: options.runnerMode === "codex",
       currentCodexThreadId,
+      apiToken: options.apiToken,
       expectedExtensionVersion: EXPECTED_EXTENSION_VERSION,
       extensionSourceDir,
       storeRoot
@@ -2990,11 +3966,14 @@ async function handleApi(request, response, options) {
 
   if (request.method === "POST" && requestUrl.pathname === "/api/delegate/current-request") {
     const body = await readJsonBody(request);
-    const tools = createBridgeTools({
-      storeRoot,
-      runnerMode: options.runnerMode,
-      currentCodexThreadId
-    });
+    const requestedCodexThreadId = String(body.currentCodexThreadId || "").trim();
+    const boundCodexThreadId = String(currentCodexThreadId || "").trim();
+    if (requestedCodexThreadId && requestedCodexThreadId !== boundCodexThreadId) {
+      throw new Error(
+        "Router V2 scope mismatch: currentCodexThreadId is bound to another Codex thread"
+      );
+    }
+    const tools = createBridgeTools(bridgeToolOptions);
     sendJson(
       response,
       201,
@@ -3009,7 +3988,11 @@ async function handleApi(request, response, options) {
   if (request.method === "POST" && requestUrl.pathname === "/api/extension/heartbeat") {
     const body = await readJsonBody(request);
     const heartbeat = await saveExtensionHeartbeat(storeRoot, body);
-    const [workspace, syncJobs] = await Promise.all([getWorkspaceBinding(storeRoot), listSyncJobs(storeRoot)]);
+    const [workspace, syncJobs, heartbeats] = await Promise.all([
+      getHeartbeatWorkspaceBinding(storeRoot, heartbeat),
+      listSyncJobs(storeRoot),
+      listExtensionHeartbeats(storeRoot, { includeDisconnected: true })
+    ]);
     const workspaceSyncJobs = syncJobsForWorkspace(syncJobs, workspace);
     const currentVersion = extensionVersionFromWorkerId(heartbeat.workerId);
     const pageMatchesWorkspace = extensionProjectMatches(workspace, heartbeat);
@@ -3025,12 +4008,20 @@ async function handleApi(request, response, options) {
       expectedExtensionVersion: EXPECTED_EXTENSION_VERSION,
       reloadExtension: shouldAskExtensionReload,
       preferences: shouldSendPreferences ? buildWorkspacePreferences(workspace) : null,
-      recovery: canControlPage ? await buildExtensionRecoveryForHeartbeat(storeRoot, workspaceSyncJobs, heartbeat, workspace) : null
+      recovery: canControlPage ? await buildExtensionRecoveryForHeartbeat(storeRoot, workspaceSyncJobs, heartbeat, workspace) : null,
+      openTarget: isExpectedExtensionVersion(heartbeat.workerId)
+        ? buildPendingProjectOpenTarget(syncJobs, heartbeats, heartbeat)
+        : null
     });
     return;
   }
 
   if (request.method === "GET" && requestUrl.pathname === "/api/diagnostics/status") {
+    const scopedWorkspace = await getScopedWorkspaceBinding(
+      storeRoot,
+      currentCodexThreadId,
+      pageScopedProjectId(requestUrl.searchParams.get("projectId"))
+    );
     sendJson(
       response,
       200,
@@ -3038,7 +4029,8 @@ async function handleApi(request, response, options) {
         storeRoot,
         runnerMode: options.runnerMode,
         currentCodexThreadId,
-        extensionSourceDir
+        extensionSourceDir,
+        workspace: scopedWorkspace.workspace
       })
     );
     return;
@@ -3056,7 +4048,11 @@ async function handleApi(request, response, options) {
   }
 
   if (request.method === "GET" && requestUrl.pathname === "/api/acceptance/status") {
-    const workspace = await getWorkspaceBinding(storeRoot);
+    const { workspace } = await getScopedWorkspaceBinding(
+      storeRoot,
+      currentCodexThreadId,
+      pageScopedProjectId(requestUrl.searchParams.get("projectId"))
+    );
     const [syncJobs, artifacts, messages, heartbeats] = await Promise.all([
       listSyncJobs(storeRoot),
       listArtifacts(storeRoot),
@@ -3089,7 +4085,11 @@ async function handleApi(request, response, options) {
   }
 
   if (request.method === "GET" && requestUrl.pathname === "/api/acceptance/report") {
-    const workspace = await getWorkspaceBinding(storeRoot);
+    const { workspace } = await getScopedWorkspaceBinding(
+      storeRoot,
+      currentCodexThreadId,
+      pageScopedProjectId(requestUrl.searchParams.get("projectId"))
+    );
     const [syncJobs, artifacts, messages, heartbeats] = await Promise.all([
       listSyncJobs(storeRoot),
       listArtifacts(storeRoot),
@@ -3119,7 +4119,11 @@ async function handleApi(request, response, options) {
   }
 
   if (request.method === "GET" && requestUrl.pathname === "/api/acceptance/real-browser-record") {
-    const workspace = await getWorkspaceBinding(storeRoot);
+    const { workspace } = await getScopedWorkspaceBinding(
+      storeRoot,
+      currentCodexThreadId,
+      pageScopedProjectId(requestUrl.searchParams.get("projectId"))
+    );
     const [syncJobs, artifacts, messages, heartbeats] = await Promise.all([
       listSyncJobs(storeRoot),
       listArtifacts(storeRoot),
@@ -3162,7 +4166,12 @@ async function handleApi(request, response, options) {
   }
 
   if (request.method === "GET" && requestUrl.pathname === "/api/workspace") {
-    sendJson(response, 200, await getWorkspaceBinding(storeRoot));
+    const scopedWorkspace = await getScopedWorkspaceBinding(
+      storeRoot,
+      currentCodexThreadId,
+      pageScopedProjectId(requestUrl.searchParams.get("projectId"))
+    );
+    sendJson(response, 200, scopedWorkspace.workspace);
     return;
   }
 
@@ -3174,6 +4183,53 @@ async function handleApi(request, response, options) {
 
   if (request.method === "POST" && requestUrl.pathname === "/api/preferences/sync") {
     const body = await readJsonBody(request);
+    const requestedProjectId = pageScopedProjectId(
+      body.projectId || requestUrl.searchParams.get("projectId")
+    );
+    if (requestedProjectId) {
+      const scopedWorkspace = await getScopedWorkspaceBinding(
+        storeRoot,
+        currentCodexThreadId,
+        requestedProjectId
+      );
+      if (scopedWorkspace.scopedOut || !scopedWorkspace.workspace.projectId) {
+        sendJson(response, 409, currentSessionNotBoundPayload(scopedWorkspace));
+        return;
+      }
+
+      const project = await updateProject(storeRoot, requestedProjectId, {
+        modePreference: body.modePreference,
+        modelPreference: body.modelPreference
+      });
+      const activeWorkspace = await getWorkspaceBinding(storeRoot);
+      if (activeWorkspace.projectId === project.id) {
+        await updateWorkspaceBinding(storeRoot, {
+          modePreference: project.modePreference,
+          modelPreference: project.modelPreference
+        });
+      }
+      const refreshedScope = await getScopedWorkspaceBinding(
+        storeRoot,
+        currentCodexThreadId,
+        requestedProjectId
+      );
+      const workspace = refreshedScope.workspace;
+
+      if (!workspace.chatgptProjectUrl) {
+        sendJson(response, 409, {
+          error: "GPT 会话未绑定。"
+        });
+        return;
+      }
+
+      sendJson(response, 201, {
+        workspace,
+        preferences: buildWorkspacePreferences(workspace),
+        syncJob: null
+      });
+      return;
+    }
+
     const workspace = await updateWorkspaceBinding(storeRoot, {
       modePreference: body.modePreference,
       modelPreference: body.modelPreference
@@ -3206,11 +4262,24 @@ async function handleApi(request, response, options) {
           conversationId: importedProject.conversationId
         });
       }
-      sendJson(response, 200, await listProjects(storeRoot, { currentCodexThreadId }));
+      const listed = await listProjects(storeRoot, { currentCodexThreadId });
+      if (pageScope?.projectId) {
+        const projects = listed.projects.filter((project) => project.id === pageScope.projectId);
+        sendJson(response, 200, {
+          activeProjectId: projects[0]?.id || null,
+          projects,
+          otherProjects: []
+        });
+        return;
+      }
+      sendJson(response, 200, listed);
       return;
     }
 
     if (request.method === "POST" && parts.length === 2) {
+      if (pageScope?.projectId) {
+        throw new Error("Bridge page scope mismatch: project-bound pages cannot create another project");
+      }
       const body = await readJsonBody(request);
       const project = await createProject(storeRoot, {
         ...body,
@@ -3228,10 +4297,12 @@ async function handleApi(request, response, options) {
         return;
       }
       const body = await readJsonBody(request);
+      const scopedProjectId = pageScopedProjectId(body.projectId);
       const bound = await bindCurrentSessionProject(
         storeRoot,
         {
           ...body,
+          projectId: scopedProjectId,
           currentCodexThreadId
         },
         {
@@ -3243,6 +4314,7 @@ async function handleApi(request, response, options) {
     }
 
     if (request.method === "PATCH" && parts[2] && parts.length === 3) {
+      pageScopedProjectId(parts[2]);
       const body = await readJsonBody(request);
       sendJson(response, 200, {
         project: await updateProject(storeRoot, parts[2], body)
@@ -3251,11 +4323,13 @@ async function handleApi(request, response, options) {
     }
 
     if (request.method === "DELETE" && parts[2] && parts.length === 3) {
+      pageScopedProjectId(parts[2]);
       sendJson(response, 200, await deleteProject(storeRoot, parts[2]));
       return;
     }
 
     if (request.method === "POST" && parts[2] && parts[3] === "select") {
+      pageScopedProjectId(parts[2]);
       sendJson(response, 200, await selectProject(storeRoot, parts[2]));
       return;
     }
@@ -3268,7 +4342,11 @@ async function handleApi(request, response, options) {
 
   if (request.method === "POST" && requestUrl.pathname === "/api/room/route-preview") {
     const body = await readJsonBody(request);
-    const { workspace } = await getScopedWorkspaceBinding(storeRoot, currentCodexThreadId);
+    const { workspace } = await getScopedWorkspaceBinding(
+      storeRoot,
+      currentCodexThreadId,
+      pageScopedProjectId(body.projectId || requestUrl.searchParams.get("projectId"))
+    );
     const messageText = String(body.text || "").trim();
     const attachmentCount = Number.isFinite(Number(body.attachmentCount)) ? Number(body.attachmentCount) : 0;
     const routeDecision = decideRoomRoute({
@@ -3281,7 +4359,12 @@ async function handleApi(request, response, options) {
   }
 
   if (parts[0] === "api" && parts[1] === "room" && parts[2] === "messages") {
-    const scopedWorkspace = await getScopedWorkspaceBinding(storeRoot, currentCodexThreadId);
+    const body = request.method === "POST" ? await readJsonBody(request) : null;
+    const scopedWorkspace = await getScopedWorkspaceBinding(
+      storeRoot,
+      currentCodexThreadId,
+      pageScopedProjectId(body?.projectId || requestUrl.searchParams.get("projectId"))
+    );
     const workspace = scopedWorkspace.workspace;
 
     if (request.method === "GET") {
@@ -3324,7 +4407,6 @@ async function handleApi(request, response, options) {
         });
         return;
       }
-      const body = await readJsonBody(request);
       let inputArtifacts = [];
       try {
         inputArtifacts = await loadInputArtifacts(storeRoot, normalizeInputArtifactIds(body.inputArtifactIds), workspace);
@@ -3372,7 +4454,8 @@ async function handleApi(request, response, options) {
           storeRoot,
           runnerMode: options.runnerMode,
           currentCodexThreadId,
-          extensionSourceDir
+          extensionSourceDir,
+          workspace
         });
         const gptBlock = buildGptSendBlock(gptSnapshot);
         if (gptBlock) {
@@ -3511,7 +4594,11 @@ async function handleApi(request, response, options) {
   }
 
   if (parts[0] === "api" && parts[1] === "artifacts") {
-    const scopedWorkspace = await getScopedWorkspaceBinding(storeRoot, currentCodexThreadId);
+    const scopedWorkspace = await getScopedWorkspaceBinding(
+      storeRoot,
+      currentCodexThreadId,
+      pageScopedProjectId(requestUrl.searchParams.get("projectId"))
+    );
     const workspace = scopedWorkspace.workspace;
     const allowUnscopedArtifactAccess = !currentCodexThreadId && !workspace.conversationId;
 
@@ -3919,6 +5006,8 @@ async function handleApi(request, response, options) {
       });
       return;
     }
+    await reconcilePendingRouterTransportTerminals(body.projectUrl || body.href || "");
+    await reconcilePendingSyncJobMessageProjections(body.projectUrl || body.href || "");
     const claimedJob = await claimNextSyncJob(storeRoot, body);
     const activeUrl = body.projectUrl || body.href || "";
     const job =
@@ -4052,7 +5141,22 @@ async function handleApi(request, response, options) {
 
   if (parts[0] === "api" && parts[1] === "sync" && parts[2] === "jobs" && parts[3]) {
     const jobId = parts[3];
-    const workspace = await getWorkspaceBinding(storeRoot);
+    const explicitProjectId = requestUrl.searchParams.get("projectId");
+    const scopedProjectId = pageScopedProjectId(explicitProjectId);
+    const scopedWorkspace = scopedProjectId
+      ? await getScopedWorkspaceBinding(storeRoot, currentCodexThreadId, scopedProjectId)
+      : null;
+    const workspace = scopedWorkspace?.workspace || await getWorkspaceBinding(storeRoot);
+
+    if (scopedProjectId) {
+      const scopedJob = await getSyncJob(storeRoot, jobId);
+      if (scopedWorkspace?.scopedOut || !syncJobMatchesWorkspace(scopedJob, workspace)) {
+        sendJson(response, 404, {
+          error: "Sync job not found in the current workspace"
+        });
+        return;
+      }
+    }
 
     if (request.method === "GET" && !parts[4]) {
       sendJson(response, 200, {
@@ -4076,11 +5180,20 @@ async function handleApi(request, response, options) {
         return;
       }
 
-      const job = await failSyncJob(storeRoot, jobId, {
+      const { job } = await failSyncJobAndProject(jobId, {
         error: "Stopped manually by user",
         errorCode: "manual_cancelled",
         recoveryAction: "manual_stop"
       });
+      if (job.status !== "failed" || job.errorCode !== "manual_cancelled") {
+        sendJson(response, 409, {
+          error: "Only pending or running GPT sync jobs can be cancelled",
+          code: "sync_job_not_active",
+          job
+        });
+        return;
+      }
+      scheduleRouterTransportTerminalReconciliation(job);
       sendJson(response, 200, {
         job
       });
@@ -4089,6 +5202,10 @@ async function handleApi(request, response, options) {
 
     if (request.method === "POST" && parts[4] === "sent") {
       const body = await readJsonBody(request);
+      const before = await getSyncJob(storeRoot, jobId);
+      if (rejectUnownedSyncJobMutation(response, before, body.workerId)) {
+        return;
+      }
       sendJson(response, 200, {
         job: await markSyncJobSent(storeRoot, jobId, body)
       });
@@ -4097,6 +5214,10 @@ async function handleApi(request, response, options) {
 
     if (request.method === "POST" && parts[4] === "pre-send-refresh") {
       const body = await readJsonBody(request);
+      const before = await getSyncJob(storeRoot, jobId);
+      if (rejectUnownedSyncJobMutation(response, before, body.workerId)) {
+        return;
+      }
       sendJson(response, 200, {
         job: await markSyncJobPreSendRefresh(storeRoot, jobId, body)
       });
@@ -4106,7 +5227,18 @@ async function handleApi(request, response, options) {
     if (request.method === "POST" && parts[4] === "complete") {
       const body = await readJsonBody(request);
       const before = await getSyncJob(storeRoot, jobId);
-      if (before.status === "succeeded" || before.status === "failed") {
+      if (rejectUnownedSyncJobMutation(response, before, body.workerId)) {
+        return;
+      }
+      const canReprocessCapturedMissingDownload =
+        before.status === "failed" &&
+        before.errorCode === "missing_download" &&
+        Boolean(before.replyText?.trim()) &&
+        before.replyText.trim() === String(body.replyText || "").trim();
+      if (
+        before.status === "succeeded" ||
+        (before.status === "failed" && !canReprocessCapturedMissingDownload)
+      ) {
         sendJson(response, 409, {
           error: "GPT sync job is no longer active",
           code: "sync_job_not_active",
@@ -4165,8 +5297,11 @@ async function handleApi(request, response, options) {
       artifactErrors.push(...inferMissingArtifactErrors(body.replyText || "", requirementArtifactIds, artifactErrors, before));
       if (shouldFailForMissingArtifactCapture(before, body.replyText || "", requirementArtifactIds, artifactErrors)) {
         const error = missingArtifactFailureMessage(artifactErrors);
-        const visibleErrorText = visibleSyncFailureText(error, "missing_download");
-        const job = await failSyncJob(storeRoot, jobId, {
+        const {
+          job,
+          chatgptMessage,
+          roomMessage
+        } = await failSyncJobAndProject(jobId, {
           error,
           errorCode: "missing_download",
           replyText: body.replyText,
@@ -4177,39 +5312,7 @@ async function handleApi(request, response, options) {
             artifactErrors
           }
         });
-        const chatgptMessage = await appendChatMessage(storeRoot, {
-          role: "chatgpt",
-          kind: "chatgpt_error",
-          text: visibleErrorText,
-          metadata: {
-            conversationId: before.conversationId,
-            syncJobId: job.id,
-            syncStatus: "failed",
-            error: job.error,
-            syncErrorCode: job.errorCode || null,
-            artifactErrors,
-            source: "chatgpt_project"
-          }
-        });
-        let roomMessage = null;
-        if (before.kind === "chat_message" || before.sourceMessageId) {
-          roomMessage = await appendRoomMessage(storeRoot, {
-            conversationId: before.conversationId,
-            from: "gpt",
-            to: ["user"],
-            text: visibleErrorText,
-            metadata: {
-              syncJobId: job.id,
-              syncStatus: "failed",
-              error: job.error,
-              syncErrorCode: job.errorCode || null,
-              artifactIds,
-              artifactErrors,
-              sourceMessageId: before.sourceMessageId || null,
-              source: "chatgpt_project"
-            }
-          });
-        }
+        scheduleRouterTransportTerminalReconciliation(job);
         sendJson(response, 200, {
           job,
           chatgptMessage,
@@ -4255,7 +5358,11 @@ async function handleApi(request, response, options) {
         visibleArtifactIds,
         before.targetRepo || workspace.targetRepo
       );
-      const job = await completeSyncJob(storeRoot, jobId, {
+      const {
+        job,
+        chatgptMessage,
+        roomMessage
+      } = await completeSyncJobAndProject(jobId, {
         replyText: body.replyText,
         artifactIds: visibleArtifactIds,
         artifactErrors,
@@ -4263,6 +5370,32 @@ async function handleApi(request, response, options) {
         projectArtifactErrors: projectArtifactSave.projectArtifactErrors,
         thoughtDurationMs: body.thoughtDurationMs
       });
+      if (job.status !== "succeeded") {
+        scheduleRouterTransportTerminalReconciliation(job);
+        sendJson(response, 409, {
+          error: "GPT sync job is no longer active",
+          code: "sync_job_not_active",
+          job,
+          chatgptMessage: null,
+          task: null,
+          resultMessage: null,
+          resultSyncJob: null,
+          inboxItem: null,
+          codexRelay: null,
+          codexRelayMessage: null,
+          roomMessage: null,
+          sequentialContinuationMessage: null,
+          sequentialContinuationJob: null,
+          imageContinuationMessage: null,
+          imageContinuationJob: null,
+          artifacts
+        });
+        return;
+      }
+      scheduleRouterTransportTerminalReconciliation(job);
+      if (canReprocessCapturedMissingDownload) {
+        await hideSupersededSyncFailureMessages(storeRoot, job);
+      }
       if (before.kind === "preference_sync") {
         sendJson(response, 200, {
           job,
@@ -4275,43 +5408,6 @@ async function handleApi(request, response, options) {
           artifacts
         });
         return;
-      }
-      const visibleReplyText =
-        imageBatchArtifactIds.length > 0 && visibleArtifacts.length === imageBatchArtifactIds.length && visibleArtifacts.every(isImageArtifactLike)
-          ? "已捕获 " + visibleArtifacts.length + " 张图片"
-          : summarizeVisibleReplyWithArtifacts(sanitizeVisibleChatGptReply(body.replyText, before), visibleArtifacts, body.replyText, before);
-      const chatgptMessage = await appendChatMessage(storeRoot, {
-        role: "chatgpt",
-        kind: "chatgpt_reply",
-        text: visibleReplyText,
-        metadata: {
-          conversationId: before.conversationId,
-          syncJobId: job.id,
-          source: "chatgpt_project",
-          artifactIds: visibleArtifactIds,
-          projectArtifacts: projectArtifactSave.projectArtifacts,
-          projectArtifactErrors: projectArtifactSave.projectArtifactErrors
-        }
-      });
-      let roomMessage = null;
-      if (before.kind === "chat_message" || before.sourceMessageId) {
-        roomMessage = await appendRoomMessage(storeRoot, {
-          conversationId: before.conversationId,
-          from: "gpt",
-          to: ["user"],
-          text: visibleReplyText,
-          metadata: {
-            syncJobId: job.id,
-            artifactIds: visibleArtifactIds,
-            artifactErrors,
-            projectArtifacts: projectArtifactSave.projectArtifacts,
-            projectArtifactErrors: projectArtifactSave.projectArtifactErrors,
-            sourceMessageId: before.sourceMessageId || null,
-            source: "chatgpt_project",
-            imageBatchParentJobId: before._bridgeImageBatchParentJobId || null,
-            imageBatchCapturedTotal: imageBatchArtifactIds.length || null
-          }
-        });
       }
 
       const sourceRoomMessages = before.sourceMessageId
@@ -4484,8 +5580,15 @@ async function handleApi(request, response, options) {
     if (request.method === "POST" && parts[4] === "fail") {
       const body = normalizeSyncFailureBody(await readJsonBody(request));
       const before = await getSyncJob(storeRoot, jobId);
-      const visibleErrorText = visibleSyncFailureText(body.error, body.errorCode);
-      const job = await failSyncJob(storeRoot, jobId, body);
+      if (rejectUnownedSyncJobMutation(response, before, body.workerId)) {
+        return;
+      }
+      const {
+        job,
+        chatgptMessage,
+        roomMessage
+      } = await failSyncJobAndProject(jobId, body);
+      scheduleRouterTransportTerminalReconciliation(job);
       if (job.status !== "failed") {
         sendJson(response, 200, {
           job,
@@ -4494,39 +5597,6 @@ async function handleApi(request, response, options) {
         });
         return;
       }
-      const chatgptMessage = await appendChatMessage(storeRoot, {
-        role: "chatgpt",
-        kind: "chatgpt_error",
-        text: visibleErrorText,
-        metadata: {
-          conversationId: before.conversationId,
-          syncJobId: job.id,
-          syncStatus: "failed",
-          error: job.error,
-          syncErrorCode: job.errorCode || null,
-          syncRecoveryAction: job.recoveryAction || null,
-          source: "chatgpt_project"
-        }
-      });
-      let roomMessage = null;
-      if (before.kind === "chat_message" || before.sourceMessageId) {
-        roomMessage = await appendRoomMessage(storeRoot, {
-          conversationId: before.conversationId,
-          from: "gpt",
-          to: ["user"],
-          text: visibleErrorText,
-          metadata: {
-            syncJobId: job.id,
-            syncStatus: "failed",
-            error: job.error,
-            syncErrorCode: job.errorCode || null,
-            syncRecoveryAction: job.recoveryAction || null,
-            sourceMessageId: before.sourceMessageId || null,
-            source: "chatgpt_project"
-          }
-        });
-      }
-
       sendJson(response, 200, {
         job,
         chatgptMessage,
@@ -4542,7 +5612,8 @@ async function handleApi(request, response, options) {
         storeRoot,
         runnerMode: options.runnerMode,
         currentCodexThreadId,
-        extensionSourceDir
+        extensionSourceDir,
+        workspace
       });
       if (!isRetryableSyncJob(before, { heartbeat: gptSnapshot.extension?.heartbeat })) {
         sendJson(response, 409, {
@@ -4561,6 +5632,37 @@ async function handleApi(request, response, options) {
       const gptBlock = buildGptSendBlock(gptSnapshot);
       if (gptBlock) {
         sendJson(response, gptBlock.status, gptBlock);
+        return;
+      }
+
+      if (
+        before.status === "failed" &&
+        ((before.sentAt && before.errorCode === "reply_timeout") ||
+          before.errorCode === "pre_send_expired")
+      ) {
+        const syncJob = await reopenFailedSyncJobForCapture(storeRoot, before.id);
+        sendJson(response, 200, {
+          message: null,
+          syncJob,
+          retriedSyncJobId: before.id,
+          captureOnly: true,
+          resend: false
+        });
+        return;
+      }
+
+      if (
+        before.status === "failed" &&
+        ["send_not_confirmed", "prompt_not_found"].includes(before.errorCode || "")
+      ) {
+        const syncJob = await reopenFailedSyncJobForResend(storeRoot, before.id);
+        sendJson(response, 200, {
+          message: null,
+          syncJob,
+          retriedSyncJobId: before.id,
+          captureOnly: false,
+          resend: true
+        });
         return;
       }
 
@@ -4627,13 +5729,26 @@ async function handleApi(request, response, options) {
 
 export function createHttpServer(options = {}) {
   const env = options.env || process.env;
-  const authToken = String(options.authToken || env.BRIDGE_AUTH_TOKEN || "").trim();
-  const configuredMaxJsonBodyBytes = Number(
-    options.maxJsonBodyBytes || env.BRIDGE_MAX_JSON_BODY_BYTES || DEFAULT_MAX_JSON_BODY_BYTES,
+  const requestedBackgroundDrainTimeoutMs = Number(
+    options.routerTerminalBackgroundDrainTimeoutMs ??
+      env.BRIDGE_ROUTER_TERMINAL_DRAIN_TIMEOUT_MS ??
+      10_000
   );
-  const maxJsonBodyBytes = Number.isSafeInteger(configuredMaxJsonBodyBytes) && configuredMaxJsonBodyBytes > 0
-    ? configuredMaxJsonBodyBytes
-    : DEFAULT_MAX_JSON_BODY_BYTES;
+  if (
+    !Number.isFinite(requestedBackgroundDrainTimeoutMs) ||
+    requestedBackgroundDrainTimeoutMs < 1 ||
+    requestedBackgroundDrainTimeoutMs > 60_000
+  ) {
+    throw new Error(
+      "Router terminal background drain timeout must be between 1 and 60000 ms"
+    );
+  }
+  const routerTerminalBackgroundDrainTimeoutMs = requestedBackgroundDrainTimeoutMs;
+  const apiToken = String(options.apiToken || env.BRIDGE_API_TOKEN || randomBytes(32).toString("base64url"));
+  const scopeSigningKey = String(
+    options.scopeSigningKey || env.BRIDGE_SCOPE_SIGNING_KEY || apiToken
+  );
+  const maxJsonBodyBytes = requestBodyLimit(options, env);
   const storeRoot = resolveBridgeDataDir({
     storeRoot: options.storeRoot,
     env,
@@ -4646,7 +5761,12 @@ export function createHttpServer(options = {}) {
   });
   const runnerMode = options.runnerMode || env.BRIDGE_RUNNER || "manual";
   const currentCodexThreadId =
-    options.currentCodexThreadId || env.BRIDGE_CURRENT_CODEX_THREAD_ID || null;
+    String(
+      options.currentCodexThreadId ||
+        env.BRIDGE_CURRENT_CODEX_THREAD_ID ||
+        env.CODEX_THREAD_ID ||
+        ""
+    ).trim() || null;
   const codexRelay =
     options.codexRelay ||
     (env.BRIDGE_CODEX_APP_RELAY === "1"
@@ -4661,40 +5781,57 @@ export function createHttpServer(options = {}) {
         }
       : null);
 
-  return createServer(async (request, response) => {
+  const routerTerminalBackgroundTasks = {
+    tasks: new Set(),
+    byKey: new Map(),
+    writes: new Set(),
+    abortController: new AbortController(),
+    closing: false,
+    discardWrites: false
+  };
+  const server = createServer(async (request, response) => {
     try {
-      if (!requestHasAllowedLoopbackHost(request)) {
-        response.writeHead(403, {
-          "Content-Type": "application/json; charset=utf-8",
-          "Cache-Control": "no-store"
+      const requestUrl = new URL(request.url, "http://127.0.0.1");
+      const origin = requestOrigin(request);
+      const trustedOrigin = trustedBrowserOrigin(request, origin);
+      const resolvedScope = requestScope(request, requestUrl, scopeSigningKey);
+      request[REQUEST_MAX_JSON_BODY_BYTES] = maxJsonBodyBytes;
+      if (trustedOrigin) {
+        response[RESPONSE_CORS_HEADERS] = corsHeadersForOrigin(origin);
+      }
+
+      if (requestUrl.pathname.startsWith("/api/") && !trustedOrigin) {
+        sendJson(response, 403, {
+          error: "Bridge API does not allow this browser origin"
         });
-        response.end(JSON.stringify({ error: "Bridge Host is not allowed" }, null, 2));
         return;
       }
-      const corsPolicy = corsPolicyForRequest(request);
-      if (!corsPolicy.allowed) {
-        response.writeHead(403, {
-          "Content-Type": "application/json; charset=utf-8",
-          "Cache-Control": "no-store"
+      if (requestUrl.pathname.startsWith("/api/") && resolvedScope.supplied && !resolvedScope.value) {
+        sendJson(response, 403, {
+          error: "Bridge page scope token is invalid"
         });
-        response.end(JSON.stringify({ error: "Browser origin is not allowed" }, null, 2));
         return;
       }
-      response[RESPONSE_CORS_HEADERS] = corsPolicy.headers;
       if (request.method === "OPTIONS") {
+        if (!trustedOrigin) {
+          sendJson(response, 403, {
+            error: "Bridge API does not allow this browser origin"
+          });
+          return;
+        }
         sendText(response, 204, "");
         return;
       }
-      const requestUrl = new URL(request.url, "http://127.0.0.1");
-      request[REQUEST_JSON_BODY_LIMIT] = maxJsonBodyBytes;
-      const sensitiveImport = requestUrl.pathname === "/api/downloads/import";
       if (
         requestUrl.pathname.startsWith("/api/") &&
-        authToken &&
-        (corsPolicy.requiresApiToken || sensitiveImport) &&
-        !bridgeTokensMatch(authToken, request.headers["x-codexbridge-token"])
+        origin &&
+        !EXTENSION_ORIGIN_PATTERN.test(origin) &&
+        BROWSER_MUTATION_METHODS.has(request.method) &&
+        !requestTokenMatches(request, apiToken)
       ) {
-        sendJson(response, 401, { error: "Bridge authentication is required" });
+        sendJson(response, 401, {
+          error: "Bridge API token is required"
+        });
         return;
       }
       if (request.method === "GET" && requestUrl.pathname === "/health") {
@@ -4705,23 +5842,138 @@ export function createHttpServer(options = {}) {
         sendJson(response, 200, versionPayload());
         return;
       }
+      if (request.method === "POST" && requestUrl.pathname === "/api/scopes") {
+        const body = await readJsonBody(request);
+        const scopedThreadId = String(body.currentCodexThreadId || "").trim();
+        if (!scopedThreadId) {
+          sendJson(response, 400, {
+            error: "currentCodexThreadId is required to create a Bridge page scope"
+          });
+          return;
+        }
+        const scopedProjectId = String(body.projectId || "").trim() || null;
+        const scopedConversationId = String(body.conversationId || "").trim() || null;
+        if (scopedProjectId) {
+          const project = await getProject(storeRoot, scopedProjectId);
+          if (
+            project.currentCodexThreadId &&
+            project.currentCodexThreadId !== scopedThreadId
+          ) {
+            throw new Error("Bridge page scope mismatch: projectId belongs to another Codex thread");
+          }
+          if (scopedConversationId && project.conversationId !== scopedConversationId) {
+            throw new Error("Bridge page scope mismatch: conversationId belongs to another project");
+          }
+        }
+        const scopeToken = createScopeToken(
+          {
+            currentCodexThreadId: scopedThreadId,
+            projectId: scopedProjectId,
+            conversationId: scopedConversationId
+          },
+          scopeSigningKey
+        );
+        const pageParams = new URLSearchParams({
+          scope: scopeToken
+        });
+        if (scopedProjectId) {
+          pageParams.set("project", scopedProjectId);
+        }
+        const pagePath = `?${pageParams.toString()}`;
+        const pageUrl = `http://${request.headers.host || "127.0.0.1:4317"}/${pagePath}`;
+        sendJson(response, 201, {
+          scopeToken,
+          pagePath,
+          pageUrl,
+          currentCodexThreadId: scopedThreadId,
+          projectId: scopedProjectId,
+          conversationId: scopedConversationId
+        });
+        return;
+      }
       if (requestUrl.pathname.startsWith("/api/")) {
         await handleApi(request, response, {
           storeRoot,
           runnerMode,
-          currentCodexThreadId,
+          currentCodexThreadId:
+            resolvedScope.value?.currentCodexThreadId || currentCodexThreadId,
+          requestScope: resolvedScope.value,
           extensionSourceDir,
+          apiToken,
           codexRelay,
-          saveArtifactAs: options.saveArtifactAs
+          saveArtifactAs: options.saveArtifactAs,
+          env,
+          routerV2Enabled: options.routerV2Enabled,
+          semanticRouterEnabled: options.semanticRouterEnabled,
+          semanticRouterMinConfidence: options.semanticRouterMinConfidence,
+          gptTransportRegistry: options.gptTransportRegistry,
+          gptTransportId: options.gptTransportId,
+          routerRunStore: options.routerRunStore,
+          routerOrchestrator: options.routerOrchestrator,
+          routerTerminalReconciliationBaseDelayMs:
+            options.routerTerminalReconciliationBaseDelayMs,
+          routerTerminalReconciliationMaxDelayMs:
+            options.routerTerminalReconciliationMaxDelayMs,
+          routerTerminalReconciliationMaxAttempts:
+            options.routerTerminalReconciliationMaxAttempts,
+          routerTerminalReconciliationClock:
+            options.routerTerminalReconciliationClock,
+          routerTerminalBackgroundTasks
         });
         return;
       }
       await serveStatic(requestUrl, response);
     } catch (error) {
-      const statusCode = Number(error?.statusCode);
-      sendJson(response, statusCode >= 400 && statusCode <= 599 ? statusCode : 500, {
+      sendJson(response, requestErrorStatus(error), {
         error: error.message
       });
     }
   });
+
+  const nativeClose = server.close.bind(server);
+  let closePromise = null;
+  server.close = (callback) => {
+    routerTerminalBackgroundTasks.closing = true;
+    if (!closePromise) {
+      const socketClosePromise = new Promise((resolve, reject) => {
+        try {
+          nativeClose((error) => error ? reject(error) : resolve());
+        } catch (error) {
+          reject(error);
+        }
+      });
+      const drainPromise = (async () => {
+        while (routerTerminalBackgroundTasks.tasks.size > 0) {
+          await Promise.allSettled([...routerTerminalBackgroundTasks.tasks]);
+        }
+      })();
+      const boundedDrainPromise = new Promise((resolve) => {
+        let timedOut = false;
+        const timer = setTimeout(async () => {
+          timedOut = true;
+          routerTerminalBackgroundTasks.discardWrites = true;
+          const abortError = new Error("Router terminal reconciliation aborted during server close");
+          abortError.name = "AbortError";
+          abortError.code = "ABORT_ERR";
+          routerTerminalBackgroundTasks.abortController.abort(abortError);
+          await Promise.allSettled([...routerTerminalBackgroundTasks.writes]);
+          resolve();
+        }, routerTerminalBackgroundDrainTimeoutMs);
+        drainPromise.then(() => {
+          if (timedOut) {
+            return;
+          }
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+      closePromise = Promise.all([socketClosePromise, boundedDrainPromise]).then(() => undefined);
+    }
+    if (typeof callback === "function") {
+      closePromise.then(() => callback(), (error) => callback(error));
+      return server;
+    }
+    return closePromise;
+  };
+  return server;
 }

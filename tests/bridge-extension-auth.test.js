@@ -1,55 +1,65 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs";
-import path from "node:path";
-import vm from "node:vm";
+import { createBridgeApiClient } from "../vendor/chatgpt-codex-bridge/public/bridge-api-client.js";
 
-const extensionDir = path.join(
-  process.cwd(),
-  "vendor",
-  "chatgpt-codex-bridge",
-  "chrome-extension",
-);
-
-function loadBridgeAuth(config = {}) {
-  const context = vm.createContext({ CODEX_BRIDGE_CONFIG: config });
-  const source = fs.readFileSync(path.join(extensionDir, "bridge-auth.js"), "utf8");
-  vm.runInContext(source, context, { filename: "bridge-auth.js" });
-  return context.CODEX_BRIDGE_AUTH;
+function jsonResponse(status, value) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    async json() {
+      return value;
+    },
+  };
 }
 
-test("extension bridge auth adds the installed token without dropping caller headers", () => {
-  const auth = loadBridgeAuth({ authToken: "a".repeat(64) });
-
-  const headers = auth.authorizedHeaders({
-    "Content-Type": "application/json",
-    Accept: "application/json",
-    "X-CodexBridge-Token": "caller-must-not-override-installed-token",
+test("embedded browser client bootstraps the Bridge API token before mutation", async () => {
+  const calls = [];
+  const client = createBridgeApiClient({
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url: String(url), options });
+      return url === "/api/config"
+        ? jsonResponse(200, { apiToken: "embedded-page-token" })
+        : jsonResponse(201, { id: "task_secured" });
+    },
   });
 
-  assert.deepEqual({ ...headers }, {
-    "Content-Type": "application/json",
-    Accept: "application/json",
-    "X-CodexBridge-Token": "a".repeat(64),
+  const response = await client.fetch("/api/tasks", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
   });
+
+  assert.equal(response.status, 201);
+  assert.deepEqual(calls.map((call) => call.url), ["/api/config", "/api/tasks"]);
+  assert.equal(calls[1].options.headers["X-Bridge-Token"], "embedded-page-token");
+  assert.equal(calls[1].options.headers["Content-Type"], "application/json");
 });
 
-test("extension bridge auth omits the token header when no token is configured", () => {
-  const auth = loadBridgeAuth({});
-
-  assert.deepEqual({ ...auth.authorizedHeaders({ Accept: "application/json" }) }, {
-    Accept: "application/json",
+test("embedded browser client refreshes its token once after service restart", async () => {
+  const calls = [];
+  const client = createBridgeApiClient({
+    apiToken: "expired-token",
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url: String(url), options });
+      if (url === "/api/config") {
+        return jsonResponse(200, { apiToken: "replacement-token" });
+      }
+      return options.headers["X-Bridge-Token"] === "expired-token"
+        ? jsonResponse(401, { error: "Bridge API token is required" })
+        : jsonResponse(200, { ok: true });
+    },
   });
-});
 
-test("extension manifest loads bridge auth before the content script", () => {
-  const manifest = JSON.parse(
-    fs.readFileSync(path.join(extensionDir, "manifest.json"), "utf8"),
-  );
+  const response = await client.fetch("/api/projects/current-session", {
+    method: "POST",
+    body: "{}",
+  });
 
-  assert.deepEqual(manifest.content_scripts[0].js, [
-    "bridge-config.js",
-    "bridge-auth.js",
-    "content-script.js",
+  assert.equal(response.status, 200);
+  assert.deepEqual(calls.map((call) => call.url), [
+    "/api/projects/current-session",
+    "/api/config",
+    "/api/projects/current-session",
   ]);
+  assert.equal(calls[2].options.headers["X-Bridge-Token"], "replacement-token");
 });

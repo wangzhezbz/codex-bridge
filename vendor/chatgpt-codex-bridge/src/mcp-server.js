@@ -8,6 +8,10 @@ import * as z from "zod/v4";
 import { createBridgeTools } from "./bridge-tools.js";
 
 function textResult(value) {
+  const structuredContent =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? value
+      : { result: value };
   return {
     content: [
       {
@@ -15,12 +19,18 @@ function textResult(value) {
         text: JSON.stringify(value, null, 2)
       }
     ],
-    structuredContent: value
+    structuredContent
   };
 }
 
 export function createMcpServer(options = {}) {
   const tools = createBridgeTools(options);
+  const toolsForCall = (input = {}) => {
+    const currentCodexThreadId = String(input.currentCodexThreadId || "").trim();
+    return currentCodexThreadId
+      ? createBridgeTools({ ...options, currentCodexThreadId })
+      : tools;
+  };
   const server = new McpServer({
     name: "chatgpt-codex-bridge",
     version: "0.1.0"
@@ -130,12 +140,18 @@ export function createMcpServer(options = {}) {
   server.registerTool(
     "list_room_messages",
     {
-      description: "List the shared user, GPT, and Codex room messages.",
+      description:
+        "List the shared user, GPT, and Codex messages only for the exact Bridge project, GPT conversation, and current Codex thread scope.",
       inputSchema: {
-        conversationId: z.string().optional().describe("Optional room conversation id")
+        currentCodexThreadId: z
+          .string()
+          .min(1)
+          .describe("Calling Codex thread id from this task's CODEX_THREAD_ID"),
+        projectId: z.string().min(1).describe("Bridge project id that owns the room"),
+        conversationId: z.string().min(1).describe("GPT conversation id that owns the room")
       }
     },
-    async (input) => textResult(await tools.listRoomMessages(input))
+    async (input) => textResult(await toolsForCall(input).listScopedRoomMessages(input))
   );
 
   server.registerTool(
@@ -144,6 +160,10 @@ export function createMcpServer(options = {}) {
       description:
         "Bind this running Codex thread to its own Bridge project, GPT conversation URL, local project directory, and routing rules before delegating work.",
       inputSchema: {
+        currentCodexThreadId: z
+          .string()
+          .min(1)
+          .describe("Calling Codex thread id from this task's CODEX_THREAD_ID"),
         projectId: z.string().optional().describe("Optional existing Bridge project id to claim for this Codex thread"),
         name: z.string().optional().describe("Bridge project name shown in the right-side Bridge page"),
         chatgptProjectUrl: z.string().min(1).describe("GPT conversation or project URL to use for this Codex thread"),
@@ -151,7 +171,7 @@ export function createMcpServer(options = {}) {
         conversationId: z.string().optional().describe("Optional existing Bridge room conversation id")
       }
     },
-    async (input) => textResult(await tools.bindCurrentCodexSession(input))
+    async (input) => textResult(await toolsForCall(input).bindCurrentCodexSession(input))
   );
 
   server.registerTool(
@@ -159,6 +179,10 @@ export function createMcpServer(options = {}) {
     {
       description: "Ask the bound GPT session from the current Codex thread and create a GPT sync job.",
       inputSchema: {
+        currentCodexThreadId: z
+          .string()
+          .min(1)
+          .describe("Calling Codex thread id from this task's CODEX_THREAD_ID"),
         projectId: z.string().optional().describe("Bridge project id. Provide projectId or conversationId to avoid cross-room routing."),
         conversationId: z
           .string()
@@ -168,7 +192,7 @@ export function createMcpServer(options = {}) {
         reason: z.string().optional().describe("Optional reason for the consultation")
       }
     },
-    async (input) => textResult(await tools.askChatGptProject(input))
+    async (input) => textResult(await toolsForCall(input).askChatGptProject(input))
   );
 
   server.registerTool(
@@ -177,12 +201,72 @@ export function createMcpServer(options = {}) {
       description:
         "Route the current Codex user request through Bridge policy. It either keeps local work in Codex or sends GPT-suitable text/files to the bound GPT session.",
       inputSchema: {
+        currentCodexThreadId: z
+          .string()
+          .min(1)
+          .describe("Calling Codex thread id from this task's CODEX_THREAD_ID"),
         projectId: z.string().optional().describe("Bridge project id. Provide projectId or conversationId to avoid cross-room routing."),
         conversationId: z
           .string()
           .optional()
           .describe("Bridge conversation id. Provide projectId or conversationId to avoid cross-room routing."),
         text: z.string().min(1).describe("The current user request from this Codex thread"),
+        routingProposal: z
+          .object({
+            version: z.literal("1").describe("Semantic routing proposal contract version"),
+            routeKind: z
+              .enum(["codex_only", "gpt_only", "gpt_then_codex"])
+              .describe("Executor plan inferred by the current Codex model"),
+            confidence: z
+              .number()
+              .min(0)
+              .max(1)
+              .describe("Confidence of this same-turn Codex routing judgment"),
+            reason: z
+              .string()
+              .optional()
+              .describe("Short reason for the semantic routing judgment"),
+            workType: z
+              .string()
+              .optional()
+              .describe("Optional semantic task category for diagnostics"),
+            gptRequestKind: z
+              .enum(["chat_message", "image_request", "user_request"])
+              .optional()
+              .describe("GPT transport request type when GPT is part of the route"),
+            stages: z
+              .array(
+                z.object({
+                  id: z
+                    .string()
+                    .regex(/^[A-Za-z0-9._-]+$/)
+                    .describe("Stable stage id"),
+                  title: z.string().min(1).describe("Short stage title"),
+                  actor: z.enum(["codex", "gpt"]).describe("Executor for this stage"),
+                  dependsOn: z
+                    .string()
+                    .regex(/^[A-Za-z0-9._-]+$/)
+                    .optional()
+                    .describe("Earlier stage id that must succeed first"),
+                  payloadText: z
+                    .string()
+                    .optional()
+                    .describe("Exact text for the first GPT stage; do not combine later stages"),
+                  instruction: z
+                    .string()
+                    .optional()
+                    .describe("Instruction used when this stage becomes current")
+                })
+              )
+              .max(20)
+              .optional()
+              .describe("Ordered model-proposed execution stages")
+          })
+          .strict()
+          .optional()
+          .describe(
+            "Structured semantic route inferred during the current Codex response. Do not call a second model just to create it."
+          ),
         localPath: z.string().optional().describe("Optional single local file path attached to the current request"),
         filename: z.string().optional().describe("Optional display filename for the single local file"),
         contentType: z.string().optional().describe("Optional MIME type for the single local file"),
@@ -204,13 +288,18 @@ export function createMcpServer(options = {}) {
           .describe(
             "Wait for the GPT-session reply before returning. Defaults to true for delegated local file analysis; pass false only for queue-only handoff."
           ),
-        timeoutMs: z.number().optional().describe("How long to wait for GPT before returning"),
+        timeoutMs: z
+          .number()
+          .optional()
+          .describe(
+            "Observation budget for this Codex call, capped at 4 minutes. GPT generation continues in the persisted Router Run after this call returns."
+          ),
         pollMs: z.number().optional().describe("How often to check the local sync job while waiting"),
         modePreference: z.string().optional().describe("Optional GPT mode to use"),
         modelPreference: z.string().optional().describe("Optional GPT model to use")
       }
     },
-    async (input) => textResult(await tools.delegateCurrentRequest(input))
+    async (input) => textResult(await toolsForCall(input).delegateCurrentRequest(input))
   );
 
   server.registerTool(
@@ -219,6 +308,10 @@ export function createMcpServer(options = {}) {
       description:
         "Continue a persisted Router V2 run under the exact Bridge project, GPT conversation, and current Codex thread scope.",
       inputSchema: {
+        currentCodexThreadId: z
+          .string()
+          .min(1)
+          .describe("Calling Codex thread id from this task's CODEX_THREAD_ID"),
         runId: z.string().min(1).describe("Router Run id returned by delegate_current_request"),
         projectId: z.string().min(1).describe("Bridge project id that owns the Router Run"),
         conversationId: z.string().min(1).describe("GPT conversation id that owns the Router Run"),
@@ -226,11 +319,38 @@ export function createMcpServer(options = {}) {
           .boolean()
           .optional()
           .describe("When true, keep advancing successful stages until the run stops or completes"),
-        timeoutMs: z.number().optional().describe("How long to wait for the current GPT stage"),
+        timeoutMs: z
+          .number()
+          .optional()
+          .describe(
+            "Observation budget for this Codex call, capped at 4 minutes. A live stage is returned with the same runId instead of being failed."
+          ),
         pollMs: z.number().optional().describe("How often to check the current GPT stage")
       }
     },
-    async (input) => textResult(await tools.continueRouterRun(input))
+    async (input) => textResult(await toolsForCall(input).continueRouterRun(input))
+  );
+
+  server.registerTool(
+    "get_router_run_status",
+    {
+      description:
+        "Read a specific or latest persisted Router V2 run under the exact Bridge project, GPT conversation, and current Codex thread scope. This tool never submits, retries, or changes a run.",
+      inputSchema: {
+        currentCodexThreadId: z
+          .string()
+          .min(1)
+          .describe("Calling Codex thread id from this task's CODEX_THREAD_ID"),
+        projectId: z.string().min(1).describe("Bridge project id that owns the Router Run"),
+        conversationId: z.string().min(1).describe("GPT conversation id that owns the Router Run"),
+        runId: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Optional Router Run id. Omit it to read the latest run in this exact scope.")
+      }
+    },
+    async (input) => textResult(await toolsForCall(input).getRouterRunStatus(input))
   );
 
   server.registerTool(
@@ -239,13 +359,17 @@ export function createMcpServer(options = {}) {
       description:
         "Cancel the current stage of a persisted Router V2 run under its exact Bridge scope.",
       inputSchema: {
+        currentCodexThreadId: z
+          .string()
+          .min(1)
+          .describe("Calling Codex thread id from this task's CODEX_THREAD_ID"),
         runId: z.string().min(1).describe("Router Run id returned by delegate_current_request"),
         projectId: z.string().min(1).describe("Bridge project id that owns the Router Run"),
         conversationId: z.string().min(1).describe("GPT conversation id that owns the Router Run"),
         reason: z.string().optional().describe("Optional cancellation reason")
       }
     },
-    async (input) => textResult(await tools.cancelRouterRun(input))
+    async (input) => textResult(await toolsForCall(input).cancelRouterRun(input))
   );
 
   server.registerTool(
@@ -265,6 +389,10 @@ export function createMcpServer(options = {}) {
       description:
         "Send a local file that the user gave to this current Codex thread to the bound GPT session for analysis.",
       inputSchema: {
+        currentCodexThreadId: z
+          .string()
+          .min(1)
+          .describe("Calling Codex thread id from this task's CODEX_THREAD_ID"),
         projectId: z.string().optional().describe("Bridge project id. Provide projectId or conversationId to avoid cross-room routing."),
         conversationId: z
           .string()
@@ -278,7 +406,7 @@ export function createMcpServer(options = {}) {
         modelPreference: z.string().optional().describe("Optional GPT model to use for the analysis")
       }
     },
-    async (input) => textResult(await tools.sendLocalFileToChatGptProject(input))
+    async (input) => textResult(await toolsForCall(input).sendLocalFileToChatGptProject(input))
   );
 
   server.registerTool(
@@ -287,6 +415,10 @@ export function createMcpServer(options = {}) {
       description:
         "Send a local file from the current Codex thread to GPT, then wait for the reply and return it in one call.",
       inputSchema: {
+        currentCodexThreadId: z
+          .string()
+          .min(1)
+          .describe("Calling Codex thread id from this task's CODEX_THREAD_ID"),
         projectId: z.string().optional().describe("Bridge project id. Provide projectId or conversationId to avoid cross-room routing."),
         conversationId: z
           .string()
@@ -302,7 +434,8 @@ export function createMcpServer(options = {}) {
         pollMs: z.number().optional().describe("How often to check the local sync job while waiting")
       }
     },
-    async (input) => textResult(await tools.sendLocalFileToChatGptProjectAndWait(input))
+    async (input) =>
+      textResult(await toolsForCall(input).sendLocalFileToChatGptProjectAndWait(input))
   );
 
   server.registerTool(

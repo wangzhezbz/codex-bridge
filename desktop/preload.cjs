@@ -61,6 +61,7 @@ contextBridge.exposeInMainWorld("codexBridge", {
   getDoubleQuotaState: () => ipcRenderer.invoke("doubleQuota:getState"),
   saveDoubleQuotaPort: (port) => ipcRenderer.invoke("doubleQuota:savePort", port),
   startDoubleQuota: () => ipcRenderer.invoke("doubleQuota:start"),
+  restartDoubleQuota: () => ipcRenderer.invoke("doubleQuota:restart"),
   stopDoubleQuota: () => ipcRenderer.invoke("doubleQuota:stop"),
   openDoubleQuota: () => ipcRenderer.invoke("doubleQuota:open"),
   prepareDoubleQuotaExtension: () => ipcRenderer.invoke("doubleQuota:prepareExtension"),

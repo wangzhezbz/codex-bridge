@@ -1,15 +1,22 @@
-﻿const BRIDGE_ORIGIN = String(globalThis.CODEX_BRIDGE_CONFIG?.origin || "").replace(/\/+$/, "");
+const BRIDGE_ORIGIN = String(globalThis.CODEX_BRIDGE_CONFIG?.origin || "").replace(/\/+$/, "");
 if (!BRIDGE_ORIGIN) {
   throw new Error("Codex GPT Bridge extension is missing bridge-config.js");
 }
-const WORKER_ID = "codex-chatgpt-project-extension-v20260712-preference-verify";
+globalThis.__CODEX_GPT_BRIDGE_CONTENT_SCRIPT_ACTIVE__ = true;
+const WORKER_ID = "codex-chatgpt-project-extension-v20260801-adaptive-office-wait";
 const POLL_MS = 1500;
-const RESPONSE_TIMEOUT_MS = 300000;
+const HEARTBEAT_REQUEST_TIMEOUT_MS = 5_000;
+const RESPONSE_IDLE_TIMEOUT_MS = 15 * 60_000;
+const RESPONSE_HARD_TIMEOUT_MS = 45 * 60_000;
 const ACTIVE_JOB_CHECK_INTERVAL_MS = 3000;
 const DOWNLOAD_CAPTURE_TIMEOUT_MS = 120000;
 const DOWNLOAD_CAPTURE_PROBE_TIMEOUT_MS = 15000;
 const PAGE_CONTEXT_FETCH_TIMEOUT_MS = 20000;
-const PRE_SEND_TIMEOUT_MS = 90000;
+const PRE_SEND_TIMEOUT_MS = 30000;
+const MAX_UNSENT_CLAIM_AGE_MS = 60_000;
+const MAX_TRUSTED_INSERT_TEXT_LENGTH = 4096;
+const STREAMING_REPLY_PROBE_MS = 2500;
+const ASSISTANT_ACTIVITY_COALESCE_MS = 250;
 const PRE_SEND_REFRESH_KEY = "chatgpt-codex-bridge:pre-send-refresh-job";
 const HEARTBEAT_RECOVERY_KEY = "chatgpt-codex-bridge:last-heartbeat-recovery";
 const CLIENT_ID_KEY = "chatgpt-codex-bridge:client-id";
@@ -22,7 +29,15 @@ let lastHeartbeatPreferenceKey = null;
 let failedHeartbeatPreferenceKey = null;
 let lastPreferenceStatus = null;
 let lastPreferenceAttemptDiagnostic = null;
+let lastCaptureStatus = null;
 let fallbackClientId = null;
+let pollInFlight = false;
+let busyHeartbeatInFlight = false;
+let cachedBridgeApiToken = String(globalThis.CODEX_BRIDGE_CONFIG?.apiToken || "");
+let bridgeApiTokenPromise = null;
+let assistantActivityObserver = null;
+let assistantActivityNotifyTimer = null;
+const assistantActivityWaiters = new Set();
 
 function newBridgeClientId() {
   return `tab_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
@@ -57,15 +72,35 @@ function currentWorkerId() {
   return `${WORKER_ID}:${runtimeState}:${bridgeClientId()}`;
 }
 
-async function sendHeartbeat() {
+function lightweightBusyPageStatus() {
+  if (isGenerating()) {
+    return {
+      state: "working",
+      code: "active_generation",
+      recoveryAction: "wait_for_generation",
+      message: "GPT 正在生成当前回复。"
+    };
+  }
+  return {
+    state: "working",
+    code: "bridge_busy",
+    recoveryAction: "wait_for_bridge",
+    message: "Bridge is processing the current GPT job."
+  };
+}
+
+async function sendHeartbeat(options = {}) {
   return bridgeApi("/api/extension/heartbeat", {
     method: "POST",
+    bridgeRequestTimeoutMs: HEARTBEAT_REQUEST_TIMEOUT_MS,
+    skipBackgroundOnTimeout: true,
     body: JSON.stringify({
       workerId: currentWorkerId(),
       href: location.href,
       title: document.title || "",
       preferenceStatus: lastPreferenceStatus,
-      pageStatus: currentPageStatus()
+      pageStatus: options.lightweight ? lightweightBusyPageStatus() : currentPageStatus(),
+      captureStatus: lastCaptureStatus
     })
   });
 }
@@ -103,13 +138,158 @@ function maybeReloadExtensionFromHeartbeat(heartbeat) {
   }
 }
 
+async function maybeOpenProjectTabFromHeartbeat(heartbeat) {
+  const target = heartbeat?.openTarget;
+  if (
+    target?.action !== "open_project_tab" ||
+    !target.projectUrl ||
+    projectUrlMatchesCurrentPage(target.projectUrl) ||
+    !canAskBackgroundForDownloads()
+  ) {
+    return false;
+  }
+  try {
+    const result = await chromeRuntimeMessage(
+      {
+        type: "bridge:openProjectTab",
+        jobId: target.jobId || null,
+        projectUrl: target.projectUrl
+      },
+      {
+        timeoutMs: 3000,
+        timeoutMessage: "Chrome did not open the pending GPT project tab"
+      }
+    );
+    return Boolean(result?.ok);
+  } catch {
+    return false;
+  }
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function notifyAssistantActivity() {
+  const waiters = [...assistantActivityWaiters];
+  assistantActivityWaiters.clear();
+  for (const resolve of waiters) {
+    resolve(true);
+  }
+}
+
+function scheduleAssistantActivityNotification() {
+  if (assistantActivityWaiters.size === 0 || assistantActivityNotifyTimer !== null) {
+    return;
+  }
+  assistantActivityNotifyTimer = setTimeout(() => {
+    assistantActivityNotifyTimer = null;
+    notifyAssistantActivity();
+  }, ASSISTANT_ACTIVITY_COALESCE_MS);
+}
+
+function installAssistantActivityObserver() {
+  if (assistantActivityObserver) {
+    return true;
+  }
+  if (typeof MutationObserver !== "function") {
+    return false;
+  }
+  const target = document?.documentElement || document?.body || null;
+  if (!target) {
+    return false;
+  }
+
+  try {
+    assistantActivityObserver = new MutationObserver(() => {
+      scheduleAssistantActivityNotification();
+    });
+    assistantActivityObserver.observe(target, {
+      childList: true,
+      characterData: true,
+      subtree: true
+    });
+    return true;
+  } catch {
+    assistantActivityObserver = null;
+    return false;
+  }
+}
+
+function waitForAssistantActivity(timeoutMs = 1000) {
+  if (!installAssistantActivityObserver()) {
+    return sleep(timeoutMs).then(() => false);
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    const finish = (changed) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timer) {
+        clearTimeout(timer);
+      }
+      assistantActivityWaiters.delete(onActivity);
+      resolve(changed);
+    };
+    const onActivity = () => finish(true);
+    assistantActivityWaiters.add(onActivity);
+    timer = setTimeout(() => finish(false), Math.max(0, Number(timeoutMs) || 0));
+  });
+}
+
+function responseWaitLimits() {
+  return {
+    idleTimeoutMs: RESPONSE_IDLE_TIMEOUT_MS,
+    hardTimeoutMs: RESPONSE_HARD_TIMEOUT_MS
+  };
+}
+
+function responseWaitExpired({
+  startedAt,
+  lastActivityAt,
+  now = Date.now(),
+  pageStillGenerating = false
+} = {}) {
+  if (now - startedAt >= RESPONSE_HARD_TIMEOUT_MS) {
+    return true;
+  }
+  if (pageStillGenerating) {
+    return false;
+  }
+  return now - lastActivityAt >= RESPONSE_IDLE_TIMEOUT_MS;
 }
 
 function preSendTimeoutMs(job = {}) {
   const explicit = Number(job._bridgePreSendTimeoutMs);
   return Number.isFinite(explicit) && explicit > 0 ? explicit : PRE_SEND_TIMEOUT_MS;
+}
+
+function unsentClaimAgeMs(job = {}, nowMs = Date.now()) {
+  if (job.sentAt || !job.claimedAt) {
+    return 0;
+  }
+  const claimedAtMs = Date.parse(job.claimedAt);
+  if (!Number.isFinite(claimedAtMs)) {
+    return 0;
+  }
+  return Math.max(0, nowMs - claimedAtMs);
+}
+
+function preSendClaimExpired(job = {}, nowMs = Date.now()) {
+  return !job.sentAt && Boolean(job.claimedAt) && unsentClaimAgeMs(job, nowMs) >= MAX_UNSENT_CLAIM_AGE_MS;
+}
+
+function preSendExpiredError() {
+  return bridgeClassifiedError(
+    "G某T 任务已被扩展领取，但 60 秒内没有真正发送。Bridge 已终止本次发送并释放队列，请重试。",
+    {
+      errorCode: "pre_send_expired",
+      recoveryAction: "retry"
+    }
+  );
 }
 
 async function withPreSendTimeout(job, operation) {
@@ -132,14 +312,112 @@ async function withPreSendTimeout(job, operation) {
   }
 }
 
+function bridgeMutationMethod(method = "GET") {
+  return ["POST", "PATCH", "PUT", "DELETE"].includes(String(method || "GET").toUpperCase());
+}
+
+async function fetchBridgeApi(url, options = {}, timeoutMs = 0) {
+  const boundedTimeoutMs = Number(timeoutMs);
+  if (!(boundedTimeoutMs > 0) || typeof AbortController !== "function" || options.signal) {
+    return fetch(url, options);
+  }
+
+  const controller = new AbortController();
+  let timeoutId = null;
+  let timedOut = false;
+  try {
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, boundedTimeoutMs);
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (timedOut) {
+      const timeoutError = new Error(`Bridge API request timed out after ${boundedTimeoutMs}ms`);
+      timeoutError.errorCode = "bridge_api_timeout";
+      timeoutError.recoveryAction = "retry";
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+async function loadBridgeApiToken(force = false, timeoutMs = 0) {
+  if (!force && cachedBridgeApiToken) {
+    return cachedBridgeApiToken;
+  }
+  if (!force && bridgeApiTokenPromise) {
+    return bridgeApiTokenPromise;
+  }
+  bridgeApiTokenPromise = fetchBridgeApi(`${BRIDGE_ORIGIN}/api/config`, {
+    headers: {
+      "Content-Type": "application/json"
+    },
+    cache: "no-store"
+  }, timeoutMs)
+    .then(async (response) => {
+      if (!response.ok) {
+        throw new Error(`Bridge API token bootstrap failed with status ${response.status}`);
+      }
+      const config = await response.json();
+      const token = String(config?.apiToken || "");
+      if (!token) {
+        throw new Error("Bridge API token bootstrap returned no token");
+      }
+      cachedBridgeApiToken = token;
+      return token;
+    })
+    .finally(() => {
+      bridgeApiTokenPromise = null;
+    });
+  return bridgeApiTokenPromise;
+}
+
 async function bridgeApi(path, options = {}) {
-  const response = await fetch(`${BRIDGE_ORIGIN}${path}`, {
-    headers: globalThis.CODEX_BRIDGE_AUTH.authorizedHeaders({
+  const {
+    bridgeRequestTimeoutMs = 0,
+    skipBackgroundOnTimeout = false,
+    ...fetchOptions
+  } = options;
+  const mutation = bridgeMutationMethod(fetchOptions.method);
+  const token = cachedBridgeApiToken;
+  const request = (requestToken) => fetchBridgeApi(`${BRIDGE_ORIGIN}${path}`, {
+    ...fetchOptions,
+    headers: {
       "Content-Type": "application/json",
-      ...(options.headers || {})
-    }),
-    ...options
-  });
+      ...(requestToken ? { "X-Bridge-Token": requestToken } : {}),
+      ...(fetchOptions.headers || {})
+    }
+  }, bridgeRequestTimeoutMs);
+  let response = null;
+  try {
+    response = await request(token);
+  } catch (error) {
+    if ((skipBackgroundOnTimeout && error?.errorCode === "bridge_api_timeout") || !canAskBackgroundForDownloads()) {
+      throw error;
+    }
+    response = await bridgeApiThroughBackground(path, fetchOptions);
+  }
+  if (response.status === 403 && canAskBackgroundForDownloads()) {
+    response = await bridgeApiThroughBackground(path, fetchOptions);
+  }
+  if (mutation && response.status === 401) {
+    try {
+      response = await request(await loadBridgeApiToken(true, bridgeRequestTimeoutMs));
+    } catch (error) {
+      if ((skipBackgroundOnTimeout && error?.errorCode === "bridge_api_timeout") || !canAskBackgroundForDownloads()) {
+        throw error;
+      }
+      response = await bridgeApiThroughBackground(path, fetchOptions);
+    }
+  }
 
   if (!response.ok) {
     const responseText = await response.text();
@@ -159,6 +437,40 @@ async function bridgeApi(path, options = {}) {
   return response.json();
 }
 
+async function bridgeApiThroughBackground(path, options = {}) {
+  const result = await chromeRuntimeMessage(
+    {
+      type: "bridge:api",
+      bridgeOrigin: BRIDGE_ORIGIN,
+      path,
+      options: {
+        method: options.method || "GET",
+        body: options.body,
+        cache: options.cache,
+        headers: options.headers
+      }
+    },
+    {
+      timeoutMs: 15_000,
+      timeoutMessage: "Bridge background API proxy timed out"
+    }
+  );
+  if (!result?.ok || !result.response) {
+    throw new Error(result?.error || "Bridge background API proxy failed");
+  }
+  const bodyText = String(result.response.bodyText || "");
+  return {
+    ok: Boolean(result.response.ok),
+    status: Number(result.response.status || 0),
+    async text() {
+      return bodyText;
+    },
+    async json() {
+      return bodyText ? JSON.parse(bodyText) : {};
+    }
+  };
+}
+
 function isRetryableCompletionApiError(error = {}) {
   return ["empty_chatgpt_reply", "interim_chatgpt_reply"].includes(error.errorCode);
 }
@@ -174,20 +486,25 @@ function findComposer() {
   return (
     document.querySelector("#prompt-textarea") ||
     document.querySelector('[contenteditable="true"][data-testid="prompt-textarea"]') ||
-    document.querySelector('[contenteditable="true"]') ||
     document.querySelector("textarea")
   );
 }
 
 async function waitForComposer(timeoutMs = 60000) {
   const started = Date.now();
+  const observesPageChanges = installAssistantActivityObserver();
+  let pageBlockerScanNeeded = true;
   while (Date.now() - started < timeoutMs) {
-    assertNoChatGptBlocker();
+    if (pageBlockerScanNeeded) {
+      assertNoChatGptBlocker();
+      pageBlockerScanNeeded = false;
+    }
     const composer = findComposer();
     if (composer) {
       return composer;
     }
-    await sleep(500);
+    const pageChanged = await waitForAssistantActivity(500);
+    pageBlockerScanNeeded = !observesPageChanges || pageChanged || pageBlockerScanNeeded;
   }
   if (isChatGptLoadingShell()) {
     throw new Error("GPT 页面仍在加载，输入框还没有出现。");
@@ -197,23 +514,22 @@ async function waitForComposer(timeoutMs = 60000) {
 
 function pageTextSnapshot() {
   return normalizeText(
-    [
-      document.body?.innerText,
-      document.body?.textContent,
-      document.documentElement?.innerText,
-      document.documentElement?.textContent,
-      document.title
-    ]
-      .filter(Boolean)
-      .join(" ")
+    document.body?.innerText ||
+      document.body?.textContent ||
+      document.documentElement?.innerText ||
+      document.documentElement?.textContent ||
+      document.title ||
+      ""
   );
 }
 
 function pageBodyTextSnapshot() {
   return normalizeText(
-    [document.body?.innerText, document.body?.textContent, document.documentElement?.innerText, document.documentElement?.textContent]
-      .filter(Boolean)
-      .join(" ")
+    document.body?.innerText ||
+      document.body?.textContent ||
+      document.documentElement?.innerText ||
+      document.documentElement?.textContent ||
+      ""
   );
 }
 
@@ -318,7 +634,7 @@ function detectScopedGenerationFailure(options = {}) {
 }
 
 function detectChatGptBlocker(options = {}) {
-  const text = pageTextSnapshot();
+  const text = options.pageText ?? pageTextSnapshot();
   if (!text) {
     return null;
   }
@@ -364,7 +680,19 @@ function detectChatGptBlocker(options = {}) {
 }
 
 function currentPageStatus() {
-  const blocker = detectChatGptBlocker();
+  const composer = findComposer();
+  const artifactPreview = isArtifactPreviewPage();
+  const pageGenerating = isGenerating();
+  if (composer && !artifactPreview && !pageGenerating && !hasVisibleAccountSelectionDialog()) {
+    return {
+      state: "ready",
+      code: "ready",
+      message: "GPT 页面已就绪。"
+    };
+  }
+
+  const pageText = pageTextSnapshot();
+  const blocker = detectChatGptBlocker({ pageText });
   if (blocker) {
     return {
       state: "blocked",
@@ -383,7 +711,7 @@ function currentPageStatus() {
     };
   }
 
-  if (isChatGptStartPage()) {
+  if (isChatGptStartPage(pageText)) {
     return {
       state: "blocked",
       code: "start_page",
@@ -392,7 +720,7 @@ function currentPageStatus() {
     };
   }
 
-  if (isArtifactPreviewPage()) {
+  if (artifactPreview) {
     return {
       state: "working",
       code: "artifact_preview",
@@ -401,7 +729,7 @@ function currentPageStatus() {
     };
   }
 
-  if (isGenerating()) {
+  if (pageGenerating) {
     return {
       state: "working",
       code: "active_generation",
@@ -426,8 +754,7 @@ function currentPageStatus() {
   };
 }
 
-function isChatGptStartPage() {
-  const text = pageTextSnapshot();
+function isChatGptStartPage(text = pageTextSnapshot()) {
   return /what can i help with|where should we begin|\u6211\u4eec\u5148\u4ece\u54ea\u91cc\u5f00\u59cb|\u6211\u80fd\u5e2e\u4ec0\u4e48/i.test(text);
 }
 
@@ -479,6 +806,37 @@ function bridgeFailurePayload(error = {}) {
   };
 }
 
+function syncJobMutationBody(input = {}) {
+  return {
+    ...input,
+    workerId: currentWorkerId()
+  };
+}
+
+function updateCaptureStatus(job, state, details = {}) {
+  lastCaptureStatus = {
+    jobId: job?.id || null,
+    state,
+    ...details,
+    updatedAt: new Date().toISOString()
+  };
+  return lastCaptureStatus;
+}
+
+function recordCompletionCaptureStatus(job, completion = null, details = {}) {
+  const completedJob = completion?.job || null;
+  if (completedJob?.status && completedJob.status !== "succeeded") {
+    updateCaptureStatus(job, completedJob.status === "failed" ? "completion_failed" : "completion_pending", {
+      completionStatus: completedJob.status,
+      errorCode: completedJob.errorCode || null,
+      error: completedJob.error || null
+    });
+    return false;
+  }
+  updateCaptureStatus(job, "captured", details);
+  return true;
+}
+
 function ensureExpectedChatGptPage(job = {}) {
   assertNoChatGptBlocker();
 
@@ -505,16 +863,52 @@ function setComposerText(composer, text) {
     return;
   }
 
-  // Clear stale contenteditable drafts before inserting the new Bridge payload.
+  // Keep the fallback asynchronous-DOM-safe. Synchronous execCommand over a
+  // long conversation can block the page before Bridge records the send.
   composer.textContent = "";
   composer.innerText = "";
-  document.execCommand("selectAll", false, null);
-  document.execCommand("insertText", false, text);
-  if (!normalizeText(composerText(composer)) && text) {
-    composer.textContent = text;
-    composer.innerText = text;
-  }
+  composer.textContent = text;
+  composer.innerText = text;
   composer.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
+}
+
+async function fillComposerText(composer, text) {
+  const value = String(text || "");
+  const isTextInput = composer.tagName === "TEXTAREA" || composer.tagName === "INPUT";
+  if (!isTextInput && value) {
+    composer.focus();
+    if (value.length <= MAX_TRUSTED_INSERT_TEXT_LENGTH && canAskBackgroundForDownloads()) {
+      try {
+        const inserted = await chromeRuntimeMessage(
+          {
+            type: "bridge:trustedInsertText",
+            text: value
+          },
+          {
+            timeoutMs: 8000,
+            timeoutMessage: "trusted text insertion timed out"
+          }
+        );
+        if (inserted?.ok) {
+          return;
+        }
+      } catch {
+        // Fall through to a direct DOM update without the synchronous execCommand path.
+      }
+    }
+
+    composer.textContent = value;
+    composer.dispatchEvent(
+      new InputEvent("input", {
+        bubbles: true,
+        inputType: "insertText",
+        data: null
+      })
+    );
+    return;
+  }
+
+  setComposerText(composer, value);
 }
 
 function composerText(composer) {
@@ -720,10 +1114,7 @@ function looksLikeSpecificModelControl(element) {
 }
 
 function isConversationTurnElement(element) {
-  return Boolean(
-    element?.closest?.('section[data-testid^="conversation-turn-"]') ||
-      element?.closest?.('[data-testid^="conversation-turn-"]')
-  );
+  return Boolean(element?.closest?.('[data-testid^="conversation-turn-"]'));
 }
 
 function preferenceControlScopes() {
@@ -1203,24 +1594,25 @@ function isInsideElement(element, container) {
 }
 
 function uploadPreviewElements() {
+  const composer = findComposer();
   return [...document.querySelectorAll("img,[data-testid],[aria-label],[title],a,button,div,span,p")]
     .filter(isVisibleElement)
     .filter((element) => {
-      const composer = findComposer();
       if (isInsideElement(element, composer)) {
         return false;
       }
-      if (element.closest?.('section[data-testid^="conversation-turn-"]')) {
+      if (element.closest?.('[data-testid^="conversation-turn-"]')) {
         return false;
       }
       return true;
     });
 }
 
-function inputArtifactAppearsUploaded(artifact = {}) {
+function inputArtifactAppearsUploaded(artifact = {}, previewElements = null) {
   const filename = String(artifact.filename || "").trim();
   const isImage = /^image\//i.test(artifact.contentType || "") || /\.(png|jpe?g|webp|gif|svg)$/i.test(filename);
-  return uploadPreviewElements().some((element) => {
+  const candidates = Array.isArray(previewElements) ? previewElements : uploadPreviewElements();
+  return candidates.some((element) => {
     const label = uploadPreviewLabel(element);
     if (filename && label.includes(filename)) {
       return true;
@@ -1231,16 +1623,24 @@ function inputArtifactAppearsUploaded(artifact = {}) {
 
 async function waitForInputArtifactsVisible(inputArtifacts = [], timeoutMs = 60000) {
   const started = Date.now();
+  const observesPageChanges = installAssistantActivityObserver();
+  let pageScanNeeded = true;
   while (Date.now() - started <= timeoutMs) {
-    assertNoChatGptBlocker();
-    if (inputArtifacts.every(inputArtifactAppearsUploaded)) {
-      return;
+    if (pageScanNeeded) {
+      assertNoChatGptBlocker();
+      const previewElements = uploadPreviewElements();
+      if (inputArtifacts.every((artifact) => inputArtifactAppearsUploaded(artifact, previewElements))) {
+        return;
+      }
+      pageScanNeeded = false;
     }
-    await sleep(500);
+    const pageChanged = await waitForAssistantActivity(500);
+    pageScanNeeded = !observesPageChanges || pageChanged || pageScanNeeded;
   }
 
+  const previewElements = uploadPreviewElements();
   const missing = inputArtifacts
-    .filter((artifact) => !inputArtifactAppearsUploaded(artifact))
+    .filter((artifact) => !inputArtifactAppearsUploaded(artifact, previewElements))
     .map((artifact) => artifact.filename || artifact.id || "artifact")
     .join(", ");
   throw new Error("GPT 附件没有出现在输入框里：" + missing);
@@ -1301,13 +1701,19 @@ function isDisabledButton(button) {
 
 async function waitForReadySendButton(timeoutMs = 60000) {
   const started = Date.now();
+  const observesPageChanges = installAssistantActivityObserver();
+  let pageBlockerScanNeeded = true;
   while (Date.now() - started < timeoutMs) {
-    assertNoChatGptBlocker();
+    if (pageBlockerScanNeeded) {
+      assertNoChatGptBlocker();
+      pageBlockerScanNeeded = false;
+    }
     const sendButton = findSendButton();
     if (sendButton && !isDisabledButton(sendButton)) {
       return sendButton;
-  }
-  await sleep(500);
+    }
+    const pageChanged = await waitForAssistantActivity(500);
+    pageBlockerScanNeeded = !observesPageChanges || pageChanged || pageBlockerScanNeeded;
   }
   throw new Error("GPT 发送按钮还没有准备好。");
 }
@@ -1324,26 +1730,50 @@ function normalizeNavigationUrl(value = "") {
 }
 
 function isArtifactPreviewPage() {
-  return /\.(png|jpe?g|webp|gif|svg|pdf|xlsx?|pptx?|docx?|zip)$/i.test((document.title || "").trim());
+  const href = String(location?.href || "");
+  if (/\/backend-api\/estuary\/content(?:[/?#]|$)/i.test(href)) {
+    return true;
+  }
+  const titleLooksLikeArtifact = /\.(png|jpe?g|webp|gif|svg|pdf|xlsx?|pptx?|docx?|zip)$/i.test(
+    (document.title || "").trim()
+  );
+  return titleLooksLikeArtifact && !findComposer();
 }
 
 function findArtifactPreviewCloseButton() {
   return [...document.querySelectorAll("button")].filter(isVisibleElement).find((button) => {
-    const label = `${button.getAttribute("aria-label") || ""} ${button.title || ""} ${button.textContent || ""}`.trim();
-    return /close|dismiss|闁稿繑濞婂Λ纾￠柛娆愮墬缁夌│閺夆晜鏌ㄥú鏉遍柡鈧幆鐗堝闯|x/i.test(label);
+    const label = normalizeText(
+      `${button.getAttribute("aria-label") || ""} ${button.title || ""} ${button.textContent || ""}`
+    );
+    return /\b(?:close|dismiss)\b/i.test(label) || label.includes("关闭") || /^(?:x|×|✕|✖)$/i.test(label);
   });
 }
 
-async function dismissArtifactPreviewIfNeeded() {
+async function dismissArtifactPreviewIfNeeded(timeoutMs = 5000) {
   if (!isArtifactPreviewPage()) {
     return;
   }
 
   const closeButton = findArtifactPreviewCloseButton();
-  if (closeButton) {
-    closeButton.click();
-    await sleep(500);
+  if (!closeButton) {
+    const error = new Error("GPT 文件预览没有可用的关闭按钮。");
+    error.errorCode = "artifact_preview_stuck";
+    error.recoveryAction = "refresh_bound_page";
+    throw error;
   }
+
+  closeButton.click();
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (findComposer() || !isArtifactPreviewPage()) {
+      return;
+    }
+    await waitForAssistantActivity(250);
+  }
+  const error = new Error("GPT 文件预览没有关闭。");
+  error.errorCode = "artifact_preview_stuck";
+  error.recoveryAction = "refresh_bound_page";
+  throw error;
 }
 
 function assistantMessages() {
@@ -1416,7 +1846,7 @@ function promptCandidatesForJob(job = {}) {
 }
 
 function conversationTurns() {
-  return [...document.querySelectorAll('section[data-testid^="conversation-turn-"]')];
+  return [...document.querySelectorAll('[data-testid^="conversation-turn-"]')];
 }
 
 function isAssistantLikeTurn(turn) {
@@ -1451,30 +1881,35 @@ function isUserLikeTurn(turn) {
   return Boolean(normalizeText(turn.textContent || ""));
 }
 
-function latestUserPromptTurnInfo(userTexts = []) {
+function latestUserPromptTurnInfo(userTexts = [], options = {}) {
   const needles = uniqueNonEmptyStrings(promptTextCandidates(userTexts).flatMap((text) => promptNeedles(text)));
   if (needles.length === 0) {
     return null;
   }
 
-  const turns = conversationTurns();
+  const afterTurnIndex = Number.isInteger(options.afterTurnIndex) ? options.afterTurnIndex : -1;
+  const turns = Array.isArray(options.turns) ? options.turns : conversationTurns();
   for (let index = turns.length - 1; index >= 0; index -= 1) {
+    if (index <= afterTurnIndex) {
+      break;
+    }
     const turnText = normalizeText(turns[index].textContent || "");
-    if (isUserLikeTurn(turns[index]) && needles.some((needle) => turnText.includes(needle))) {
-      return { index, turn: turns[index], needle: needles.find((needle) => turnText.includes(needle)) || "" };
+    const matchingNeedle = needles.find((needle) => turnText.includes(needle));
+    if (matchingNeedle && isUserLikeTurn(turns[index])) {
+      return { index, turn: turns[index], needle: matchingNeedle };
     }
   }
 
   return null;
 }
 
-function assistantTurnsAfterTurnIndex(turnIndex) {
+function assistantTurnsAfterTurnIndex(turnIndex, turnsSnapshot = null) {
   const index = Number(turnIndex);
   if (!Number.isInteger(index) || index < 0) {
     return [];
   }
 
-  const turns = conversationTurns();
+  const turns = Array.isArray(turnsSnapshot) ? turnsSnapshot : conversationTurns();
   if (index >= turns.length) {
     return [];
   }
@@ -1482,17 +1917,28 @@ function assistantTurnsAfterTurnIndex(turnIndex) {
   return turns.slice(index + 1).filter(isAssistantLikeTurn);
 }
 
-function assistantTurnsAfterUserTexts(userTexts = []) {
-  const promptInfo = latestUserPromptTurnInfo(userTexts);
+function assistantTurnsAfterUserTexts(userTexts = [], turnsSnapshot = null) {
+  const turns = Array.isArray(turnsSnapshot) ? turnsSnapshot : conversationTurns();
+  const promptInfo = latestUserPromptTurnInfo(userTexts, { turns });
   if (!promptInfo) {
     return [];
   }
 
-  return assistantTurnsAfterTurnIndex(promptInfo.index);
+  return assistantTurnsAfterTurnIndex(promptInfo.index, turns);
 }
 
-function assistantTurnsAfterUserText(userText = "") {
-  return assistantTurnsAfterUserTexts([userText]);
+function assistantTurnsAfterUserText(userText = "", turnsSnapshot = null) {
+  return assistantTurnsAfterUserTexts([userText], turnsSnapshot);
+}
+
+function assistantMessagesForReplyScope(afterUserTurnIndex, afterUserTexts = [], turnsSnapshot = null) {
+  const indexedMessages = Number.isInteger(afterUserTurnIndex)
+    ? assistantTurnsAfterTurnIndex(afterUserTurnIndex, turnsSnapshot)
+    : [];
+  if (indexedMessages.length > 0) {
+    return indexedMessages;
+  }
+  return afterUserTexts.length > 0 ? assistantTurnsAfterUserTexts(afterUserTexts, turnsSnapshot) : [];
 }
 
 function userPromptTurnExists(userText = "") {
@@ -1517,6 +1963,35 @@ function userPromptTurnExistsAny(userTexts = []) {
   return [...document.querySelectorAll('[data-message-author-role="user"]')].some((node) =>
     needles.some((needle) => normalizeText(node.textContent || "").includes(needle))
   );
+}
+
+function directUserPromptNodes() {
+  return [...document.querySelectorAll('[data-message-author-role="user"]')];
+}
+
+function latestDirectUserPromptInfo(userTexts = [], options = {}) {
+  if (!Number.isInteger(options.afterUserMessageCount)) {
+    return null;
+  }
+  const needles = uniqueNonEmptyStrings(promptTextCandidates(userTexts).flatMap((text) => promptNeedles(text)));
+  if (needles.length === 0) {
+    return null;
+  }
+  const afterUserMessageCount = options.afterUserMessageCount;
+  const nodes = directUserPromptNodes();
+  for (let index = nodes.length - 1; index >= afterUserMessageCount; index -= 1) {
+    const nodeText = normalizeText(nodes[index].textContent || "");
+    const needle = needles.find((candidate) => nodeText.includes(candidate));
+    if (needle) {
+      return {
+        index: null,
+        turn: nodes[index],
+        needle,
+        fallback: "direct_user_message"
+      };
+    }
+  }
+  return null;
 }
 
 function nodeTagName(node) {
@@ -1771,43 +2246,48 @@ function lastAssistantText(options = {}) {
 }
 
 function lastAssistantMessage(options = {}) {
+  let requiredScopeMissed = false;
+  const turnsSnapshot = Array.isArray(options.turns) ? options.turns : null;
   if (Number.isInteger(options.afterUserTurnIndex)) {
-    const scoped = assistantTurnsAfterTurnIndex(options.afterUserTurnIndex);
+    const scoped = assistantTurnsAfterTurnIndex(options.afterUserTurnIndex, turnsSnapshot);
     if (scoped.length > 0) {
       return scoped[scoped.length - 1];
     }
-    if (options.requireAfterUserText && conversationTurns().length > 0) {
-      return null;
+    if (options.requireAfterUserText && (turnsSnapshot || conversationTurns()).length > 0) {
+      requiredScopeMissed = true;
     }
   }
 
   const afterUserTexts = promptTextCandidates(options.afterUserTexts || [], options.afterUserText);
   if (afterUserTexts.length > 0) {
-    const scoped = assistantTurnsAfterUserTexts(afterUserTexts);
+    const scoped = assistantTurnsAfterUserTexts(afterUserTexts, turnsSnapshot);
     if (scoped.length > 0) {
       return scoped[scoped.length - 1];
     }
-    if (options.requireAfterUserText && conversationTurns().length > 0) {
-      return null;
+    if (options.requireAfterUserText && (turnsSnapshot || conversationTurns()).length > 0) {
+      requiredScopeMissed = true;
     }
   }
 
-  if (options.afterUserText) {
-    const scoped = assistantTurnsAfterUserText(options.afterUserText);
-    if (scoped.length > 0) {
-      return scoped[scoped.length - 1];
-    }
-    if (options.requireAfterUserText && conversationTurns().length > 0) {
-      return null;
-    }
+  if (requiredScopeMissed) {
+    return null;
   }
-
   const messages = assistantMessages();
   return messages[messages.length - 1] || null;
 }
 
+function latestChangedAssistantMessage(previousText = "") {
+  const messages = assistantMessages();
+  const latest = messages[messages.length - 1] || null;
+  if (!latest) {
+    return null;
+  }
+  const text = extractAssistantReplyText(latest);
+  return hasUsableAssistantText(text, previousText) ? latest : null;
+}
+
 function assistantDownloadScope(messageNode) {
-  return messageNode?.closest?.('section[data-testid^="conversation-turn-"]') || messageNode;
+  return messageNode?.closest?.('[data-testid^="conversation-turn-"]') || messageNode;
 }
 
 function hasUsableAssistantText(current, previousText, options = {}) {
@@ -1880,27 +2360,33 @@ function hasUsableAssistantContent(messageNode, previousText, options = {}) {
     return false;
   }
 
-  const text = extractAssistantReplyText(messageNode);
-  if (hasGeneratedImage(messageNode) && imageReplyStillProcessingText(text)) {
+  const text = Object.prototype.hasOwnProperty.call(options, "replyText")
+    ? options.replyText
+    : extractAssistantReplyText(messageNode);
+  const generatedImagePresent = Object.prototype.hasOwnProperty.call(options, "generatedImageCount")
+    ? Number(options.generatedImageCount || 0) > 0
+    : hasGeneratedImage(messageNode);
+  if (generatedImagePresent && imageReplyStillProcessingText(text)) {
     return false;
   }
 
-  return (
-    hasUsableAssistantText(text, previousText, options) ||
-    hasGeneratedImage(messageNode) ||
-    hasDownloadableArtifact(messageNode)
-  );
+  if (hasUsableAssistantText(text, previousText, options) || generatedImagePresent) {
+    return true;
+  }
+  return Object.prototype.hasOwnProperty.call(options, "hasDownloadableArtifact")
+    ? Boolean(options.hasDownloadableArtifact)
+    : hasDownloadableArtifact(messageNode);
 }
 
 function looksLikePossiblyStreamingReply(value = "") {
   const text = normalizeText(value);
-  if (text.length < 80) {
+  if (!text) {
     return false;
   }
   if (/```[^`]*$/m.test(text)) {
     return true;
   }
-  return !/[\u3002\uFF1F\uFF01!?~\u2026;\uFF1B\]\}"'\u201D\u2019\uFF09\)]$/.test(text);
+  return !/[.\u3002\uFF1F\uFF01!?~\u2026;\uFF1B\]\}"'\u201D\u2019\uFF09\)]$/.test(text);
 }
 
 function assistantReplyStableTarget(text = "", options = {}) {
@@ -1909,7 +2395,7 @@ function assistantReplyStableTarget(text = "", options = {}) {
     target = 6;
   }
   if (looksLikePossiblyStreamingReply(text)) {
-    target = Math.max(target, 8);
+    target = Math.max(target, normalizeText(text).length < 80 ? 12 : 8);
   }
   return target;
 }
@@ -1945,14 +2431,21 @@ function imageReplyStillProcessingText(text = "") {
 }
 
 function visibleReplyTextFromAssistant(messageNode, previousText, options = {}) {
-  const text = extractAssistantReplyText(messageNode);
-  if (messageNode && hasGeneratedImage(messageNode) && imageReplyStillProcessingText(text)) {
+  const text = Object.prototype.hasOwnProperty.call(options, "replyText")
+    ? options.replyText
+    : extractAssistantReplyText(messageNode);
+  const generatedImagePresent = messageNode && (
+    Object.prototype.hasOwnProperty.call(options, "generatedImageCount")
+      ? Number(options.generatedImageCount || 0) > 0
+      : hasGeneratedImage(messageNode)
+  );
+  if (generatedImagePresent && imageReplyStillProcessingText(text)) {
     return "\u5df2\u751f\u6210\u56fe\u7247\u3002";
   }
   if (text && (options.allowRepeatedText || text !== previousText)) {
     return text;
   }
-  if (messageNode && hasGeneratedImage(messageNode)) {
+  if (generatedImagePresent) {
     if (text) {
       return text;
     }
@@ -1994,7 +2487,10 @@ const CHINESE_SMALL_NUMBERS = new Map([
 
 function requestedImageCount(job = {}) {
   const text = jobPromptText(job);
-  if (job.kind !== "image_request" && !hasImageOutputRequestSignal(text)) {
+  if (
+    hasNegativeArtifactSignal(text) ||
+    (job.kind !== "image_request" && !hasImageOutputRequestSignal(text))
+  ) {
     return 0;
   }
 
@@ -2022,12 +2518,33 @@ function hasOutputArtifactRequestSignal(job = {}) {
 
 function expectsImageArtifact(job = {}) {
   const text = jobPromptText(job);
+  if (hasNegativeArtifactSignal(text)) {
+    return false;
+  }
   return job.kind === "image_request" || hasImageOutputRequestSignal(text) || (hasOutputArtifactRequestSignal(job) && /\.(png|jpe?g|webp|gif|svg)\b/i.test(text));
 }
 
+function hasExplicitNoImageSignal(value = "") {
+  const clauses = String(value || "").split(/[，。！？!?；;\n]+/u);
+  return clauses.some((clause) => {
+    const chineseNoImage =
+      /(?:(?:不要|别|无需|不需要|禁止|避免)\s*|不\s*(?=(?:再|提前)?(?:生成|制作|创建|绘制|画|设计)))(?:再|提前)?\s*(?:(?:生成|制作|创建|绘制|画|设计)\s*)?(?:任何|任意|新的?)?\s*(?:生图|配图|图片|图像|照片|海报|封面|图标|logo|插画|视觉)/iu.test(
+        clause
+      );
+    const englishNoImage =
+      /\b(?:do not|don't|without|no need to|avoid)\s+(?:(?:generate|create|draw|make|design)\s+)?(?:any\s+|a\s+|an\s+|new\s+)?(?:images?|pictures?|photos?|posters?|covers?|icons?|logos?|illustrations?)\b/iu.test(
+        clause
+      );
+    return chineseNoImage || englishNoImage;
+  });
+}
+
 function hasNegativeArtifactSignal(value = "") {
-  return /(?:only an example|example filename|no file was generated|no downloadable file|not a real file|do not generate files?|don't generate files?|without generating files?|\u4e0d\u8981\u751f\u6210\u6587\u4ef6|\u4e0d\u751f\u6210\u6587\u4ef6|\u4e0d\u8981\u6dfb\u52a0\u94fe\u63a5)/i.test(
-    value || ""
+  return (
+    hasExplicitNoImageSignal(value) ||
+    /(?:only an example|example filename|no file was generated|no downloadable file|not a real file|do not generate (?:files?|images?|pictures?|posters?)|don't generate (?:files?|images?|pictures?|posters?)|without generating (?:files?|images?|pictures?|posters?)|\u4e0d\u8981\u751f\u6210(?:\u6587\u4ef6|\u56fe|\u56fe\u7247|\u56fe\u50cf|\u6d77\u62a5|\u5c01\u9762|\u63d2\u753b)|\u4e0d\u751f\u6210(?:\u6587\u4ef6|\u56fe|\u56fe\u7247|\u56fe\u50cf|\u6d77\u62a5|\u5c01\u9762|\u63d2\u753b)|\u65e0\u9700\u751f\u6210(?:\u6587\u4ef6|\u56fe|\u56fe\u7247|\u56fe\u50cf|\u6d77\u62a5|\u5c01\u9762|\u63d2\u753b)|\u4e0d\u8981\u6dfb\u52a0\u94fe\u63a5)/i.test(
+      value || ""
+    )
   );
 }
 
@@ -2102,10 +2619,11 @@ function isStoppedStatusLabel(label = "") {
 }
 
 function isGenerating() {
-  if (findStopGeneratingButton()) {
+  const candidates = stopCandidateElements();
+  if (findStopGeneratingButton(candidates)) {
     return true;
   }
-  return stopCandidateElements().some((button) => {
+  return candidates.some((button) => {
     if (!isVisibleElement(button)) {
       return false;
     }
@@ -2118,8 +2636,8 @@ function isGenerating() {
   });
 }
 
-function findStopGeneratingButton() {
-  return stopCandidateElements().filter(isVisibleElement).find((button) => {
+function findStopGeneratingButton(candidates = null) {
+  return (candidates || stopCandidateElements()).filter(isVisibleElement).find((button) => {
     const label = stopCandidateLabel(button);
     if (isStoppedStatusLabel(label)) {
       return false;
@@ -2609,14 +3127,26 @@ function uniqueImageCandidates(candidates) {
 
 function imageCandidates(messageNode, options = {}) {
   const requestedCount = Number(options.expectedImageCount || 0);
+  const excludedKeys = new Set(
+    (Array.isArray(options.excludeImageKeys) ? options.excludeImageKeys : [])
+      .map((key) => canonicalImageUrlKey(String(key || "")))
+      .filter(Boolean)
+  );
   const candidates = [
     ...rawImageCandidates(messageNode)
   ];
-  const scoped = uniqueImageCandidates(candidates);
+  const keepCurrentJobImage = (candidate) => !excludedKeys.has(imageCandidateKey(candidate));
+  const scoped = uniqueImageCandidates(candidates).filter(keepCurrentJobImage);
   if (options.includePageGallery || (requestedCount > 1 && scoped.length > 0 && scoped.length < requestedCount)) {
-    return uniqueImageCandidates([...scoped, ...documentImageRailCandidates(messageNode)]);
+    return uniqueImageCandidates([...scoped, ...documentImageRailCandidates(messageNode)]).filter(keepCurrentJobImage);
   }
   return scoped;
+}
+
+function generatedImageBaselineKeys(scope = document) {
+  return uniqueImageCandidates(rawImageCandidates(scope))
+    .map(imageCandidateKey)
+    .filter(Boolean);
 }
 
 function canonicalImageUrlKey(src) {
@@ -3269,7 +3799,7 @@ function canAskBackgroundForDownloads() {
   return typeof chrome !== "undefined" && chrome.runtime && typeof chrome.runtime.sendMessage === "function";
 }
 
-function chromeRuntimeMessage(payload) {
+function chromeRuntimeMessage(payload, options = {}) {
   return new Promise((resolve, reject) => {
     if (!canAskBackgroundForDownloads()) {
       reject(new Error("Chrome extension download bridge is unavailable"));
@@ -3277,12 +3807,25 @@ function chromeRuntimeMessage(payload) {
     }
 
     let settled = false;
+    let timeoutId = null;
     const settle = (fn, value) => {
       if (!settled) {
         settled = true;
+        if (timeoutId !== null) {
+          clearTimeout(timeoutId);
+        }
         fn(value);
       }
     };
+
+    const timeoutMs = Number(options.timeoutMs);
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+      timeoutId = setTimeout(() => {
+        const error = new Error(options.timeoutMessage || "Chrome extension message timed out");
+        error.errorCode = "chrome_runtime_message_timeout";
+        settle(reject, error);
+      }, timeoutMs);
+    }
 
     const callback = (response) => {
       const lastError = chrome.runtime.lastError;
@@ -3347,7 +3890,7 @@ async function triggerDownloadButton(button) {
   button.click();
 }
 
-async function triggerSendButton(button) {
+async function triggerSendButton(button, options = {}) {
   await scrollElementIntoClickView(button);
   const point = clickCoordinates(button);
   const attempt = {
@@ -3363,6 +3906,9 @@ async function triggerSendButton(button) {
         type: "bridge:trustedClick",
         x: point.x,
         y: point.y
+      }, {
+        timeoutMs: Number(options.runtimeTimeoutMs) || 1500,
+        timeoutMessage: "trusted click timed out"
       });
       attempt.usedTrustedClick = true;
       attempt.trustedClickOk = Boolean(clicked?.ok);
@@ -3373,9 +3919,12 @@ async function triggerSendButton(button) {
         attempt.buttonAfter = buttonDiagnosticInfo(button);
         return attempt;
       }
-    } catch {
+    } catch (error) {
       attempt.usedTrustedClick = true;
-      attempt.trustedClickError = "trusted click threw";
+      attempt.trustedClickError =
+        error?.errorCode === "chrome_runtime_message_timeout"
+          ? "trusted click timed out"
+          : "trusted click threw";
       // Fall back to DOM click when Chrome debugger clicks are unavailable.
     }
   }
@@ -3463,6 +4012,7 @@ async function captureArtifactFromDownloadButtonAttempt(button, options = {}) {
   const watch = await chromeRuntimeMessage({
     type: "bridge:startDownloadWatch",
     bridgeOrigin: BRIDGE_ORIGIN,
+    bridgeApiToken: cachedBridgeApiToken || null,
     syncJobId: options.syncJobId || null,
     expectedFilename,
     timeoutMs: options.timeoutMs || DOWNLOAD_CAPTURE_TIMEOUT_MS
@@ -3515,6 +4065,7 @@ async function captureArtifactFromDownloadUrl(resource, options = {}) {
   const captured = await chromeRuntimeMessage({
     type: "bridge:downloadUrl",
     bridgeOrigin: BRIDGE_ORIGIN,
+    bridgeApiToken: cachedBridgeApiToken || null,
     syncJobId: options.syncJobId || null,
     url: resource.url,
     filename: resource.filename || filenameFromUrl(resource.url) || null,
@@ -3548,12 +4099,20 @@ async function recoverArtifactIdsForSyncJob(syncJobId, expectedFilenames = []) {
 async function collectImageArtifacts(messageNode, errors = [], options = {}) {
   const artifacts = [];
   const imageSeen = options.imageSeen || new Set();
+  const configuredLimit = Number(options.maxArtifacts ?? options.expectedImageCount);
+  const maxArtifacts =
+    Number.isFinite(configuredLimit) && configuredLimit > 0
+      ? Math.floor(configuredLimit)
+      : Number.POSITIVE_INFINITY;
   let artifactIndex = Number.isFinite(Number(options.startIndex)) ? Number(options.startIndex) : 0;
   const images = imageCandidates(messageNode, options);
   const requestedFilenames =
     options.requestedFilenames ||
     filenamesFromText(messageNode?.textContent || "").filter((filename) => /\.(png|jpe?g|webp|gif|svg)$/i.test(filename));
   for (const image of images) {
+    if (artifacts.length >= maxArtifacts) {
+      break;
+    }
     const src = imageSourceUrl(image);
     const key = imageCandidateKey(image);
     if (!src || !key || imageSeen.has(key)) {
@@ -3585,14 +4144,23 @@ async function collectImageArtifacts(messageNode, errors = [], options = {}) {
 
 async function collectInteractiveImageGalleryArtifacts(messageNode, errors = [], options = {}) {
   const artifacts = [];
+  const configuredLimit = Number(options.maxArtifacts ?? options.expectedImageCount);
+  const maxArtifacts =
+    Number.isFinite(configuredLimit) && configuredLimit > 0
+      ? Math.floor(configuredLimit)
+      : Number.POSITIVE_INFINITY;
   const controls = imageGalleryControlCandidates(messageNode);
   for (const control of controls) {
+    if (artifacts.length >= maxArtifacts) {
+      break;
+    }
     try {
       control.click?.();
       await sleep(150);
       const captured = await collectImageArtifacts(messageNode, errors, {
         ...options,
-        startIndex: (options.startIndex || 0) + artifacts.length
+        startIndex: (options.startIndex || 0) + artifacts.length,
+        maxArtifacts: maxArtifacts - artifacts.length
       });
       artifacts.push(...captured);
     } catch (error) {
@@ -3711,6 +4279,20 @@ function isPreviewOnlyPresentationMessage(messageNode) {
   return hasPresentationPreviewSignal;
 }
 
+function interpreterResourceWaitTimeoutForMessage(messageNode) {
+  const hasOfficePreviewFilename = downloadFilenamesFromMessage(messageNode).some((filename) =>
+    /\.(?:docx?|xlsx?|pdf)$/i.test(filename)
+  );
+  if (
+    hasOfficePreviewFilename &&
+    !hasExplicitDownloadSurface(messageNode) &&
+    imageCandidates(messageNode).length > 0
+  ) {
+    return 750;
+  }
+  return 5000;
+}
+
 async function collectAnchorAndButtonArtifacts(messageNode, errors = [], options = {}) {
   const artifacts = [];
   const artifactIds = [];
@@ -3791,11 +4373,19 @@ async function collectDownloadArtifacts(messageNode, options = {}) {
   if (options.preferImages && imageCandidates(messageNode, options).length > 0) {
     const imageSeen = new Set();
     artifacts.push(...(await collectImageArtifacts(messageNode, errors, { ...options, imageSeen })));
+    const expectedImageCount = Number(options.expectedImageCount || 0);
+    if (expectedImageCount > 0 && artifacts.length >= expectedImageCount) {
+      return { artifacts, artifactIds, errors };
+    }
     artifacts.push(
       ...(await collectInteractiveImageGalleryArtifacts(messageNode, errors, {
         ...options,
         imageSeen,
-        startIndex: artifacts.length
+        startIndex: artifacts.length,
+        maxArtifacts:
+          expectedImageCount > 0
+            ? expectedImageCount - artifacts.length
+            : undefined
       }))
     );
     return { artifacts, artifactIds, errors };
@@ -3807,10 +4397,23 @@ async function collectDownloadArtifacts(messageNode, options = {}) {
     return { artifacts, artifactIds, errors };
   }
 
+  const visibleImageFilenames = downloadFilenamesFromMessage(messageNode);
+  if (
+    visibleImageFilenames.length > 0 &&
+    visibleImageFilenames.every((filename) => IMAGE_ARTIFACT_FILENAME_RE.test(filename)) &&
+    !hasExplicitDownloadSurface(messageNode) &&
+    imageCandidates(messageNode, options).length > 0
+  ) {
+    artifacts.push(...(await collectImageArtifacts(messageNode, errors, options)));
+    return { artifacts, artifactIds, errors };
+  }
+
   let skipFinalDirectArtifacts = false;
   let suppressErrorsFrom = null;
   let triedInterpreterResources = false;
-  const skipInterpreterResources = isPreviewOnlyPresentationMessage(messageNode);
+  const interpreterFilenames = downloadFilenamesFromMessage(messageNode);
+  const skipInterpreterResources =
+    interpreterFilenames.length === 0 || isPreviewOnlyPresentationMessage(messageNode);
   if (hasZipArtifactMention(messageNode)) {
     const zipResources = interpreterDownloadResourcesForFilenames(filenamesFromText(messageNode?.textContent || ""));
     if (zipResources.length > 0) {
@@ -3840,6 +4443,19 @@ async function collectDownloadArtifacts(messageNode, options = {}) {
     }
   }
 
+  if (!hasZipArtifactMention(messageNode) && hasExplicitDownloadSurface(messageNode)) {
+    const directErrorCount = errors.length;
+    const immediateDirectArtifacts = await collectAnchorAndButtonArtifacts(messageNode, errors, options);
+    artifacts.push(...immediateDirectArtifacts.artifacts);
+    artifactIds.push(...immediateDirectArtifacts.artifactIds);
+    if (artifacts.length > 0 || artifactIds.length > 0) {
+      return { artifacts, artifactIds, errors };
+    }
+    if (errors.length > directErrorCount && suppressErrorsFrom === null) {
+      suppressErrorsFrom = directErrorCount;
+    }
+  }
+
   let interpreterArtifacts = { artifacts: [], artifactIds: [] };
   if (!triedInterpreterResources && !skipInterpreterResources) {
     const interpreterErrorCount = errors.length;
@@ -3858,7 +4474,10 @@ async function collectDownloadArtifacts(messageNode, options = {}) {
     !triedInterpreterResources
   ) {
     await revealInterpreterDownloadResources(messageNode);
-    await waitForInterpreterDownloadResources(downloadFilenamesFromMessage(messageNode));
+    await waitForInterpreterDownloadResources(
+      interpreterFilenames,
+      interpreterResourceWaitTimeoutForMessage(messageNode)
+    );
     interpreterArtifacts = await collectInterpreterDownloadArtifacts(messageNode, errors, options);
     artifacts.push(...interpreterArtifacts.artifacts);
     artifactIds.push(...interpreterArtifacts.artifactIds);
@@ -3903,19 +4522,28 @@ async function collectDownloadArtifacts(messageNode, options = {}) {
 
 async function waitForAssistantReply(previousText, options = {}) {
   const started = Date.now();
+  let lastActivityAt = started;
+  let lastActivitySignature = "";
   let lastActiveCheckAt = started;
   let stableText = "";
   let stableCount = 0;
   let pendingArtifactText = "";
   let pendingArtifactMessage = null;
+  let streamingProbeText = "";
+  let streamingStableCount = 0;
+  let pageBlockerScanNeeded = true;
   const expectedImageCount = Number(options.expectedImageCount || 0);
   const afterUserTexts = promptTextCandidates(options.afterUserTexts || [], options.afterUserText, options.alternateUserTexts || []);
+  const assertNoBlockerAfterPageChange = (blockerOptions = {}) => {
+    if (!pageBlockerScanNeeded) {
+      return;
+    }
+    assertNoChatGptBlocker(blockerOptions);
+    pageBlockerScanNeeded = false;
+  };
 
   while (true) {
     const now = Date.now();
-    if (now - started >= RESPONSE_TIMEOUT_MS) {
-      break;
-    }
     if (options.job && now - lastActiveCheckAt >= ACTIVE_JOB_CHECK_INTERVAL_MS && !(await syncJobStillActive(options.job))) {
       lastActiveCheckAt = now;
       const stoppedError = new Error("Bridge sync job stopped.");
@@ -3923,19 +4551,94 @@ async function waitForAssistantReply(previousText, options = {}) {
       throw stoppedError;
     }
     lastActiveCheckAt = options.job && now - lastActiveCheckAt >= ACTIVE_JOB_CHECK_INTERVAL_MS ? now : lastActiveCheckAt;
-    const scopedMessages = Number.isInteger(options.afterUserTurnIndex)
-      ? assistantTurnsAfterTurnIndex(options.afterUserTurnIndex)
-      : afterUserTexts.length > 0
-        ? assistantTurnsAfterUserTexts(afterUserTexts)
-        : [];
-    const currentMessage =
+    const turnsSnapshot =
+      Number.isInteger(options.afterUserTurnIndex) || afterUserTexts.length > 0
+        ? conversationTurns()
+        : null;
+    const requiresScopedReply = Number.isInteger(options.afterUserTurnIndex) || afterUserTexts.length > 0;
+    const hasScopedTurnSnapshot = Array.isArray(turnsSnapshot) && turnsSnapshot.length > 0;
+    const scopedMessages = assistantMessagesForReplyScope(
+      options.afterUserTurnIndex,
+      afterUserTexts,
+      turnsSnapshot
+    );
+    const scopedCurrentMessage =
       scopedMessages[scopedMessages.length - 1] ||
-      lastAssistantMessage({
-        afterUserTurnIndex: options.afterUserTurnIndex,
-        afterUserTexts,
-        afterUserText: options.afterUserText,
-        requireAfterUserText: Number.isInteger(options.afterUserTurnIndex) || afterUserTexts.length > 0
-      });
+      (!requiresScopedReply || !hasScopedTurnSnapshot
+        ? lastAssistantMessage({
+            afterUserTurnIndex: options.afterUserTurnIndex,
+            afterUserTexts,
+            afterUserText: options.afterUserText,
+            turns: turnsSnapshot,
+            requireAfterUserText: false
+          })
+        : null);
+       const currentMessage =
+      scopedCurrentMessage ||
+      (Number.isInteger(options.afterUserTurnIndex)
+        ? latestChangedAssistantMessage(previousText)
+        : null);
+       const pageStillGenerating = isGenerating();
+    const activityText = cleanChatGptReplyText(
+      assistantReplyRoot(currentMessage)?.textContent || ""
+    );
+    const activityImageCount = uniqueGeneratedImageCount(currentMessage, {
+      expectedImageCount,
+      excludeImageKeys: options.excludeImageKeys
+    });
+    const activityHasDownload = hasDownloadableArtifact(currentMessage);
+    const activitySignature = `${activityText}\nimages:${activityImageCount}\ndownload:${activityHasDownload}`;
+    if (pageStillGenerating || activitySignature !== lastActivitySignature) {
+      lastActivityAt = now;
+      lastActivitySignature = activitySignature;
+    }
+    if (responseWaitExpired({ startedAt: started, lastActivityAt, now, pageStillGenerating })) {
+      break;
+    }
+    if (pageStillGenerating) {
+      const streamingText = activityText;
+      if (hasGenerationFailureText(streamingText)) {
+        const blocker = generationFailureBlocker();
+        throw bridgeClassifiedError(blocker.message, {
+          errorCode: blocker.code,
+          recoveryAction: blocker.recoveryAction
+        });
+      }
+      if (streamingText === streamingProbeText) {
+        streamingStableCount += 1;
+      } else {
+        streamingProbeText = streamingText;
+        streamingStableCount = streamingText ? 1 : 0;
+      }
+      const streamingImageCount = activityImageCount;
+      const streamingDownloadableArtifact = activityHasDownload;
+      if (streamingImageCount > 0 || streamingDownloadableArtifact) {
+        pendingArtifactText = streamingText || "\u5df2\u751f\u6210\u56fe\u7247\u3002";
+        pendingArtifactMessage = currentMessage;
+      }
+      const streamingOptions = {
+        ...options,
+        generatedImageCount: streamingImageCount,
+        hasDownloadableArtifact: streamingDownloadableArtifact,
+        pageStillGenerating: true
+      };
+      if (
+        streamingStableCount >= effectiveStableTarget(streamingText, streamingOptions) &&
+        shouldAcceptStableTextDuringGlobalGeneration(streamingText, streamingOptions)
+      ) {
+        const stableReply = visibleReplyTextFromAssistant(currentMessage, previousText, {
+          allowRepeatedText: scopedMessages.length > 0,
+          generatedImageCount: activityImageCount
+        });
+        if (hasUsableAssistantText(stableReply, previousText, {
+          allowRepeatedText: scopedMessages.length > 0
+        })) {
+          return stableReply;
+        }
+      }
+      pageBlockerScanNeeded = (await waitForAssistantActivity(STREAMING_REPLY_PROBE_MS)) || pageBlockerScanNeeded;
+      continue;
+    }
     if (
       options.requireFreshUnscopedReply &&
       scopedMessages.length === 0 &&
@@ -3943,18 +4646,27 @@ async function waitForAssistantReply(previousText, options = {}) {
       afterUserTexts.length === 0 &&
       normalizeText(extractAssistantReplyText(currentMessage)) === normalizeText(previousText)
     ) {
-      assertNoChatGptBlocker({ afterUserText: options.afterUserText });
-      await sleep(1000);
+      assertNoBlockerAfterPageChange({ afterUserText: options.afterUserText });
+      pageBlockerScanNeeded = (await waitForAssistantActivity(1000)) || pageBlockerScanNeeded;
       continue;
     }
     const allowRepeatedText = scopedMessages.length > 0;
-    const hasUsableContent = hasUsableAssistantContent(currentMessage, previousText, { allowRepeatedText });
+    const rawCurrentText = extractAssistantReplyText(currentMessage);
+    const hasUsableContent = hasUsableAssistantContent(currentMessage, previousText, {
+      allowRepeatedText,
+      replyText: rawCurrentText,
+      generatedImageCount: activityImageCount,
+      hasDownloadableArtifact: activityHasDownload
+    });
     if (hasUsableContent) {
-      const rawCurrentText = extractAssistantReplyText(currentMessage);
-      const current = visibleReplyTextFromAssistant(currentMessage, previousText, { allowRepeatedText });
-      const generatedImageCount = uniqueGeneratedImageCount(currentMessage, { expectedImageCount });
-      const downloadableArtifactPresent = hasDownloadableArtifact(currentMessage);
-      if (generatedImageCount > 0 || hasDownloadableArtifact(currentMessage)) {
+      const current = visibleReplyTextFromAssistant(currentMessage, previousText, {
+        allowRepeatedText,
+        replyText: rawCurrentText,
+        generatedImageCount: activityImageCount
+      });
+      const generatedImageCount = activityImageCount;
+      const downloadableArtifactPresent = activityHasDownload;
+      if (generatedImageCount > 0 || downloadableArtifactPresent) {
         pendingArtifactText = current;
         pendingArtifactMessage = currentMessage;
       }
@@ -3964,12 +4676,11 @@ async function waitForAssistantReply(previousText, options = {}) {
         generatedImageCount < expectedImageCount &&
         !downloadableArtifactPresent
       ) {
-        assertNoChatGptBlocker({ afterUserText: options.afterUserText });
-        await sleep(1000);
+        assertNoBlockerAfterPageChange({ afterUserText: options.afterUserText });
+        pageBlockerScanNeeded = (await waitForAssistantActivity(1000)) || pageBlockerScanNeeded;
         continue;
       }
 
-      const pageStillGenerating = isGenerating();
       if (current === stableText) {
         stableCount += 1;
       } else {
@@ -3987,8 +4698,8 @@ async function waitForAssistantReply(previousText, options = {}) {
         generatedImageCount > 0 &&
         (imageReplyStillProcessingText(rawCurrentText) || (!downloadableArtifactPresent && expectedImageCount > 0));
       if (imageNeedsSettling && stableCount < (downloadableArtifactPresent ? 5 : 10)) {
-        assertNoChatGptBlocker({ afterUserText: afterUserTexts[0] || options.afterUserText });
-        await sleep(1000);
+        assertNoBlockerAfterPageChange({ afterUserText: afterUserTexts[0] || options.afterUserText });
+        pageBlockerScanNeeded = (await waitForAssistantActivity(1000)) || pageBlockerScanNeeded;
         continue;
       }
       if (
@@ -4003,10 +4714,10 @@ async function waitForAssistantReply(previousText, options = {}) {
         return current;
       }
     } else {
-      assertNoChatGptBlocker({ afterUserText: afterUserTexts[0] || options.afterUserText });
+      assertNoBlockerAfterPageChange({ afterUserText: afterUserTexts[0] || options.afterUserText });
     }
 
-    await sleep(1000);
+    pageBlockerScanNeeded = (await waitForAssistantActivity(1000)) || pageBlockerScanNeeded;
   }
 
   if (pendingArtifactMessage) {
@@ -4017,32 +4728,64 @@ async function waitForAssistantReply(previousText, options = {}) {
   throw new Error("等待 GPT 回复超时。");
 }
 
-async function markJobSent(job, previousAssistantText) {
+async function markJobSent(job, previousAssistantText, submittedPromptInfo = null) {
   await bridgeApi(`/api/sync/jobs/${job.id}/sent`, {
     method: "POST",
-    body: JSON.stringify({
-      workerId: currentWorkerId(),
+    body: JSON.stringify(syncJobMutationBody({
       previousAssistantText,
+      submittedPromptTurnIndex: Number.isInteger(submittedPromptInfo?.index)
+        ? submittedPromptInfo.index
+        : null,
+      artifactBaselineImageKeys: job.artifactBaselineImageKeys || [],
       refreshSentAt: !job.sentAt
-    })
+    }))
   });
 }
 
 async function waitForSubmittedPrompt(job, timeoutMs = 15000, contextOrComposer = null) {
   const started = Date.now();
   const promptCandidates = promptCandidatesForJob(job);
-  const composer = contextOrComposer?.composer || contextOrComposer || null;
-  const context = contextOrComposer?.composer ? contextOrComposer : { composer };
+  let pageBlockerScanNeeded = true;
+  const hasContextOptions =
+    contextOrComposer &&
+    typeof contextOrComposer === "object" &&
+    ("composer" in contextOrComposer || "afterTurnIndex" in contextOrComposer);
+  const context = hasContextOptions ? contextOrComposer : { composer: contextOrComposer || null };
+  const composer = context.composer || null;
   while (Date.now() - started < timeoutMs) {
-    const promptInfo = latestUserPromptTurnInfo(promptCandidates);
+    const promptInfo = latestUserPromptTurnInfo(promptCandidates, {
+      afterTurnIndex: context.afterTurnIndex
+    });
     if (promptInfo) {
       return promptInfo;
     }
-    if (userPromptTurnExistsAny(promptCandidates)) {
+    const directPromptInfo = latestDirectUserPromptInfo(promptCandidates, {
+      afterUserMessageCount: context.afterUserMessageCount
+    });
+    if (directPromptInfo) {
+      return directPromptInfo;
+    }
+    if (
+      Number.isInteger(context.afterTurnIndex) &&
+      composer &&
+      !composerContainsBridgeDraft(composer, job?.payloadText) &&
+      isGenerating()
+    ) {
+      return {
+        index: context.afterTurnIndex,
+        turn: null,
+        needle: "",
+        fallback: "composer_cleared"
+      };
+    }
+    if (!Number.isInteger(context.afterTurnIndex) && userPromptTurnExistsAny(promptCandidates)) {
       return null;
     }
-    assertNoChatGptBlocker();
-    await sleep(500);
+    if (pageBlockerScanNeeded) {
+      assertNoChatGptBlocker();
+      pageBlockerScanNeeded = false;
+    }
+    pageBlockerScanNeeded = (await waitForAssistantActivity(500)) || pageBlockerScanNeeded;
   }
   throw sendConfirmationError(job, context);
 }
@@ -4053,9 +4796,7 @@ async function markJobPreSendRefresh(job) {
   }
   return bridgeApi(`/api/sync/jobs/${job.id}/pre-send-refresh`, {
     method: "POST",
-    body: JSON.stringify({
-      workerId: currentWorkerId()
-    })
+    body: JSON.stringify(syncJobMutationBody())
   });
 }
 
@@ -4151,6 +4892,9 @@ function refreshBeforeSending(job, options = {}) {
   }
 
   const force = Boolean(options.force);
+  if (!job.sentAt && preSendClaimExpired(job)) {
+    return false;
+  }
   if (job.sentAt && !force) {
     return false;
   }
@@ -4240,10 +4984,16 @@ function rememberHeartbeatRecovery(signature) {
 }
 
 async function handleHeartbeatRecovery(recovery) {
-  if (!recovery || !["navigate", "reload", "stop_generation"].includes(recovery.action)) {
+  if (
+    !recovery ||
+    !["navigate", "reload", "stop_generation", "capture_existing_reply"].includes(recovery.action)
+  ) {
     return false;
   }
   if (!recoveryMatchesCurrentPage(recovery)) {
+    return false;
+  }
+  if ((recovery.job?.workerId || recovery.workerId) && !recoveryBelongsToCurrentWorker(recovery)) {
     return false;
   }
 
@@ -4258,6 +5008,14 @@ async function handleHeartbeatRecovery(recovery) {
       rememberHeartbeatRecovery(signature);
     }
     return stopped;
+  }
+
+  if (recovery.action === "capture_existing_reply") {
+    const captured = await captureExistingReply(recovery.job);
+    if (captured) {
+      rememberHeartbeatRecovery(signature);
+    }
+    return captured;
   }
 
   if (!recovery.job && recovery.action === "navigate" && recovery.projectUrl) {
@@ -4334,7 +5092,11 @@ function recoveryMatchesCurrentPage(recovery = null) {
 }
 
 function recoveryBelongsToCurrentWorker(recovery = null) {
-  const workerId = recovery?.job?.workerId || recovery?.workerId || "";
+  const workerId =
+    recovery?.workerId ||
+    recovery?.job?._bridgeRecoveryWorkerId ||
+    recovery?.job?.workerId ||
+    "";
   return Boolean(workerId && workerId === currentWorkerId());
 }
 
@@ -4443,7 +5205,7 @@ async function applyHeartbeatPreferences(preferences = null) {
     return true;
   }
 
-  if (key === lastHeartbeatPreferenceKey || preferenceSyncIsThrottled(key)) {
+  if (preferenceSyncIsThrottled(key)) {
     return false;
   }
 
@@ -4493,7 +5255,7 @@ async function processPreferenceSyncJob(job) {
 
   await bridgeApi(`/api/sync/jobs/${job.id}/complete`, {
     method: "POST",
-    body: JSON.stringify({
+    body: JSON.stringify(syncJobMutationBody({
       replyText: "GPT 偏好已同步",
       artifacts: [],
       artifactIds: [],
@@ -4501,7 +5263,7 @@ async function processPreferenceSyncJob(job) {
         ...(!modeSynced && normalizedJob.modePreference ? [{ error: `Mode preference was not found: ${normalizedJob.modePreference}` }] : []),
         ...(!modelSynced && normalizedJob.modelPreference ? [{ error: `Model preference was not found: ${normalizedJob.modelPreference}` }] : [])
       ]
-    })
+    }))
   });
 }
 
@@ -4516,6 +5278,9 @@ async function processJob(job, options = {}) {
 
   const promptCandidates = promptCandidatesForJob(job);
   const isResume = Boolean(options.resume || job.resume || job.sentAt);
+  if (!isResume && preSendClaimExpired(job)) {
+    throw preSendExpiredError();
+  }
   if (
     !isResume &&
     job.projectUrl &&
@@ -4530,12 +5295,17 @@ async function processJob(job, options = {}) {
     }
   }
   const previous = job.previousAssistantText || lastAssistantText();
-  let submittedPromptInfo = null;
+  let submittedPromptInfo = Number.isInteger(job.submittedPromptTurnIndex)
+    ? { index: job.submittedPromptTurnIndex }
+    : null;
 
   if (!isResume) {
     let preSendShouldReturn = false;
     try {
-      await withPreSendTimeout(job, async () => {
+      // Do not race the mutating send path against an outer timer. A timed-out
+      // Promise.race does not cancel DOM work, so the abandoned branch could
+      // click Send after Bridge had already classified the job as unsent.
+      await (async () => {
     if (!ensureExpectedChatGptPage(job)) {
       preSendShouldReturn = true;
       return;
@@ -4549,7 +5319,15 @@ async function processJob(job, options = {}) {
       }
       throw error;
     }
-    await dismissArtifactPreviewIfNeeded();
+    try {
+      await dismissArtifactPreviewIfNeeded();
+    } catch (error) {
+      if (error?.errorCode === "artifact_preview_stuck" && refreshBeforeSending(job, { force: true })) {
+        preSendShouldReturn = true;
+        return;
+      }
+      throw error;
+    }
 
     let composer = null;
     try {
@@ -4573,7 +5351,7 @@ async function processJob(job, options = {}) {
         });
       }
     }
-    setComposerText(composer, job.payloadText);
+    await fillComposerText(composer, job.payloadText);
     await sleep(300);
     try {
       await uploadInputArtifacts(job);
@@ -4588,18 +5366,33 @@ async function processJob(job, options = {}) {
         throw error;
       }
 
+      const lastTurnIndexBeforeSend = conversationTurns().length - 1;
+      const userMessageCountBeforeSend = directUserPromptNodes().length;
+      job.artifactBaselineImageKeys = generatedImageBaselineKeys();
       const sendAttempt = await triggerSendButton(sendButton);
       try {
-        submittedPromptInfo = await waitForSubmittedPrompt(job, 4000, { composer, sendButton, sendAttempt });
+        submittedPromptInfo = await waitForSubmittedPrompt(job, 4000, {
+          composer,
+            sendButton,
+            sendAttempt,
+            afterTurnIndex: lastTurnIndexBeforeSend,
+            afterUserMessageCount: userMessageCountBeforeSend
+        });
       } catch (error) {
         if (error?.errorCode !== "send_not_confirmed" || !composerContainsBridgeDraft(composer, job.payloadText)) {
           throw error;
         }
 
         sendAttempt.retry = await retryUnsentComposerDraft(job, { composer, sendButton });
-        submittedPromptInfo = await waitForSubmittedPrompt(job, 12000, { composer, sendButton, sendAttempt });
+        submittedPromptInfo = await waitForSubmittedPrompt(job, 12000, {
+          composer,
+            sendButton,
+            sendAttempt,
+            afterTurnIndex: lastTurnIndexBeforeSend,
+            afterUserMessageCount: userMessageCountBeforeSend
+        });
       }
-      await markJobSent(job, previous);
+      await markJobSent(job, previous, submittedPromptInfo);
     } catch (error) {
       const promptWasSubmitted = Boolean(job.payloadText && userPromptTurnExistsAny(promptCandidates));
       if (!promptWasSubmitted) {
@@ -4611,13 +5404,18 @@ async function processJob(job, options = {}) {
       }
       throw error;
     }
-      });
+      })();
       if (preSendShouldReturn) {
         return;
       }
     } catch (error) {
-      if (error?.errorCode === "pre_send_timeout" && refreshBeforeSending(job, { force: true, maxAttempts: 2 })) {
-        return;
+      if (error?.errorCode === "pre_send_timeout") {
+        if (preSendClaimExpired(job)) {
+          throw preSendExpiredError();
+        }
+        if (refreshBeforeSending(job, { force: true, maxAttempts: 2 })) {
+          return;
+        }
       }
       throw error;
     }
@@ -4635,7 +5433,8 @@ async function processJob(job, options = {}) {
       afterUserText: promptFallback ? "" : job.payloadText,
       afterUserTexts: promptFallback ? [] : promptCandidates,
       expectedImageCount: requestedImageCount(job),
-      inputArtifactCount: job.inputArtifacts?.length || 0
+      inputArtifactCount: job.inputArtifacts?.length || 0,
+      excludeImageKeys: job.artifactBaselineImageKeys || []
     });
   } catch (error) {
     if (error?.bridgeJobStopped) {
@@ -4672,6 +5471,7 @@ async function processJob(job, options = {}) {
         syncJobId: job.id,
         preferImages: expectsImageArtifact(job),
         expectedImageCount: requestedImageCount(job),
+        excludeImageKeys: job.artifactBaselineImageKeys || [],
         requestedFilename: requestedImageFilename(job),
         requestedFilenames: requestedImageFilenames(job)
       });
@@ -4679,26 +5479,164 @@ async function processJob(job, options = {}) {
   if (!(await syncJobStillActive(job))) {
     return;
   }
-  await bridgeApi(`/api/sync/jobs/${job.id}/complete`, {
+  const completion = await bridgeApi(`/api/sync/jobs/${job.id}/complete`, {
     method: "POST",
-    body: JSON.stringify({
+    body: JSON.stringify(syncJobMutationBody({
       replyText,
       artifacts: downloaded.artifacts,
       artifactIds: downloaded.artifactIds,
       artifactErrors: downloaded.errors,
       thoughtDurationMs: assistantThoughtDurationMs(assistantMessage)
-    })
+    }))
+  });
+  recordCompletionCaptureStatus(job, completion, {
+    replyLength: replyText.length,
+    artifactCount: downloaded.artifacts.length + downloaded.artifactIds.length
   });
 }
 
-async function poll() {
+async function captureExistingReply(job) {
+  if (!job?.id || !job.sentAt) {
+    updateCaptureStatus(job, "invalid_job");
+    return false;
+  }
+  if (isGenerating()) {
+    updateCaptureStatus(job, "page_generating");
+    return false;
+  }
+  if (!(await syncJobStillActive(job))) {
+    if (lastCaptureStatus?.jobId === job.id && lastCaptureStatus.state === "captured") {
+      return true;
+    }
+    updateCaptureStatus(job, "job_inactive");
+    return false;
+  }
+
+  const promptCandidates = promptCandidatesForJob(job);
+  const promptInfo = latestUserPromptTurnInfo(promptCandidates);
+  const assistantMessage = lastAssistantMessage({
+    afterUserTexts: promptCandidates,
+    afterUserText: job.payloadText,
+    requireAfterUserText: true
+  });
+  if (!promptInfo) {
+    updateCaptureStatus(job, "prompt_not_found", {
+      promptCandidateCount: promptCandidates.length
+    });
+    return false;
+  }
+  if (!assistantMessage) {
+    updateCaptureStatus(job, "assistant_not_found", {
+      promptTurnIndex: promptInfo.index
+    });
+    return false;
+  }
+  const usable = hasUsableAssistantContent(
+    assistantMessage,
+    job.previousAssistantText || "",
+    { allowRepeatedText: true }
+  );
+  if (!usable) {
+    updateCaptureStatus(job, "assistant_not_usable", {
+      promptTurnIndex: promptInfo.index
+    });
+    return false;
+  }
+
+  const imageArtifactReady =
+    expectsImageArtifact(job) &&
+    imageCandidates(assistantDownloadScope(assistantMessage), {
+      expectedImageCount: requestedImageCount(job),
+      includePageGallery: true,
+      excludeImageKeys: job.artifactBaselineImageKeys || []
+    }).length > 0;
+  const downloadableArtifactReady =
+    hasOutputArtifactRequestSignal(job) &&
+    hasDownloadableArtifact(assistantMessage);
+  let replyText = visibleReplyTextFromAssistant(
+    assistantMessage,
+    job.previousAssistantText || "",
+    { allowRepeatedText: true }
+  );
+  if (
+    imageArtifactReady &&
+    (!replyText || isInterimAssistantText(replyText) || imageReplyStillProcessingText(replyText))
+  ) {
+    replyText = "\u5df2\u751f\u6210\u56fe\u7247\u3002";
+  }
+  if (
+    !replyText ||
+    isInterimAssistantText(replyText) ||
+    (
+      looksLikePossiblyStreamingReply(replyText) &&
+      !imageArtifactReady &&
+      !downloadableArtifactReady
+    )
+  ) {
+    updateCaptureStatus(job, "reply_not_final", {
+      replyLength: replyText?.length || 0,
+      interim: isInterimAssistantText(replyText),
+      possiblyStreaming: looksLikePossiblyStreamingReply(replyText),
+      imageArtifactReady,
+      downloadableArtifactReady
+    });
+    return false;
+  }
+
+  const downloaded = shouldSkipArtifactCapture(job, replyText)
+    ? { artifacts: [], artifactIds: [], errors: [] }
+    : await collectDownloadArtifacts(assistantDownloadScope(assistantMessage), {
+        syncJobId: job.id,
+        preferImages: expectsImageArtifact(job),
+        expectedImageCount: requestedImageCount(job),
+        includePageGallery: expectsImageArtifact(job),
+        excludeImageKeys: job.artifactBaselineImageKeys || [],
+        requestedFilename: requestedImageFilename(job),
+        requestedFilenames: requestedImageFilenames(job)
+      });
+  if (!(await syncJobStillActive(job))) {
+    if (lastCaptureStatus?.jobId === job.id && lastCaptureStatus.state === "captured") {
+      return true;
+    }
+    updateCaptureStatus(job, "job_ended_during_capture");
+    return false;
+  }
+
+  try {
+    const completion = await bridgeApi(`/api/sync/jobs/${job.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify(syncJobMutationBody({
+        replyText,
+        artifacts: downloaded.artifacts,
+        artifactIds: downloaded.artifactIds,
+        artifactErrors: downloaded.errors,
+        thoughtDurationMs: assistantThoughtDurationMs(assistantMessage)
+      }))
+    });
+    return recordCompletionCaptureStatus(job, completion, {
+      replyLength: replyText.length,
+      artifactCount: downloaded.artifacts.length + downloaded.artifactIds.length
+    });
+  } catch (error) {
+    updateCaptureStatus(job, "completion_rejected", {
+      errorCode: error?.errorCode || null,
+      error: error?.message || String(error || "")
+    });
+    if (isRetryableCompletionApiError(error)) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function runPollCycle() {
   if (!location.hostname.endsWith("chatgpt.com")) {
     return;
   }
 
   let heartbeat = null;
   try {
-    heartbeat = await sendHeartbeat();
+    heartbeat = await sendHeartbeat({ lightweight: busy });
   } catch {
     // The bridge may be stopped; keep polling quietly.
   }
@@ -4706,6 +5644,7 @@ async function poll() {
   if (maybeReloadExtensionFromHeartbeat(heartbeat)) {
     return;
   }
+  await maybeOpenProjectTabFromHeartbeat(heartbeat);
 
   let preSendRefreshJob = takePreSendRefreshJob();
   const controlsCurrentPage = heartbeatMatchesCurrentPage(heartbeat);
@@ -4747,7 +5686,7 @@ async function poll() {
   busy = true;
   try {
     if (preSendRefreshJob) {
-      await processJob(preSendRefreshJob, { afterPreSendRefresh: true });
+      await processJobAndReportFailure(preSendRefreshJob, { afterPreSendRefresh: true });
       return;
     }
 
@@ -4764,17 +5703,7 @@ async function poll() {
     });
 
     if (claimed.job) {
-      try {
-        await processJob(claimed.job, { resume: claimed.resume });
-      } catch (error) {
-        if (isRetryableCompletionApiError(error)) {
-          return;
-        }
-        await bridgeApi(`/api/sync/jobs/${claimed.job.id}/fail`, {
-          method: "POST",
-          body: JSON.stringify(bridgeFailurePayload(error))
-        });
-      }
+      await processJobAndReportFailure(claimed.job, { resume: claimed.resume });
     }
   } catch {
     // The bridge may be stopped; keep polling quietly.
@@ -4783,5 +5712,46 @@ async function poll() {
   }
 }
 
+async function poll() {
+  if (busy) {
+    if (busyHeartbeatInFlight) {
+      return;
+    }
+    busyHeartbeatInFlight = true;
+    try {
+      await runPollCycle();
+    } finally {
+      busyHeartbeatInFlight = false;
+    }
+    return;
+  }
+  if (pollInFlight) {
+    return;
+  }
+  pollInFlight = true;
+  try {
+    await runPollCycle();
+  } finally {
+    pollInFlight = false;
+  }
+}
+
+async function processJobAndReportFailure(job, options = {}) {
+  try {
+    await processJob(job, options);
+    return true;
+  } catch (error) {
+    if (isRetryableCompletionApiError(error)) {
+      return false;
+    }
+    await bridgeApi(`/api/sync/jobs/${job.id}/fail`, {
+      method: "POST",
+      body: JSON.stringify(syncJobMutationBody(bridgeFailurePayload(error)))
+    });
+    return false;
+  }
+}
+
 setInterval(poll, POLL_MS);
+installAssistantActivityObserver();
 poll();

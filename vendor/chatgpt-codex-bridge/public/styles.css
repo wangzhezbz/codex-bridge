@@ -331,10 +331,32 @@ label {
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  scrollbar-color: var(--line-strong) var(--surface-2);
   display: grid;
   grid-template-rows: auto auto auto auto;
   gap: 24px;
   align-content: start;
+}
+
+.project-view::-webkit-scrollbar {
+  width: 12px;
+}
+
+.project-view::-webkit-scrollbar-track {
+  background: var(--surface-2);
+  border-radius: 999px;
+}
+
+.project-view::-webkit-scrollbar-thumb {
+  min-height: 48px;
+  border: 3px solid var(--surface-2);
+  border-radius: 999px;
+  background: var(--line-strong);
+}
+
+.project-view::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
 }
 
 .project-hero {
@@ -1385,14 +1407,22 @@ label {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+  min-width: 0;
+  width: 100%;
   padding: 14px 16px;
   border-bottom: 1px solid var(--line);
 }
 
 .document-preview-header strong {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.document-preview-header .inline-actions {
+  flex: 0 0 auto;
 }
 
 .document-preview-body {

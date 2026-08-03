@@ -358,6 +358,20 @@ test("Windows packaged smoke writes a machine-readable report for release prefli
   assert.match(main, /duplicateRequestProtection !== false/);
 });
 
+test("Windows packaged smoke rejects stale Embedded Bridge contents", () => {
+  const smoke = fs.readFileSync(path.join(process.cwd(), "scripts", "smoke-packaged-windows.mjs"), "utf8");
+
+  assert.match(smoke, /embedded-manifest\.json/);
+  assert.match(smoke, /bridge-api-client\.js/);
+  assert.match(smoke, /visible-branding\.js/);
+  assert.match(smoke, /bridge-auth\.js/);
+  assert.match(smoke, /extensionProtocolVersion/);
+  assert.match(smoke, /v20260801-adaptive-office-wait/);
+  assert.match(smoke, /@hono["',]+\s*"node-server/);
+  assert.match(smoke, /fast-uri/);
+  assert.match(smoke, /assertDependencyVersionAtLeast/);
+});
+
 test("desktop cleans old managed update artifacts and previous installed apps after update", () => {
   const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
 

@@ -300,6 +300,7 @@ let capabilityHistoryFilter = "all";
 let lastProjectRecoveryResult = null;
 let historyRecoveryStatus = null;
 let doubleQuotaState = null;
+let doubleQuotaExtensionGuideActive = false;
 let sessionSearchText = "";
 let stateDetailLoaded = false;
 let stateDetailLoading = false;
@@ -781,7 +782,11 @@ const els = {
   doubleQuotaServiceTitle: document.querySelector("#doubleQuotaServiceTitle"),
   doubleQuotaServiceDetail: document.querySelector("#doubleQuotaServiceDetail"),
   doubleQuotaUrl: document.querySelector("#doubleQuotaUrl"),
-  doubleQuotaVersion: document.querySelector("#doubleQuotaVersion"),
+  doubleQuotaServiceVersion: document.querySelector("#doubleQuotaServiceVersion"),
+  doubleQuotaProtocolVersion: document.querySelector("#doubleQuotaProtocolVersion"),
+  doubleQuotaExtensionProtocol: document.querySelector("#doubleQuotaExtensionProtocol"),
+  doubleQuotaEmbeddedVersion: document.querySelector("#doubleQuotaEmbeddedVersion"),
+  doubleQuotaServiceSource: document.querySelector("#doubleQuotaServiceSource"),
   doubleQuotaMcpStatus: document.querySelector("#doubleQuotaMcpStatus"),
   doubleQuotaPort: document.querySelector("#doubleQuotaPort"),
   doubleQuotaMessage: document.querySelector("#doubleQuotaMessage"),
@@ -793,11 +798,12 @@ const els = {
   doubleQuotaExtensionRuntimeState: document.querySelector("#doubleQuotaExtensionRuntimeState"),
   saveDoubleQuotaPort: document.querySelector("#saveDoubleQuotaPort"),
   startDoubleQuota: document.querySelector("#startDoubleQuota"),
+  restartDoubleQuota: document.querySelector("#restartDoubleQuota"),
   stopDoubleQuota: document.querySelector("#stopDoubleQuota"),
-  openDoubleQuota: document.querySelector("#openDoubleQuota"),
   manageDoubleQuotaExtension: document.querySelector("#manageDoubleQuotaExtension"),
   openDoubleQuotaExtensionManager: document.querySelector("#openDoubleQuotaExtensionManager"),
   refreshDoubleQuotaExtension: document.querySelector("#refreshDoubleQuotaExtension"),
+  doubleQuotaExtensionGuide: document.querySelector("#doubleQuotaExtensionGuide"),
   repairDoubleQuotaMcp: document.querySelector("#repairDoubleQuotaMcp"),
   toast: document.querySelector("#toast"),
   requestDetailDialog: document.querySelector("#requestDetailDialog"),
@@ -932,7 +938,9 @@ els.saveDoubleQuotaPort?.addEventListener("click", (event) =>
   runAction(event.currentTarget, async () => {
     doubleQuotaState = await api.saveDoubleQuotaPort(Number(els.doubleQuotaPort.value));
     renderDoubleQuota();
-    showToast("双倍额度端口已保存；请重新加载 Chrome 扩展。");
+    showToast(doubleQuotaState.restartRequired
+      ? "端口已保存；当前服务仍使用原端口，点击重启服务后生效。"
+      : "双倍额度端口已保存；请重新加载 Chrome 扩展。");
   }),
 );
 
@@ -941,6 +949,14 @@ els.startDoubleQuota?.addEventListener("click", (event) =>
     doubleQuotaState = await api.startDoubleQuota();
     renderDoubleQuota();
     showToast(doubleQuotaState.ownedProcess ? "双倍额度服务已启动。" : "已连接现有双倍额度服务。");
+  }),
+);
+
+els.restartDoubleQuota?.addEventListener("click", (event) =>
+  runAction(event.currentTarget, async () => {
+    doubleQuotaState = await api.restartDoubleQuota();
+    renderDoubleQuota();
+    showToast("双倍额度服务已重启。");
   }),
 );
 
@@ -954,13 +970,6 @@ els.stopDoubleQuota?.addEventListener("click", (event) =>
   }),
 );
 
-els.openDoubleQuota?.addEventListener("click", (event) =>
-  runAction(event.currentTarget, async () => {
-    doubleQuotaState = await api.openDoubleQuota();
-    renderDoubleQuota();
-  }),
-);
-
 els.manageDoubleQuotaExtension?.addEventListener("click", (event) =>
   runAction(event.currentTarget, async () => {
     doubleQuotaState = await api.manageDoubleQuotaExtension();
@@ -971,28 +980,44 @@ els.manageDoubleQuotaExtension?.addEventListener("click", (event) =>
       );
     }
     await api.copyText(doubleQuotaState.extensionDir);
-    await api.openDoubleQuotaExtensionManager();
-    showToast(
-      doubleQuotaState.extensionBrowser?.registeredStable
-        ? "扩展文件已安装并校验。请在 Chrome 扩展页点击该扩展的“重新加载”。"
-        : "扩展文件已安装并校验，目录已复制。请在 Chrome 扩展页加载该目录。",
-    );
-    await refreshDoubleQuotaState();
+    doubleQuotaExtensionGuideActive = true;
+    renderDoubleQuota();
+    const openedState = await api.openDoubleQuotaExtensionManager();
+    doubleQuotaState = openedState;
+    renderDoubleQuota();
+    showToast("扩展文件已准备并复制目录。请在 Chrome 中完成加载，再点击“重新检测”。");
   }),
 );
 
 els.openDoubleQuotaExtensionManager?.addEventListener("click", (event) =>
   runAction(event.currentTarget, async () => {
     doubleQuotaState = await api.openDoubleQuotaExtensionManager();
+    doubleQuotaExtensionGuideActive = true;
     renderDoubleQuota();
-    showToast("已打开 Chrome 扩展管理页；地址也已复制，可直接粘贴到地址栏。");
+    showToast("已打开 Chrome 扩展管理页；若页面未跳转，地址已复制，可在地址栏粘贴并回车。");
   }),
 );
 
 els.refreshDoubleQuotaExtension?.addEventListener("click", (event) =>
   runAction(event.currentTarget, async () => {
+    const wasInstalled = doubleQuotaState?.extensionInstallation?.installed === true;
     await refreshDoubleQuotaState();
-    showToast("扩展状态已重新检测。");
+    const installation = doubleQuotaState?.extensionInstallation || {};
+    if (installation.installed) {
+      doubleQuotaExtensionGuideActive = false;
+      renderDoubleQuota();
+      showToast(wasInstalled
+        ? "已重新检测：Chrome 扩展仍然安装正常。"
+        : "检测成功：Chrome 已加载扩展。启动服务后可继续检测实时连接。");
+      return;
+    }
+    if (installation.filesReady) {
+      doubleQuotaExtensionGuideActive = true;
+      renderDoubleQuota();
+      showToast("尚未检测到 Chrome 加载扩展，请完成“加载已解压的扩展程序”。", "error");
+      return;
+    }
+    showToast("扩展文件尚未准备，请先点击“开始安装”。", "error");
   }),
 );
 
@@ -2046,31 +2071,49 @@ function renderDoubleQuota() {
     running: "运行中",
     attached: "外部服务已连接",
     starting: "启动中",
+    stopping: "停止中",
+    version_mismatch: "版本不匹配",
     stopped: "已停止",
     error: "启动失败",
   }[current.status] || "状态未知";
   els.doubleQuotaStatus.textContent = statusText;
   els.doubleQuotaStatus.classList.toggle("muted", !current.running);
-  els.doubleQuotaStatus.classList.toggle("failed", current.status === "error");
+  els.doubleQuotaStatus.classList.toggle(
+    "failed",
+    current.status === "error" || current.status === "version_mismatch",
+  );
   const serviceRunning = Boolean(current.running);
   els.doubleQuotaServiceBanner.classList.toggle("running", serviceRunning);
-  els.doubleQuotaServiceBanner.classList.toggle("stopped", !serviceRunning && current.status !== "starting");
-  els.doubleQuotaServiceBanner.classList.toggle("starting", current.status === "starting");
+  els.doubleQuotaServiceBanner.classList.toggle(
+    "stopped",
+    !serviceRunning && !["starting", "stopping"].includes(current.status),
+  );
+  els.doubleQuotaServiceBanner.classList.toggle(
+    "starting",
+    ["starting", "stopping"].includes(current.status),
+  );
   els.doubleQuotaServiceTitle.textContent = serviceRunning
-    ? "双倍额度服务正在运行"
+    ? current.status === "version_mismatch"
+      ? "双倍额度服务版本不匹配"
+      : "双倍额度服务正在运行"
     : current.status === "starting"
       ? "双倍额度服务正在启动"
+      : current.status === "stopping"
+        ? "双倍额度服务正在停止"
       : "双倍额度服务已关闭";
   els.doubleQuotaServiceDetail.textContent = serviceRunning
     ? `已监听 ${current.url || "http://127.0.0.1:4317/"}`
-    : "当前不会接收 ChatGPT 网页请求";
+    : "当前不会接收 G某T 网页请求";
   els.doubleQuotaUrl.textContent = current.url || "http://127.0.0.1:4317/";
-  const extensionProtocol = current.extensionProtocolVersion
-    ? ` · 扩展 ${current.extensionProtocolVersion}`
-    : "";
-  els.doubleQuotaVersion.textContent = current.serviceVersion || current.version
-    ? `v${current.serviceVersion || current.version} · 协议 ${current.protocolVersion}${extensionProtocol}`
-    : "-";
+  els.doubleQuotaServiceVersion.textContent = current.serviceVersion ? `v${current.serviceVersion}` : "-";
+  els.doubleQuotaProtocolVersion.textContent = current.protocolVersion ? `v${current.protocolVersion}` : "-";
+  els.doubleQuotaExtensionProtocol.textContent = current.extensionProtocolVersion || "-";
+  els.doubleQuotaEmbeddedVersion.textContent = current.version ? `v${current.version}` : "-";
+  els.doubleQuotaServiceSource.textContent = current.externalProcess
+    ? "外部兼容服务"
+    : current.ownedProcess
+      ? "CodexBridge 内置"
+      : "内置待启动";
   els.doubleQuotaMcpStatus.textContent = current.mcpInstalled ? "已安装" : "尚未安装";
   if (document.activeElement !== els.doubleQuotaPort && current.port) {
     els.doubleQuotaPort.value = String(current.port);
@@ -2078,15 +2121,20 @@ function renderDoubleQuota() {
   const extensionDisk = current.extensionDisk || {};
   const extensionBrowser = current.extensionBrowser || {};
   const extensionRuntime = current.extensionRuntime || {};
+  const extensionInstallation = current.extensionInstallation || {};
   const extensionDisplayVersion = String(current.extensionDisplayVersion || current.extensionManifestVersion || "").trim();
   els.doubleQuotaExtensionPath.textContent = current.extensionDir || "尚未准备固定安装目录";
   const extensionAction = current.extensionAction || {};
   if (els.doubleQuotaExtensionState) {
     els.doubleQuotaExtensionState.textContent = extensionRuntime.connected
       ? "已连接"
-      : extensionDisk.verified
-        ? "文件已安装"
-        : "尚未安装";
+      : extensionInstallation.status === "update_required"
+        ? "需要更新"
+        : extensionInstallation.installed
+          ? "已安装"
+          : extensionInstallation.filesReady
+            ? "等待 Chrome 加载"
+            : "尚未安装";
     els.doubleQuotaExtensionState.classList.toggle("muted", !extensionRuntime.connected);
     els.doubleQuotaExtensionState.classList.toggle(
       "failed",
@@ -2112,7 +2160,15 @@ function renderDoubleQuota() {
   );
   setDoubleQuotaExtensionLayerState(
     els.doubleQuotaExtensionRuntimeState,
-    extensionRuntime.connected ? "已连接" : extensionRuntime.stale ? "版本待刷新" : "尚未连接",
+    extensionRuntime.connected
+      ? "已连接"
+      : extensionRuntime.stale
+        ? "版本待刷新"
+        : extensionRuntime.status === "service_offline"
+          ? "启动服务后检测"
+          : extensionRuntime.status === "unavailable"
+            ? "暂时无法检测"
+            : "尚未连接",
     { muted: !extensionRuntime.connected, failed: extensionRuntime.stale === true },
   );
   if (els.manageDoubleQuotaExtension) {
@@ -2125,6 +2181,8 @@ function renderDoubleQuota() {
       ? "扩展已连接，可以正常使用。"
       : extensionRuntime.stale
         ? "Chrome 中的扩展版本未刷新，请在扩展页点击“重新加载”。"
+        : extensionInstallation.installed && extensionRuntime.status === "service_offline"
+          ? "扩展已经安装；服务未启动，因此暂不检测实时连接。"
         : extensionBrowser.registeredStable
           ? "Chrome 已加载固定目录，但服务尚未收到连接；请确认扩展已启用并重新加载。"
           : deploymentVerified
@@ -2138,16 +2196,24 @@ function renderDoubleQuota() {
       extensionDisk.status === "incomplete" || extensionRuntime.stale === true,
     );
   }
+  if (els.doubleQuotaExtensionGuide) {
+    const installationNeedsGuide = ["awaiting_browser", "old_path", "update_required"]
+      .includes(extensionInstallation.status);
+    els.doubleQuotaExtensionGuide.classList.toggle(
+      "hidden",
+      !doubleQuotaExtensionGuideActive && !installationNeedsGuide,
+    );
+  }
   els.doubleQuotaMessage.textContent = current.error || current.message ||
     (current.externalProcess
       ? "当前端口上的兼容服务由外部程序启动，CodexBridge 只附着使用，不会强制关闭。"
       : "服务独立运行，不会改变 15722 模型 Router。");
   els.startDoubleQuota.disabled = Boolean(current.running);
+  els.restartDoubleQuota.disabled = !current.ownedProcess || current.bridgeTaskActive === true;
   els.stopDoubleQuota.disabled = !current.running;
   els.startDoubleQuota.textContent = current.running ? "服务已启动" : "启动服务";
   els.stopDoubleQuota.textContent = current.running ? "停止服务" : "服务已停止";
-  els.openDoubleQuota.disabled = !current.running;
-  els.saveDoubleQuotaPort.disabled = Boolean(current.running);
+  els.saveDoubleQuotaPort.disabled = false;
 }
 
 function setDoubleQuotaExtensionLayerState(element, text, {

@@ -1,7 +1,26 @@
 import {
+  createProjectRefreshCoordinator,
+  displayProjectConversationUrl,
+  projectIdFromPageUrl,
+  restoreProjectConversationUrl,
+  runProjectRefresh,
   saveProjectBindingForScope,
-  selectProjectForScope
+  selectProjectForScope,
+  withProjectIdInPageUrl
 } from "./project-binding-client.js";
+import {
+  installVisibleBrandingGuard,
+  maskVisibleBrandName
+} from "./visible-branding.js";
+import { createBridgeApiClient } from "./bridge-api-client.js";
+
+installVisibleBrandingGuard();
+const PAGE_QUERY = new URLSearchParams(window.location.search);
+const PAGE_SCOPE_TOKEN = String(PAGE_QUERY.get("scope") || "");
+const PAGE_PROJECT_ID = projectIdFromPageUrl(window.location.href);
+const bridgeApiClient = createBridgeApiClient({
+  scopeToken: PAGE_SCOPE_TOKEN
+});
 
 const MODE_PREFERENCES = new Set(["fast", "balanced", "advanced", "high", "pro"]);
 const MODEL_PREFERENCES = new Set(["gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.3", "o3"]);
@@ -26,27 +45,11 @@ const MODE_LABELS_BY_MODEL = {
   "gpt-5.4": { fast: "极速", pro: "专业" },
   "gpt-5.3": { fast: "极速" }
 };
-const ACCEPTANCE_MODE = new URLSearchParams(window.location.search).get("qa") === "1";
+const ACCEPTANCE_MODE = PAGE_QUERY.get("qa") === "1";
 const TEXT_PREVIEW_EXTENSIONS = new Set(["txt", "md", "json", "html", "css", "js", "ts", "py", "log", "xml", "yaml", "yml"]);
 const INLINE_PREVIEW_EXTENSIONS = new Set(["xlsx", "csv", "pptx", "pdf", "docx", "zip", "psd"]);
 const TEXT_ENCODING_LOSS_MESSAGE = "文本看起来已经乱码，里面出现大量问号。请重新输入后再发送。";
 const HIDDEN_ENCODING_LOSS_MESSAGE = "这条消息疑似在发送前已经乱码，已隐藏原文。";
-
-function storedPreference(key, allowedValues, fallback) {
-  const value = window.localStorage.getItem(key);
-  return allowedValues.has(value) ? value : fallback;
-}
-
-function storedModePreference() {
-  const current = storedPreference("bridge-mode-preference", MODE_PREFERENCES, null);
-  if (current) return current;
-  const legacy = window.localStorage.getItem("bridge-model-preference");
-  return MODE_PREFERENCES.has(legacy) ? legacy : "balanced";
-}
-
-function storedModelPreference() {
-  return storedPreference("bridge-model-preference", MODEL_PREFERENCES, "gpt-5.6-sol");
-}
 
 function modelSupportsModePreference(modelPreference) {
   return modePreferencesForModel(modelPreference).length > 0;
@@ -190,20 +193,21 @@ const state = {
   acceptanceRecordText: "",
   gptPreflight: null,
   currentCodexThreadId: null,
-  modePreference: storedModePreference(),
-  modelPreference: storedModelPreference(),
+  modePreference: "balanced",
+  modelPreference: "gpt-5.6-sol",
   theme: window.localStorage.getItem("bridge-theme") || "dark",
   loading: false
 };
 
 let preferenceSyncTimer = null;
+const projectRefreshCoordinator = createProjectRefreshCoordinator();
 
 document.documentElement.dataset.theme = state.theme;
 
 function normalizeVisibleGptText(input = "") {
   const text = String(input?.message || input || "").trim();
   if (!text) return "";
-  return text
+  const normalized = text
     .replace(/ChatGPT page cannot receive messages yet/gi, "GPT 页面暂时不能接收任务")
     .replace(
       /ChatGPT is still generating\. Bridge will wait for the current reply to finish\./gi,
@@ -245,6 +249,7 @@ function normalizeVisibleGptText(input = "") {
     )
     .replace(/\bChatGPT Project\b/g, "GPT 会话")
     .replace(/\bChatGPT\b/g, "GPT");
+  return maskVisibleBrandName(normalized);
 }
 
 function friendlyErrorMessage(input = "") {
@@ -307,7 +312,7 @@ function friendlySyncStatusReason(reason = "", syncStatus = "") {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
+  const response = await bridgeApiClient.fetch(path, {
     headers: {
       "Content-Type": "application/json",
       ...(options.headers || {})
@@ -327,6 +332,14 @@ async function api(path, options = {}) {
   }
 
   return response.json();
+}
+
+function scopedProjectPath(path, projectId = state.activeProjectId) {
+  if (!projectId) {
+    return path;
+  }
+  const separator = path.includes("?") ? "&" : "?";
+  return `${path}${separator}projectId=${encodeURIComponent(projectId)}`;
 }
 
 function showToast(message) {
@@ -470,7 +483,6 @@ function selectedModelPreference() {
 
 function setModePreference(value) {
   state.modePreference = MODE_PREFERENCES.has(value) ? value : state.modePreference || "balanced";
-  window.localStorage.setItem("bridge-mode-preference", state.modePreference);
   const visibleMode = compatibleModePreference(selectedModelPreference(), state.modePreference) || "default";
   if (els.modeSelect && els.modeSelect.value !== visibleMode) {
     els.modeSelect.value = visibleMode;
@@ -504,7 +516,6 @@ function syncPreferenceControls() {
 
 function setModelPreference(value) {
   state.modelPreference = MODEL_PREFERENCES.has(value) ? value : "gpt-5.6-sol";
-  window.localStorage.setItem("bridge-model-preference", state.modelPreference);
   if (els.modelSelect && els.modelSelect.value !== state.modelPreference) {
     els.modelSelect.value = state.modelPreference;
   }
@@ -518,9 +529,10 @@ function queuePreferenceSync() {
 
 async function syncPreferencesToChatGpt({ successToast = "已发送同步请求" } = {}) {
   try {
-    const result = await api("/api/preferences/sync", {
+    const result = await api(scopedProjectPath("/api/preferences/sync"), {
       method: "POST",
       body: JSON.stringify({
+        projectId: state.activeProjectId,
         modePreference: selectedModePreference(),
         modelPreference: selectedModelPreference()
       })
@@ -777,7 +789,15 @@ function createImageActions(artifact) {
   return actions;
 }
 
+function replacePageProjectId(projectId) {
+  const pageUrl = withProjectIdInPageUrl(window.location.href, projectId);
+  if (pageUrl !== window.location.href) {
+    window.history.replaceState({}, "", pageUrl);
+  }
+}
+
 function showProjects() {
+  replacePageProjectId(null);
   document.body.classList.add("project-mode");
   els.projectView.classList.remove("is-hidden");
   els.chatView.classList.add("is-hidden");
@@ -790,6 +810,7 @@ function showProjects() {
 }
 
 function showChat() {
+  replacePageProjectId(state.activeProjectId);
   document.body.classList.remove("project-mode");
   els.projectView.classList.add("is-hidden");
   els.chatView.classList.remove("is-hidden");
@@ -854,15 +875,17 @@ function renderOnboardingGuide() {
   els.onboardingGuide.dataset.hasProjects = state.projects.length > 0 ? "true" : "false";
 }
 
-async function loadProjects({ autoEnter = true } = {}) {
+async function loadProjects({ autoEnter = false, preferredProjectId = null } = {}) {
   const payload = await api("/api/projects");
   state.projects = payload.projects || [];
   state.otherProjects = payload.otherProjects || [];
-  state.activeProjectId = payload.activeProjectId || state.projects[0]?.id || null;
+  const preferredProject = state.projects.find((project) => project.id === preferredProjectId);
+  state.activeProjectId = preferredProject?.id || payload.activeProjectId || state.projects[0]?.id || null;
   state.activeProject = state.projects.find((project) => project.id === state.activeProjectId) || null;
   renderProjectList();
 
-  if (autoEnter && state.activeProject) {
+  const canAutoEnter = autoEnter && state.activeProject && (!preferredProjectId || preferredProject);
+  if (canAutoEnter) {
     showChat();
     await refreshWorkspaceSurface({ scrollToBottom: true });
   } else {
@@ -877,6 +900,13 @@ async function selectProject(projectId) {
       projectId,
       currentCodexThreadId: state.currentCodexThreadId
     });
+    projectRefreshCoordinator.invalidate();
+    state.workspace = null;
+    state.status = null;
+    state.artifacts = [];
+    state.messages = [];
+    renderMessages([]);
+    renderArtifacts([]);
     state.activeProjectId = payload.activeProjectId;
     state.activeProject = payload.project;
     await loadProjects({ autoEnter: false });
@@ -1564,7 +1594,9 @@ function updateStatusLine(status) {
 
 function updateSettingsFields() {
   const workspace = state.workspace || {};
-  els.settingsProjectUrlInput.value = workspace.chatgptProjectUrl || state.activeProject?.chatgptProjectUrl || "";
+  els.settingsProjectUrlInput.value = displayProjectConversationUrl(
+    workspace.chatgptProjectUrl || state.activeProject?.chatgptProjectUrl || ""
+  );
   els.settingsTargetRepoInput.value = workspace.targetRepo || state.activeProject?.targetRepo || "";
 }
 
@@ -1707,10 +1739,10 @@ function renderImagePreviewDialog(artifacts, index = 0) {
 
   state.imagePreviewArtifacts = images;
   state.imagePreviewIndex = safeIndex;
-  els.imagePreviewTitle.textContent = artifact.filename || "鍥剧墖";
+  els.imagePreviewTitle.textContent = artifact.filename || "图片";
   els.imagePreviewCounter.textContent = images.length > 1 ? `${safeIndex + 1}/${images.length}` : "";
   els.imagePreview.src = artifactDownloadUrl(artifact);
-  els.imagePreview.alt = artifact.filename || "GPT 杈撳嚭鍥剧墖棰勮";
+  els.imagePreview.alt = artifact.filename || "图片预览";
   if (els.imagePreviewDownloadButton) {
     els.imagePreviewDownloadButton.disabled = false;
   }
@@ -2644,7 +2676,7 @@ async function clearRoomConversation() {
   const confirmed = window.confirm("清空当前对话？只会清空 Bridge 当前房间视图，不会删除本地文件。");
   if (!confirmed) return;
   try {
-    await api("/api/room/messages", {
+    await api(scopedProjectPath("/api/room/messages"), {
       method: "DELETE"
     });
     state.expandedLongTextKeys.clear();
@@ -2868,9 +2900,9 @@ function renderAcceptancePanel(payload) {
   syncGptActionControls();
 }
 
-async function loadAcceptanceStatus() {
+async function loadAcceptanceStatus(projectId = state.activeProjectId) {
   if (!ACCEPTANCE_MODE || !els.acceptancePanel) return null;
-  const payload = await api("/api/acceptance/status");
+  const payload = await api(scopedProjectPath("/api/acceptance/status", projectId));
   renderAcceptancePanel(payload);
   return payload;
 }
@@ -2999,40 +3031,65 @@ function renderArtifacts(artifacts = []) {
   }
 }
 
-async function loadWorkspace() {
-  state.workspace = await api("/api/workspace");
+function applyWorkspacePreferences(workspace = {}) {
+  const modelPreference = MODEL_PREFERENCES.has(workspace.modelPreference)
+    ? workspace.modelPreference
+    : "gpt-5.6-sol";
+  const modePreference =
+    compatibleModePreference(modelPreference, workspace.modePreference) ||
+    modePreferencesForModel(modelPreference)[0] ||
+    "balanced";
+  setModelPreference(modelPreference);
+  setModePreference(modePreference);
+}
+
+async function loadWorkspaceSurface(projectId) {
+  const [workspace, status, artifactsPayload, messagesPayload, acceptancePayload] = await Promise.all([
+    api(scopedProjectPath("/api/workspace", projectId)),
+    api(scopedProjectPath("/api/diagnostics/status", projectId)),
+    api(scopedProjectPath("/api/artifacts", projectId)),
+    api(scopedProjectPath("/api/room/messages", projectId)),
+    ACCEPTANCE_MODE && els.acceptancePanel
+      ? api(scopedProjectPath("/api/acceptance/status", projectId))
+      : Promise.resolve(null)
+  ]);
+  return {
+    workspace,
+    status,
+    artifacts: artifactsPayload.artifacts || [],
+    messages: messagesPayload.messages || messagesPayload || [],
+    acceptance: acceptancePayload
+  };
+}
+
+function applyWorkspaceSurface(surface) {
+  state.workspace = surface.workspace;
+  state.status = surface.status;
+  state.messages = surface.messages;
+  applyWorkspacePreferences(surface.workspace);
   updateSettingsFields();
-  return state.workspace;
-}
-
-async function loadStatus() {
-  state.status = await api("/api/diagnostics/status");
-  updateStatusLine(state.status);
-  return state.status;
-}
-
-async function loadArtifacts() {
-  const query = state.workspace?.conversationId
-    ? `?conversationId=${encodeURIComponent(state.workspace.conversationId)}`
-    : "";
-  const payload = await api(`/api/artifacts${query}`);
-  renderArtifacts(payload.artifacts || []);
-}
-
-async function loadMessages() {
-  const payload = await api("/api/room/messages");
-  state.messages = payload.messages || payload || [];
-  renderMessages(state.messages);
+  updateStatusLine(surface.status);
+  renderArtifacts(surface.artifacts);
+  renderMessages(surface.messages);
   renderChainStatusPanel();
+  if (surface.acceptance) {
+    renderAcceptancePanel(surface.acceptance);
+  }
 }
 
 async function refreshWorkspaceSurface({ scrollToBottom = false } = {}) {
+  const projectId = state.activeProjectId;
+  if (!projectId) return false;
   const chatScrollState = captureChatScrollState();
   const previousLastMessageId = latestVisibleMessageId();
-  await loadWorkspace();
-  await Promise.all([loadStatus(), loadArtifacts()]);
-  await loadMessages();
-  await loadAcceptanceStatus();
+  const applied = await runProjectRefresh({
+    coordinator: projectRefreshCoordinator,
+    projectId,
+    getActiveProjectId: () => state.activeProjectId,
+    load: loadWorkspaceSurface,
+    apply: applyWorkspaceSurface
+  });
+  if (!applied) return false;
   updateStatusLine(state.status);
   updateSettingsFields();
   const nextLastMessageId = latestVisibleMessageId();
@@ -3048,6 +3105,7 @@ async function refreshWorkspaceSurface({ scrollToBottom = false } = {}) {
     clearBottomScrollSettle();
     restoreChatScrollState(chatScrollState);
   }
+  return true;
 }
 
 async function previewArtifact(artifactId) {
@@ -3502,9 +3560,10 @@ function restoreChatScrollState(chatScrollState) {
 }
 
 async function sendMessage(text, targets, options = {}) {
-  return api("/api/room/messages", {
+  return api(scopedProjectPath("/api/room/messages"), {
     method: "POST",
     body: JSON.stringify({
+      projectId: state.activeProjectId,
       text,
       to: targets,
       inputArtifactIds: options.inputArtifactIds || undefined,
@@ -3704,7 +3763,7 @@ els.newProjectForm.addEventListener("submit", async (event) => {
       method: "POST",
       body: JSON.stringify({
         name: els.projectNameInput.value,
-        chatgptProjectUrl: els.projectUrlInput.value,
+        chatgptProjectUrl: restoreProjectConversationUrl(els.projectUrlInput.value),
         targetRepo: els.targetRepoInput.value
       })
     });
@@ -3736,7 +3795,7 @@ els.bindingForm.addEventListener("submit", async (event) => {
   const submitButton = event.submitter;
   if (submitButton) submitButton.disabled = true;
   const patch = {
-    chatgptProjectUrl: els.settingsProjectUrlInput.value,
+    chatgptProjectUrl: restoreProjectConversationUrl(els.settingsProjectUrlInput.value),
     targetRepo: els.settingsTargetRepoInput.value
   };
 
@@ -3868,7 +3927,10 @@ syncComposerSendControl();
 api("/api/config")
   .then((config) => {
     state.currentCodexThreadId = config.currentCodexThreadId || null;
-    return loadProjects({ autoEnter: true });
+    return loadProjects({
+      autoEnter: Boolean(PAGE_PROJECT_ID),
+      preferredProjectId: PAGE_PROJECT_ID
+    });
   })
   .catch((error) => {
     showProjects();

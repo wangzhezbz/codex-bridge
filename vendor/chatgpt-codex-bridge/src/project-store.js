@@ -3,6 +3,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { updateWorkspaceBinding } from "./conversation-store.js";
+import { normalizeChatGptPreferences } from "./preference-compat.js";
 
 const PROJECTS_FILE = "projects.json";
 
@@ -76,6 +77,14 @@ function projectNameFromInput(input = {}) {
 
 function normalizeProjectInput(input = {}, existing = null) {
   const updatedAt = nowIso();
+  const hasPreferenceInput =
+    Object.hasOwn(input, "modePreference") || Object.hasOwn(input, "modelPreference");
+  const preferences = normalizeChatGptPreferences({
+    modePreference:
+      Object.hasOwn(input, "modePreference") ? input.modePreference : existing?.modePreference,
+    modelPreference:
+      Object.hasOwn(input, "modelPreference") ? input.modelPreference : existing?.modelPreference
+  });
   return {
     id: existing?.id || input.id || projectIdFromDate(new Date(updatedAt)),
     name: projectNameFromInput(input) || existing?.name || "未命名项目",
@@ -87,6 +96,11 @@ function normalizeProjectInput(input = {}, existing = null) {
       conversationIdFromDate(new Date(updatedAt)),
     currentCodexThreadId:
       normalizeOptionalText(input.currentCodexThreadId) || existing?.currentCodexThreadId || null,
+    modePreference: preferences.modePreference,
+    modelPreference: preferences.modelPreference,
+    preferenceUpdatedAt: hasPreferenceInput
+      ? updatedAt
+      : existing?.preferenceUpdatedAt || null,
     createdAt: existing?.createdAt || updatedAt,
     updatedAt
   };
@@ -158,7 +172,9 @@ export async function bindCurrentSessionProject(storeRoot, input = {}, options =
     chatgptProjectUrl: project.chatgptProjectUrl,
     targetRepo: project.targetRepo,
     conversationId: project.conversationId,
-    currentCodexThreadId: project.currentCodexThreadId
+    currentCodexThreadId: project.currentCodexThreadId,
+    modePreference: project.modePreference,
+    modelPreference: project.modelPreference
   });
 
   return {
@@ -241,7 +257,9 @@ export async function deleteProject(storeRoot, projectId) {
           projectId: nextProject.id,
           chatgptProjectUrl: nextProject.chatgptProjectUrl,
           targetRepo: nextProject.targetRepo,
-          conversationId: nextProject.conversationId
+          conversationId: nextProject.conversationId,
+          modePreference: nextProject.modePreference,
+          modelPreference: nextProject.modelPreference
         }
       : {
           projectId: null,
@@ -290,7 +308,9 @@ export async function ensureProjectForWorkspace(storeRoot, workspace = {}, optio
       chatgptProjectUrl: workspace.chatgptProjectUrl,
       targetRepo: workspace.targetRepo,
       conversationId: workspace.conversationId,
-      currentCodexThreadId: currentCodexThreadId || existing?.currentCodexThreadId || null
+      currentCodexThreadId: currentCodexThreadId || existing?.currentCodexThreadId || null,
+      modePreference: workspace.modePreference,
+      modelPreference: workspace.modelPreference
     },
     existing
   );
@@ -324,7 +344,9 @@ export async function selectProject(storeRoot, projectId) {
     projectId: updatedProject.id,
     chatgptProjectUrl: updatedProject.chatgptProjectUrl,
     targetRepo: updatedProject.targetRepo,
-    conversationId: updatedProject.conversationId
+    conversationId: updatedProject.conversationId,
+    modePreference: updatedProject.modePreference,
+    modelPreference: updatedProject.modelPreference
   });
 
   return {

@@ -113,11 +113,13 @@ function inferOutlineLabel(text = "") {
 
 function buildSequentialCreativePlan(text = "") {
   const value = normalizeText(text);
-  const hasSequence = matchesAny(value, sequencePatterns);
   const hasOutline = /(?:大纲|提纲|前\s*[一二三四五六七八九十百\d]+\s*集|first\s+ten\s+episodes?|outline|设定|世界观|人物设定)/i.test(value);
-  const hasChapter = /(?:第一章|第\s*[一二三四五六七八九十百\d]+\s*章|chapter\s+one|正文|写.{0,8}章)/i.test(value);
+  const hasChapter = /(?:第一章|第\s*[一二三四五六七八九十百\d]+\s*章|第\s*[一二三四五六七八九十百\d]+\s*集.{0,8}(?:详细|正文|内容)|chapter\s+one|正文|写.{0,8}章)/i.test(value);
   const hasPoster = /(?:海报|封面|配图|生图|生成.{0,12}(?:图|图片|图像|海报|封面)|poster|cover\s+image)/i.test(value);
   const stageCount = [hasOutline, hasChapter, hasPoster].filter(Boolean).length;
+  const hasSequence =
+    matchesAny(value, sequencePatterns) ||
+    (stageCount >= 2 && /(?:还有|并且|同时|再|最后)/i.test(value));
 
   if (!hasSequence || stageCount < 2 || !(hasOutline && (hasChapter || hasPoster))) {
     return null;
@@ -292,7 +294,395 @@ function buildGptThenCodexPayload(text, workspace = {}) {
   ].join("\n");
 }
 
-export function decideRoomRoute(input = {}) {
+const SEMANTIC_ROUTER_POLICY_VERSION = "semantic-router-v1";
+const SEMANTIC_ROUTE_KINDS = new Set(["codex_only", "gpt_only", "gpt_then_codex"]);
+const SEMANTIC_STAGE_ACTORS = new Set(["codex", "gpt"]);
+const SEMANTIC_SYNC_KINDS = new Set(["chat_message", "image_request", "user_request"]);
+
+function normalizeSemanticStage(stage, index, priorIds) {
+  if (!stage || typeof stage !== "object" || Array.isArray(stage)) {
+    throw new TypeError(`routingProposal.stages[${index}] must be an object`);
+  }
+  const id = normalizeText(stage.id);
+  const title = normalizeText(stage.title);
+  const actor = normalizeText(stage.actor).toLowerCase();
+  const dependsOn = normalizeText(stage.dependsOn) || null;
+  if (!id || !/^[A-Za-z0-9._-]+$/.test(id)) {
+    throw new TypeError(`routingProposal.stages[${index}].id must use A-Z, a-z, 0-9, dot, underscore, or dash`);
+  }
+  if (priorIds.has(id)) {
+    throw new TypeError(`routingProposal stage id is duplicated: ${id}`);
+  }
+  if (!title) {
+    throw new TypeError(`routingProposal.stages[${index}].title is required`);
+  }
+  if (!SEMANTIC_STAGE_ACTORS.has(actor)) {
+    throw new TypeError(`routingProposal.stages[${index}].actor must be codex or gpt`);
+  }
+  if (dependsOn && !priorIds.has(dependsOn)) {
+    throw new TypeError(`routingProposal stage ${id} depends on an unknown or later stage: ${dependsOn}`);
+  }
+  priorIds.add(id);
+  return {
+    id,
+    title,
+    actor,
+    dependsOn,
+    payloadText: normalizeText(stage.payloadText),
+    instruction: normalizeText(stage.instruction) || null
+  };
+}
+
+function normalizeRoutingProposal(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("routingProposal must be an object");
+  }
+  const version = normalizeText(value.version);
+  const routeKind = normalizeText(value.routeKind);
+  const confidence = Number(value.confidence);
+  if (version !== "1") {
+    throw new TypeError("routingProposal.version must be 1");
+  }
+  if (!SEMANTIC_ROUTE_KINDS.has(routeKind)) {
+    throw new TypeError("routingProposal.routeKind must be codex_only, gpt_only, or gpt_then_codex");
+  }
+  if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+    throw new TypeError("routingProposal.confidence must be a number from 0 to 1");
+  }
+  if (value.stages != null && !Array.isArray(value.stages)) {
+    throw new TypeError("routingProposal.stages must be an array");
+  }
+  if (value.stages?.length > 20) {
+    throw new TypeError("routingProposal.stages cannot contain more than 20 stages");
+  }
+  const priorIds = new Set();
+  const stages = (value.stages || []).map((stage, index) =>
+    normalizeSemanticStage(stage, index, priorIds)
+  );
+  const actors = stages.map((stage) => stage.actor);
+  if (routeKind === "codex_only" && actors.includes("gpt")) {
+    throw new TypeError("codex_only routingProposal cannot contain GPT stages");
+  }
+  if (routeKind === "gpt_only" && actors.includes("codex")) {
+    throw new TypeError("gpt_only routingProposal cannot contain Codex stages");
+  }
+  if (
+    routeKind === "gpt_then_codex" &&
+    stages.length > 0 &&
+    (!actors.includes("gpt") || !actors.includes("codex"))
+  ) {
+    throw new TypeError(
+      "gpt_then_codex routingProposal stages must include both GPT and Codex executors"
+    );
+  }
+  const firstCodexIndex = actors.indexOf("codex");
+  if (firstCodexIndex >= 0 && actors.slice(firstCodexIndex + 1).includes("gpt")) {
+    throw new TypeError("routingProposal cannot return to GPT after a Codex stage");
+  }
+  const gptRequestKind = normalizeText(value.gptRequestKind) || null;
+  if (gptRequestKind && !SEMANTIC_SYNC_KINDS.has(gptRequestKind)) {
+    throw new TypeError(
+      "routingProposal.gptRequestKind must be chat_message, image_request, or user_request"
+    );
+  }
+  return {
+    version,
+    routeKind,
+    confidence,
+    reason: normalizeText(value.reason) || null,
+    workType: normalizeText(value.workType) || "semantic",
+    gptRequestKind,
+    stages
+  };
+}
+
+function explicitUserRouteOverride(text) {
+  const denyGpt = matchesAny(text, denyGptPatterns);
+  const explicitCodexOnly = matchesAny(text, explicitCodexOnlyPatterns);
+  const explicitGptRequest = matchesAny(text, explicitGptRequestPatterns);
+  if (denyGpt || (explicitCodexOnly && !explicitGptRequest)) {
+    return "codex_only";
+  }
+  if (explicitGptRequest) {
+    return "gpt_only";
+  }
+  return null;
+}
+
+function withSemanticDecision(route, metadata = {}) {
+  return {
+    ...route,
+    decisionSource: metadata.decisionSource,
+    policyVersion: SEMANTIC_ROUTER_POLICY_VERSION,
+    confidence: metadata.confidence,
+    needsClarification: metadata.needsClarification === true,
+    routingProposal: metadata.routingProposal || null
+  };
+}
+
+function buildSemanticCodexRoute({
+  text,
+  workspace,
+  reason,
+  decisionSource,
+  confidence,
+  needsClarification = false,
+  routingProposal = null
+}) {
+  return withSemanticDecision(
+    {
+      kind: "codex_only",
+      targets: ["codex"],
+      syncKind: null,
+      gptPayloadText: null,
+      codexPromptText: buildCodexPromptText(text, workspace),
+      reason,
+      policy: buildRoutePolicy({
+        kind: "codex_only",
+        work: routingProposal?.workType || "semantic",
+        workspace,
+        reason
+      })
+    },
+    {
+      decisionSource,
+      confidence,
+      needsClarification,
+      routingProposal
+    }
+  );
+}
+
+function semanticSequentialPlan(proposal, text) {
+  const stages = proposal.stages.filter((stage) => stage.actor === "gpt");
+  if (stages.length === 0) {
+    return null;
+  }
+  return {
+    id: "semantic_model_plan",
+    summary: "Codex supplied a structured semantic routing plan. Bridge will submit one GPT stage at a time.",
+    currentStageIndex: 0,
+    stages: stages.map((stage, index) => ({
+      id: stage.id,
+      title: stage.title,
+      dependsOn: stage.dependsOn,
+      payloadText: index === 0 ? stage.payloadText || text : stage.payloadText,
+      instruction: stage.instruction
+    })),
+    nextActionText: stages[1]?.instruction || null
+  };
+}
+
+function proposalDelegatesImageGenerationToCodex(proposal) {
+  return proposal.stages.some((stage) => {
+    if (stage.actor !== "codex") {
+      return false;
+    }
+    const stageText = [stage.title, stage.payloadText, stage.instruction].filter(Boolean).join("\n");
+    return matchesAny(stripNegatedImageGenerationClauses(stageText), imageGenerationPatterns);
+  });
+}
+
+function explicitlyRejectsImageGeneration(text) {
+  const value = normalizeText(text);
+  const withoutNegatedImageClauses = stripNegatedImageGenerationClauses(value);
+  return (
+    withoutNegatedImageClauses !== value &&
+    !matchesAny(withoutNegatedImageClauses, imageGenerationPatterns)
+  );
+}
+
+function proposalWithoutRejectedImageStages(proposal, text) {
+  if (!explicitlyRejectsImageGeneration(text)) {
+    return proposal;
+  }
+
+  const stageById = new Map(proposal.stages.map((stage) => [stage.id, stage]));
+  const removedIds = new Set(
+    proposal.stages
+      .filter((stage) => {
+        const stageText = [stage.title, stage.payloadText, stage.instruction]
+          .filter(Boolean)
+          .join("\n");
+        return matchesAny(stripNegatedImageGenerationClauses(stageText), imageGenerationPatterns);
+      })
+      .map((stage) => stage.id)
+  );
+  if (removedIds.size === 0 && proposal.gptRequestKind !== "image_request") {
+    return proposal;
+  }
+
+  const retainedDependency = (dependsOn) => {
+    let candidate = dependsOn;
+    const visited = new Set();
+    while (candidate && removedIds.has(candidate) && !visited.has(candidate)) {
+      visited.add(candidate);
+      candidate = stageById.get(candidate)?.dependsOn || null;
+    }
+    return candidate || null;
+  };
+
+  return {
+    ...proposal,
+    gptRequestKind:
+      proposal.gptRequestKind === "image_request" ? "user_request" : proposal.gptRequestKind,
+    stages: proposal.stages
+      .filter((stage) => !removedIds.has(stage.id))
+      .map((stage) => ({
+        ...stage,
+        dependsOn: retainedDependency(stage.dependsOn)
+      }))
+  };
+}
+
+function proposalForExistingResultRevision(proposal) {
+  if (proposal.workType !== "existing_result_revision") {
+    return proposal;
+  }
+  if (proposal.routeKind === "codex_only") {
+    return {
+      ...proposal,
+      stages: []
+    };
+  }
+  return {
+    ...proposal,
+    routeKind: "gpt_only",
+    gptRequestKind: "user_request",
+    stages: []
+  };
+}
+
+function routeFromSemanticProposal({ text, workspace, proposal }) {
+  if (proposal.routeKind === "codex_only") {
+    return buildSemanticCodexRoute({
+      text,
+      workspace,
+      reason: proposal.reason || "Codex classified this request as local execution work.",
+      decisionSource: "semantic_proposal",
+      confidence: proposal.confidence,
+      routingProposal: proposal
+    });
+  }
+
+  const sequentialPlan = semanticSequentialPlan(proposal, text);
+  const firstStagePayload = sequentialPlan?.stages[0]?.payloadText || text;
+  const kind = proposal.routeKind;
+  const reason =
+    proposal.reason ||
+    (kind === "gpt_then_codex"
+      ? "Codex classified this request as GPT work followed by local Codex execution."
+      : "Codex classified this request as GPT-suitable work.");
+  const syncKind =
+    proposal.gptRequestKind || (kind === "gpt_then_codex" ? "user_request" : "chat_message");
+  const gptPayloadText =
+    kind === "gpt_then_codex"
+      ? buildGptThenCodexPayload(firstStagePayload, workspace)
+      : firstStagePayload;
+  if (sequentialPlan && kind === "gpt_then_codex") {
+    sequentialPlan.stages[0].payloadText = gptPayloadText;
+  }
+  const policy = buildRoutePolicy({
+    kind,
+    work: proposal.workType,
+    workspace,
+    reason
+  });
+  if (proposal.stages.length > 0) {
+    policy.stages = proposal.stages.map((stage) =>
+      buildPolicyStage(stage.actor, stage.title, stage.instruction || stage.payloadText || stage.title)
+    );
+  }
+  return withSemanticDecision(
+    {
+      kind,
+      targets: ["gpt"],
+      syncKind,
+      gptPayloadText,
+      codexPromptText: null,
+      reason,
+      ...(sequentialPlan ? { sequentialPlan } : {}),
+      policy
+    },
+    {
+      decisionSource: "semantic_proposal",
+      confidence: proposal.confidence,
+      routingProposal: proposal
+    }
+  );
+}
+
+function decideSemanticRoomRoute(input = {}) {
+  const text = normalizeText(input.text);
+  const workspace = input.workspace || {};
+  const proposal = proposalForExistingResultRevision(
+    proposalWithoutRejectedImageStages(
+      normalizeRoutingProposal(input.routingProposal),
+      text
+    )
+  );
+  const explicitOverride = explicitUserRouteOverride(text);
+
+  if (!hasBoundGpt(workspace)) {
+    return buildSemanticCodexRoute({
+      text,
+      workspace,
+      reason: "No GPT conversation is bound, so the request must stay in Codex.",
+      decisionSource: "scope_guard",
+      confidence: 1,
+      routingProposal: proposal
+    });
+  }
+  if (explicitOverride === "codex_only") {
+    return buildSemanticCodexRoute({
+      text,
+      workspace,
+      reason: "The user explicitly required Codex-only execution.",
+      decisionSource: "explicit_user_override",
+      confidence: 1,
+      routingProposal: proposal
+    });
+  }
+  if (explicitOverride === "gpt_only" && proposal.routeKind === "codex_only") {
+    return withSemanticDecision(decideLegacyRoomRoute(input), {
+      decisionSource: "explicit_user_override",
+      confidence: 1,
+      routingProposal: proposal
+    });
+  }
+
+  const configuredThreshold = Number(input.semanticRouterMinConfidence);
+  const minimumConfidence =
+    Number.isFinite(configuredThreshold) && configuredThreshold >= 0 && configuredThreshold <= 1
+      ? configuredThreshold
+      : 0.6;
+  if (proposal.confidence < minimumConfidence) {
+    return buildSemanticCodexRoute({
+      text,
+      workspace,
+      reason: "The semantic routing proposal is below the configured confidence threshold.",
+      decisionSource: "semantic_low_confidence",
+      confidence: proposal.confidence,
+      needsClarification: true,
+      routingProposal: proposal
+    });
+  }
+  const creativePlan = buildSequentialCreativePlan(text);
+  if (
+    creativePlan &&
+    proposal.routeKind === "gpt_then_codex" &&
+    proposalDelegatesImageGenerationToCodex(proposal)
+  ) {
+    return withSemanticDecision(decideLegacyRoomRoute(input), {
+      decisionSource: "semantic_capability_guard",
+      confidence: proposal.confidence,
+      routingProposal: proposal
+    });
+  }
+  return routeFromSemanticProposal({ text, workspace, proposal });
+}
+
+function decideLegacyRoomRoute(input = {}) {
   const text = normalizeText(input.text);
   const workspace = input.workspace || {};
   const attachmentCount = Number(input.attachmentCount || 0);
@@ -372,4 +762,18 @@ export function decideRoomRoute(input = {}) {
     reason,
     policy: buildRoutePolicy({ kind: "gpt_only", work, workspace, reason })
   };
+}
+
+export function decideRoomRoute(input = {}) {
+  if (!input.semanticRouterEnabled) {
+    return decideLegacyRoomRoute(input);
+  }
+  if (!input.routingProposal) {
+    return withSemanticDecision(decideLegacyRoomRoute(input), {
+      decisionSource: "legacy_rules_fallback",
+      confidence: null,
+      routingProposal: null
+    });
+  }
+  return decideSemanticRoomRoute(input);
 }

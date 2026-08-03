@@ -5835,6 +5835,23 @@ body.resizing-usage-column {
   line-height: 1.75;
 }
 
+.double-quota-extension-guide {
+  margin-top: 14px;
+  padding: 14px 16px;
+  border: 1px solid rgba(196, 138, 18, 0.36);
+  border-radius: 10px;
+  background: #fff8df;
+  color: #745000;
+}
+
+.double-quota-extension-guide strong {
+  display: block;
+}
+
+.double-quota-extension-guide .double-quota-steps {
+  color: inherit;
+}
+
 @media (max-width: 1120px) {
   .double-quota-metrics {
     grid-template-columns: 1fr;

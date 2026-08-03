@@ -12,5 +12,11 @@
   },
   "healthPath": "/health",
   "versionPath": "/version",
+  "security": {
+    "apiTokenHeader": "X-Bridge-Token",
+    "scopeHeader": "X-Bridge-Scope",
+    "scopeQueryParameter": "scope",
+    "scopeCreatePath": "/api/scopes"
+  },
   "extensionDir": "chrome-extension"
 }

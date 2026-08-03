@@ -33,17 +33,16 @@ function fixture() {
     path.join(vendorDir, "chrome-extension", "manifest.json"),
     JSON.stringify({
       manifest_version: 3,
-      name: "Codex GPT Bridge",
-      version: "0.1.1",
-      version_name: "0.1.1 - 20260712",
+      name: "Codex G某T Bridge",
+      version: "0.1.57",
+      version_name: "0.1.57 - 20260801",
       background: { service_worker: "background.js" },
-      content_scripts: [{ js: ["bridge-config.js", "bridge-auth.js", "content-script.js"] }],
+      content_scripts: [{ js: ["bridge-config.js", "content-script.js"] }],
     }),
     "utf8",
   );
   fs.writeFileSync(path.join(vendorDir, "chrome-extension", "background.js"), "// background\n", "utf8");
   fs.writeFileSync(path.join(vendorDir, "chrome-extension", "content-script.js"), "// content\n", "utf8");
-  fs.writeFileSync(path.join(vendorDir, "chrome-extension", "bridge-auth.js"), "// auth\n", "utf8");
   fs.writeFileSync(path.join(vendorDir, "chrome-extension", "bridge-config.js"), "// config\n", "utf8");
   fs.writeFileSync(
     path.join(vendorDir, "embedded-manifest.json"),
@@ -55,6 +54,7 @@ function fixture() {
       defaults: { host: "127.0.0.1", port: 4317 },
       healthPath: "/health",
       versionPath: "/version",
+      security: { apiTokenHeader: "X-Bridge-Token" },
       extensionDir: "chrome-extension",
     }),
     "utf8",
@@ -77,9 +77,38 @@ function compatibleVersion() {
     service: "chatgpt-codex-bridge",
     version: "0.1.0",
     protocolVersion: 1,
-    extensionProtocolVersion: "v20260712-preference-verify",
+    extensionProtocolVersion: "v20260801-adaptive-office-wait",
   };
 }
+
+function compatibleServiceResponse(url) {
+  if (url.endsWith("/health")) return compatibleHealth();
+  if (url.endsWith("/version")) return compatibleVersion();
+  if (url.endsWith("/api/diagnostics/status")) {
+    return { activeSyncJob: null, extension: {} };
+  }
+  return null;
+}
+
+test("bundled Embedded runtime exposes the v0.1.0 service and v0.1.57 extension contracts", () => {
+  const vendorDir = path.join(process.cwd(), "vendor", "chatgpt-codex-bridge");
+  const embedded = JSON.parse(
+    fs.readFileSync(path.join(vendorDir, "embedded-manifest.json"), "utf8"),
+  );
+  const extension = JSON.parse(
+    fs.readFileSync(path.join(vendorDir, "chrome-extension", "manifest.json"), "utf8"),
+  );
+
+  assert.equal(embedded.version, "0.1.0");
+  assert.equal(embedded.protocolVersion, 1);
+  assert.equal(embedded.security.apiTokenHeader, "X-Bridge-Token");
+  assert.equal(extension.name, "Codex G某T Bridge");
+  assert.equal(extension.version, "0.1.57");
+  assert.deepEqual(extension.content_scripts[0].js, ["bridge-config.js", "content-script.js"]);
+  assert.equal(fs.existsSync(path.join(vendorDir, "chrome-extension", "bridge-auth.js")), false);
+  assert.equal(fs.existsSync(path.join(vendorDir, "public", "bridge-api-client.js")), true);
+  assert.equal(fs.existsSync(path.join(vendorDir, "public", "visible-branding.js")), true);
+});
 
 test("double quota service exposes the embedded manifest and default stopped state", async () => {
   const dirs = fixture();
@@ -97,8 +126,8 @@ test("double quota service exposes the embedded manifest and default stopped sta
   assert.equal(state.url, "http://127.0.0.1:4317/");
   assert.equal(state.version, "0.1.0");
   assert.equal(state.protocolVersion, 1);
-  assert.equal(state.extensionManifestVersion, "0.1.1");
-  assert.equal(state.extensionDisplayVersion, "0.1.1 - 20260712");
+  assert.equal(state.extensionManifestVersion, "0.1.57");
+  assert.equal(state.extensionDisplayVersion, "0.1.57 - 20260801");
   assert.equal(state.ownedProcess, false);
 });
 
@@ -143,8 +172,8 @@ test("embedded Chrome extension exposes a user-visible build version", () => {
     fs.readFileSync(path.join(process.cwd(), "vendor", "chatgpt-codex-bridge", "chrome-extension", "manifest.json"), "utf8"),
   );
 
-  assert.equal(extensionManifest.version, "0.1.1");
-  assert.match(extensionManifest.version_name, /20260712/);
+  assert.equal(extensionManifest.version, "0.1.57");
+  assert.match(extensionManifest.version_name, /20260801/);
 });
 
 test("double quota state reads the service version and extension protocol independently from health", async () => {
@@ -171,21 +200,23 @@ test("double quota state reads the service version and extension protocol indepe
     "http://127.0.0.1:4317/api/diagnostics/status",
   ]);
   assert.equal(
-    requested[2].options.headers["X-CodexBridge-Token"],
-    savedConfig.authToken,
+    requested[2].options.headers["X-Bridge-Token"],
+    savedConfig.apiToken,
   );
   assert.equal(state.serviceVersion, "0.1.0");
-  assert.equal(state.extensionProtocolVersion, "v20260712-preference-verify");
+  assert.equal(state.extensionProtocolVersion, "v20260801-adaptive-office-wait");
   assert.equal(state.versionCompatible, true);
 });
 
-test("double quota extension management exposes install, update, repair, and current states", async () => {
+test("double quota extension management does not call an installed extension broken while the service is stopped", async () => {
   const scenarios = [
-    { extension: { diskVerified: false, version: "", expectedVersion: "v2", connected: false, needsReload: false, registeredStable: false }, action: "install", label: "安装扩展" },
-    { extension: { diskVerified: true, version: "v1", expectedVersion: "v2", connected: true, needsReload: true, registeredStable: true }, action: "update", label: "更新扩展" },
-    { extension: { diskVerified: true, version: "v2", expectedVersion: "v2", connected: false, needsReload: false, registeredStable: true }, action: "repair", label: "修复扩展" },
-    { extension: { diskVerified: true, version: "v2", expectedVersion: "v2", connected: true, needsReload: false, registeredStable: true }, action: "current", label: "扩展已是最新" },
-    { extension: { diskVerified: true, version: "", expectedVersion: "v2", connected: false, needsReload: false, registeredStable: false }, action: "load", label: "在 Chrome 中安装" },
+    { extension: { runtimeObservable: false, diskVerified: false, registeredStable: false }, action: "install", label: "开始安装" },
+    { extension: { runtimeObservable: false, diskStatus: "outdated", diskVerified: false, registeredStable: true }, action: "update", label: "更新扩展" },
+    { extension: { runtimeObservable: true, diskVerified: true, version: "v1", expectedVersion: "v2", connected: true, needsReload: true, registeredStable: true }, action: "update", label: "更新扩展" },
+    { extension: { runtimeObservable: true, diskVerified: true, version: "v2", expectedVersion: "v2", connected: false, needsReload: false, registeredStable: true }, action: "repair", label: "重新加载扩展" },
+    { extension: { runtimeObservable: true, diskVerified: true, version: "v2", expectedVersion: "v2", connected: true, needsReload: false, registeredStable: true }, action: "current", label: "扩展已是最新" },
+    { extension: { runtimeObservable: false, diskVerified: true, registeredStable: false }, action: "load", label: "继续安装" },
+    { extension: { runtimeObservable: false, diskVerified: true, registeredStable: true }, action: "installed", label: "扩展已安装" },
   ];
 
   for (const scenario of scenarios) {
@@ -206,6 +237,59 @@ test("double quota port validation rejects privileged and invalid ports", async 
   assert.equal(state.url, "http://127.0.0.1:54317/");
 });
 
+test("double quota health requires the explicit ready payload", async () => {
+  const dirs = fixture();
+  const service = createChatgptBridgeService({
+    ...dirs,
+    requestJson: async (url) => url.endsWith("/health")
+      ? { ...compatibleHealth(), ok: false }
+      : compatibleVersion(),
+  });
+
+  const state = await service.getState();
+
+  assert.equal(state.running, false);
+  assert.equal(state.status, "stopped");
+});
+
+test("saving a new port keeps an owned service running until an explicit restart", async () => {
+  const dirs = fixture();
+  let serviceAlive = false;
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = (signal) => {
+    serviceAlive = false;
+    queueMicrotask(() => child.emit("exit", 0, signal));
+    return true;
+  };
+  const service = createChatgptBridgeService({
+    ...dirs,
+    requestJson: async (url) => {
+      if (!serviceAlive || !url.includes(":4317/")) return null;
+      if (url.endsWith("/health")) return compatibleHealth();
+      if (url.endsWith("/version")) return compatibleVersion();
+      return { activeSyncJob: null, extension: {} };
+    },
+    spawnImpl() {
+      serviceAlive = true;
+      return child;
+    },
+    delay: async () => {},
+  });
+  await service.start();
+
+  const state = await service.savePort(54317);
+
+  assert.equal(state.status, "running");
+  assert.equal(state.port, 54317);
+  assert.equal(state.activePort, 4317);
+  assert.equal(state.url, "http://127.0.0.1:4317/");
+  assert.equal(state.restartRequired, true);
+  assert.equal(serviceAlive, true);
+  await service.stop();
+});
+
 test("double quota prepares a stable extension with the configured origin", async () => {
   const dirs = fixture();
   const service = createChatgptBridgeService({ ...dirs, requestJson: async () => null });
@@ -216,7 +300,7 @@ test("double quota prepares a stable extension with the configured origin", asyn
   assert.equal(state.extensionReady, true);
   assert.match(state.extensionDir, /extensions[\\/]chatgpt-codex-bridge$/);
   assert.equal(fs.existsSync(path.join(state.extensionDir, "manifest.json")), true);
-  for (const fileName of ["manifest.json", "background.js", "content-script.js", "bridge-auth.js", "bridge-config.js"]) {
+  for (const fileName of ["manifest.json", "background.js", "content-script.js", "bridge-config.js"]) {
     assert.equal(fs.existsSync(path.join(state.extensionDir, fileName)), true, fileName);
   }
   assert.match(
@@ -225,7 +309,7 @@ test("double quota prepares a stable extension with the configured origin", asyn
   );
 });
 
-test("double quota persists one auth token and deploys it only through extension config", async () => {
+test("double quota persists one API token and deploys it only through extension config", async () => {
   const dirs = fixture();
   const first = createChatgptBridgeService({ ...dirs, requestJson: async () => null });
 
@@ -240,16 +324,16 @@ test("double quota persists one auth token and deploys it only through extension
     "utf8",
   );
 
-  assert.match(savedConfig.authToken, /^[a-f0-9]{64}$/);
-  assert.match(extensionConfig, new RegExp(`authToken: ${JSON.stringify(savedConfig.authToken)}`));
-  assert.equal(Object.hasOwn(firstState, "authToken"), false);
+  assert.match(savedConfig.apiToken, /^[a-f0-9]{64}$/);
+  assert.match(extensionConfig, new RegExp(`apiToken: ${JSON.stringify(savedConfig.apiToken)}`));
+  assert.equal(Object.hasOwn(firstState, "apiToken"), false);
 
   const second = createChatgptBridgeService({ ...dirs, requestJson: async () => null });
   await second.prepareExtension();
   const restoredConfig = JSON.parse(
     fs.readFileSync(configPath, "utf8"),
   );
-  assert.equal(restoredConfig.authToken, savedConfig.authToken);
+  assert.equal(restoredConfig.apiToken, savedConfig.apiToken);
 });
 
 test("extension deployment does not depend on recursive cpSync and completes in a Chinese user data path", async () => {
@@ -269,7 +353,7 @@ test("extension deployment does not depend on recursive cpSync and completes in 
   try {
     const state = await service.prepareExtension();
     assert.equal(state.extensionReady, true);
-    for (const fileName of ["manifest.json", "background.js", "content-script.js", "bridge-auth.js", "bridge-config.js"]) {
+    for (const fileName of ["manifest.json", "background.js", "content-script.js", "bridge-config.js"]) {
       assert.equal(fs.existsSync(path.join(state.extensionDir, fileName)), true, fileName);
     }
   } finally {
@@ -335,13 +419,13 @@ test("double quota treats Chrome preference paths as registration evidence witho
     path.join(loadedDir, "manifest.json"),
     JSON.stringify({
       manifest_version: 3,
-      name: "Codex GPT Bridge",
+      name: "Codex G某T Bridge",
       background: { service_worker: "background.js" },
-      content_scripts: [{ js: ["bridge-config.js", "bridge-auth.js", "content-script.js"] }],
+      content_scripts: [{ js: ["bridge-config.js", "content-script.js"] }],
     }),
     "utf8",
   );
-  for (const fileName of ["background.js", "content-script.js", "bridge-auth.js", "bridge-config.js"]) {
+  for (const fileName of ["background.js", "content-script.js", "bridge-config.js"]) {
     fs.writeFileSync(path.join(loadedDir, fileName), "OLD-CHROME-COPY\n", "utf8");
   }
   fs.writeFileSync(
@@ -382,13 +466,13 @@ test("double quota also reads unpacked extension paths stored in a direct Chrome
     path.join(loadedDir, "manifest.json"),
     JSON.stringify({
       manifest_version: 3,
-      name: "Codex GPT Bridge",
+      name: "Codex G某T Bridge",
       background: { service_worker: "background.js" },
-      content_scripts: [{ js: ["bridge-config.js", "bridge-auth.js", "content-script.js"] }],
+      content_scripts: [{ js: ["bridge-config.js", "content-script.js"] }],
     }),
     "utf8",
   );
-  for (const fileName of ["background.js", "content-script.js", "bridge-auth.js", "bridge-config.js"]) {
+  for (const fileName of ["background.js", "content-script.js", "bridge-config.js"]) {
     fs.writeFileSync(path.join(loadedDir, fileName), "OLD-PREFERENCES-COPY\n", "utf8");
   }
   fs.writeFileSync(
@@ -473,7 +557,7 @@ test("double quota does not mistake the service extension source directory for C
   const state = await service.prepareExtension();
 
   assert.deepEqual(state.extensionRegisteredDirs, []);
-  assert.equal(state.extensionAction.id, "update");
+  assert.equal(state.extensionAction.id, "load");
   assert.deepEqual(state.extensionUpdateDirs, [state.extensionDir]);
   assert.equal(fs.readFileSync(path.join(loadedDir, "background.js"), "utf8"), "OLD-DIAGNOSTICS-COPY\n");
   assert.equal(state.extensionManagerRevision, "verified-stable-dir-v2");
@@ -485,7 +569,7 @@ test("double quota does not mistake the service extension source directory for C
   assert.match(state.extensionDeployment.updatedAt, /^\d{4}-\d{2}-\d{2}T/);
 });
 
-test("double quota update returns immediately after verified deployment instead of polling Chrome", async () => {
+test("double quota deployment returns immediately instead of polling Chrome", async () => {
   const dirs = fixture();
   const profileDir = path.join(dirs.chromeUserDataDir, "Default");
   const loadedDir = path.join(dirs.root, "reloadable-chrome-extension");
@@ -513,7 +597,7 @@ test("double quota update returns immediately after verified deployment instead 
 
   const state = await service.manageExtension();
 
-  assert.equal(state.extensionAction.id, "update");
+  assert.equal(state.extensionAction.id, "load");
   assert.equal(state.extensionUpdate.status, "files_ready");
   assert.equal(state.extensionUpdate.manualReloadRequired, true);
   assert.equal(state.extensionUpdate.diskVerified, true);
@@ -547,8 +631,44 @@ test("disk installation, Chrome registration, and runtime connection are reporte
 
   assert.equal(state.extensionDisk.status, "current");
   assert.equal(state.extensionBrowser.status, "not_registered");
-  assert.equal(state.extensionRuntime.status, "not_connected");
+  assert.equal(state.extensionRuntime.status, "service_offline");
+  assert.equal(state.extensionInstallation.status, "awaiting_browser");
+  assert.equal(state.extensionInstallation.installed, false);
   assert.equal(state.extensionAction.id, "load");
+});
+
+test("a Chrome-registered extension remains installed while the service is stopped", async () => {
+  const dirs = fixture();
+  const service = createChatgptBridgeService({ ...dirs, requestJson: async () => null });
+  const prepared = await service.prepareExtension();
+  const profileDir = path.join(dirs.chromeUserDataDir, "Default");
+  fs.mkdirSync(profileDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(profileDir, "Preferences"),
+    JSON.stringify({
+      extensions: {
+        settings: {
+          abcdefghijklmnopabcdefghijklmnop: {
+            location: 4,
+            path: prepared.extensionDir,
+            state: 1,
+          },
+        },
+      },
+    }),
+    "utf8",
+  );
+
+  const state = await service.getState();
+
+  assert.equal(state.running, false);
+  assert.equal(state.extensionBrowser.registeredStable, true);
+  assert.equal(state.extensionRuntime.status, "service_offline");
+  assert.equal(state.extensionRuntime.observable, false);
+  assert.equal(state.extensionInstallation.status, "installed");
+  assert.equal(state.extensionInstallation.installed, true);
+  assert.equal(state.extensionAction.id, "installed");
+  assert.equal(state.extensionAction.complete, true);
 });
 
 test("MCP repair preserves unrelated Codex configuration and is idempotent", async () => {
@@ -582,7 +702,7 @@ test("MCP repair preserves unrelated Codex configuration and is idempotent", asy
   assert.match(first, /\[mcp_servers\.github\][\s\S]*command = "github-mcp"/);
   assert.match(first, /\[projects\.'C:\\\\work'\][\s\S]*trust_level = "trusted"/);
   assert.match(first, /\[mcp_servers\.chatgpt_codex_bridge\][\s\S]*C:\/Apps\/CodexBridge\.exe/);
-  assert.match(first, /BRIDGE_ROUTER_V2 = "0"/);
+  assert.match(first, /BRIDGE_ROUTER_V2 = "1"/);
   assert.equal((first.match(/\[mcp_servers\.chatgpt_codex_bridge\]/g) || []).length, 1);
 });
 
@@ -591,7 +711,7 @@ test("service attaches to a compatible external process and never kills it", asy
   let spawnCalls = 0;
   const service = createChatgptBridgeService({
     ...dirs,
-    requestJson: async () => compatibleHealth(),
+    requestJson: async (url) => compatibleServiceResponse(url),
     spawnImpl() {
       spawnCalls += 1;
       throw new Error("must not spawn");
@@ -606,6 +726,158 @@ test("service attaches to a compatible external process and never kills it", asy
   assert.equal(started.ownedProcess, false);
   assert.equal(stopped.status, "attached");
   assert.equal(stopped.externalProcess, true);
+});
+
+test("maintenance and restart refuse to interrupt an active Bridge task", async () => {
+  const dirs = fixture();
+  let serviceAlive = false;
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.killSignals = [];
+  child.kill = (signal) => {
+    child.killSignals.push(signal);
+    return true;
+  };
+  const service = createChatgptBridgeService({
+    ...dirs,
+    requestJson: async (url) => {
+      if (!serviceAlive) return null;
+      if (url.endsWith("/api/diagnostics/status")) {
+        return {
+          activeSyncJob: { id: "sync_active", status: "running" },
+          status: { state: "running", reason: "G某T 正在处理" },
+          extension: {},
+        };
+      }
+      return compatibleServiceResponse(url);
+    },
+    spawnImpl() {
+      serviceAlive = true;
+      return child;
+    },
+    delay: async () => {},
+  });
+  await service.start();
+
+  await assert.rejects(() => service.assertMaintenanceSafe("更新"), /正在运行.*稍后/i);
+  await assert.rejects(() => service.restart(), /正在运行.*稍后/i);
+  assert.deepEqual(child.killSignals, []);
+});
+
+test("explicit restart replaces only the owned Bridge child", async () => {
+  const dirs = fixture();
+  let activeChild = null;
+  let spawnCalls = 0;
+  const children = [];
+  const service = createChatgptBridgeService({
+    ...dirs,
+    requestJson: async (url) => activeChild
+      ? compatibleServiceResponse(url)
+      : null,
+    spawnImpl() {
+      spawnCalls += 1;
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.killSignals = [];
+      child.kill = (signal) => {
+        child.killSignals.push(signal);
+        activeChild = null;
+        queueMicrotask(() => child.emit("exit", 0, signal));
+        return true;
+      };
+      children.push(child);
+      activeChild = child;
+      return child;
+    },
+    delay: async () => {},
+  });
+  await service.start();
+
+  const restarted = await service.restart();
+
+  assert.equal(restarted.status, "running");
+  assert.equal(spawnCalls, 2);
+  assert.deepEqual(children[0].killSignals, ["SIGTERM"]);
+  assert.deepEqual(children[1].killSignals, []);
+  await service.stop();
+});
+
+test("owned Bridge stop reports when graceful exit requires a forced fallback", async () => {
+  const dirs = fixture();
+  let serviceAlive = false;
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.killSignals = [];
+  child.kill = (signal) => {
+    child.killSignals.push(signal);
+    if (signal === "SIGKILL") serviceAlive = false;
+    return true;
+  };
+  const service = createChatgptBridgeService({
+    ...dirs,
+    stopTimeoutMs: 5,
+    requestJson: async (url) => serviceAlive
+      ? compatibleServiceResponse(url)
+      : null,
+    spawnImpl() {
+      serviceAlive = true;
+      return child;
+    },
+    delay: async () => {},
+  });
+  await service.start();
+
+  const stopped = await service.stop();
+
+  assert.equal(stopped.status, "stopped");
+  assert.equal(stopped.forcedStop, true);
+  assert.match(stopped.message, /未能正常退出.*强制停止/);
+  assert.deepEqual(child.killSignals, ["SIGTERM", "SIGKILL"]);
+});
+
+test("synchronous child launch failures restore a retryable non-owned error state", async () => {
+  const dirs = fixture();
+  const service = createChatgptBridgeService({
+    ...dirs,
+    requestJson: async () => null,
+    spawnImpl() {
+      throw new Error("spawn denied");
+    },
+  });
+
+  await assert.rejects(() => service.start(), /spawn denied/);
+  const state = await service.getState();
+
+  assert.equal(state.status, "error");
+  assert.equal(state.ownedProcess, false);
+});
+
+test("failed stop signals keep the owned child retryable instead of sticking in stopping", async () => {
+  const dirs = fixture();
+  let serviceAlive = false;
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = () => false;
+  const service = createChatgptBridgeService({
+    ...dirs,
+    requestJson: async (url) => serviceAlive ? compatibleServiceResponse(url) : null,
+    spawnImpl() {
+      serviceAlive = true;
+      return child;
+    },
+    delay: async () => {},
+  });
+  await service.start();
+
+  await assert.rejects(() => service.stop(), /退出信号发送失败/);
+  const state = await service.getState();
+
+  assert.equal(state.status, "running");
+  assert.equal(state.ownedProcess, true);
 });
 
 test("service starts and gracefully stops only its owned Electron-as-Node child", async () => {
@@ -627,12 +899,12 @@ test("service starts and gracefully stops only its owned Electron-as-Node child"
   const service = createChatgptBridgeService({
     ...dirs,
     execPath: "C:\\Apps\\CodexBridge.exe",
-    requestJson: async () => {
+    requestJson: async (url) => {
       healthCalls += 1;
       if (healthCalls >= 2 && child.killSignals.length === 0) {
         serviceAlive = true;
       }
-      return serviceAlive ? compatibleHealth() : null;
+      return serviceAlive ? compatibleServiceResponse(url) : null;
     },
     spawnImpl(command, args, options) {
       spawnArgs = { command, args, options };
@@ -653,8 +925,8 @@ test("service starts and gracefully stops only its owned Electron-as-Node child"
   const savedConfig = JSON.parse(
     fs.readFileSync(path.join(dirs.dataRootDir, "config", "double-quota.json"), "utf8"),
   );
-  assert.equal(spawnArgs.options.env.BRIDGE_AUTH_TOKEN, savedConfig.authToken);
-  assert.equal(spawnArgs.options.env.BRIDGE_ROUTER_V2, "0");
+  assert.equal(spawnArgs.options.env.BRIDGE_API_TOKEN, savedConfig.apiToken);
+  assert.equal(spawnArgs.options.env.BRIDGE_ROUTER_V2, "1");
   assert.equal(spawnArgs.options.windowsHide, true);
   assert.deepEqual(child.killSignals, ["SIGTERM"]);
   assert.equal(stopped.status, "stopped");
@@ -674,10 +946,10 @@ test("service start is not blocked when the optional Chrome extension refresh fa
   let spawnCalls = 0;
   const service = createChatgptBridgeService({
     ...dirs,
-    requestJson: async () => {
+    requestJson: async (url) => {
       healthCalls += 1;
       if (healthCalls >= 2) serviceAlive = true;
-      return serviceAlive ? compatibleHealth() : null;
+      return serviceAlive ? compatibleServiceResponse(url) : null;
     },
     spawnImpl() {
       spawnCalls += 1;

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Bridge</title>
     <link rel="icon" href="data:,">
-    <link rel="stylesheet" href="/styles.css?v=20260707-gpt-copy">
+    <link rel="stylesheet" href="/styles.css?v=20260729-safe-send-lifecycle">
   </head>
   <body class="project-mode">
     <div class="app-shell">
@@ -79,15 +79,15 @@
         <section id="projectView" class="project-view" aria-label="绑定当前会话">
           <div class="project-hero">
             <p class="kicker">当前 Codex 会话</p>
-            <h1>先有 Codex 会话，再绑定右侧 GPT</h1>
-            <p>在当前 Codex 会话里打开这个页面后，绑定它自己的 GPT 会话和本地项目目录。后续消息、文件和上下文只归这个会话使用。</p>
+            <h1>先有 Codex 会话，再绑定右侧 G某T</h1>
+            <p>在当前 Codex 会话里打开这个页面后，绑定它自己的 G某T 会话和本地项目目录。后续消息、文件和上下文只归这个会话使用。</p>
           </div>
 
           <section id="onboardingGuide" class="onboarding-guide" aria-label="首次使用检查">
             <div class="onboarding-copy">
               <p class="kicker">首次使用</p>
               <h2>先确认三件事</h2>
-              <p>页面能打开说明本地服务已启动；绑定当前会话后点自检，确认扩展、GPT 会话和规则都在同一条链路上。</p>
+              <p>页面能打开说明本地服务已启动；绑定当前会话后点自检，确认扩展、G某T 会话和规则都在同一条链路上。</p>
             </div>
             <ol class="onboarding-steps">
               <li><span>1</span><strong>打开本页</strong></li>
@@ -104,8 +104,8 @@
               <input id="projectNameInput" name="name" autocomplete="off" placeholder="例如：游戏登录页">
             </label>
             <label>
-              GPT 会话
-              <input id="projectUrlInput" name="chatgptProjectUrl" autocomplete="off" placeholder="https://chatgpt.com/c/...">
+              G某T 会话
+              <input id="projectUrlInput" name="chatgptProjectUrl" type="text" autocomplete="off" spellcheck="false" placeholder="粘贴目标会话地址">
             </label>
             <label>
               本地项目目录
@@ -169,14 +169,14 @@
           <form id="chatForm" class="composer">
             <div id="composerBox" class="composer-box">
               <div id="attachmentTray" class="attachment-tray" hidden></div>
-              <textarea id="chatInput" name="text" placeholder="给 GPT 发消息"></textarea>
+              <textarea id="chatInput" name="text" placeholder="给 G某T 发消息"></textarea>
               <div class="composer-footer">
                 <label class="attach-button" title="添加本机文件" aria-label="添加本机文件">
                   <span aria-hidden="true">+</span>
                   <input id="composerFileInput" type="file" multiple>
                 </label>
                 <div class="composer-footer-right">
-                  <select id="modeSelect" class="preference-select mode-select" aria-label="GPT 模式">
+                  <select id="modeSelect" class="preference-select mode-select" aria-label="G某T 模式">
                     <option value="default">默认</option>
                     <option value="fast">极速 5.5</option>
                     <option value="balanced" selected>中</option>
@@ -184,7 +184,7 @@
                     <option value="high">极高</option>
                     <option value="pro">Pro</option>
                   </select>
-                  <select id="modelSelect" class="preference-select model-select" aria-label="GPT 模型">
+                  <select id="modelSelect" class="preference-select model-select" aria-label="G某T 模型">
                     <option value="gpt-5.6-sol">5.6 Sol</option>
                     <option value="gpt-5.5">5.5</option>
                     <option value="gpt-5.4">5.4</option>
@@ -210,8 +210,8 @@
         </form>
         <form id="bindingForm" class="settings-form">
           <label>
-            GPT 会话
-            <input id="settingsProjectUrlInput" name="chatgptProjectUrl" autocomplete="off">
+            G某T 会话
+            <input id="settingsProjectUrlInput" name="chatgptProjectUrl" type="text" autocomplete="off" spellcheck="false">
           </label>
           <label>
             本地项目目录
@@ -269,11 +269,11 @@
             <button type="submit" class="icon-button" aria-label="关闭">×</button>
           </div>
         </form>
-        <img id="imagePreview" alt="GPT 输出图片预览">
+        <img id="imagePreview" alt="G某T 输出图片预览">
       </dialog>
 
       <p id="toast" class="toast" role="status"></p>
     </div>
-    <script type="module" src="/app.js?v=20260712-project-binding"></script>
+    <script type="module" src="/app.js?v=20260731-refresh-recovery"></script>
   </body>
 </html>
