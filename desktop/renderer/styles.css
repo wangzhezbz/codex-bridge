@@ -3447,6 +3447,35 @@ h3 {
   background: #f8fafb;
 }
 
+.model-api-inline {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: end;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.model-api-inline label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.model-api-inline span {
+  margin: 0;
+  color: #526776;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.model-api-inline select,
+.model-api-inline button {
+  min-height: 34px;
+}
+
 .image-provider-inline span {
   color: #526776;
   font-size: 12px;

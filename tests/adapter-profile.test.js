@@ -175,6 +175,63 @@ test("codex_openai responses routes default to stored server-side state", () => 
   assert.deepEqual(filtered.include, ["reasoning.encrypted_content"]);
 });
 
+test("codex_openai drops unpersisted reasoning references when store is false", () => {
+  const filtered = filterPayloadForAdapter(
+    {
+      model: "gpt-5.6-terra",
+      store: false,
+      input: [
+        { role: "user", content: [{ type: "input_text", text: "before" }] },
+        {
+          id: "rs_foreign_reasoning",
+          type: "reasoning",
+          summary: [{ type: "summary_text", text: "foreign reasoning" }],
+        },
+        { role: "user", content: [{ type: "input_text", text: "continue" }] },
+      ],
+    },
+    {
+      id: "cb-gpt-5-6-terra",
+      provider: "codex",
+      api: "responses",
+      model: "gpt-5.6-terra",
+      authMode: "codex_openai",
+    },
+  );
+
+  assert.equal(filtered.store, false);
+  assert.deepEqual(filtered.input, [
+    { role: "user", content: [{ type: "input_text", text: "before" }] },
+    { role: "user", content: [{ type: "input_text", text: "continue" }] },
+  ]);
+});
+
+test("codex_openai strips foreign reasoning content from stored item references", () => {
+  const filtered = filterPayloadForAdapter(
+    {
+      model: "gpt-5.6-terra",
+      store: true,
+      input: [
+        {
+          id: "rs_foreign_reasoning",
+          type: "reasoning",
+          content: [{ type: "reasoning_text", text: "provider-private format" }],
+          summary: [{ type: "summary_text", text: "foreign summary" }],
+        },
+      ],
+    },
+    {
+      id: "cb-gpt-5-6-terra",
+      provider: "codex",
+      api: "responses",
+      model: "gpt-5.6-terra",
+      authMode: "codex_openai",
+    },
+  );
+
+  assert.deepEqual(filtered.input, [{ id: "rs_foreign_reasoning", type: "reasoning" }]);
+});
+
 test("adapter profiles classify DeepSeek chat routes", () => {
   const profile = normalizeAdapterProfile({
     id: "gpt-5.4-mini",

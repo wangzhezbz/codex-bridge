@@ -500,7 +500,7 @@ test("desktop renderer exposes editable provider settings and connection tests",
   assert.match(rendererSource, /data-provider-name/);
   assert.match(rendererSource, /data-provider-short-name/);
   assert.match(rendererSource, /data-provider-base-url/);
-  assert.match(rendererSource, /data-provider-api/);
+  assert.doesNotMatch(rendererSource, /data-provider-api/);
   assert.match(rendererSource, /data-provider-key-url/);
   assert.match(rendererSource, /data-provider-docs-url/);
   assert.match(rendererSource, /data-provider-logo-upload/);
@@ -521,6 +521,26 @@ test("desktop renderer exposes editable provider settings and connection tests",
   assert.match(mainSource, /ipcMain\.handle\("providers:reset"/);
   assert.match(mainSource, /ipcMain\.handle\("providers:testConnection"/);
   assert.match(mainSource, /ipcMain\.handle\("logos:select"/);
+});
+
+test("desktop renderer exposes API editing on every model instead of the provider", () => {
+  assert.match(rendererSource, /编辑模型/);
+  assert.match(rendererSource, /data-model-api=/);
+  assert.match(rendererSource, /data-model-api-save=/);
+  assert.match(rendererSource, /saveInlineModelApi/);
+});
+
+test("inline model API and context saves preserve the model's other manual overrides", () => {
+  const contextStart = rendererSource.indexOf("function saveInlineModelContext");
+  const apiStart = rendererSource.indexOf("function saveInlineModelApi");
+  const summaryStart = rendererSource.indexOf("function modelCapabilitySummary");
+  const contextHandler = rendererSource.slice(contextStart, apiStart);
+  const apiHandler = rendererSource.slice(apiStart, summaryStart);
+
+  assert.notEqual(contextStart, -1);
+  assert.notEqual(apiStart, -1);
+  assert.match(contextHandler, /\.\.\.model\.capabilityOverrides/);
+  assert.match(apiHandler, /\.\.\.model\.capabilityOverrides/);
 });
 
 test("desktop renderer gates remote provider actions behind API keys", () => {
@@ -564,6 +584,29 @@ test("desktop renderer uses real provider logos with a visible default fallback"
   assert.equal(existsSync(resolve(__dirname, "../desktop/renderer/assets/providers/default.svg")), true);
   assert.doesNotMatch(kimiLogoSource, /fill="#fff"/i);
   assert.match(defaultLogoSource, />AI</);
+});
+
+test("Claude, Gemini, and Grok render their own bundled brand logos", () => {
+  const logoStart = rendererSource.indexOf("function providerLogo(");
+  const logoEnd = rendererSource.indexOf("function renderModelPool(", logoStart);
+  const sandbox = { escapeHtml: (value) => String(value) };
+  runInNewContext(
+    `${rendererSource.slice(logoStart, logoEnd)}\n` +
+      "globalThis.providerLogoForTest = providerLogo;",
+    sandbox,
+  );
+
+  const cases = [
+    [{ id: "anthropic", shortName: "Claude" }, "claude.svg"],
+    [{ id: "gemini", shortName: "Gemini" }, "gemini.svg"],
+    [{ id: "xai", shortName: "Grok" }, "grok.ico"],
+  ];
+  for (const [provider, filename] of cases) {
+    const markup = sandbox.providerLogoForTest(provider);
+    assert.match(markup, new RegExp(`assets/providers/${filename}`));
+    assert.doesNotMatch(markup, /assets\/providers\/default\.svg/);
+    assert.equal(existsSync(resolve(__dirname, "../desktop/renderer/assets/providers", filename)), true);
+  }
 });
 
 test("desktop renderer enlarges the default AI provider logo", () => {
@@ -617,7 +660,7 @@ test("desktop renderer exposes direct per-model context editing", () => {
     rendererSource.indexOf("function saveInlineModelContext"),
     rendererSource.indexOf("function modelCapabilitySummary"),
   );
-  assert.match(inlineContextSave, /capabilities:\s*{\s*contextWindow,\s*}/s);
+  assert.match(inlineContextSave, /capabilities:\s*{\s*\.\.\.model\.capabilityOverrides,\s*contextWindow,\s*}/s);
   assert.doesNotMatch(inlineContextSave, /inputModalities/);
   assert.doesNotMatch(inlineContextSave, /reasoning/);
   assert.match(cssSource, /\.provider-model-controls\s*{\s*display: grid/s);

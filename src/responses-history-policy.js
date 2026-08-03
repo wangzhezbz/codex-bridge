@@ -9,6 +9,11 @@ export function shouldInlineLocalHistoryForResponses(requestBody, history, route
   }
   const meta = history.getResponseMeta(previousResponseId);
   if (meta) {
+    const sourceRouteId = String(meta.routeSnapshot?.id || meta.routeId || "").trim();
+    const targetRouteId = String(route.id || "").trim();
+    if (sourceRouteId && targetRouteId && sourceRouteId !== targetRouteId) {
+      return true;
+    }
     return meta.upstreamKnown === false;
   }
   const localHistory = history.get?.(previousResponseId);

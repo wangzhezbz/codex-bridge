@@ -438,6 +438,26 @@ function applyCodexOpenAiResponsesContract(payload, profile) {
     include.push("reasoning.encrypted_content");
   }
   payload.include = include;
+  sanitizeCodexOpenAiReasoningInput(payload);
+}
+
+function sanitizeCodexOpenAiReasoningInput(payload) {
+  if (!Array.isArray(payload.input)) {
+    return;
+  }
+  payload.input = payload.input.flatMap((item) => {
+    if (!item || typeof item !== "object" || item.type !== "reasoning") {
+      return [item];
+    }
+    if (typeof item.encrypted_content === "string" && item.encrypted_content) {
+      return [item];
+    }
+    if (payload.store === false) {
+      return [];
+    }
+    const id = String(item.id || "").trim();
+    return id ? [{ id, type: "reasoning" }] : [];
+  });
 }
 
 export function reasoningParamsForAdapter(request = {}, route = {}, options = {}) {

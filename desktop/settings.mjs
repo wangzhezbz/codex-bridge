@@ -10820,9 +10820,12 @@ function applyProviderOverride(provider, override) {
   if (!override) {
     return { ...provider };
   }
+  const effectiveOverride = provider.custom
+    ? override
+    : Object.fromEntries(Object.entries(override).filter(([key]) => key !== "api"));
   return {
     ...provider,
-    ...override,
+    ...effectiveOverride,
     id: provider.id,
     custom: Boolean(provider.custom),
   };
@@ -10915,7 +10918,7 @@ function providerDirectoryModelApi(provider = {}, entry = {}, remoteModel = {}, 
       return "responses";
     }
   }
-  return provider.api || exact?.api || fallback?.api || "chat_completions";
+  return exact?.api || provider.api || fallback?.api || "chat_completions";
 }
 
 function providerDirectoryModelDisplayName(provider = {}, remoteModel = {}, upstreamModel = "") {
@@ -17981,6 +17984,9 @@ function applyModelCapabilityOverride(model, overrides) {
   if (override.updatedAt) {
     next.capabilityOverrideUpdatedAt = override.updatedAt;
   }
+  if (["responses", "chat_completions", "anthropic_messages"].includes(override.api)) {
+    next.api = override.api;
+  }
   if (Array.isArray(override.inputModalities)) {
     next.inputModalities = override.inputModalities;
   }
@@ -18489,6 +18495,9 @@ function normalizeModelCapabilityOverride(value, { keepUpdatedAt = false } = {})
     return null;
   }
   const result = {};
+  if (["responses", "chat_completions", "anthropic_messages"].includes(value.api)) {
+    result.api = value.api;
+  }
   const inputModalities = normalizeCapabilityInputModalities(value);
   if (inputModalities) {
     result.inputModalities = inputModalities;

@@ -13246,7 +13246,7 @@ test("synced OpenAI models omit GPT from display names while retaining gpt upstr
   );
 });
 
-test("provider overrides update provider catalog and generated routes", () => {
+test("provider overrides cannot replace built-in per-model API contracts", () => {
   const rootDir = makeTempProject();
   const saved = saveProviderOverride(rootDir, "deepseek", {
     name: "DeepSeek Proxy",
@@ -13256,10 +13256,12 @@ test("provider overrides update provider catalog and generated routes", () => {
     keyUrl: "https://proxy.example.com/key",
     docsUrl: "https://proxy.example.com/docs",
   });
-  saveSelection(rootDir, ["deepseek-v4-pro"], MODE_HYBRID);
+  saveSelection(rootDir, ["deepseek-v4-pro", "deepseek-v4-flash"], MODE_HYBRID);
 
   const provider = providerCatalog(rootDir).find((item) => item.id === "deepseek");
-  const model = modelCatalog(rootDir).find((item) => item.presetId === "deepseek-v4-pro");
+  const models = modelCatalog(rootDir).filter((item) => item.providerId === "deepseek");
+  const pro = models.find((item) => item.presetId === "deepseek-v4-pro");
+  const flash = models.find((item) => item.presetId === "deepseek-v4-flash");
   const config = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
 
   assert.equal(saved.baseUrl, "https://proxy.example.com/v1");
@@ -13267,11 +13269,14 @@ test("provider overrides update provider catalog and generated routes", () => {
   assert.equal(provider.name, "DeepSeek Proxy");
   assert.equal(provider.shortName, "DS Proxy");
   assert.equal(provider.baseUrl, "https://proxy.example.com/v1");
-  assert.equal(provider.api, "responses");
-  assert.equal(model.baseUrl, "https://proxy.example.com/v1");
-  assert.equal(model.api, "responses");
+  assert.equal(provider.api, undefined);
+  assert.equal(pro.baseUrl, "https://proxy.example.com/v1");
+  assert.equal(flash.baseUrl, "https://proxy.example.com/v1");
+  assert.equal(pro.api, "chat_completions");
+  assert.equal(flash.api, "responses");
   assert.equal(config.models[0].baseUrl, "https://proxy.example.com/v1");
-  assert.equal(config.models[0].api, "responses");
+  assert.equal(config.models[0].api, "chat_completions");
+  assert.equal(config.models[1].api, "responses");
 });
 
 test("provider logos are copied into the local data directory", () => {
@@ -13737,6 +13742,7 @@ test("manual capability overrides apply to one route without changing route-spec
   saveSelection(rootDir, ["deepseek-v4-pro", "kimi-k2-7-code"]);
 
   const saved = saveModelCapabilityOverride(rootDir, "deepseek-v4-pro", {
+    api: "responses",
     inputModalities: ["text", "image", "file", "audio"],
     contextWindow: 123456,
     reasoning: { mode: "unknown", note: "manual verification pending" },
@@ -13746,14 +13752,17 @@ test("manual capability overrides apply to one route without changing route-spec
   const config = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
 
   assert.deepEqual(saved.inputModalities, ["text", "image", "file", "audio"]);
+  assert.equal(saved.api, "responses");
   assert.equal(saved.contextWindow, 123456);
   assert.equal(saved.reasoning.mode, "unknown");
   assert.deepEqual(overrides["deepseek-v4-pro"].inputModalities, ["text", "image", "file", "audio"]);
   assert.equal(deepseek.capabilityOverrideSource, "manual");
+  assert.equal(deepseek.api, "responses");
   assert.deepEqual(deepseek.inputModalities, ["text", "image", "file", "audio"]);
   assert.equal(deepseek.contextWindow, 123456);
   assert.deepEqual(config.models[0].inputModalities, ["text", "image", "file", "audio"]);
   assert.equal(config.models[0].contextWindow, 123456);
+  assert.equal(config.models[0].api, "responses");
   assert.equal(config.models[0].capabilityOverrides.reasoning.mode, "unknown");
   assert.deepEqual(config.models[0].dropParams, ["response_format", "parallel_tool_calls"]);
   assert.equal(config.models[1].sourcePresetId, "kimi-k2-7-code");

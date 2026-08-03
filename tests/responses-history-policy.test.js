@@ -133,3 +133,35 @@ test("stateless Responses routes inline provider-owned history", async () => {
     true,
   );
 });
+
+test("Responses routes inline history owned by a different route", async () => {
+  const { shouldInlineLocalHistoryForResponses } = await import(
+    "../src/responses-history-policy.js"
+  );
+  const history = new ResponseHistory();
+  history.recordTurn({
+    responseId: "resp_deepseek_before_terra",
+    messages: [
+      { role: "user", content: "first question" },
+      { role: "assistant", content: "DeepSeek answer" },
+    ],
+    response: { id: "resp_deepseek_before_terra", object: "response", output: [] },
+    meta: {
+      upstreamKnown: true,
+      routeId: "cb-deepseek-v4-flash",
+    },
+  });
+
+  assert.equal(
+    shouldInlineLocalHistoryForResponses(
+      { previous_response_id: "resp_deepseek_before_terra" },
+      history,
+      {
+        id: "cb-gpt-5-6-terra",
+        api: "responses",
+        supportsResponsePreviousId: true,
+      },
+    ),
+    true,
+  );
+});

@@ -1,6 +1,7 @@
 const CONFIG_PACKAGE_SCHEMA = "codexbridge.config-package";
 const CONFIG_PACKAGE_VERSION = 1;
 const VALID_MODES = new Set(["hybrid", "all_api"]);
+const VALID_MODEL_APIS = new Set(["responses", "chat_completions", "anthropic_messages"]);
 const MAX_INPUT_BYTES = 16 * 1024 * 1024;
 const MAX_ISSUES = 100;
 const MAX_ARRAY_ITEMS = 2_000;
@@ -965,8 +966,11 @@ function validateModelCapabilities(value, path, context) {
   } else {
     result.overrides = validateDynamicMap(value.overrides, `${path}.overrides`, context, (override, overridePath) => {
       if (!expectPlainObject(override, overridePath, context)) return {};
-      assertAllowedKeys(override, new Set(["inputModalities", "contextWindow", "reasoning", "updatedAt"]), overridePath, context);
+      assertAllowedKeys(override, new Set(["api", "inputModalities", "contextWindow", "reasoning", "updatedAt"]), overridePath, context);
       const normalized = {};
+      if (Object.hasOwn(override, "api")) {
+        normalized.api = normalizeEnum(override.api, VALID_MODEL_APIS, `${overridePath}.api`, context);
+      }
       if (Object.hasOwn(override, "inputModalities")) {
         normalized.inputModalities = validateModalities(override.inputModalities, `${overridePath}.inputModalities`, context);
       }

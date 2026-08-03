@@ -136,6 +136,7 @@ function validPackage(overrides = {}) {
       imageInput: { "deepseek-v4-pro": true },
       overrides: {
         "deepseek-v4-pro": {
+          api: "responses",
           inputModalities: ["text", "image"],
           contextWindow: 128000,
           reasoning: { mode: "supported", note: "portable" },
@@ -212,6 +213,7 @@ test("the current exporter produces a package accepted by the strict validator",
     providerId: "demo-image",
   });
   saveModelCapabilityOverride(rootDir, "deepseek-v4-pro", {
+    api: "responses",
     inputModalities: ["text", "image"],
     contextWindow: 100_000,
     reasoning: { mode: "supported" },
@@ -228,6 +230,7 @@ test("the current exporter produces a package accepted by the strict validator",
 
   assert.equal(result.ok, true, JSON.stringify(result.issues));
   assert.deepEqual(result.candidate.selection.selectedModelIds, exported.selection.selectedModelIds);
+  assert.equal(result.candidate.modelCapabilities.overrides["deepseek-v4-pro"].api, "responses");
   assert.equal(result.candidate.includesSecrets, false);
 });
 
@@ -314,6 +317,23 @@ test("each importable section is validated before a candidate is released", () =
     assert.equal(result.candidate, null, `${section} must not expose a partial candidate`);
     assert.equal(result.issues.some((issue) => issue.section === section), true, `${section} issue missing`);
   }
+});
+
+test("model capability imports reject unsupported per-model API contracts", () => {
+  const result = validateConfigPackageImport(validPackage({
+    modelCapabilities: {
+      imageInput: {},
+      overrides: {
+        "deepseek-v4-pro": { api: "legacy_completions" },
+      },
+    },
+  }));
+
+  assert.equal(result.ok, false);
+  assert.equal(
+    result.issues.some((issue) => issue.code === "invalid_enum" && issue.path.endsWith(".api")),
+    true,
+  );
 });
 
 test("secret-bearing nested fields are rejected without reflecting secret values", () => {

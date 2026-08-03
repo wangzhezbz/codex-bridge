@@ -119,6 +119,91 @@ test("stateless native Responses routes replace previous_response_id with local 
   }
 });
 
+test("cross-route Responses history reaches codex_openai without foreign reasoning ids", async () => {
+  const originalFetch = globalThis.fetch;
+  const seenBodies = [];
+  globalThis.fetch = async (_url, init) => {
+    seenBodies.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({
+      id: "resp_terra_after_deepseek",
+      object: "response",
+      status: "completed",
+      model: "gpt-5.6-terra",
+      output: [],
+      output_text: "terra answer",
+      error: null,
+      incomplete_details: null,
+      usage: null,
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  try {
+    const history = new ResponseHistory();
+    history.recordTurn({
+      responseId: "resp_deepseek_before_terra",
+      messages: [
+        { role: "user", content: "first question" },
+        { role: "assistant", content: "DeepSeek answer" },
+      ],
+      response: {
+        id: "resp_deepseek_before_terra",
+        object: "response",
+        status: "completed",
+        output: [],
+      },
+      meta: {
+        upstreamKnown: true,
+        routeId: "cb-deepseek-v4-flash",
+      },
+    });
+
+    const res = collectResponse();
+    await proxyResponsesApi(
+      {
+        model: "gpt-5.6-terra",
+        previous_response_id: "resp_deepseek_before_terra",
+        input: [
+          {
+            id: "rs_foreign_deepseek_reasoning",
+            type: "reasoning",
+            content: [{ type: "reasoning_text", text: "foreign reasoning" }],
+          },
+          { role: "user", content: "now answer with Terra" },
+        ],
+      },
+      {
+        id: "cb-gpt-5-6-terra",
+        provider: "codex",
+        api: "responses",
+        baseUrl: "https://api.openai.com/v1",
+        model: "gpt-5.6-terra",
+        authMode: "codex_openai",
+        supportsResponsePreviousId: true,
+      },
+      history,
+      res,
+      {
+        clientAuth: {
+          kind: "codex_openai",
+          bearerToken: "codex-openai-token",
+        },
+      },
+    );
+
+    assert.equal(seenBodies.length, 1);
+    assert.equal(seenBodies[0].previous_response_id, undefined);
+    assert.equal(JSON.stringify(seenBodies[0]).includes("rs_foreign_deepseek_reasoning"), false);
+    assert.match(JSON.stringify(seenBodies[0].input), /first question/);
+    assert.match(JSON.stringify(seenBodies[0].input), /DeepSeek answer/);
+    assert.match(JSON.stringify(seenBodies[0].input), /now answer with Terra/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("callJsonUpstream rejects an upstream response body above the configured byte limit", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () =>

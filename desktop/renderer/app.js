@@ -2449,7 +2449,7 @@ function providerSaveRepairToast(sync = {}) {
   const result = sync?.repair || sync;
   const issues = Array.isArray(result?.beforeStatus?.issues) ? result.beforeStatus.issues : [];
   if (!issues.length && !sync?.needsRepair) {
-    return "供应商设置已保存，相关模型会使用新的 Base URL 和接口类型。";
+    return "供应商设置已保存，相关模型会使用新的 Base URL 和公共配置。";
   }
   return `供应商设置已保存，并已修复 ${formatNumber(Math.max(issues.length, 1))} 项失效模型引用。`;
 }
@@ -6410,7 +6410,6 @@ function renderProviderEditor() {
     return;
   }
   const models = (state.modelPresets || []).filter((model) => model.providerId === provider.id);
-  const apiValue = providerApiValue(provider, models);
   const keyEnv = providerSecretKey(provider);
   const saved = keyEnv ? Boolean(state.secretStatus?.[keyEnv]) : true;
   const status = keyEnv ? (saved ? "已保存" : "未保存") : "无需 Key";
@@ -6471,13 +6470,6 @@ function renderProviderEditor() {
         <label class="wide-field">
           <span>Base URL</span>
           <input data-provider-base-url value="${escapeHtml(provider.baseUrl || "")}" placeholder="https://api.example.com/v1" />
-        </label>
-        <label>
-          <span>接口类型</span>
-          <select data-provider-api>
-            <option value="chat_completions" ${apiValue === "chat_completions" ? "selected" : ""}>Chat Completions</option>
-            <option value="responses" ${apiValue === "responses" ? "selected" : ""}>Responses</option>
-          </select>
         </label>
         <label>
           <span>获取 Key 链接</span>
@@ -6647,7 +6639,6 @@ function providerSettingsPayload(card) {
     name: settings?.querySelector("[data-provider-name]")?.value.trim() || provider?.name || "",
     shortName: settings?.querySelector("[data-provider-short-name]")?.value.trim() || provider?.shortName || "",
     baseUrl: settings?.querySelector("[data-provider-base-url]")?.value.trim() || "",
-    api: settings?.querySelector("[data-provider-api]")?.value || providerApiValue(provider),
     keyUrl: settings?.querySelector("[data-provider-key-url]")?.value.trim() || "",
     docsUrl: settings?.querySelector("[data-provider-docs-url]")?.value.trim() || "",
     keyEnv: settings?.dataset.providerKeyEnv || provider?.keyEnv || "",
@@ -6981,6 +6972,9 @@ function providerLogoKey(provider = {}) {
   if (text === "__custom__" || text.includes("custom")) return "custom";
   if (text.includes("codex") || text === "gpt") return "codex";
   if (text.includes("openai")) return "openai";
+  if (text.includes("anthropic") || text.includes("claude")) return "claude";
+  if (text.includes("xai") || text.includes("grok")) return "grok";
+  if (text.includes("gemini") || text.includes("google")) return "gemini";
   if (text.includes("deepseek")) return "deepseek";
   if (text.includes("kimi") || text.includes("moonshot")) return "kimi";
   if (text.includes("xiaomi") || text.includes("mimo")) return "mimo";
@@ -6999,6 +6993,9 @@ function providerLogoKey(provider = {}) {
 const PROVIDER_LOGO_FILES = {
   codex: "openai.svg",
   openai: "openai.svg",
+  claude: "claude.svg",
+  grok: "grok.ico",
+  gemini: "gemini.svg",
   deepseek: "deepseek.svg",
   kimi: "kimi.svg",
   mimo: "mimo.svg",
@@ -7173,6 +7170,12 @@ function bindModelConfigControls(target) {
       saveInlineModelContext(button);
     });
   });
+  target.querySelectorAll("[data-model-api-save]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      saveInlineModelApi(button);
+    });
+  });
   target.querySelectorAll("[data-edit-custom]").forEach((button) => {
     button.addEventListener("click", () => openCustomEditor(button.dataset.editCustom));
   });
@@ -7277,14 +7280,31 @@ function modelExtraSettingsControl(model) {
   return `
     <details class="model-extra-settings">
       <summary>
-        <span>高级设置</span>
-        <small>生图代理、能力恢复</small>
+        <span>编辑模型</span>
+        <small>接口类型、生图代理、能力恢复</small>
       </summary>
       <div class="model-extra-settings-body">
+        ${inlineModelApiControl(model)}
         ${imageProviderSelectControl(model)}
         ${modelCapabilityResetControl(model)}
       </div>
     </details>
+  `;
+}
+
+function inlineModelApiControl(model) {
+  return `
+    <div class="model-api-inline" data-model-api-editor="${escapeHtml(model.presetId)}">
+      <label>
+        <span>接口类型</span>
+        <select data-model-api="${escapeHtml(model.presetId)}">
+          <option value="chat_completions" ${model.api === "chat_completions" ? "selected" : ""}>Chat Completions</option>
+          <option value="responses" ${model.api === "responses" ? "selected" : ""}>Responses</option>
+          <option value="anthropic_messages" ${model.api === "anthropic_messages" ? "selected" : ""}>Anthropic Messages</option>
+        </select>
+      </label>
+      <button class="ghost-button light small" type="button" data-model-api-save="${escapeHtml(model.presetId)}">保存接口</button>
+    </div>
   `;
 }
 
@@ -7617,6 +7637,7 @@ function saveInlineModelContext(button) {
     const response = await api.saveModelCapabilities({
       presetId,
       capabilities: {
+        ...model.capabilityOverrides,
         contextWindow,
       },
     });
@@ -7624,6 +7645,29 @@ function saveInlineModelContext(button) {
     draftSelection = [...state.selectedModelIds];
     render();
     showToast("这个模型的上下文大小已保存。");
+  });
+}
+
+function saveInlineModelApi(button) {
+  return runAction(button, async () => {
+    const container = button.closest("[data-model-api-editor]");
+    const presetId = container?.dataset.modelApiEditor || button.dataset.modelApiSave;
+    const model = modelMap().get(presetId);
+    const apiType = container?.querySelector("[data-model-api]")?.value || "";
+    if (!model || !["responses", "chat_completions", "anthropic_messages"].includes(apiType)) {
+      throw new Error("请选择有效的模型接口类型。");
+    }
+    const response = await api.saveModelCapabilities({
+      presetId,
+      capabilities: {
+        ...model.capabilityOverrides,
+        api: apiType,
+      },
+    });
+    state = response?.state || await api.getState();
+    draftSelection = [...state.selectedModelIds];
+    render();
+    showToast("这个模型的接口类型已保存。");
   });
 }
 
