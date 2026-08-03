@@ -130,6 +130,40 @@ export class ResponseHistory {
     this.applyPruneResult(pruneResult);
   }
 
+  async recordTurnAsync(turn = {}) {
+    if (!this.storage?.recordTurnAsync) {
+      return this.recordTurn(turn);
+    }
+    const responseId = String(turn.responseId || turn.response?.id || "").trim();
+    if (!responseId) {
+      return;
+    }
+    this.deletePendingPersistentEntry(responseId);
+    if (this.storageError) {
+      throw this.storageUnavailableError();
+    }
+    let pruneResult;
+    try {
+      pruneResult = await this.storage.recordTurnAsync(turn);
+    } catch (error) {
+      throw this.handleStorageWriteError(error);
+    }
+    const messages = Array.isArray(turn.messages) ? turn.messages : [];
+    const response = turn.response || null;
+    const meta = turn.meta || {};
+    this.setEntry(
+      responseId,
+      messages,
+      Number(pruneResult?.recordBytes?.messages),
+    );
+    if (response) {
+      this.responses.set(responseId, response);
+    }
+    this.responseMeta.set(responseId, meta);
+    this.trim();
+    this.applyPruneResult(pruneResult);
+  }
+
   lookup(responseId) {
     if (!responseId) {
       return unavailableResult("missing", "memory");
@@ -237,9 +271,11 @@ export class ResponseHistory {
     }
   }
 
-  setEntry(responseId, messages) {
+  setEntry(responseId, messages, knownSize = NaN) {
     const previousSize = this.entrySizes.get(responseId) || 0;
-    const nextSize = byteSize(messages);
+    const nextSize = Number.isFinite(knownSize) && knownSize >= 0
+      ? knownSize
+      : byteSize(messages);
     this.entries.set(responseId, messages);
     this.entrySizes.set(responseId, nextSize);
     this.totalEntryBytes += nextSize - previousSize;

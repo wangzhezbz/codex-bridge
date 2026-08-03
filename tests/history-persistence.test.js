@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -266,6 +267,117 @@ test("persistent history round trips a complete record larger than one megabyte"
   } finally {
     first?.close?.();
     second?.close?.();
+    cleanupHistoryFixture(fixture);
+  }
+});
+
+test("async persistent history commits a complete turn before resolving", async () => {
+  const fixture = historyFixture();
+  let first;
+  let second;
+  try {
+    first = new ResponseHistory({ historyPath: fixture.historyPath });
+    await first.recordTurnAsync(historyTurn("resp_async_commit", [
+      { role: "user", content: "persist this before resolving" },
+      { role: "assistant", content: "persisted" },
+    ]));
+    first.close();
+    first = null;
+
+    second = new ResponseHistory({ historyPath: fixture.historyPath });
+    const reopened = second.lookup("resp_async_commit");
+    assert.equal(reopened.state, "available");
+    assert.deepEqual(reopened.messages, [
+      { role: "user", content: "persist this before resolving" },
+      { role: "assistant", content: "persisted" },
+    ]);
+  } finally {
+    first?.close?.();
+    second?.close?.();
+    cleanupHistoryFixture(fixture);
+  }
+});
+
+test("async persistent history preserves the injected retention clock", async () => {
+  const fixture = historyFixture();
+  let now = 1_000;
+  let history;
+  try {
+    history = new ResponseHistory({
+      historyPath: fixture.historyPath,
+      now: () => now,
+      ttlMs: 100,
+    });
+    await history.recordTurnAsync(historyTurn("resp_async_clock", [
+      { role: "user", content: "expire on the injected clock" },
+    ]));
+    now = 1_101;
+    assert.equal(history.lookup("resp_async_clock").state, "expired");
+  } finally {
+    history?.close?.();
+    cleanupHistoryFixture(fixture);
+  }
+});
+
+test("async persistent history hands a large write off without blocking the caller", async () => {
+  const fixture = historyFixture();
+  const largeText = `worker-handoff:${"0123456789abcdef".repeat(3_000_000)}:complete`;
+  const turn = historyTurn("resp_async_large", [
+    { role: "user", content: largeText },
+    { role: "assistant", content: "large async record saved" },
+  ]);
+  let first;
+  let second;
+  try {
+    first = new ResponseHistory({ historyPath: fixture.historyPath });
+    const startedAt = performance.now();
+    const pendingWrite = first.recordTurnAsync(turn);
+    const handoffMs = performance.now() - startedAt;
+    assert.ok(
+      handoffMs < 150,
+      `large history handoff blocked the caller for ${handoffMs.toFixed(1)}ms`,
+    );
+    await pendingWrite;
+    first.close();
+    first = null;
+
+    second = new ResponseHistory({ historyPath: fixture.historyPath });
+    assert.equal(second.lookup("resp_async_large").messages[0].content, largeText);
+  } finally {
+    first?.close?.();
+    second?.close?.();
+    cleanupHistoryFixture(fixture);
+  }
+});
+
+test("async persistent history rejects writes after an unexpected clean worker exit", async () => {
+  const fixture = historyFixture();
+  let history;
+  try {
+    history = new ResponseHistory({ historyPath: fixture.historyPath });
+    await history.recordTurnAsync(historyTurn("resp_worker_started", [
+      { role: "user", content: "start the history worker" },
+    ]));
+    const writer = history.storage.writer;
+    const workerExit = once(writer.worker, "exit");
+    writer.worker.postMessage({ type: "close" });
+    await workerExit;
+    assert.equal(writer.closed, true);
+
+    await assert.rejects(
+      Promise.race([
+        history.recordTurnAsync(historyTurn("resp_after_clean_exit", [
+          { role: "user", content: "do not hang" },
+        ])),
+        new Promise((_, reject) => setTimeout(
+          () => reject(new Error("history write hung after worker exit")),
+          250,
+        )),
+      ]),
+      /history writer is closed/i,
+    );
+  } finally {
+    history?.close?.();
     cleanupHistoryFixture(fixture);
   }
 });
@@ -741,6 +853,44 @@ test("chat routing records messages response and safe route metadata in one turn
   assert.equal(injectedCloseCalls, 0);
 });
 
+test("chat routing uses the async atomic history writer when it is available", async () => {
+  const turns = [];
+  const history = {
+    get() {
+      return [];
+    },
+    getResponseMeta() {
+      return null;
+    },
+    recordTurn() {
+      throw new Error("synchronous history writer must not run");
+    },
+    async recordTurnAsync(turn) {
+      turns.push(turn);
+    },
+  };
+  const upstream = http.createServer(async (_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(chatCompletion("chatcmpl_async_turn", "async answer")));
+  });
+  let router;
+  try {
+    await listen(upstream);
+    router = createRouterServer(chatRouterConfig(serverUrl(upstream)), { history });
+    await listen(router);
+    const result = await postResponses(router, {
+      model: "cb-deepseek-history",
+      input: "record this through the async writer",
+    });
+    assert.equal(result.status, 200, JSON.stringify(result.body));
+    assert.equal(turns.length, 1);
+    assert.equal(turns[0].responseId, result.body.id);
+  } finally {
+    await closeIfListening(router);
+    await closeIfListening(upstream);
+  }
+});
+
 test("image generation records its completed response in one atomic turn", async () => {
   const turns = [];
   let legacyWrites = 0;
@@ -754,7 +904,10 @@ test("image generation records its completed response in one atomic turn", async
     recordResponse() {
       legacyWrites += 1;
     },
-    recordTurn(turn) {
+    recordTurn() {
+      throw new Error("synchronous image history writer must not run");
+    },
+    async recordTurnAsync(turn) {
       turns.push(turn);
     },
   };

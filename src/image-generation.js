@@ -98,7 +98,14 @@ export async function proxyImageGenerationFallback(
     parentResponseId: requestBody.previous_response_id || null,
     routeSnapshot: imageHistoryRouteSnapshot(route),
   };
-  if (typeof history?.recordTurn === "function") {
+  if (typeof history?.recordTurnAsync === "function") {
+    await history.recordTurnAsync({
+      responseId: response.id,
+      messages,
+      response,
+      meta,
+    });
+  } else if (typeof history?.recordTurn === "function") {
     history.recordTurn({
       responseId: response.id,
       messages,

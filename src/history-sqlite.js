@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
 import { DatabaseSync } from "node:sqlite";
+import { Worker } from "node:worker_threads";
 
 const SCHEMA_VERSION = 1;
 const DEFAULT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -112,6 +113,7 @@ export class HistorySqliteStore {
       options.journalSizeLimitBytes,
       DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
     );
+    this.writer = null;
     fs.mkdirSync(path.dirname(this.path), { recursive: true });
     this.db = new DatabaseSync(this.path, { timeout: 5000 });
     try {
@@ -166,7 +168,7 @@ export class HistorySqliteStore {
     }
   }
 
-  recordTurn(turn = {}) {
+  recordTurn(turn = {}, nowOverride = NaN) {
     const responseId = String(turn.responseId || turn.response?.id || "").trim();
     if (!responseId) {
       return;
@@ -183,7 +185,9 @@ export class HistorySqliteStore {
       );
     }
     const storedBytes = messages.buffer.length + response.buffer.length + meta.buffer.length;
-    const now = Number(this.now());
+    const now = Number.isFinite(nowOverride)
+      ? Number(nowOverride)
+      : Number(this.now());
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.db.prepare(`
@@ -223,11 +227,42 @@ export class HistorySqliteStore {
         tombstonesDeleted:
           pruneResult.tombstonesDeleted + Number(tombstoneDelete.changes || 0),
       });
-      return pruneResult;
+      return {
+        ...pruneResult,
+        recordBytes: {
+          messages: messages.uncompressedBytes,
+          response: response.uncompressedBytes,
+          meta: meta.uncompressedBytes,
+        },
+      };
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  recordTurnAsync(turn = {}) {
+    if (!this.db) {
+      return Promise.reject(historyStorageError(
+        "history_storage_closed",
+        "Response history database is not open.",
+      ));
+    }
+    if (!this.writer) {
+      this.writer = new HistorySqliteWriter(this.path, {
+        ttlMs: this.ttlMs,
+        maxRecordBytes: this.maxRecordBytes,
+        maxBytes: this.maxBytes,
+        protectRecentMs: this.protectRecentMs,
+        tombstoneTtlMs: this.tombstoneTtlMs,
+        maxTombstones: this.maxTombstones,
+        maxTombstoneBytes: this.maxTombstoneBytes,
+        incrementalVacuumPages: this.incrementalVacuumPages,
+        walAutocheckpointPages: this.walAutocheckpointPages,
+        journalSizeLimitBytes: this.journalSizeLimitBytes,
+      });
+    }
+    return this.writer.recordTurn(turn, Number(this.now()));
   }
 
   lookup(responseId) {
@@ -405,6 +440,8 @@ export class HistorySqliteStore {
   }
 
   close() {
+    this.writer?.close();
+    this.writer = null;
     if (!this.db) {
       return;
     }
@@ -536,6 +573,114 @@ export class HistorySqliteStore {
         created_at = excluded.created_at
     `).run(responseId, reason, now);
   }
+}
+
+class HistorySqliteWriter {
+  constructor(historyPath, options) {
+    this.nextRequestId = 1;
+    this.pending = new Map();
+    this.closed = false;
+    this.closing = false;
+    this.worker = new Worker(new URL("./history-sqlite-worker.js", import.meta.url), {
+      workerData: { historyPath, options },
+    });
+    this.worker.on("message", (message) => this.handleMessage(message));
+    this.worker.on("error", (error) => this.fail(error));
+    this.worker.on("exit", (code) => {
+      if (!this.closing) {
+        this.fail(new Error(`Response history writer exited with code ${code}.`));
+      }
+    });
+  }
+
+  recordTurn(turn, now) {
+    if (this.closed) {
+      return Promise.reject(historyStorageError(
+        "history_storage_closed",
+        "Response history writer is closed.",
+      ));
+    }
+    const requestId = this.nextRequestId++;
+    return new Promise((resolve, reject) => {
+      this.pending.set(requestId, { resolve, reject });
+      try {
+        this.worker.postMessage({ type: "record_turn", requestId, turn, now });
+      } catch (error) {
+        this.pending.delete(requestId);
+        reject(error);
+      }
+    });
+  }
+
+  handleMessage(message = {}) {
+    if (message.type !== "record_turn_result") {
+      return;
+    }
+    const pending = this.pending.get(message.requestId);
+    if (!pending) {
+      return;
+    }
+    this.pending.delete(message.requestId);
+    if (message.ok) {
+      pending.resolve(message.result);
+      return;
+    }
+    pending.reject(historyWorkerError(message.error));
+  }
+
+  fail(error) {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    for (const pending of this.pending.values()) {
+      pending.reject(error);
+    }
+    this.pending.clear();
+  }
+
+  close() {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    this.closing = true;
+    const signal = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+    try {
+      this.worker.postMessage({ type: "close", signal });
+      Atomics.wait(signal, 0, 0, 5_000);
+    } catch {}
+    void this.worker.terminate();
+    const error = historyStorageError(
+      "history_storage_closed",
+      "Response history writer closed before the write completed.",
+    );
+    for (const pending of this.pending.values()) {
+      pending.reject(error);
+    }
+    this.pending.clear();
+  }
+}
+
+function historyWorkerError(value = {}) {
+  const error = new Error(value.message || "Response history worker failed.");
+  for (const key of [
+    "name",
+    "code",
+    "errcode",
+    "sqliteCode",
+    "statusCode",
+    "localHistoryError",
+    "internalCode",
+  ]) {
+    if (value[key] !== undefined) {
+      error[key] = value[key];
+    }
+  }
+  if (value.stack) {
+    error.stack = value.stack;
+  }
+  return error;
 }
 
 function encodeJson(value) {

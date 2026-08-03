@@ -1156,7 +1156,7 @@ export async function proxyResponsesApi(
           `!! upstream route=${route.id} returned HTTP ${upstream.status} with completed Responses SSE; ` +
           "treating stream as completed for compatibility",
       );
-      recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
+      await recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
         requestBody,
         route,
       });
@@ -1179,7 +1179,7 @@ export async function proxyResponsesApi(
           `!! upstream route=${route.id} returned HTTP ${upstream.status} with completed Responses SSE; ` +
           "returning completed response JSON for compatibility",
       );
-      recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
+      await recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
         requestBody,
         route,
       });
@@ -1213,7 +1213,7 @@ export async function proxyResponsesApi(
         route,
       );
     }
-    recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
+    await recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
       requestBody,
       route,
     });
@@ -1248,7 +1248,7 @@ export async function proxyResponsesApi(
         return;
       }
       if (isCompletedResponsesObject(completedResponse)) {
-        recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
+        await recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
           requestBody,
           route,
         });
@@ -1299,7 +1299,7 @@ export async function proxyResponsesApi(
         route,
       );
     }
-    recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
+    await recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
       requestBody,
       route,
     });
@@ -1466,7 +1466,7 @@ export async function proxyResponsesApi(
   }
 
   try {
-    recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
+    await recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
       requestBody,
       route,
     });
@@ -1960,7 +1960,7 @@ export async function proxyChatCompletions(
     response = chatResponseStream.alignResponse(response);
   }
 
-  recordHistoryTurn(
+  await recordHistoryTurn(
     history,
     response,
     [
@@ -2138,7 +2138,7 @@ async function proxyChatCompact(requestBody, route, history, res, context = {}) 
     outcome: localFallback ? "local_fallback" : "completed",
     reasonCode: localFallback || "remote_summary_completed",
   });
-  recordHistoryTurn(
+  await recordHistoryTurn(
     history,
     response,
     [
@@ -2414,7 +2414,7 @@ async function proxyResponsesCompact(requestBody, route, history, res, context =
     outcome: upstream ? "completed" : "local_fallback",
     reasonCode: upstream ? "remote_summary_completed" : "compact_local_fallback",
   });
-  recordHistoryTurn(
+  await recordHistoryTurn(
     history,
     response,
     [
@@ -2739,7 +2739,7 @@ function interactivePluginBootstrapCode(kind) {
   ].join("\n");
 }
 
-function sendLocalImageRejectedResponse({
+async function sendLocalImageRejectedResponse({
   requestBody,
   route,
   history,
@@ -2765,7 +2765,7 @@ function sendLocalImageRejectedResponse({
     { stripReasoningTags: false },
   );
 
-  recordHistoryTurn(
+  await recordHistoryTurn(
     history,
     response,
     [...messagesForHistory, assistantHistoryMessageFromChat(localChat)],
@@ -3197,7 +3197,7 @@ function extractResponsesObject(text) {
   );
 }
 
-function recordResponsesHistory(
+async function recordResponsesHistory(
   history,
   response,
   sourceMessages,
@@ -3207,7 +3207,7 @@ function recordResponsesHistory(
   if (!history || !isResponsesObject(response)) {
     return;
   }
-  recordHistoryTurn(
+  await recordHistoryTurn(
     history,
     response,
     [
@@ -3225,7 +3225,7 @@ function recordResponsesHistory(
   );
 }
 
-function recordHistoryTurn(
+async function recordHistoryTurn(
   history,
   response,
   messages,
@@ -3240,6 +3240,10 @@ function recordHistoryTurn(
     return;
   }
   try {
+    if (typeof history.recordTurnAsync === "function") {
+      await history.recordTurnAsync(turn);
+      return;
+    }
     if (typeof history.recordTurn === "function") {
       history.recordTurn(turn);
       return;
