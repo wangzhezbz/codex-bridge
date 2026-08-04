@@ -107,7 +107,9 @@ test("double quota is a dedicated desktop page backed by narrow IPC methods", ()
     rendererSource.indexOf('els.manageDoubleQuotaExtension?.addEventListener'),
     rendererSource.indexOf('els.openDoubleQuotaExtensionManager?.addEventListener'),
   );
-  assert.match(extensionUpdateHandler, /api\.copyText\(doubleQuotaState\.extensionDir\)[\s\S]*api\.openDoubleQuotaExtensionManager\(\)/);
+  assert.doesNotMatch(extensionUpdateHandler, /api\.copyText\(/);
+  assert.match(extensionUpdateHandler, /api\.openDoubleQuotaExtensionManager\(\)/);
+  assert.match(extensionUpdateHandler, /请手动复制上方扩展目录/);
   assert.doesNotMatch(extensionUpdateHandler, /requestedAction === "reinstall"/);
   assert.match(extensionUpdateHandler, /extensionUpdate\?\.status === "failed"[\s\S]*throw new Error/);
   assert.match(mainSource, /App Paths\\\\chrome\.exe/);
@@ -116,6 +118,9 @@ test("double quota is a dedicated desktop page backed by narrow IPC methods", ()
   assert.match(mainSource, /clipboard\.writeText\("chrome:\/\/extensions\/"\)/);
   assert.match(section, /id="doubleQuotaExtensionGuide"/);
   assert.match(section, /加载已解压的扩展程序/);
+  assert.match(section, /请手动选中并复制上方“固定安装目录”中的完整路径/);
+  assert.match(section, /将路径粘贴到选择窗口并确认/);
+  assert.doesNotMatch(section, /扩展目录已经复制|可直接粘贴选择/);
   assert.match(
     rendererSource,
     /STATE_UNAVAILABLE_READ_ONLY_API_METHODS = new Set\(\[[\s\S]*?"getDoubleQuotaState"/,

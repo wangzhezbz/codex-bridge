@@ -979,13 +979,12 @@ els.manageDoubleQuotaExtension?.addEventListener("click", (event) =>
         doubleQuotaState.extensionUpdate.error || "Chrome 扩展更新失败，请稍后重试。",
       );
     }
-    await api.copyText(doubleQuotaState.extensionDir);
     doubleQuotaExtensionGuideActive = true;
     renderDoubleQuota();
     const openedState = await api.openDoubleQuotaExtensionManager();
     doubleQuotaState = openedState;
     renderDoubleQuota();
-    showToast("扩展文件已准备并复制目录。请在 Chrome 中完成加载，再点击“重新检测”。");
+    showToast("扩展文件已准备。请手动复制上方扩展目录，在 Chrome 中完成加载后点击“重新检测”。");
   }),
 );
 
