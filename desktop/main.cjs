@@ -7,6 +7,7 @@ const {
   desktopCapturer,
   dialog,
   ipcMain: electronIpcMain,
+  nativeImage,
   screen,
   shell,
 } = require("electron");
@@ -57,6 +58,7 @@ const { classifyRouterProcessOutput } = require("./router-start-diagnostics.cjs"
 const { runRouterStartForIpc } = require("./router-start-result.cjs");
 const { readBoundedRegularUtf8File } = require("./safe-import-file.cjs");
 const { createChatgptBridgeService } = require("./chatgpt-bridge-service.cjs");
+const { createTrayIcon } = require("./tray-icon.cjs");
 const {
   chromeExtensionManagerPlan,
   parseChromeExtensionManagerResult,
@@ -988,7 +990,11 @@ function createTray() {
   if (tray) {
     return tray;
   }
-  tray = new Tray(trayIconPath);
+  tray = new Tray(createTrayIcon({
+    platform: process.platform,
+    iconPath: trayIconPath,
+    nativeImage,
+  }));
   tray.setToolTip("CodexBridge");
   refreshTrayMenu();
   tray.on("click", () => showMainWindow());
