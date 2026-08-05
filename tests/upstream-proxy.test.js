@@ -1392,6 +1392,149 @@ test("DeepSeek Pro streams reasoning events before answer text arrives", async (
   }
 });
 
+test("DeepSeek chat stream completes on DONE without waiting for the upstream socket to close", async () => {
+  const originalFetch = globalThis.fetch;
+  const encoder = new TextEncoder();
+  let streamController = null;
+  let upstreamCancelled = false;
+  let proxyPromise = null;
+  let proxySettled = false;
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    start(controller) {
+      streamController = controller;
+    },
+    cancel() {
+      upstreamCancelled = true;
+    },
+  }), {
+    status: 200,
+    headers: { "content-type": "text/event-stream; charset=utf-8" },
+  });
+
+  try {
+    const res = collectResponse();
+    proxyPromise = proxyChatCompletions(
+      { model: "deepseek-test", input: "hello", stream: true },
+      {
+        id: "deepseek-test",
+        displayName: "DeepSeek Test",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: "https://api.deepseek.com/v1",
+        model: "deepseek-chat",
+        apiKey: "test-key",
+      },
+      null,
+      res,
+      {},
+    ).finally(() => {
+      proxySettled = true;
+    });
+
+    await waitFor(() => streamController !== null, 500);
+    streamController.enqueue(encoder.encode(
+      'data: {"id":"chatcmpl-held-open","object":"chat.completion.chunk","model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"answer ready"},"finish_reason":"stop"}]}\n\n' +
+      "data: [DONE]\n\n",
+    ));
+
+    await waitFor(() => proxySettled, 500);
+    assert.equal(upstreamCancelled, true);
+    assert.match(res.body(), /answer ready/);
+    assert.match(res.body(), /response\.completed/);
+    assert.match(res.body(), /data: \[DONE\]/);
+  } finally {
+    if (!upstreamCancelled && streamController) {
+      streamController.close();
+    }
+    await proxyPromise?.catch(() => {});
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("DeepSeek Responses stream completes on response.completed without waiting for socket close", async () => {
+  const originalFetch = globalThis.fetch;
+  const encoder = new TextEncoder();
+  let streamController = null;
+  let upstreamCancelled = false;
+  let proxyPromise = null;
+  let proxySettled = false;
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    start(controller) {
+      streamController = controller;
+    },
+    cancel() {
+      upstreamCancelled = true;
+    },
+  }), {
+    status: 200,
+    headers: { "content-type": "text/event-stream; charset=utf-8" },
+  });
+
+  const completedResponse = {
+    id: "resp_held_open",
+    object: "response",
+    created_at: 1,
+    status: "completed",
+    model: "deepseek-v4-flash",
+    output: [{
+      id: "msg_held_open",
+      type: "message",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "output_text", text: "answer ready", annotations: [] }],
+    }],
+    output_text: "answer ready",
+    error: null,
+    incomplete_details: null,
+    usage: { input_tokens: 3, output_tokens: 2, total_tokens: 5 },
+  };
+
+  try {
+    const res = collectResponse();
+    const history = new ResponseHistory();
+    proxyPromise = proxyResponsesApi(
+      { model: "deepseek-v4-flash", input: "hello", stream: true },
+      {
+        id: "deepseek-v4-flash",
+        displayName: "DeepSeek V4 Flash",
+        provider: "deepseek",
+        api: "responses",
+        baseUrl: "https://api.deepseek.com",
+        model: "deepseek-v4-flash",
+        apiKey: "test-key",
+        supportsResponsePreviousId: false,
+      },
+      history,
+      res,
+      {},
+    ).finally(() => {
+      proxySettled = true;
+    });
+
+    await waitFor(() => streamController !== null, 500);
+    streamController.enqueue(encoder.encode(
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"answer ready"}\n\n' +
+      `event: response.completed\ndata: ${JSON.stringify({
+        type: "response.completed",
+        response: completedResponse,
+      })}\n\ndata: [DONE]\n\n`,
+    ));
+
+    await waitFor(() => proxySettled, 500);
+    assert.equal(upstreamCancelled, true);
+    assert.match(res.body(), /answer ready/);
+    assert.match(res.body(), /response\.completed/);
+    assert.match(res.body(), /data: \[DONE\]/);
+    assert.equal(history.getResponse("resp_held_open")?.status, "completed");
+  } finally {
+    if (!upstreamCancelled && streamController) {
+      streamController.close();
+    }
+    await proxyPromise?.catch(() => {});
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("upstream requests use HTTPS proxy dispatcher when configured", async () => {
   const originalFetch = globalThis.fetch;
   const originalEnv = snapshotProxyEnv();

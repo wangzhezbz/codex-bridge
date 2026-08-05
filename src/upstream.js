@@ -1327,8 +1327,10 @@ export async function proxyResponsesApi(
   let diagnosticTail = "";
   const terminalBuffer = createTextBuffer();
   let terminalStarted = false;
+  let terminalComplete = false;
   let streamError = null;
   try {
+    upstreamRead:
     for await (const chunk of readUpstreamBody(
       upstream,
       context,
@@ -1341,10 +1343,14 @@ export async function proxyResponsesApi(
         if (terminalStarted || responsesSseStreamComplete(block)) {
           terminalStarted = true;
           appendTerminalText(terminalBuffer, block);
+          terminalComplete = responsesSseStreamComplete(textBufferValue(terminalBuffer));
           continue;
         }
         diagnosticTail = appendDiagnosticTail(diagnosticTail, block);
         await writeResponseChunk(res, block, context);
+      }
+      if (terminalComplete) {
+        break upstreamRead;
       }
     }
     const pendingText = finishSseBlockAccumulator(pendingEvent);
@@ -2306,11 +2312,20 @@ async function callChatCompletionsResponsesStreamUpstream(
         detectedEventStream = true;
         for (const bufferedChunk of bufferedChunks) {
           await writeStreamEvents(stream.push(bufferedChunk));
+          if (stream.sawDone) {
+            break;
+          }
         }
         bufferedChunks = [];
+        if (stream.sawDone) {
+          break;
+        }
         continue;
       }
       await writeStreamEvents(stream.push(chunk));
+      if (stream.sawDone) {
+        break;
+      }
     }
   }
   if (!detectedEventStream) {

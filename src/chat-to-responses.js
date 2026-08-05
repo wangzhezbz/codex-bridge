@@ -540,6 +540,9 @@ export function createChatCompletionResponsesStream(
     get completed() {
       return failed || sawDone || sawFinishReason;
     },
+    get sawDone() {
+      return sawDone;
+    },
     get failed() {
       return failed;
     },
