@@ -4,6 +4,7 @@ node_modules/
 
 # Test scratch directories
 .tmp/
+.worktrees/
 .tmp-updates-*/
 .tmp-installed-cleanup-*/
 .tmp-installed-legacy-cleanup-*/
