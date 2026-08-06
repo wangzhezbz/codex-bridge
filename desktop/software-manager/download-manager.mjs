@@ -118,6 +118,7 @@ async function downloadOnce(context) {
     throw error;
   }
 
+  throwIfAborted(context.signal);
   return verifyAndPromote({ ...context, receivedBytes, resumed });
 }
 
@@ -131,13 +132,17 @@ function onProgressSafely(onProgress, event, callback, chunk) {
 }
 
 async function verifyAndPromote(context) {
+  throwIfAborted(context.signal);
   if (context.receivedBytes !== context.asset.size) {
     throw nonRetryableError(`download length mismatch: expected ${context.asset.size}, received ${context.receivedBytes}`);
   }
+  throwIfAborted(context.signal);
   const sha256 = await hashFile(context.streamFs, context.partPath);
+  throwIfAborted(context.signal);
   if (sha256 !== context.asset.sha256.toLowerCase()) {
     throw nonRetryableError("download SHA256 mismatch");
   }
+  throwIfAborted(context.signal);
   await context.fileOps.rename(context.partPath, context.destination);
   return {
     path: context.destination,

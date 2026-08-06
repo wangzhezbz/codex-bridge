@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
+import fs from "node:fs";
 import { createServer } from "node:http";
-import { mkdtemp, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
 import test from "node:test";
 
 import { createDownloadManager } from "../desktop/software-manager/download-manager.mjs";
@@ -36,14 +38,24 @@ async function startServer(handler) {
 
 async function withTempDirectory(fn) {
   const directory = await mkdtemp(join(tmpdir(), "codexbridge-download-"));
-  try {
-    return await fn(directory);
-  } finally {
-    for (const name of await readdir(directory)) {
-      await unlink(join(directory, name));
+  const createdFiles = new Set();
+  const fixture = {
+    directory,
+    destination(name = "component.zip") {
+      const destination = join(directory, name);
+      createdFiles.add(destination);
+      createdFiles.add(`${destination}.part`);
+      return destination;
     }
-    // The fixture directory is empty because every known test file was removed above.
-    const { rmdir } = await import("node:fs/promises");
+  };
+  try {
+    return await fn(fixture);
+  } finally {
+    for (const path of createdFiles) {
+      await unlink(path).catch((error) => {
+        if (error?.code !== "ENOENT") throw error;
+      });
+    }
     await rmdir(directory);
   }
 }
@@ -60,8 +72,8 @@ test("resumes a partial package and verifies final SHA256", async () => {
     response.end(body.subarray(offset));
   });
   try {
-    await withTempDirectory(async (directory) => {
-      const destination = join(directory, "component.zip");
+    await withTempDirectory(async ({ destination: fixtureDestination }) => {
+      const destination = fixtureDestination();
       await writeFile(`${destination}.part`, body.subarray(0, 7));
       const progress = [];
       const manager = createDownloadManager({ retryPolicy: { maxAttempts: 2, delayMs: 0 } });
@@ -98,8 +110,8 @@ test("restarts from zero when a server ignores the resume Range", async () => {
     response.end(body);
   });
   try {
-    await withTempDirectory(async (directory) => {
-      const destination = join(directory, "component.zip");
+    await withTempDirectory(async ({ destination: fixtureDestination }) => {
+      const destination = fixtureDestination();
       await writeFile(`${destination}.part`, body.subarray(0, 9));
       const manager = createDownloadManager();
 
@@ -126,8 +138,8 @@ test("retries a connection reset within its bounded retry budget", async () => {
     response.end(body);
   });
   try {
-    await withTempDirectory(async (directory) => {
-      const destination = join(directory, "component.zip");
+    await withTempDirectory(async ({ destination: fixtureDestination }) => {
+      const destination = fixtureDestination();
       const manager = createDownloadManager({ retryPolicy: { maxAttempts: 2, delayMs: 0 } });
 
       await manager.download({ asset: assetFor(`${origin.url}/component.zip`), destination });
@@ -148,8 +160,8 @@ test("cancellation leaves exactly one partial file and never promotes it", async
     response.once("close", () => clearTimeout(timer));
   });
   try {
-    await withTempDirectory(async (directory) => {
-      const destination = join(directory, "component.zip");
+    await withTempDirectory(async ({ directory, destination: fixtureDestination }) => {
+      const destination = fixtureDestination();
       const controller = new AbortController();
       const manager = createDownloadManager();
 
@@ -180,8 +192,8 @@ test("rejects a length mismatch without promoting the partial package", async ()
     response.end(truncated);
   });
   try {
-    await withTempDirectory(async (directory) => {
-      const destination = join(directory, "component.zip");
+    await withTempDirectory(async ({ destination: fixtureDestination }) => {
+      const destination = fixtureDestination();
       const manager = createDownloadManager();
 
       await assert.rejects(manager.download({ asset: assetFor(`${origin.url}/component.zip`), destination }), /length/i);
@@ -200,8 +212,8 @@ test("rejects a SHA256 mismatch without promoting the partial package", async ()
     response.end(body);
   });
   try {
-    await withTempDirectory(async (directory) => {
-      const destination = join(directory, "component.zip");
+    await withTempDirectory(async ({ destination: fixtureDestination }) => {
+      const destination = fixtureDestination();
       const manager = createDownloadManager();
       const asset = { ...assetFor(`${origin.url}/component.zip`), sha256: "0".repeat(64) };
 
@@ -229,8 +241,8 @@ test("rejects cross-origin redirects before forwarding authorization", async () 
     response.end();
   });
   try {
-    await withTempDirectory(async (directory) => {
-      const destination = join(directory, "component.zip");
+    await withTempDirectory(async ({ directory, destination: fixtureDestination }) => {
+      const destination = fixtureDestination();
       const manager = createDownloadManager();
 
       await assert.rejects(
@@ -245,5 +257,55 @@ test("rejects cross-origin redirects before forwarding authorization", async () 
   } finally {
     await source.close();
     await target.close();
+  }
+});
+
+test("cancellation during SHA256 verification leaves the partial package unpromoted", async () => {
+  let beginHash;
+  const hashStarted = new Promise((resolve) => {
+    beginHash = resolve;
+  });
+  let releaseHash;
+  const hashCanFinish = new Promise((resolve) => {
+    releaseHash = resolve;
+  });
+  const delayedHashFs = {
+    ...await import("node:fs/promises"),
+    createWriteStream: fs.createWriteStream,
+    createReadStream() {
+      return Readable.from((async function* () {
+        beginHash();
+        yield body.subarray(0, 8);
+        await hashCanFinish;
+        yield body.subarray(8);
+      })());
+    }
+  };
+  const origin = await startServer((request, response) => {
+    response.writeHead(200, { "Content-Length": body.length });
+    response.end(body);
+  });
+  try {
+    await withTempDirectory(async ({ directory, destination: fixtureDestination }) => {
+      const destination = fixtureDestination();
+      const controller = new AbortController();
+      const manager = createDownloadManager({ fsApi: delayedHashFs });
+      const download = manager.download({
+        asset: assetFor(`${origin.url}/component.zip`),
+        destination,
+        signal: controller.signal
+      });
+
+      await hashStarted;
+      controller.abort();
+      releaseHash();
+
+      await assert.rejects(download, { name: "AbortError" });
+      assert.deepEqual(await readdir(directory), ["component.zip.part"]);
+      assert.deepEqual(await readFile(`${destination}.part`), body);
+      await assert.rejects(stat(destination));
+    });
+  } finally {
+    await origin.close();
   }
 });
