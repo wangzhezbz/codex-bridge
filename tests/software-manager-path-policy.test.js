@@ -202,3 +202,41 @@ test("ownership path fields must be own properties of plain records", () => {
   };
   assert.equal(isOwnedPath({ target: "C:\\Windows\\System32", ownership }), false);
 });
+
+function validOwnership() {
+  return {
+    schemaVersion: 1,
+    installRoot: null,
+    components: {},
+    skills: {},
+    shortcuts: [],
+    rollback: null,
+    activeTask: null,
+    lastTask: null,
+  };
+}
+
+const malformedOwnershipCases = [
+  ["inherited top-level installRoot", () => Object.assign(Object.create({ installRoot: "C:\\Windows" }), {
+    schemaVersion: 1,
+    components: {},
+    skills: {},
+    shortcuts: [],
+    rollback: null,
+    activeTask: null,
+    lastTask: null,
+  })],
+  ["string component", () => ({ ...validOwnership(), components: { app: "C:\\Windows" } })],
+  ["array skill", () => ({ ...validOwnership(), skills: { documents: ["C:\\Windows"] } })],
+  ["string shortcut", () => ({ ...validOwnership(), shortcuts: ["C:\\Windows"] })],
+  ["malformed rollback", () => ({ ...validOwnership(), rollback: { message: "C:\\Windows" } })],
+];
+
+for (const [label, buildOwnership] of malformedOwnershipCases) {
+  test(`malformed ownership never authorizes paths: ${label}`, () => {
+    assert.equal(isOwnedPath({
+      target: "C:\\Windows\\System32\\cmd.exe",
+      ownership: buildOwnership(),
+    }), false);
+  });
+}

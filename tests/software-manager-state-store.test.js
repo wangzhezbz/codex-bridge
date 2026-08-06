@@ -211,3 +211,52 @@ test("identity-aware rename refuses a state entry replaced after stable open", a
   await assert.rejects(store.save(state("C:\\Next")), /stale_entry_identity/);
   assert.deepEqual(JSON.parse(memory.get("ownership.json")), state("C:\\External"));
 });
+
+const malformedNestedStateCases = [
+  ["inherited top-level installRoot", () => Object.assign(Object.create({ installRoot: "C:\\Windows" }), {
+    schemaVersion: 1,
+    components: {},
+    skills: {},
+    shortcuts: [],
+    rollback: null,
+    activeTask: null,
+    lastTask: null,
+  })],
+  ["string component", () => ({ ...state(), components: { app: "C:\\Windows" } })],
+  ["array skill", () => ({ ...state(), skills: { documents: ["C:\\Windows"] } })],
+  ["string shortcut", () => ({ ...state(), shortcuts: ["C:\\Windows"] })],
+  ["malformed rollback", () => ({ ...state(), rollback: { message: "C:\\Windows" } })],
+  ["array activeTask", () => ({ ...state(), activeTask: ["C:\\Windows"] })],
+];
+
+for (const [label, buildState] of malformedNestedStateCases) {
+  test(`rejects malformed nested state before opening the state directory: ${label}`, async () => {
+    const memory = createMemoryStateFs();
+    const store = createOwnershipStore({ stateDir: path.resolve("state"), fsApi: memory.fsApi });
+    await assert.rejects(store.save(buildState()), { code: "ownership_state_invalid" });
+    assert.deepEqual(memory.calls, []);
+  });
+}
+
+test("malformed persisted nested state safely degrades without mutation", async () => {
+  const malformed = { ...state(), components: { app: "C:\\Windows" } };
+  const memory = createMemoryStateFs({ "ownership.json": JSON.stringify(malformed) });
+  const store = createOwnershipStore({ stateDir: path.resolve("state"), fsApi: memory.fsApi });
+  assert.deepEqual(await store.load(), state(null));
+  assert.equal(memory.calls.some(([operation]) => ["write", "unlink-entry-no-follow", "rename-entry-no-follow"].includes(operation)), false);
+});
+
+test("retains JSON metadata while only fixed path fields define ownership records", async () => {
+  const next = {
+    ...state(),
+    components: { app: { installPath: "C:\\Owned\\app", version: "C:\\Windows" } },
+    skills: { documents: { sha256: "C:\\Windows", target: "C:\\Owned\\skills\\documents" } },
+    shortcuts: [{ message: "C:\\Windows", path: "C:\\Owned\\shortcut.lnk" }],
+    rollback: [{ path: "C:\\Owned\\rollback", reason: "update" }],
+    activeTask: { message: "C:\\Windows", progress: 50 },
+  };
+  const memory = createMemoryStateFs();
+  const store = createOwnershipStore({ stateDir: path.resolve("state"), fsApi: memory.fsApi });
+  await store.save(next);
+  assert.deepEqual(await store.load(), next);
+});

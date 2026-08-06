@@ -1,42 +1,11 @@
 import path from "node:path";
 
-const STATE_KEYS = Object.freeze([
-  "schemaVersion",
-  "installRoot",
-  "components",
-  "skills",
-  "shortcuts",
-  "rollback",
-  "activeTask",
-  "lastTask",
-]);
+import { isValidOwnershipState } from "./path-policy.mjs";
 
 function stateError(code) {
   const error = new Error(code);
   error.code = code;
   return error;
-}
-
-function isPlainObject(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    && Object.getPrototypeOf(value) === Object.prototype;
-}
-
-function isObjectOrNull(value) {
-  return value === null || isPlainObject(value);
-}
-
-function isValidState(value) {
-  if (!isPlainObject(value) || Object.keys(value).length !== STATE_KEYS.length
-    || !STATE_KEYS.every((key) => Object.hasOwn(value, key))) return false;
-  return value.schemaVersion === 1
-    && (value.installRoot === null || (typeof value.installRoot === "string" && value.installRoot.length > 0))
-    && isPlainObject(value.components)
-    && isPlainObject(value.skills)
-    && Array.isArray(value.shortcuts)
-    && (value.rollback === null || Array.isArray(value.rollback) || isPlainObject(value.rollback))
-    && isObjectOrNull(value.activeTask)
-    && isObjectOrNull(value.lastTask);
 }
 
 function emptyState() {
@@ -78,7 +47,7 @@ async function readValidated(directory, name) {
   if (!handle) return { entry: null, value: null };
   try {
     const parsed = JSON.parse(await handle.readFile("utf8"));
-    return { entry: handle.entry, value: isValidState(parsed) ? parsed : null };
+    return { entry: handle.entry, value: isValidOwnershipState(parsed) ? parsed : null };
   } catch {
     return { entry: handle.entry, value: null };
   } finally {
@@ -115,7 +84,7 @@ export function createOwnershipStore({ stateDir, fsApi }) {
     },
 
     async save(value) {
-      if (!isValidState(value)) throw stateError("ownership_state_invalid");
+      if (!isValidOwnershipState(value)) throw stateError("ownership_state_invalid");
       const directory = await openStateDirectory(fsApi, stateDir);
       try {
         const existingTemp = await openExisting(directory, tempName);
