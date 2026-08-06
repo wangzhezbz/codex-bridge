@@ -27,7 +27,10 @@ function hasParentTraversal(value) {
   return String(value).split(/[\\/]+/u).includes("..");
 }
 
-function normalizeInstallCandidate(candidate) {
+function normalizeCanonicalWindowsPath(candidate, { allowCodexSkillId = null, allowTrailingSeparator = false } = {}) {
+  if (typeof candidate !== "string" || candidate.length === 0 || candidate.trim() !== candidate) {
+    throw policyError("path_noncanonical");
+  }
   const slashNormalized = candidate.replaceAll("/", "\\");
   let normalized;
   try {
@@ -35,9 +38,9 @@ function normalizeInstallCandidate(candidate) {
   } catch {
     throw policyError("install_root_invalid");
   }
-  if (normalized.startsWith("\\\\")) throw policyError("install_root_unc");
+  if (normalized.startsWith("\\\\")) throw policyError("path_unc_or_device");
   if (!/^[a-z]:\\/iu.test(normalized) || normalized.includes("\0")) {
-    throw policyError("install_root_invalid");
+    throw policyError("path_not_drive_absolute");
   }
   const rawSegments = slashNormalized.slice(3).split("\\");
   const finalIndex = rawSegments.length - 1;
@@ -46,14 +49,25 @@ function normalizeInstallCandidate(candidate) {
     if (segment.length === 0 || segment === "." || segment === ".." || /[ .]$/u.test(segment)
       || /[<>:"|?*\u0000-\u001f]/u.test(segment)
       || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu.test(segment)) {
-      throw policyError("install_root_noncanonical");
+      throw policyError("path_noncanonical");
     }
   }
   const exact = normalized.replace(/[\\/]+$/u, "");
-  if (exact.split("\\").some((segment) => segment.toLowerCase() === ".codex")) {
-    throw policyError("install_root_protected");
+  if (!allowTrailingSeparator && slashNormalized !== exact) throw policyError("path_noncanonical");
+  const segments = exact.split("\\");
+  const codexIndex = segments.findIndex((segment) => segment.toLowerCase() === ".codex");
+  if (codexIndex !== -1) {
+    const allowedSkillPath = typeof allowCodexSkillId === "string"
+      && codexIndex === segments.length - 3
+      && segments[codexIndex + 1]?.toLowerCase() === "skills"
+      && segments[codexIndex + 2] === allowCodexSkillId;
+    if (!allowedSkillPath) throw policyError("path_codex_data_rejected");
   }
   return exact;
+}
+
+function normalizeInstallCandidate(candidate) {
+  return normalizeCanonicalWindowsPath(candidate, { allowTrailingSeparator: true });
 }
 
 function canonicalWindowsPath(value) {
@@ -71,9 +85,13 @@ function isPlainObject(value) {
     && Object.getPrototypeOf(value) === Object.prototype;
 }
 
-function isOwnershipPath(value) {
-  return typeof value === "string" && value.length > 0 && path.win32.isAbsolute(value)
-    && !value.startsWith("\\\\") && !hasParentTraversal(value) && !value.includes("\0");
+function isOwnershipPath(value, options) {
+  try {
+    normalizeCanonicalWindowsPath(value, options);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function isJsonValue(value, seen = new Set(), depth = 0) {
@@ -88,14 +106,14 @@ function isJsonValue(value, seen = new Set(), depth = 0) {
   return valid;
 }
 
-function isPathRecord(value, pathField) {
-  return isPlainObject(value) && Object.hasOwn(value, pathField) && isOwnershipPath(value[pathField])
+function isPathRecord(value, pathField, options) {
+  return isPlainObject(value) && Object.hasOwn(value, pathField) && isOwnershipPath(value[pathField], options)
     && isJsonValue(value);
 }
 
-function isRecordMap(value, pathField) {
+function isRecordMap(value, pathField, { codexSkillTargets = false } = {}) {
   return isPlainObject(value) && Object.entries(value).every(([id, record]) => (
-    SKILL_ID_PATTERN.test(id) && isPathRecord(record, pathField)
+    SKILL_ID_PATTERN.test(id) && isPathRecord(record, pathField, codexSkillTargets ? { allowCodexSkillId: id } : undefined)
   ));
 }
 
@@ -112,7 +130,7 @@ export function isValidOwnershipState(value) {
   return value.schemaVersion === 1
     && (value.installRoot === null || isOwnershipPath(value.installRoot))
     && isRecordMap(value.components, "installPath")
-    && isRecordMap(value.skills, "target")
+    && isRecordMap(value.skills, "target", { codexSkillTargets: true })
     && Array.isArray(value.shortcuts) && value.shortcuts.every((record) => isPathRecord(record, "path"))
     && validRollback
     && isTaskRecord(value.activeTask)

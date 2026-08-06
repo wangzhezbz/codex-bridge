@@ -260,3 +260,28 @@ test("retains JSON metadata while only fixed path fields define ownership record
   await store.save(next);
   assert.deepEqual(await store.load(), next);
 });
+
+const unsafeOwnershipStatePaths = [
+  ["slash UNC", "//server/share/owned"],
+  ["backslash UNC", "\\\\server\\share\\owned"],
+  ["device namespace", "\\\\?\\C:\\owned"],
+  ["DOS device namespace", "\\\\.\\C:\\owned"],
+  ["non-drive absolute", "\\owned\\root"],
+  ["trailing dot segment", "C:\\Owned.\\app"],
+  ["trailing space segment", "C:\\Owned \\app"],
+  [".codex data path", "C:\\Users\\me\\.codex\\data"],
+];
+
+for (const [label, unsafePath] of unsafeOwnershipStatePaths) {
+  test(`state store fails closed for non-canonical ownership path: ${label}`, async () => {
+    const invalid = state(unsafePath);
+    const memory = createMemoryStateFs();
+    const store = createOwnershipStore({ stateDir: path.resolve("state"), fsApi: memory.fsApi });
+    await assert.rejects(store.save(invalid), { code: "ownership_state_invalid" });
+    assert.deepEqual(memory.calls, []);
+
+    memory.replace("ownership.json", JSON.stringify(invalid));
+    assert.deepEqual(await store.load(), state(null));
+    assert.equal(memory.calls.some(([operation]) => ["write", "unlink-entry-no-follow", "rename-entry-no-follow"].includes(operation)), false);
+  });
+}

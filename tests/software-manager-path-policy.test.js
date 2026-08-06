@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   isOwnedPath,
+  isValidOwnershipState,
   resolveSkillTarget,
   validateInstallRoot,
 } from "../desktop/software-manager/path-policy.mjs";
@@ -240,3 +241,28 @@ for (const [label, buildOwnership] of malformedOwnershipCases) {
     }), false);
   });
 }
+
+const unsafeOwnershipPathCases = [
+  ["slash UNC", "//server/share/owned"],
+  ["backslash UNC", "\\\\server\\share\\owned"],
+  ["device namespace", "\\\\?\\C:\\owned"],
+  ["DOS device namespace", "\\\\.\\C:\\owned"],
+  ["non-drive absolute", "\\owned\\root"],
+  ["trailing dot segment", "C:\\Owned.\\app"],
+  ["trailing space segment", "C:\\Owned \\app"],
+  [".codex data path", "C:\\Users\\me\\.codex\\data"],
+];
+
+for (const [label, unsafePath] of unsafeOwnershipPathCases) {
+  test(`ownership schema rejects non-canonical path: ${label}`, () => {
+    const ownership = { ...validOwnership(), installRoot: unsafePath };
+    assert.equal(isValidOwnershipState(ownership), false);
+    assert.equal(isOwnedPath({ target: `${unsafePath}\\payload.bin`, ownership }), false);
+  });
+}
+
+test("ownership schema accepts a canonical drive-absolute path", () => {
+  const ownership = { ...validOwnership(), installRoot: "D:\\Owned\\CodexBridge" };
+  assert.equal(isValidOwnershipState(ownership), true);
+  assert.equal(isOwnedPath({ target: "D:\\Owned\\CodexBridge\\payload.bin", ownership }), true);
+});
