@@ -4,6 +4,8 @@ import test from "node:test";
 
 import { createOwnershipStore } from "../desktop/software-manager/state-store.mjs";
 
+const CANONICAL_SKILLS_ROOT = "C:\\Users\\me\\.codex\\skills";
+
 function state(installRoot = "C:\\Tools\\CodexBridge") {
   return {
     schemaVersion: 1,
@@ -256,10 +258,67 @@ test("retains JSON metadata while only fixed path fields define ownership record
     activeTask: { message: "C:\\Windows", progress: 50 },
   };
   const memory = createMemoryStateFs();
-  const store = createOwnershipStore({ stateDir: path.resolve("state"), fsApi: memory.fsApi });
+  const store = createOwnershipStore({
+    stateDir: path.resolve("state"),
+    fsApi: memory.fsApi,
+    skillsRoot: "C:\\Owned\\skills",
+  });
   await store.save(next);
   assert.deepEqual(await store.load(), next);
 });
+
+test("store saves and loads Skill ownership bound to its injected canonical Skills root", async () => {
+  const next = {
+    ...state(),
+    skills: { documents: { target: "C:\\Users\\me\\.codex\\skills\\documents" } },
+  };
+  const memory = createMemoryStateFs();
+  const store = createOwnershipStore({
+    stateDir: path.resolve("state"),
+    fsApi: memory.fsApi,
+    skillsRoot: CANONICAL_SKILLS_ROOT,
+  });
+
+  await store.save(next);
+  assert.deepEqual(await store.load(), next);
+});
+
+test("store fails closed for Skill ownership without an injected canonical Skills root", async () => {
+  const withSkill = {
+    ...state(),
+    skills: { documents: { target: "C:\\Users\\me\\.codex\\skills\\documents" } },
+  };
+  const memory = createMemoryStateFs({ "ownership.json": JSON.stringify(withSkill) });
+  const store = createOwnershipStore({ stateDir: path.resolve("state"), fsApi: memory.fsApi });
+
+  await assert.rejects(store.save(withSkill), { code: "ownership_state_invalid" });
+  assert.deepEqual(await store.load(), state(null));
+  assert.equal(memory.calls.some(([operation]) => ["write", "unlink-entry-no-follow", "rename-entry-no-follow"].includes(operation)), false);
+});
+
+for (const [label, target] of [
+  ["Windows prefix with the same .codex suffix", "C:\\Windows\\.codex\\skills\\documents"],
+  ["another user", "C:\\Users\\other\\.codex\\skills\\documents"],
+  ["another drive", "D:\\Users\\me\\.codex\\skills\\documents"],
+  ["case alias", "c:\\Users\\me\\.codex\\skills\\documents"],
+  ["trailing-dot alias", "C:\\Users\\me\\.codex\\skills\\documents."],
+  ["nested target", "C:\\Users\\me\\.codex\\skills\\nested\\documents"],
+  ["different Skill ID", "C:\\Users\\me\\.codex\\skills\\pdf"],
+]) {
+  test(`store rejects Skill ownership outside its injected canonical root: ${label}`, async () => {
+    const invalid = { ...state(), skills: { documents: { target } } };
+    const memory = createMemoryStateFs({ "ownership.json": JSON.stringify(invalid) });
+    const store = createOwnershipStore({
+      stateDir: path.resolve("state"),
+      fsApi: memory.fsApi,
+      skillsRoot: CANONICAL_SKILLS_ROOT,
+    });
+
+    await assert.rejects(store.save(invalid), { code: "ownership_state_invalid" });
+    assert.deepEqual(await store.load(), state(null));
+    assert.equal(memory.calls.some(([operation]) => ["write", "unlink-entry-no-follow", "rename-entry-no-follow"].includes(operation)), false);
+  });
+}
 
 const unsafeOwnershipStatePaths = [
   ["slash UNC", "//server/share/owned"],

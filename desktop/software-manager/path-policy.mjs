@@ -27,7 +27,11 @@ function hasParentTraversal(value) {
   return String(value).split(/[\\/]+/u).includes("..");
 }
 
-function normalizeCanonicalWindowsPath(candidate, { allowCodexSkillId = null, allowTrailingSeparator = false } = {}) {
+function normalizeCanonicalWindowsPath(candidate, {
+  allowCodexSkillId = null,
+  allowCodexSkillsRoot = false,
+  allowTrailingSeparator = false,
+} = {}) {
   if (typeof candidate !== "string" || candidate.length === 0 || candidate.trim() !== candidate) {
     throw policyError("path_noncanonical");
   }
@@ -57,11 +61,14 @@ function normalizeCanonicalWindowsPath(candidate, { allowCodexSkillId = null, al
   const segments = exact.split("\\");
   const codexIndex = segments.findIndex((segment) => segment.toLowerCase() === ".codex");
   if (codexIndex !== -1) {
+    const allowedSkillsRoot = allowCodexSkillsRoot
+      && codexIndex === segments.length - 2
+      && segments[codexIndex + 1]?.toLowerCase() === "skills";
     const allowedSkillPath = typeof allowCodexSkillId === "string"
       && codexIndex === segments.length - 3
       && segments[codexIndex + 1]?.toLowerCase() === "skills"
       && segments[codexIndex + 2] === allowCodexSkillId;
-    if (!allowedSkillPath) throw policyError("path_codex_data_rejected");
+    if (!allowedSkillsRoot && !allowedSkillPath) throw policyError("path_codex_data_rejected");
   }
   return exact;
 }
@@ -111,17 +118,41 @@ function isPathRecord(value, pathField, options) {
     && isJsonValue(value);
 }
 
-function isRecordMap(value, pathField, { codexSkillTargets = false } = {}) {
+function isRecordMap(value, pathField) {
   return isPlainObject(value) && Object.entries(value).every(([id, record]) => (
-    SKILL_ID_PATTERN.test(id) && isPathRecord(record, pathField, codexSkillTargets ? { allowCodexSkillId: id } : undefined)
+    SKILL_ID_PATTERN.test(id) && isPathRecord(record, pathField)
   ));
+}
+
+function deriveCanonicalSkillTarget(skillsRoot, skillId) {
+  if (typeof skillsRoot !== "string" || !SKILL_ID_PATTERN.test(skillId)) {
+    throw policyError("skill_context_invalid");
+  }
+  const root = normalizeCanonicalWindowsPath(skillsRoot, { allowCodexSkillsRoot: true });
+  if (root !== skillsRoot) throw policyError("skill_context_noncanonical");
+  const target = normalizeCanonicalWindowsPath(path.win32.join(root, skillId), { allowCodexSkillId: skillId });
+  if (path.win32.dirname(target) !== root) throw policyError("skill_path_escape");
+  return target;
+}
+
+function isSkillRecordMap(value, skillsRoot) {
+  if (!isPlainObject(value)) return false;
+  return Object.entries(value).every(([id, record]) => {
+    if (!SKILL_ID_PATTERN.test(id) || !isPlainObject(record) || !Object.hasOwn(record, "target")
+      || typeof record.target !== "string" || !isJsonValue(record)) return false;
+    try {
+      return record.target === deriveCanonicalSkillTarget(skillsRoot, id);
+    } catch {
+      return false;
+    }
+  });
 }
 
 function isTaskRecord(value) {
   return value === null || (isPlainObject(value) && isJsonValue(value));
 }
 
-export function isValidOwnershipState(value) {
+export function isValidOwnershipState(value, { skillsRoot } = {}) {
   if (!isPlainObject(value) || Object.keys(value).length !== OWNERSHIP_KEYS.length
     || !OWNERSHIP_KEYS.every((key) => Object.hasOwn(value, key))) return false;
   const validRollback = value.rollback === null
@@ -130,7 +161,7 @@ export function isValidOwnershipState(value) {
   return value.schemaVersion === 1
     && (value.installRoot === null || isOwnershipPath(value.installRoot))
     && isRecordMap(value.components, "installPath")
-    && isRecordMap(value.skills, "target", { codexSkillTargets: true })
+    && isSkillRecordMap(value.skills, skillsRoot)
     && Array.isArray(value.shortcuts) && value.shortcuts.every((record) => isPathRecord(record, "path"))
     && validRollback
     && isTaskRecord(value.activeTask)
@@ -184,8 +215,7 @@ export async function resolveSkillTarget({ skillsRoot, skillId, realpath, lstat 
   if (typeof skillId !== "string" || !SKILL_ID_PATTERN.test(skillId)) throw policyError("skill_id_rejected");
   if (typeof realpath !== "function" || typeof lstat !== "function") throw policyError("skill_resolver_invalid");
   const root = await realpath(skillsRoot);
-  const target = path.resolve(root, skillId);
-  if (path.dirname(target).toLowerCase() !== path.resolve(root).toLowerCase()) throw policyError("skill_path_escape");
+  const target = deriveCanonicalSkillTarget(root, skillId);
   const stat = await lstat(target).catch((error) => {
     if (error?.code === "ENOENT") return null;
     throw error;
@@ -222,8 +252,8 @@ function addRecordPath(record, field, anchors) {
   }
 }
 
-export function isOwnedPath({ target, ownership }) {
-  if (!isValidOwnershipState(ownership) || typeof target !== "string"
+export function isOwnedPath({ target, ownership, skillsRoot }) {
+  if (!isValidOwnershipState(ownership, { skillsRoot }) || typeof target !== "string"
     || !path.win32.isAbsolute(target) || hasParentTraversal(target)) return false;
   return collectOwnedAnchors(ownership)
     .filter((anchor) => typeof anchor === "string" && path.win32.isAbsolute(anchor) && !hasParentTraversal(anchor))

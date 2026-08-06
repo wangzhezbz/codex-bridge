@@ -9,6 +9,8 @@ import {
   validateInstallRoot,
 } from "../desktop/software-manager/path-policy.mjs";
 
+const CANONICAL_SKILLS_ROOT = "C:\\Users\\me\\.codex\\skills";
+
 function fixtureEnv() {
   return {
     SystemRoot: "C:\\Windows",
@@ -165,12 +167,78 @@ test("ownership rejects sibling-prefix escapes and recognizes explicit owned pat
     lastTask: null,
   };
 
-  assert.equal(isOwnedPath({ target: "C:\\Tools\\CodexBridge\\components\\git\\bin\\git.exe", ownership }), true);
-  assert.equal(isOwnedPath({ target: "C:\\Users\\me\\.codex\\skills\\documents\\SKILL.md", ownership }), true);
-  assert.equal(isOwnedPath({ target: "C:\\Users\\me\\Desktop\\CodexBridge.lnk", ownership }), true);
-  assert.equal(isOwnedPath({ target: "C:\\Tools\\CodexBridge-old\\payload.exe", ownership }), false);
-  assert.equal(isOwnedPath({ target: "C:\\Tools\\CodexBridge\\..\\foreign", ownership }), false);
+  assert.equal(isOwnedPath({
+    target: "C:\\Tools\\CodexBridge\\components\\git\\bin\\git.exe",
+    ownership,
+    skillsRoot: CANONICAL_SKILLS_ROOT,
+  }), true);
+  assert.equal(isOwnedPath({
+    target: "C:\\Users\\me\\.codex\\skills\\documents\\SKILL.md",
+    ownership,
+    skillsRoot: CANONICAL_SKILLS_ROOT,
+  }), true);
+  assert.equal(isOwnedPath({
+    target: "C:\\Users\\me\\Desktop\\CodexBridge.lnk",
+    ownership,
+    skillsRoot: CANONICAL_SKILLS_ROOT,
+  }), true);
+  assert.equal(isOwnedPath({
+    target: "C:\\Tools\\CodexBridge-old\\payload.exe",
+    ownership,
+    skillsRoot: CANONICAL_SKILLS_ROOT,
+  }), false);
+  assert.equal(isOwnedPath({
+    target: "C:\\Tools\\CodexBridge\\..\\foreign",
+    ownership,
+    skillsRoot: CANONICAL_SKILLS_ROOT,
+  }), false);
 });
+
+test("Skill ownership is bound to the canonical Skills root supplied by the main process", () => {
+  const ownership = {
+    ...validOwnership(),
+    skills: { documents: { target: "C:\\Users\\me\\.codex\\skills\\documents" } },
+  };
+
+  assert.equal(isValidOwnershipState(ownership, { skillsRoot: CANONICAL_SKILLS_ROOT }), true);
+  assert.equal(isOwnedPath({
+    target: "C:\\Users\\me\\.codex\\skills\\documents\\SKILL.md",
+    ownership,
+    skillsRoot: CANONICAL_SKILLS_ROOT,
+  }), true);
+});
+
+test("Skill ownership fails closed without a canonical Skills root context", () => {
+  const ownership = {
+    ...validOwnership(),
+    skills: { documents: { target: "C:\\Users\\me\\.codex\\skills\\documents" } },
+  };
+
+  assert.equal(isValidOwnershipState(ownership), false);
+  assert.equal(isOwnedPath({
+    target: "C:\\Users\\me\\.codex\\skills\\documents\\SKILL.md",
+    ownership,
+  }), false);
+});
+
+for (const [label, target] of [
+  ["Windows prefix with the same .codex suffix", "C:\\Windows\\.codex\\skills\\documents"],
+  ["another user", "C:\\Users\\other\\.codex\\skills\\documents"],
+  ["another drive", "D:\\Users\\me\\.codex\\skills\\documents"],
+  ["case alias", "c:\\Users\\me\\.codex\\skills\\documents"],
+  ["trailing-dot alias", "C:\\Users\\me\\.codex\\skills\\documents."],
+  ["nested target", "C:\\Users\\me\\.codex\\skills\\nested\\documents"],
+  ["different Skill ID", "C:\\Users\\me\\.codex\\skills\\pdf"],
+]) {
+  test(`Skill ownership rejects a target not re-derived from the canonical root: ${label}`, () => {
+    const ownership = {
+      ...validOwnership(),
+      skills: { documents: { target } },
+    };
+    assert.equal(isValidOwnershipState(ownership, { skillsRoot: CANONICAL_SKILLS_ROOT }), false);
+    assert.equal(isOwnedPath({ target: `${target}\\SKILL.md`, ownership, skillsRoot: CANONICAL_SKILLS_ROOT }), false);
+  });
+}
 
 test("ownership metadata strings never become authorized roots", () => {
   const ownership = {
@@ -184,9 +252,17 @@ test("ownership metadata strings never become authorized roots", () => {
     lastTask: null,
   };
 
-  assert.equal(isOwnedPath({ target: "C:\\Owned\\app\\bin.exe", ownership }), true);
-  assert.equal(isOwnedPath({ target: "C:\\Owned\\skills\\documents\\SKILL.md", ownership }), true);
-  assert.equal(isOwnedPath({ target: "C:\\Windows\\System32\\cmd.exe", ownership }), false);
+  assert.equal(isOwnedPath({ target: "C:\\Owned\\app\\bin.exe", ownership, skillsRoot: "C:\\Owned\\skills" }), true);
+  assert.equal(isOwnedPath({
+    target: "C:\\Owned\\skills\\documents\\SKILL.md",
+    ownership,
+    skillsRoot: "C:\\Owned\\skills",
+  }), true);
+  assert.equal(isOwnedPath({
+    target: "C:\\Windows\\System32\\cmd.exe",
+    ownership,
+    skillsRoot: "C:\\Owned\\skills",
+  }), false);
 });
 
 test("ownership path fields must be own properties of plain records", () => {

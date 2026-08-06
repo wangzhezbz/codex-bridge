@@ -42,12 +42,12 @@ async function openExisting(directory, name) {
   return handle === null ? null : requireFileHandle(handle);
 }
 
-async function readValidated(directory, name) {
+async function readValidated(directory, name, skillsRoot) {
   const handle = await openExisting(directory, name);
   if (!handle) return { entry: null, value: null };
   try {
     const parsed = JSON.parse(await handle.readFile("utf8"));
-    return { entry: handle.entry, value: isValidOwnershipState(parsed) ? parsed : null };
+    return { entry: handle.entry, value: isValidOwnershipState(parsed, { skillsRoot }) ? parsed : null };
   } catch {
     return { entry: handle.entry, value: null };
   } finally {
@@ -59,7 +59,7 @@ async function openStateDirectory(fsApi, stateDir) {
   return requireDirectoryHandle(await fsApi.openStateDirectoryNoFollow(stateDir));
 }
 
-export function createOwnershipStore({ stateDir, fsApi }) {
+export function createOwnershipStore({ stateDir, fsApi, skillsRoot }) {
   if (typeof stateDir !== "string" || !path.isAbsolute(stateDir) || !fsApi) {
     throw stateError("ownership_store_invalid");
   }
@@ -74,9 +74,9 @@ export function createOwnershipStore({ stateDir, fsApi }) {
     async load() {
       const directory = await openStateDirectory(fsApi, stateDir);
       try {
-        const main = await readValidated(directory, mainName);
+        const main = await readValidated(directory, mainName, skillsRoot);
         if (main.value) return main.value;
-        const backup = await readValidated(directory, backupName);
+        const backup = await readValidated(directory, backupName, skillsRoot);
         return backup.value ?? emptyState();
       } finally {
         await directory.close();
@@ -84,7 +84,7 @@ export function createOwnershipStore({ stateDir, fsApi }) {
     },
 
     async save(value) {
-      if (!isValidOwnershipState(value)) throw stateError("ownership_state_invalid");
+      if (!isValidOwnershipState(value, { skillsRoot })) throw stateError("ownership_state_invalid");
       const directory = await openStateDirectory(fsApi, stateDir);
       try {
         const existingTemp = await openExisting(directory, tempName);
@@ -107,8 +107,8 @@ export function createOwnershipStore({ stateDir, fsApi }) {
           await temp.close();
         }
 
-        const main = await readValidated(directory, mainName);
-        const backup = await readValidated(directory, backupName);
+        const main = await readValidated(directory, mainName, skillsRoot);
+        const backup = await readValidated(directory, backupName, skillsRoot);
         if (main.entry) {
           if (main.value) {
             if (backup.entry) await directory.unlinkEntryNoFollow(backup.entry);
