@@ -295,27 +295,35 @@ test("journal accepts the same strict abort/revert suffix for a pre-commit rollb
   ]);
 });
 
-test("recoverTransactions keeps a failed journal and clears it only after slot recovery succeeds", async () => {
+test("recoverTransactions rejects split recovery and delegates the complete journal lifecycle", async () => {
   const fake = createJournalFs();
   const journal = createTransactionJournal({ journalDir: "D:\\State\\transactions", fsApi: fake.fsApi });
   await journal.record(record());
-  const seen = [];
   await assert.rejects(
     recoverTransactions({
       journal,
-      slots: { async recoverTransaction(transaction) { seen.push(clone(transaction)); throw new Error("crash_again"); } },
+      slots: { async recoverTransaction() {} },
     }),
-    /crash_again/u,
+    /transaction_recovery_capability_invalid/u,
   );
   assert.equal((await journal.listTransactions()).length, 1);
 
+  const seen = [];
   const recovered = await recoverTransactions({
     journal,
-    slots: { async recoverTransaction(transaction) { seen.push(clone(transaction)); } },
+    slots: {
+      async recoverJournalTransactions(receivedJournal) {
+        assert.equal(receivedJournal, journal);
+        seen.push(receivedJournal);
+        const [transaction] = await receivedJournal.listTransactions();
+        await receivedJournal.clear(transaction);
+        return [{ taskId: transaction.taskId, componentId: transaction.componentId, mode: transaction.mode }];
+      },
+    },
   });
   assert.deepEqual(recovered, [{ taskId: "task-3", componentId: "chatgpt", mode: "promote" }]);
   assert.equal((await journal.listTransactions()).length, 0);
-  assert.equal(seen.length, 2);
+  assert.equal(seen.length, 1);
 });
 
 test("a crash while clearing a cleanup-committed journal remains recoverable and idempotent", async () => {

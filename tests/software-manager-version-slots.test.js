@@ -41,6 +41,19 @@ function emptyState() {
   };
 }
 
+function createSharedOwnershipBacking(initialState) {
+  let persisted = clone(initialState);
+  return {
+    createStore() {
+      return {
+        async load() { return clone(persisted); },
+        async save(next) { persisted = clone(next); },
+      };
+    },
+    state() { return clone(persisted); },
+  };
+}
+
 function createFixture({ componentId = "chatgpt", slots = {}, state = emptyState() } = {}) {
   const rootPath = componentId === "chatgpt"
     ? "D:\\CodexBridge\\ChatGPT"
@@ -519,7 +532,7 @@ test("second update moves oldest to retiring, commits ownership, then deletes re
   const oldRename = fixture.calls.findIndex((call) => call[0] === "rename-slot" && call[1] === "c" && call[2] === "cp");
   const newWal = fixture.calls.findIndex((call) => call[0] === "journal-commit" && call[1] === "chatgpt.new_promoted.json");
   const newRename = fixture.calls.findIndex((call) => call[0] === "rename-slot" && call[1] === "ct" && call[2] === "c");
-  const stateCommit = fixture.calls.findIndex((call) => call[0] === "state-commit");
+  const stateCommit = fixture.calls.findIndex((call) => call[0] === "state-commit" && call[1] === "3.0.0");
   const stateWal = fixture.calls.findIndex((call) => call[0] === "journal-commit" && call[1] === "chatgpt.state_committed.json");
   const deletion = fixture.calls.findIndex((call) => call[0] === "delete-slot" && call[1] === "cr");
   assert.ok(retiringWal < retireRename && oldWal < oldRename && newWal < newRename);
@@ -559,17 +572,15 @@ test("recovery authorizes the journal root and ownership snapshot before opening
     match: ({ from, to }) => from === "cp" && to === "cr",
   });
   await assert.rejects(fixture.manager.promotePreparedVersion(promotionPlan(fixture, "3.0.0")), /crash_after_retire/u);
-  const [pending] = await fixture.journal.listTransactions();
-  pending.snapshot.rootPath = "D:\\Outside\\ChatGPT";
-  pending.snapshot.paths = {
-    current: "D:\\Outside\\ChatGPT\\c",
-    previous: "D:\\Outside\\ChatGPT\\cp",
-    staging: "D:\\Outside\\ChatGPT\\ct",
-    retiring: "D:\\Outside\\ChatGPT\\cr",
-  };
+  const forgedState = fixture.state();
+  forgedState.installRoot = "D:\\Outside";
+  fixture.setState(forgedState);
   fixture.resetCalls();
 
-  await assert.rejects(fixture.manager.recoverTransaction(pending), /slot_root_not_owned/u);
+  await assert.rejects(
+    recoverTransactions({ journal: fixture.journal, slots: fixture.manager }),
+    /slot_root_not_owned/u,
+  );
   assert.equal(fixture.calls.some((call) => call[0] === "open-version-root"), false);
   assert.equal(fixture.calls.some((call) => ["rename-slot", "state-commit", "delete-slot"].includes(call[0])), false);
 });
@@ -634,7 +645,12 @@ for (const crash of [
   { name: "after retiring rename", kind: "rename", after: true, match: ({ from, to }) => from === "cp" && to === "cr" },
   { name: "after old-current rename", kind: "rename", after: true, match: ({ from, to }) => from === "c" && to === "cp" },
   { name: "after incoming rename", kind: "rename", after: true, match: ({ from, to }) => from === "ct" && to === "c" },
-  { name: "after ownership commit", kind: "state", after: true },
+  {
+    name: "after ownership commit",
+    kind: "state",
+    after: true,
+    match: (next) => next.components.chatgpt?.version === "3.0.0",
+  },
   { name: "before retiring deletion", kind: "delete", after: false },
   { name: "after retiring deletion", kind: "delete", after: true },
 ]) {
@@ -786,7 +802,12 @@ for (const crash of [
 for (const crash of [
   { name: "after current retires", kind: "rename", after: true, match: ({ from, to }) => from === "c" && to === "cr" },
   { name: "after previous becomes current", kind: "rename", after: true, match: ({ from, to }) => from === "cp" && to === "c" },
-  { name: "after rollback ownership commit", kind: "state", after: true },
+  {
+    name: "after rollback ownership commit",
+    kind: "state",
+    after: true,
+    match: (next) => next.components.chatgpt?.version === "1.0.0",
+  },
   { name: "before rejected-version deletion", kind: "delete", after: false },
   { name: "after rejected-version deletion", kind: "delete", after: true },
 ]) {
@@ -887,7 +908,10 @@ test("abort after ownership save but before its WAL restores the exact original 
   original.rollback[0].note = "preserve-this-metadata";
   original.lastTask = { taskId: "older-task", componentId: "git", action: "promote" };
   fixture.setState(original);
-  fixture.fail("state", new Error("crash_after_ownership_save"), { after: true });
+  fixture.fail("state", new Error("crash_after_ownership_save"), {
+    after: true,
+    match: (next) => next.components.chatgpt?.version === "3.0.0",
+  });
   await assert.rejects(
     fixture.manager.promotePreparedVersion(promotionPlan(fixture, "3.0.0")),
     /crash_after_ownership_save/u,
@@ -938,10 +962,16 @@ test("abort recovery is idempotent after restoring ownership but before its WAL 
     currentVersion: "2.0.0", previousVersion: "1.0.0", incomingVersion: "3.0.0",
   });
   const before = fixture.state();
-  fixture.fail("state", new Error("forward_state_crash"), { after: true });
+  fixture.fail("state", new Error("forward_state_crash"), {
+    after: true,
+    match: (next) => next.components.chatgpt?.version === "3.0.0",
+  });
   await assert.rejects(fixture.manager.promotePreparedVersion(promotionPlan(fixture, "3.0.0")), /forward_state_crash/u);
   fixture.damageSlot("c", "corrupt");
-  fixture.fail("state", new Error("abort_state_crash"), { after: true });
+  fixture.fail("state", new Error("abort_state_crash"), {
+    after: true,
+    match: (next) => next.components.chatgpt?.version === "2.0.0",
+  });
   await assert.rejects(
     recoverTransactions({ journal: fixture.journal, slots: fixture.manager }),
     /abort_state_crash/u,
@@ -1049,6 +1079,295 @@ test("a pending ChatGPT journal blocks Git until recovery clears the transaction
   await gitManager.promotePreparedVersion(promotionPlan(git, "2.46.0", "git"));
   assert.equal(persisted.components.chatgpt.version, "3.0.0");
   assert.equal(persisted.components.git.version, "2.46.0");
+});
+
+test("a pending ChatGPT transaction in a separate journal blocks Git until its owner recovers and clears it", async () => {
+  const chatgpt = fixtureWithInstalled({
+    currentVersion: "2.0.0", previousVersion: "1.0.0", incomingVersion: "3.0.0",
+  });
+  const git = createFixture({ componentId: "git", slots: { staging: null } });
+  const backing = createSharedOwnershipBacking(chatgpt.state());
+  const ownershipStore = backing.createStore();
+  const chatgptJournal = createTransactionJournal({
+    journalDir: "D:\\CodexBridge\\State\\chatgpt-transactions",
+    fsApi: chatgpt.fsApi,
+  });
+  const gitJournal = createTransactionJournal({
+    journalDir: "D:\\CodexBridge\\State\\git-transactions",
+    fsApi: git.fsApi,
+  });
+  const chatgptManager = createVersionSlotManager({
+    fsApi: chatgpt.fsApi, ownershipStore, journal: chatgptJournal,
+  });
+  const gitManager = createVersionSlotManager({
+    fsApi: git.fsApi, ownershipStore, journal: gitJournal,
+  });
+  chatgpt.fail("rename", new Error("chatgpt_separate_journal_crash"), {
+    after: true,
+    match: ({ from, to }) => from === "c" && to === "cp",
+  });
+  await assert.rejects(
+    chatgptManager.promotePreparedVersion(promotionPlan(chatgpt, "3.0.0")),
+    /chatgpt_separate_journal_crash/u,
+  );
+
+  await assert.rejects(
+    gitManager.promotePreparedVersion(promotionPlan(git, "2.46.0", "git")),
+    /slot_pending_transaction/u,
+  );
+  assert.equal(backing.state().components.git, undefined);
+  assert.equal((await recoverTransactions({ journal: chatgptJournal, slots: chatgptManager })).length, 1);
+  await gitManager.promotePreparedVersion(promotionPlan(git, "2.46.0", "git"));
+  assert.equal(backing.state().components.chatgpt.version, "3.0.0");
+  assert.equal(backing.state().components.git.version, "2.46.0");
+});
+
+test("a persisted pending transaction blocks new managers after process restart simulation", async () => {
+  const chatgpt = fixtureWithInstalled({
+    currentVersion: "2.0.0", previousVersion: "1.0.0", incomingVersion: "3.0.0",
+  });
+  const git = createFixture({ componentId: "git", slots: { staging: null } });
+  const backing = createSharedOwnershipBacking(chatgpt.state());
+  const chatgptJournalDir = "D:\\CodexBridge\\State\\restart-chatgpt-transactions";
+  const gitJournalDir = "D:\\CodexBridge\\State\\restart-git-transactions";
+  const firstChatgptManager = createVersionSlotManager({
+    fsApi: chatgpt.fsApi,
+    ownershipStore: backing.createStore(),
+    journal: createTransactionJournal({ journalDir: chatgptJournalDir, fsApi: chatgpt.fsApi }),
+  });
+  chatgpt.fail("rename", new Error("chatgpt_restart_pending_crash"), {
+    after: true,
+    match: ({ from, to }) => from === "c" && to === "cp",
+  });
+  await assert.rejects(
+    firstChatgptManager.promotePreparedVersion(promotionPlan(chatgpt, "3.0.0")),
+    /chatgpt_restart_pending_crash/u,
+  );
+
+  const restartedStore = backing.createStore();
+  const restartedChatgptJournal = createTransactionJournal({
+    journalDir: chatgptJournalDir,
+    fsApi: chatgpt.fsApi,
+  });
+  const restartedChatgptManager = createVersionSlotManager({
+    fsApi: chatgpt.fsApi, ownershipStore: restartedStore, journal: restartedChatgptJournal,
+  });
+  const restartedGitManager = createVersionSlotManager({
+    fsApi: git.fsApi,
+    ownershipStore: restartedStore,
+    journal: createTransactionJournal({ journalDir: gitJournalDir, fsApi: git.fsApi }),
+  });
+  await assert.rejects(
+    restartedGitManager.promotePreparedVersion(promotionPlan(git, "2.46.0", "git")),
+    /slot_pending_transaction/u,
+  );
+  assert.equal((await recoverTransactions({
+    journal: restartedChatgptJournal,
+    slots: restartedChatgptManager,
+  })).length, 1);
+  await restartedGitManager.promotePreparedVersion(promotionPlan(git, "2.46.0", "git"));
+  assert.equal(backing.state().components.chatgpt.version, "3.0.0");
+  assert.equal(backing.state().components.git.version, "2.46.0");
+});
+
+test("a cleanup tombstone in one journal blocks other journals only until atomic recovery clears it", async () => {
+  const chatgpt = fixtureWithInstalled({
+    currentVersion: "2.0.0", previousVersion: "1.0.0", incomingVersion: "3.0.0",
+  });
+  const git = createFixture({ componentId: "git", slots: { staging: null } });
+  const backing = createSharedOwnershipBacking(chatgpt.state());
+  const ownershipStore = backing.createStore();
+  const chatgptJournal = createTransactionJournal({
+    journalDir: "D:\\CodexBridge\\State\\tombstone-chatgpt-transactions",
+    fsApi: chatgpt.fsApi,
+  });
+  const gitJournal = createTransactionJournal({
+    journalDir: "D:\\CodexBridge\\State\\tombstone-git-transactions",
+    fsApi: git.fsApi,
+  });
+  const chatgptManager = createVersionSlotManager({
+    fsApi: chatgpt.fsApi, ownershipStore, journal: chatgptJournal,
+  });
+  const gitManager = createVersionSlotManager({
+    fsApi: git.fsApi, ownershipStore, journal: gitJournal,
+  });
+  chatgpt.fail("journal-unlink", new Error("chatgpt_tombstone_clear_crash"), {
+    after: true,
+    match: ({ name }) => name === "chatgpt.prepared.json",
+  });
+  await assert.rejects(
+    chatgptManager.promotePreparedVersion(promotionPlan(chatgpt, "3.0.0")),
+    /chatgpt_tombstone_clear_crash/u,
+  );
+
+  await assert.rejects(
+    gitManager.promotePreparedVersion(promotionPlan(git, "2.46.0", "git")),
+    /slot_pending_transaction/u,
+  );
+  assert.equal((await recoverTransactions({ journal: chatgptJournal, slots: chatgptManager })).length, 1);
+  await gitManager.promotePreparedVersion(promotionPlan(git, "2.46.0", "git"));
+  assert.equal(backing.state().components.chatgpt.version, "3.0.0");
+  assert.equal(backing.state().components.git.version, "2.46.0");
+});
+
+test("recovery holds the ownership-store lock through journal clear and claim release", async () => {
+  const chatgpt = fixtureWithInstalled({
+    currentVersion: "2.0.0", previousVersion: "1.0.0", incomingVersion: "3.0.0",
+  });
+  const git = createFixture({ componentId: "git", slots: { staging: null } });
+  const backing = createSharedOwnershipBacking(chatgpt.state());
+  const ownershipStore = backing.createStore();
+  const baseChatgptJournal = createTransactionJournal({
+    journalDir: "D:\\CodexBridge\\State\\atomic-chatgpt-transactions",
+    fsApi: chatgpt.fsApi,
+  });
+  let releaseClear;
+  let clearReached;
+  const clearStarted = new Promise((resolve) => { clearReached = resolve; });
+  const clearBarrier = new Promise((resolve) => { releaseClear = resolve; });
+  const chatgptJournal = Object.freeze({
+    scopeId: baseChatgptJournal.scopeId,
+    record: (...args) => baseChatgptJournal.record(...args),
+    listTransactions: (...args) => baseChatgptJournal.listTransactions(...args),
+    async clear(...args) {
+      clearReached();
+      await clearBarrier;
+      return baseChatgptJournal.clear(...args);
+    },
+  });
+  const gitJournal = createTransactionJournal({
+    journalDir: "D:\\CodexBridge\\State\\atomic-git-transactions",
+    fsApi: git.fsApi,
+  });
+  const chatgptManager = createVersionSlotManager({
+    fsApi: chatgpt.fsApi, ownershipStore, journal: chatgptJournal,
+  });
+  const gitManager = createVersionSlotManager({
+    fsApi: git.fsApi, ownershipStore, journal: gitJournal,
+  });
+  chatgpt.fail("rename", new Error("chatgpt_atomic_recovery_crash"), {
+    after: true,
+    match: ({ from, to }) => from === "c" && to === "cp",
+  });
+  await assert.rejects(
+    chatgptManager.promotePreparedVersion(promotionPlan(chatgpt, "3.0.0")),
+    /chatgpt_atomic_recovery_crash/u,
+  );
+
+  const recovery = recoverTransactions({ journal: chatgptJournal, slots: chatgptManager });
+  await clearStarted;
+  let gitOutcome;
+  const gitPromotion = gitManager.promotePreparedVersion(promotionPlan(git, "2.46.0", "git"))
+    .then(() => ({ ok: true }), (error) => ({ ok: false, error }));
+  gitPromotion.then((outcome) => { gitOutcome = outcome; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(gitOutcome, undefined);
+
+  releaseClear();
+  assert.equal((await recovery).length, 1);
+  assert.deepEqual(await gitPromotion, { ok: true });
+  assert.equal(backing.state().components.chatgpt.version, "3.0.0");
+  assert.equal(backing.state().components.git.version, "2.46.0");
+});
+
+test("restart recovery releases a clearing claim after its committed journal was fully cleared", async () => {
+  const chatgpt = fixtureWithInstalled({
+    currentVersion: "2.0.0", previousVersion: "1.0.0", incomingVersion: "3.0.0",
+  });
+  const git = createFixture({ componentId: "git", slots: { staging: null } });
+  const chatgptJournalDir = "D:\\CodexBridge\\State\\cleared-chatgpt-transactions";
+  const gitJournalDir = "D:\\CodexBridge\\State\\cleared-git-transactions";
+  const chatgptJournal = createTransactionJournal({
+    journalDir: chatgptJournalDir,
+    fsApi: chatgpt.fsApi,
+  });
+  let failRelease = true;
+  const firstStore = {
+    load: (...args) => chatgpt.ownershipStore.load(...args),
+    async save(next) {
+      if (failRelease && next.activeTask === null
+        && next.components.chatgpt?.version === "3.0.0") {
+        failRelease = false;
+        throw new Error("claim_release_crash");
+      }
+      return chatgpt.ownershipStore.save(next);
+    },
+  };
+  const firstManager = createVersionSlotManager({
+    fsApi: chatgpt.fsApi, ownershipStore: firstStore, journal: chatgptJournal,
+  });
+  await assert.rejects(
+    firstManager.promotePreparedVersion(promotionPlan(chatgpt, "3.0.0")),
+    /claim_release_crash/u,
+  );
+  assert.deepEqual(await chatgptJournal.listTransactions(), []);
+  assert.equal((await firstStore.load()).activeTask.lifecycle, "clearing");
+
+  const restartedStore = {
+    load: (...args) => chatgpt.ownershipStore.load(...args),
+    save: (...args) => chatgpt.ownershipStore.save(...args),
+  };
+  const restartedChatgptJournal = createTransactionJournal({
+    journalDir: chatgptJournalDir,
+    fsApi: chatgpt.fsApi,
+  });
+  const restartedChatgptManager = createVersionSlotManager({
+    fsApi: chatgpt.fsApi, ownershipStore: restartedStore, journal: restartedChatgptJournal,
+  });
+  const restartedGitManager = createVersionSlotManager({
+    fsApi: git.fsApi,
+    ownershipStore: restartedStore,
+    journal: createTransactionJournal({ journalDir: gitJournalDir, fsApi: git.fsApi }),
+  });
+  await assert.rejects(
+    restartedGitManager.promotePreparedVersion(promotionPlan(git, "2.46.0", "git")),
+    /slot_pending_transaction/u,
+  );
+  assert.deepEqual(await recoverTransactions({
+    journal: restartedChatgptJournal,
+    slots: restartedChatgptManager,
+  }), []);
+  assert.equal((await restartedStore.load()).activeTask, null);
+  await restartedGitManager.promotePreparedVersion(promotionPlan(git, "2.46.0", "git"));
+  assert.equal((await restartedStore.load()).components.chatgpt.version, "3.0.0");
+  assert.equal((await restartedStore.load()).components.git.version, "2.46.0");
+});
+
+test("a pending transaction does not block a manager backed by a different ownership store", async () => {
+  const chatgpt = fixtureWithInstalled({
+    currentVersion: "2.0.0", previousVersion: "1.0.0", incomingVersion: "3.0.0",
+  });
+  const git = createFixture({ componentId: "git", slots: { staging: null } });
+  const chatgptBacking = createSharedOwnershipBacking(chatgpt.state());
+  const gitBacking = createSharedOwnershipBacking(git.state());
+  const chatgptManager = createVersionSlotManager({
+    fsApi: chatgpt.fsApi,
+    ownershipStore: chatgptBacking.createStore(),
+    journal: createTransactionJournal({
+      journalDir: "D:\\CodexBridge\\State\\isolated-chatgpt-transactions",
+      fsApi: chatgpt.fsApi,
+    }),
+  });
+  const gitManager = createVersionSlotManager({
+    fsApi: git.fsApi,
+    ownershipStore: gitBacking.createStore(),
+    journal: createTransactionJournal({
+      journalDir: "D:\\CodexBridge\\State\\isolated-git-transactions",
+      fsApi: git.fsApi,
+    }),
+  });
+  chatgpt.fail("rename", new Error("chatgpt_isolated_pending_crash"), {
+    after: true,
+    match: ({ from, to }) => from === "c" && to === "cp",
+  });
+  await assert.rejects(
+    chatgptManager.promotePreparedVersion(promotionPlan(chatgpt, "3.0.0")),
+    /chatgpt_isolated_pending_crash/u,
+  );
+
+  await gitManager.promotePreparedVersion(promotionPlan(git, "2.46.0", "git"));
+  assert.equal(gitBacking.state().components.git.version, "2.46.0");
+  assert.equal(chatgptBacking.state().components.git, undefined);
 });
 
 test("retiring deletion re-loads and rejects ownership changed after this transaction committed", async () => {

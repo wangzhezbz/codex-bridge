@@ -9,6 +9,11 @@ const VERSION = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/u;
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
 const RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/iu;
+const ACTIVE_TRANSACTION_KIND = "software-version-slot";
+const ACTIVE_TRANSACTION_LIFECYCLES = new Set(["reserved", "active", "clearing"]);
+const ACTIVE_TRANSACTION_KEYS = [
+  "kind", "schemaVersion", "lifecycle", "journalScope", "taskId", "componentId", "mode", "rootPath",
+];
 const OWNERSHIP_STORE_LOCKS = new WeakMap();
 
 function slotError(code, cause) {
@@ -200,6 +205,43 @@ function sameJson(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function isVersionTransactionClaim(value) {
+  if (!hasExactKeys(value, ACTIVE_TRANSACTION_KEYS)
+    || value.kind !== ACTIVE_TRANSACTION_KIND || value.schemaVersion !== 1
+    || !ACTIVE_TRANSACTION_LIFECYCLES.has(value.lifecycle)
+    || typeof value.journalScope !== "string" || value.journalScope !== value.journalScope.toLowerCase()
+    || !TASK_ID.test(value.taskId ?? "") || !COMPONENT_IDS.has(value.componentId)
+    || !["promote", "rollback"].includes(value.mode)) {
+    return false;
+  }
+  try {
+    return canonicalRoot(value.journalScope) === value.journalScope
+      && canonicalRoot(value.rootPath) === value.rootPath;
+  } catch {
+    return false;
+  }
+}
+
+function transactionClaim(value, journalScope, lifecycle) {
+  const claim = {
+    kind: ACTIVE_TRANSACTION_KIND,
+    schemaVersion: 1,
+    lifecycle,
+    journalScope,
+    taskId: value.taskId,
+    componentId: value.componentId,
+    mode: value.mode,
+    rootPath: value.rootPath,
+  };
+  if (!isVersionTransactionClaim(claim)) throw slotError("slot_active_transaction_invalid");
+  return claim;
+}
+
+function claimMatches(value, transaction, journalScope, lifecycles = ACTIVE_TRANSACTION_LIFECYCLES) {
+  if (!isVersionTransactionClaim(value) || !lifecycles.has(value.lifecycle)) return false;
+  return sameJson(value, transactionClaim(transaction, journalScope, value.lifecycle));
+}
+
 function managedStateMatches(state, componentId, rootPath, current, previous) {
   try {
     requireManagedState(state, componentId, rootPath, current, previous);
@@ -240,7 +282,7 @@ function expectedPostOwnership(snapshot) {
       manifestDigest: desired.previous.manifestDigest,
       slotIdentity: structuredClone(desired.previous.identity),
     } : null,
-    activeTask: null,
+    activeTask: structuredClone(before.activeTask),
     lastTask: {
       taskId: snapshot.taskId,
       componentId: snapshot.componentId,
@@ -381,14 +423,97 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
     throw slotError("slot_ownership_store_required");
   }
   if (!journal || typeof journal.record !== "function" || typeof journal.listTransactions !== "function"
-    || typeof journal.clear !== "function") {
+    || typeof journal.clear !== "function" || typeof journal.scopeId !== "string") {
     throw slotError("slot_journal_required");
   }
+  let journalScope;
+  try {
+    journalScope = canonicalRoot(journal.scopeId);
+  } catch (error) {
+    throw slotError("slot_journal_required", error);
+  }
+  if (journalScope !== journalScope.toLowerCase()) throw slotError("slot_journal_required");
 
-  async function requireNoPendingTransaction() {
+  async function requireNoPendingTransaction(state) {
+    if (state?.activeTask !== null) throw slotError("slot_pending_transaction");
     const pending = await journal.listTransactions();
     if (!Array.isArray(pending)) throw slotError("slot_journal_invalid");
     if (pending.length !== 0) throw slotError("slot_pending_transaction");
+  }
+
+  async function releaseMatchingClaim(transaction, allowedLifecycles) {
+    const state = await ownershipStore.load();
+    if (state?.activeTask === null) return false;
+    if (!claimMatches(state?.activeTask, transaction, journalScope, allowedLifecycles)) {
+      throw slotError("slot_active_transaction_changed");
+    }
+    await ownershipStore.save({ ...structuredClone(state), activeTask: null });
+    return true;
+  }
+
+  async function beginTransaction(state, snapshot) {
+    const expectedActive = transactionClaim(snapshot, journalScope, "active");
+    if (!sameJson(snapshot.ownershipBefore.activeTask, expectedActive)) {
+      throw slotError("slot_active_transaction_invalid");
+    }
+    const reserved = transactionClaim(snapshot, journalScope, "reserved");
+    try {
+      await ownershipStore.save({ ...structuredClone(state), activeTask: reserved });
+    } catch (error) {
+      try {
+        await releaseMatchingClaim(snapshot, new Set(["reserved"]));
+      } catch {
+        // A persisted reservation remains recoverable by its journal scope.
+      }
+      throw error;
+    }
+    try {
+      await journal.record(snapshot);
+    } catch (error) {
+      let durable = true;
+      try {
+        const pending = await journal.listTransactions();
+        if (!Array.isArray(pending)) throw slotError("slot_journal_invalid");
+        durable = pending.some((transaction) => transaction.taskId === snapshot.taskId
+          && transaction.componentId === snapshot.componentId && transaction.mode === snapshot.mode);
+      } catch {
+        // Ambiguous journal state must retain its persistent reservation.
+      }
+      if (!durable) await releaseMatchingClaim(snapshot, new Set(["reserved"]));
+      throw error;
+    }
+    const reservedState = await ownershipStore.load();
+    if (!claimMatches(reservedState?.activeTask, snapshot, journalScope, new Set(["reserved", "active"]))) {
+      throw slotError("slot_active_transaction_changed");
+    }
+    if (reservedState.activeTask.lifecycle === "reserved") {
+      await ownershipStore.save({ ...structuredClone(reservedState), activeTask: expectedActive });
+    }
+  }
+
+  async function markTransactionClearing(snapshot) {
+    if (snapshot.ownershipBefore.activeTask === null) return;
+    if (!isVersionTransactionClaim(snapshot.ownershipBefore.activeTask)) {
+      throw slotError("slot_active_transaction_invalid");
+    }
+    const state = await ownershipStore.load();
+    if (!claimMatches(state?.activeTask, snapshot, journalScope, new Set(["active", "clearing"]))) {
+      throw slotError("slot_active_transaction_changed");
+    }
+    if (state.activeTask.lifecycle === "active") {
+      await ownershipStore.save({
+        ...structuredClone(state),
+        activeTask: transactionClaim(snapshot, journalScope, "clearing"),
+      });
+    }
+  }
+
+  async function finishAndClearTransaction(transaction) {
+    await markTransactionClearing(transaction.snapshot);
+    await journal.clear(transaction);
+    if (isVersionTransactionClaim(transaction.snapshot.ownershipBefore.activeTask)) {
+      await releaseMatchingClaim(transaction.snapshot, new Set(["clearing"]));
+    }
   }
 
   async function openRoot(rootPath) {
@@ -768,9 +893,9 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
 
   async function promotePreparedVersion(rawPlan) {
     const plan = validatePromotionPlan(rawPlan);
-    await requireNoPendingTransaction();
     const slots = namesFor(plan.componentId);
     const state = await ownershipStore.load();
+    await requireNoPendingTransaction(state);
     requireAuthorizedRoot(state, plan.rootPath, plan.componentId);
     const root = await openRoot(plan.rootPath);
     let incoming;
@@ -800,8 +925,13 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
         manifestDigest: plan.manifestDigest,
         identity: staging.descriptor.identity,
       }, plan.componentId);
-      snapshot = baseRecord({ ...plan, mode: "promote", incoming, current, previous, state });
-      await journal.record(snapshot);
+      const descriptor = { ...plan, mode: "promote" };
+      const claimedState = {
+        ...structuredClone(state),
+        activeTask: transactionClaim(descriptor, journalScope, "active"),
+      };
+      snapshot = baseRecord({ ...descriptor, incoming, current, previous, state: claimedState });
+      await beginTransaction(state, snapshot);
       const sealed = validateEvidence(await root.sealPreparedSlotNoFollow(staging.descriptor, {
         schemaVersion: 2,
         componentId: plan.componentId,
@@ -816,14 +946,14 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
 
     const transaction = { taskId: snapshot.taskId, componentId: snapshot.componentId, mode: snapshot.mode, snapshot };
     await executeTransaction(snapshot);
-    await journal.clear(transaction);
+    await finishAndClearTransaction(transaction);
     return { componentId: plan.componentId, version: plan.version, rollbackAvailable: current !== null };
   }
 
   async function rollbackVersion(componentId) {
     namesFor(componentId);
-    await requireNoPendingTransaction();
     const state = await ownershipStore.load();
+    await requireNoPendingTransaction(state);
     const rollback = rollbackFor(state, componentId);
     if (!rollback) throw slotError("rollback_not_available");
     const rootPath = canonicalRoot(rollback.rootPath);
@@ -844,21 +974,51 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
       await root.close();
     }
     requireManagedState(state, componentId, rootPath, current, previous);
-    const snapshot = baseRecord({
+    const descriptor = {
       taskId: `rollback-${componentId}`,
       componentId,
       mode: "rollback",
       rootPath,
+    };
+    const claimedState = {
+      ...structuredClone(state),
+      activeTask: transactionClaim(descriptor, journalScope, "active"),
+    };
+    const snapshot = baseRecord({
+      ...descriptor,
       incoming: null,
       current,
       previous,
-      state,
+      state: claimedState,
     });
-    await journal.record(snapshot);
+    await beginTransaction(state, snapshot);
     const transaction = { taskId: snapshot.taskId, componentId, mode: "rollback", snapshot };
     await executeTransaction(snapshot);
-    await journal.clear(transaction);
+    await finishAndClearTransaction(transaction);
     return { componentId, version: previous.version, rollbackAvailable: false };
+  }
+
+  async function prepareRecoveryClaim(snapshot, phases) {
+    const snapshotClaim = snapshot.ownershipBefore.activeTask;
+    if (snapshotClaim === null) return;
+    if (!isVersionTransactionClaim(snapshotClaim)) throw slotError("slot_recovery_claim_invalid");
+    if (!claimMatches(snapshotClaim, snapshot, journalScope, new Set(["active"]))) {
+      throw slotError("slot_recovery_claim_invalid");
+    }
+    const state = await ownershipStore.load();
+    if (!claimMatches(state?.activeTask, snapshot, journalScope)) {
+      throw slotError("slot_recovery_claim_mismatch");
+    }
+    if (state.activeTask.lifecycle === "clearing"
+      && !phases.has("cleanup_committed") && !phases.has("abort_cleanup_committed")) {
+      throw slotError("slot_recovery_claim_phase_invalid");
+    }
+    if (state.activeTask.lifecycle !== "active") {
+      await ownershipStore.save({
+        ...structuredClone(state),
+        activeTask: transactionClaim(snapshot, journalScope, "active"),
+      });
+    }
   }
 
   async function recoverTransaction(transaction) {
@@ -869,6 +1029,7 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
     const phases = new Set(Array.isArray(transaction.records)
       ? transaction.records.map((record) => record.phase)
       : []);
+    await prepareRecoveryClaim(transaction.snapshot, phases);
     const hasAbortPhase = [...phases].some((phase) => phase.startsWith("abort_"));
     const state = await ownershipStore.load();
     requireRecoveryOwnershipState(state, transaction.snapshot, {
@@ -900,6 +1061,33 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
     await executeTransaction(transaction.snapshot);
   }
 
+  async function recoverJournalTransactions(recoveryJournal) {
+    if (recoveryJournal !== journal) throw slotError("slot_recovery_journal_mismatch");
+    const transactions = await journal.listTransactions();
+    if (!Array.isArray(transactions)) throw slotError("slot_journal_invalid");
+    if (transactions.length === 0) {
+      const state = await ownershipStore.load();
+      const active = state?.activeTask;
+      if (isVersionTransactionClaim(active) && active.journalScope === journalScope) {
+        if (active.lifecycle === "active") throw slotError("slot_recovery_journal_missing");
+        await releaseMatchingClaim(active, new Set([active.lifecycle]));
+      }
+      return [];
+    }
+
+    const recovered = [];
+    for (const transaction of transactions) {
+      await recoverTransaction(transaction);
+      await finishAndClearTransaction(transaction);
+      recovered.push({
+        taskId: transaction.taskId,
+        componentId: transaction.componentId,
+        mode: transaction.mode,
+      });
+    }
+    return recovered;
+  }
+
   return Object.freeze({
     promotePreparedVersion(rawPlan) {
       return withOwnershipStoreLock(ownershipStore, () => promotePreparedVersion(rawPlan));
@@ -907,8 +1095,11 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
     rollbackVersion(componentId) {
       return withOwnershipStoreLock(ownershipStore, () => rollbackVersion(componentId));
     },
-    recoverTransaction(transaction) {
-      return withOwnershipStoreLock(ownershipStore, () => recoverTransaction(transaction));
+    recoverJournalTransactions(recoveryJournal) {
+      return withOwnershipStoreLock(
+        ownershipStore,
+        () => recoverJournalTransactions(recoveryJournal),
+      );
     },
   });
 }

@@ -303,7 +303,7 @@ export function createTransactionJournal({ journalDir, fsApi }) {
   if (!fsApi || typeof fsApi.openJournalDirectoryNoFollow !== "function") {
     throw journalError("transaction_journal_no_follow_capability_required");
   }
-  canonicalRoot(journalDir);
+  const scopeId = canonicalRoot(journalDir).toLowerCase();
 
   async function openDirectory() {
     return requireDirectory(await fsApi.openJournalDirectoryNoFollow(journalDir));
@@ -442,23 +442,13 @@ export function createTransactionJournal({ journalDir, fsApi }) {
     }
   }
 
-  return Object.freeze({ record, listTransactions, clear });
+  return Object.freeze({ scopeId, record, listTransactions, clear });
 }
 
 export async function recoverTransactions({ journal, slots }) {
   if (!journal || typeof journal.listTransactions !== "function" || typeof journal.clear !== "function"
-    || !slots || typeof slots.recoverTransaction !== "function") {
+    || !slots || typeof slots.recoverJournalTransactions !== "function") {
     throw journalError("transaction_recovery_capability_invalid");
   }
-  const recovered = [];
-  for (const transaction of await journal.listTransactions()) {
-    await slots.recoverTransaction(transaction);
-    await journal.clear(transaction);
-    recovered.push({
-      taskId: transaction.taskId,
-      componentId: transaction.componentId,
-      mode: transaction.mode,
-    });
-  }
-  return recovered;
+  return slots.recoverJournalTransactions(journal);
 }
