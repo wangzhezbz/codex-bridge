@@ -3,10 +3,13 @@ import path from "node:path";
 import { deleteAuthorizedTree } from "./safe-delete.mjs";
 
 const COMPONENT_IDS = new Set(["chatgpt", "v2rayn", "git"]);
+const COMPONENT_ROOT_NAMES = Object.freeze({ chatgpt: "ChatGPT", v2rayn: "V2RayN", git: "Git" });
 const SLOT_KEYS = ["current", "previous", "staging", "retiring"];
 const VERSION = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/u;
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
+const SHA256 = /^[a-f0-9]{64}$/u;
 const RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/iu;
+const OWNERSHIP_STORE_LOCKS = new WeakMap();
 
 function slotError(code, cause) {
   const error = new Error(code, cause === undefined ? undefined : { cause });
@@ -64,9 +67,12 @@ function sameIdentity(left, right) {
 }
 
 function validateEvidence(value, componentId) {
-  if (!hasExactKeys(value, ["schemaVersion", "componentId", "version", "identity"])
-    || value.schemaVersion !== 1 || value.componentId !== componentId
-    || typeof value.version !== "string" || !VERSION.test(value.version)) {
+  if (!hasExactKeys(value, [
+    "schemaVersion", "componentId", "version", "treeDigest", "manifestDigest", "identity",
+  ])
+    || value.schemaVersion !== 2 || value.componentId !== componentId
+    || typeof value.version !== "string" || !VERSION.test(value.version)
+    || !SHA256.test(value.treeDigest ?? "") || !SHA256.test(value.manifestDigest ?? "")) {
     throw slotError("slot_complete_evidence_invalid");
   }
   identityKey(value.identity);
@@ -92,11 +98,13 @@ function validateOpenedSlot(value, expectedName, componentId, { allowIncomplete 
     || !sameIdentity(value.descriptor.identity, value.descriptor.identity)) {
     throw slotError("slot_descriptor_invalid");
   }
-  if (value.evidence === null && allowIncomplete) return value;
+  if (value.evidence === null && allowIncomplete) {
+    return { descriptor: value.descriptor, evidence: null, markerStatus: value.markerStatus ?? "missing" };
+  }
   if (value.evidence === null) throw slotError("slot_complete_evidence_required");
   const evidence = validateEvidence(value.evidence, componentId);
   if (!sameIdentity(evidence.identity, value.descriptor.identity)) throw slotError("slot_identity_changed");
-  return { descriptor: value.descriptor, evidence };
+  return { descriptor: value.descriptor, evidence, markerStatus: value.markerStatus ?? "complete" };
 }
 
 function rollbackRecords(state) {
@@ -114,31 +122,53 @@ function withoutRollback(state, componentId) {
   return remaining;
 }
 
-function requireAuthorizedRoot(state, rootPath) {
+async function withOwnershipStoreLock(store, action) {
+  const previous = OWNERSHIP_STORE_LOCKS.get(store) ?? Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const tail = previous.then(() => gate, () => gate);
+  OWNERSHIP_STORE_LOCKS.set(store, tail);
+  await previous.catch(() => {});
+  try {
+    return await action();
+  } finally {
+    release();
+    if (OWNERSHIP_STORE_LOCKS.get(store) === tail) OWNERSHIP_STORE_LOCKS.delete(store);
+  }
+}
+
+function requireAuthorizedRoot(state, rootPath, componentId) {
   let installRoot;
   try {
     installRoot = canonicalRoot(state?.installRoot);
   } catch (error) {
     throw slotError("slot_root_not_owned", error);
   }
-  if (path.win32.dirname(rootPath) !== installRoot) throw slotError("slot_root_not_owned");
+  if (path.win32.dirname(rootPath) !== installRoot
+    || rootPath !== path.win32.join(installRoot, COMPONENT_ROOT_NAMES[componentId])) {
+    throw slotError("slot_root_not_owned");
+  }
 }
 
 function evidenceMatches(left, right) {
   return left !== null && right !== null
     && left.componentId === right.componentId && left.version === right.version
+    && left.treeDigest === right.treeDigest && left.manifestDigest === right.manifestDigest
     && sameIdentity(left.identity, right.identity);
 }
 
 function requireManagedState(state, componentId, rootPath, current, previous) {
-  requireAuthorizedRoot(state, rootPath);
+  requireAuthorizedRoot(state, rootPath, componentId);
   const component = state?.components?.[componentId];
   const names = namesFor(componentId);
   if (current === null) {
     if (component !== undefined) throw slotError("slot_ownership_mismatch");
   } else if (!isPlainRecord(component)
+    || component.managed !== true
     || component.installPath !== path.win32.join(rootPath, names.current)
     || component.version !== current.version
+    || component.treeDigest !== current.treeDigest
+    || component.manifestDigest !== current.manifestDigest
     || !sameIdentity(component.slotIdentity, current.identity)) {
     throw slotError("slot_ownership_mismatch");
   }
@@ -148,15 +178,106 @@ function requireManagedState(state, componentId, rootPath, current, previous) {
   } else if (!isPlainRecord(rollback)
     || rollback.path !== path.win32.join(rootPath, names.previous)
     || rollback.rootPath !== rootPath || rollback.version !== previous.version
+    || rollback.treeDigest !== previous.treeDigest
+    || rollback.manifestDigest !== previous.manifestDigest
     || !sameIdentity(rollback.slotIdentity, previous.identity)) {
     throw slotError("slot_rollback_ownership_mismatch");
   }
 }
 
-function baseRecord({ taskId, componentId, mode, rootPath, incoming, current, previous }) {
+function ownershipSlice(state, componentId) {
+  return {
+    component: state.components[componentId] === undefined
+      ? null
+      : structuredClone(state.components[componentId]),
+    rollback: structuredClone(rollbackFor(state, componentId)),
+    activeTask: structuredClone(state.activeTask),
+    lastTask: structuredClone(state.lastTask),
+  };
+}
+
+function sameJson(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function managedStateMatches(state, componentId, rootPath, current, previous) {
+  try {
+    requireManagedState(state, componentId, rootPath, current, previous);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function desiredEvidence(snapshot) {
+  const incoming = evidenceFromSnapshot(snapshot, "incoming");
+  const current = evidenceFromSnapshot(snapshot, "current");
+  const previous = evidenceFromSnapshot(snapshot, "previous");
+  return snapshot.mode === "promote"
+    ? { current: incoming, previous: current }
+    : { current: previous, previous: null };
+}
+
+function expectedPostOwnership(snapshot) {
+  const desired = desiredEvidence(snapshot);
+  const before = snapshot.ownershipBefore;
+  return {
+    component: {
+      ...(isPlainRecord(before.component) ? structuredClone(before.component) : {}),
+      installPath: snapshot.paths.current,
+      version: desired.current.version,
+      treeDigest: desired.current.treeDigest,
+      manifestDigest: desired.current.manifestDigest,
+      slotIdentity: structuredClone(desired.current.identity),
+      managed: true,
+    },
+    rollback: desired.previous ? {
+      path: snapshot.paths.previous,
+      rootPath: snapshot.rootPath,
+      componentId: snapshot.componentId,
+      version: desired.previous.version,
+      treeDigest: desired.previous.treeDigest,
+      manifestDigest: desired.previous.manifestDigest,
+      slotIdentity: structuredClone(desired.previous.identity),
+    } : null,
+    activeTask: null,
+    lastTask: {
+      taskId: snapshot.taskId,
+      componentId: snapshot.componentId,
+      action: snapshot.mode === "promote" ? "promote" : "rollback",
+    },
+  };
+}
+
+function applyOwnershipSlice(state, componentId, slice) {
+  const next = structuredClone(state);
+  if (slice.component === null) delete next.components[componentId];
+  else next.components[componentId] = structuredClone(slice.component);
+  next.rollback = withoutRollback(next, componentId);
+  if (slice.rollback !== null) {
+    next.rollback = [...rollbackRecords(next), structuredClone(slice.rollback)];
+  }
+  next.activeTask = structuredClone(slice.activeTask);
+  next.lastTask = structuredClone(slice.lastTask);
+  return next;
+}
+
+function requireRecoveryOwnershipState(state, snapshot) {
+  requireAuthorizedRoot(state, snapshot.rootPath, snapshot.componentId);
+  const slice = ownershipSlice(state, snapshot.componentId);
+  const preMatches = sameJson(slice, snapshot.ownershipBefore);
+  const desired = desiredEvidence(snapshot);
+  const postMatches = sameJson(slice, expectedPostOwnership(snapshot)) && managedStateMatches(
+    state, snapshot.componentId, snapshot.rootPath, desired.current, desired.previous,
+  );
+  if (!preMatches && !postMatches) throw slotError("slot_recovery_ownership_mismatch");
+  return postMatches ? "post" : "pre";
+}
+
+function baseRecord({ taskId, componentId, mode, rootPath, incoming, current, previous, state }) {
   const slots = namesFor(componentId);
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     taskId,
     componentId,
     mode,
@@ -174,15 +295,29 @@ function baseRecord({ taskId, componentId, mode, rootPath, incoming, current, pr
       current: current?.identity ?? null,
       previous: previous?.identity ?? null,
     },
+    integrities: {
+      incoming: incoming ? {
+        treeDigest: incoming.treeDigest, manifestDigest: incoming.manifestDigest,
+      } : null,
+      current: current ? {
+        treeDigest: current.treeDigest, manifestDigest: current.manifestDigest,
+      } : null,
+      previous: previous ? {
+        treeDigest: previous.treeDigest, manifestDigest: previous.manifestDigest,
+      } : null,
+    },
+    ownershipBefore: ownershipSlice(state, componentId),
   };
 }
 
 function evidenceFromSnapshot(snapshot, key) {
   if (snapshot.versions[key] === null || snapshot.identities[key] === null) return null;
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     componentId: snapshot.componentId,
     version: snapshot.versions[key],
+    treeDigest: snapshot.integrities[key].treeDigest,
+    manifestDigest: snapshot.integrities[key].manifestDigest,
     identity: structuredClone(snapshot.identities[key]),
   };
 }
@@ -192,9 +327,13 @@ function phaseRecord(snapshot, phase) {
 }
 
 function validatePromotionPlan(plan) {
-  if (!hasExactKeys(plan, ["taskId", "componentId", "rootPath", "version"])
+  if (!hasExactKeys(plan, [
+    "taskId", "componentId", "rootPath", "version", "verificationReceipt", "manifestDigest",
+  ])
     || !TASK_ID.test(plan.taskId ?? "") || !COMPONENT_IDS.has(plan.componentId)
-    || typeof plan.version !== "string" || !VERSION.test(plan.version)) {
+    || typeof plan.version !== "string" || !VERSION.test(plan.version)
+    || plan.verificationReceipt === null || typeof plan.verificationReceipt !== "object"
+    || !SHA256.test(plan.manifestDigest ?? "")) {
     throw slotError("slot_promotion_plan_invalid");
   }
   return { ...plan, rootPath: canonicalRoot(plan.rootPath) };
@@ -228,14 +367,19 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
     return validateRootCapability(await fsApi.openVersionRootNoFollow(rootPath));
   }
 
-  async function inspectLayout(snapshot, { allowIncompleteStaging = false } = {}) {
+  async function inspectLayout(snapshot, {
+    allowIncompleteStaging = false,
+    allowIncompleteRetiring = false,
+    allowIncompleteAny = false,
+  } = {}) {
     const root = await openRoot(snapshot.rootPath);
     try {
       const layout = {};
       for (const key of SLOT_KEYS) {
         const opened = await root.openSlotNoFollow(snapshot.slots[key]);
         layout[key] = validateOpenedSlot(opened, snapshot.slots[key], snapshot.componentId, {
-          allowIncomplete: allowIncompleteStaging && key === "staging",
+          allowIncomplete: allowIncompleteAny || (allowIncompleteStaging && key === "staging")
+            || (allowIncompleteRetiring && key === "retiring"),
         });
       }
       return layout;
@@ -251,6 +395,14 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
     return locations[0] ?? null;
   }
 
+  function locateByIdentity(layout, evidence) {
+    if (!evidence) return null;
+    const locations = SLOT_KEYS.filter((key) => layout[key]
+      && sameIdentity(layout[key].descriptor.identity, evidence.identity));
+    if (locations.length > 1) throw slotError("slot_identity_duplicated");
+    return locations[0] ?? null;
+  }
+
   function assertRecognizedLayout(layout, snapshot) {
     const recognized = ["incoming", "current", "previous"]
       .map((key) => evidenceFromSnapshot(snapshot, key))
@@ -260,6 +412,31 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
         throw slotError("slot_unrecognized_complete_version");
       }
     }
+  }
+
+  function assertAbortLayout(layout, snapshot) {
+    const incoming = evidenceFromSnapshot(snapshot, "incoming");
+    const recognized = ["incoming", "current", "previous"]
+      .map((key) => evidenceFromSnapshot(snapshot, key))
+      .filter(Boolean);
+    for (const slot of Object.values(layout)) {
+      if (!slot) continue;
+      if (recognized.some((evidence) => evidenceMatches(slot.evidence, evidence))) continue;
+      if (slot.evidence === null && incoming
+        && sameIdentity(slot.descriptor.identity, incoming.identity)) continue;
+      throw slotError("slot_unrecognized_complete_version");
+    }
+  }
+
+  function slotMatchesEvidence(slot, evidence, { allowMarkerless = false } = {}) {
+    if (!slot || !evidence) return false;
+    if (evidenceMatches(slot.evidence, evidence)) return true;
+    return allowMarkerless && slot.evidence === null && slot.markerStatus === "missing"
+      && sameIdentity(slot.descriptor.identity, evidence.identity);
+  }
+
+  function optionalSlotMatches(slot, evidence) {
+    return evidence === null ? slot === null : slotMatchesEvidence(slot, evidence);
   }
 
   async function moveIfNeeded(snapshot, phase, sourceKey, destinationKey, evidence) {
@@ -288,45 +465,145 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
     }
   }
 
-  async function commitOwnership(snapshot) {
+  async function revertMoveIfNeeded(snapshot, phase, sourceKey, destinationKey, evidence, {
+    allowIncomplete = false,
+    allowMissing = false,
+  } = {}) {
+    await journal.record(phaseRecord(snapshot, phase));
+    if (!evidence) return;
+    const layout = await inspectLayout(snapshot, { allowIncompleteAny: true });
+    assertAbortLayout(layout, snapshot);
+    const location = allowIncomplete ? locateByIdentity(layout, evidence) : locate(layout, evidence);
+    if (location === destinationKey) return;
+    if (location === null && allowMissing) return;
+    if (location !== sourceKey) throw slotError("slot_complete_version_missing");
+    if (layout[destinationKey] !== null) throw slotError("slot_destination_occupied");
+
+    const root = await openRoot(snapshot.rootPath);
+    try {
+      const source = validateOpenedSlot(
+        await root.openSlotNoFollow(snapshot.slots[sourceKey]),
+        snapshot.slots[sourceKey],
+        snapshot.componentId,
+        { allowIncomplete },
+      );
+      if (!source || (allowIncomplete
+        ? !sameIdentity(source.descriptor.identity, evidence.identity)
+        : !evidenceMatches(source.evidence, evidence))) {
+        throw slotError("slot_identity_changed");
+      }
+      if (await root.openSlotNoFollow(snapshot.slots[destinationKey]) !== null) {
+        throw slotError("slot_destination_occupied");
+      }
+      await root.renameSlotNoReplace(source.descriptor, snapshot.slots[destinationKey]);
+    } finally {
+      await root.close();
+    }
+  }
+
+  async function restorePreOwnership(snapshot) {
     const state = await ownershipStore.load();
-    if (!isPlainRecord(state) || !isPlainRecord(state.components)) throw slotError("slot_ownership_state_invalid");
+    const stateKind = requireRecoveryOwnershipState(state, snapshot);
+    if (stateKind === "pre") return;
+    await ownershipStore.save(applyOwnershipSlice(state, snapshot.componentId, snapshot.ownershipBefore));
+  }
+
+  async function deleteAbortedIncoming(snapshot) {
+    const incoming = evidenceFromSnapshot(snapshot, "incoming");
+    if (!incoming) return;
+    const layout = await inspectLayout(snapshot, { allowIncompleteAny: true });
+    assertAbortLayout(layout, snapshot);
+    const location = locateByIdentity(layout, incoming);
+    if (location === null) return;
+    const candidate = layout[location];
+    if (candidate.evidence !== null) throw slotError("slot_abort_complete_version_protected");
+    if (location !== "staging") throw slotError("slot_abort_incoming_not_isolated");
+    const root = await openRoot(snapshot.rootPath);
+    try {
+      const opened = validateOpenedSlot(
+        await root.openSlotNoFollow(snapshot.slots.staging),
+        snapshot.slots.staging,
+        snapshot.componentId,
+        { allowIncomplete: true },
+      );
+      if (!opened || opened.evidence !== null
+        || !sameIdentity(opened.descriptor.identity, incoming.identity)) {
+        throw slotError("slot_abort_incoming_changed");
+      }
+      await deleteAuthorizedTree({
+        target: snapshot.paths.staging,
+        authorizedRoot: snapshot.rootPath,
+        rootHandle: root,
+        targetDescriptor: opened.descriptor,
+      });
+    } finally {
+      await root.close();
+    }
+  }
+
+  async function abortTransaction(snapshot) {
     const incoming = evidenceFromSnapshot(snapshot, "incoming");
     const current = evidenceFromSnapshot(snapshot, "current");
     const previous = evidenceFromSnapshot(snapshot, "previous");
-    const desiredCurrent = snapshot.mode === "promote" ? incoming : previous;
-    const desiredPrevious = snapshot.mode === "promote" ? current : null;
-    const next = structuredClone(state);
-    next.components[snapshot.componentId] = {
-      ...(isPlainRecord(next.components[snapshot.componentId]) ? next.components[snapshot.componentId] : {}),
-      installPath: snapshot.paths.current,
-      version: desiredCurrent.version,
-      slotIdentity: structuredClone(desiredCurrent.identity),
-      managed: true,
-    };
-    next.rollback = withoutRollback(next, snapshot.componentId);
-    if (desiredPrevious) {
-      const record = {
-        path: snapshot.paths.previous,
-        rootPath: snapshot.rootPath,
-        componentId: snapshot.componentId,
-        version: desiredPrevious.version,
-        slotIdentity: structuredClone(desiredPrevious.identity),
-      };
-      next.rollback = [...rollbackRecords(next), record];
+    await journal.record(phaseRecord(snapshot, "abort_started"));
+    await revertMoveIfNeeded(
+      snapshot, "abort_incoming_isolated", "current", "staging", incoming,
+      { allowIncomplete: true, allowMissing: true },
+    );
+    await revertMoveIfNeeded(snapshot, "abort_current_restored", "previous", "current", current);
+    await revertMoveIfNeeded(snapshot, "abort_previous_restored", "retiring", "previous", previous);
+    await journal.record(phaseRecord(snapshot, "abort_state_restoring"));
+    await restorePreOwnership(snapshot);
+    await journal.record(phaseRecord(snapshot, "abort_cleanup_started"));
+    await deleteAbortedIncoming(snapshot);
+    await journal.record(phaseRecord(snapshot, "abort_cleanup_committed"));
+  }
+
+  async function finishAbortedTransaction(snapshot) {
+    const state = await ownershipStore.load();
+    requireAuthorizedRoot(state, snapshot.rootPath, snapshot.componentId);
+    if (!managedStateMatches(
+      state,
+      snapshot.componentId,
+      snapshot.rootPath,
+      evidenceFromSnapshot(snapshot, "current"),
+      evidenceFromSnapshot(snapshot, "previous"),
+    )) {
+      throw slotError("slot_abort_ownership_mismatch");
     }
-    next.activeTask = null;
-    next.lastTask = {
-      taskId: snapshot.taskId,
-      componentId: snapshot.componentId,
-      action: snapshot.mode === "promote" ? "promote" : "rollback",
-    };
-    await ownershipStore.save(next);
+    const layout = await inspectLayout(snapshot, { allowIncompleteAny: true });
+    assertAbortLayout(layout, snapshot);
+    const incoming = evidenceFromSnapshot(snapshot, "incoming");
+    if (locateByIdentity(layout, incoming) !== null
+      || !optionalSlotMatches(layout.current, evidenceFromSnapshot(snapshot, "current"))
+      || !optionalSlotMatches(layout.previous, evidenceFromSnapshot(snapshot, "previous"))
+      || layout.retiring !== null) {
+      throw slotError("slot_abort_layout_invalid");
+    }
+  }
+
+  async function commitOwnership(snapshot) {
+    const state = await ownershipStore.load();
+    if (!isPlainRecord(state) || !isPlainRecord(state.components)) throw slotError("slot_ownership_state_invalid");
+    const stateKind = requireRecoveryOwnershipState(state, snapshot);
+    if (stateKind === "pre") {
+      await ownershipStore.save(applyOwnershipSlice(
+        state, snapshot.componentId, expectedPostOwnership(snapshot),
+      ));
+    }
+    const confirmed = await ownershipStore.load();
+    if (requireRecoveryOwnershipState(confirmed, snapshot) !== "post") {
+      throw slotError("slot_ownership_commit_lost");
+    }
     await journal.record(phaseRecord(snapshot, "state_committed"));
   }
 
-  async function deleteRetiring(snapshot, evidence, desiredCurrent) {
+  async function deleteRetiring(snapshot, evidence, desiredCurrent, { allowMarkerless = false } = {}) {
     if (!evidence) return;
+    const state = await ownershipStore.load();
+    if (requireRecoveryOwnershipState(state, snapshot) !== "post") {
+      throw slotError("slot_retiring_state_changed");
+    }
     const root = await openRoot(snapshot.rootPath);
     try {
       const current = validateOpenedSlot(
@@ -337,9 +614,12 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
       }
       const retiring = validateOpenedSlot(
         await root.openSlotNoFollow(snapshot.slots.retiring), snapshot.slots.retiring, snapshot.componentId,
+        { allowIncomplete: allowMarkerless },
       );
       if (!retiring) return;
-      if (!evidenceMatches(retiring.evidence, evidence)) throw slotError("slot_retiring_identity_changed");
+      if (!slotMatchesEvidence(retiring, evidence, { allowMarkerless })) {
+        throw slotError("slot_retiring_identity_changed");
+      }
       await deleteAuthorizedTree({
         target: snapshot.paths.retiring,
         authorizedRoot: snapshot.rootPath,
@@ -370,7 +650,7 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
         throw slotError("slot_promotion_postcondition_failed");
       }
       await commitOwnership(snapshot);
-      await deleteRetiring(snapshot, previous, incoming);
+      await deleteRetiring(snapshot, previous, incoming, { allowMarkerless: true });
       await journal.record(phaseRecord(snapshot, "cleanup_committed"));
       return;
     }
@@ -380,7 +660,7 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
     const layout = await inspectLayout(snapshot);
     if (!evidenceMatches(layout.current?.evidence, previous)) throw slotError("slot_rollback_postcondition_failed");
     await commitOwnership(snapshot);
-    await deleteRetiring(snapshot, current, previous);
+    await deleteRetiring(snapshot, current, previous, { allowMarkerless: true });
     await journal.record(phaseRecord(snapshot, "cleanup_committed"));
   }
 
@@ -391,17 +671,19 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
     const desiredCurrent = snapshot.mode === "promote" ? incoming : previous;
     const desiredPrevious = snapshot.mode === "promote" ? current : null;
     const retired = snapshot.mode === "promote" ? previous : current;
-    const layout = await inspectLayout(snapshot);
-    assertRecognizedLayout(layout, snapshot);
+    const layout = await inspectLayout(snapshot, { allowIncompleteRetiring: true });
+    const retiringRecognized = layout.retiring === null
+      || slotMatchesEvidence(layout.retiring, retired, { allowMarkerless: true });
+    assertRecognizedLayout({ ...layout, retiring: retiringRecognized ? null : layout.retiring }, snapshot);
     if (!evidenceMatches(layout.current?.evidence, desiredCurrent)
       || (desiredPrevious === null ? layout.previous !== null : !evidenceMatches(layout.previous?.evidence, desiredPrevious))
       || layout.staging !== null
-      || (layout.retiring !== null && !evidenceMatches(layout.retiring.evidence, retired))) {
+      || !retiringRecognized) {
       throw slotError("slot_committed_layout_invalid");
     }
     const state = await ownershipStore.load();
     requireManagedState(state, snapshot.componentId, snapshot.rootPath, desiredCurrent, desiredPrevious);
-    await deleteRetiring(snapshot, retired, desiredCurrent);
+    await deleteRetiring(snapshot, retired, desiredCurrent, { allowMarkerless: true });
     await journal.record(phaseRecord(snapshot, "cleanup_committed"));
   }
 
@@ -409,7 +691,7 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
     const plan = validatePromotionPlan(rawPlan);
     const slots = namesFor(plan.componentId);
     const state = await ownershipStore.load();
-    requireAuthorizedRoot(state, plan.rootPath);
+    requireAuthorizedRoot(state, plan.rootPath, plan.componentId);
     const root = await openRoot(plan.rootPath);
     let incoming;
     let current;
@@ -419,12 +701,6 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
         await root.openSlotNoFollow(slots.staging), slots.staging, plan.componentId, { allowIncomplete: true },
       );
       if (!staging) throw slotError("slot_staging_missing");
-      incoming = staging.evidence ?? validateEvidence(await root.sealPreparedSlotNoFollow(staging.descriptor, {
-        schemaVersion: 1,
-        componentId: plan.componentId,
-        version: plan.version,
-      }), plan.componentId);
-      if (incoming.version !== plan.version) throw slotError("slot_staging_version_mismatch");
       const openedCurrent = validateOpenedSlot(
         await root.openSlotNoFollow(slots.current), slots.current, plan.componentId,
       );
@@ -434,12 +710,20 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
       current = openedCurrent?.evidence ?? null;
       previous = openedPrevious?.evidence ?? null;
       if (await root.openSlotNoFollow(slots.retiring) !== null) throw slotError("slot_recovery_required");
+      requireManagedState(state, plan.componentId, plan.rootPath, current, previous);
+      incoming = validateEvidence(await root.sealPreparedSlotNoFollow(staging.descriptor, {
+        schemaVersion: 2,
+        componentId: plan.componentId,
+        version: plan.version,
+        manifestDigest: plan.manifestDigest,
+      }, plan.verificationReceipt), plan.componentId);
+      if (incoming.version !== plan.version) throw slotError("slot_staging_version_mismatch");
+      if (incoming.manifestDigest !== plan.manifestDigest) throw slotError("slot_staging_manifest_mismatch");
     } finally {
       await root.close();
     }
 
-    requireManagedState(state, plan.componentId, plan.rootPath, current, previous);
-    const snapshot = baseRecord({ ...plan, mode: "promote", incoming, current, previous });
+    const snapshot = baseRecord({ ...plan, mode: "promote", incoming, current, previous, state });
     await journal.record(snapshot);
     const transaction = { taskId: snapshot.taskId, componentId: snapshot.componentId, mode: snapshot.mode, snapshot };
     await executeTransaction(snapshot);
@@ -478,6 +762,7 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
       incoming: null,
       current,
       previous,
+      state,
     });
     await journal.record(snapshot);
     const transaction = { taskId: snapshot.taskId, componentId, mode: "rollback", snapshot };
@@ -491,13 +776,45 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
       || transaction.componentId !== transaction.snapshot.componentId || transaction.mode !== transaction.snapshot.mode) {
       throw slotError("slot_recovery_record_invalid");
     }
-    if (Array.isArray(transaction.records)
-      && transaction.records.some((record) => ["state_committed", "cleanup_committed"].includes(record.phase))) {
+    const state = await ownershipStore.load();
+    requireRecoveryOwnershipState(state, transaction.snapshot);
+    const phases = new Set(Array.isArray(transaction.records)
+      ? transaction.records.map((record) => record.phase)
+      : []);
+    if (phases.has("abort_cleanup_committed")) {
+      await finishAbortedTransaction(transaction.snapshot);
+      return;
+    }
+    if (phases.has("abort_started")) {
+      await abortTransaction(transaction.snapshot);
+      return;
+    }
+    if (phases.has("state_committed") || phases.has("cleanup_committed")) {
       await finishCommittedTransaction(transaction.snapshot);
       return;
+    }
+    if (transaction.mode === "promote") {
+      const layout = await inspectLayout(transaction.snapshot, { allowIncompleteAny: true });
+      assertAbortLayout(layout, transaction.snapshot);
+      const incoming = evidenceFromSnapshot(transaction.snapshot, "incoming");
+      const location = locateByIdentity(layout, incoming);
+      if (location === null || !evidenceMatches(layout[location].evidence, incoming)) {
+        await abortTransaction(transaction.snapshot);
+        return;
+      }
     }
     await executeTransaction(transaction.snapshot);
   }
 
-  return Object.freeze({ promotePreparedVersion, rollbackVersion, recoverTransaction });
+  return Object.freeze({
+    promotePreparedVersion(rawPlan) {
+      return withOwnershipStoreLock(ownershipStore, () => promotePreparedVersion(rawPlan));
+    },
+    rollbackVersion(componentId) {
+      return withOwnershipStoreLock(ownershipStore, () => rollbackVersion(componentId));
+    },
+    recoverTransaction(transaction) {
+      return withOwnershipStoreLock(ownershipStore, () => recoverTransaction(transaction));
+    },
+  });
 }

@@ -8,6 +8,9 @@ const MAX_STATE_BYTES = 16 * 1_024 * 1_024;
 const MAX_ARCHIVE_BYTES = 16 * 1_024 * 1_024 * 1_024;
 const MAX_PATH_CHARS = 32_760;
 const VERSION_MARKER_NAME = ".codexbridge-version.json";
+const COMPONENT_IDS = new Set(["chatgpt", "v2rayn", "git"]);
+const VERSION = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/u;
+const SHA256 = /^[a-f0-9]{64}$/u;
 const DRIVE_PATH = /^[A-Za-z]:\\/u;
 const RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/iu;
 const REQUIRED_NATIVE_METHODS = [
@@ -217,16 +220,96 @@ function ensureDirectChild(parentPath, name) {
   return child;
 }
 
+function hasExactKeys(value, keys) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.getPrototypeOf(value) === Object.prototype
+    && Object.keys(value).length === keys.length
+    && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function digestJson(value) {
+  return crypto.createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex");
+}
+
+function compareEntryPath(left, right) {
+  const leftKey = left.path.toLowerCase();
+  const rightKey = right.path.toLowerCase();
+  if (leftKey < rightKey) return -1;
+  if (leftKey > rightKey) return 1;
+  return left.path < right.path ? -1 : left.path > right.path ? 1 : 0;
+}
+
+function normalizeRequiredFiles(value) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_ENTRIES) {
+    throw capabilityError("version_manifest_invalid");
+  }
+  const entries = new Map();
+  function add(entry) {
+    const key = entry.path.toLowerCase();
+    const existing = entries.get(key);
+    if (existing && (existing.path !== entry.path || existing.directory !== entry.directory
+      || existing.size !== entry.size)) {
+      throw capabilityError("version_manifest_invalid");
+    }
+    entries.set(key, entry);
+  }
+  for (const item of value) {
+    if (!hasExactKeys(item, ["path", "size", "directory"])
+      || typeof item.path !== "string" || item.path.length === 0 || item.path.includes("\\")
+      || typeof item.directory !== "boolean" || !Number.isSafeInteger(item.size) || item.size < 0
+      || (item.directory && item.size !== 0)) {
+      throw capabilityError("version_manifest_invalid");
+    }
+    const segments = validateRelativeSegments(item.path.split("/"));
+    if (segments.join("/") !== item.path) throw capabilityError("version_manifest_invalid");
+    for (let index = 1; index < segments.length; index += 1) {
+      add({ path: segments.slice(0, index).join("/"), size: 0, directory: true });
+    }
+    add({ path: item.path, size: item.size, directory: item.directory });
+  }
+  return [...entries.values()].sort(compareEntryPath);
+}
+
+function normalizeVerificationRequest(value) {
+  if (!hasExactKeys(value, ["componentId", "version", "requiredFiles"])
+    || !COMPONENT_IDS.has(value.componentId) || !VERSION.test(value.version ?? "")) {
+    throw capabilityError("version_verification_request_invalid");
+  }
+  const requiredFiles = normalizeRequiredFiles(value.requiredFiles);
+  return {
+    componentId: value.componentId,
+    version: value.version,
+    requiredFiles,
+    manifestDigest: digestJson(requiredFiles),
+  };
+}
+
 function normalizeVersionMarker(value) {
   if (!value || Object.getPrototypeOf(value) !== Object.prototype
-    || Object.keys(value).length !== 3
-    || value.schemaVersion !== 1
-    || !["chatgpt", "v2rayn", "git"].includes(value.componentId)
-    || typeof value.version !== "string"
-    || !/^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/u.test(value.version)) {
+    || Object.keys(value).length !== 5
+    || value.schemaVersion !== 2
+    || !COMPONENT_IDS.has(value.componentId)
+    || typeof value.version !== "string" || !VERSION.test(value.version)
+    || typeof value.treeDigest !== "string" || !SHA256.test(value.treeDigest)
+    || typeof value.manifestDigest !== "string" || !SHA256.test(value.manifestDigest)) {
     throw capabilityError("version_marker_invalid");
   }
-  return { schemaVersion: 1, componentId: value.componentId, version: value.version };
+  return {
+    schemaVersion: 2,
+    componentId: value.componentId,
+    version: value.version,
+    treeDigest: value.treeDigest,
+    manifestDigest: value.manifestDigest,
+  };
+}
+
+function normalizeSealMetadata(value) {
+  if (!hasExactKeys(value, ["schemaVersion", "componentId", "version", "manifestDigest"])
+    || value.schemaVersion !== 2 || !COMPONENT_IDS.has(value.componentId)
+    || !VERSION.test(value.version ?? "") || !SHA256.test(value.manifestDigest ?? "")) {
+    throw capabilityError("version_marker_invalid");
+  }
+  return { ...value };
 }
 
 export function createWindowsFileCapabilities({
@@ -241,6 +324,7 @@ export function createWindowsFileCapabilities({
   if (typeof randomUUID !== "function") {
     throw capabilityError("windows_file_adapter_required");
   }
+  const verificationReceipts = new WeakMap();
 
   async function openRecordDirectoryNoFollow(stateDir, { includeListing = false } = {}) {
     const pin = await openPinnedPath(nativeApi, stateDir, {
@@ -502,6 +586,102 @@ export function createWindowsFileCapabilities({
       if (primaryError) throw primaryError;
     }
 
+    async function computeVersionTree(slotInternal) {
+      requireOpen(pin.owner);
+      const rootInfo = validateInfo(await nativeApi.queryHandle(slotInternal.handle), "directory");
+      verifyIdentity(slotInternal.identity, rootInfo);
+      const entries = [];
+      let entryCount = 0;
+      let totalBytes = 0;
+
+      async function namesFor(record) {
+        const names = [];
+        try {
+          for await (const entry of nativeApi.enumerateDirectory(record.handle, {
+            limit: MAX_ENTRIES - entryCount,
+          })) {
+            if (!entry || entry.reparse === true) throw capabilityError("windows_reparse_point_rejected");
+            names.push(validateChildName(entry.name));
+          }
+        } catch (error) {
+          if (error?.code === "native_directory_entry_limit_exceeded"
+            || error?.code === "windows_directory_limit_exceeded") {
+            throw capabilityError("version_tree_entry_count_exceeded", error);
+          }
+          throw error;
+        }
+        return names.sort((left, right) => left.localeCompare(right, "en"));
+      }
+
+      async function walk(record, relativeSegments, depth) {
+        if (depth > MAX_DEPTH) throw capabilityError("version_tree_depth_exceeded");
+        for (const name of await namesFor(record)) {
+          if (depth === 0 && name === VERSION_MARKER_NAME) continue;
+          entryCount += 1;
+          if (entryCount > MAX_ENTRIES) throw capabilityError("version_tree_entry_count_exceeded");
+          const childPath = ensureDirectChild(record.path, name);
+          const handle = await nativeApi.openPath(childPath, {
+            access: ["read", "attributes"],
+            share: ["read"],
+            disposition: "openExisting",
+            directory: true,
+          });
+          pin.owner.handles.add(handle);
+          let primaryError = null;
+          try {
+            const info = validateInfo(await nativeApi.queryHandle(handle));
+            if (info.nlink !== 1) throw capabilityError("windows_hard_link_rejected");
+            const finalPath = validateAbsolute(await nativeApi.finalPath(handle));
+            if (!samePath(finalPath, childPath)) throw capabilityError("windows_final_path_mismatch");
+            const itemSegments = [...relativeSegments, name];
+            const relative = itemSegments.join("/");
+            if (info.directory) {
+              entries.push({ path: relative, size: 0, directory: true });
+              await walk({ handle, path: finalPath }, itemSegments, depth + 1);
+            } else {
+              await nativeApi.assertNoAlternateDataStreams(handle);
+              totalBytes += info.size;
+              if (!Number.isSafeInteger(totalBytes) || totalBytes > MAX_ARCHIVE_BYTES) {
+                throw capabilityError("version_tree_size_exceeded");
+              }
+              const content = await nativeApi.readFile(handle, MAX_ARCHIVE_BYTES);
+              if (!Buffer.isBuffer(content) || content.length !== info.size) {
+                throw capabilityError("version_tree_read_invalid");
+              }
+              entries.push({
+                path: relative,
+                size: info.size,
+                directory: false,
+                sha256: crypto.createHash("sha256").update(content).digest("hex"),
+              });
+            }
+          } catch (error) {
+            primaryError = error;
+          }
+          try {
+            await closeOne(nativeApi, pin.owner, handle);
+          } catch (closeError) {
+            if (primaryError) {
+              throw new AggregateError([primaryError, closeError], primaryError.message, { cause: primaryError });
+            }
+            throw closeError;
+          }
+          if (primaryError) throw primaryError;
+        }
+      }
+
+      await walk({ handle: slotInternal.handle, path: slotInternal.path }, [], 0);
+      entries.sort(compareEntryPath);
+      const manifest = entries.map(({ path: entryPath, size, directory }) => ({
+        path: entryPath, size, directory,
+      }));
+      return {
+        entries,
+        treeDigest: digestJson(entries),
+        manifestDigest: digestJson(manifest),
+      };
+    }
+
     const rootFacade = makeDirectoryFacade(pin.leaf);
     if (!versionSlots) {
       return Object.freeze({ ...rootFacade, async close() { await closeOwner(nativeApi, pin.owner); } });
@@ -550,16 +730,27 @@ export function createWindowsFileCapabilities({
 
     async function readMarker(internal) {
       const marker = await openMarker(internal, "r");
-      if (!marker) return null;
+      if (!marker) return { evidence: null, markerStatus: "missing" };
       let primaryError = null;
+      let result;
       try {
         const data = await nativeApi.readFile(marker.handle, MAX_STATE_BYTES);
         const metadata = normalizeVersionMarker(JSON.parse(data.toString("utf8")));
-        return { ...metadata, identity: publicIdentity(internal.identity) };
+        const tree = await computeVersionTree(internal);
+        if (tree.treeDigest !== metadata.treeDigest || tree.manifestDigest !== metadata.manifestDigest) {
+          throw capabilityError("version_tree_digest_mismatch");
+        }
+        result = {
+          evidence: { ...metadata, identity: publicIdentity(internal.identity) },
+          markerStatus: "complete",
+        };
       } catch (error) {
-        primaryError = error?.code === "version_marker_invalid"
-          ? error
-          : capabilityError("version_marker_invalid", error);
+        if (["version_marker_invalid", "version_tree_digest_mismatch"].includes(error?.code)
+          || error instanceof SyntaxError) {
+          result = { evidence: null, markerStatus: "invalid" };
+        } else {
+          primaryError = error;
+        }
       } finally {
         try {
           await closeOne(nativeApi, pin.owner, marker.handle);
@@ -568,7 +759,8 @@ export function createWindowsFileCapabilities({
           throw closeError;
         }
       }
-      throw primaryError;
+      if (primaryError) throw primaryError;
+      return result;
     }
 
     async function openSlotNoFollow(name) {
@@ -581,38 +773,74 @@ export function createWindowsFileCapabilities({
       }
       if (descriptor.kind !== "directory") throw capabilityError("version_slot_directory_required");
       const internal = requireSlotDescriptor(descriptor);
-      return Object.freeze({ descriptor, evidence: await readMarker(internal) });
+      const marker = await readMarker(internal);
+      return Object.freeze({ descriptor, ...marker });
     }
 
-    async function sealPreparedSlotNoFollow(descriptor, value) {
-      const metadata = normalizeVersionMarker(value);
+    async function sealPreparedSlotNoFollow(descriptor, value, verificationReceipt) {
+      const metadata = normalizeSealMetadata(value);
       const internal = requireSlotDescriptor(descriptor);
-      const current = validateInfo(await nativeApi.queryHandle(internal.handle), "directory");
-      verifyIdentity(internal.identity, current);
-      const existing = await readMarker(internal);
-      if (existing) {
-        if (existing.componentId !== metadata.componentId || existing.version !== metadata.version) {
-          throw capabilityError("version_marker_conflict");
-        }
-        return existing;
+      const receipt = verificationReceipts.get(verificationReceipt);
+      if (!receipt) throw capabilityError("version_verification_receipt_invalid");
+      if (receipt.state !== "fresh") throw capabilityError("version_verification_receipt_consumed");
+      const priorReceiptState = receipt.state;
+      if (identityKey(receipt.directoryIdentity) !== identityKey(internal.identity)) {
+        throw capabilityError("version_verification_receipt_directory_mismatch");
       }
-      const marker = await openMarker(internal, "wx");
-      let primaryError = null;
+      if (receipt.componentId !== metadata.componentId || receipt.version !== metadata.version
+        || receipt.manifestDigest !== metadata.manifestDigest) {
+        throw capabilityError("version_verification_receipt_mismatch");
+      }
+      receipt.state = "busy";
+      let succeeded = false;
       try {
-        await nativeApi.writeFile(marker.handle, Buffer.from(`${JSON.stringify(metadata)}\n`, "utf8"));
-        await nativeApi.flushFile(marker.handle);
-      } catch (error) {
-        primaryError = error;
-      } finally {
-        try {
-          await closeOne(nativeApi, pin.owner, marker.handle);
-        } catch (closeError) {
-          if (primaryError) throw new AggregateError([primaryError, closeError], primaryError.message, { cause: primaryError });
-          throw closeError;
+        const current = validateInfo(await nativeApi.queryHandle(internal.handle), "directory");
+        verifyIdentity(internal.identity, current);
+        const tree = await computeVersionTree(internal);
+        if (tree.treeDigest !== receipt.treeDigest || tree.manifestDigest !== receipt.manifestDigest) {
+          throw capabilityError("version_tree_digest_mismatch");
         }
+        const markerMetadata = normalizeVersionMarker({
+          ...metadata,
+          treeDigest: receipt.treeDigest,
+        });
+        const existing = await readMarker(internal);
+        if (existing.markerStatus === "invalid") throw capabilityError("version_marker_conflict");
+        if (existing.evidence) {
+          if (existing.evidence.componentId !== markerMetadata.componentId
+            || existing.evidence.version !== markerMetadata.version
+            || existing.evidence.treeDigest !== markerMetadata.treeDigest
+            || existing.evidence.manifestDigest !== markerMetadata.manifestDigest) {
+            throw capabilityError("version_marker_conflict");
+          }
+          succeeded = true;
+          receipt.state = "consumed";
+          return existing.evidence;
+        }
+        const marker = await openMarker(internal, "wx");
+        let primaryError = null;
+        try {
+          await nativeApi.writeFile(marker.handle, Buffer.from(`${JSON.stringify(markerMetadata)}\n`, "utf8"));
+          await nativeApi.flushFile(marker.handle);
+        } catch (error) {
+          primaryError = error;
+        } finally {
+          try {
+            await closeOne(nativeApi, pin.owner, marker.handle);
+          } catch (closeError) {
+            if (primaryError) {
+              throw new AggregateError([primaryError, closeError], primaryError.message, { cause: primaryError });
+            }
+            throw closeError;
+          }
+        }
+        if (primaryError) throw primaryError;
+        succeeded = true;
+        receipt.state = "consumed";
+        return { ...markerMetadata, identity: publicIdentity(internal.identity) };
+      } finally {
+        if (!succeeded && receipt.state === "busy") receipt.state = priorReceiptState;
       }
-      if (primaryError) throw primaryError;
-      return { ...metadata, identity: publicIdentity(internal.identity) };
     }
 
     async function renameSlotNoReplace(descriptor, destinationName) {
@@ -759,9 +987,11 @@ export function createWindowsFileCapabilities({
         const finalPath = validateAbsolute(await nativeApi.finalPath(handle));
         if (!samePath(finalPath, outputPath)) throw capabilityError("windows_final_path_mismatch");
         const relative = segments.join("/");
-        tracked.set(relative, {
+        const trackedRecord = {
           handle, info, path: finalPath, relative, directory: false, expectedSize: size,
-        });
+          contentHasher: crypto.createHash("sha256"), contentDigest: null,
+        };
+        tracked.set(relative, trackedRecord);
       } catch (error) {
         await closeOne(nativeApi, pin.owner, handle).catch((closeError) => {
           throw new AggregateError([error, closeError], error.message, { cause: error });
@@ -770,6 +1000,7 @@ export function createWindowsFileCapabilities({
       }
       let written = 0;
       let settled = false;
+      const trackedRecord = tracked.get(segments.join("/"));
       return new Writable({
         write(chunk, _encoding, callback) {
           const data = Buffer.from(chunk);
@@ -778,6 +1009,7 @@ export function createWindowsFileCapabilities({
             callback(capabilityError("archive_output_size_exceeded"));
             return;
           }
+          trackedRecord.contentHasher.update(data);
           Promise.resolve(nativeApi.appendFile(handle, data)).then(() => callback(), callback);
         },
         final(callback) {
@@ -786,7 +1018,12 @@ export function createWindowsFileCapabilities({
             return;
           }
           Promise.resolve(nativeApi.flushFile(handle))
-            .then(() => { settled = true; callback(); }, callback);
+            .then(() => {
+              trackedRecord.contentDigest = trackedRecord.contentHasher.digest("hex");
+              trackedRecord.contentHasher = null;
+              settled = true;
+              callback();
+            }, callback);
         },
         destroy(error, callback) {
           if (settled || !error) {
@@ -801,10 +1038,14 @@ export function createWindowsFileCapabilities({
       });
     }
 
-    async function verifyTreeNoFollow(signal) {
+    async function verifyTreeNoFollow(signal, rawVerification) {
       requireOpen(pin.owner);
       throwIfAborted(signal);
+      const verification = rawVerification === undefined
+        ? null
+        : normalizeVerificationRequest(rawVerification);
       const result = [];
+      const digestEntries = [];
       let entryCount = 0;
       let totalBytes = 0;
       for (const [relative, record] of tracked) {
@@ -865,11 +1106,48 @@ export function createWindowsFileCapabilities({
             hardLink: false,
             nlink: 1,
           });
+          if (!child.directory && !SHA256.test(child.contentDigest ?? "")) {
+            throw capabilityError("version_tree_content_digest_missing");
+          }
+          digestEntries.push({
+            path: relative,
+            size: child.directory ? 0 : info.size,
+            directory: child.directory,
+            ...(!child.directory ? { sha256: child.contentDigest } : {}),
+          });
           if (child.directory) await walk(child, itemSegments, depth + 1);
         }
       }
       await walk(pin.leaf, [], 0);
       throwIfAborted(signal);
+      if (verification) {
+        digestEntries.sort(compareEntryPath);
+        const actualManifest = digestEntries.map(({ path: entryPath, size, directory }) => ({
+          path: entryPath, size, directory,
+        }));
+        const actualManifestDigest = digestJson(actualManifest);
+        if (actualManifestDigest !== verification.manifestDigest) {
+          throw capabilityError("version_manifest_mismatch");
+        }
+        const currentRoot = validateInfo(await nativeApi.queryHandle(pin.leaf.handle), "directory");
+        verifyIdentity(pin.leaf.info.identity, currentRoot);
+        const verificationReceipt = Object.freeze(Object.create(null));
+        const treeDigest = digestJson(digestEntries);
+        verificationReceipts.set(verificationReceipt, {
+          state: "fresh",
+          directoryIdentity: publicIdentity(pin.leaf.info.identity),
+          componentId: verification.componentId,
+          version: verification.version,
+          manifestDigest: verification.manifestDigest,
+          treeDigest,
+        });
+        return Object.freeze({
+          tree: result,
+          verificationReceipt,
+          treeDigest,
+          manifestDigest: verification.manifestDigest,
+        });
+      }
       return result;
     }
 

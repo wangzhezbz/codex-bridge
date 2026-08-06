@@ -91,8 +91,18 @@ function createJournalFs() {
 
 function record(overrides = {}) {
   const rootPath = "D:\\CodexBridge\\ChatGPT";
+  const identities = {
+    incoming: { volumeSerial: "vol", fileId: "three" },
+    current: { volumeSerial: "vol", fileId: "two" },
+    previous: { volumeSerial: "vol", fileId: "one" },
+  };
+  const integrities = {
+    incoming: { treeDigest: "3".repeat(64), manifestDigest: "a".repeat(64) },
+    current: { treeDigest: "2".repeat(64), manifestDigest: "b".repeat(64) },
+    previous: { treeDigest: "1".repeat(64), manifestDigest: "c".repeat(64) },
+  };
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     taskId: "task-3",
     componentId: "chatgpt",
     mode: "promote",
@@ -106,10 +116,28 @@ function record(overrides = {}) {
       retiring: `${rootPath}\\cr`,
     },
     versions: { incoming: "3.0.0", current: "2.0.0", previous: "1.0.0" },
-    identities: {
-      incoming: { volumeSerial: "vol", fileId: "three" },
-      current: { volumeSerial: "vol", fileId: "two" },
-      previous: { volumeSerial: "vol", fileId: "one" },
+    identities,
+    integrities,
+    ownershipBefore: {
+      component: {
+        installPath: `${rootPath}\\c`,
+        version: "2.0.0",
+        treeDigest: integrities.current.treeDigest,
+        manifestDigest: integrities.current.manifestDigest,
+        slotIdentity: clone(identities.current),
+        managed: true,
+      },
+      rollback: {
+        path: `${rootPath}\\cp`,
+        rootPath,
+        componentId: "chatgpt",
+        version: "1.0.0",
+        treeDigest: integrities.previous.treeDigest,
+        manifestDigest: integrities.previous.manifestDigest,
+        slotIdentity: clone(identities.previous),
+      },
+      activeTask: null,
+      lastTask: null,
     },
     ...overrides,
   };
@@ -199,6 +227,35 @@ test("journal rejects phase gaps instead of inferring a completed rename from a 
   const fake = createJournalFs();
   const journal = createTransactionJournal({ journalDir: "D:\\State\\transactions", fsApi: fake.fsApi });
   await journal.record(record());
+  await assert.rejects(
+    journal.record(record({ phase: "new_promoted" })),
+    /transaction_journal_phase_order_invalid/u,
+  );
+});
+
+test("journal accepts only a strict idempotent abort/revert suffix after a pre-commit promote prefix", async () => {
+  const fake = createJournalFs();
+  const journal = createTransactionJournal({ journalDir: "D:\\State\\transactions", fsApi: fake.fsApi });
+  await journal.record(record());
+  await journal.record(record({ phase: "retiring_moved" }));
+  await assert.rejects(
+    journal.record(record({ phase: "abort_current_restored" })),
+    /transaction_journal_phase_order_invalid/u,
+  );
+  for (const phase of [
+    "abort_started", "abort_incoming_isolated", "abort_current_restored",
+    "abort_previous_restored", "abort_state_restoring", "abort_cleanup_started",
+    "abort_cleanup_committed",
+  ]) {
+    await journal.record(record({ phase }));
+  }
+  await journal.record(record({ phase: "abort_cleanup_committed" }));
+  const [transaction] = await journal.listTransactions();
+  assert.deepEqual(transaction.records.map((item) => item.phase), [
+    "prepared", "retiring_moved", "abort_started", "abort_incoming_isolated",
+    "abort_current_restored", "abort_previous_restored", "abort_state_restoring",
+    "abort_cleanup_started", "abort_cleanup_committed",
+  ]);
   await assert.rejects(
     journal.record(record({ phase: "new_promoted" })),
     /transaction_journal_phase_order_invalid/u,

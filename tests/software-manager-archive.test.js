@@ -60,6 +60,35 @@ test("extracts ZIP bytes only after every entry passes preflight", async () => {
   assert.equal(memory.closed, true);
 });
 
+test("verified extraction returns the opaque version receipt and manifest digest from the capability", async () => {
+  const archivePath = await writeZipFixture([{ name: "app.exe", body: "payload" }]);
+  const destination = path.resolve("staging", "zip-receipt");
+  const verificationReceipt = Object.freeze(Object.create(null));
+  const memory = memoryDestination(destination, {
+    receiptResult: {
+      verificationReceipt,
+      treeDigest: "a".repeat(64),
+      manifestDigest: "b".repeat(64),
+    },
+  });
+
+  const result = await zipService(memory.fsApi).extractArchive({
+    format: "zip",
+    archivePath,
+    destination,
+    verification: { componentId: "chatgpt", version: "1.0.0" },
+  });
+
+  assert.equal(result.verificationReceipt, verificationReceipt);
+  assert.equal(result.treeDigest, "a".repeat(64));
+  assert.equal(result.manifestDigest, "b".repeat(64));
+  assert.deepEqual(memory.verification, {
+    componentId: "chatgpt",
+    version: "1.0.0",
+    requiredFiles: [{ path: "app.exe", size: 7, directory: false }],
+  });
+});
+
 test("does not open a ZIP output file when a later entry is unsafe", async () => {
   const archivePath = await writeZipFixture([
     { name: "safe.txt", body: "would otherwise be written" },
@@ -735,6 +764,7 @@ function sevenZipListing(entries) {
 function memoryDestination(destination, {
   verifiedTree,
   onVerify,
+  receiptResult,
   destinationCloseError,
   pinCloseError,
 } = {}) {
@@ -774,12 +804,12 @@ function memoryDestination(destination, {
     async assertEmptyNoFollow() {
       state.assertEmptyCalls += 1;
     },
-    async verifyTreeNoFollow(signal) {
+    async verifyTreeNoFollow(signal, verification) {
       state.verifyTreeCalls += 1;
       state.verifySignal = signal;
+      state.verification = verification;
       await onVerify?.(signal);
-      if (verifiedTree !== undefined) return verifiedTree;
-      return [
+      const tree = verifiedTree !== undefined ? verifiedTree : [
         ...[...directories].map((relativePath) => verifiedItem(destination, {
           path: relativePath, size: 0, directory: true,
         })),
@@ -787,6 +817,7 @@ function memoryDestination(destination, {
           path: relativePath, size: Buffer.byteLength(value), directory: false,
         })),
       ];
+      return receiptResult && verification ? { tree, ...receiptResult } : tree;
     },
     async close() {
       state.closed = true;

@@ -153,9 +153,17 @@ function createFakeNative(initial = []) {
       if (nodes.has(key(destination)) && !nodes.get(key(destination)).deleted && !replace) {
         throw codedError("entry_exists", 183);
       }
-      nodes.delete(key(source.path));
+      const sourcePath = source.path;
+      const descendants = [...nodes.values()].filter((node) => node !== source
+        && node.path.toLowerCase().startsWith(`${sourcePath.toLowerCase()}\\`));
+      nodes.delete(key(sourcePath));
       source.path = destination;
       nodes.set(key(destination), source);
+      for (const descendant of descendants) {
+        nodes.delete(key(descendant.path));
+        descendant.path = `${destination}${descendant.path.slice(sourcePath.length)}`;
+        nodes.set(key(descendant.path), descendant);
+      }
     },
     async deleteByHandle(handle, { directory }) {
       const { node } = requireHandle(handle);
@@ -350,28 +358,198 @@ test("state exclusive create is syncable and rename never replaces an occupied d
   await directory.close();
 });
 
-test("version-root capability seals a complete marker and renames a direct child only by held identity", async () => {
+async function finishWritable(output, value) {
+  const completed = new Promise((resolve, reject) => {
+    output.once("finish", resolve);
+    output.once("error", reject);
+  });
+  output.end(value);
+  await completed;
+}
+
+async function issueVersionReceipt(api, destinationPath, { componentId = "chatgpt", version = "1.0.0" } = {}) {
+  const destination = await api.openArchiveDestinationNoFollow(destinationPath);
+  const output = await destination.createFilePathNoFollow(["app.exe"], { exclusive: true, size: 7 });
+  await finishWritable(output, "payload");
+  const verified = await destination.verifyTreeNoFollow(undefined, {
+    componentId,
+    version,
+    requiredFiles: [{ path: "app.exe", size: 7, directory: false }],
+  });
+  await destination.close();
+  return verified;
+}
+
+test("version-root capability consumes an opaque exact-tree receipt before sealing and renames by held identity", async () => {
   const fake = createFakeNative([
     { path: "C:\\work\\versions" },
     { path: "C:\\work\\versions\\ct" },
   ]);
-  const root = await capabilities(fake).openVersionRootNoFollow("C:\\work\\versions");
+  const api = capabilities(fake);
+  const verified = await issueVersionReceipt(api, "C:\\work\\versions\\ct");
+  assert.ok(verified.verificationReceipt && typeof verified.verificationReceipt === "object");
+  assert.match(verified.treeDigest, /^[a-f0-9]{64}$/u);
+  assert.match(verified.manifestDigest, /^[a-f0-9]{64}$/u);
+
+  const root = await api.openVersionRootNoFollow("C:\\work\\versions");
   const staging = await root.openSlotNoFollow("ct");
   assert.equal(staging.evidence, null);
+  await assert.rejects(
+    root.sealPreparedSlotNoFollow(staging.descriptor, {
+      schemaVersion: 2,
+      componentId: "chatgpt",
+      version: "1.0.0",
+      manifestDigest: verified.manifestDigest,
+    }, {}),
+    /version_verification_receipt_invalid/u,
+  );
   const evidence = await root.sealPreparedSlotNoFollow(staging.descriptor, {
-    schemaVersion: 1,
+    schemaVersion: 2,
     componentId: "chatgpt",
     version: "1.0.0",
-  });
+    manifestDigest: verified.manifestDigest,
+  }, verified.verificationReceipt);
   assert.equal(evidence.version, "1.0.0");
   assert.deepEqual(evidence.identity, staging.descriptor.identity);
+  assert.equal(evidence.treeDigest, verified.treeDigest);
+  assert.equal(evidence.manifestDigest, verified.manifestDigest);
   assert.equal(fake.calls.some((call) => call[0] === "flush" && call[1].endsWith(".codexbridge-version.json")), true);
+  await assert.rejects(
+    root.sealPreparedSlotNoFollow(staging.descriptor, {
+      schemaVersion: 2,
+      componentId: "chatgpt",
+      version: "1.0.0",
+      manifestDigest: verified.manifestDigest,
+    }, verified.verificationReceipt),
+    /version_verification_receipt_consumed/u,
+  );
 
   await root.renameSlotNoReplace(staging.descriptor, "c");
   assert.equal(fake.calls.some((call) => call[0] === "rename-handle"
     && call[1] === "C:\\work\\versions\\ct" && call[3] === "c" && call[4] === false), true);
   await root.close();
   assert.equal(fake.handles.size, 0);
+
+  fake.add("C:\\work\\versions\\ct", { kind: "directory" });
+  fake.add("C:\\work\\versions\\ct\\app.exe", { kind: "file", data: "payload" });
+  const secondRoot = await api.openVersionRootNoFollow("C:\\work\\versions");
+  const replacementStaging = await secondRoot.openSlotNoFollow("ct");
+  await assert.rejects(
+    secondRoot.sealPreparedSlotNoFollow(replacementStaging.descriptor, {
+      schemaVersion: 2,
+      componentId: "chatgpt",
+      version: "1.0.0",
+      manifestDigest: verified.manifestDigest,
+    }, verified.verificationReceipt),
+    /version_verification_receipt_(?:consumed|directory_mismatch)/u,
+  );
+  await secondRoot.close();
+});
+
+test("version receipt rejects wrong bindings, stale reuse, missing files, and changed content", async () => {
+  const fake = createFakeNative([
+    { path: "C:\\work\\versions" },
+    { path: "C:\\work\\versions\\ct" },
+    { path: "C:\\work\\other" },
+  ]);
+  const api = capabilities(fake);
+  const wrongDirectory = await issueVersionReceipt(api, "C:\\work\\other");
+  let root = await api.openVersionRootNoFollow("C:\\work\\versions");
+  let staging = await root.openSlotNoFollow("ct");
+  await assert.rejects(
+    root.sealPreparedSlotNoFollow(staging.descriptor, {
+      schemaVersion: 2,
+      componentId: "chatgpt",
+      version: "1.0.0",
+      manifestDigest: wrongDirectory.manifestDigest,
+    }, wrongDirectory.verificationReceipt),
+    /version_verification_receipt_directory_mismatch/u,
+  );
+  await root.close();
+
+  const verified = await issueVersionReceipt(api, "C:\\work\\versions\\ct");
+  root = await api.openVersionRootNoFollow("C:\\work\\versions");
+  staging = await root.openSlotNoFollow("ct");
+  for (const metadata of [
+    {
+      schemaVersion: 2,
+      componentId: "chatgpt",
+      version: "2.0.0",
+      manifestDigest: verified.manifestDigest,
+    },
+    {
+      schemaVersion: 2,
+      componentId: "git",
+      version: "1.0.0",
+      manifestDigest: verified.manifestDigest,
+    },
+    {
+      schemaVersion: 2,
+      componentId: "chatgpt",
+      version: "1.0.0",
+      manifestDigest: "0".repeat(64),
+    },
+  ]) {
+    await assert.rejects(
+      root.sealPreparedSlotNoFollow(staging.descriptor, metadata, verified.verificationReceipt),
+      /version_verification_receipt_mismatch/u,
+    );
+  }
+  await root.close();
+
+  fake.get("C:\\work\\versions\\ct\\app.exe").data = Buffer.from("changed");
+  root = await api.openVersionRootNoFollow("C:\\work\\versions");
+  staging = await root.openSlotNoFollow("ct");
+  await assert.rejects(
+    root.sealPreparedSlotNoFollow(staging.descriptor, {
+      schemaVersion: 2,
+      componentId: "chatgpt",
+      version: "1.0.0",
+      manifestDigest: verified.manifestDigest,
+    }, verified.verificationReceipt),
+    /version_tree_digest_mismatch/u,
+  );
+  await root.close();
+
+  fake.get("C:\\work\\versions\\ct\\app.exe").data = Buffer.from("payload");
+  fake.get("C:\\work\\versions\\ct\\app.exe").deleted = true;
+  root = await api.openVersionRootNoFollow("C:\\work\\versions");
+  staging = await root.openSlotNoFollow("ct");
+  await assert.rejects(
+    root.sealPreparedSlotNoFollow(staging.descriptor, {
+      schemaVersion: 2,
+      componentId: "chatgpt",
+      version: "1.0.0",
+      manifestDigest: verified.manifestDigest,
+    }, verified.verificationReceipt),
+    /version_tree_digest_mismatch/u,
+  );
+  await root.close();
+});
+
+test("openSlot validates the V2 marker against the current exact-tree content digest", async () => {
+  const fake = createFakeNative([
+    { path: "C:\\work\\versions" },
+    { path: "C:\\work\\versions\\ct" },
+  ]);
+  const api = capabilities(fake);
+  const verified = await issueVersionReceipt(api, "C:\\work\\versions\\ct");
+  let root = await api.openVersionRootNoFollow("C:\\work\\versions");
+  let staging = await root.openSlotNoFollow("ct");
+  await root.sealPreparedSlotNoFollow(staging.descriptor, {
+    schemaVersion: 2,
+    componentId: "chatgpt",
+    version: "1.0.0",
+    manifestDigest: verified.manifestDigest,
+  }, verified.verificationReceipt);
+  await root.close();
+
+  fake.get("C:\\work\\versions\\ct\\app.exe").data = Buffer.from("PAYLOAD");
+  root = await api.openVersionRootNoFollow("C:\\work\\versions");
+  staging = await root.openSlotNoFollow("ct");
+  assert.equal(staging.markerStatus, "invalid");
+  assert.equal(staging.evidence, null);
+  await root.close();
 });
 
 test("version-root rename rejects identity drift before invoking the native rename", async () => {

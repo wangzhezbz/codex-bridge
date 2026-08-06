@@ -18,6 +18,8 @@ const SEVEN_ZIP_ALLOWED_FIELDS = new Set([
   "headers size", "solid", "blocks", "volumes", "offset", "tail size", "embedded stub size",
   "cluster size", "sector size",
 ]);
+const VERSION = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/u;
+const SHA256 = /^[a-f0-9]{64}$/u;
 
 function archiveError(code, cause) {
   const error = new Error(code, cause === undefined ? undefined : { cause });
@@ -39,6 +41,39 @@ function throwIfAborted(signal) {
 function validateFormat(format) {
   if (format !== "zip" && format !== "7z") throw archiveError("archive_format_rejected");
   return format;
+}
+
+function normalizeVerification(value) {
+  if (value === undefined) return null;
+  if (!value || Object.getPrototypeOf(value) !== Object.prototype
+    || Object.keys(value).length !== 2
+    || !Object.hasOwn(value, "componentId") || !Object.hasOwn(value, "version")
+    || !["chatgpt", "v2rayn", "git"].includes(value.componentId)
+    || !VERSION.test(value.version ?? "")) {
+    throw archiveError("archive_verification_invalid");
+  }
+  return { componentId: value.componentId, version: value.version };
+}
+
+function unwrapVerifiedTree(value, verification) {
+  if (!verification) return { tree: value, receipt: null };
+  if (!value || Object.getPrototypeOf(value) !== Object.prototype
+    || Object.keys(value).length !== 4
+    || !["tree", "verificationReceipt", "treeDigest", "manifestDigest"]
+      .every((key) => Object.hasOwn(value, key))
+    || !Array.isArray(value.tree)
+    || value.verificationReceipt === null || typeof value.verificationReceipt !== "object"
+    || !SHA256.test(value.treeDigest ?? "") || !SHA256.test(value.manifestDigest ?? "")) {
+    throw archiveError("archive_verification_receipt_invalid");
+  }
+  return {
+    tree: value.tree,
+    receipt: {
+      verificationReceipt: value.verificationReceipt,
+      treeDigest: value.treeDigest,
+      manifestDigest: value.manifestDigest,
+    },
+  };
 }
 
 function requireAbsolutePath(value, code) {
@@ -278,7 +313,7 @@ function requireZipDestinationHandle(handle) {
   return handle;
 }
 
-async function extractZip({ archivePath, destination, signal, fsApi }) {
+async function extractZip({ archivePath, destination, signal, fsApi, verification }) {
   throwIfAborted(signal);
   const enumerated = await enumerateZip(archivePath, signal);
   let destinationHandle;
@@ -310,10 +345,16 @@ async function extractZip({ archivePath, destination, signal, fsApi }) {
       await pipeline(input, output, signal ? { signal } : {});
     }
     throwIfAborted(signal);
-    const verifiedTree = await destinationHandle.verifyTreeNoFollow(signal);
+    const verified = await destinationHandle.verifyTreeNoFollow(signal, verification ? {
+      ...verification,
+      requiredFiles: enumerated.publicResult.entries,
+    } : undefined);
     throwIfAborted(signal);
-    validateVerifiedTree(verifiedTree, destination, enumerated.publicResult.entries);
-    result = enumerated.publicResult;
+    const unwrapped = unwrapVerifiedTree(verified, verification);
+    validateVerifiedTree(unwrapped.tree, destination, enumerated.publicResult.entries);
+    result = unwrapped.receipt
+      ? { ...enumerated.publicResult, ...unwrapped.receipt }
+      : enumerated.publicResult;
   } catch (error) {
     primaryError = error;
   }
@@ -538,7 +579,9 @@ function validateVerifiedTree(tree, destination, inspectedEntries) {
   if (expected.size !== 0) throw archiveError("archive_output_mismatch");
 }
 
-async function extractSevenZip({ archivePath, destination, signal, sevenZipPath, spawnFile, spawnStream, fsApi }) {
+async function extractSevenZip({
+  archivePath, destination, signal, sevenZipPath, spawnFile, spawnStream, fsApi, verification,
+}) {
   throwIfAborted(signal);
   if (typeof fsApi?.pinArchiveFileNoFollow !== "function"
     || typeof fsApi?.openArchiveDestinationNoFollow !== "function") {
@@ -590,10 +633,16 @@ async function extractSevenZip({ archivePath, destination, signal, sevenZipPath,
     throwIfAborted(signal);
     await archivePin.assertStableNoFollow();
     throwIfAborted(signal);
-    const verifiedTree = await destinationHandle.verifyTreeNoFollow(signal);
+    const verified = await destinationHandle.verifyTreeNoFollow(signal, verification ? {
+      ...verification,
+      requiredFiles: inspected.publicResult.entries,
+    } : undefined);
     throwIfAborted(signal);
-    validateVerifiedTree(verifiedTree, destination, inspected.publicResult.entries);
-    result = inspected.publicResult;
+    const unwrapped = unwrapVerifiedTree(verified, verification);
+    validateVerifiedTree(unwrapped.tree, destination, inspected.publicResult.entries);
+    result = unwrapped.receipt
+      ? { ...inspected.publicResult, ...unwrapped.receipt }
+      : inspected.publicResult;
   } catch (error) {
     primaryError = error;
   }
@@ -624,13 +673,16 @@ export function createArchiveService({ sevenZipPath, spawnFile, spawnStream, fsA
       })).publicResult;
     },
 
-    async extractArchive({ format, archivePath, destination, signal } = {}) {
+    async extractArchive({ format, archivePath, destination, signal, verification: rawVerification } = {}) {
       throwIfAborted(signal);
       const exactFormat = validateFormat(format);
       const exactArchivePath = requireAbsolutePath(archivePath, "archive_path_rejected");
       const exactDestination = requireAbsolutePath(destination, "archive_destination_rejected");
+      const verification = normalizeVerification(rawVerification);
       if (exactFormat === "zip") {
-        return extractZip({ archivePath: exactArchivePath, destination: exactDestination, signal, fsApi });
+        return extractZip({
+          archivePath: exactArchivePath, destination: exactDestination, signal, fsApi, verification,
+        });
       }
       if (!bundledSevenZipPath) throw archiveError("archive_7z_path_required");
       return extractSevenZip({
@@ -641,6 +693,7 @@ export function createArchiveService({ sevenZipPath, spawnFile, spawnStream, fsA
         spawnFile,
         spawnStream,
         fsApi,
+        verification,
       });
     },
   };

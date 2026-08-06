@@ -1,18 +1,25 @@
 import path from "node:path";
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const COMPONENT_IDS = new Set(["chatgpt", "v2rayn", "git"]);
 const PHASES = [
   "prepared", "retiring_moved", "old_moved", "new_promoted", "state_committed", "cleanup_committed",
+  "abort_started", "abort_incoming_isolated", "abort_current_restored", "abort_previous_restored",
+  "abort_state_restoring", "abort_cleanup_started", "abort_cleanup_committed",
+];
+const ABORT_PHASES = [
+  "abort_started", "abort_incoming_isolated", "abort_current_restored", "abort_previous_restored",
+  "abort_state_restoring", "abort_cleanup_started", "abort_cleanup_committed",
 ];
 const RECORD_KEYS = [
   "schemaVersion", "taskId", "componentId", "mode", "phase", "rootPath",
-  "slots", "paths", "versions", "identities",
+  "slots", "paths", "versions", "identities", "integrities", "ownershipBefore",
 ];
 const SLOT_KEYS = ["current", "previous", "staging", "retiring"];
 const VERSION_KEYS = ["incoming", "current", "previous"];
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
 const VERSION = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/u;
+const SHA256 = /^[a-f0-9]{64}$/u;
 const RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/iu;
 
 function journalError(code, cause) {
@@ -72,6 +79,84 @@ function normalizeVersion(value) {
   return value;
 }
 
+function normalizeIntegrity(value) {
+  if (value === null) return null;
+  if (!hasExactKeys(value, ["treeDigest", "manifestDigest"])
+    || !SHA256.test(value.treeDigest ?? "") || !SHA256.test(value.manifestDigest ?? "")) {
+    throw journalError("transaction_record_invalid");
+  }
+  return { treeDigest: value.treeDigest, manifestDigest: value.manifestDigest };
+}
+
+function normalizeJson(value, state = { count: 0 }, depth = 0) {
+  state.count += 1;
+  if (state.count > 2_048 || depth > 16) throw journalError("transaction_record_invalid");
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    if (value.length > 32_760 || value.includes("\0")) throw journalError("transaction_record_invalid");
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw journalError("transaction_record_invalid");
+    return value;
+  }
+  if (Array.isArray(value)) return value.map((item) => normalizeJson(item, state, depth + 1));
+  if (!isPlainRecord(value)) throw journalError("transaction_record_invalid");
+  const result = {};
+  for (const key of Object.keys(value)) {
+    if (key.length === 0 || key.length > 256 || key.includes("\0")) throw journalError("transaction_record_invalid");
+    Object.defineProperty(result, key, {
+      value: normalizeJson(value[key], state, depth + 1),
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  }
+  return result;
+}
+
+function sameIdentity(left, right) {
+  if (!left || !right) return false;
+  return left.volumeSerial === right.volumeSerial && left.fileId === right.fileId;
+}
+
+function normalizeOwnershipBefore(value, {
+  componentId, rootPath, paths, versions, identities, integrities,
+}) {
+  if (!hasExactKeys(value, ["component", "rollback", "activeTask", "lastTask"])) {
+    throw journalError("transaction_record_invalid");
+  }
+  const normalized = normalizeJson(value);
+  if (!(normalized.activeTask === null || isPlainRecord(normalized.activeTask))
+    || !(normalized.lastTask === null || isPlainRecord(normalized.lastTask))) {
+    throw journalError("transaction_record_invalid");
+  }
+  if (versions.current === null) {
+    if (normalized.component !== null) throw journalError("transaction_record_invalid");
+  } else if (!isPlainRecord(normalized.component)
+    || normalized.component.installPath !== paths.current
+    || normalized.component.version !== versions.current
+    || normalized.component.treeDigest !== integrities.current.treeDigest
+    || normalized.component.manifestDigest !== integrities.current.manifestDigest
+    || normalized.component.managed !== true
+    || !sameIdentity(normalized.component.slotIdentity, identities.current)) {
+    throw journalError("transaction_record_invalid");
+  }
+  if (versions.previous === null) {
+    if (normalized.rollback !== null) throw journalError("transaction_record_invalid");
+  } else if (!isPlainRecord(normalized.rollback)
+    || normalized.rollback.path !== paths.previous
+    || normalized.rollback.rootPath !== rootPath
+    || normalized.rollback.componentId !== componentId
+    || normalized.rollback.version !== versions.previous
+    || normalized.rollback.treeDigest !== integrities.previous.treeDigest
+    || normalized.rollback.manifestDigest !== integrities.previous.manifestDigest
+    || !sameIdentity(normalized.rollback.slotIdentity, identities.previous)) {
+    throw journalError("transaction_record_invalid");
+  }
+  return normalized;
+}
+
 function normalizeRecord(value) {
   if (!hasExactKeys(value, RECORD_KEYS) || value.schemaVersion !== SCHEMA_VERSION
     || !TASK_ID.test(value.taskId ?? "") || !COMPONENT_IDS.has(value.componentId)
@@ -88,13 +173,18 @@ function normalizeRecord(value) {
     || SLOT_KEYS.some((key) => value.paths[key] !== path.win32.join(rootPath, expectedSlots[key]))) {
     throw journalError("transaction_record_invalid");
   }
-  if (!hasExactKeys(value.versions, VERSION_KEYS) || !hasExactKeys(value.identities, VERSION_KEYS)) {
+  if (!hasExactKeys(value.versions, VERSION_KEYS) || !hasExactKeys(value.identities, VERSION_KEYS)
+    || !hasExactKeys(value.integrities, VERSION_KEYS)) {
     throw journalError("transaction_record_invalid");
   }
   const versions = Object.fromEntries(VERSION_KEYS.map((key) => [key, normalizeVersion(value.versions[key])]));
   const identities = Object.fromEntries(VERSION_KEYS.map((key) => [key, normalizeIdentity(value.identities[key])]));
+  const integrities = Object.fromEntries(VERSION_KEYS.map((key) => [key, normalizeIntegrity(value.integrities[key])]));
   for (const key of VERSION_KEYS) {
-    if ((versions[key] === null) !== (identities[key] === null)) throw journalError("transaction_record_invalid");
+    if ((versions[key] === null) !== (identities[key] === null)
+      || (versions[key] === null) !== (integrities[key] === null)) {
+      throw journalError("transaction_record_invalid");
+    }
   }
   if (value.mode === "promote") {
     if (versions.incoming === null || (versions.previous !== null && versions.current === null)) {
@@ -104,6 +194,15 @@ function normalizeRecord(value) {
     || value.phase === "old_moved") {
     throw journalError("transaction_record_invalid");
   }
+  const paths = Object.fromEntries(SLOT_KEYS.map((key) => [key, path.win32.join(rootPath, expectedSlots[key])]));
+  const ownershipBefore = normalizeOwnershipBefore(value.ownershipBefore, {
+    componentId: value.componentId,
+    rootPath,
+    paths,
+    versions,
+    identities,
+    integrities,
+  });
   return {
     schemaVersion: SCHEMA_VERSION,
     taskId: value.taskId,
@@ -112,9 +211,11 @@ function normalizeRecord(value) {
     phase: value.phase,
     rootPath,
     slots: { ...expectedSlots },
-    paths: Object.fromEntries(SLOT_KEYS.map((key) => [key, path.win32.join(rootPath, expectedSlots[key])])),
+    paths,
     versions,
     identities,
+    integrities,
+    ownershipBefore,
   };
 }
 
@@ -145,7 +246,7 @@ function recordsEqual(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function expectedSequence(record) {
+function forwardSequence(record) {
   if (record.mode === "rollback") {
     return ["prepared", "retiring_moved", "new_promoted", "state_committed", "cleanup_committed"];
   }
@@ -157,6 +258,22 @@ function expectedSequence(record) {
     "state_committed",
     "cleanup_committed",
   ];
+}
+
+function expectedSequences(record) {
+  const forward = forwardSequence(record);
+  if (record.mode !== "promote") return [forward];
+  const stateIndex = forward.indexOf("state_committed");
+  const aborts = [];
+  for (let prefixLength = 1; prefixLength <= stateIndex; prefixLength += 1) {
+    aborts.push([...forward.slice(0, prefixLength), ...ABORT_PHASES]);
+  }
+  return [forward, ...aborts];
+}
+
+function isExactPrefix(sequence, phases) {
+  return phases.length <= sequence.length
+    && phases.every((phase, index) => sequence[index] === phase);
 }
 
 async function readRecord(directory, name) {
@@ -204,16 +321,23 @@ export function createTransactionJournal({ journalDir, fsApi }) {
         if (!recordsEqual(existing.record, normalized)) throw journalError("transaction_journal_conflict");
         return existing.record;
       }
-      const sequence = expectedSequence(normalized);
-      const phaseIndex = sequence.indexOf(normalized.phase);
-      if (phaseIndex === -1) throw journalError("transaction_journal_phase_order_invalid");
-      for (const predecessor of sequence.slice(0, phaseIndex)) {
-        const prior = await readRecord(directory, fileName(normalized.componentId, predecessor));
-        if (!prior) throw journalError("transaction_journal_phase_order_invalid");
+      const priorRecords = [];
+      for (const phase of PHASES) {
+        const prior = await readRecord(directory, fileName(normalized.componentId, phase));
+        if (!prior) continue;
         if (!recordsEqual({ ...prior.record, phase: normalized.phase }, normalized)) {
           throw journalError("transaction_journal_conflict");
         }
+        priorRecords.push(prior.record);
       }
+      const priorSet = new Set(priorRecords.map((item) => item.phase));
+      if (priorSet.size !== priorRecords.length) throw journalError("transaction_journal_conflict");
+      const validNext = expectedSequences(normalized).some((sequence) => {
+        const ordered = sequence.filter((phase) => priorSet.has(phase));
+        return ordered.length === priorSet.size && isExactPrefix(sequence, ordered)
+          && sequence[priorSet.size] === normalized.phase;
+      });
+      if (!validNext) throw journalError("transaction_journal_phase_order_invalid");
       await unlinkNamed(directory, tempName);
 
       const temp = requireFile(await directory.openFileNoFollow(tempName, "wx"), true);
@@ -240,7 +364,7 @@ export function createTransactionJournal({ journalDir, fsApi }) {
       }
       const groups = new Map();
       for (const name of names) {
-        const match = /^(chatgpt|v2rayn|git)\.(prepared|retiring_moved|old_moved|new_promoted|state_committed|cleanup_committed)\.json(\.tmp)?$/u.exec(name);
+        const match = /^(chatgpt|v2rayn|git)\.(prepared|retiring_moved|old_moved|new_promoted|state_committed|cleanup_committed|abort_started|abort_incoming_isolated|abort_current_restored|abort_previous_restored|abort_state_restoring|abort_cleanup_started|abort_cleanup_committed)\.json(\.tmp)?$/u.exec(name);
         if (!match) throw journalError("transaction_journal_entry_invalid");
         if (match[3]) {
           await unlinkNamed(directory, name);
@@ -262,7 +386,8 @@ export function createTransactionJournal({ journalDir, fsApi }) {
       for (const records of groups.values()) {
         const prepared = records.find((item) => item.phase === "prepared");
         const cleanup = records.find((item) => item.phase === "cleanup_committed");
-        const anchor = prepared ?? cleanup;
+        const abortCleanup = records.find((item) => item.phase === "abort_cleanup_committed");
+        const anchor = prepared ?? cleanup ?? abortCleanup;
         if (!anchor || records.some((item) => {
           const comparable = { ...item, phase: "prepared" };
           return !recordsEqual(comparable, { ...anchor, phase: "prepared" });
@@ -270,14 +395,18 @@ export function createTransactionJournal({ journalDir, fsApi }) {
           throw journalError("transaction_journal_conflict");
         }
         const snapshot = { ...anchor, phase: "prepared" };
-        const sequence = expectedSequence(snapshot);
+        const sequences = expectedSequences(snapshot);
         const present = new Set(records.map((item) => item.phase));
-        if (!cleanup) {
+        let sequence;
+        if (cleanup || abortCleanup) {
+          sequence = sequences.find((candidate) => candidate.at(-1) === (cleanup ? "cleanup_committed" : "abort_cleanup_committed")
+            && [...present].every((phase) => candidate.includes(phase)));
+        } else {
           if (!prepared) throw journalError("transaction_journal_phase_order_invalid");
-          const count = sequence.findIndex((phase) => !present.has(phase));
-          const prefixLength = count === -1 ? sequence.length : count;
-          if (records.length !== prefixLength) throw journalError("transaction_journal_phase_order_invalid");
+          sequence = sequences.find((candidate) => isExactPrefix(candidate, candidate.filter((phase) => present.has(phase)))
+            && records.length === candidate.filter((phase) => present.has(phase)).length);
         }
+        if (!sequence) throw journalError("transaction_journal_phase_order_invalid");
         records.sort((left, right) => sequence.indexOf(left.phase) - sequence.indexOf(right.phase));
         transactions.push({
           taskId: snapshot.taskId,
@@ -301,8 +430,8 @@ export function createTransactionJournal({ journalDir, fsApi }) {
     const directory = await openDirectory();
     try {
       const deletionOrder = [
-        ...found.records.filter((item) => item.phase !== "cleanup_committed"),
-        ...found.records.filter((item) => item.phase === "cleanup_committed"),
+        ...found.records.filter((item) => !["cleanup_committed", "abort_cleanup_committed"].includes(item.phase)),
+        ...found.records.filter((item) => ["cleanup_committed", "abort_cleanup_committed"].includes(item.phase)),
       ];
       for (const item of deletionOrder) {
         const opened = await readRecord(directory, fileName(item.componentId, item.phase));
