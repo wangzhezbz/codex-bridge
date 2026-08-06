@@ -1,6 +1,7 @@
 export const COMPONENT_IDS = Object.freeze(["chatgpt", "v2rayn", "git"]);
 export const TEST_CATALOG_ORIGIN = "https://shanhaiyouling.com";
 export const TEST_CATALOG_PATH = "/codexbridge-install-test/component-catalog.json";
+export const TEST_PACKAGE_PATH = "/codexbridge-test/packages/";
 
 const COMPONENT_KEYS = new Set([
   "id", "name", "version", "architecture", "format", "assetUrl", "size", "sha256",
@@ -32,13 +33,20 @@ export function compareVersions(left, right) {
 }
 
 export function resolveCatalogAssetUrl(catalogUrl, assetUrl) {
+  if (typeof assetUrl !== "string" || /%(?:2e|2f|5c)/i.test(assetUrl)) {
+    throw catalogError("catalog_asset_url_rejected");
+  }
   let resolved;
   try {
     resolved = new URL(assetUrl, catalogUrl);
   } catch {
     throw catalogError("catalog_asset_url_invalid");
   }
-  if (resolved.protocol !== "https:") throw catalogError("catalog_asset_url_rejected");
+  if (resolved.protocol !== "https:" || resolved.origin !== TEST_CATALOG_ORIGIN
+    || !resolved.pathname.startsWith(TEST_PACKAGE_PATH) || resolved.pathname === TEST_PACKAGE_PATH
+    || resolved.search || resolved.hash) {
+    throw catalogError("catalog_asset_url_rejected");
+  }
   return resolved.href;
 }
 
@@ -117,12 +125,11 @@ function isSafePathList(value) {
 }
 
 function isSafeAssetUrl(value) {
-  if (typeof value !== "string" || value.length === 0) return false;
   try {
-    const url = new URL(value);
-    return url.protocol === "https:";
+    resolveCatalogAssetUrl(`${TEST_CATALOG_ORIGIN}${TEST_CATALOG_PATH}`, value);
+    return true;
   } catch {
-    return isSafeRelativePath(value);
+    return false;
   }
 }
 

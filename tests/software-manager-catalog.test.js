@@ -21,7 +21,7 @@ function componentFixture(overrides = {}) {
     version: "1.2.3",
     architecture: "x64",
     format: "zip",
-    assetUrl: "assets/chatgpt-1.2.3.zip",
+    assetUrl: "https://shanhaiyouling.com/codexbridge-test/packages/chatgpt-1.2.3.zip",
     size: 1234,
     sha256: "a".repeat(64),
     entrypoint: "ChatGPT.exe",
@@ -39,7 +39,7 @@ function skillFixture(id, overrides = {}) {
     name: "Documents",
     description: "Create and edit documents.",
     version: "1.2.3",
-    assetUrl: `assets/skills/${id}.zip`,
+    assetUrl: `https://shanhaiyouling.com/codexbridge-test/packages/skills/${id}.zip`,
     size: 1234,
     sha256: "b".repeat(64),
     files: ["SKILL.md"],
@@ -78,6 +78,23 @@ test("catalog rejects a non-HTTPS asset URL", () => {
   assert.throws(() => parseCatalog({ schemaVersion: 1, components: [componentFixture({ assetUrl: "http://example.test/chatgpt.zip" })], skills: [] }), /asset_url/i);
 });
 
+test("catalog rejects an external HTTPS asset URL", () => {
+  assert.throws(() => parseCatalog({ schemaVersion: 1, components: [componentFixture({ assetUrl: "https://example.test/chatgpt.zip" })], skills: [] }), /asset_url/i);
+});
+
+test("catalog rejects an asset in the old production path", () => {
+  assert.throws(() => parseCatalog({ schemaVersion: 1, components: [componentFixture({ assetUrl: "https://shanhaiyouling.com/codexbridge-install/packages/chatgpt.zip" })], skills: [] }), /asset_url/i);
+});
+
+test("catalog rejects encoded traversal in an asset URL", () => {
+  assert.throws(() => parseCatalog({ schemaVersion: 1, components: [componentFixture({ assetUrl: "https://shanhaiyouling.com/codexbridge-test/packages/%2e%2e/escape.zip" })], skills: [] }), /asset_url/i);
+});
+
+test("catalog rejects asset URL queries and fragments", () => {
+  assert.throws(() => parseCatalog({ schemaVersion: 1, components: [componentFixture({ assetUrl: "https://shanhaiyouling.com/codexbridge-test/packages/chatgpt.zip?token=x" })], skills: [] }), /asset_url/i);
+  assert.throws(() => parseCatalog({ schemaVersion: 1, components: [componentFixture({ assetUrl: "https://shanhaiyouling.com/codexbridge-test/packages/chatgpt.zip#fragment" })], skills: [] }), /asset_url/i);
+});
+
 test("catalog rejects duplicate Skill IDs", () => {
   assert.throws(() => parseCatalog({ schemaVersion: 1, components: [], skills: [skillFixture("documents"), skillFixture("documents")] }), /skill_id_duplicate/i);
 });
@@ -94,8 +111,14 @@ test("catalog rejects a production-origin URL", () => {
   );
 });
 
-test("catalog resolves relative asset URLs against the signed catalog URL", () => {
-  assert.equal(resolveCatalogAssetUrl(TEST_CATALOG_URL, "assets/chatgpt.zip"), "https://shanhaiyouling.com/codexbridge-install-test/assets/chatgpt.zip");
+test("catalog resolves an authorized test package asset URL", () => {
+  assert.equal(resolveCatalogAssetUrl(TEST_CATALOG_URL, "https://shanhaiyouling.com/codexbridge-test/packages/chatgpt.zip"), "https://shanhaiyouling.com/codexbridge-test/packages/chatgpt.zip");
+});
+
+test("catalog trust rejects the default unprovisioned public key", () => {
+  const signed = signedFixture({ components: [componentFixture()] });
+  const { publicKeyPem, ...unsignedRuntime } = signed;
+  assert.throws(() => verifyCatalogEnvelope({ ...unsignedRuntime, catalogUrl: TEST_CATALOG_URL }), /catalog_trust_not_provisioned/);
 });
 
 test("catalog compares numeric version segments", () => {
