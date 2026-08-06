@@ -51,14 +51,17 @@ function requireChildDescriptor(descriptor, expectedName) {
   return descriptor;
 }
 
-export async function deleteAuthorizedTree({ target, authorizedRoot, fsApi }) {
-  if (!fsApi || typeof fsApi.openDirectoryNoFollow !== "function") {
+export async function deleteAuthorizedTree({ target, authorizedRoot, fsApi, rootHandle, targetDescriptor }) {
+  const suppliedDescriptor = rootHandle !== undefined || targetDescriptor !== undefined;
+  if (suppliedDescriptor ? (!rootHandle || !targetDescriptor) : (!fsApi || typeof fsApi.openDirectoryNoFollow !== "function")) {
     throw deleteError("delete_no_follow_capability_required");
   }
   const root = normalize(authorizedRoot);
   const exactTarget = authorizeChild(target, root);
-  const rootHandle = requireDirectoryHandle(await fsApi.openDirectoryNoFollow(root));
-  const openHandles = new Set([rootHandle]);
+  const stableRootHandle = suppliedDescriptor
+    ? requireDirectoryHandle(rootHandle)
+    : requireDirectoryHandle(await fsApi.openDirectoryNoFollow(root));
+  const openHandles = new Set([stableRootHandle]);
 
   async function closeHandle(handle) {
     if (!openHandles.delete(handle)) return;
@@ -94,8 +97,22 @@ export async function deleteAuthorizedTree({ target, authorizedRoot, fsApi }) {
   }
 
   try {
+    if (suppliedDescriptor) {
+      if (path.dirname(exactTarget) !== root) throw deleteError("delete_descriptor_target_not_direct_child");
+      const descriptor = requireChildDescriptor(targetDescriptor, path.basename(exactTarget));
+      if (typeof stableRootHandle.assertChildDescriptorNoFollow !== "function") {
+        throw deleteError("delete_no_follow_descriptor_capability_required");
+      }
+      try {
+        await stableRootHandle.assertChildDescriptorNoFollow(descriptor);
+      } catch (error) {
+        throw deleteError("delete_no_follow_descriptor_invalid", error);
+      }
+      await walk(stableRootHandle, descriptor, exactTarget, 0);
+      return;
+    }
     const relativeSegments = path.relative(root, exactTarget).split(path.sep);
-    let parentHandle = rootHandle;
+    let parentHandle = stableRootHandle;
     let currentPath = root;
     for (let index = 0; index < relativeSegments.length; index += 1) {
       const name = relativeSegments[index];

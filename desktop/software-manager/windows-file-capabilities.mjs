@@ -7,6 +7,7 @@ const MAX_ENTRIES = 4_096;
 const MAX_STATE_BYTES = 16 * 1_024 * 1_024;
 const MAX_ARCHIVE_BYTES = 16 * 1_024 * 1_024 * 1_024;
 const MAX_PATH_CHARS = 32_760;
+const VERSION_MARKER_NAME = ".codexbridge-version.json";
 const DRIVE_PATH = /^[A-Za-z]:\\/u;
 const RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/iu;
 const REQUIRED_NATIVE_METHODS = [
@@ -216,6 +217,18 @@ function ensureDirectChild(parentPath, name) {
   return child;
 }
 
+function normalizeVersionMarker(value) {
+  if (!value || Object.getPrototypeOf(value) !== Object.prototype
+    || Object.keys(value).length !== 3
+    || value.schemaVersion !== 1
+    || !["chatgpt", "v2rayn", "git"].includes(value.componentId)
+    || typeof value.version !== "string"
+    || !/^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/u.test(value.version)) {
+    throw capabilityError("version_marker_invalid");
+  }
+  return { schemaVersion: 1, componentId: value.componentId, version: value.version };
+}
+
 export function createWindowsFileCapabilities({
   platform = process.platform,
   nativeApi,
@@ -229,7 +242,7 @@ export function createWindowsFileCapabilities({
     throw capabilityError("windows_file_adapter_required");
   }
 
-  async function openStateDirectoryNoFollow(stateDir) {
+  async function openRecordDirectoryNoFollow(stateDir, { includeListing = false } = {}) {
     const pin = await openPinnedPath(nativeApi, stateDir, {
       kind: "directory",
       access: ["attributes"],
@@ -328,7 +341,7 @@ export function createWindowsFileCapabilities({
       if (primaryError) throw primaryError;
     }
 
-    return Object.freeze({
+    const facade = {
       openFileNoFollow,
       async unlinkEntryNoFollow(entry) {
         await mutate(entry, (descriptor) => nativeApi.deleteByHandle(descriptor.handle, { directory: false }));
@@ -340,10 +353,38 @@ export function createWindowsFileCapabilities({
         ), { retryOccupied: true });
       },
       async close() { await closeOwner(nativeApi, pin.owner); },
-    });
+    };
+    if (includeListing) {
+      facade.listFileNamesNoFollow = async () => {
+        requireOpen(pin.owner);
+        const names = [];
+        try {
+          for await (const entry of nativeApi.enumerateDirectory(pin.leaf.handle, { limit: MAX_ENTRIES })) {
+            if (!entry || entry.reparse === true) throw capabilityError("windows_reparse_point_rejected");
+            names.push(validateChildName(entry.name));
+          }
+        } catch (error) {
+          if (error?.code === "native_directory_entry_limit_exceeded"
+            || error?.code === "windows_directory_limit_exceeded") {
+            throw capabilityError("journal_entry_limit_exceeded", error);
+          }
+          throw error;
+        }
+        return names;
+      };
+    }
+    return Object.freeze(facade);
   }
 
-  async function openDirectoryNoFollow(rootPath) {
+  async function openStateDirectoryNoFollow(stateDir) {
+    return openRecordDirectoryNoFollow(stateDir);
+  }
+
+  async function openJournalDirectoryNoFollow(journalDir) {
+    return openRecordDirectoryNoFollow(journalDir, { includeListing: true });
+  }
+
+  async function openStableDirectoryNoFollow(rootPath, { versionSlots = false } = {}) {
     const pin = await openPinnedPath(nativeApi, rootPath, {
       kind: "directory",
       access: ["read", "attributes"],
@@ -360,6 +401,14 @@ export function createWindowsFileCapabilities({
         if (facadeClosed) throw capabilityError("delete_directory_closed");
       }
       return Object.freeze({
+        async assertChildDescriptorNoFollow(descriptor) {
+          requireFacade();
+          const internal = descriptorMap.get(descriptor);
+          if (!internal || internal.token !== token || internal.state !== "open") {
+            throw capabilityError("delete_descriptor_invalid");
+          }
+          return true;
+        },
         async listChildren() {
           requireFacade();
           const names = [];
@@ -400,10 +449,13 @@ export function createWindowsFileCapabilities({
             const descriptor = Object.freeze({
               name,
               kind,
+              identity: publicIdentity(info.identity),
               ...(kind === "directory" ? { handle: makeDirectoryFacade({ handle, path: finalPath, info }) } : {}),
             });
             if (!info.directory) await nativeApi.assertNoAlternateDataStreams(handle);
-            descriptorMap.set(descriptor, { handle, identity: info.identity, directory: info.directory, token, state: "open" });
+            descriptorMap.set(descriptor, {
+              handle, identity: info.identity, directory: info.directory, token, state: "open", path: finalPath,
+            });
             return descriptor;
           } catch (error) {
             await closeOne(nativeApi, pin.owner, handle).catch((closeError) => {
@@ -451,7 +503,155 @@ export function createWindowsFileCapabilities({
     }
 
     const rootFacade = makeDirectoryFacade(pin.leaf);
-    return Object.freeze({ ...rootFacade, async close() { await closeOwner(nativeApi, pin.owner); } });
+    if (!versionSlots) {
+      return Object.freeze({ ...rootFacade, async close() { await closeOwner(nativeApi, pin.owner); } });
+    }
+
+    function requireSlotDescriptor(descriptor, { claim = false } = {}) {
+      requireOpen(pin.owner);
+      const internal = descriptorMap.get(descriptor);
+      if (!internal || internal.token === undefined || !internal.directory) {
+        throw capabilityError("version_slot_descriptor_invalid");
+      }
+      if (internal.state !== "open") throw capabilityError("version_slot_descriptor_consumed");
+      if (claim) internal.state = "busy";
+      return internal;
+    }
+
+    async function openMarker(internal, flags) {
+      const markerPath = ensureDirectChild(internal.path, VERSION_MARKER_NAME);
+      let handle;
+      try {
+        handle = await nativeApi.openPath(markerPath, {
+          access: flags === "r" ? ["read", "attributes"] : ["read", "write", "attributes", "delete"],
+          share: ["read", "write"],
+          disposition: flags === "r" ? "openExisting" : "createNew",
+          directory: false,
+        });
+      } catch (error) {
+        if (flags === "r" && isMissing(error)) return null;
+        throw error;
+      }
+      pin.owner.handles.add(handle);
+      try {
+        const info = validateInfo(await nativeApi.queryHandle(handle), "file");
+        if (info.nlink !== 1) throw capabilityError("windows_hard_link_rejected");
+        await nativeApi.assertNoAlternateDataStreams(handle);
+        const finalPath = validateAbsolute(await nativeApi.finalPath(handle));
+        if (!samePath(finalPath, markerPath)) throw capabilityError("windows_final_path_mismatch");
+        return { handle, info, path: markerPath };
+      } catch (error) {
+        await closeOne(nativeApi, pin.owner, handle).catch((closeError) => {
+          throw new AggregateError([error, closeError], error.message, { cause: error });
+        });
+        throw error;
+      }
+    }
+
+    async function readMarker(internal) {
+      const marker = await openMarker(internal, "r");
+      if (!marker) return null;
+      let primaryError = null;
+      try {
+        const data = await nativeApi.readFile(marker.handle, MAX_STATE_BYTES);
+        const metadata = normalizeVersionMarker(JSON.parse(data.toString("utf8")));
+        return { ...metadata, identity: publicIdentity(internal.identity) };
+      } catch (error) {
+        primaryError = error?.code === "version_marker_invalid"
+          ? error
+          : capabilityError("version_marker_invalid", error);
+      } finally {
+        try {
+          await closeOne(nativeApi, pin.owner, marker.handle);
+        } catch (closeError) {
+          if (primaryError) throw new AggregateError([primaryError, closeError], primaryError.message, { cause: primaryError });
+          throw closeError;
+        }
+      }
+      throw primaryError;
+    }
+
+    async function openSlotNoFollow(name) {
+      let descriptor;
+      try {
+        descriptor = await rootFacade.openChildNoFollow(name);
+      } catch (error) {
+        if (isMissing(error)) return null;
+        throw error;
+      }
+      if (descriptor.kind !== "directory") throw capabilityError("version_slot_directory_required");
+      const internal = requireSlotDescriptor(descriptor);
+      return Object.freeze({ descriptor, evidence: await readMarker(internal) });
+    }
+
+    async function sealPreparedSlotNoFollow(descriptor, value) {
+      const metadata = normalizeVersionMarker(value);
+      const internal = requireSlotDescriptor(descriptor);
+      const current = validateInfo(await nativeApi.queryHandle(internal.handle), "directory");
+      verifyIdentity(internal.identity, current);
+      const existing = await readMarker(internal);
+      if (existing) {
+        if (existing.componentId !== metadata.componentId || existing.version !== metadata.version) {
+          throw capabilityError("version_marker_conflict");
+        }
+        return existing;
+      }
+      const marker = await openMarker(internal, "wx");
+      let primaryError = null;
+      try {
+        await nativeApi.writeFile(marker.handle, Buffer.from(`${JSON.stringify(metadata)}\n`, "utf8"));
+        await nativeApi.flushFile(marker.handle);
+      } catch (error) {
+        primaryError = error;
+      } finally {
+        try {
+          await closeOne(nativeApi, pin.owner, marker.handle);
+        } catch (closeError) {
+          if (primaryError) throw new AggregateError([primaryError, closeError], primaryError.message, { cause: primaryError });
+          throw closeError;
+        }
+      }
+      if (primaryError) throw primaryError;
+      return { ...metadata, identity: publicIdentity(internal.identity) };
+    }
+
+    async function renameSlotNoReplace(descriptor, destinationName) {
+      const internal = requireSlotDescriptor(descriptor, { claim: true });
+      let primaryError = null;
+      try {
+        const current = validateInfo(await nativeApi.queryHandle(internal.handle), "directory");
+        verifyIdentity(internal.identity, current);
+        await nativeApi.renameByHandle(
+          internal.handle, pin.leaf.handle, validateChildName(destinationName), { replace: false },
+        );
+      } catch (error) {
+        primaryError = error;
+      }
+      internal.state = "consumed";
+      try {
+        await closeOne(nativeApi, pin.owner, internal.handle);
+      } catch (closeError) {
+        if (primaryError) throw new AggregateError([primaryError, closeError], primaryError.message, { cause: primaryError });
+        throw closeError;
+      }
+      if (primaryError) throw primaryError;
+    }
+
+    return Object.freeze({
+      ...rootFacade,
+      openSlotNoFollow,
+      sealPreparedSlotNoFollow,
+      renameSlotNoReplace,
+      async close() { await closeOwner(nativeApi, pin.owner); },
+    });
+  }
+
+  async function openDirectoryNoFollow(rootPath) {
+    return openStableDirectoryNoFollow(rootPath);
+  }
+
+  async function openVersionRootNoFollow(rootPath) {
+    return openStableDirectoryNoFollow(rootPath, { versionSlots: true });
   }
 
   async function pinArchiveFileNoFollow(archivePath) {
@@ -964,7 +1164,9 @@ export function createWindowsFileCapabilities({
 
   return Object.freeze({
     openStateDirectoryNoFollow,
+    openJournalDirectoryNoFollow,
     openDirectoryNoFollow,
+    openVersionRootNoFollow,
     pinArchiveFileNoFollow,
     openArchiveDestinationNoFollow,
     createShortcutFileApi,

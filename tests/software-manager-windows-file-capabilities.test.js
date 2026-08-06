@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { deleteAuthorizedTree } from "../desktop/software-manager/safe-delete.mjs";
 import { createWin32FileApi } from "../desktop/software-manager/win32-file-api.mjs";
 import { createWindowsFileCapabilities } from "../desktop/software-manager/windows-file-capabilities.mjs";
 
@@ -347,6 +348,106 @@ test("state exclusive create is syncable and rename never replaces an occupied d
   assert.equal(fake.get("C:\\work\\state\\occupied.json").data.toString(), "keep");
   assert.equal(fake.calls.some((call) => call[0] === "flush"), true);
   await directory.close();
+});
+
+test("version-root capability seals a complete marker and renames a direct child only by held identity", async () => {
+  const fake = createFakeNative([
+    { path: "C:\\work\\versions" },
+    { path: "C:\\work\\versions\\ct" },
+  ]);
+  const root = await capabilities(fake).openVersionRootNoFollow("C:\\work\\versions");
+  const staging = await root.openSlotNoFollow("ct");
+  assert.equal(staging.evidence, null);
+  const evidence = await root.sealPreparedSlotNoFollow(staging.descriptor, {
+    schemaVersion: 1,
+    componentId: "chatgpt",
+    version: "1.0.0",
+  });
+  assert.equal(evidence.version, "1.0.0");
+  assert.deepEqual(evidence.identity, staging.descriptor.identity);
+  assert.equal(fake.calls.some((call) => call[0] === "flush" && call[1].endsWith(".codexbridge-version.json")), true);
+
+  await root.renameSlotNoReplace(staging.descriptor, "c");
+  assert.equal(fake.calls.some((call) => call[0] === "rename-handle"
+    && call[1] === "C:\\work\\versions\\ct" && call[3] === "c" && call[4] === false), true);
+  await root.close();
+  assert.equal(fake.handles.size, 0);
+});
+
+test("version-root rename rejects identity drift before invoking the native rename", async () => {
+  const fake = createFakeNative([
+    { path: "C:\\work\\versions" },
+    { path: "C:\\work\\versions\\ct" },
+  ]);
+  const root = await capabilities(fake).openVersionRootNoFollow("C:\\work\\versions");
+  const staging = await root.openSlotNoFollow("ct");
+  fake.get("C:\\work\\versions\\ct").identity = { volumeSerial: "vol-1", fileId: "swapped" };
+  await assert.rejects(root.renameSlotNoReplace(staging.descriptor, "c"), /identity_changed/u);
+  assert.equal(fake.calls.some((call) => call[0] === "rename-handle"), false);
+  await root.close();
+  assert.equal(fake.handles.size, 0);
+});
+
+test("version-root descriptor deletes a retiring tree only through the shared handle-bound safe walker", async () => {
+  const fake = createFakeNative([
+    { path: "C:\\work\\versions" },
+    { path: "C:\\work\\versions\\cr" },
+    { path: "C:\\work\\versions\\cr\\payload.bin", kind: "file", data: "old" },
+  ]);
+  const root = await capabilities(fake).openVersionRootNoFollow("C:\\work\\versions");
+  const retiring = await root.openSlotNoFollow("cr");
+  await deleteAuthorizedTree({
+    target: "C:\\work\\versions\\cr",
+    authorizedRoot: "C:\\work\\versions",
+    rootHandle: root,
+    targetDescriptor: retiring.descriptor,
+  });
+  assert.equal(fake.get("C:\\work\\versions\\cr"), undefined);
+  assert.equal(fake.get("C:\\work\\versions\\cr\\payload.bin"), undefined);
+  assert.equal(fake.calls.filter((call) => call[0] === "delete-handle").length, 2);
+  assert.equal(fake.handles.size, 0);
+});
+
+test("descriptor deletion rejects a slot capability from another pinned root before touching its tree", async () => {
+  const fake = createFakeNative([
+    { path: "C:\\work\\versions-a" },
+    { path: "C:\\work\\versions-a\\cr" },
+    { path: "C:\\work\\versions-b" },
+    { path: "C:\\work\\versions-b\\cr" },
+    { path: "C:\\work\\versions-b\\cr\\keep.bin", kind: "file", data: "keep" },
+  ]);
+  const capabilitiesApi = capabilities(fake);
+  const rootA = await capabilitiesApi.openVersionRootNoFollow("C:\\work\\versions-a");
+  const rootB = await capabilitiesApi.openVersionRootNoFollow("C:\\work\\versions-b");
+  const foreign = await rootB.openSlotNoFollow("cr");
+  await assert.rejects(
+    deleteAuthorizedTree({
+      target: "C:\\work\\versions-a\\cr",
+      authorizedRoot: "C:\\work\\versions-a",
+      rootHandle: rootA,
+      targetDescriptor: foreign.descriptor,
+    }),
+    /delete_no_follow_descriptor_invalid/u,
+  );
+  assert.equal(fake.get("C:\\work\\versions-b\\cr\\keep.bin").data.toString(), "keep");
+  assert.equal(fake.calls.some((call) => call[0] === "delete-handle"), false);
+  await rootB.close();
+  assert.equal(fake.handles.size, 0);
+});
+
+test("journal directory exposes bounded direct-child listing plus flushed no-replace publication", async () => {
+  const fake = createFakeNative([{ path: "C:\\work\\journal" }]);
+  const directory = await capabilities(fake).openJournalDirectoryNoFollow("C:\\work\\journal");
+  const temp = await directory.openFileNoFollow("chatgpt.prepared.json.tmp", "wx");
+  await temp.writeFile("{}", "utf8");
+  await temp.sync();
+  await temp.close();
+  await directory.renameEntryNoFollow(temp.entry, "chatgpt.prepared.json");
+  assert.deepEqual(await directory.listFileNamesNoFollow(), ["chatgpt.prepared.json"]);
+  assert.equal(fake.calls.some((call) => call[0] === "flush"), true);
+  assert.equal(fake.calls.some((call) => call[0] === "rename-handle" && call[4] === false), true);
+  await directory.close();
+  assert.equal(fake.handles.size, 0);
 });
 
 test("safe-delete lists bounded names and deletes files and directories by descriptor handle", async () => {
