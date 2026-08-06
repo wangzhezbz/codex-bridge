@@ -234,12 +234,68 @@ test("process ownership rejects relative executable paths before listing or stop
   assert.equal(fixture.calls.execFile.length, 0);
 });
 
-test("launches only a validated absolute executable through execFile with no shell", async () => {
+test("launchOwned waits for spawn evidence, unrefs, and never waits for process exit", { timeout: 1_000 }, async () => {
   const fixture = fakeHost();
-  await fixture.host.launchOwned("D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe");
-  assertCommand(fixture.calls.execFile[0], "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe", []);
-  assert.equal(fixture.calls.execFile[0].options.detached, true);
+  const result = await fixture.host.launchOwned("D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe");
+
+  assert.deepEqual(result, { executablePath: "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe", pid: 4242 });
+  assert.equal(fixture.calls.execFile.length, 0);
+  assert.deepEqual(fixture.calls.spawnDetached, [{
+    file: "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe",
+    args: [],
+    options: {
+      shell: false,
+      stdio: "ignore",
+      windowsHide: false,
+      detached: true,
+      env: { PATH: "C:\\Windows" },
+    },
+  }]);
+  assert.deepEqual(fixture.calls.unref, [4242]);
+  assert.equal(fixture.spawnExitSettled(), false);
   await assert.rejects(fixture.host.launchOwned("ChatGPT.exe"), /executable_path_absolute_required/);
+});
+
+test("launchOwned does not claim success before delayed spawn evidence and does not unref a failed spawn", async () => {
+  let resolveStarted;
+  const started = new Promise((resolve) => { resolveStarted = resolve; });
+  const delayed = fakeHost({ spawnStarted: started });
+  let settled = false;
+  const pending = delayed.host.launchOwned("D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe")
+    .finally(() => { settled = true; });
+
+  await Promise.resolve();
+  assert.equal(settled, false);
+  assert.deepEqual(delayed.calls.unref, []);
+  resolveStarted();
+  await pending;
+  assert.deepEqual(delayed.calls.unref, [4242]);
+
+  const failed = fakeHost({ spawnStarted: Promise.reject(new Error("spawn failed")) });
+  await assert.rejects(
+    failed.host.launchOwned("D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe"),
+    /owned_process_launch_failed/,
+  );
+  assert.deepEqual(failed.calls.unref, []);
+});
+
+test("launchOwned fails closed when the detached-spawn capability is absent", async () => {
+  const host = createWindowsHost({
+    platform: "win32",
+    env: {},
+    electronShell: {},
+    async execFile() { return { exitCode: 0, stdout: "", stderr: "" }; },
+  });
+  await assert.rejects(host.launchOwned("D:\\Owned\\ChatGPT.exe"), /spawn_detached_adapter_required/);
+});
+
+test("launchOwned does not return started when detached handle unref fails", async () => {
+  const fixture = fakeHost({ spawnUnrefFailure: new Error("unref failed") });
+  await assert.rejects(
+    fixture.host.launchOwned("D:\\Owned\\ChatGPT.exe"),
+    /owned_process_launch_failed/,
+  );
+  assert.deepEqual(fixture.calls.unref, [4242]);
 });
 
 test("rejects Windows alternate-data-stream paths before executing them", async () => {
@@ -261,9 +317,11 @@ test("rejects Windows alternate-data-stream paths before executing them", async 
 test("creates shortcut collision names in ChatGPT.lnk, ChatGPT（1）.lnk order without overwriting", async () => {
   const desktopPath = "C:\\Users\\me\\Desktop";
   const targetPath = "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe";
+  const basePath = `${desktopPath}\\ChatGPT.lnk`;
+  const firstCollisionPath = `${desktopPath}\\ChatGPT（1）.lnk`;
   const fixture = fakeHost({ shortcuts: new Map([
-    [`${desktopPath}\\ChatGPT.lnk`, { target: "C:\\Other\\ChatGPT.exe" }],
-    [`${desktopPath}\\ChatGPT（1）.lnk`, { target: "C:\\Other\\ChatGPT.exe" }],
+    [basePath, { target: "C:\\Other\\ChatGPT.exe" }],
+    [firstCollisionPath, { target: "C:\\Other2\\ChatGPT.exe" }],
   ]) });
 
   const record = await fixture.host.createShortcut({ desktopPath, name: "ChatGPT", targetPath });
@@ -273,51 +331,99 @@ test("creates shortcut collision names in ChatGPT.lnk, ChatGPT（1）.lnk order 
     desktopPath,
     targetPath,
   });
+  assert.deepEqual(fixture.calls.tempCreates, [{ directory: desktopPath, suffix: ".lnk" }]);
   assert.deepEqual(fixture.calls.shortcutWrites, [{
-    path: `${desktopPath}\\ChatGPT（2）.lnk`,
+    path: `${desktopPath}\\.codexbridge-shortcut-1.lnk`,
     operation: "create",
     options: { target: targetPath, cwd: "D:\\CBApps\\ChatGPT\\c", description: "ChatGPT" },
   }]);
+  assert.deepEqual(fixture.calls.shortcutCommits.map(({ destinationPath }) => destinationPath), [
+    basePath,
+    firstCollisionPath,
+    `${desktopPath}\\ChatGPT（2）.lnk`,
+  ]);
+  assert.equal(fixture.shortcuts.get(basePath).target, "C:\\Other\\ChatGPT.exe");
+  assert.equal(fixture.shortcuts.get(firstCollisionPath).target, "C:\\Other2\\ChatGPT.exe");
+  assert.equal(fixture.shortcuts.get(record.path).target, targetPath);
+  assert.deepEqual(fixture.calls.tempRemoves, []);
 });
 
-test("supports the native Electron shell shortcut API without a synthetic existence method", async () => {
+test("shortcut creation cleans only its exact temporary link when atomic commit fails", async () => {
   const desktopPath = "C:\\Users\\me\\Desktop";
-  const targetPath = "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe";
-  const occupiedPath = `${desktopPath}\\ChatGPT.lnk`;
-  const createdPath = `${desktopPath}\\ChatGPT（1）.lnk`;
-  const shortcuts = new Map([[occupiedPath, { target: "C:\\Other\\ChatGPT.exe" }]]);
+  const existingPath = `${desktopPath}\\ChatGPT.lnk`;
+  const fixture = fakeHost({
+    shortcuts: new Map([[existingPath, { target: "C:\\Other\\ChatGPT.exe" }]]),
+    shortcutCommitFailure: new Error("native commit failed"),
+  });
+
+  await assert.rejects(
+    fixture.host.createShortcut({
+      desktopPath,
+      name: "ChatGPT",
+      targetPath: "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe",
+    }),
+    /shortcut_commit_failed/,
+  );
+
+  assert.deepEqual(fixture.calls.shortcutWrites.map(({ path: shortcutPath }) => shortcutPath), [
+    `${desktopPath}\\.codexbridge-shortcut-1.lnk`,
+  ]);
+  assert.deepEqual(fixture.calls.tempRemoves.map(({ path: shortcutPath }) => shortcutPath), [
+    `${desktopPath}\\.codexbridge-shortcut-1.lnk`,
+  ]);
+  assert.equal(fixture.shortcuts.get(existingPath).target, "C:\\Other\\ChatGPT.exe");
+  assert.equal(fixture.shortcuts.size, 1);
+});
+
+test("shortcut creation cleans a capability-owned temp object that fails same-desktop validation", async () => {
+  const fixture = fakeHost({ shortcutTempPath: "D:\\Other\\.codexbridge-shortcut-1.lnk" });
+
+  await assert.rejects(
+    fixture.host.createShortcut({
+      desktopPath: "C:\\Users\\me\\Desktop",
+      name: "ChatGPT",
+      targetPath: "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe",
+    }),
+    /shortcut_temp_capability_invalid/,
+  );
+
+  assert.deepEqual(fixture.calls.shortcutWrites, []);
+  assert.deepEqual(fixture.calls.tempRemoves.map(({ path: shortcutPath }) => shortcutPath), [
+    "D:\\Other\\.codexbridge-shortcut-1.lnk",
+  ]);
+});
+
+test("shortcut methods fail closed without atomic shortcut filesystem capabilities", async () => {
   const writes = [];
-  const trashed = [];
   const electronShell = {
-    readShortcutLink(shortcutPath) {
-      if (!shortcuts.has(shortcutPath)) throw new Error("missing shortcut");
-      return shortcuts.get(shortcutPath);
-    },
-    writeShortcutLink(shortcutPath, operation, options) {
-      writes.push(shortcutPath);
-      if (shortcuts.has(shortcutPath)) return false;
-      shortcuts.set(shortcutPath, { target: options.target });
-      return true;
-    },
-    async trashItem(shortcutPath) {
-      trashed.push(shortcutPath);
-      shortcuts.delete(shortcutPath);
-    },
+    writeShortcutLink(...args) { writes.push(args); return true; },
+    readShortcutLink() { return { target: "D:\\Owned\\ChatGPT.exe" }; },
   };
   const host = createWindowsHost({
     platform: "win32",
     env: {},
     electronShell,
+    spawnDetached: defaultSpawnDetached(),
     async execFile() { return { exitCode: 0, stdout: "", stderr: "" }; },
   });
 
-  const record = await host.createShortcut({ desktopPath, name: "ChatGPT", targetPath });
-  assert.equal(record.path, createdPath);
-  assert.deepEqual(writes, [occupiedPath, createdPath]);
-  assert.deepEqual(await host.removeRecordedShortcut(record), { removed: true, path: createdPath });
-  assert.deepEqual(trashed, [createdPath]);
-  assert.equal(shortcuts.has(occupiedPath), true);
-  assert.equal(shortcuts.has(createdPath), false);
+  await assert.rejects(
+    host.createShortcut({
+      desktopPath: "C:\\Users\\me\\Desktop",
+      name: "ChatGPT",
+      targetPath: "D:\\Owned\\ChatGPT.exe",
+    }),
+    /shortcut_file_capability_required/,
+  );
+  await assert.rejects(
+    host.removeRecordedShortcut({
+      path: "C:\\Users\\me\\Desktop\\ChatGPT.lnk",
+      desktopPath: "C:\\Users\\me\\Desktop",
+      targetPath: "D:\\Owned\\ChatGPT.exe",
+    }),
+    /shortcut_file_capability_required/,
+  );
+  assert.deepEqual(writes, []);
 });
 
 test("shortcut creation rejects renderer-controlled names and non-absolute targets", async () => {
@@ -350,9 +456,27 @@ test("removes only the exact recorded desktop shortcut when its current target s
   const result = await fixture.host.removeRecordedShortcut({ path: recordedPath, desktopPath, targetPath });
 
   assert.deepEqual(result, { removed: true, path: recordedPath });
-  assert.deepEqual(fixture.calls.trashed, [recordedPath]);
+  assert.deepEqual(fixture.calls.fileRemoves.map(({ path: shortcutPath }) => shortcutPath), [recordedPath]);
   assert.equal(fixture.shortcuts.has(recordedPath), false);
   assert.equal(fixture.shortcuts.has(otherPath), true);
+});
+
+test("recorded shortcut removal distinguishes absent and non-file paths without mutation", async () => {
+  const desktopPath = "C:\\Users\\me\\Desktop";
+  const targetPath = "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe";
+  const absentPath = `${desktopPath}\\ChatGPT.lnk`;
+  const otherPath = `${desktopPath}\\ChatGPT（1）.lnk`;
+  const fixture = fakeHost({ otherShortcutPaths: new Set([otherPath]) });
+
+  assert.deepEqual(
+    await fixture.host.removeRecordedShortcut({ path: absentPath, desktopPath, targetPath }),
+    { removed: false, path: absentPath },
+  );
+  await assert.rejects(
+    fixture.host.removeRecordedShortcut({ path: otherPath, desktopPath, targetPath }),
+    /shortcut_path_not_file/,
+  );
+  assert.deepEqual(fixture.calls.fileRemoves, []);
 });
 
 test("refuses shortcut deletion outside the recorded desktop or after target replacement", async () => {
@@ -373,7 +497,7 @@ test("refuses shortcut deletion outside the recorded desktop or after target rep
     fixture.host.removeRecordedShortcut({ path: inside, desktopPath, targetPath }),
     /shortcut_target_mismatch/,
   );
-  assert.deepEqual(fixture.calls.trashed, []);
+  assert.deepEqual(fixture.calls.fileRemoves, []);
 });
 
 test("Git installer command uses a fixed verified silent argument list", async () => {
@@ -447,14 +571,34 @@ function fakeHost({
   authenticodeOutput,
   processes = [],
   shortcuts = new Map(),
+  otherShortcutPaths = new Set(),
+  shortcutCommitFailure = null,
+  shortcutTempPath = null,
+  spawnStarted = Promise.resolve(),
+  spawnUnrefFailure = null,
 } = {}) {
   const calls = {
     execFile: [],
     registry: [],
     processList: 0,
+    spawnDetached: [],
+    unref: [],
     shortcutWrites: [],
-    trashed: [],
+    tempCreates: [],
+    shortcutCommits: [],
+    tempRemoves: [],
+    fileInspects: [],
+    fileRemoves: [],
   };
+  let spawnExitSettled = false;
+  const spawnExit = new Promise(() => {}).finally(() => { spawnExitSettled = true; });
+  const identities = new Map();
+  let identitySequence = 0;
+  for (const shortcutPath of shortcuts.keys()) {
+    identities.set(shortcutPath, `identity-${++identitySequence}`);
+  }
+  const tempReservations = new Map();
+  let tempSequence = 0;
 
   const execFile = async (file, args, options) => {
     calls.execFile.push({ file, args: [...args], options });
@@ -486,10 +630,19 @@ function fakeHost({
     calls.processList += 1;
     return processes;
   };
+  const spawnDetached = async (file, args, options) => {
+    calls.spawnDetached.push({ file, args: [...args], options });
+    return {
+      pid: 4242,
+      started: spawnStarted,
+      exit: spawnExit,
+      unref() {
+        calls.unref.push(4242);
+        if (spawnUnrefFailure) throw spawnUnrefFailure;
+      },
+    };
+  };
   const electronShell = {
-    async shortcutExists(shortcutPath) {
-      return shortcuts.has(shortcutPath);
-    },
     readShortcutLink(shortcutPath) {
       if (!shortcuts.has(shortcutPath)) {
         const error = new Error("missing");
@@ -500,21 +653,81 @@ function fakeHost({
     },
     writeShortcutLink(shortcutPath, operation, options) {
       calls.shortcutWrites.push({ path: shortcutPath, operation, options });
-      if (shortcuts.has(shortcutPath)) return false;
+      otherShortcutPaths.delete(shortcutPath);
       shortcuts.set(shortcutPath, { target: options.target });
+      identities.set(shortcutPath, `identity-${++identitySequence}`);
       return true;
     },
-    async trashItem(shortcutPath) {
-      calls.trashed.push(shortcutPath);
+  };
+  const shortcutFileApi = {
+    async createTemp({ directory, suffix }) {
+      calls.tempCreates.push({ directory, suffix });
+      const temp = {
+        path: shortcutTempPath ?? `${directory}\\.codexbridge-shortcut-${++tempSequence}${suffix}`,
+        token: `temp-${tempSequence}`,
+      };
+      tempReservations.set(temp.token, temp);
+      identities.set(temp.path, `identity-${++identitySequence}`);
+      return temp;
+    },
+    async commitNoReplace(temp, destinationPath) {
+      calls.shortcutCommits.push({ temp, destinationPath });
+      if (shortcutCommitFailure) throw shortcutCommitFailure;
+      if (!tempReservations.has(temp?.token) || !shortcuts.has(temp.path)) {
+        throw new Error("invalid temp capability");
+      }
+      if (shortcuts.has(destinationPath) || otherShortcutPaths.has(destinationPath)
+        || [...tempReservations.values()].some((entry) => entry.path === destinationPath)) {
+        return "occupied";
+      }
+      shortcuts.set(destinationPath, shortcuts.get(temp.path));
+      identities.set(destinationPath, identities.get(temp.path));
+      shortcuts.delete(temp.path);
+      identities.delete(temp.path);
+      tempReservations.delete(temp.token);
+      return "committed";
+    },
+    async removeTemp(temp) {
+      calls.tempRemoves.push(temp);
+      if (!tempReservations.has(temp?.token)) throw new Error("invalid temp capability");
+      shortcuts.delete(temp.path);
+      identities.delete(temp.path);
+      tempReservations.delete(temp.token);
+    },
+    async inspectExact(shortcutPath) {
+      calls.fileInspects.push(shortcutPath);
+      if (otherShortcutPaths.has(shortcutPath)) return { kind: "other" };
+      if (!shortcuts.has(shortcutPath)) return { kind: "absent" };
+      return { kind: "file", identity: identities.get(shortcutPath) };
+    },
+    async removeExact({ path: shortcutPath, identity }) {
+      calls.fileRemoves.push({ path: shortcutPath, identity });
+      if (!shortcuts.has(shortcutPath) || identities.get(shortcutPath) !== identity) return false;
       shortcuts.delete(shortcutPath);
+      identities.delete(shortcutPath);
+      return true;
     },
   };
 
   return {
-    host: createWindowsHost({ platform, execFile, electronShell, registryReader, processLister, env }),
+    host: createWindowsHost({
+      platform,
+      execFile,
+      electronShell,
+      registryReader,
+      processLister,
+      shortcutFileApi,
+      spawnDetached,
+      env,
+    }),
     calls,
     shortcuts,
+    spawnExitSettled: () => spawnExitSettled,
   };
+}
+
+function defaultSpawnDetached() {
+  return async () => ({ pid: 4242, started: Promise.resolve(), unref() {} });
 }
 
 function assertCommand(call, file, args) {
