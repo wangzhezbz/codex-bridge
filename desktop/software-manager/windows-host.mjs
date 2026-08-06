@@ -293,7 +293,7 @@ function requireElectronMethod(electronShell, name) {
 }
 
 function requireShortcutFileApi(shortcutFileApi) {
-  const methods = ["createTemp", "commitNoReplace", "removeTemp", "inspectExact", "removeExact"];
+  const methods = ["createTemp", "sealTemp", "commitNoReplace", "removeTemp", "inspectExact", "removeExact", "release"];
   if (!isPlainRecord(shortcutFileApi)
     || methods.some((name) => typeof shortcutFileApi[name] !== "function")) {
     throw hostError("shortcut_file_capability_required");
@@ -332,7 +332,7 @@ function validateShortcutInspection(value) {
   if (!isPlainRecord(value) || !["absent", "file", "other"].includes(value.kind)) {
     throw hostError("shortcut_file_inspection_invalid");
   }
-  if (value.kind === "file" && (!Object.hasOwn(value, "identity") || value.identity == null)) {
+  if (value.kind === "file" && typeof value.path !== "string") {
     throw hostError("shortcut_file_inspection_invalid");
   }
   return value;
@@ -537,6 +537,7 @@ export function createWindowsHost({
         await cleanupShortcutTemp(fileApi, temp, error);
       }
       let committed = false;
+      let activeTemp = temp;
       let primaryError = null;
       let result = null;
       try {
@@ -546,14 +547,24 @@ export function createWindowsHost({
           { target: targetPath, cwd: path.win32.dirname(targetPath), description: record.name },
         );
         if (created !== true) throw hostError("shortcut_create_failed");
-        const current = await readShortcut(electronShell, validatedTemp.tempPath);
+        let sealedTemp;
+        try {
+          sealedTemp = await fileApi.sealTemp(temp);
+        } catch (error) {
+          throw hostError("shortcut_temp_seal_failed", error);
+        }
+        if (!isPlainRecord(sealedTemp) || sealedTemp.path !== validatedTemp.tempPath) {
+          throw hostError("shortcut_temp_capability_invalid");
+        }
+        activeTemp = sealedTemp;
+        const current = await readShortcut(electronShell, activeTemp.path);
         if (pathKey(current.target) !== pathKey(targetPath)) throw hostError("shortcut_target_mismatch");
 
         for (let collision = 0; collision < MAX_SHORTCUT_COLLISIONS; collision += 1) {
           const candidate = path.win32.join(desktopPath, shortcutFileName(record.name, collision));
           let status;
           try {
-            status = await fileApi.commitNoReplace(temp, candidate);
+            status = await fileApi.commitNoReplace(activeTemp, candidate);
           } catch (error) {
             throw hostError("shortcut_commit_failed", error);
           }
@@ -567,7 +578,7 @@ export function createWindowsHost({
       } catch (error) {
         primaryError = error;
       }
-      if (!committed) await cleanupShortcutTemp(fileApi, temp, primaryError);
+      if (!committed) await cleanupShortcutTemp(fileApi, activeTemp, primaryError);
       if (primaryError) throw primaryError;
       return result;
     },
@@ -578,12 +589,25 @@ export function createWindowsHost({
       const inspected = validateShortcutInspection(await fileApi.inspectExact(shortcutPath));
       if (inspected.kind === "absent") return { removed: false, path: shortcutPath };
       if (inspected.kind !== "file") throw hostError("shortcut_path_not_file");
-      const current = await readShortcut(electronShell, shortcutPath);
-      if (pathKey(current.target) !== pathKey(targetPath)) throw hostError("shortcut_target_mismatch");
-      const removed = await fileApi.removeExact({ path: shortcutPath, identity: inspected.identity });
+      let removed = false;
+      try {
+        const current = await readShortcut(electronShell, inspected.path);
+        if (pathKey(current.target) !== pathKey(targetPath)) throw hostError("shortcut_target_mismatch");
+        removed = await fileApi.removeExact(inspected);
+      } catch (error) {
+        try {
+          await fileApi.release(inspected);
+        } catch (releaseError) {
+          throw new AggregateError([error, releaseError], error.message, { cause: error });
+        }
+        throw error;
+      }
       if (removed !== true) throw hostError("shortcut_remove_failed");
       const after = validateShortcutInspection(await fileApi.inspectExact(shortcutPath));
-      if (after.kind !== "absent") throw hostError("shortcut_remove_failed");
+      if (after.kind !== "absent") {
+        if (after.kind === "file") await fileApi.release(after);
+        throw hostError("shortcut_remove_failed");
+      }
       return { removed: true, path: shortcutPath };
     },
 

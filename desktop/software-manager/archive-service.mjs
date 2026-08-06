@@ -5,6 +5,7 @@ import yauzl from "yauzl";
 const MAX_ARCHIVE_ENTRIES = 4_096;
 const MAX_TOTAL_UNPACKED_BYTES = 16n * 1_024n * 1_024n * 1_024n;
 const MAX_SEVEN_ZIP_LISTING_BYTES = 16 * 1_024 * 1_024;
+const MAX_SEVEN_ZIP_STDERR_BYTES = 1 * 1_024 * 1_024;
 const UNIX_FILE_TYPE_MASK = 0o170000;
 const UNIX_DIRECTORY_TYPE = 0o040000;
 const UNIX_SYMLINK_TYPE = 0o120000;
@@ -270,7 +271,8 @@ function openZipReadStream(zipFile, entry) {
 
 function requireZipDestinationHandle(handle) {
   if (!handle || typeof handle.ensureDirectoryPathNoFollow !== "function"
-    || typeof handle.createFilePathNoFollow !== "function" || typeof handle.close !== "function") {
+    || typeof handle.createFilePathNoFollow !== "function"
+    || typeof handle.verifyTreeNoFollow !== "function" || typeof handle.close !== "function") {
     throw archiveError("archive_no_follow_capability_invalid");
   }
   return handle;
@@ -308,6 +310,9 @@ async function extractZip({ archivePath, destination, signal, fsApi }) {
       await pipeline(input, output, signal ? { signal } : {});
     }
     throwIfAborted(signal);
+    const verifiedTree = await destinationHandle.verifyTreeNoFollow(signal);
+    throwIfAborted(signal);
+    validateVerifiedTree(verifiedTree, destination, enumerated.publicResult.entries);
     result = enumerated.publicResult;
   } catch (error) {
     primaryError = error;
@@ -359,7 +364,7 @@ function parseSevenZipListing(stdout) {
     const link = [...SEVEN_ZIP_LINK_FIELDS].some((field) => fields.has(field) && fields.get(field) !== "")
       || attributePolicy.link;
     const directory = /[\\/]$/u.test(rawPath) || attributePolicy.directory || folder === "+";
-    collector.add({ rawPath, size: BigInt(rawSize), directory, link });
+    collector.add({ rawPath, size: BigInt(rawSize), directory, link, source: rawPath });
   }
   return collector.finish();
 }
@@ -401,11 +406,64 @@ async function runSevenZip({ sevenZipPath, spawnFile, args, signal }) {
   return result.stdout;
 }
 
+function requireStreamingProcess(value) {
+  if (!value || typeof value !== "object" || !value.stdout || typeof value.stdout.pipe !== "function"
+    || !value.stderr || typeof value.stderr[Symbol.asyncIterator] !== "function"
+    || !value.completed || typeof value.completed.then !== "function"
+    || typeof value.cancel !== "function") {
+    throw archiveError("archive_7z_stream_adapter_invalid");
+  }
+  return value;
+}
+
+async function consumeBoundedStderr(stream) {
+  let size = 0;
+  for await (const chunk of stream) {
+    size += Buffer.byteLength(chunk);
+    if (size > MAX_SEVEN_ZIP_STDERR_BYTES) throw archiveError("archive_7z_stderr_exceeded");
+  }
+}
+
+async function streamSevenZipEntry({
+  archivePath, rawEntryPath, output, signal, sevenZipPath, spawnStream,
+}) {
+  throwIfAborted(signal);
+  if (typeof spawnStream !== "function") throw archiveError("archive_7z_stream_adapter_required");
+  let processHandle;
+  try {
+    processHandle = requireStreamingProcess(await spawnStream(sevenZipPath, [
+      "x", "-so", "-y", "-t7z", "-sns-", "--", archivePath, rawEntryPath,
+    ], {
+      shell: false,
+      windowsHide: true,
+      signal,
+    }));
+    throwIfAborted(signal);
+    const [,, completed] = await Promise.all([
+      pipeline(processHandle.stdout, output, signal ? { signal } : {}),
+      consumeBoundedStderr(processHandle.stderr),
+      processHandle.completed,
+    ]);
+    throwIfAborted(signal);
+    if (!completed || !Number.isInteger(completed.exitCode)) {
+      throw archiveError("archive_7z_stream_adapter_invalid");
+    }
+    if (completed.exitCode !== 0) throw archiveError("archive_7z_failed");
+  } catch (error) {
+    try {
+      processHandle?.cancel();
+    } catch (cancelError) {
+      throw new AggregateError([error, cancelError], error.message, { cause: error });
+    }
+    throw error;
+  }
+}
+
 async function inspectSevenZip({ archivePath, signal, sevenZipPath, spawnFile }) {
   const stdout = await runSevenZip({
     sevenZipPath,
     spawnFile,
-    args: ["l", "-slt", "-ba", "--", archivePath],
+    args: ["l", "-slt", "-ba", "-t7z", "-sns-", "--", archivePath],
     signal,
   });
   if (typeof stdout !== "string") throw archiveError("archive_7z_listing_encoding_required");
@@ -421,6 +479,8 @@ function requireArchivePin(handle) {
 
 function requireSevenZipDestinationHandle(handle) {
   if (!handle || typeof handle.assertEmptyNoFollow !== "function"
+    || typeof handle.ensureDirectoryPathNoFollow !== "function"
+    || typeof handle.createFilePathNoFollow !== "function"
     || typeof handle.verifyTreeNoFollow !== "function" || typeof handle.close !== "function") {
     throw archiveError("archive_no_follow_capability_invalid");
   }
@@ -478,7 +538,7 @@ function validateVerifiedTree(tree, destination, inspectedEntries) {
   if (expected.size !== 0) throw archiveError("archive_output_mismatch");
 }
 
-async function extractSevenZip({ archivePath, destination, signal, sevenZipPath, spawnFile, fsApi }) {
+async function extractSevenZip({ archivePath, destination, signal, sevenZipPath, spawnFile, spawnStream, fsApi }) {
   throwIfAborted(signal);
   if (typeof fsApi?.pinArchiveFileNoFollow !== "function"
     || typeof fsApi?.openArchiveDestinationNoFollow !== "function") {
@@ -503,12 +563,30 @@ async function extractSevenZip({ archivePath, destination, signal, sevenZipPath,
     throwIfAborted(signal);
     await destinationHandle.assertEmptyNoFollow();
     throwIfAborted(signal);
-    await runSevenZip({
-      sevenZipPath,
-      spawnFile,
-      args: ["x", "-y", `-o${destination}`, "--", archivePath],
-      signal,
-    });
+    for (const entry of inspected.entries) {
+      throwIfAborted(signal);
+      if (entry.directory) {
+        await destinationHandle.ensureDirectoryPathNoFollow([...entry.segments]);
+        continue;
+      }
+      const parents = entry.segments.slice(0, -1);
+      if (parents.length > 0) await destinationHandle.ensureDirectoryPathNoFollow(parents);
+      const output = await destinationHandle.createFilePathNoFollow([...entry.segments], {
+        exclusive: true,
+        size: entry.size,
+      });
+      if (!output || typeof output.write !== "function" || typeof output.end !== "function") {
+        throw archiveError("archive_no_follow_file_handle_invalid");
+      }
+      await streamSevenZipEntry({
+        archivePath,
+        rawEntryPath: entry.source,
+        output,
+        signal,
+        sevenZipPath,
+        spawnStream,
+      });
+    }
     throwIfAborted(signal);
     await archivePin.assertStableNoFollow();
     throwIfAborted(signal);
@@ -522,7 +600,7 @@ async function extractSevenZip({ archivePath, destination, signal, sevenZipPath,
   return finishWithClose({ primaryError, result, resources: [destinationHandle, archivePin] });
 }
 
-export function createArchiveService({ sevenZipPath, spawnFile, fsApi } = {}) {
+export function createArchiveService({ sevenZipPath, spawnFile, spawnStream, fsApi } = {}) {
   const bundledSevenZipPath = sevenZipPath === undefined
     ? undefined
     : requireAbsolutePath(sevenZipPath, "archive_7z_path_rejected");
@@ -561,6 +639,7 @@ export function createArchiveService({ sevenZipPath, spawnFile, fsApi } = {}) {
         signal,
         sevenZipPath: bundledSevenZipPath,
         spawnFile,
+        spawnStream,
         fsApi,
       });
     },

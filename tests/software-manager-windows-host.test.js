@@ -337,6 +337,8 @@ test("creates shortcut collision names in ChatGPT.lnk, ChatGPT（1）.lnk order 
     operation: "create",
     options: { target: targetPath, cwd: "D:\\CBApps\\ChatGPT\\c", description: "ChatGPT" },
   }]);
+  assert.equal(fixture.calls.tempSeals.length, 1);
+  assert.equal(fixture.calls.shortcutReads[0].held, true);
   assert.deepEqual(fixture.calls.shortcutCommits.map(({ destinationPath }) => destinationPath), [
     basePath,
     firstCollisionPath,
@@ -498,6 +500,20 @@ test("refuses shortcut deletion outside the recorded desktop or after target rep
     /shortcut_target_mismatch/,
   );
   assert.deepEqual(fixture.calls.fileRemoves, []);
+  assert.equal(fixture.calls.fileReleases.length, 1);
+});
+
+test("recorded shortcut removal reads and removes through the same held inspection descriptor", async () => {
+  const desktopPath = "C:\\Users\\me\\Desktop";
+  const shortcutPath = `${desktopPath}\\ChatGPT.lnk`;
+  const targetPath = "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe";
+  const fixture = fakeHost({ shortcuts: new Map([[shortcutPath, { target: targetPath }]]) });
+
+  await fixture.host.removeRecordedShortcut({ path: shortcutPath, desktopPath, targetPath });
+
+  assert.equal(fixture.calls.shortcutReads[0].held, true);
+  assert.equal(fixture.calls.fileRemoves[0], fixture.calls.fileInspects[0].descriptor);
+  assert.deepEqual(fixture.calls.fileReleases, []);
 });
 
 test("Git installer command uses a fixed verified silent argument list", async () => {
@@ -584,11 +600,14 @@ function fakeHost({
     spawnDetached: [],
     unref: [],
     shortcutWrites: [],
+    shortcutReads: [],
     tempCreates: [],
+    tempSeals: [],
     shortcutCommits: [],
     tempRemoves: [],
     fileInspects: [],
     fileRemoves: [],
+    fileReleases: [],
   };
   let spawnExitSettled = false;
   const spawnExit = new Promise(() => {}).finally(() => { spawnExitSettled = true; });
@@ -598,6 +617,7 @@ function fakeHost({
     identities.set(shortcutPath, `identity-${++identitySequence}`);
   }
   const tempReservations = new Map();
+  const heldPaths = new Map();
   let tempSequence = 0;
 
   const execFile = async (file, args, options) => {
@@ -644,6 +664,7 @@ function fakeHost({
   };
   const electronShell = {
     readShortcutLink(shortcutPath) {
+      calls.shortcutReads.push({ path: shortcutPath, held: heldPaths.has(shortcutPath) });
       if (!shortcuts.has(shortcutPath)) {
         const error = new Error("missing");
         error.code = "ENOENT";
@@ -670,21 +691,32 @@ function fakeHost({
       identities.set(temp.path, `identity-${++identitySequence}`);
       return temp;
     },
-    async commitNoReplace(temp, destinationPath) {
-      calls.shortcutCommits.push({ temp, destinationPath });
-      if (shortcutCommitFailure) throw shortcutCommitFailure;
+    async sealTemp(temp) {
+      calls.tempSeals.push(temp);
       if (!tempReservations.has(temp?.token) || !shortcuts.has(temp.path)) {
+        throw new Error("invalid temp capability");
+      }
+      const sealed = { path: temp.path, token: temp.token, sealToken: `seal-${temp.token}` };
+      heldPaths.set(sealed.path, sealed);
+      return sealed;
+    },
+    async commitNoReplace(sealed, destinationPath) {
+      calls.shortcutCommits.push({ temp: sealed, destinationPath });
+      if (shortcutCommitFailure) throw shortcutCommitFailure;
+      if (!tempReservations.has(sealed?.token) || heldPaths.get(sealed.path) !== sealed
+        || !shortcuts.has(sealed.path)) {
         throw new Error("invalid temp capability");
       }
       if (shortcuts.has(destinationPath) || otherShortcutPaths.has(destinationPath)
         || [...tempReservations.values()].some((entry) => entry.path === destinationPath)) {
         return "occupied";
       }
-      shortcuts.set(destinationPath, shortcuts.get(temp.path));
-      identities.set(destinationPath, identities.get(temp.path));
-      shortcuts.delete(temp.path);
-      identities.delete(temp.path);
-      tempReservations.delete(temp.token);
+      shortcuts.set(destinationPath, shortcuts.get(sealed.path));
+      identities.set(destinationPath, identities.get(sealed.path));
+      shortcuts.delete(sealed.path);
+      identities.delete(sealed.path);
+      tempReservations.delete(sealed.token);
+      heldPaths.delete(sealed.path);
       return "committed";
     },
     async removeTemp(temp) {
@@ -693,19 +725,30 @@ function fakeHost({
       shortcuts.delete(temp.path);
       identities.delete(temp.path);
       tempReservations.delete(temp.token);
+      heldPaths.delete(temp.path);
     },
     async inspectExact(shortcutPath) {
-      calls.fileInspects.push(shortcutPath);
+      const call = { path: shortcutPath, descriptor: null };
+      calls.fileInspects.push(call);
       if (otherShortcutPaths.has(shortcutPath)) return { kind: "other" };
       if (!shortcuts.has(shortcutPath)) return { kind: "absent" };
-      return { kind: "file", identity: identities.get(shortcutPath) };
+      const descriptor = { kind: "file", path: shortcutPath, token: `inspect-${++identitySequence}` };
+      call.descriptor = descriptor;
+      heldPaths.set(shortcutPath, descriptor);
+      return descriptor;
     },
-    async removeExact({ path: shortcutPath, identity }) {
-      calls.fileRemoves.push({ path: shortcutPath, identity });
-      if (!shortcuts.has(shortcutPath) || identities.get(shortcutPath) !== identity) return false;
+    async removeExact(descriptor) {
+      calls.fileRemoves.push(descriptor);
+      const shortcutPath = descriptor?.path;
+      if (heldPaths.get(shortcutPath) !== descriptor || !shortcuts.has(shortcutPath)) return false;
       shortcuts.delete(shortcutPath);
       identities.delete(shortcutPath);
+      heldPaths.delete(shortcutPath);
       return true;
+    },
+    async release(descriptor) {
+      calls.fileReleases.push(descriptor);
+      if (heldPaths.get(descriptor?.path) === descriptor) heldPaths.delete(descriptor.path);
     },
   };
 

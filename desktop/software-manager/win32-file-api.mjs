@@ -14,10 +14,14 @@ const FILE_ATTRIBUTE_REPARSE_POINT = 0x400;
 const FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
 const FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
 const FILE_ATTRIBUTE_TAG_INFO = 9;
+const FILE_STREAM_INFO = 7;
 const FILE_ID_INFO = 18;
+const FILE_ID_BOTH_DIRECTORY_INFO = 10;
+const FILE_ID_BOTH_DIRECTORY_RESTART_INFO = 11;
 const FILE_DISPOSITION_INFO = 4;
 const FILE_RENAME_INFO = 3;
 const MAX_NATIVE_PATH_CHARS = 32_768;
+const NATIVE_ENUM_BUFFER_BYTES = 64 * 1_024;
 
 function win32Error(code, operation, nativeCode) {
   const error = new Error(code);
@@ -33,7 +37,16 @@ function mapNativeCode(nativeCode) {
   if (nativeCode === 32 || nativeCode === 33) return "sharing_violation";
   if (nativeCode === 80 || nativeCode === 183) return "entry_exists";
   if (nativeCode === 87) return "native_primitive_unsupported";
+  if (nativeCode === 206) return "windows_path_too_long";
   return "windows_native_call_failed";
+}
+
+function toExtendedPath(exactPath) {
+  if (typeof exactPath !== "string" || !/^[A-Za-z]:\\/u.test(exactPath)
+    || exactPath.startsWith("\\\\?\\") || exactPath.length >= MAX_NATIVE_PATH_CHARS - 4) {
+    throw win32Error("windows_path_absolute_required");
+  }
+  return `\\\\?\\${exactPath}`;
 }
 
 function maskFrom(values, table, code) {
@@ -55,26 +68,26 @@ export function createWin32FileApi({ platform = process.platform, koffi } = {}) 
   if (!ffi || typeof ffi.load !== "function") throw win32Error("koffi_adapter_required");
 
   const kernel32 = ffi.load("Kernel32.dll");
-  const CreateFileW = kernel32.func("CreateFileW", "intptr_t", [
+  const CreateFileW = kernel32.func("__stdcall", "CreateFileW", "intptr_t", [
     "str16", "uint32_t", "uint32_t", "void *", "uint32_t", "uint32_t", "intptr_t",
   ]);
-  const CloseHandle = kernel32.func("CloseHandle", "int", ["intptr_t"]);
-  const GetLastError = kernel32.func("GetLastError", "uint32_t", []);
+  const CloseHandle = kernel32.func("__stdcall", "CloseHandle", "int", ["intptr_t"]);
+  const GetLastError = kernel32.func("__stdcall", "GetLastError", "uint32_t", []);
   const GetFileInformationByHandle = kernel32.func(
-    "GetFileInformationByHandle", "int", ["intptr_t", "void *"],
+    "__stdcall", "GetFileInformationByHandle", "int", ["intptr_t", "void *"],
   );
   const GetFileInformationByHandleEx = kernel32.func(
-    "GetFileInformationByHandleEx", "int", ["intptr_t", "int", "void *", "uint32_t"],
+    "__stdcall", "GetFileInformationByHandleEx", "int", ["intptr_t", "int", "void *", "uint32_t"],
   );
   const GetFinalPathNameByHandleW = kernel32.func(
-    "GetFinalPathNameByHandleW", "uint32_t", ["intptr_t", "void *", "uint32_t", "uint32_t"],
+    "__stdcall", "GetFinalPathNameByHandleW", "uint32_t", ["intptr_t", "void *", "uint32_t", "uint32_t"],
   );
-  const ReadFile = kernel32.func("ReadFile", "int", ["intptr_t", "void *", "uint32_t", "void *", "void *"]);
-  const WriteFile = kernel32.func("WriteFile", "int", ["intptr_t", "void *", "uint32_t", "void *", "void *"]);
-  const FlushFileBuffers = kernel32.func("FlushFileBuffers", "int", ["intptr_t"]);
-  const CreateDirectoryW = kernel32.func("CreateDirectoryW", "int", ["str16", "void *"]);
+  const ReadFile = kernel32.func("__stdcall", "ReadFile", "int", ["intptr_t", "void *", "uint32_t", "void *", "void *"]);
+  const WriteFile = kernel32.func("__stdcall", "WriteFile", "int", ["intptr_t", "void *", "uint32_t", "void *", "void *"]);
+  const FlushFileBuffers = kernel32.func("__stdcall", "FlushFileBuffers", "int", ["intptr_t"]);
+  const CreateDirectoryW = kernel32.func("__stdcall", "CreateDirectoryW", "int", ["str16", "void *"]);
   const SetFileInformationByHandle = kernel32.func(
-    "SetFileInformationByHandle", "int", ["intptr_t", "int", "void *", "uint32_t"],
+    "__stdcall", "SetFileInformationByHandle", "int", ["intptr_t", "int", "void *", "uint32_t"],
   );
   const pointerSize = typeof ffi.sizeof === "function" ? ffi.sizeof("intptr_t") : 8;
   if (pointerSize !== 4 && pointerSize !== 8) throw win32Error("windows_pointer_size_unsupported");
@@ -109,9 +122,79 @@ export function createWin32FileApi({ platform = process.platform, koffi } = {}) 
     }
     const flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT
       | (options.directory ? FILE_FLAG_BACKUP_SEMANTICS : 0);
-    const handle = CreateFileW(exactPath, access, share, null, creation, flags, 0);
+    const handle = CreateFileW(toExtendedPath(exactPath), access, share, null, creation, flags, 0);
     if (handleValue(handle) === -1n) throw failure("CreateFileW");
     return handle;
+  }
+
+  function assertNoAlternateDataStreams(handle) {
+    const output = Buffer.alloc(NATIVE_ENUM_BUFFER_BYTES);
+    requireSuccess(
+      GetFileInformationByHandleEx(handle, FILE_STREAM_INFO, output, output.length),
+      "GetFileInformationByHandleEx(FileStreamInfo)",
+    );
+    let offset = 0;
+    for (;;) {
+      if (offset + 24 > output.length) throw win32Error("windows_stream_information_invalid");
+      const next = output.readUInt32LE(offset);
+      const nameLength = output.readUInt32LE(offset + 4);
+      if ((nameLength & 1) !== 0 || offset + 24 + nameLength > output.length) {
+        throw win32Error("windows_stream_information_invalid");
+      }
+      const name = output.subarray(offset + 24, offset + 24 + nameLength).toString("utf16le");
+      if (name !== "::$DATA") throw win32Error("windows_alternate_data_stream_rejected");
+      if (next === 0) break;
+      if (next < 24 || offset + next <= offset || offset + next >= output.length) {
+        throw win32Error("windows_stream_information_invalid");
+      }
+      offset += next;
+    }
+  }
+
+  async function* enumerateDirectory(handle, { limit } = {}) {
+    if (!Number.isSafeInteger(limit) || limit < 0) throw win32Error("windows_directory_limit_invalid");
+    let first = true;
+    let count = 0;
+    for (;;) {
+      const output = Buffer.alloc(NATIVE_ENUM_BUFFER_BYTES);
+      const result = GetFileInformationByHandleEx(
+        handle,
+        first ? FILE_ID_BOTH_DIRECTORY_RESTART_INFO : FILE_ID_BOTH_DIRECTORY_INFO,
+        output,
+        output.length,
+      );
+      first = false;
+      if (!result) {
+        const nativeCode = Number(GetLastError());
+        if (nativeCode === 18) return;
+        throw win32Error(mapNativeCode(nativeCode), "GetFileInformationByHandleEx(FileIdBothDirectoryInfo)", nativeCode);
+      }
+      let offset = 0;
+      for (;;) {
+        if (offset + 104 > output.length) throw win32Error("windows_directory_information_invalid");
+        const next = output.readUInt32LE(offset);
+        const attributes = output.readUInt32LE(offset + 56);
+        const nameLength = output.readUInt32LE(offset + 60);
+        if ((nameLength & 1) !== 0 || offset + 104 + nameLength > output.length) {
+          throw win32Error("windows_directory_information_invalid");
+        }
+        const name = output.subarray(offset + 104, offset + 104 + nameLength).toString("utf16le");
+        if (name !== "." && name !== "..") {
+          count += 1;
+          if (count > limit) throw win32Error("windows_directory_limit_exceeded");
+          yield Object.freeze({
+            name,
+            reparse: (attributes & FILE_ATTRIBUTE_REPARSE_POINT) !== 0,
+            fileId: output.readBigUInt64LE(offset + 96).toString(16).padStart(16, "0"),
+          });
+        }
+        if (next === 0) break;
+        if (next < 104 || offset + next <= offset || offset + next >= output.length) {
+          throw win32Error("windows_directory_information_invalid");
+        }
+        offset += next;
+      }
+    }
   }
 
   function queryHandle(handle) {
@@ -186,7 +269,7 @@ export function createWin32FileApi({ platform = process.platform, koffi } = {}) 
   }
 
   function createDirectory(exactPath) {
-    requireSuccess(CreateDirectoryW(exactPath, null), "CreateDirectoryW");
+    requireSuccess(CreateDirectoryW(toExtendedPath(exactPath), null), "CreateDirectoryW");
   }
 
   function renameByHandle(handle, rootHandle, name, { replace = false } = {}) {
@@ -201,7 +284,7 @@ export function createWin32FileApi({ platform = process.platform, koffi } = {}) 
     const rootPath = finalPath(rootHandle).replace(/[\\]+$/u, "");
     const destinationPath = `${rootPath}\\${name}`;
     if (destinationPath.length >= MAX_NATIVE_PATH_CHARS) throw win32Error("native_path_buffer_exceeded");
-    const encoded = Buffer.from(destinationPath, "utf16le");
+    const encoded = Buffer.from(toExtendedPath(destinationPath), "utf16le");
     const rootOffset = pointerSize === 8 ? 8 : 4;
     const lengthOffset = rootOffset + pointerSize;
     const nameOffset = lengthOffset + 4;
@@ -231,6 +314,8 @@ export function createWin32FileApi({ platform = process.platform, koffi } = {}) 
   return Object.freeze({
     openPath,
     queryHandle,
+    assertNoAlternateDataStreams,
+    enumerateDirectory,
     finalPath,
     readFile,
     writeFile: writeChunk,

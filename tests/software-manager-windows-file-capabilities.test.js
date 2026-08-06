@@ -26,6 +26,7 @@ function createFakeNative(initial = []) {
       data: Buffer.from(options.data ?? ""),
       reparse: options.reparse === true,
       nlink: options.nlink ?? 1,
+      streams: options.streams ?? ["::$DATA"],
       identity: options.identity ?? { volumeSerial: "vol-1", fileId: `id-${identitySeed++}` },
       deleted: false,
     };
@@ -98,6 +99,28 @@ function createFakeNative(initial = []) {
     },
     async flushFile(handle) {
       calls.push(["flush", requireHandle(handle).node.path]);
+    },
+    async assertNoAlternateDataStreams(handle) {
+      const { node } = requireHandle(handle);
+      calls.push(["streams", node.path]);
+      if (node.streams.some((name) => name !== "::$DATA")) throw codedError("alternate_data_stream_rejected");
+    },
+    async *enumerateDirectory(handle, { limit }) {
+      const { node } = requireHandle(handle);
+      calls.push(["enumerate", node.path, limit]);
+      const prefix = `${node.path.replace(/[\\]+$/u, "")}\\`.toLowerCase();
+      let count = 0;
+      for (const child of [...nodes.values()]
+        .filter((candidate) => !candidate.deleted && candidate.path.toLowerCase().startsWith(prefix))
+        .filter((candidate) => !candidate.path.slice(prefix.length).includes("\\"))) {
+        count += 1;
+        if (count > limit) throw codedError("native_directory_entry_limit_exceeded");
+        yield {
+          name: child.path.slice(prefix.length),
+          reparse: child.reparse,
+          identity: structuredClone(child.identity),
+        };
+      }
     },
     async createDirectory(exactPath) {
       calls.push(["mkdir", exactPath]);
@@ -215,6 +238,17 @@ test("state directory and entries reject reparses and close every pinned handle"
   assert.equal(fake.handles.size, 0);
 });
 
+test("opened regular files reject non-default alternate data streams", async () => {
+  const fake = createFakeNative([
+    { path: "C:\\work\\state" },
+    { path: "C:\\work\\state\\ownership.json", kind: "file", data: "{}", streams: ["::$DATA", ":payload:$DATA"] },
+  ]);
+  const directory = await capabilities(fake).openStateDirectoryNoFollow("C:\\work\\state");
+  await assert.rejects(directory.openFileNoFollow("ownership.json", "r"), /alternate_data_stream/u);
+  await directory.close();
+  assert.equal(fake.handles.size, 0);
+});
+
 test("handle cleanup preserves the primary rejection when CloseHandle also fails", async () => {
   const fake = createFakeNative([{ path: "C:\\work\\state", reparse: true }]);
   fake.failClose("C:\\", codedError("close_failed", 6));
@@ -263,6 +297,23 @@ test("descriptor mutation fails closed when stable identity evidence changes", a
   assert.equal(fake.handles.size, 0);
 });
 
+test("state descriptor mutation is synchronously claimed before the first await", async () => {
+  const fake = createFakeNative([
+    { path: "C:\\work\\state" },
+    { path: "C:\\work\\state\\ownership.json", kind: "file", data: "original" },
+  ]);
+  const directory = await capabilities(fake).openStateDirectoryNoFollow("C:\\work\\state");
+  const file = await directory.openFileNoFollow("ownership.json", "r");
+  await file.close();
+  const results = await Promise.allSettled([
+    directory.unlinkEntryNoFollow(file.entry),
+    directory.unlinkEntryNoFollow(file.entry),
+  ]);
+  assert.deepEqual(results.map((result) => result.status).sort(), ["fulfilled", "rejected"]);
+  assert.equal(fake.calls.filter((call) => call[0] === "delete-handle").length, 1);
+  await directory.close();
+});
+
 test("state exclusive create is syncable and rename never replaces an occupied destination", async () => {
   const fake = createFakeNative([
     { path: "C:\\work\\state" },
@@ -295,6 +346,24 @@ test("safe-delete lists bounded names and deletes files and directories by descr
   assert.deepEqual(fake.calls.filter((call) => call[0] === "delete-handle").map((call) => call[2]), [false, true]);
   await root.close();
   assert.equal(fake.handles.size, 0);
+  assert.equal(fake.calls.some((call) => call[0] === "readdir"), false);
+  assert.equal(fake.calls.some((call) => call[0] === "enumerate"), true);
+});
+
+test("safe-delete directory enumeration enforces one owner-wide entry budget", async () => {
+  const entries = [{ path: "C:\\work\\owned" }, { path: "C:\\work\\owned\\nested" }];
+  for (let index = 0; index < 4_095; index += 1) {
+    entries.push({ path: `C:\\work\\owned\\file-${index}.txt`, kind: "file", data: "" });
+  }
+  entries.push({ path: "C:\\work\\owned\\nested\\overflow.txt", kind: "file", data: "" });
+  const fake = createFakeNative(entries);
+  const root = await capabilities(fake).openDirectoryNoFollow("C:\\work\\owned");
+  const names = await root.listChildren();
+  assert.equal(names.length, 4_096);
+  const nested = await root.openChildNoFollow("nested");
+  await assert.rejects(nested.handle.listChildren(), /entry_limit/u);
+  await nested.handle.close();
+  await root.close();
 });
 
 test("archive pin detects identity change while holding the exact file", async () => {
@@ -349,6 +418,9 @@ test("archive destination creates pinned parents and a writable exclusive file w
     output.once("finish", resolve);
     output.once("error", reject);
   });
+  const trackedHandle = [...fake.handles].find((handle) => handle.node.path.endsWith("tool.exe"));
+  assert.equal(trackedHandle?.closed, false);
+  assert.deepEqual(trackedHandle?.options.share, ["read"]);
   assert.deepEqual(await destination.verifyTreeNoFollow(), [
     { path: "app", realPath: "C:\\work\\staging\\app", directory: true, size: 0, link: false, reparse: false, hardLink: false, nlink: 1 },
     { path: "app/bin", realPath: "C:\\work\\staging\\app\\bin", directory: true, size: 0, link: false, reparse: false, hardLink: false, nlink: 1 },
@@ -373,8 +445,12 @@ test("shortcut temp revalidates identity and commits by handle without replacing
     directory: false,
   });
   fake.get(temp.path).data = Buffer.from("electron shortcut");
-  assert.equal(await shortcut.commitNoReplace(temp, "C:\\Users\\me\\Desktop\\ChatGPT.lnk"), "occupied");
-  assert.equal(await shortcut.commitNoReplace(temp, "C:\\Users\\me\\Desktop\\ChatGPT（2）.lnk"), "committed");
+  const sealed = await shortcut.sealTemp(temp);
+  assert.equal(sealed.path, temp.path);
+  const sealedHandle = [...fake.handles].find((handle) => handle.node.path === temp.path && handle.options.access.includes("delete"));
+  assert.deepEqual(sealedHandle.options.share, ["read"]);
+  assert.equal(await shortcut.commitNoReplace(sealed, "C:\\Users\\me\\Desktop\\ChatGPT.lnk"), "occupied");
+  assert.equal(await shortcut.commitNoReplace(sealed, "C:\\Users\\me\\Desktop\\ChatGPT（2）.lnk"), "committed");
   assert.equal(fake.get("C:\\Users\\me\\Desktop\\ChatGPT.lnk").data.toString(), "existing");
   assert.equal(fake.get("C:\\Users\\me\\Desktop\\ChatGPT（2）.lnk").data.toString(), "electron shortcut");
   assert.equal(fake.calls.some((call) => call[0] === "rename-handle"), true);
@@ -386,12 +462,27 @@ test("shortcut commit rejects a temp identity swapped after Electron writes", as
   const temp = await shortcut.createTemp({ directory: "C:\\Users\\me\\Desktop", suffix: ".lnk" });
   fake.replace(temp.path, { kind: "file", data: "attacker" });
   await assert.rejects(
-    shortcut.commitNoReplace(temp, "C:\\Users\\me\\Desktop\\ChatGPT.lnk"),
+    shortcut.sealTemp(temp),
     /identity_changed/u,
   );
   assert.equal(fake.calls.some((call) => call[0] === "rename-handle"), false);
   assert.equal(fake.handles.size, 0);
   assert.equal(await shortcut.removeTemp(temp), true);
+});
+
+test("shortcut removeTemp closes the whole owner and aggregates identity and close failures", async () => {
+  const fake = createFakeNative([{ path: "C:\\Users\\me\\Desktop" }]);
+  const shortcut = capabilities(fake).createShortcutFileApi();
+  const temp = await shortcut.createTemp({ directory: "C:\\Users\\me\\Desktop", suffix: ".lnk" });
+  fake.replace(temp.path, { kind: "file", data: "attacker" });
+  fake.failClose(temp.path, new Error("close failed"));
+
+  await assert.rejects(shortcut.removeTemp(temp), (error) => {
+    assert.equal(error instanceof AggregateError, true);
+    assert.match(JSON.stringify(error, Object.getOwnPropertyNames(error)), /identity_changed|close failed/u);
+    return true;
+  });
+  assert.equal(fake.handles.size, 0);
 });
 
 test("shortcut inspection distinguishes absence from access errors and removal consumes exact identity", async () => {
@@ -409,7 +500,7 @@ test("shortcut inspection distinguishes absence from access errors and removal c
   const removableApi = capabilities(removable).createShortcutFileApi();
   const inspected = await removableApi.inspectExact(path);
   assert.equal(inspected.kind, "file");
-  assert.equal(await removableApi.removeExact({ path, identity: inspected.identity }), true);
+  assert.equal(await removableApi.removeExact(inspected), true);
   assert.equal(removable.calls.some((call) => call[0] === "delete-handle"), true);
   assert.deepEqual(await removableApi.inspectExact(path), { kind: "absent" });
 });
@@ -426,6 +517,20 @@ test("shortcut inspection reports directories as other and rejects reparses inst
   assert.deepEqual(await shortcut.inspectExact(directoryPath), { kind: "other" });
   await assert.rejects(shortcut.inspectExact(reparsePath), /reparse/u);
   assert.equal(fake.handles.size, 0);
+});
+
+test("shortcut held descriptor is synchronously claimed and only occupied restores retryability", async () => {
+  const fake = createFakeNative([{ path: "C:\\Users\\me\\Desktop" }]);
+  const shortcut = capabilities(fake).createShortcutFileApi();
+  const temp = await shortcut.createTemp({ directory: "C:\\Users\\me\\Desktop", suffix: ".lnk" });
+  fake.get(temp.path).data = Buffer.from("shortcut");
+  const sealed = await shortcut.sealTemp(temp);
+  const results = await Promise.allSettled([
+    shortcut.commitNoReplace(sealed, "C:\\Users\\me\\Desktop\\ChatGPT.lnk"),
+    shortcut.commitNoReplace(sealed, "C:\\Users\\me\\Desktop\\V2RayN.lnk"),
+  ]);
+  assert.deepEqual(results.map((result) => result.status).sort(), ["fulfilled", "rejected"]);
+  assert.equal(fake.calls.filter((call) => call[0] === "rename-handle").length, 1);
 });
 
 test("thin Win32 layer binds only fixed Kernel32 APIs and opens no-follow with directory semantics", async () => {
@@ -447,8 +552,9 @@ test("thin Win32 layer binds only fixed Kernel32 APIs and opens no-follow with d
     load(name) {
       assert.equal(name, "Kernel32.dll");
       return {
-        func(name) {
-          bindings.push(name);
+        func(...definition) {
+          bindings.push(definition);
+          const name = definition.length === 4 ? definition[1] : definition[0];
           return stubs.get(name) ?? (() => 1);
         },
       };
@@ -463,6 +569,7 @@ test("thin Win32 layer binds only fixed Kernel32 APIs and opens no-follow with d
     directory: true,
   });
   assert.equal(handle, 42n);
+  assert.equal(createCalls[0][0], "\\\\?\\C:\\safe");
   assert.equal(createCalls[0][5] & 0x00200000, 0x00200000);
   assert.equal(createCalls[0][5] & 0x02000000, 0x02000000);
   assert.equal(createCalls[0][1] & 0x20, 0x20);
@@ -475,11 +582,12 @@ test("thin Win32 layer binds only fixed Kernel32 APIs and opens no-follow with d
   const renameNameLength = setInfoCalls[0][2].readUInt32LE(16);
   assert.equal(
     setInfoCalls[0][2].subarray(20, 20 + renameNameLength).toString("utf16le"),
-    "C:\\safe\\target.lnk",
+    "\\\\?\\C:\\safe\\target.lnk",
   );
-  assert.equal(setInfoCalls[0][2].length, 24 + Buffer.byteLength("C:\\safe\\target.lnk", "utf16le"));
+  assert.equal(setInfoCalls[0][2].length, 24 + Buffer.byteLength("\\\\?\\C:\\safe\\target.lnk", "utf16le"));
   assert.equal(setInfoCalls[1][1], 4);
-  assert.deepEqual(bindings, [
+  assert.equal(bindings.every((definition) => definition[0] === "__stdcall"), true);
+  assert.deepEqual(bindings.map((definition) => definition[1]), [
     "CreateFileW", "CloseHandle", "GetLastError", "GetFileInformationByHandle",
     "GetFileInformationByHandleEx", "GetFinalPathNameByHandleW", "ReadFile", "WriteFile",
     "FlushFileBuffers", "CreateDirectoryW", "SetFileInformationByHandle",

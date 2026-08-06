@@ -92,3 +92,49 @@ No installed software, registry, PATH, Desktop, `.codex`, or server was touched.
 - Syntax checks for both new production modules and the new test — exit 0.
 - `npm run check` — exit 0.
 - `git diff --check` — exit 0.
+
+## Fix round 1
+
+The first review round closed all nine follow-up findings across the Task 4 archive service, Task 5 Windows host, and Task 5B native boundary.
+
+### Archive extraction boundary
+
+- 7z inspection now uses only `l -slt -ba -t7z -sns- -- <archive>`.
+- 7z extraction no longer gives 7z a destination directory. Each preflight regular file is extracted through one injected streaming process using only `x -so -y -t7z -sns- -- <archive> <raw-entry-path>` and piped into the capability-owned writer.
+- The raw 7z entry path is retained only as the already-preflighted source selector. Destination paths are always derived from normalized validated segments.
+- Each stream requires bounded stderr, a successful process completion result, cancellation propagation, and an exact byte count enforced by the destination writer.
+- ZIP and 7z both enumerate and validate the complete output tree against the preflight tree before success.
+
+### Retained output capabilities
+
+- Created archive files and directories retain their original handles, identities, final paths, expected sizes, and read-only sharing until verification and close.
+- A writer flush no longer closes its native handle. Verification rechecks every retained handle for identity, final path, type, size, link count, reparse evidence, and alternate streams.
+- Directory traversal now uses bounded native handle enumeration. It rejects invalid names and reparse evidence before any child open, detects untracked extras, and never uses `fs.readdir`.
+- Safe-delete enumeration shares one 4,096-entry budget across the complete owner/tree and claims every mutation descriptor synchronously before its first await.
+- A verified staging path is valid only while these capabilities remain held. Any later promotion must be part of the same controlled transaction; reopening a path after capability close is not equivalent validation.
+
+### Shortcut and native boundary
+
+- Shortcut creation now seals the Electron-written temp file by reacquiring the original identity with READ+DELETE and share-read only. The sealed descriptor stays held while Electron reads it and is the same descriptor used for no-replace commit or cleanup.
+- Exact shortcut inspection now returns a held opaque descriptor. The host reads while it is held and passes that same descriptor to removal; mismatch and read-error paths release it without inspect-close-reopen.
+- State, safe-delete, temp, and inspection descriptors use synchronous `open -> busy -> consumed` claims. Only an explicit occupied rename restores `open` for retry.
+- `removeTemp` closes the complete capability owner in `finally` and aggregates a primary mutation error with any close errors.
+- Every Kernel32 function is bound with explicit `__stdcall`.
+- All internal native paths use the `\\?\` extended form for open, directory creation, and handle rename; Win32 error 206 maps to `windows_path_too_long` while public final paths remain ordinary DOS paths.
+- Native `FileStreamInfo` rejects any stream other than `::$DATA`, and native `FileIdBothDirectoryRestartInfo` / `FileIdBothDirectoryInfo` provides bounded streaming directory enumeration by pinned handle.
+
+### Fix-round TDD and Windows smoke evidence
+
+The added RED cases initially exposed 10 file-capability failures, 7 archive failures, and 4 Windows-host failures. The final focused suites pass:
+
+- Archive, native capability, and Windows host: 139 passed, 0 failed.
+- All software-manager suites: 266 passed, 0 failed.
+
+Real task-owned Win32 sandboxes under this worktree passed and were removed one exact path at a time:
+
+- state handle create/write/flush/rename/read/delete: pass;
+- shortcut Electron-write simulation, seal, held read, commit, held inspection, and exact removal: pass;
+- native archive create/enumerate/verify with a 294-character file path: 9 verified entries;
+- a real NTFS alternate data stream was rejected by `FileStreamInfo`.
+
+The first long-path smoke exposed that directory enumeration additionally needs list-directory read access (`ERROR_ACCESS_DENIED`). After adding that access to enumerated directory handles, the complete long-path/ADS smoke passed. No installed software, registry, PATH, Desktop, `.codex`, or server was touched.
