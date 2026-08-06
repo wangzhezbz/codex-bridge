@@ -304,9 +304,10 @@ function normalizeVersionMarker(value) {
 }
 
 function normalizeSealMetadata(value) {
-  if (!hasExactKeys(value, ["schemaVersion", "componentId", "version", "manifestDigest"])
+  if (!hasExactKeys(value, ["schemaVersion", "componentId", "version", "treeDigest", "manifestDigest"])
     || value.schemaVersion !== 2 || !COMPONENT_IDS.has(value.componentId)
-    || !VERSION.test(value.version ?? "") || !SHA256.test(value.manifestDigest ?? "")) {
+    || !VERSION.test(value.version ?? "") || !SHA256.test(value.treeDigest ?? "")
+    || !SHA256.test(value.manifestDigest ?? "")) {
     throw capabilityError("version_marker_invalid");
   }
   return { ...value };
@@ -788,6 +789,7 @@ export function createWindowsFileCapabilities({
         throw capabilityError("version_verification_receipt_directory_mismatch");
       }
       if (receipt.componentId !== metadata.componentId || receipt.version !== metadata.version
+        || receipt.treeDigest !== metadata.treeDigest
         || receipt.manifestDigest !== metadata.manifestDigest) {
         throw capabilityError("version_verification_receipt_mismatch");
       }
@@ -802,7 +804,6 @@ export function createWindowsFileCapabilities({
         }
         const markerMetadata = normalizeVersionMarker({
           ...metadata,
-          treeDigest: receipt.treeDigest,
         });
         const existing = await readMarker(internal);
         if (existing.markerStatus === "invalid") throw capabilityError("version_marker_conflict");

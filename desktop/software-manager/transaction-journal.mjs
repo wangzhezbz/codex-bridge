@@ -262,7 +262,6 @@ function forwardSequence(record) {
 
 function expectedSequences(record) {
   const forward = forwardSequence(record);
-  if (record.mode !== "promote") return [forward];
   const stateIndex = forward.indexOf("state_committed");
   const aborts = [];
   for (let prefixLength = 1; prefixLength <= stateIndex; prefixLength += 1) {

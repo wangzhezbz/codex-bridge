@@ -143,6 +143,19 @@ function record(overrides = {}) {
   };
 }
 
+function rollbackRecord(overrides = {}) {
+  const base = record();
+  return {
+    ...base,
+    taskId: "rollback-chatgpt",
+    mode: "rollback",
+    versions: { ...base.versions, incoming: null },
+    identities: { ...base.identities, incoming: null },
+    integrities: { ...base.integrities, incoming: null },
+    ...overrides,
+  };
+}
+
 test("journal records each phase through a flushed direct-child temp before no-replace publication", async () => {
   const fake = createJournalFs();
   const journal = createTransactionJournal({ journalDir: "D:\\State\\transactions", fsApi: fake.fsApi });
@@ -260,6 +273,26 @@ test("journal accepts only a strict idempotent abort/revert suffix after a pre-c
     journal.record(record({ phase: "new_promoted" })),
     /transaction_journal_phase_order_invalid/u,
   );
+});
+
+test("journal accepts the same strict abort/revert suffix for a pre-commit rollback", async () => {
+  const fake = createJournalFs();
+  const journal = createTransactionJournal({ journalDir: "D:\\State\\transactions", fsApi: fake.fsApi });
+  await journal.record(rollbackRecord());
+  await journal.record(rollbackRecord({ phase: "retiring_moved" }));
+  for (const phase of [
+    "abort_started", "abort_incoming_isolated", "abort_current_restored",
+    "abort_previous_restored", "abort_state_restoring", "abort_cleanup_started",
+    "abort_cleanup_committed",
+  ]) {
+    await journal.record(rollbackRecord({ phase }));
+  }
+  const [transaction] = await journal.listTransactions();
+  assert.deepEqual(transaction.records.map((item) => item.phase), [
+    "prepared", "retiring_moved", "abort_started", "abort_incoming_isolated",
+    "abort_current_restored", "abort_previous_restored", "abort_state_restoring",
+    "abort_cleanup_started", "abort_cleanup_committed",
+  ]);
 });
 
 test("recoverTransactions keeps a failed journal and clears it only after slot recovery succeeds", async () => {

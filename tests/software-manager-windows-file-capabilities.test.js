@@ -399,6 +399,7 @@ test("version-root capability consumes an opaque exact-tree receipt before seali
       schemaVersion: 2,
       componentId: "chatgpt",
       version: "1.0.0",
+      treeDigest: verified.treeDigest,
       manifestDigest: verified.manifestDigest,
     }, {}),
     /version_verification_receipt_invalid/u,
@@ -407,6 +408,7 @@ test("version-root capability consumes an opaque exact-tree receipt before seali
     schemaVersion: 2,
     componentId: "chatgpt",
     version: "1.0.0",
+    treeDigest: verified.treeDigest,
     manifestDigest: verified.manifestDigest,
   }, verified.verificationReceipt);
   assert.equal(evidence.version, "1.0.0");
@@ -419,6 +421,7 @@ test("version-root capability consumes an opaque exact-tree receipt before seali
       schemaVersion: 2,
       componentId: "chatgpt",
       version: "1.0.0",
+      treeDigest: verified.treeDigest,
       manifestDigest: verified.manifestDigest,
     }, verified.verificationReceipt),
     /version_verification_receipt_consumed/u,
@@ -439,6 +442,7 @@ test("version-root capability consumes an opaque exact-tree receipt before seali
       schemaVersion: 2,
       componentId: "chatgpt",
       version: "1.0.0",
+      treeDigest: verified.treeDigest,
       manifestDigest: verified.manifestDigest,
     }, verified.verificationReceipt),
     /version_verification_receipt_(?:consumed|directory_mismatch)/u,
@@ -461,6 +465,7 @@ test("version receipt rejects wrong bindings, stale reuse, missing files, and ch
       schemaVersion: 2,
       componentId: "chatgpt",
       version: "1.0.0",
+      treeDigest: wrongDirectory.treeDigest,
       manifestDigest: wrongDirectory.manifestDigest,
     }, wrongDirectory.verificationReceipt),
     /version_verification_receipt_directory_mismatch/u,
@@ -475,19 +480,29 @@ test("version receipt rejects wrong bindings, stale reuse, missing files, and ch
       schemaVersion: 2,
       componentId: "chatgpt",
       version: "2.0.0",
+      treeDigest: verified.treeDigest,
       manifestDigest: verified.manifestDigest,
     },
     {
       schemaVersion: 2,
       componentId: "git",
       version: "1.0.0",
+      treeDigest: verified.treeDigest,
       manifestDigest: verified.manifestDigest,
     },
     {
       schemaVersion: 2,
       componentId: "chatgpt",
       version: "1.0.0",
+      treeDigest: verified.treeDigest,
       manifestDigest: "0".repeat(64),
+    },
+    {
+      schemaVersion: 2,
+      componentId: "chatgpt",
+      version: "1.0.0",
+      treeDigest: "0".repeat(64),
+      manifestDigest: verified.manifestDigest,
     },
   ]) {
     await assert.rejects(
@@ -505,6 +520,7 @@ test("version receipt rejects wrong bindings, stale reuse, missing files, and ch
       schemaVersion: 2,
       componentId: "chatgpt",
       version: "1.0.0",
+      treeDigest: verified.treeDigest,
       manifestDigest: verified.manifestDigest,
     }, verified.verificationReceipt),
     /version_tree_digest_mismatch/u,
@@ -520,6 +536,7 @@ test("version receipt rejects wrong bindings, stale reuse, missing files, and ch
       schemaVersion: 2,
       componentId: "chatgpt",
       version: "1.0.0",
+      treeDigest: verified.treeDigest,
       manifestDigest: verified.manifestDigest,
     }, verified.verificationReceipt),
     /version_tree_digest_mismatch/u,
@@ -540,6 +557,7 @@ test("openSlot validates the V2 marker against the current exact-tree content di
     schemaVersion: 2,
     componentId: "chatgpt",
     version: "1.0.0",
+    treeDigest: verified.treeDigest,
     manifestDigest: verified.manifestDigest,
   }, verified.verificationReceipt);
   await root.close();

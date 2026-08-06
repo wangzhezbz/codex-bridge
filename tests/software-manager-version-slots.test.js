@@ -50,7 +50,7 @@ function createFixture({ componentId = "chatgpt", slots = {}, state = emptyState
   const calls = [];
   let identitySeed = 0;
   let failRule = null;
-  const verificationReceipts = new WeakMap();
+  let verificationReceipts = new WeakMap();
 
   function treeFor(node) {
     return [...node.files.entries()]
@@ -207,6 +207,7 @@ function createFixture({ componentId = "chatgpt", slots = {}, state = emptyState
       async sealPreparedSlotNoFollow(descriptor, metadata, verificationReceipt) {
         const internal = descriptors.get(descriptor);
         assert.equal(internal?.type, "slot");
+        maybeFail("seal", { name: internal.name, metadata });
         const receipt = verificationReceipts.get(verificationReceipt);
         if (!receipt) throw new Error("version_verification_receipt_invalid");
         if (receipt.state !== "fresh") throw new Error("version_verification_receipt_consumed");
@@ -216,6 +217,7 @@ function createFixture({ componentId = "chatgpt", slots = {}, state = emptyState
           throw new Error("version_verification_receipt_directory_mismatch");
         }
         if (receipt.componentId !== metadata.componentId || receipt.version !== metadata.version
+          || receipt.treeDigest !== metadata.treeDigest
           || receipt.manifestDigest !== metadata.manifestDigest) {
           throw new Error("version_verification_receipt_mismatch");
         }
@@ -233,6 +235,7 @@ function createFixture({ componentId = "chatgpt", slots = {}, state = emptyState
         }
         receipt.state = "consumed";
         calls.push(["seal", internal.name, metadata.version]);
+        maybeFail("seal", { name: internal.name, metadata }, { after: true });
         return { ...clone(marker), identity: clone(internal.node.identity) };
       },
       async renameSlotNoReplace(descriptor, destinationName) {
@@ -277,7 +280,12 @@ function createFixture({ componentId = "chatgpt", slots = {}, state = emptyState
         return {
           entry,
           async readFile() { return file.data; },
-          async writeFile(value) { file.data = String(value); calls.push(["journal-write", name]); },
+          async writeFile(value) {
+            maybeFail("journal-write", { name });
+            file.data = String(value);
+            calls.push(["journal-write", name]);
+            maybeFail("journal-write", { name }, { after: true });
+          },
           async sync() { calls.push(["journal-flush", name]); },
           async close() {},
         };
@@ -374,6 +382,9 @@ function createFixture({ componentId = "chatgpt", slots = {}, state = emptyState
       const node = rootSlots.get(name);
       assert.ok(node, `expected slot ${name}`);
       node.files.set(".codexbridge-version.json", markerFor(node, version));
+    },
+    forgetVerificationReceipts() {
+      verificationReceipts = new WeakMap();
     },
     issueVerificationReceipt(version, requestedComponentId = componentId) {
       const stagingName = requestedComponentId === "chatgpt" ? "ct" : "staging";
@@ -477,6 +488,7 @@ function promotionPlan(fixture, version, componentId = "chatgpt", taskId = `prom
     rootPath: fixture.rootPath,
     version,
     verificationReceipt: verification.verificationReceipt,
+    treeDigest: verification.treeDigest,
     manifestDigest: verification.manifestDigest,
   };
 }
@@ -666,6 +678,110 @@ test("failed rollback recovery never deletes the only complete version", async (
   assert.equal(fixture.versions().previous, "1.0.0");
   assert.equal(fixture.calls.some((call) => call[0] === "delete-slot"), false);
 });
+
+for (const damage of ["missing", "corrupt"]) {
+  test(`rollback recovery aborts and restores current when the target is ${damage}`, async () => {
+    const fixture = fixtureWithInstalled({ currentVersion: "2.0.0", previousVersion: "1.0.0" });
+    fixture.fail("rename", new Error("rollback_forward_crash"), {
+      after: true,
+      match: ({ from, to }) => from === "c" && to === "cr",
+    });
+    await assert.rejects(fixture.manager.rollbackVersion("chatgpt"), /rollback_forward_crash/u);
+    fixture.damageSlot("cp", damage);
+    fixture.resetCalls();
+    const restarted = createVersionSlotManager({
+      fsApi: fixture.fsApi,
+      ownershipStore: fixture.ownershipStore,
+      journal: fixture.journal,
+    });
+
+    assert.equal((await recoverTransactions({ journal: fixture.journal, slots: restarted })).length, 1);
+    assert.deepEqual(await recoverTransactions({ journal: fixture.journal, slots: restarted }), []);
+    assert.deepEqual(fixture.versions(), {
+      current: "2.0.0", previous: null, staging: null, retiring: null,
+    });
+    assert.equal(fixture.state().components.chatgpt.version, "2.0.0");
+    assert.equal(fixture.state().rollback, null);
+    const abortWal = fixture.calls.findIndex((call) => call[0] === "journal-commit"
+      && call[1] === "chatgpt.abort_started.json");
+    const restoreWal = fixture.calls.findIndex((call) => call[0] === "journal-commit"
+      && call[1] === "chatgpt.abort_current_restored.json");
+    const restoreRename = fixture.calls.findIndex((call) => call[0] === "rename-slot"
+      && call[1] === "cr" && call[2] === "c");
+    assert.ok(abortWal >= 0 && restoreWal >= 0 && restoreWal < restoreRename);
+    if (damage === "corrupt") {
+      assert.equal(fixture.calls.some((call) => call[0] === "rename-slot"
+        && call[1] === "cp" && call[2] === "ct"), true);
+      assert.equal(fixture.calls.some((call) => call[0] === "delete-slot" && call[1] === "ct"), true);
+    }
+  });
+}
+
+test("rollback abort recovers from an abort-cleanup-only journal after clear crashes", async () => {
+  const fixture = fixtureWithInstalled({ currentVersion: "2.0.0", previousVersion: "1.0.0" });
+  fixture.fail("rename", new Error("rollback_forward_crash"), {
+    after: true,
+    match: ({ from, to }) => from === "c" && to === "cr",
+  });
+  await assert.rejects(fixture.manager.rollbackVersion("chatgpt"), /rollback_forward_crash/u);
+  fixture.damageSlot("cp", "corrupt");
+  fixture.fail("journal-unlink", new Error("abort_journal_clear_crash"), {
+    match: ({ name }) => name === "chatgpt.abort_cleanup_committed.json",
+  });
+  await assert.rejects(
+    recoverTransactions({ journal: fixture.journal, slots: fixture.manager }),
+    /abort_journal_clear_crash/u,
+  );
+  const [pending] = await fixture.journal.listTransactions();
+  assert.deepEqual(pending.records.map((record) => record.phase), ["abort_cleanup_committed"]);
+  const restarted = createVersionSlotManager({
+    fsApi: fixture.fsApi,
+    ownershipStore: fixture.ownershipStore,
+    journal: fixture.journal,
+  });
+
+  assert.equal((await recoverTransactions({ journal: fixture.journal, slots: restarted })).length, 1);
+  assert.deepEqual(await recoverTransactions({ journal: fixture.journal, slots: restarted }), []);
+  assert.deepEqual(fixture.versions(), {
+    current: "2.0.0", previous: null, staging: null, retiring: null,
+  });
+  assert.equal(fixture.state().rollback, null);
+});
+
+for (const crash of [
+  { name: "after invalid target isolation", kind: "rename", after: true, match: ({ from, to }) => from === "cp" && to === "ct" },
+  { name: "after original current restoration", kind: "rename", after: true, match: ({ from, to }) => from === "cr" && to === "c" },
+  { name: "after abort ownership save", kind: "state", after: true },
+  { name: "after invalid target deletion", kind: "delete", after: true, match: ({ name }) => name === "ct" },
+]) {
+  test(`rollback abort recovery is restart-idempotent ${crash.name}`, async () => {
+    const fixture = fixtureWithInstalled({ currentVersion: "2.0.0", previousVersion: "1.0.0" });
+    fixture.fail("rename", new Error("rollback_forward_crash"), {
+      after: true,
+      match: ({ from, to }) => from === "c" && to === "cr",
+    });
+    await assert.rejects(fixture.manager.rollbackVersion("chatgpt"), /rollback_forward_crash/u);
+    fixture.damageSlot("cp", "corrupt");
+    fixture.fail(crash.kind, new Error("rollback_abort_crash"), crash);
+    await assert.rejects(
+      recoverTransactions({ journal: fixture.journal, slots: fixture.manager }),
+      /rollback_abort_crash/u,
+    );
+    const restarted = createVersionSlotManager({
+      fsApi: fixture.fsApi,
+      ownershipStore: fixture.ownershipStore,
+      journal: fixture.journal,
+    });
+
+    assert.equal((await recoverTransactions({ journal: fixture.journal, slots: restarted })).length, 1);
+    assert.deepEqual(await recoverTransactions({ journal: fixture.journal, slots: restarted }), []);
+    assert.deepEqual(fixture.versions(), {
+      current: "2.0.0", previous: null, staging: null, retiring: null,
+    });
+    assert.equal(fixture.state().components.chatgpt.version, "2.0.0");
+    assert.equal(fixture.state().rollback, null);
+  });
+}
 
 for (const crash of [
   { name: "after current retires", kind: "rename", after: true, match: ({ from, to }) => from === "c" && to === "cr" },
@@ -895,6 +1011,46 @@ test("two managers sharing one ownership store serialize ChatGPT and Git promoti
   assert.deepEqual(git.versions(), { current: "2.46.0", previous: null, staging: null, retiring: null });
 });
 
+test("a pending ChatGPT journal blocks Git until recovery clears the transaction", async () => {
+  const chatgpt = fixtureWithInstalled({
+    currentVersion: "2.0.0", previousVersion: "1.0.0", incomingVersion: "3.0.0",
+  });
+  const git = createFixture({ componentId: "git", slots: { staging: null } });
+  let persisted = chatgpt.state();
+  const ownershipStore = {
+    async load() { return clone(persisted); },
+    async save(next) { persisted = clone(next); },
+  };
+  const sharedJournal = createTransactionJournal({
+    journalDir: chatgpt.journalDir,
+    fsApi: chatgpt.fsApi,
+  });
+  const chatgptManager = createVersionSlotManager({
+    fsApi: chatgpt.fsApi, ownershipStore, journal: sharedJournal,
+  });
+  const gitManager = createVersionSlotManager({
+    fsApi: git.fsApi, ownershipStore, journal: sharedJournal,
+  });
+  chatgpt.fail("rename", new Error("chatgpt_pending_crash"), {
+    after: true,
+    match: ({ from, to }) => from === "c" && to === "cp",
+  });
+  await assert.rejects(
+    chatgptManager.promotePreparedVersion(promotionPlan(chatgpt, "3.0.0")),
+    /chatgpt_pending_crash/u,
+  );
+
+  await assert.rejects(
+    gitManager.promotePreparedVersion(promotionPlan(git, "2.46.0", "git")),
+    /slot_pending_transaction/u,
+  );
+  assert.equal(persisted.components.git, undefined);
+  assert.equal((await recoverTransactions({ journal: sharedJournal, slots: chatgptManager })).length, 1);
+  await gitManager.promotePreparedVersion(promotionPlan(git, "2.46.0", "git"));
+  assert.equal(persisted.components.chatgpt.version, "3.0.0");
+  assert.equal(persisted.components.git.version, "2.46.0");
+});
+
 test("retiring deletion re-loads and rejects ownership changed after this transaction committed", async () => {
   const fixture = fixtureWithInstalled({
     currentVersion: "2.0.0", previousVersion: "1.0.0", incomingVersion: "3.0.0",
@@ -935,12 +1091,19 @@ test("slot manager fails closed without the native version-root capability", () 
 });
 
 test("promotion requires a fake-verifier-issued opaque receipt and rejects post-verification content changes", async () => {
-  const fixture = createFixture({ slots: { ct: null } });
-  const verifiedPlan = promotionPlan(fixture, "1.0.0");
+  const forgedFixture = createFixture({ slots: { ct: null } });
+  const forgedPlan = promotionPlan(forgedFixture, "1.0.0");
   await assert.rejects(
-    fixture.manager.promotePreparedVersion({ ...verifiedPlan, verificationReceipt: {} }),
+    forgedFixture.manager.promotePreparedVersion({ ...forgedPlan, verificationReceipt: {} }),
     /version_verification_receipt_invalid/u,
   );
+  assert.equal((await forgedFixture.journal.listTransactions()).length, 1);
+  assert.deepEqual(forgedFixture.versions(), {
+    current: null, previous: null, staging: null, retiring: null,
+  });
+
+  const fixture = createFixture({ slots: { ct: null } });
+  const verifiedPlan = promotionPlan(fixture, "1.0.0");
   fixture.changeSlotContent("ct", "tampered-after-verification");
   await assert.rejects(
     fixture.manager.promotePreparedVersion(verifiedPlan),
@@ -948,6 +1111,45 @@ test("promotion requires a fake-verifier-issued opaque receipt and rejects post-
   );
   assert.deepEqual(fixture.versions(), { current: null, previous: null, staging: null, retiring: null });
   assert.equal(fixture.state().components.chatgpt, undefined);
+});
+
+test("a failed first prepared WAL write does not consume the receipt and the same plan retries", async () => {
+  const fixture = createFixture({ slots: { ct: null } });
+  const plan = promotionPlan(fixture, "1.0.0");
+  fixture.fail("journal-write", new Error("prepared_wal_failed"), {
+    match: ({ name }) => name === "chatgpt.prepared.json.tmp",
+  });
+
+  await assert.rejects(fixture.manager.promotePreparedVersion(plan), /prepared_wal_failed/u);
+  assert.equal(fixture.calls.some((call) => call[0] === "seal"), false);
+  await fixture.manager.promotePreparedVersion(plan);
+  assert.deepEqual(fixture.versions(), {
+    current: "1.0.0", previous: null, staging: null, retiring: null,
+  });
+});
+
+test("a restart recovers a seal completed after prepared WAL without the in-memory receipt", async () => {
+  const fixture = createFixture({ slots: { ct: null } });
+  fixture.fail("seal", new Error("crash_after_seal"), { after: true });
+  await assert.rejects(
+    fixture.manager.promotePreparedVersion(promotionPlan(fixture, "1.0.0")),
+    /crash_after_seal/u,
+  );
+  const preparedWal = fixture.calls.findIndex((call) => call[0] === "journal-commit"
+    && call[1] === "chatgpt.prepared.json");
+  const seal = fixture.calls.findIndex((call) => call[0] === "seal");
+  assert.ok(preparedWal >= 0 && preparedWal < seal);
+  fixture.forgetVerificationReceipts();
+  const restarted = createVersionSlotManager({
+    fsApi: fixture.fsApi,
+    ownershipStore: fixture.ownershipStore,
+    journal: fixture.journal,
+  });
+
+  assert.equal((await recoverTransactions({ journal: fixture.journal, slots: restarted })).length, 1);
+  assert.deepEqual(fixture.versions(), {
+    current: "1.0.0", previous: null, staging: null, retiring: null,
+  });
 });
 
 test("first-install promotion rejects a component root outside the ownership install root before mutation", async () => {
