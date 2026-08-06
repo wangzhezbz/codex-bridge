@@ -15,6 +15,8 @@ function createFakeNative(initial = []) {
   let identitySeed = 1;
   let failOpen = null;
   let failClose = null;
+  let failRename = null;
+  let failDelete = null;
 
   const key = (value) => value.toLowerCase();
   const canonical = (value) => value.replace(/[\\]+$/u, "") || value;
@@ -64,6 +66,19 @@ function createFakeNative(initial = []) {
         node = add(exactPath, { kind: options.directory ? "directory" : "file" });
       } else if (!node || node.deleted) {
         throw codedError("entry_missing", 2);
+      }
+      const category = (access) => new Set(access.map((value) => (
+        value === "write" ? "write" : value === "delete" ? "delete" : "read"
+      )));
+      const requestedAccess = category(options.access);
+      const requestedShare = new Set(options.share);
+      for (const existing of handles) {
+        if (existing.closed || existing.node !== node) continue;
+        const existingAccess = category(existing.options.access);
+        if ([...requestedAccess].some((value) => !existing.options.share.includes(value))
+          || [...existingAccess].some((value) => !requestedShare.has(value))) {
+          throw codedError("sharing_violation", 32);
+        }
       }
       const handle = { node, options, closed: false };
       handles.add(handle);
@@ -132,6 +147,7 @@ function createFakeNative(initial = []) {
       const source = requireHandle(handle).node;
       const root = requireHandle(rootHandle).node;
       calls.push(["rename-handle", source.path, root.path, name, replace]);
+      if (failRename?.path?.toLowerCase() === source.path.toLowerCase()) throw failRename.error;
       const destination = `${root.path.replace(/[\\]+$/u, "")}\\${name}`;
       if (nodes.has(key(destination)) && !nodes.get(key(destination)).deleted && !replace) {
         throw codedError("entry_exists", 183);
@@ -143,12 +159,13 @@ function createFakeNative(initial = []) {
     async deleteByHandle(handle, { directory }) {
       const { node } = requireHandle(handle);
       calls.push(["delete-handle", node.path, directory]);
+      if (failDelete?.path?.toLowerCase() === node.path.toLowerCase()) throw failDelete.error;
       node.deleted = true;
       nodes.delete(key(node.path));
     },
     async closeHandle(handle) {
       if (!handles.has(handle) || handle.closed) throw codedError("double_close");
-      calls.push(["close", handle.node.path]);
+      calls.push(["close", handle.node.path, structuredClone(handle.options)]);
       handle.closed = true;
       handles.delete(handle);
       if (failClose?.path?.toLowerCase() === handle.node.path.toLowerCase()) throw failClose.error;
@@ -177,6 +194,8 @@ function createFakeNative(initial = []) {
     },
     failOpen(path, error) { failOpen = { path, error }; },
     failClose(path, error) { failClose = { path, error }; },
+    failRename(path, error) { failRename = { path, error }; },
+    failDelete(path, error) { failDelete = { path, error }; },
     get(path) { return nodes.get(key(path)); },
   };
 }
@@ -447,9 +466,27 @@ test("shortcut temp revalidates identity and commits by handle without replacing
   fake.get(temp.path).data = Buffer.from("electron shortcut");
   const sealed = await shortcut.sealTemp(temp);
   assert.equal(sealed.path, temp.path);
-  const sealedHandle = [...fake.handles].find((handle) => handle.node.path === temp.path && handle.options.access.includes("delete"));
-  assert.deepEqual(sealedHandle.options.share, ["read"]);
+  const sealedHandle = [...fake.handles].find((handle) => handle.node.path === temp.path && !handle.options.access.includes("delete"));
+  assert.deepEqual(sealedHandle.options.access, ["read", "attributes"]);
+  assert.deepEqual(sealedHandle.options.share, ["read", "delete"]);
+  const electronRead = await fake.nativeApi.openPath(temp.path, {
+    access: ["read"], share: ["read"], disposition: "openExisting", directory: false,
+  });
+  await assert.rejects(fake.nativeApi.openPath(temp.path, {
+    access: ["write"], share: ["read", "write", "delete"], disposition: "openExisting", directory: false,
+  }), /sharing_violation/u);
+  await fake.nativeApi.closeHandle(electronRead);
   assert.equal(await shortcut.commitNoReplace(sealed, "C:\\Users\\me\\Desktop\\ChatGPT.lnk"), "occupied");
+  const heldAfterCollision = [...fake.handles].filter((handle) => handle.node.path === temp.path);
+  assert.equal(heldAfterCollision.length, 2);
+  assert.equal(heldAfterCollision.some((handle) => handle.options.access.includes("delete")), true);
+  const mutationOpenIndex = fake.calls.findIndex((call) => call[0] === "open"
+    && call[1] === temp.path && call[2].access.includes("delete"));
+  const sealCloseIndex = fake.calls.findIndex((call) => call[0] === "close"
+    && call[1] === temp.path && call[2].access.includes("read")
+    && call[2].share.includes("delete") && !call[2].access.includes("delete"));
+  assert.equal(mutationOpenIndex >= 0, true);
+  assert.equal(sealCloseIndex === -1 || sealCloseIndex > mutationOpenIndex, true);
   assert.equal(await shortcut.commitNoReplace(sealed, "C:\\Users\\me\\Desktop\\ChatGPT（2）.lnk"), "committed");
   assert.equal(fake.get("C:\\Users\\me\\Desktop\\ChatGPT.lnk").data.toString(), "existing");
   assert.equal(fake.get("C:\\Users\\me\\Desktop\\ChatGPT（2）.lnk").data.toString(), "electron shortcut");
@@ -500,6 +537,10 @@ test("shortcut inspection distinguishes absence from access errors and removal c
   const removableApi = capabilities(removable).createShortcutFileApi();
   const inspected = await removableApi.inspectExact(path);
   assert.equal(inspected.kind, "file");
+  const electronRead = await removable.nativeApi.openPath(path, {
+    access: ["read"], share: ["read"], disposition: "openExisting", directory: false,
+  });
+  await removable.nativeApi.closeHandle(electronRead);
   assert.equal(await removableApi.removeExact(inspected), true);
   assert.equal(removable.calls.some((call) => call[0] === "delete-handle"), true);
   assert.deepEqual(await removableApi.inspectExact(path), { kind: "absent" });
@@ -531,6 +572,43 @@ test("shortcut held descriptor is synchronously claimed and only occupied restor
   ]);
   assert.deepEqual(results.map((result) => result.status).sort(), ["fulfilled", "rejected"]);
   assert.equal(fake.calls.filter((call) => call[0] === "rename-handle").length, 1);
+});
+
+test("shortcut commit failure deletes the temp and closes both held handles", async () => {
+  const fake = createFakeNative([{ path: "C:\\Users\\me\\Desktop" }]);
+  const shortcut = capabilities(fake).createShortcutFileApi();
+  const temp = await shortcut.createTemp({ directory: "C:\\Users\\me\\Desktop", suffix: ".lnk" });
+  fake.get(temp.path).data = Buffer.from("shortcut");
+  const sealed = await shortcut.sealTemp(temp);
+  fake.failRename(temp.path, new Error("rename failed"));
+
+  await assert.rejects(
+    shortcut.commitNoReplace(sealed, "C:\\Users\\me\\Desktop\\ChatGPT.lnk"),
+    /rename failed/u,
+  );
+  assert.equal(fake.get(temp.path), undefined);
+  assert.equal(fake.handles.size, 0);
+  assert.equal(await shortcut.removeTemp(sealed), true);
+});
+
+test("shortcut removeExact failure closes both held handles and aggregates close failures", async () => {
+  const shortcutPath = "C:\\Users\\me\\Desktop\\ChatGPT.lnk";
+  const fake = createFakeNative([
+    { path: "C:\\Users\\me\\Desktop" },
+    { path: shortcutPath, kind: "file", data: "shortcut" },
+  ]);
+  const shortcut = capabilities(fake).createShortcutFileApi();
+  const inspected = await shortcut.inspectExact(shortcutPath);
+  fake.failDelete(shortcutPath, new Error("delete failed"));
+  fake.failClose(shortcutPath, new Error("close failed"));
+
+  await assert.rejects(shortcut.removeExact(inspected), (error) => {
+    assert.equal(error instanceof AggregateError, true);
+    assert.match(JSON.stringify(error, Object.getOwnPropertyNames(error)), /delete failed|close failed/u);
+    return true;
+  });
+  assert.equal(fake.handles.size, 0);
+  await shortcut.release(inspected);
 });
 
 test("thin Win32 layer binds only fixed Kernel32 APIs and opens no-follow with directory semantics", async () => {

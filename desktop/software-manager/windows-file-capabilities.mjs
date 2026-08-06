@@ -691,7 +691,7 @@ export function createWindowsFileCapabilities({
     const tempMap = new WeakMap();
     const inspectionMap = new WeakMap();
 
-    async function acquireMutationHandle(internal) {
+    async function acquireMutationHandle(internal, identityErrorCode = "shortcut_temp_identity_changed") {
       if (internal.mutationHandle) return internal.mutationHandle;
       let handle;
       try {
@@ -699,18 +699,18 @@ export function createWindowsFileCapabilities({
           access: ["read", "delete"], share: ["read"], disposition: "openExisting", directory: false,
         });
       } catch (error) {
-        if (isMissing(error)) throw capabilityError("shortcut_temp_identity_changed", error);
+        if (isMissing(error)) throw capabilityError(identityErrorCode, error);
         throw error;
       }
       internal.pin.owner.handles.add(handle);
       try {
         const info = validateInfo(await nativeApi.queryHandle(handle), "file");
         if (info.nlink !== 1 || identityKey(info.identity) !== identityKey(internal.identity)) {
-          throw capabilityError("shortcut_temp_identity_changed");
+          throw capabilityError(identityErrorCode);
         }
         await nativeApi.assertNoAlternateDataStreams(handle);
         const finalPath = validateAbsolute(await nativeApi.finalPath(handle));
-        if (!samePath(finalPath, internal.path)) throw capabilityError("shortcut_temp_identity_changed");
+        if (!samePath(finalPath, internal.path)) throw capabilityError(identityErrorCode);
         internal.mutationHandle = handle;
         return handle;
       } catch (error) {
@@ -739,6 +739,23 @@ export function createWindowsFileCapabilities({
         throw closeError;
       }
       if (primaryError) throw primaryError;
+    }
+
+    async function settleTempFailure(internal, primaryError) {
+      const errors = [primaryError];
+      if (internal.mutationHandle) {
+        try {
+          await nativeApi.deleteByHandle(internal.mutationHandle, { directory: false });
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      internal.state = "consumed";
+      internal.active = null;
+      const failure = errors.length === 1
+        ? primaryError
+        : new AggregateError(errors, primaryError.message, { cause: primaryError });
+      return closeOwnerWithPrimary(internal.pin.owner, failure);
     }
 
     return Object.freeze({
@@ -779,8 +796,23 @@ export function createWindowsFileCapabilities({
       },
       async sealTemp(temp) {
         const internal = claimTemp(temp);
+        let sealHandle;
         try {
-          await acquireMutationHandle(internal);
+          sealHandle = await nativeApi.openPath(internal.path, {
+            access: ["read", "attributes"],
+            share: ["read", "delete"],
+            disposition: "openExisting",
+            directory: false,
+          });
+          internal.pin.owner.handles.add(sealHandle);
+          const info = validateInfo(await nativeApi.queryHandle(sealHandle), "file");
+          if (info.nlink !== 1 || identityKey(info.identity) !== identityKey(internal.identity)) {
+            throw capabilityError("shortcut_temp_identity_changed");
+          }
+          await nativeApi.assertNoAlternateDataStreams(sealHandle);
+          const finalPath = validateAbsolute(await nativeApi.finalPath(sealHandle));
+          if (!samePath(finalPath, internal.path)) throw capabilityError("shortcut_temp_identity_changed");
+          internal.sealHandle = sealHandle;
           await closeOne(nativeApi, internal.pin.owner, internal.initialHandle);
           const sealed = Object.freeze({ path: internal.path });
           internal.active = sealed;
@@ -803,20 +835,19 @@ export function createWindowsFileCapabilities({
           }
           validateChildName(path.win32.basename(candidate));
         } catch (error) {
-          internal.state = "failed";
-          throw error;
+          return settleTempFailure(internal, error);
         }
         try {
+          const mutationHandle = await acquireMutationHandle(internal);
           await nativeApi.renameByHandle(
-            internal.mutationHandle, internal.pin.leaf.handle, path.win32.basename(candidate), { replace: false },
+            mutationHandle, internal.pin.leaf.handle, path.win32.basename(candidate), { replace: false },
           );
         } catch (error) {
           if (isOccupied(error)) {
             internal.state = "open";
             return "occupied";
           }
-          internal.state = "failed";
-          throw error;
+          return settleTempFailure(internal, error);
         }
         internal.state = "consumed";
         internal.active = null;
@@ -851,8 +882,8 @@ export function createWindowsFileCapabilities({
         try {
           pin = await openPinnedPath(nativeApi, exact, {
             kind: undefined,
-            access: ["read", "delete"],
-            share: ["read"],
+            access: ["read", "attributes"],
+            share: ["read", "delete"],
           });
         } catch (error) {
           if (isMissing(error)) return Object.freeze({ kind: "absent" });
@@ -866,7 +897,10 @@ export function createWindowsFileCapabilities({
           }
           await nativeApi.assertNoAlternateDataStreams(pin.leaf.handle);
           const descriptor = Object.freeze({ kind: "file", path: exact });
-          inspectionMap.set(descriptor, { pin, identity: info.identity, state: "open" });
+          inspectionMap.set(descriptor, {
+            pin, path: exact, identity: info.identity, sealHandle: pin.leaf.handle,
+            mutationHandle: null, state: "open",
+          });
           return descriptor;
         } catch (error) {
           return closeOwnerWithPrimary(pin.owner, error);
@@ -877,17 +911,18 @@ export function createWindowsFileCapabilities({
         if (!internal || internal.state !== "open") throw capabilityError("shortcut_inspection_capability_invalid");
         internal.state = "busy";
         try {
-          const info = validateInfo(await nativeApi.queryHandle(internal.pin.leaf.handle), "file");
+          const info = validateInfo(await nativeApi.queryHandle(internal.sealHandle), "file");
           if (info.nlink !== 1 || identityKey(info.identity) !== identityKey(internal.identity)) {
             throw capabilityError("shortcut_identity_changed");
           }
-          await nativeApi.assertNoAlternateDataStreams(internal.pin.leaf.handle);
-          const finalPath = validateAbsolute(await nativeApi.finalPath(internal.pin.leaf.handle));
+          await nativeApi.assertNoAlternateDataStreams(internal.sealHandle);
+          const finalPath = validateAbsolute(await nativeApi.finalPath(internal.sealHandle));
           if (!samePath(finalPath, descriptor.path)) throw capabilityError("shortcut_identity_changed");
-          await nativeApi.deleteByHandle(internal.pin.leaf.handle, { directory: false });
+          const mutationHandle = await acquireMutationHandle(internal, "shortcut_identity_changed");
+          await nativeApi.deleteByHandle(mutationHandle, { directory: false });
         } catch (error) {
-          internal.state = "failed";
-          throw error;
+          internal.state = "consumed";
+          return closeOwnerWithPrimary(internal.pin.owner, error);
         }
         internal.state = "consumed";
         await closeOwner(nativeApi, internal.pin.owner);

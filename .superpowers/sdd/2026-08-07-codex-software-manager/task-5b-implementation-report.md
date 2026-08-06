@@ -138,3 +138,28 @@ Real task-owned Win32 sandboxes under this worktree passed and were removed one 
 - a real NTFS alternate data stream was rejected by `FileStreamInfo`.
 
 The first long-path smoke exposed that directory enumeration additionally needs list-directory read access (`ERROR_ACCESS_DENIED`). After adding that access to enumerated directory handles, the complete long-path/ADS smoke passed. No installed software, registry, PATH, Desktop, `.codex`, or server was touched.
+
+## Fix round 2
+
+The second review round corrected the held-shortcut sharing contract without reopening a writable path window.
+
+### Two-phase shortcut handle contract
+
+- `sealTemp` and `inspectExact` now hold a read/attributes seal handle without DELETE desired access.
+- The seal shares read and delete, but never write. This permits Electron's read-only shortcut open and the later mutation handle while denying any same-identity in-place writer for the complete target-read interval.
+- After the host finishes `readShortcutLink`, `commitNoReplace` or `removeExact` synchronously claims the descriptor before its first await, keeps the read seal alive, and opens a second READ+DELETE mutation handle.
+- The mutation handle is revalidated for identity, final path, link count, reparse state, and alternate streams before handle-based rename or deletion. The read seal is never closed before the mutation handle opens, so there is no writable gap between target validation and mutation.
+- Occupied no-replace rename remains the sole retryable state and retains both handles. Completion, cleanup, or release closes the complete owner and preserves aggregated close errors.
+
+### Fix-round evidence
+
+The fake native adapter now enforces Windows bidirectional share compatibility. Its RED failures reproduced both old conflicts: a seal handle could not satisfy the read/attributes contract, and a read-only open alongside `inspectExact` failed with `sharing_violation`. The GREEN contract proves:
+
+- a read-only client can open while the seal is held;
+- an in-place writer is rejected while the seal is held;
+- after an occupied rename, both the read seal and mutation handle remain live for the retry;
+- the seal is not closed before the mutation handle opens.
+
+A real Electron `39.8.10` probe ran only in a task-owned worktree sandbox. `shell.writeShortcutLink` succeeded, `shell.readShortcutLink` succeeded while the new seal was held, commit returned `committed`, a second held inspection read succeeded, and exact removal completed. The probe script, shortcut, and empty sandbox directory were each removed by explicit non-recursive paths; the real Desktop was never used.
+
+Final round-2 regression counts are 141/141 for the archive/native-capability/Windows-host focused set and 268/268 across all software-manager suites. Dedicated failure cases also prove that a non-occupied commit failure removes the temp and closes both handles, while an exact-remove failure closes both handles and aggregates the primary and close failures.
