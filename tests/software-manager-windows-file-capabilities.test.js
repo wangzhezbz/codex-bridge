@@ -591,6 +591,47 @@ test("shortcut commit failure deletes the temp and closes both held handles", as
   assert.equal(await shortcut.removeTemp(sealed), true);
 });
 
+for (const [label, candidatePath, expected] of [
+  ["invalid candidate", "ChatGPT.lnk", /windows_path_absolute_required/u],
+  ["cross-directory candidate", "D:\\Other\\ChatGPT.lnk", /candidate_directory_mismatch/u],
+]) {
+  test(`shortcut ${label} still deletes the sealed temp by its held identity`, async () => {
+    const fake = createFakeNative([{ path: "C:\\Users\\me\\Desktop" }]);
+    const shortcut = capabilities(fake).createShortcutFileApi();
+    const temp = await shortcut.createTemp({ directory: "C:\\Users\\me\\Desktop", suffix: ".lnk" });
+    fake.get(temp.path).data = Buffer.from("shortcut");
+    const sealed = await shortcut.sealTemp(temp);
+
+    await assert.rejects(shortcut.commitNoReplace(sealed, candidatePath), expected);
+    assert.equal(fake.get(temp.path), undefined);
+    assert.equal(fake.calls.some((call) => call[0] === "delete-handle" && call[1] === temp.path), true);
+    assert.equal(fake.handles.size, 0);
+    assert.equal(await shortcut.removeTemp(sealed), true);
+  });
+}
+
+test("shortcut invalid candidate preserves mutation-open and close failures without claiming cleanup", async () => {
+  const fake = createFakeNative([{ path: "C:\\Users\\me\\Desktop" }]);
+  const shortcut = capabilities(fake).createShortcutFileApi();
+  const temp = await shortcut.createTemp({ directory: "C:\\Users\\me\\Desktop", suffix: ".lnk" });
+  fake.get(temp.path).data = Buffer.from("shortcut");
+  const sealed = await shortcut.sealTemp(temp);
+  fake.failOpen(temp.path, new Error("mutation open failed"));
+  fake.failClose(temp.path, new Error("seal close failed"));
+
+  await assert.rejects(shortcut.commitNoReplace(sealed, "ChatGPT.lnk"), (error) => {
+    assert.equal(error instanceof AggregateError, true);
+    const serialized = JSON.stringify(error, Object.getOwnPropertyNames(error));
+    assert.match(serialized, /windows_path_absolute_required/u);
+    assert.match(serialized, /mutation open failed/u);
+    assert.match(serialized, /seal close failed/u);
+    return true;
+  });
+  assert.notEqual(fake.get(temp.path), undefined);
+  assert.equal(fake.handles.size, 0);
+  await assert.rejects(shortcut.removeTemp(sealed), /cleanup_unconfirmed/u);
+});
+
 test("shortcut removeExact failure closes both held handles and aggregates close failures", async () => {
   const shortcutPath = "C:\\Users\\me\\Desktop\\ChatGPT.lnk";
   const fake = createFakeNative([

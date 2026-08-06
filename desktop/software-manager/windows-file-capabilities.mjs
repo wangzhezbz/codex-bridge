@@ -741,21 +741,35 @@ export function createWindowsFileCapabilities({
       if (primaryError) throw primaryError;
     }
 
-    async function settleTempFailure(internal, primaryError) {
+    async function settleTempFailure(internal, primaryError, { acquireIfMissing = false } = {}) {
       const errors = [primaryError];
-      if (internal.mutationHandle) {
+      let deletionConfirmed = false;
+      if (!internal.mutationHandle && acquireIfMissing) {
         try {
-          await nativeApi.deleteByHandle(internal.mutationHandle, { directory: false });
+          await acquireMutationHandle(internal);
         } catch (error) {
           errors.push(error);
         }
       }
-      internal.state = "consumed";
-      internal.active = null;
+      if (internal.mutationHandle) {
+        try {
+          await nativeApi.deleteByHandle(internal.mutationHandle, { directory: false });
+          deletionConfirmed = true;
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      internal.state = deletionConfirmed ? "consumed" : "cleanup_unconfirmed";
+      if (deletionConfirmed) internal.active = null;
       const failure = errors.length === 1
         ? primaryError
         : new AggregateError(errors, primaryError.message, { cause: primaryError });
-      return closeOwnerWithPrimary(internal.pin.owner, failure);
+      try {
+        return await closeOwnerWithPrimary(internal.pin.owner, failure);
+      } catch (error) {
+        if (!deletionConfirmed) internal.cleanupError = error;
+        throw error;
+      }
     }
 
     return Object.freeze({
@@ -835,7 +849,7 @@ export function createWindowsFileCapabilities({
           }
           validateChildName(path.win32.basename(candidate));
         } catch (error) {
-          return settleTempFailure(internal, error);
+          return settleTempFailure(internal, error, { acquireIfMissing: true });
         }
         try {
           const mutationHandle = await acquireMutationHandle(internal);
@@ -857,6 +871,9 @@ export function createWindowsFileCapabilities({
       async removeTemp(temp) {
         const internal = tempMap.get(temp);
         if (!internal) throw capabilityError("shortcut_temp_capability_invalid");
+        if (internal.state === "cleanup_unconfirmed") {
+          throw capabilityError("shortcut_temp_cleanup_unconfirmed", internal.cleanupError);
+        }
         if (internal.state === "consumed" && internal.pin.owner.closed) return true;
         if (internal.active !== temp || !["open", "failed"].includes(internal.state)) {
           throw capabilityError("shortcut_temp_capability_invalid");

@@ -163,3 +163,19 @@ The fake native adapter now enforces Windows bidirectional share compatibility. 
 A real Electron `39.8.10` probe ran only in a task-owned worktree sandbox. `shell.writeShortcutLink` succeeded, `shell.readShortcutLink` succeeded while the new seal was held, commit returned `committed`, a second held inspection read succeeded, and exact removal completed. The probe script, shortcut, and empty sandbox directory were each removed by explicit non-recursive paths; the real Desktop was never used.
 
 Final round-2 regression counts are 141/141 for the archive/native-capability/Windows-host focused set and 268/268 across all software-manager suites. Dedicated failure cases also prove that a non-occupied commit failure removes the temp and closes both handles, while an exact-remove failure closes both handles and aggregates the primary and close failures.
+
+## Fix round 3
+
+The third review round closed the remaining pre-mutation validation cleanup gap in `commitNoReplace`.
+
+- An invalid or cross-directory candidate is still synchronously claimed before any await, but candidate validation failure no longer closes the owner before cleanup.
+- While the read seal remains held, the failure path now acquires the READ+DELETE mutation handle, revalidates the original temp identity/final path/link and stream evidence, deletes by that handle, and only then closes the complete owner.
+- The descriptor enters `consumed` only after handle deletion is confirmed. If mutation acquisition or handle deletion cannot be confirmed, it enters `cleanup_unconfirmed`; subsequent `removeTemp` rejects instead of reporting a false success.
+- The original candidate-validation error remains primary. Mutation-acquisition, delete, and owner-close errors are retained through `AggregateError`.
+- Regression cases cover an invalid relative candidate, a valid absolute candidate outside the sealed directory, and mutation-open plus seal-close failures.
+
+A real Win32 task-owned sandbox confirmed that a sealed temp given the invalid candidate `ChatGPT.lnk` returned `windows_path_absolute_required`, was deleted by handle, and made the later `removeTemp` call safely idempotent. The explicit sandbox was removed non-recursively.
+
+Before this round, the untracked `.task5b-round2-aba-smoke.cjs` was inspected and confirmed to be a round-2 ABA/Electron review probe. That single explicit file was deleted, followed separately by its confirmed-empty `.task5b-round2-aba` directory; no recursive deletion was used.
+
+Final round-3 verification passed: 144/144 for the archive/native-capability/Windows-host focused set, 271/271 across all software-manager suites, the complete `npm run check` gate (including 16/16 recovery tests), production dependency audits with zero vulnerabilities, package-content policy, syntax checks, and `git diff --check`.
