@@ -103,6 +103,13 @@ test("rejects a ZIP file that conflicts with a descendant path", async () => {
   await assert.rejects(zipService().inspectArchive({ format: "zip", archivePath }), /archive_path_conflict/);
 });
 
+for (const deviceName of ["COM1", "LPT9.txt", "COM¹", "lpt².log", "COM³.bin"]) {
+  test(`rejects Windows device entry name ${deviceName}`, async () => {
+    const archivePath = await writeZipFixture([{ name: `app/${deviceName}`, body: "x" }]);
+    await assert.rejects(zipService().inspectArchive({ format: "zip", archivePath }), /archive_path_rejected/);
+  });
+}
+
 test("rejects encrypted or unsupported ZIP entries during preflight", async (t) => {
   await t.test("encrypted", async () => {
     const archivePath = await writeZipFixture([{ name: "secret.txt", body: "x", flags: 0x801, method: 8 }]);
@@ -177,12 +184,37 @@ test("lists a normal 7z with the fixed bundled executable command", async () => 
   assert.equal(fake.calls[0].options.shell, false);
 });
 
+test("accepts correctly decoded non-ASCII 7z listing text", async () => {
+  const fake = fakeSevenZip({ listing: sevenZipListing([
+    { path: "工具/说明.txt", size: 6, attributes: "A" },
+  ]) });
+  const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, fsApi: {} });
+
+  const result = await service.inspectArchive({ format: "7z", archivePath: path.resolve("packages", "中文.7z") });
+  assert.deepEqual(result.entries, [{ path: "工具/说明.txt", size: 6, directory: false }]);
+});
+
+test("rejects undecoded Buffer stdout for a 7z listing", async () => {
+  const fake = fakeSevenZip({ listing: Buffer.from(sevenZipListing([
+    { path: "工具/说明.txt", size: 6, attributes: "A" },
+  ]), "utf8") });
+  const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, fsApi: {} });
+
+  await assert.rejects(
+    service.inspectArchive({ format: "7z", archivePath: path.resolve("packages", "buffer.7z") }),
+    /archive_7z_listing_encoding_required/,
+  );
+});
+
 test("extracts 7z only with fixed arguments and no-follow capability verification", async () => {
   const archivePath = path.resolve("packages", "tool.7z");
   const destination = path.resolve("staging", "seven-ok");
   const fake = fakeSevenZip({ listing: sevenZipListing([{ path: "app/tool.exe", size: 12, attributes: "A" }]) });
   const memory = memoryDestination(destination, {
-    verifiedTree: [{ path: "app/tool.exe", realPath: path.join(destination, "app", "tool.exe"), directory: false }],
+    verifiedTree: [
+      verifiedItem(destination, { path: "app", size: 0, directory: true }),
+      verifiedItem(destination, { path: "app/tool.exe", size: 12, directory: false }),
+    ],
   });
   const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, fsApi: memory.fsApi });
 
@@ -225,6 +257,99 @@ test("rejects 7z symlink and reparse metadata", async () => {
     service.inspectArchive({ format: "7z", archivePath: path.resolve("packages", "link.7z") }),
     /archive_link_rejected/,
   );
+});
+
+test("parses 7z security fields without overwrite or empty-value ambiguity", async (t) => {
+  await t.test("duplicate critical field", async () => {
+    const fake = fakeSevenZip({ listing: [
+      "Path = safe.txt",
+      "Size = 1",
+      "Attributes = A",
+      "Encrypted = -",
+      "Path = outside.txt",
+    ].join("\r\n") });
+    const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, fsApi: {} });
+    await assert.rejects(
+      service.inspectArchive({ format: "7z", archivePath: path.resolve("packages", "duplicate.7z") }),
+      /archive_7z_list_ambiguous/,
+    );
+  });
+
+  for (const field of ["Symbolic Link", "Hard Link", "Link", "Copy Link", "Reparse"]) {
+    await t.test(`non-empty ${field}`, async () => {
+      const fake = fakeSevenZip({ listing: [
+        "Path = app/link",
+        "Size = 1",
+        "Attributes = A",
+        "Encrypted = -",
+        `${field} = target`,
+      ].join("\r\n") });
+      const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, fsApi: {} });
+      await assert.rejects(
+        service.inspectArchive({ format: "7z", archivePath: path.resolve("packages", "link-field.7z") }),
+        /archive_link_rejected/,
+      );
+    });
+  }
+
+  await t.test("empty link fields", async () => {
+    const fake = fakeSevenZip({ listing: [
+      "Path = app/ordinary.txt",
+      "Size = 1",
+      "Attributes = A_ lrwxrwxrwx",
+      "Encrypted = -",
+      "Symbolic Link = ",
+      "Hard Link = ",
+      "Link = ",
+      "Copy Link = ",
+      "Reparse = ",
+    ].join("\r\n") });
+    const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, fsApi: {} });
+    const result = await service.inspectArchive({ format: "7z", archivePath: path.resolve("packages", "empty-links.7z") });
+    assert.deepEqual(result.entries, [{ path: "app/ordinary.txt", size: 1, directory: false }]);
+  });
+
+  await t.test("encrypted entry", async () => {
+    const fake = fakeSevenZip({ listing: [
+      "Path = secret.txt",
+      "Size = 1",
+      "Attributes = A",
+      "Encrypted = +",
+    ].join("\r\n") });
+    const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, fsApi: {} });
+    await assert.rejects(
+      service.inspectArchive({ format: "7z", archivePath: path.resolve("packages", "encrypted.7z") }),
+      /archive_encrypted_entry_rejected/,
+    );
+  });
+
+  await t.test("malformed injected record line", async () => {
+    const fake = fakeSevenZip({ listing: [
+      "Path = safe.txt",
+      "Size = 1",
+      "Attributes = A",
+      "this is not an slt field",
+    ].join("\r\n") });
+    const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, fsApi: {} });
+    await assert.rejects(
+      service.inspectArchive({ format: "7z", archivePath: path.resolve("packages", "injected.7z") }),
+      /archive_7z_list_invalid/,
+    );
+  });
+
+  await t.test("unknown injected field", async () => {
+    const fake = fakeSevenZip({ listing: [
+      "Path = safe.txt",
+      "Size = 1",
+      "Attributes = A",
+      "Injected Field = outside.txt",
+    ].join("\r\n") });
+    const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, fsApi: {} });
+    await assert.rejects(
+      service.inspectArchive({ format: "7z", archivePath: path.resolve("packages", "unknown-field.7z") }),
+      /archive_7z_list_invalid/,
+    );
+  });
 });
 
 test("rejects 7z entry-count and declared-size bombs", async (t) => {
@@ -273,11 +398,136 @@ test("rejects a post-7z no-follow tree report that escapes destination", async (
   const destination = path.resolve("staging", "seven-escape");
   const fake = fakeSevenZip({ listing: sevenZipListing([{ path: "app/tool.exe", size: 1, attributes: "A" }]) });
   const memory = memoryDestination(destination, {
-    verifiedTree: [{ path: "app/tool.exe", realPath: path.resolve("outside", "tool.exe"), directory: false }],
+    verifiedTree: [
+      verifiedItem(destination, { path: "app", size: 0, directory: true }),
+      { ...verifiedItem(destination, { path: "app/tool.exe", size: 1, directory: false }), realPath: path.resolve("outside", "tool.exe") },
+    ],
   });
   const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, fsApi: memory.fsApi });
 
   await assert.rejects(service.extractArchive({ format: "7z", archivePath, destination }), /archive_output_escape/);
+});
+
+test("7z post-extraction tree must exactly match preflight metadata", async (t) => {
+  const archivePath = path.resolve("packages", "tree-contract.7z");
+  const destination = path.resolve("staging", "tree-contract");
+  const expectedTree = [
+    verifiedItem(destination, { path: "app", size: 0, directory: true }),
+    verifiedItem(destination, { path: "app/tool.exe", size: 12, directory: false }),
+  ];
+  const cases = [
+    ["missing entry", expectedTree.slice(0, 1)],
+    ["extra entry", [...expectedTree, verifiedItem(destination, { path: "extra.txt", size: 1, directory: false })]],
+    ["type mismatch", [expectedTree[0], { ...expectedTree[1], directory: true }]],
+    ["size mismatch", [expectedTree[0], { ...expectedTree[1], size: 13 }]],
+    ["missing explicit link evidence", [expectedTree[0], omit(expectedTree[1], "link")]],
+    ["hard link", [expectedTree[0], { ...expectedTree[1], hardLink: true }]],
+    ["multiple links", [expectedTree[0], { ...expectedTree[1], nlink: 2 }]],
+  ];
+
+  for (const [label, verifiedTree] of cases) {
+    await t.test(label, async () => {
+      const fake = fakeSevenZip({ listing: sevenZipListing([{ path: "app/tool.exe", size: 12, attributes: "A" }]) });
+      const memory = memoryDestination(destination, { verifiedTree });
+      const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, fsApi: memory.fsApi });
+      await assert.rejects(
+        service.extractArchive({ format: "7z", archivePath, destination }),
+        /archive_(?:no_follow_tree_invalid|output_mismatch)/,
+      );
+    });
+  }
+});
+
+test("cancellation during 7z no-follow verification fails closed and closes handles", async () => {
+  const archivePath = path.resolve("packages", "verify-cancel.7z");
+  const destination = path.resolve("staging", "verify-cancel");
+  const controller = new AbortController();
+  const fake = fakeSevenZip({ listing: sevenZipListing([{ path: "safe.txt", size: 1, attributes: "A" }]) });
+  const memory = memoryDestination(destination, {
+    verifiedTree: [verifiedItem(destination, { path: "safe.txt", size: 1, directory: false })],
+    onVerify(signal) {
+      assert.equal(signal, controller.signal);
+      controller.abort();
+    },
+  });
+  const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, fsApi: memory.fsApi });
+
+  await assert.rejects(
+    service.extractArchive({ format: "7z", archivePath, destination, signal: controller.signal }),
+    (error) => error?.name === "AbortError",
+  );
+  assert.equal(memory.archivePinClosed, true);
+  assert.equal(memory.closed, true);
+});
+
+test("7z cleanup closes every available handle without hiding the primary error", async () => {
+  const archivePath = path.resolve("packages", "cleanup.7z");
+  const destination = path.resolve("staging", "cleanup");
+  const fake = fakeSevenZip({ listing: sevenZipListing([{ path: "safe.txt", size: 1, attributes: "A" }]) });
+  const primaryTree = [{ ...verifiedItem(destination, { path: "safe.txt", size: 1, directory: false }), size: 2 }];
+  const memory = memoryDestination(destination, {
+    verifiedTree: primaryTree,
+    destinationCloseError: new Error("destination_close_failed"),
+    pinCloseError: new Error("pin_close_failed"),
+  });
+  const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, fsApi: memory.fsApi });
+
+  await assert.rejects(service.extractArchive({ format: "7z", archivePath, destination }), (error) => {
+    assert.equal(error instanceof AggregateError, true);
+    assert.match(error.errors[0].message, /archive_output_mismatch/);
+    assert.match(error.errors[1].message, /destination_close_failed/);
+    assert.match(error.errors[2].message, /pin_close_failed/);
+    return true;
+  });
+  assert.equal(memory.closed, true);
+  assert.equal(memory.archivePinClosed, true);
+});
+
+test("invalid closeable 7z capability handles are still released", async (t) => {
+  const archivePath = path.resolve("packages", "invalid-handle.7z");
+  const destination = path.resolve("staging", "invalid-handle");
+  const fake = fakeSevenZip({ listing: sevenZipListing([{ path: "safe.txt", size: 1, attributes: "A" }]) });
+
+  await t.test("archive pin", async () => {
+    let pinClosed = false;
+    const service = createArchiveService({
+      sevenZipPath: SEVEN_ZIP_PATH,
+      spawnFile: fake.spawnFile,
+      fsApi: {
+        async pinArchiveFileNoFollow() {
+          return { async close() { pinClosed = true; } };
+        },
+        async openArchiveDestinationNoFollow() {
+          throw new Error("must not open destination");
+        },
+      },
+    });
+    await assert.rejects(service.extractArchive({ format: "7z", archivePath, destination }), /archive_no_follow_capability_invalid/);
+    assert.equal(pinClosed, true);
+  });
+
+  await t.test("destination", async () => {
+    let destinationClosed = false;
+    let pinClosed = false;
+    const service = createArchiveService({
+      sevenZipPath: SEVEN_ZIP_PATH,
+      spawnFile: fake.spawnFile,
+      fsApi: {
+        async pinArchiveFileNoFollow() {
+          return {
+            async assertStableNoFollow() {},
+            async close() { pinClosed = true; },
+          };
+        },
+        async openArchiveDestinationNoFollow() {
+          return { async close() { destinationClosed = true; } };
+        },
+      },
+    });
+    await assert.rejects(service.extractArchive({ format: "7z", archivePath, destination }), /archive_no_follow_capability_invalid/);
+    assert.equal(destinationClosed, true);
+    assert.equal(pinClosed, true);
+  });
 });
 
 test("fails closed when extraction lacks stable no-follow capabilities", async (t) => {
@@ -332,11 +582,17 @@ function sevenZipListing(entries) {
     `Size = ${entry.size}`,
     `Packed Size = ${entry.size}`,
     `Attributes = ${entry.attributes}`,
+    "Encrypted = -",
     "CRC = 00000000",
   ].join("\r\n")).join("\r\n\r\n");
 }
 
-function memoryDestination(destination, { verifiedTree = [] } = {}) {
+function memoryDestination(destination, {
+  verifiedTree = [],
+  onVerify,
+  destinationCloseError,
+  pinCloseError,
+} = {}) {
   const files = new Map();
   const directories = new Set();
   const state = {
@@ -373,12 +629,15 @@ function memoryDestination(destination, { verifiedTree = [] } = {}) {
     async assertEmptyNoFollow() {
       state.assertEmptyCalls += 1;
     },
-    async verifyTreeNoFollow() {
+    async verifyTreeNoFollow(signal) {
       state.verifyTreeCalls += 1;
+      state.verifySignal = signal;
+      await onVerify?.(signal);
       return verifiedTree;
     },
     async close() {
       state.closed = true;
+      if (destinationCloseError) throw destinationCloseError;
     },
   };
   state.root = root;
@@ -395,11 +654,31 @@ function memoryDestination(destination, { verifiedTree = [] } = {}) {
         },
         async close() {
           state.archivePinClosed = true;
+          if (pinCloseError) throw pinCloseError;
         },
       };
     },
   };
   return state;
+}
+
+function verifiedItem(destination, { path: relativePath, size, directory }) {
+  return {
+    path: relativePath,
+    realPath: path.join(destination, ...relativePath.split("/")),
+    size,
+    directory,
+    link: false,
+    reparse: false,
+    hardLink: false,
+    nlink: 1,
+  };
+}
+
+function omit(value, key) {
+  const copy = { ...value };
+  delete copy[key];
+  return copy;
 }
 
 async function writeZipFixture(entries) {
