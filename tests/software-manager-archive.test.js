@@ -184,6 +184,32 @@ test("lists a normal 7z with the fixed bundled executable command", async () => 
   assert.equal(fake.calls[0].options.shell, false);
 });
 
+for (const attributes of ["RD", "HD", "RHD"]) {
+  test(`recognizes compact Windows ${attributes} as a directory with children`, async () => {
+    const fake = fakeSevenZip({ listing: sevenZipListing([
+      { path: "hidden-dir", size: 0, attributes },
+      { path: "hidden-dir/tool.exe", size: 12, attributes: "A" },
+    ]) });
+    const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, fsApi: {} });
+
+    const result = await service.inspectArchive({ format: "7z", archivePath: path.resolve("packages", `${attributes}.7z`) });
+    assert.deepEqual(result.entries, [
+      { path: "hidden-dir", size: 0, directory: true },
+      { path: "hidden-dir/tool.exe", size: 12, directory: false },
+    ]);
+  });
+}
+
+test("keeps a regular Unix mode token classified as a file", async () => {
+  const fake = fakeSevenZip({ listing: sevenZipListing([
+    { path: "app/tool", size: 12, attributes: "A_ -rwxr-xr-x" },
+  ]) });
+  const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, fsApi: {} });
+
+  const result = await service.inspectArchive({ format: "7z", archivePath: path.resolve("packages", "unix-file.7z") });
+  assert.deepEqual(result.entries, [{ path: "app/tool", size: 12, directory: false }]);
+});
+
 test("accepts correctly decoded non-ASCII 7z listing text", async () => {
   const fake = fakeSevenZip({ listing: sevenZipListing([
     { path: "工具/说明.txt", size: 6, attributes: "A" },

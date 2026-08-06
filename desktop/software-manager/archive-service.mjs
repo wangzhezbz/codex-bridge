@@ -367,9 +367,13 @@ function parseSevenZipListing(stdout) {
 function parseSevenZipAttributes(attributes) {
   const tokens = attributes.trim().split(/\s+/u).filter(Boolean);
   const unixMode = tokens.find((token) => /^[bcdlps-][rwxstST-]{9}$/u.test(token));
+  const windowsCompact = tokens.find((token) => /^(?=.*[A-Za-z])[RHSDACTPLOINE.]+$/iu.test(token));
   return {
-    link: unixMode?.[0]?.toLowerCase() === "l" || /\b(?:symlink|junction|reparse)\b/iu.test(attributes),
-    directory: unixMode?.[0]?.toLowerCase() === "d" || /^d(?:$|[.\s_])/iu.test(attributes),
+    link: unixMode?.[0]?.toLowerCase() === "l"
+      || windowsCompact?.toUpperCase().includes("L") === true
+      || /\b(?:symlink|junction|reparse)\b/iu.test(attributes),
+    directory: unixMode?.[0]?.toLowerCase() === "d"
+      || windowsCompact?.toUpperCase().includes("D") === true,
   };
 }
 
