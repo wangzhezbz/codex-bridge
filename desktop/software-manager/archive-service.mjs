@@ -355,11 +355,22 @@ function parseSevenZipListing(stdout) {
     if (folder !== undefined && folder !== "+" && folder !== "-") throw archiveError("archive_7z_list_invalid");
     const anti = fields.get("anti");
     if (anti !== undefined && anti !== "" && anti !== "-") throw archiveError("archive_7z_list_invalid");
-    const link = [...SEVEN_ZIP_LINK_FIELDS].some((field) => (fields.get(field) ?? "").trim().length > 0);
-    const directory = /[\\/]$/u.test(rawPath) || /^d/iu.test(attributes) || folder === "+";
+    const attributePolicy = parseSevenZipAttributes(attributes);
+    const link = [...SEVEN_ZIP_LINK_FIELDS].some((field) => fields.has(field) && fields.get(field) !== "")
+      || attributePolicy.link;
+    const directory = /[\\/]$/u.test(rawPath) || attributePolicy.directory || folder === "+";
     collector.add({ rawPath, size: BigInt(rawSize), directory, link });
   }
   return collector.finish();
+}
+
+function parseSevenZipAttributes(attributes) {
+  const tokens = attributes.trim().split(/\s+/u).filter(Boolean);
+  const unixMode = tokens.find((token) => /^[bcdlps-][rwxstST-]{9}$/u.test(token));
+  return {
+    link: unixMode?.[0]?.toLowerCase() === "l" || /\b(?:symlink|junction|reparse)\b/iu.test(attributes),
+    directory: unixMode?.[0]?.toLowerCase() === "d" || /^d(?:$|[.\s_])/iu.test(attributes),
+  };
 }
 
 function requireSpawnResult(result) {
@@ -443,6 +454,9 @@ function validateVerifiedTree(tree, destination, inspectedEntries) {
       throw archiveError("archive_no_follow_tree_invalid");
     }
     const normalized = normalizeEntryPath(item.path, item.directory);
+    if (normalized.directory !== item.directory || normalized.path !== item.path) {
+      throw archiveError("archive_no_follow_tree_invalid");
+    }
     if (seen.has(normalized.key)) throw archiveError("archive_duplicate_output_path");
     seen.add(normalized.key);
     const realPath = requireAbsolutePath(item.realPath, "archive_output_escape");

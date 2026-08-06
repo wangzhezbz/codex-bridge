@@ -296,7 +296,7 @@ test("parses 7z security fields without overwrite or empty-value ambiguity", asy
     const fake = fakeSevenZip({ listing: [
       "Path = app/ordinary.txt",
       "Size = 1",
-      "Attributes = A_ lrwxrwxrwx",
+      "Attributes = A",
       "Encrypted = -",
       "Symbolic Link = ",
       "Hard Link = ",
@@ -308,6 +308,53 @@ test("parses 7z security fields without overwrite or empty-value ambiguity", asy
     const result = await service.inspectArchive({ format: "7z", archivePath: path.resolve("packages", "empty-links.7z") });
     assert.deepEqual(result.entries, [{ path: "app/ordinary.txt", size: 1, directory: false }]);
   });
+
+  for (const whitespace of [" ", "\t", " \t "]) {
+    await t.test(`whitespace-only symbolic-link target ${JSON.stringify(whitespace)}`, async () => {
+      const fake = fakeSevenZip({ listing: [
+        "Path = app/ambiguous-link",
+        "Size = 1",
+        "Attributes = A",
+        "Encrypted = -",
+        `Symbolic Link = ${whitespace}`,
+      ].join("\r\n") });
+      const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, fsApi: {} });
+      await assert.rejects(
+        service.inspectArchive({ format: "7z", archivePath: path.resolve("packages", "whitespace-link.7z") }),
+        /archive_(?:link_rejected|7z_list_ambiguous)/,
+      );
+    });
+  }
+
+  await t.test("Unix l file-type attribute", async () => {
+    const fake = fakeSevenZip({ listing: [
+      "Path = app/unix-link",
+      "Size = 1",
+      "Attributes = A_ lrwxrwxrwx",
+      "Encrypted = -",
+    ].join("\r\n") });
+    const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, fsApi: {} });
+    await assert.rejects(
+      service.inspectArchive({ format: "7z", archivePath: path.resolve("packages", "unix-link.7z") }),
+      /archive_link_rejected/,
+    );
+  });
+
+  for (const attributes of ["A symlink", "A junction", "A reparse"]) {
+    await t.test(`semantic link attribute ${attributes}`, async () => {
+      const fake = fakeSevenZip({ listing: [
+        "Path = app/semantic-link",
+        "Size = 1",
+        `Attributes = ${attributes}`,
+        "Encrypted = -",
+      ].join("\r\n") });
+      const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, fsApi: {} });
+      await assert.rejects(
+        service.inspectArchive({ format: "7z", archivePath: path.resolve("packages", "semantic-link.7z") }),
+        /archive_link_rejected/,
+      );
+    });
+  }
 
   await t.test("encrypted entry", async () => {
     const fake = fakeSevenZip({ listing: [
@@ -423,6 +470,9 @@ test("7z post-extraction tree must exactly match preflight metadata", async (t) 
     ["missing explicit link evidence", [expectedTree[0], omit(expectedTree[1], "link")]],
     ["hard link", [expectedTree[0], { ...expectedTree[1], hardLink: true }]],
     ["multiple links", [expectedTree[0], { ...expectedTree[1], nlink: 2 }]],
+    ["file path trailing slash", [expectedTree[0], { ...expectedTree[1], path: "app/tool.exe/" }]],
+    ["directory path trailing slash", [{ ...expectedTree[0], path: "app/" }, expectedTree[1]]],
+    ["noncanonical separator", [expectedTree[0], { ...expectedTree[1], path: "app\\tool.exe" }]],
   ];
 
   for (const [label, verifiedTree] of cases) {
