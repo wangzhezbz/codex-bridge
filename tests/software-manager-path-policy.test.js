@@ -53,6 +53,27 @@ test("accepts a normalized writable application directory", async () => {
   assert.deepEqual(result, { ok: true, path: "C:\\Tools\\CodexBridge" });
 });
 
+for (const candidate of [
+  "//server/share/CodexBridge",
+  "C:\\Portable\\.CODEX\\managed",
+  "D:\\staging\\.codex\\manager",
+  "C:\\Tools.\\CodexBridge",
+  "C:\\Tools \\CodexBridge",
+  "C:\\Tools\\CodexBridge. ",
+  "C:\\CON\\CodexBridge",
+  "C:\\Tools\\NUL.txt\\CodexBridge",
+]) {
+  test(`rejects non-canonical or protected install root ${candidate}`, async () => {
+    const result = await validateInstallRoot({
+      candidate,
+      env: fixtureEnv(),
+      maxRelativePath: 100,
+      access: allowAccess,
+    });
+    assert.equal(result.ok, false);
+  });
+}
+
 test("rejects install roots containing parent traversal", async () => {
   const result = await validateInstallRoot({
     candidate: "C:\\Tools\\staging\\..\\CodexBridge",
@@ -135,8 +156,8 @@ test("ownership rejects sibling-prefix escapes and recognizes explicit owned pat
   const ownership = {
     schemaVersion: 1,
     installRoot: "C:\\Tools\\CodexBridge",
-    components: { git: { path: "C:\\Tools\\CodexBridge\\components\\git" } },
-    skills: { documents: { path: "C:\\Users\\me\\.codex\\skills\\documents" } },
+    components: { git: { installPath: "C:\\Tools\\CodexBridge\\components\\git" } },
+    skills: { documents: { target: "C:\\Users\\me\\.codex\\skills\\documents" } },
     shortcuts: [{ path: "C:\\Users\\me\\Desktop\\CodexBridge.lnk" }],
     rollback: [{ path: "D:\\CodexBridgeRollback\\chatgpt" }],
     activeTask: null,
@@ -148,4 +169,36 @@ test("ownership rejects sibling-prefix escapes and recognizes explicit owned pat
   assert.equal(isOwnedPath({ target: "C:\\Users\\me\\Desktop\\CodexBridge.lnk", ownership }), true);
   assert.equal(isOwnedPath({ target: "C:\\Tools\\CodexBridge-old\\payload.exe", ownership }), false);
   assert.equal(isOwnedPath({ target: "C:\\Tools\\CodexBridge\\..\\foreign", ownership }), false);
+});
+
+test("ownership metadata strings never become authorized roots", () => {
+  const ownership = {
+    schemaVersion: 1,
+    installRoot: null,
+    components: { app: { installPath: "C:\\Owned\\app", version: "C:\\Windows" } },
+    skills: { documents: { target: "C:\\Owned\\skills\\documents", sha256: "C:\\Windows" } },
+    shortcuts: [{ path: "C:\\Owned\\shortcut.lnk", message: "C:\\Windows" }],
+    rollback: null,
+    activeTask: { message: "C:\\Windows" },
+    lastTask: null,
+  };
+
+  assert.equal(isOwnedPath({ target: "C:\\Owned\\app\\bin.exe", ownership }), true);
+  assert.equal(isOwnedPath({ target: "C:\\Owned\\skills\\documents\\SKILL.md", ownership }), true);
+  assert.equal(isOwnedPath({ target: "C:\\Windows\\System32\\cmd.exe", ownership }), false);
+});
+
+test("ownership path fields must be own properties of plain records", () => {
+  const inheritedComponent = Object.create({ installPath: "C:\\Windows" });
+  const ownership = {
+    schemaVersion: 1,
+    installRoot: null,
+    components: { app: inheritedComponent },
+    skills: {},
+    shortcuts: [],
+    rollback: null,
+    activeTask: null,
+    lastTask: null,
+  };
+  assert.equal(isOwnedPath({ target: "C:\\Windows\\System32", ownership }), false);
 });

@@ -1,6 +1,4 @@
 import assert from "node:assert/strict";
-import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
@@ -19,111 +17,197 @@ function state(installRoot = "C:\\Tools\\CodexBridge") {
   };
 }
 
-async function tempStateDir(t) {
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "codexbridge-state-test-"));
-  t.after(async () => {
-    for (const name of ["ownership.json.tmp", "ownership.json", "ownership.json.bak"]) {
-      await fs.unlink(path.join(stateDir, name)).catch((error) => {
-        if (error.code !== "ENOENT") throw error;
-      });
-    }
-    await fs.rmdir(stateDir);
-  });
-  return stateDir;
-}
-
-test("missing or corrupt ownership state falls back to an empty schema", async (t) => {
-  const stateDir = await tempStateDir(t);
-  const store = createOwnershipStore({ stateDir, fsApi: fs });
-  const empty = state(null);
-  assert.deepEqual(await store.load(), empty);
-
-  await fs.writeFile(path.join(stateDir, "ownership.json"), "{broken", "utf8");
-  assert.deepEqual(await store.load(), empty);
-});
-
-test("save flushes ownership.json.tmp and atomically renames it", async (t) => {
-  const stateDir = await tempStateDir(t);
+function createMemoryStateFs(initial = {}) {
+  let nextIdentity = 1;
+  let failFinalRename = false;
   const calls = [];
+  const entries = new Map(Object.entries(initial).map(([name, data]) => [
+    name,
+    { data, identity: nextIdentity++, name },
+  ]));
+
+  function fileHandle(node) {
+    return {
+      entry: { identity: node.identity, name: node.name },
+      async readFile() { calls.push(["read", node.name, node.identity]); return node.data; },
+      async writeFile(data) { calls.push(["write", node.name, node.identity]); node.data = data; },
+      async sync() { calls.push(["sync", node.name, node.identity]); },
+      async close() { calls.push(["close-file", node.name, node.identity]); },
+    };
+  }
+
+  function current(entry) {
+    const node = entries.get(entry.name);
+    if (!node || node.identity !== entry.identity) {
+      throw Object.assign(new Error("stale_entry_identity"), { code: "stale_entry_identity" });
+    }
+    return node;
+  }
+
   const fsApi = {
-    ...fs,
-    async open(...args) {
-      calls.push(["open", ...args]);
-      const handle = await fs.open(...args);
+    async openStateDirectoryNoFollow(stateDir) {
+      calls.push(["open-directory-no-follow", stateDir]);
       return {
-        async writeFile(...writeArgs) { calls.push(["writeFile"]); return handle.writeFile(...writeArgs); },
-        async sync() { calls.push(["sync"]); return handle.sync(); },
-        async close() { calls.push(["close"]); return handle.close(); },
+        async openFileNoFollow(name, flags) {
+          calls.push(["open-file-no-follow", name, flags]);
+          if (flags === "r") return entries.has(name) ? fileHandle(entries.get(name)) : null;
+          if (flags !== "wx" || entries.has(name)) throw Object.assign(new Error("entry_exists"), { code: "EEXIST" });
+          const node = { data: "", identity: nextIdentity++, name };
+          entries.set(name, node);
+          return fileHandle(node);
+        },
+        async unlinkEntryNoFollow(entry) {
+          calls.push(["unlink-entry-no-follow", entry.name, entry.identity]);
+          current(entry);
+          entries.delete(entry.name);
+        },
+        async renameEntryNoFollow(entry, destinationName) {
+          calls.push(["rename-entry-no-follow", entry.name, destinationName, entry.identity]);
+          if (failFinalRename && entry.name === "ownership.json.tmp" && destinationName === "ownership.json") {
+            throw Object.assign(new Error("interrupted"), { code: "EIO" });
+          }
+          const node = current(entry);
+          if (entries.has(destinationName)) throw Object.assign(new Error("destination_exists"), { code: "EEXIST" });
+          entries.delete(entry.name);
+          node.name = destinationName;
+          entries.set(destinationName, node);
+        },
+        async close() { calls.push(["close-directory"]); },
       };
     },
-    async rename(from, to) {
-      calls.push(["rename", path.basename(from), path.basename(to)]);
-      return fs.rename(from, to);
-    },
   };
-  const store = createOwnershipStore({ stateDir, fsApi });
+
+  return {
+    calls,
+    fsApi,
+    get(name) { return entries.get(name)?.data ?? null; },
+    replace(name, data) {
+      entries.set(name, { data, identity: nextIdentity++, name });
+    },
+    setFailFinalRename(value) { failFinalRename = value; },
+  };
+}
+
+test("missing or corrupt ownership state falls back to an empty schema", async () => {
+  const memory = createMemoryStateFs();
+  const store = createOwnershipStore({ stateDir: path.resolve("state"), fsApi: memory.fsApi });
+  assert.deepEqual(await store.load(), state(null));
+
+  memory.replace("ownership.json", "{broken");
+  assert.deepEqual(await store.load(), state(null));
+});
+
+test("save flushes ownership.json.tmp and atomically renames it", async () => {
+  const memory = createMemoryStateFs();
+  const calls = memory.calls;
+  const store = createOwnershipStore({ stateDir: path.resolve("state"), fsApi: memory.fsApi });
   const next = state();
 
   await store.save(next);
 
   assert.deepEqual(await store.load(), next);
   assert.ok(calls.find(([operation]) => operation === "sync"));
-  assert.ok(calls.find((call) => call[0] === "rename" && call[1] === "ownership.json.tmp" && call[2] === "ownership.json"));
+  assert.ok(calls.find((call) => call[0] === "rename-entry-no-follow"
+    && call[1] === "ownership.json.tmp" && call[2] === "ownership.json"));
 });
 
-test("a validated previous state is retained as ownership.json.bak", async (t) => {
-  const stateDir = await tempStateDir(t);
-  const store = createOwnershipStore({ stateDir, fsApi: fs });
+test("a validated previous state is retained as ownership.json.bak", async () => {
+  const memory = createMemoryStateFs();
+  const store = createOwnershipStore({ stateDir: path.resolve("state"), fsApi: memory.fsApi });
   const previous = state("C:\\Previous");
   const next = state("C:\\Next");
   await store.save(previous);
   await store.save(next);
 
-  assert.deepEqual(JSON.parse(await fs.readFile(path.join(stateDir, "ownership.json.bak"), "utf8")), previous);
+  assert.deepEqual(JSON.parse(memory.get("ownership.json.bak")), previous);
   assert.deepEqual(await store.load(), next);
 });
 
-test("load falls back to a validated backup after interrupted atomic rename", async (t) => {
-  const stateDir = await tempStateDir(t);
+test("load falls back to a validated backup after interrupted atomic rename", async () => {
+  const memory = createMemoryStateFs();
   const previous = state("C:\\Previous");
-  const setupStore = createOwnershipStore({ stateDir, fsApi: fs });
-  await setupStore.save(previous);
-
-  const interruptedFs = {
-    ...fs,
-    async rename(from, to) {
-      if (path.basename(from) === "ownership.json.tmp" && path.basename(to) === "ownership.json") {
-        throw Object.assign(new Error("interrupted"), { code: "EIO" });
-      }
-      return fs.rename(from, to);
-    },
-  };
-  const store = createOwnershipStore({ stateDir, fsApi: interruptedFs });
+  const store = createOwnershipStore({ stateDir: path.resolve("state"), fsApi: memory.fsApi });
+  await store.save(previous);
+  memory.setFailFinalRename(true);
   await assert.rejects(store.save(state("C:\\Next")), /interrupted/);
 
   assert.deepEqual(await store.load(), previous);
 });
 
 test("state files that are links or reparse points are never followed", async () => {
-  const touched = [];
   const fsApi = {
-    async lstat(target) {
-      touched.push(["lstat", target]);
-      return { isSymbolicLink: () => true, isReparsePoint: () => false };
+    async openStateDirectoryNoFollow() {
+      throw Object.assign(new Error("state_reparse_point"), { code: "state_reparse_point" });
     },
-    async readFile(target) { touched.push(["readFile", target]); throw new Error("must not read link"); },
   };
   const store = createOwnershipStore({ stateDir: path.resolve("state"), fsApi });
-  assert.deepEqual(await store.load(), state(null));
-  assert.equal(touched.some(([operation]) => operation === "readFile"), false);
+  await assert.rejects(store.load(), /reparse/i);
 });
 
 test("save rejects malformed state before writing", async () => {
   let touched = false;
   const store = createOwnershipStore({
     stateDir: path.resolve("state"),
-    fsApi: { async open() { touched = true; } },
+    fsApi: { async openStateDirectoryNoFollow() { touched = true; } },
   });
   await assert.rejects(store.save({ schemaVersion: 1 }), { code: "ownership_state_invalid" });
   assert.equal(touched, false);
+});
+
+test("fails closed when state fsApi has no stable no-follow capability", () => {
+  assert.throws(() => createOwnershipStore({
+    stateDir: path.resolve("state"),
+    fsApi: {},
+  }), /no.follow|capability/i);
+});
+
+test("reads through a stable handle when the state path is replaced after open", async () => {
+  const original = state("C:\\Original");
+  const external = state("C:\\External");
+  const memory = createMemoryStateFs({ "ownership.json": JSON.stringify(original) });
+  const originalOpen = memory.fsApi.openStateDirectoryNoFollow;
+  memory.fsApi.openStateDirectoryNoFollow = async (...args) => {
+    const directory = await originalOpen(...args);
+    const originalOpenFile = directory.openFileNoFollow;
+    directory.openFileNoFollow = async (name, flags) => {
+      const handle = await originalOpenFile(name, flags);
+      if (name === "ownership.json" && handle) memory.replace(name, JSON.stringify(external));
+      return handle;
+    };
+    return directory;
+  };
+  const store = createOwnershipStore({ stateDir: path.resolve("state"), fsApi: memory.fsApi });
+  assert.deepEqual(await store.load(), original);
+});
+
+for (const code of ["state_directory_reparse_point", "ancestor_reparse_point"]) {
+  test(`rejects unsafe state directory capability result ${code}`, async () => {
+    const store = createOwnershipStore({
+      stateDir: path.resolve("state", "nested"),
+      fsApi: {
+        async openStateDirectoryNoFollow() { throw Object.assign(new Error(code), { code }); },
+      },
+    });
+    await assert.rejects(store.load(), /reparse/i);
+  });
+}
+
+test("identity-aware rename refuses a state entry replaced after stable open", async () => {
+  const previous = state("C:\\Previous");
+  const memory = createMemoryStateFs({ "ownership.json": JSON.stringify(previous) });
+  const originalOpen = memory.fsApi.openStateDirectoryNoFollow;
+  memory.fsApi.openStateDirectoryNoFollow = async (...args) => {
+    const directory = await originalOpen(...args);
+    const originalRename = directory.renameEntryNoFollow;
+    directory.renameEntryNoFollow = async (entry, destination) => {
+      if (entry.name === "ownership.json") {
+        memory.replace(entry.name, JSON.stringify(state("C:\\External")));
+      }
+      return originalRename(entry, destination);
+    };
+    return directory;
+  };
+  const store = createOwnershipStore({ stateDir: path.resolve("state"), fsApi: memory.fsApi });
+  await assert.rejects(store.save(state("C:\\Next")), /stale_entry_identity/);
+  assert.deepEqual(JSON.parse(memory.get("ownership.json")), state("C:\\External"));
 });

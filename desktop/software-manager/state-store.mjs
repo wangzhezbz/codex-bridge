@@ -52,84 +52,107 @@ function emptyState() {
   };
 }
 
-function isLink(stat) {
-  return Boolean(stat?.isSymbolicLink?.() || stat?.isReparsePoint?.());
-}
-
-async function inspect(fsApi, target) {
-  try {
-    return await fsApi.lstat(target);
-  } catch (error) {
-    if (error?.code === "ENOENT") return null;
-    throw error;
+function requireDirectoryHandle(handle) {
+  if (!handle || typeof handle.openFileNoFollow !== "function"
+    || typeof handle.unlinkEntryNoFollow !== "function" || typeof handle.renameEntryNoFollow !== "function"
+    || typeof handle.close !== "function") {
+    throw stateError("ownership_no_follow_capability_invalid");
   }
+  return handle;
 }
 
-async function readValidated(fsApi, target) {
-  const stat = await inspect(fsApi, target);
-  if (!stat || isLink(stat) || (typeof stat.isFile === "function" && !stat.isFile())) return null;
+function requireFileHandle(handle) {
+  if (!handle || !handle.entry || typeof handle.readFile !== "function" || typeof handle.close !== "function") {
+    throw stateError("ownership_no_follow_file_invalid");
+  }
+  return handle;
+}
+
+async function openExisting(directory, name) {
+  const handle = await directory.openFileNoFollow(name, "r");
+  return handle === null ? null : requireFileHandle(handle);
+}
+
+async function readValidated(directory, name) {
+  const handle = await openExisting(directory, name);
+  if (!handle) return { entry: null, value: null };
   try {
-    const parsed = JSON.parse(await fsApi.readFile(target, "utf8"));
-    return isValidState(parsed) ? parsed : null;
+    const parsed = JSON.parse(await handle.readFile("utf8"));
+    return { entry: handle.entry, value: isValidState(parsed) ? parsed : null };
   } catch {
-    return null;
+    return { entry: handle.entry, value: null };
+  } finally {
+    await handle.close();
   }
 }
 
-async function rejectLinkAt(fsApi, target) {
-  const stat = await inspect(fsApi, target);
-  if (isLink(stat)) throw stateError("ownership_state_reparse_link");
-  return stat;
+async function openStateDirectory(fsApi, stateDir) {
+  return requireDirectoryHandle(await fsApi.openStateDirectoryNoFollow(stateDir));
 }
 
 export function createOwnershipStore({ stateDir, fsApi }) {
   if (typeof stateDir !== "string" || !path.isAbsolute(stateDir) || !fsApi) {
     throw stateError("ownership_store_invalid");
   }
-  const mainPath = path.join(stateDir, "ownership.json");
-  const tempPath = path.join(stateDir, "ownership.json.tmp");
-  const backupPath = path.join(stateDir, "ownership.json.bak");
+  if (typeof fsApi.openStateDirectoryNoFollow !== "function") {
+    throw stateError("ownership_no_follow_capability_required");
+  }
+  const mainName = "ownership.json";
+  const tempName = "ownership.json.tmp";
+  const backupName = "ownership.json.bak";
 
   return Object.freeze({
     async load() {
-      return await readValidated(fsApi, mainPath)
-        ?? await readValidated(fsApi, backupPath)
-        ?? emptyState();
+      const directory = await openStateDirectory(fsApi, stateDir);
+      try {
+        const main = await readValidated(directory, mainName);
+        if (main.value) return main.value;
+        const backup = await readValidated(directory, backupName);
+        return backup.value ?? emptyState();
+      } finally {
+        await directory.close();
+      }
     },
 
     async save(value) {
       if (!isValidState(value)) throw stateError("ownership_state_invalid");
-      const tempStat = await rejectLinkAt(fsApi, tempPath);
-      if (tempStat) {
-        if (typeof fsApi.unlink !== "function") throw stateError("ownership_store_invalid");
-        await fsApi.unlink(tempPath);
-      }
-
-      const handle = await fsApi.open(tempPath, "wx");
+      const directory = await openStateDirectory(fsApi, stateDir);
       try {
-        await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
-
-      try {
-        const mainStat = await rejectLinkAt(fsApi, mainPath);
-        const backupStat = await rejectLinkAt(fsApi, backupPath);
-        if (mainStat) {
-          const current = await readValidated(fsApi, mainPath);
-          if (current) {
-            if (backupStat) await fsApi.unlink(backupPath);
-            await fsApi.rename(mainPath, backupPath);
-          } else {
-            await fsApi.unlink(mainPath);
-          }
-        } else if (backupStat && !await readValidated(fsApi, backupPath)) {
-          await fsApi.unlink(backupPath);
+        const existingTemp = await openExisting(directory, tempName);
+        if (existingTemp) {
+          const entry = existingTemp.entry;
+          await existingTemp.close();
+          await directory.unlinkEntryNoFollow(entry);
         }
-        await fsApi.rename(tempPath, mainPath);
-      } catch (error) {
-        throw error;
+
+        const temp = requireFileHandle(await directory.openFileNoFollow(tempName, "wx"));
+        if (typeof temp.writeFile !== "function" || typeof temp.sync !== "function") {
+          await temp.close();
+          throw stateError("ownership_no_follow_file_invalid");
+        }
+        const tempEntry = temp.entry;
+        try {
+          await temp.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+          await temp.sync();
+        } finally {
+          await temp.close();
+        }
+
+        const main = await readValidated(directory, mainName);
+        const backup = await readValidated(directory, backupName);
+        if (main.entry) {
+          if (main.value) {
+            if (backup.entry) await directory.unlinkEntryNoFollow(backup.entry);
+            await directory.renameEntryNoFollow(main.entry, backupName);
+          } else {
+            await directory.unlinkEntryNoFollow(main.entry);
+          }
+        } else if (backup.entry && !backup.value) {
+          await directory.unlinkEntryNoFollow(backup.entry);
+        }
+        await directory.renameEntryNoFollow(tempEntry, mainName);
+      } finally {
+        await directory.close();
       }
     },
   });

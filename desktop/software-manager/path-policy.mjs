@@ -13,8 +13,37 @@ function failed(error) {
   return { ok: false, error };
 }
 
-function hasParentTraversal(value, pathApi = path) {
+function hasParentTraversal(value) {
   return String(value).split(/[\\/]+/u).includes("..");
+}
+
+function normalizeInstallCandidate(candidate) {
+  const slashNormalized = candidate.replaceAll("/", "\\");
+  let normalized;
+  try {
+    normalized = path.win32.normalize(slashNormalized);
+  } catch {
+    throw policyError("install_root_invalid");
+  }
+  if (normalized.startsWith("\\\\")) throw policyError("install_root_unc");
+  if (!/^[a-z]:\\/iu.test(normalized) || normalized.includes("\0")) {
+    throw policyError("install_root_invalid");
+  }
+  const rawSegments = slashNormalized.slice(3).split("\\");
+  const finalIndex = rawSegments.length - 1;
+  for (const [index, segment] of rawSegments.entries()) {
+    if (segment.length === 0 && index === finalIndex) continue;
+    if (segment.length === 0 || segment === "." || segment === ".." || /[ .]$/u.test(segment)
+      || /[<>:"|?*\u0000-\u001f]/u.test(segment)
+      || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu.test(segment)) {
+      throw policyError("install_root_noncanonical");
+    }
+  }
+  const exact = normalized.replace(/[\\/]+$/u, "");
+  if (exact.split("\\").some((segment) => segment.toLowerCase() === ".codex")) {
+    throw policyError("install_root_protected");
+  }
+  return exact;
 }
 
 function canonicalWindowsPath(value) {
@@ -32,10 +61,13 @@ export async function validateInstallRoot({ candidate, env = {}, maxRelativePath
     || !Number.isSafeInteger(maxRelativePath) || maxRelativePath < 0 || typeof access !== "function") {
     return failed("install_root_invalid");
   }
-  if (hasParentTraversal(candidate, path.win32)) return failed("install_path_traversal");
-  if (candidate.startsWith("\\\\") || !path.win32.isAbsolute(candidate)) return failed("install_root_invalid");
-
-  const normalized = path.win32.normalize(candidate).replace(/[\\/]+$/u, "");
+  if (hasParentTraversal(candidate)) return failed("install_path_traversal");
+  let normalized;
+  try {
+    normalized = normalizeInstallCandidate(candidate);
+  } catch (error) {
+    return failed(error.code ?? "install_root_invalid");
+  }
   const parsed = path.win32.parse(normalized);
   if (!normalized || normalized.toLowerCase() === parsed.root.replace(/[\\/]+$/u, "").toLowerCase()) {
     return failed("install_root_protected");
@@ -84,33 +116,34 @@ export async function resolveSkillTarget({ skillsRoot, skillId, realpath, lstat 
 function collectOwnedAnchors(ownership) {
   const anchors = [];
   if (typeof ownership?.installRoot === "string") anchors.push(ownership.installRoot);
-  for (const section of [ownership?.components, ownership?.skills, ownership?.shortcuts, ownership?.rollback]) {
-    collectSectionPaths(section, anchors);
+  if (ownership?.components && typeof ownership.components === "object" && !Array.isArray(ownership.components)) {
+    for (const record of Object.values(ownership.components)) addRecordPath(record, "installPath", anchors);
+  }
+  if (ownership?.skills && typeof ownership.skills === "object" && !Array.isArray(ownership.skills)) {
+    for (const record of Object.values(ownership.skills)) addRecordPath(record, "target", anchors);
+  }
+  if (Array.isArray(ownership?.shortcuts)) {
+    for (const record of ownership.shortcuts) addRecordPath(record, "path", anchors);
+  }
+  if (Array.isArray(ownership?.rollback)) {
+    for (const record of ownership.rollback) addRecordPath(record, "path", anchors);
+  } else {
+    addRecordPath(ownership?.rollback, "path", anchors);
   }
   return anchors;
 }
 
-function collectSectionPaths(value, anchors) {
-  if (typeof value === "string") {
-    anchors.push(value);
-    return;
-  }
-  if (!value || typeof value !== "object") return;
-  if (Array.isArray(value)) {
-    for (const entry of value) collectSectionPaths(entry, anchors);
-    return;
-  }
-  for (const key of ["path", "target", "installPath"]) {
-    if (typeof value[key] === "string") anchors.push(value[key]);
-  }
-  for (const [key, entry] of Object.entries(value)) {
-    if (!["path", "target", "installPath"].includes(key)) collectSectionPaths(entry, anchors);
+function addRecordPath(record, field, anchors) {
+  if (record && typeof record === "object" && !Array.isArray(record)
+    && Object.getPrototypeOf(record) === Object.prototype && Object.hasOwn(record, field)
+    && typeof record[field] === "string") {
+    anchors.push(record[field]);
   }
 }
 
 export function isOwnedPath({ target, ownership }) {
-  if (typeof target !== "string" || !path.win32.isAbsolute(target) || hasParentTraversal(target, path.win32)) return false;
+  if (typeof target !== "string" || !path.win32.isAbsolute(target) || hasParentTraversal(target)) return false;
   return collectOwnedAnchors(ownership)
-    .filter((anchor) => typeof anchor === "string" && path.win32.isAbsolute(anchor) && !hasParentTraversal(anchor, path.win32))
+    .filter((anchor) => typeof anchor === "string" && path.win32.isAbsolute(anchor) && !hasParentTraversal(anchor))
     .some((anchor) => isEqualOrWithinWindows(target, anchor));
 }
