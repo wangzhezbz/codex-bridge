@@ -1,4 +1,5 @@
 import { compareVersions, COMPONENT_IDS } from "../../shared/software-manager/catalog-schema.mjs";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 
 const KINDS = new Set(["install", "update", "uninstall", "rollback"]);
@@ -63,7 +64,7 @@ function decodePercent(value) {
 
 function redactString(value) {
   let text = decodePercent(String(value));
-  text = text.replace(/\b(?:https?|file):\/\/[^\s,;"']+/giu, "[REDACTED_URL]");
+  text = text.replace(/\b[a-z][a-z0-9+.-]{1,31}:\/\/[^\s,;"']+/giu, "[REDACTED_URL]");
   text = text.replace(/\b(?:Bearer|Basic)\s+[^\s,;"']+/giu, (match) => `${match.split(/\s/u, 1)[0]} [REDACTED]`);
   text = text.replace(/\b(?:sk-(?:proj|svcacct|ant)-|xai-|pplx-|gsk_|hf_|ghp_|github_pat_)[A-Za-z0-9_-]{12,}\b/giu, "[REDACTED]");
   text = text.replace(/\bAIza[A-Za-z0-9_-]{20,}\b/gu, "[REDACTED]");
@@ -205,11 +206,14 @@ function failedResult(componentId, action, error) {
 
 function publicExternalTask(value) {
   const kind = PUBLIC_EXTERNAL_KINDS.has(value?.kind) ? value.kind : "external-operation";
-  const candidateId = value?.componentId ?? value?.skillId;
-  const componentId = COMPONENT_SET.has(candidateId) || candidateId === "skills"
-    || (typeof candidateId === "string" && SKILL_ID.test(candidateId))
-    ? candidateId
-    : null;
+  let componentId = null;
+  if (kind.startsWith("git-")) componentId = "git";
+  else if (kind.startsWith("skill-")) {
+    componentId = typeof value?.skillId === "string" && SKILL_ID.test(value.skillId) ? value.skillId : null;
+  } else if (kind.startsWith("component-") || kind === "software-version-slot"
+    || kind === "version-promote" || kind === "version-rollback") {
+    componentId = COMPONENT_SET.has(value?.componentId) ? value.componentId : null;
+  }
   return deepFreeze(redactValue({
     external: true,
     critical: true,
@@ -303,6 +307,7 @@ export function createSoftwareManagerService({
   }
 
   const listeners = new Map();
+  const listenerContext = new AsyncLocalStorage();
   const uiLogs = [];
   let pendingLogWrites = 0;
   const logQueue = [];
@@ -382,7 +387,7 @@ export function createSoftwareManagerService({
   }
 
   function settleLogItem(item) {
-    for (const resolve of item.waiters.splice(0)) resolve();
+    item.resolve();
   }
 
   function degradeLogging(error) {
@@ -442,8 +447,6 @@ export function createSoftwareManagerService({
     const coalesceKey = important
       ? null
       : `${raw?.taskId ?? "service"}:${raw?.componentId ?? "service"}:${raw?.phase ?? "progress"}`;
-    let resolveWrite;
-    const written = new Promise((resolve) => { resolveWrite = resolve; });
     const capacityUsed = logQueue.length + (logWriteActive ? 1 : 0);
     if (capacityUsed >= maxPendingLogWrites) {
       const replaceable = coalesceKey === null
@@ -453,21 +456,18 @@ export function createSoftwareManagerService({
         replaceable.entry = entry;
         replaceable.important = replaceable.important || important;
         if (important) replaceable.coalesceKey = null;
-        replaceable.waiters.push(resolveWrite);
-        return written;
+        return replaceable.completion;
       }
-      if (!important) {
-        resolveWrite();
-        return written;
-      }
+      if (!important) return Promise.resolve();
       degradeLogging(serviceError("software_manager_log_queue_saturated"));
-      resolveWrite();
-      return written;
+      return Promise.resolve();
     }
-    logQueue.push({ entry, important, coalesceKey, waiters: [resolveWrite] });
+    let resolveWrite;
+    const completion = new Promise((resolve) => { resolveWrite = resolve; });
+    logQueue.push({ entry, important, coalesceKey, completion, resolve: resolveWrite });
     updatePendingLogWrites();
     startLogWorker();
-    return pendingLogWrites >= maxPendingLogWrites ? written : Promise.resolve();
+    return pendingLogWrites >= maxPendingLogWrites ? completion : Promise.resolve();
   }
 
   async function drainLogs() {
@@ -491,8 +491,12 @@ export function createSoftwareManagerService({
     record.running = true;
     void Promise.resolve().then(async () => {
       while (record.active && record.queue.length > 0) {
-        const { event } = record.queue.shift();
-        try { await record.listener(event); } catch { /* listener failures stay isolated */ }
+        const { event, causes } = record.queue.shift();
+        const lease = { active: true };
+        const context = { token, causes: new Set([...causes, token]), lease };
+        try { await listenerContext.run(context, () => record.listener(event)); }
+        catch { /* listener failures stay isolated */ }
+        finally { lease.active = false; }
       }
     }).finally(() => {
       record.running = false;
@@ -500,13 +504,14 @@ export function createSoftwareManagerService({
     });
   }
 
-  function enqueueListenerEvent(token, record, event) {
+  function enqueueListenerEvent(token, record, event, causes) {
     if (!record.active) return;
     const key = listenerEventKey(event);
     if (key !== null) {
       const existing = record.queue.find((item) => item.key === key);
       if (existing) {
         existing.event = event;
+        existing.causes = new Set([...existing.causes, ...causes]);
         return;
       }
     }
@@ -520,14 +525,18 @@ export function createSoftwareManagerService({
         return;
       }
     }
-    record.queue.push({ event, key });
+    record.queue.push({ event, key, causes: new Set(causes) });
     startListenerWorker(token, record);
   }
 
   function emit(rawEvent) {
     const event = deepFreeze(redactValue(rawEvent));
+    const source = listenerContext.getStore();
+    const sourceActive = Boolean(source?.lease?.active && listeners.get(source.token)?.active);
+    const causes = sourceActive ? source.causes : new Set();
     for (const [token, record] of listeners) {
-      enqueueListenerEvent(token, record, event);
+      if (causes.has(token)) continue;
+      enqueueListenerEvent(token, record, event, causes);
     }
   }
 
@@ -661,15 +670,31 @@ export function createSoftwareManagerService({
   async function recoverPending() {
     if (currentTask || startReserved) throw serviceError("software_manager_task_running");
     if (!recoveryPromise) {
-      recoveryPromise = withEntryGate(() => runRecovery()).finally(() => { recoveryPromise = null; });
+      recoveryPromise = withEntryGate(() => refreshRecoveryStateInGate()).finally(() => { recoveryPromise = null; });
     }
     return recoveryPromise;
   }
 
-  async function ensureRecoveryInGate({ force = false } = {}) {
-    const outcome = force || !recoveryComplete || recoveryFailure || externalTask
-      ? await runRecovery()
-      : { recovered: true, pending: false };
+  async function refreshRecoveryStateInGate() {
+    let state;
+    try { state = await loadOwnership(); }
+    catch (error) {
+      externalTask = null;
+      recoveryFailure = serviceError("software_manager_recovery_failed", error);
+      recoveryComplete = true;
+      return { recovered: false, pending: true };
+    }
+    if (state?.activeTask) {
+      externalTask = publicExternalTask(state.activeTask);
+      recoveryFailure = serviceError("software_manager_pending_recovery");
+      return runRecovery();
+    }
+    if (!recoveryComplete || recoveryFailure || externalTask) return runRecovery();
+    return { recovered: true, pending: false };
+  }
+
+  async function ensureRecoveryInGate() {
+    const outcome = await refreshRecoveryStateInGate();
     if (outcome.pending || recoveryFailure || externalTask) {
       throw serviceError("software_manager_pending_recovery", recoveryFailure ?? undefined);
     }
@@ -878,7 +903,7 @@ export function createSoftwareManagerService({
     startReserved = true;
     return withEntryGate(async () => {
       try {
-        await ensureRecoveryInGate({ force: true });
+        await ensureRecoveryInGate();
         const service = await currentCatalog();
         if (!service) throw serviceError("software_manager_catalog_unavailable");
         const state = await loadOwnership();
@@ -889,6 +914,7 @@ export function createSoftwareManagerService({
         }
         const request = validateRequest(rawRequest, service, state);
         const adapters = await resolveAdapters(service, request.installRootToken);
+        await ensureRecoveryInGate();
         const taskId = issueTaskId();
         const startedAt = now();
         const task = {
@@ -918,6 +944,10 @@ export function createSoftwareManagerService({
           for (const id of request.componentIds) components.push(await runCriticalComponent(adapters, id, request.kind));
           skills = await runCriticalSkills(adapters, request.skillIds, request.kind);
         }
+        task.phase = "finishing";
+        task.cancellable = false;
+        task.critical = false;
+        task.activePhaseNonce = null;
         const result = deepFreeze(redactValue({
           taskId,
           kind: request.kind,
@@ -1025,8 +1055,11 @@ export function createSoftwareManagerService({
     if (platform !== "win32") return buildSnapshot({ inspect: false });
     if (currentTask || startReserved) return buildSnapshot({ inspect: false });
     return withEntryGate(async () => {
-      if (!recoveryComplete || recoveryFailure || externalTask) await runRecovery();
-      return buildSnapshot();
+      const before = await refreshRecoveryStateInGate();
+      if (before.pending) return buildSnapshot({ inspect: false });
+      await buildSnapshot();
+      await refreshRecoveryStateInGate();
+      return buildSnapshot({ inspect: false });
     });
   }
 
@@ -1044,7 +1077,9 @@ export function createSoftwareManagerService({
         catalogService = null;
         catalogFailure = serviceError("software_manager_catalog_unavailable", error);
       }
+      await ensureRecoveryInGate();
       const snapshot = await buildSnapshot();
+      await ensureRecoveryInGate();
       emit({ type: "snapshot", snapshot });
       return snapshot;
     });
@@ -1058,8 +1093,10 @@ export function createSoftwareManagerService({
       const chosen = await installRootResolver.choose(candidate);
       const token = typeof chosen === "string" ? chosen : chosen?.token;
       if (typeof token !== "string" || !OPAQUE_TOKEN.test(token)) throw serviceError("software_manager_install_root_invalid");
+      await ensureRecoveryInGate();
       selectedInstallRootToken = token;
       const snapshot = await buildSnapshot();
+      await ensureRecoveryInGate();
       emit({ type: "snapshot", snapshot });
       return Object.freeze({ installRootToken: token });
     });
@@ -1070,7 +1107,8 @@ export function createSoftwareManagerService({
       ? { cancelled: false, reason: "critical" }
       : { cancelled: false, reason: "idle" };
     if (currentTask.acceptedCancel) return { cancelled: false, reason: "already_cancelled" };
-    if (!currentTask.cancellable || currentTask.critical) return { cancelled: false, reason: "critical" };
+    if (currentTask.critical) return { cancelled: false, reason: "critical" };
+    if (!currentTask.cancellable) return { cancelled: false, reason: "not_cancellable" };
     currentTask.acceptedCancel = true;
     currentTask.activePhaseNonce = null;
     currentTask.cancellable = false;
@@ -1084,11 +1122,13 @@ export function createSoftwareManagerService({
   }
 
   function prepareForQuit() {
+    // The main process must await an asynchronous service entry first so this
+    // synchronous decision observes any newly persisted external claim.
     if (externalTask) return { allowQuit: false, reason: "critical" };
     if (!currentTask) return { allowQuit: true };
     if (currentTask.acceptedCancel) return { allowQuit: false, reason: "cancelling", canCancel: false };
     if (currentTask.critical) return { allowQuit: false, reason: "critical" };
-    return { allowQuit: false, reason: "running", canCancel: true };
+    return { allowQuit: false, reason: "running", canCancel: Boolean(currentTask.cancellable) };
   }
 
   function subscribe(listener) {

@@ -636,6 +636,29 @@ test("quit decisions distinguish idle, cancellable running, and critical", async
   assert.deepEqual(service.prepareForQuit(), { allowQuit: true });
 });
 
+test("finishing log drain is non-critical and non-cancellable across cancel, quit, and snapshot", async () => {
+  const entered = deferred();
+  const release = deferred();
+  const { service } = fixtureService({
+    logWriteTimeoutMs: 5_000,
+    logSink: {
+      async write(entry) {
+        if (entry.phase === "finished") { entered.resolve(); await release.promise; }
+      },
+    },
+  });
+  const running = service.startTask({ kind: "install", componentIds: ["chatgpt"], skillIds: [] });
+  await entered.promise;
+  assert.deepEqual(service.cancelTask(), { cancelled: false, reason: "not_cancellable" });
+  assert.deepEqual(service.prepareForQuit(), { allowQuit: false, reason: "running", canCancel: false });
+  const task = (await service.getSnapshot()).task;
+  assert.deepEqual({ phase: task.phase, critical: task.critical, cancellable: task.cancellable }, {
+    phase: "finishing", critical: false, cancellable: false,
+  });
+  release.resolve();
+  assert.equal((await running).status, "succeeded");
+});
+
 test("critical state is reset even when an adapter throws", async () => {
   const { service } = fixtureService({ chatgpt: { commit: async () => { throw new Error("boom"); } } });
   const result = await service.startTask({ kind: "install", componentIds: ["chatgpt"], skillIds: [] });
@@ -697,6 +720,22 @@ test("external skill claims expose only the public kind and normalized component
   });
   assert.equal(JSON.stringify(task).includes("secret"), false);
   assert.equal(JSON.stringify(task).includes("N".repeat(32)), false);
+});
+
+test("external task component identity is derived from kind-specific fixed fields", async () => {
+  const state = {
+    activeTask: {
+      kind: "git-uninstall", taskId: "other", componentId: "chatgpt", skillId: "documents",
+      targetDir: "C:\\secret\\git",
+    },
+    components: {}, skills: {}, rollback: null,
+  };
+  const { service } = fixtureService({ state });
+  const task = (await service.getSnapshot()).task;
+  assert.equal(task.kind, "git-uninstall");
+  assert.equal(task.componentId, "git");
+  assert.equal(JSON.stringify(task).includes("chatgpt"), false);
+  assert.equal(JSON.stringify(task).includes("documents"), false);
 });
 
 test("snapshot retries stale recovery through the entry gate after an external claim clears", async () => {
@@ -761,6 +800,100 @@ test("entry gate preserves refresh-before-start ordering in the same turn", asyn
   const starting = service.startTask({ kind: "install", componentIds: ["chatgpt"], skillIds: [] });
   await Promise.all([refreshing, starting]);
   assert.deepEqual(order.slice(0, 2), ["refresh", "prepare"]);
+});
+
+test("every asynchronous entry gate fresh-loads a durable claim created after a healthy recovery", async () => {
+  for (const entry of ["snapshot", "refresh", "choose", "start", "recover"]) {
+    const state = { activeTask: null, components: {}, skills: {}, rollback: null };
+    let recoveries = 0;
+    const { service } = fixtureService({ state, recoverTransactions: async () => { recoveries += 1; } });
+    assert.equal((await service.getSnapshot()).pendingRecovery, false);
+    state.activeTask = {
+      kind: "component-prepare", taskId: `external-${entry}`, componentId: "chatgpt", version: "2.0.0",
+    };
+    if (entry === "snapshot") {
+      const snapshot = await service.getSnapshot();
+      assert.equal(snapshot.pendingRecovery, true);
+      assert.equal(snapshot.task.external, true);
+      assert.deepEqual(service.prepareForQuit(), { allowQuit: false, reason: "critical" });
+    } else if (entry === "refresh") {
+      await assert.rejects(service.refresh(), /software_manager_pending_recovery/);
+    } else if (entry === "choose") {
+      await assert.rejects(service.chooseInstallRoot("C:\\Chosen"), /software_manager_pending_recovery/);
+    } else if (entry === "start") {
+      await assert.rejects(
+        service.startTask({ kind: "install", componentIds: ["chatgpt"], skillIds: [] }),
+        /software_manager_pending_recovery/,
+      );
+    } else {
+      assert.equal((await service.recoverPending()).pending, true);
+    }
+    assert.equal(recoveries, 2, entry);
+  }
+});
+
+test("healthy fresh ownership checks stay cheap and concurrent claim recovery runs once", async () => {
+  const state = { activeTask: null, components: {}, skills: {}, rollback: null };
+  let recoveries = 0;
+  const { service } = fixtureService({
+    state,
+    recoverTransactions: async () => {
+      recoveries += 1;
+      if (recoveries === 2) state.activeTask = null;
+    },
+  });
+  await service.getSnapshot();
+  await service.refresh();
+  await service.chooseInstallRoot("C:\\Chosen");
+  assert.equal((await service.getSnapshot()).pendingRecovery, false);
+  assert.equal(recoveries, 1);
+
+  state.activeTask = { kind: "component-prepare", taskId: "external-race", componentId: "chatgpt", version: "2.0.0" };
+  const [refreshed, chosen] = await Promise.all([service.refresh(), service.chooseInstallRoot("C:\\Other")]);
+  assert.equal(refreshed.pendingRecovery, false);
+  assert.match(chosen.installRootToken, /^root_token_/u);
+  assert.equal(recoveries, 2);
+});
+
+test("fresh ownership recheck catches claims created during refresh, root choice, and start preflight", async () => {
+  for (const entry of ["refresh", "choose", "start"]) {
+    const state = { activeTask: null, components: {}, skills: {}, rollback: null };
+    let prepareCalls = 0;
+    let armStartClaim = false;
+    const serviceCatalog = catalogFixture();
+    const claim = () => {
+      state.activeTask = { kind: "component-prepare", taskId: `race-${entry}`, componentId: "chatgpt", version: "2.0.0" };
+    };
+    const options = { state, recoverTransactions: async () => {} };
+    if (entry === "refresh") {
+      options.catalogProvider = { getCurrent: () => serviceCatalog, refresh: async () => { claim(); return serviceCatalog; } };
+    } else if (entry === "choose") {
+      options.installRootResolver = {
+        choose: async () => { claim(); return { token: "root_token_00000002" }; },
+        resolve: async () => ({ kind: "root" }),
+        getCurrentToken: () => "root_token_00000001",
+      };
+    } else {
+      options.adapterFactory = async () => {
+        if (armStartClaim) claim();
+        return {
+          chatgpt: adapterFixture("chatgpt", { prepare: async () => { prepareCalls += 1; return operationResult("chatgpt", "prepare"); } }),
+          v2rayn: adapterFixture("v2rayn"), git: adapterFixture("git"), skills: skillsAdapterFixture(),
+        };
+      };
+    }
+    const { service } = fixtureService(options);
+    await service.getSnapshot();
+    if (entry === "start") armStartClaim = true;
+    if (entry === "refresh") await assert.rejects(service.refresh(), /software_manager_pending_recovery/);
+    else if (entry === "choose") await assert.rejects(service.chooseInstallRoot("C:\\Race"), /software_manager_pending_recovery/);
+    else await assert.rejects(
+      service.startTask({ kind: "install", componentIds: ["chatgpt"], skillIds: [] }),
+      /software_manager_pending_recovery/,
+    );
+    assert.equal(prepareCalls, 0);
+    assert.equal((await service.getSnapshot()).task.external, true);
+  }
 });
 
 test("recovery cannot re-enter while a service task owns the unified entry gate", async () => {
@@ -971,6 +1104,45 @@ test("a hung log sink times out, degrades once, and cannot hold task completion"
   assert.equal(snapshot.logs.filter(({ message }) => message === "software_manager_log_sink_degraded").length, 1);
 });
 
+test("coalesced progress shares one completion promise and keeps only the latest of 100k updates", async () => {
+  const sinkEntered = deferred();
+  const sinkRelease = deferred();
+  const burstReady = deferred();
+  const disk = [];
+  let sharedPromise = null;
+  let allShared = true;
+  const { service } = fixtureService({
+    maxPendingLogWrites: 2,
+    logWriteTimeoutMs: 5_000,
+    logSink: {
+      async write(entry) {
+        disk.push(entry);
+        if (disk.length === 1) { sinkEntered.resolve(); await sinkRelease.promise; }
+      },
+    },
+    chatgpt: {
+      prepare: async ({ onProgress }) => {
+        await sinkEntered.promise;
+        for (let index = 0; index < 100_000; index += 1) {
+          const completion = onProgress({ phase: "download", percent: index % 100, message: `burst-${index}` });
+          if (index === 0) sharedPromise = completion;
+          else if (completion !== sharedPromise) allShared = false;
+        }
+        burstReady.resolve();
+        return operationResult("chatgpt", "prepare", "failed");
+      },
+    },
+  });
+  const running = service.startTask({ kind: "install", componentIds: ["chatgpt"], skillIds: [] });
+  await burstReady.promise;
+  assert.equal(allShared, true);
+  assert.equal((await service.getSnapshot()).logging.pendingWrites, 2);
+  sinkRelease.resolve();
+  await running;
+  assert.equal(disk.some(({ message }) => message === "burst-99999"), true);
+  assert.equal(disk.some(({ message }) => message === "burst-0"), false);
+});
+
 test("non-awaited progress uses a truly bounded log queue and cancellation remains bounded", async () => {
   const entered = deferred();
   const release = deferred();
@@ -1070,6 +1242,13 @@ test("redaction preserves normal text while bounding deep hostile structures wit
             "https://private.example/path?q=secret",
             "file:///C:/private/token.txt",
             "\\\\server\\share\\private.txt",
+            "vless://secret@example.com:443/path",
+            "vmess://opaque-secret",
+            "trojan://secret@example.com",
+            "ss://opaque-secret",
+            "ssr://opaque-secret",
+            "ws://private.example/socket",
+            "wss://private.example/socket",
           ].join(" "),
           hostile,
           api_key: "'QUOTED'",
@@ -1098,6 +1277,13 @@ test("redaction preserves normal text while bounding deep hostile structures wit
     "private.example",
     "file:///C:/private",
     "server\\share\\private",
+    "vless://",
+    "vmess://",
+    "trojan://",
+    "ss://",
+    "ssr://",
+    "ws://",
+    "wss://",
   ]) assert.equal(text.includes(secret), false);
   assert.equal(text.length < 200_000, true);
   assert.equal(Object.getPrototypeOf(events[0]), null);
@@ -1167,6 +1353,77 @@ test("slow listeners have bounded coalescing queues without losing the latest pr
   assert.equal(observed.length <= 12, true);
   assert.equal(observed.some(({ type, message }) => type === "progress" && message === "listener-999"), true);
   assert.equal(observed.some(({ type }) => type === "finished"), true);
+});
+
+test("a listener-triggered operation does not feed back to its causal listeners but still reaches peers", async () => {
+  const nestedDone = deferred();
+  const { service } = fixtureService();
+  let firstCount = 0;
+  let secondCount = 0;
+  let triggered = false;
+  service.subscribe(async (event) => {
+    if (event.type !== "snapshot") return;
+    firstCount += 1;
+    if (!triggered) {
+      triggered = true;
+      await service.refresh();
+      nestedDone.resolve();
+    }
+  });
+  service.subscribe((event) => { if (event.type === "snapshot") secondCount += 1; });
+  await service.refresh();
+  await nestedDone.promise;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(firstCount, 1);
+  assert.equal(secondCount, 2);
+});
+
+test("causal ancestry stops two listeners from recursively refreshing each other", async () => {
+  const settled = deferred();
+  const { service } = fixtureService();
+  const counts = [0, 0];
+  let triggered = 0;
+  const listener = (index) => async (event) => {
+    if (event.type !== "snapshot") return;
+    counts[index] += 1;
+    if (triggered < 12) {
+      triggered += 1;
+      await service.refresh();
+    }
+    if (counts[0] >= 2 && counts[1] >= 2) settled.resolve();
+  };
+  service.subscribe(listener(0));
+  service.subscribe(listener(1));
+  await service.refresh();
+  await Promise.race([
+    settled.promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("listener causal loop timeout")), 500)),
+  ]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(counts, [2, 2]);
+  assert.equal(triggered, 4);
+});
+
+test("a detached listener callback outlives its causal lease and receives later feedback normally", async () => {
+  const receivedTwice = deferred();
+  const { service } = fixtureService();
+  let received = 0;
+  let scheduled = false;
+  service.subscribe((event) => {
+    if (event.type !== "snapshot") return;
+    received += 1;
+    if (received === 2) receivedTwice.resolve();
+    if (!scheduled) {
+      scheduled = true;
+      setImmediate(() => { void service.refresh(); });
+    }
+  });
+  await service.refresh();
+  await Promise.race([
+    receivedTwice.promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("detached listener feedback timeout")), 500)),
+  ]);
+  assert.equal(received, 2);
 });
 
 test("repeated subscription of the same function has independent unsubscribe identity", async () => {
