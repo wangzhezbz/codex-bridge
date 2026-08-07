@@ -113,7 +113,11 @@ export function isShortcutBoundToCurrent(value, ownership, componentId = value?.
   const currentPath = componentId === "chatgpt"
     ? path.win32.join(ownership.installRoot, "c")
     : path.win32.join(ownership.installRoot, "V2RayN", "current");
-  return component.installPath === currentPath && component.entrypointPath === value?.targetPath;
+  return component.managed === true
+    && component.installPath === currentPath
+    && component.entrypointPath === value?.targetPath
+    && within(component.entrypointPath, currentPath)
+    && component.entrypointPath.toLowerCase() !== currentPath.toLowerCase();
 }
 
 function validShortcut(task, ownership) {

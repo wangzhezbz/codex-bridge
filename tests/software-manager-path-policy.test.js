@@ -223,6 +223,7 @@ test("ownership rejects sibling-prefix escapes and recognizes explicit owned pat
     components: {
       git: { installPath: "C:\\Tools\\CodexBridge\\components\\git" },
       chatgpt: {
+        managed: true,
         installPath: "C:\\Tools\\CodexBridge\\c",
         entrypointPath: "C:\\Tools\\CodexBridge\\c\\ChatGPT.exe",
       },
@@ -319,6 +320,7 @@ test("ownership metadata strings never become authorized roots", () => {
     components: {
       app: { installPath: "C:\\Owned\\app", version: "C:\\Windows" },
       chatgpt: {
+        managed: true,
         installPath: "C:\\Owned\\c", entrypointPath: "C:\\Owned\\c\\ChatGPT.exe",
       },
     },
@@ -425,6 +427,25 @@ test("shortcut ownership is one exact component-bound record with an owned curre
     assert.equal(isValidOwnershipState({ ...ownership, shortcuts: [invalid] }), false);
   }
   assert.equal(isValidOwnershipState({ ...ownership, components: {} }), false);
+  assert.equal(isValidOwnershipState({
+    ...ownership,
+    components: {
+      chatgpt: { ...ownership.components.chatgpt, managed: false },
+    },
+  }), false);
+  const { managed: _managed, ...unmanagedComponent } = ownership.components.chatgpt;
+  assert.equal(isValidOwnershipState({
+    ...ownership,
+    components: { chatgpt: unmanagedComponent },
+  }), false);
+  const externalTarget = "C:\\External\\ChatGPT.exe";
+  assert.equal(isValidOwnershipState({
+    ...ownership,
+    components: {
+      chatgpt: { ...ownership.components.chatgpt, entrypointPath: externalTarget },
+    },
+    shortcuts: [{ ...shortcut, targetPath: externalTarget }],
+  }), false);
   assert.equal(isValidOwnershipState({
     ...ownership,
     components: {

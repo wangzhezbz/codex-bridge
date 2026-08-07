@@ -9,6 +9,7 @@ import {
   revalidateFixedDirectoryCapability,
   revalidateInstallRootCapability,
 } from "./path-policy.mjs";
+import { isShortcutBoundToCurrent, isValidShortcutRecord } from "./ownership-task-schema.mjs";
 
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
@@ -516,6 +517,11 @@ export function createComponentAdapters({
         desktopPath,
         targetPath: task.targetPath,
       }, "shortcut_recovery_record_invalid");
+      if (!isValidShortcutRecord(shortcut, { componentId: task.componentId, desktopPath, targetPath: task.targetPath })
+        || !isShortcutBoundToCurrent(shortcut, state, task.componentId)) {
+        throw adapterError("shortcut_recovery_record_invalid");
+      }
+      await revalidateFixedDirectoryCapability(desktopCapability);
       let recovered;
       try {
         recovered = await inspectRecordedShortcut(shortcut);
@@ -824,8 +830,18 @@ export function createComponentAdapters({
       if (!record) return result(componentId, "uninstall", "skipped", { message: "component_not_installed" });
       before = record.version;
       if (typeof record.entrypointPath !== "string") throw adapterError("component_runtime_metadata_missing");
+      const shortcuts = state.shortcuts.map((shortcut) => {
+        if (!isValidShortcutRecord(shortcut, {
+          desktopPath, includeComponentId: true,
+        }) || !isShortcutBoundToCurrent(shortcut, state)) {
+          throw adapterError("shortcut_uninstall_record_invalid");
+        }
+        return shortcut;
+      }).filter((shortcut) => shortcut.componentId === componentId);
+      if (shortcuts.length > 0) await revalidateFixedDirectoryCapability(desktopCapability);
       await windowsHost.stopOwnedProcesses([record.entrypointPath]);
-      for (const shortcut of state.shortcuts.filter((item) => item?.componentId === componentId)) {
+      for (const shortcut of shortcuts) {
+        await revalidateFixedDirectoryCapability(desktopCapability);
         await windowsHost.removeRecordedShortcut(shortcut);
       }
       const taskId = TASK_ID.test(context.taskId ?? "") ? context.taskId : `uninstall-${componentId}`;

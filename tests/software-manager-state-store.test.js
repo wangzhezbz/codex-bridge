@@ -431,6 +431,7 @@ test("retains JSON metadata while only fixed path fields define ownership record
     components: {
       app: { installPath: "C:\\Owned\\app", version: "C:\\Windows" },
       chatgpt: {
+        managed: true,
         installPath: "C:\\Tools\\CodexBridge\\c",
         entrypointPath: "C:\\Tools\\CodexBridge\\c\\ChatGPT.exe",
       },

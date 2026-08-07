@@ -538,6 +538,20 @@ test("recorded shortcut inspection fails closed on a wrong target, marker, path,
   assert.equal(fixture.calls.fileInspects.length, 2);
 });
 
+test("recorded shortcuts reject a basename belonging to the other component before file access", async () => {
+  const desktopPath = "C:\\Users\\me\\Desktop";
+  const fixture = fakeHost();
+  const chatgpt = ownedShortcut(`${desktopPath}\\V2RayN.lnk`, desktopPath, "D:\\CBApps\\c\\ChatGPT.exe");
+  const v2rayn = {
+    ...ownedShortcut(`${desktopPath}\\ChatGPT.lnk`, desktopPath, "D:\\CBApps\\V2RayN\\current\\v2rayN.exe"),
+    name: "V2RayN",
+  };
+
+  await assert.rejects(fixture.host.inspectRecordedShortcut(chatgpt), /shortcut_path_rejected/u);
+  await assert.rejects(fixture.host.removeRecordedShortcut(v2rayn), /shortcut_path_rejected/u);
+  assert.deepEqual(fixture.calls.fileInspects, []);
+});
+
 test("removes only the exact recorded desktop shortcut when its current target still matches", async () => {
   const desktopPath = "C:\\Users\\me\\Desktop";
   const recordedPath = `${desktopPath}\\ChatGPT（1）.lnk`;

@@ -409,7 +409,10 @@ function validateRecordedShortcut(record) {
   if (pathKey(path.win32.dirname(shortcutPath)) !== pathKey(desktopPath)) {
     throw hostError("shortcut_path_not_desktop_child");
   }
-  if (!/^(?:ChatGPT|V2RayN)(?:（[1-9]\d*）)?\.lnk$/u.test(path.win32.basename(shortcutPath))) {
+  const shortcutNamePattern = record.name === "ChatGPT"
+    ? /^ChatGPT(?:\uFF08[1-9]\d*\uFF09)?\.lnk$/u
+    : /^V2RayN(?:\uFF08[1-9]\d*\uFF09)?\.lnk$/u;
+  if (!shortcutNamePattern.test(path.win32.basename(shortcutPath))) {
     throw hostError("shortcut_path_rejected");
   }
   return {

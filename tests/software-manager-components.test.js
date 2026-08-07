@@ -87,7 +87,8 @@ function fixture({
   stateSaveFailureAt = null, persistentFailureAt = null, skillHashes = null, gitInstallFailure = null,
   invalidAuthenticodePath = null, initialSkillEvidence = null,
   catalogService = TRUSTED_CATALOG, installRootCapability = INSTALL_CAPABILITY,
-  skillsRootCapability = SKILLS_CAPABILITY, onDownload = null, onExtract = null,
+  skillsRootCapability = SKILLS_CAPABILITY, desktopCapability = DESKTOP_CAPABILITY,
+  onDownload = null, onExtract = null,
   onReplaceSkill = null, onGitInstall = null, onVerifyComponent = null,
   onAuthenticode = null, onGitPin = null, gitExecutionTimeoutMs = undefined,
   onGitUninstall = null,
@@ -97,7 +98,7 @@ function fixture({
   let saveCount = 0;
   const calls = {
     downloads: [], extracts: [], promotions: [], rollbacks: [], stopped: [], launched: [], shortcuts: [],
-    removedShortcuts: [], verified: [], gitInstalls: [], gitUninstalls: [], replacedSkills: [], deletedSkills: [],
+    removedShortcuts: [], inspectedShortcuts: [], verified: [], gitInstalls: [], gitUninstalls: [], replacedSkills: [], deletedSkills: [],
     deletedComponents: [], hashes: [], persistentPrepared: [], persistentVerified: [], gitPins: [], gitRevalidates: [],
     gitReleases: [], retained: [], discarded: [],
     gitMutableReleases: [],
@@ -178,6 +179,7 @@ function fixture({
       return structuredClone(record);
     },
     async inspectRecordedShortcut(record) {
+      calls.inspectedShortcuts.push(structuredClone(record));
       const shortcut = shortcutReservations.get(record.path);
       return shortcut ? { kind: "shortcut", shortcut: structuredClone(shortcut) } : { kind: "absent" };
     },
@@ -368,7 +370,7 @@ function fixture({
     catalogService,
     installRootCapability,
     skillsRootCapability,
-    desktopCapability: DESKTOP_CAPABILITY,
+    desktopCapability,
     downloader, archiveService, versionSlots, ownershipStore, windowsHost, componentFiles, skillFiles,
     gitIdentityCapabilities,
     ...(gitExecutionTimeoutMs === undefined ? {} : { gitExecutionTimeoutMs }),
@@ -810,6 +812,101 @@ test("a completed native component uninstall is recovered after its final state 
   assert.equal(getState().activeTask, null);
   assert.equal(getState().components.chatgpt, undefined);
   assert.equal(calls.deletedComponents.length, 2);
+});
+
+test("component uninstall rejects foreign or legacy shortcut records before stopping or deleting", async (t) => {
+  const targetPath = "D:\\CBApps\\c\\ChatGPT.exe";
+  const base = emptyState(INSTALL_ROOT);
+  base.components.chatgpt = {
+    managed: true, installPath: "D:\\CBApps\\c", version: "2.0.0",
+    entrypointPath: targetPath, requiredFiles: [targetPath], health: "healthy",
+  };
+  const owned = {
+    componentId: "chatgpt", name: "ChatGPT", path: `${DESKTOP}\\ChatGPT.lnk`,
+    desktopPath: DESKTOP, targetPath, creationId: "a".repeat(32),
+  };
+  const cases = [
+    ["foreign desktop", { ...owned, path: "C:\\Other\\Desktop\\ChatGPT.lnk", desktopPath: "C:\\Other\\Desktop" }],
+    ["legacy missing marker", { componentId: "chatgpt", name: "ChatGPT", path: owned.path, desktopPath: DESKTOP, targetPath }],
+  ];
+
+  for (const [name, shortcut] of cases) {
+    await t.test(name, async () => {
+      const state = structuredClone(base);
+      state.shortcuts = [shortcut];
+      const { adapters, calls, getState } = fixture({ state });
+      const removed = await adapters.chatgpt.uninstall({ taskId: `reject-${name.replaceAll(" ", "-")}` });
+      assert.equal(removed.status, "failed");
+      assert.deepEqual(calls.stopped, []);
+      assert.deepEqual(calls.removedShortcuts, []);
+      assert.deepEqual(calls.deletedComponents, []);
+      assert.equal(getState().components.chatgpt.entrypointPath, targetPath);
+    });
+  }
+});
+
+test("component uninstall validates but preserves another component's owned shortcut", async () => {
+  const chatTarget = "D:\\CBApps\\c\\ChatGPT.exe";
+  const v2Target = "D:\\CBApps\\V2RayN\\current\\v2rayN.exe";
+  const state = emptyState(INSTALL_ROOT);
+  state.components = {
+    chatgpt: {
+      managed: true, installPath: "D:\\CBApps\\c", version: "2.0.0",
+      entrypointPath: chatTarget, requiredFiles: [chatTarget], health: "healthy",
+    },
+    v2rayn: {
+      managed: true, installPath: "D:\\CBApps\\V2RayN\\current", version: "7.0.4",
+      entrypointPath: v2Target, requiredFiles: [v2Target], health: "healthy",
+    },
+  };
+  state.shortcuts = [
+    {
+      componentId: "chatgpt", name: "ChatGPT", path: `${DESKTOP}\\ChatGPT.lnk`,
+      desktopPath: DESKTOP, targetPath: chatTarget, creationId: "a".repeat(32),
+    },
+    {
+      componentId: "v2rayn", name: "V2RayN", path: `${DESKTOP}\\V2RayN.lnk`,
+      desktopPath: DESKTOP, targetPath: v2Target, creationId: "b".repeat(32),
+    },
+  ];
+  const { adapters, calls, getState } = fixture({ state });
+
+  const removed = await adapters.chatgpt.uninstall({ taskId: "remove-only-chatgpt" });
+
+  assert.equal(removed.status, "succeeded");
+  assert.deepEqual(calls.removedShortcuts.map((shortcut) => shortcut.componentId), ["chatgpt"]);
+  assert.deepEqual(getState().shortcuts.map((shortcut) => shortcut.componentId), ["v2rayn"]);
+  assert.equal(getState().components.v2rayn.entrypointPath, v2Target);
+});
+
+test("shortcut recovery revalidates the trusted desktop capability immediately before inspection", async () => {
+  let identityRead = 0;
+  const changingDesktopCapability = await authorizeDesktopPath({
+    getDesktopPath: () => DESKTOP,
+    realpath: async (value) => value,
+    lstat: async () => ({ ...directoryStat, ino: ++identityRead <= 2 ? 1 : 2 }),
+  });
+  const targetPath = "D:\\CBApps\\c\\ChatGPT.exe";
+  const state = emptyState(INSTALL_ROOT);
+  state.components.chatgpt = {
+    managed: true, installPath: "D:\\CBApps\\c", version: "2.0.0",
+    entrypointPath: targetPath, requiredFiles: [targetPath], health: "healthy",
+  };
+  state.activeTask = {
+    kind: "component-shortcut", phase: "reserved", taskId: "desktop-identity-race", componentId: "chatgpt",
+    desktopPath: DESKTOP, targetPath,
+    shortcut: {
+      name: "ChatGPT", path: `${DESKTOP}\\ChatGPT.lnk`, desktopPath: DESKTOP,
+      targetPath, creationId: "a".repeat(32),
+    },
+  };
+  const { adapters, calls, getState } = fixture({ state, desktopCapability: changingDesktopCapability });
+
+  const inspected = await adapters.chatgpt.inspectInstalled({});
+
+  assert.equal(inspected.status, "failed");
+  assert.deepEqual(calls.inspectedShortcuts, []);
+  assert.equal(getState().activeTask.taskId, "desktop-identity-race");
 });
 
 test("external Git inspect works with null ownership and ambiguous discovery fails closed", async () => {
