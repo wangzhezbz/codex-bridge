@@ -5,6 +5,7 @@ import test from "node:test";
 
 import { createComponentAdapters } from "../desktop/software-manager/component-adapters.mjs";
 import { createTrustedCatalogService, verifyCatalogEnvelope } from "../desktop/software-manager/catalog-trust.mjs";
+import { getOwnershipCoordinator } from "../desktop/software-manager/ownership-coordinator.mjs";
 import {
   authorizeDesktopPath, authorizeInstallRoot, authorizeSkillsRoot,
 } from "../desktop/software-manager/path-policy.mjs";
@@ -15,8 +16,9 @@ const DESKTOP = "C:\\Users\\tester\\Desktop";
 const DIGEST_A = "a".repeat(64);
 const DIGEST_B = "b".repeat(64);
 const SKILL_HASH = "c".repeat(64);
+const OLD_SKILL_HASH = "d".repeat(64);
 const TEST_CATALOG_URL = "https://shanhaiyouling.com/codexbridge-install-test/component-catalog.json";
-const directoryStat = { isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false };
+const directoryStat = { dev: 1, ino: 1, isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false };
 
 const INSTALL_CAPABILITY = await authorizeInstallRoot({
   candidate: INSTALL_ROOT,
@@ -73,16 +75,16 @@ const TRUSTED_CATALOG = trustedCatalog();
 
 function emptyState(installRoot = null) {
   return {
-    schemaVersion: 1, installRoot, components: {}, skills: {}, shortcuts: [], rollback: null,
+    schemaVersion: 1, generation: 0, installRoot, components: {}, skills: {}, shortcuts: [], rollback: null,
     activeTask: null, lastTask: null,
   };
 }
 
 function fixture({
   state = emptyState(), gitDiscovery = { kind: "none" }, gitDiscoveries = null, running = false,
-  slotFailure = null, finalVerifyFailure = null, shortcutFailure = null, restartFailure = null,
+  slotFailure = null, rollbackFailure = null, finalVerifyFailure = null, shortcutFailure = null, restartFailure = null,
   stateSaveFailureAt = null, persistentFailureAt = null, skillHashes = null, gitInstallFailure = null,
-  invalidAuthenticodePath = null,
+  invalidAuthenticodePath = null, initialSkillEvidence = null,
 } = {}) {
   let currentState = structuredClone(state);
   let saveCount = 0;
@@ -94,16 +96,26 @@ function fixture({
   };
   const archiveReceipts = new WeakSet();
   const skillReceipts = new WeakSet();
+  const skillCompletionReceipts = new WeakSet();
+  const skillProofs = new Map();
+  const installedSkillEvidence = new Map();
+  if (initialSkillEvidence && typeof initialSkillEvidence === "object") {
+    installedSkillEvidence.set(initialSkillEvidence.target, structuredClone(initialSkillEvidence.evidence));
+  }
   const gitPins = new WeakSet();
+  const shortcutReservations = new Map();
   const deletedSkillTargets = new Set();
   const ownershipStore = {
     async load() { return structuredClone(currentState); },
-    async save(next) {
+    async compareAndSwap(expectedGeneration, next) {
       saveCount += 1;
       if (saveCount === stateSaveFailureAt) throw Object.assign(new Error("state_save_failed"), { code: "state_save_failed" });
-      currentState = structuredClone(next);
+      if (currentState.generation !== expectedGeneration) throw new Error("ownership_generation_conflict");
+      currentState = { ...structuredClone(next), generation: expectedGeneration + 1 };
+      return structuredClone(currentState);
     },
   };
+  const testOwnershipCoordinator = getOwnershipCoordinator(ownershipStore);
   const windowsHost = {
     async discoverGit() {
       const value = Array.isArray(gitDiscoveries) && gitDiscoveries.length > 0 ? gitDiscoveries.shift() : gitDiscovery;
@@ -123,9 +135,21 @@ function fixture({
     async createShortcut(record) {
       calls.shortcuts.push(record);
       if (shortcutFailure) throw shortcutFailure;
-      return { ...record, path: path.win32.join(record.desktopPath, `${record.name}（1）.lnk`) };
+      const shortcut = { ...record, path: path.win32.join(record.desktopPath, `${record.name}（1）.lnk`) };
+      if (typeof record.reservationId === "string") shortcutReservations.set(record.reservationId, structuredClone(shortcut));
+      return shortcut;
     },
-    async removeRecordedShortcut(record) { calls.removedShortcuts.push(record); return { removed: true }; },
+    async recoverShortcutReservation({ reservationId }) {
+      const shortcut = shortcutReservations.get(reservationId);
+      return shortcut ? { kind: "shortcut", shortcut: structuredClone(shortcut) } : { kind: "absent" };
+    },
+    async removeRecordedShortcut(record) {
+      calls.removedShortcuts.push(record);
+      for (const [id, shortcut] of shortcutReservations) {
+        if (shortcut.path === record.path) shortcutReservations.delete(id);
+      }
+      return { removed: true };
+    },
     async runGitInstaller(plan) {
       calls.gitInstalls.push(plan);
       if (gitInstallFailure) throw gitInstallFailure;
@@ -146,21 +170,39 @@ function fixture({
     },
   };
   const versionSlots = {
+    previousComponents: new Map(),
     async promotePreparedVersion(plan) {
       calls.promotions.push(plan);
       if (slotFailure) throw slotFailure;
       assert.equal(archiveReceipts.has(plan.verificationReceipt), true);
       const rootPath = plan.componentId === "chatgpt" ? INSTALL_ROOT : path.win32.join(INSTALL_ROOT, "V2RayN");
       assert.equal(plan.rootPath, rootPath);
-      currentState.installRoot = INSTALL_ROOT;
-      currentState.components[plan.componentId] = {
+      const next = await testOwnershipCoordinator.store.load();
+      this.previousComponents.set(plan.componentId, structuredClone(next.components[plan.componentId] ?? null));
+      next.installRoot = INSTALL_ROOT;
+      next.components[plan.componentId] = {
         managed: true,
         installPath: path.win32.join(rootPath, plan.componentId === "chatgpt" ? "c" : "current"),
         version: plan.version, treeDigest: plan.treeDigest, manifestDigest: plan.manifestDigest,
+        ...structuredClone(plan.runtimeMetadata),
       };
+      if (this.previousComponents.get(plan.componentId)) {
+        next.rollback = [{ componentId: plan.componentId, path: `${rootPath}\\previous` }];
+      }
+      await testOwnershipCoordinator.store.save(next);
       return { componentId: plan.componentId, version: plan.version, rollbackAvailable: state.installRoot !== null };
     },
-    async rollbackVersion(componentId) { calls.rollbacks.push(componentId); return { componentId, version: "1.0.0", rollbackAvailable: false }; },
+    async rollbackVersion(componentId) {
+      calls.rollbacks.push(componentId);
+      if (rollbackFailure) throw rollbackFailure;
+      const next = await testOwnershipCoordinator.store.load();
+      const previous = this.previousComponents.get(componentId);
+      if (!previous) throw new Error("rollback_not_available");
+      next.components[componentId] = structuredClone(previous);
+      next.rollback = null;
+      await testOwnershipCoordinator.store.save(next);
+      return { componentId, version: previous.version, rollbackAvailable: false };
+    },
   };
   let verifyCalls = 0;
   const componentFiles = {
@@ -196,12 +238,58 @@ function fixture({
       assert.equal(skillReceipts.has(plan.verificationReceipt), true);
       skillReceipts.delete(plan.verificationReceipt);
       calls.replacedSkills.push(plan);
+      const completionReceipt = Object.freeze(Object.create(null));
+      skillCompletionReceipts.add(completionReceipt);
+      installedSkillEvidence.set(plan.target, {
+        kind: "directory", identity: { volumeSerial: "v", fileId: `skill-${calls.replacedSkills.length}` },
+        treeDigest: plan.treeDigest, manifestDigest: plan.manifestDigest,
+        skillMdSha256: plan.skillMdSha256,
+      });
+      return { completionReceipt };
     },
-    async deleteExact(plan) { calls.deletedSkills.push(plan); deletedSkillTargets.add(plan.target); },
+    async finalizeReplacement({ completionReceipt, target, expected }) {
+      assert.equal(skillCompletionReceipts.has(completionReceipt), true);
+      skillCompletionReceipts.delete(completionReceipt);
+      const evidence = installedSkillEvidence.get(target);
+      assert.deepEqual({ treeDigest: evidence.treeDigest, manifestDigest: evidence.manifestDigest }, {
+        treeDigest: expected.treeDigest, manifestDigest: expected.manifestDigest,
+      });
+      const proof = `skill-proof-${skillProofs.size + 1}`;
+      skillProofs.set(proof, structuredClone(evidence));
+      return { completionProof: proof, evidence: structuredClone(evidence) };
+    },
+    async verifyCompletionProof({ completionProof, target }) {
+      const evidence = skillProofs.get(completionProof);
+      if (!evidence || !installedSkillEvidence.has(target)) throw new Error("skill_completion_proof_invalid");
+      return structuredClone(evidence);
+    },
+    async recoverCompletionProof({ target, expected }) {
+      const evidence = installedSkillEvidence.get(target);
+      if (!evidence || evidence.treeDigest !== expected.treeDigest
+        || evidence.manifestDigest !== expected.manifestDigest
+        || evidence.skillMdSha256 !== expected.skillMdSha256) throw new Error("skill_completion_recovery_mismatch");
+      const proof = `skill-proof-${skillProofs.size + 1}`;
+      skillProofs.set(proof, structuredClone(evidence));
+      return { completionProof: proof, evidence: structuredClone(evidence) };
+    },
+    async deleteExact(plan) {
+      calls.deletedSkills.push(plan); deletedSkillTargets.add(plan.target); installedSkillEvidence.delete(plan.target);
+    },
     async inspectExact({ target }) {
       if (deletedSkillTargets.has(target)) return { kind: "absent" };
+      if (installedSkillEvidence.has(target)) return structuredClone(installedSkillEvidence.get(target));
       const record = currentState.skills.documents;
-      return record?.target === target ? { kind: "directory", skillMdSha256: record.skillMdSha256 } : { kind: "absent" };
+      if (record?.target !== target) return { kind: "absent" };
+      const previous = currentState.activeTask?.previousEvidence;
+      const evidence = {
+        kind: "directory",
+        identity: record.identity ?? previous?.identity ?? { volumeSerial: "v", fileId: "existing" },
+        treeDigest: record.treeDigest ?? previous?.treeDigest ?? DIGEST_B,
+        manifestDigest: record.manifestDigest ?? previous?.manifestDigest ?? DIGEST_A,
+        skillMdSha256: record.skillMdSha256,
+      };
+      installedSkillEvidence.set(target, evidence);
+      return structuredClone(evidence);
     },
   };
   const gitIdentityCapabilities = {
@@ -271,16 +359,18 @@ test("prepare or download failure never persists the selected install root", asy
   assert.equal(getState().installRoot, null);
 });
 
-test("post-promotion verify, shortcut, state, or restart failures do not report failed after a durable switch", async (t) => {
+test("post-promotion shortcut, state, or restart failures do not report failed after a verified switch", async (t) => {
   for (const [name, options] of [
-    ["final verify", { finalVerifyFailure: new Error("final") }],
     ["shortcut", { shortcutFailure: new Error("shortcut") }],
-    ["state", { stateSaveFailureAt: 1 }],
+    ["state", { stateSaveFailureAt: 2 }],
     ["restart", { running: true, restartFailure: new Error("restart") }],
   ]) {
     await t.test(name, async () => {
       const state = emptyState(INSTALL_ROOT);
-      state.components.chatgpt = { managed: true, installPath: "D:\\CBApps\\c", version: "1.0.0" };
+      state.components.chatgpt = {
+        managed: true, installPath: "D:\\CBApps\\c", version: "1.0.0",
+        entrypointPath: "D:\\CBApps\\c\\ChatGPT.exe", requiredFiles: ["D:\\CBApps\\c\\ChatGPT.exe"],
+      };
       const { adapters, calls } = fixture({ state, ...options });
       await adapters.chatgpt.prepare({ taskId: `warning-${name.replace(" ", "-")}` });
       const committed = await adapters.chatgpt.commit({ taskId: `warning-${name.replace(" ", "-")}` });
@@ -289,6 +379,67 @@ test("post-promotion verify, shortcut, state, or restart failures do not report 
       assert.equal(calls.promotions.length, 1);
     });
   }
+});
+
+test("shortcut creation is reserved before mutation and adopted without duplication after an applied-state save failure", async () => {
+  const { adapters, calls, getState } = fixture({ stateSaveFailureAt: 4 });
+  await adapters.chatgpt.prepare({ taskId: "shortcut-recover" });
+  const committed = await adapters.chatgpt.commit({ taskId: "shortcut-recover" });
+  assert.equal(committed.status, "succeeded");
+  assert.equal(getState().activeTask.kind, "component-shortcut");
+  assert.equal(getState().activeTask.phase, "reserved");
+  assert.equal(calls.shortcuts.length, 1);
+  assert.equal((await adapters.chatgpt.inspectInstalled({})).status, "succeeded");
+  assert.equal(calls.shortcuts.length, 1);
+  assert.equal(getState().activeTask, null);
+  assert.equal(getState().shortcuts.length, 1);
+});
+
+test("core verification failure rolls an update back and returns failed with the restored version", async () => {
+  const state = emptyState(INSTALL_ROOT);
+  state.components.chatgpt = {
+    managed: true, installPath: "D:\\CBApps\\c", version: "1.0.0",
+    entrypointPath: "D:\\CBApps\\c\\OldChat.exe", requiredFiles: ["D:\\CBApps\\c\\OldChat.exe"],
+  };
+  const { adapters, calls, getState } = fixture({ state, running: true, finalVerifyFailure: new Error("final") });
+  await adapters.chatgpt.prepare({ taskId: "verify-rollback" });
+  const committed = await adapters.chatgpt.commit({ taskId: "verify-rollback" });
+  assert.equal(committed.status, "failed");
+  assert.equal(committed.versionAfter, "1.0.0");
+  assert.deepEqual(calls.rollbacks, ["chatgpt"]);
+  assert.deepEqual(calls.stopped[0], ["D:\\CBApps\\c\\OldChat.exe"]);
+  assert.equal(calls.launched.at(-1), "D:\\CBApps\\c\\OldChat.exe");
+  assert.equal(getState().components.chatgpt.entrypointPath, "D:\\CBApps\\c\\OldChat.exe");
+  assert.deepEqual(calls.shortcuts, []);
+});
+
+test("core verification failure on first install records failed-unhealthy and never reports success", async () => {
+  const { adapters, calls, getState } = fixture({ finalVerifyFailure: new Error("final") });
+  await adapters.chatgpt.prepare({ taskId: "verify-first" });
+  const committed = await adapters.chatgpt.commit({ taskId: "verify-first" });
+  assert.equal(committed.status, "failed");
+  assert.equal(committed.versionAfter, "2.0.0");
+  assert.equal(committed.rollbackAvailable, false);
+  assert.equal(getState().components.chatgpt.health, "failed-unhealthy");
+  assert.deepEqual(calls.shortcuts, []);
+  assert.deepEqual(calls.launched, []);
+});
+
+test("rollback failure after core verification failure reports the actually installed new version", async () => {
+  const state = emptyState(INSTALL_ROOT);
+  state.components.chatgpt = {
+    managed: true, installPath: "D:\\CBApps\\c", version: "1.0.0",
+    entrypointPath: "D:\\CBApps\\c\\OldChat.exe", requiredFiles: ["D:\\CBApps\\c\\OldChat.exe"],
+  };
+  const { adapters } = fixture({
+    state, finalVerifyFailure: new Error("final"),
+    rollbackFailure: Object.assign(new Error("rollback_failed"), { code: "rollback_failed" }),
+  });
+  await adapters.chatgpt.prepare({ taskId: "verify-rollback-fail" });
+  const committed = await adapters.chatgpt.commit({ taskId: "verify-rollback-fail" });
+  assert.equal(committed.status, "failed");
+  assert.equal(committed.versionAfter, "2.0.0");
+  assert.equal(committed.rollbackAvailable, true);
 });
 
 test("a pre-promotion V2RayN persistent-config identity failure prevents stop and promotion", async () => {
@@ -302,7 +453,11 @@ test("a pre-promotion V2RayN persistent-config identity failure prevents stop an
 
 test("V2RayN retains a separate persistent config root and stops only an owned executable", async () => {
   const state = emptyState(INSTALL_ROOT);
-  state.components.v2rayn = { managed: true, installPath: "D:\\CBApps\\V2RayN\\current", version: "6.0.0" };
+  state.components.v2rayn = {
+    managed: true, installPath: "D:\\CBApps\\V2RayN\\current", version: "6.0.0",
+    entrypointPath: "D:\\CBApps\\V2RayN\\current\\v2rayN.exe",
+    requiredFiles: ["D:\\CBApps\\V2RayN\\current\\v2rayN.exe"],
+  };
   const { adapters, calls } = fixture({ state, running: true });
   await adapters.v2rayn.prepare({ taskId: "v2" });
   const committed = await adapters.v2rayn.commit({ taskId: "v2" });
@@ -313,7 +468,10 @@ test("V2RayN retains a separate persistent config root and stops only an owned e
 
 test("a completed native component uninstall is recovered after its final state save fails", async () => {
   const state = emptyState(INSTALL_ROOT);
-  state.components.chatgpt = { managed: true, installPath: "D:\\CBApps\\c", version: "2.0.0" };
+  state.components.chatgpt = {
+    managed: true, installPath: "D:\\CBApps\\c", version: "2.0.0",
+    entrypointPath: "D:\\CBApps\\c\\ChatGPT.exe", requiredFiles: ["D:\\CBApps\\c\\ChatGPT.exe"],
+  };
   const { adapters, calls, getState } = fixture({ state, stateSaveFailureAt: 2 });
   const removed = await adapters.chatgpt.uninstall({ taskId: "chat-uninstall" });
   assert.equal(removed.status, "succeeded");
@@ -358,7 +516,9 @@ test("managed Git installs to one stable directory, keeps signed installers for 
     ...externalGit, version: "2.51.0", installDir: "D:\\CBApps\\Git",
     executablePath: "D:\\CBApps\\Git\\cmd\\git.exe", uninstallerPath: "D:\\CBApps\\Git\\unins000.exe",
   };
-  const { adapters, calls, getState } = fixture({ gitDiscoveries: [{ kind: "none" }, registered], gitDiscovery: registered });
+  const { adapters, calls, getState } = fixture({
+    gitDiscoveries: [{ kind: "none" }, { kind: "none" }, registered], gitDiscovery: registered,
+  });
   await adapters.git.prepare({ taskId: "git-managed", selected: true });
   const installed = await adapters.git.commit({ taskId: "git-managed" });
   assert.equal(installed.status, "succeeded");
@@ -366,7 +526,54 @@ test("managed Git installs to one stable directory, keeps signed installers for 
   assert.equal(calls.promotions.length, 0);
   assert.equal(getState().components.git.installPath, "D:\\CBApps\\Git");
   assert.equal(getState().components.git.currentInstaller.version, "2.51.0");
+  assert.equal(calls.gitPins[0].targetMustBeAbsent, true);
   assert.deepEqual(calls.shortcuts, []);
+});
+
+test("managed Git update pins the existing registered target and rejects replacement before installer execution", async () => {
+  const state = emptyState(INSTALL_ROOT);
+  state.components.git = {
+    managed: true, installPath: "D:\\CBApps\\Git", version: "2.50.0",
+    executablePath: "D:\\CBApps\\Git\\cmd\\git.exe", uninstallerPath: "D:\\CBApps\\Git\\unins000.exe",
+    currentInstaller: { path: "D:\\CBApps\\downloads\\git-2.50.0.exe", sha256: DIGEST_B, version: "2.50.0" },
+    previousInstaller: null,
+  };
+  const current = { ...externalGit, version: "2.50.0", installDir: state.components.git.installPath,
+    executablePath: state.components.git.executablePath, uninstallerPath: state.components.git.uninstallerPath };
+  const replaced = { ...current, uninstallerPath: "D:\\CBApps\\Git\\unins001.exe" };
+  const { adapters, calls } = fixture({ state, gitDiscoveries: [current, replaced], gitDiscovery: replaced });
+  assert.equal((await adapters.git.prepare({ taskId: "git-managed-race", selected: true })).status, "succeeded");
+  assert.equal(calls.gitPins[0].discovery.uninstallerPath, current.uninstallerPath);
+  assert.equal((await adapters.git.commit({ taskId: "git-managed-race" })).status, "failed");
+  assert.deepEqual(calls.gitInstalls, []);
+});
+
+test("a third managed Git update retains only current and previous installers and retries cleanup idempotently", async () => {
+  const state = emptyState(INSTALL_ROOT);
+  state.components.git = {
+    managed: true, installPath: "D:\\CBApps\\Git", version: "2.50.0",
+    executablePath: "D:\\CBApps\\Git\\cmd\\git.exe", uninstallerPath: "D:\\CBApps\\Git\\unins000.exe",
+    currentInstaller: { path: "D:\\CBApps\\downloads\\git-2.50.0.exe", sha256: DIGEST_B, version: "2.50.0" },
+    previousInstaller: { path: "D:\\CBApps\\downloads\\git-2.49.0.exe", sha256: DIGEST_A, version: "2.49.0" },
+  };
+  const current = { ...externalGit, version: "2.50.0", installDir: state.components.git.installPath,
+    executablePath: state.components.git.executablePath, uninstallerPath: state.components.git.uninstallerPath };
+  const installed = { ...current, version: "2.51.0" };
+  const { adapters, calls, getState } = fixture({
+    state, gitDiscoveries: [current, current, installed], gitDiscovery: installed, stateSaveFailureAt: 3,
+  });
+  const prepared = await adapters.git.prepare({ taskId: "git-third", selected: true });
+  assert.equal(prepared.status, "succeeded");
+  const committed = await adapters.git.commit({ taskId: "git-third" });
+  assert.equal(committed.status, "succeeded");
+  assert.equal(getState().activeTask.kind, "git-install-cleanup");
+  assert.equal(calls.discarded.length, 1);
+  assert.equal((await adapters.git.inspectInstalled({})).status, "succeeded");
+  assert.equal(calls.discarded.length, 2);
+  assert.equal(getState().activeTask, null);
+  assert.equal(getState().components.git.currentInstaller.version, "2.51.0");
+  assert.equal(getState().components.git.previousInstaller.version, "2.50.0");
+  assert.equal(calls.discarded[0].version, "2.49.0");
 });
 
 test("managed Git adopts a completed fixed-target install after the final ownership save fails", async () => {
@@ -381,14 +588,17 @@ test("managed Git adopts a completed fixed-target install after the final owners
     ...externalGit, version: "2.51.0", installDir: "D:\\CBApps\\Git",
     executablePath: "D:\\CBApps\\Git\\cmd\\git.exe", uninstallerPath: "D:\\CBApps\\Git\\unins000.exe",
   };
-  const { adapters, getState } = fixture({ state, gitDiscovery: installed, stateSaveFailureAt: 2 });
+  const current = { ...installed, version: "2.50.0" };
+  const { adapters, getState } = fixture({
+    state, gitDiscoveries: [current, current, installed], gitDiscovery: installed, stateSaveFailureAt: 2,
+  });
   await adapters.git.prepare({ taskId: "git-adopt", selected: true });
   const committed = await adapters.git.commit({ taskId: "git-adopt" });
   assert.equal(committed.status, "succeeded");
   assert.match(committed.message, /warning/u);
   assert.equal(getState().activeTask.kind, "git-install");
   const inspected = await adapters.git.inspectInstalled({});
-  assert.equal(inspected.status, "succeeded");
+  assert.equal(inspected.status, "succeeded", inspected.message);
   assert.equal(getState().components.git.version, "2.51.0");
   assert.equal(getState().components.git.previousInstaller.version, "2.50.0");
   assert.equal(getState().activeTask, null);
@@ -415,9 +625,14 @@ test("managed Git rollback reinstalls the retained previous installer into the s
     previousInstaller: { path: "D:\\CBApps\\downloads\\git-2.50.0.exe", sha256: DIGEST_B, version: "2.50.0" },
   };
   const discovery = { ...externalGit, ownership: "external", installDir: "D:\\CBApps\\Git", executablePath: "D:\\CBApps\\Git\\cmd\\git.exe", uninstallerPath: "D:\\CBApps\\Git\\unins000.exe", version: "2.51.0" };
-  const { adapters, calls, getState } = fixture({ state, gitDiscovery: discovery });
+  const restored = { ...discovery, version: "2.50.0" };
+  const { adapters, calls, getState } = fixture({ state, gitDiscoveries: [discovery, restored], gitDiscovery: restored });
   const rolled = await adapters.git.rollback({ taskId: "git-rollback" });
   assert.equal(rolled.status, "succeeded");
+  assert.deepEqual(calls.gitUninstalls[0], {
+    uninstallerPath: discovery.uninstallerPath, installDir: discovery.installDir,
+  });
+  assert.equal(calls.gitPins.some((record) => record.discovery?.uninstallerPath === discovery.uninstallerPath), true);
   assert.equal(calls.gitInstalls[0].installerPath, state.components.git.previousInstaller.path);
   assert.equal(calls.gitInstalls[0].targetDir, "D:\\CBApps\\Git");
   assert.equal(getState().components.git.version, "2.50.0");
@@ -436,12 +651,16 @@ test("managed Git rollback remains succeeded and is adopted after post-reinstall
     ...externalGit, version: "2.50.0", installDir: "D:\\CBApps\\Git",
     executablePath: "D:\\CBApps\\Git\\cmd\\git.exe", uninstallerPath: "D:\\CBApps\\Git\\unins000.exe",
   };
-  const { adapters, calls, getState } = fixture({ state, gitDiscovery: rolledBack, stateSaveFailureAt: 2 });
+  const current = { ...rolledBack, version: "2.51.0" };
+  const { adapters, calls, getState } = fixture({
+    state, gitDiscoveries: [current, rolledBack, rolledBack], gitDiscovery: rolledBack, stateSaveFailureAt: 2,
+  });
   const rolled = await adapters.git.rollback({ taskId: "git-rollback-adopt" });
   assert.equal(rolled.status, "succeeded");
   assert.match(rolled.message, /warning/u);
   assert.equal(getState().activeTask.kind, "git-rollback");
-  assert.equal((await adapters.git.inspectInstalled({})).status, "succeeded");
+  const recovered = await adapters.git.inspectInstalled({});
+  assert.equal(recovered.status, "succeeded", recovered.message);
   assert.equal(getState().components.git.version, "2.50.0");
   assert.equal(getState().activeTask, null);
   assert.equal(calls.discarded.length, 1);
@@ -520,6 +739,76 @@ test("Skill uninstall is independently recovered after deletion completed before
   assert.equal(getState().activeTask, null);
 });
 
+test("reserved Skill recovery does not adopt a tree that only matches the expected SKILL.md hash", async () => {
+  const state = emptyState(INSTALL_ROOT);
+  state.skills.documents = {
+    target: "C:\\Users\\tester\\.codex\\skills\\documents", version: "0.9.0",
+    packageSha256: DIGEST_A, skillMdSha256: SKILL_HASH,
+  };
+  state.activeTask = {
+    kind: "skill-replace", phase: "reserved", taskId: "skill-tree-mismatch", skillId: "documents",
+    skillsRoot: SKILLS_ROOT, target: state.skills.documents.target, version: "1.0.0",
+    packageSha256: DIGEST_B, skillMdSha256: SKILL_HASH,
+    treeDigest: DIGEST_A, manifestDigest: DIGEST_B,
+    previousEvidence: {
+      kind: "directory", identity: { volumeSerial: "v", fileId: "old" },
+      treeDigest: DIGEST_B, manifestDigest: DIGEST_A, skillMdSha256: SKILL_HASH,
+    },
+  };
+  const { adapters, getState } = fixture({
+    state,
+    initialSkillEvidence: {
+      target: state.skills.documents.target,
+      evidence: {
+        kind: "directory", identity: { volumeSerial: "v", fileId: "unexpected" },
+        treeDigest: DIGEST_A, manifestDigest: DIGEST_A, skillMdSha256: SKILL_HASH,
+      },
+    },
+  });
+  const inspected = await adapters.skills.inspectInstalled({ skillIds: ["documents"] });
+  assert.equal(inspected[0].status, "failed");
+  assert.equal(getState().skills.documents.version, "0.9.0");
+  assert.equal(getState().activeTask.phase, "reserved");
+});
+
+test("forged applied Skill completion evidence is rejected without adoption", async () => {
+  const state = emptyState(INSTALL_ROOT);
+  state.activeTask = {
+    kind: "skill-replace", phase: "applied", taskId: "skill-forged", skillId: "documents",
+    skillsRoot: SKILLS_ROOT, target: "C:\\Users\\tester\\.codex\\skills\\documents", version: "1.0.0",
+    packageSha256: DIGEST_B, skillMdSha256: SKILL_HASH, treeDigest: DIGEST_A, manifestDigest: DIGEST_B,
+    previousEvidence: { kind: "absent" }, completionProof: { forged: true },
+  };
+  const { adapters, getState } = fixture({ state });
+  const inspected = await adapters.skills.inspectInstalled({ skillIds: ["documents"] });
+  assert.equal(inspected[0].status, "failed");
+  assert.equal(getState().skills.documents, undefined);
+  assert.equal(getState().activeTask.phase, "applied");
+});
+
+test("reserved Skill recovery safely clears a pre-mutation failure after verifying the complete previous tree", async () => {
+  const target = "C:\\Users\\tester\\.codex\\skills\\documents";
+  const state = emptyState(INSTALL_ROOT);
+  state.skills.documents = {
+    target, version: "0.9.0", packageSha256: DIGEST_A, skillMdSha256: OLD_SKILL_HASH,
+    identity: { volumeSerial: "v", fileId: "old" }, treeDigest: DIGEST_B, manifestDigest: DIGEST_A,
+  };
+  state.activeTask = {
+    kind: "skill-replace", phase: "reserved", taskId: "skill-before-mutation", skillId: "documents",
+    skillsRoot: SKILLS_ROOT, target, version: "1.0.0", packageSha256: DIGEST_B,
+    skillMdSha256: SKILL_HASH, treeDigest: DIGEST_A, manifestDigest: DIGEST_B,
+    previousEvidence: {
+      kind: "directory", identity: state.skills.documents.identity,
+      treeDigest: DIGEST_B, manifestDigest: DIGEST_A, skillMdSha256: OLD_SKILL_HASH,
+    },
+  };
+  const { adapters, getState } = fixture({ state, skillHashes: [OLD_SKILL_HASH] });
+  const inspected = await adapters.skills.inspectInstalled({ skillIds: ["documents"] });
+  assert.equal(inspected[0].status, "succeeded", JSON.stringify(inspected[0]));
+  assert.equal(inspected[0].versionAfter, "0.9.0");
+  assert.equal(getState().activeTask, null);
+});
+
 test("Skills are independent and an unsigned ID cannot mutate a sibling or the root", async () => {
   const { adapters, calls } = fixture();
   const prepared = await adapters.skills.prepare({ taskId: "skills-batch", skillIds: ["documents", "unsigned"] });
@@ -531,7 +820,10 @@ test("Skills are independent and an unsigned ID cannot mutate a sibling or the r
 
 test("failed results use the newest persistent version snapshot and never reject on state load errors", async () => {
   const state = emptyState(INSTALL_ROOT);
-  state.components.chatgpt = { managed: true, installPath: "D:\\CBApps\\c", version: "1.0.0" };
+  state.components.chatgpt = {
+    managed: true, installPath: "D:\\CBApps\\c", version: "1.0.0",
+    entrypointPath: "D:\\CBApps\\c\\ChatGPT.exe", requiredFiles: ["D:\\CBApps\\c\\ChatGPT.exe"],
+  };
   const { adapters } = fixture({ state, slotFailure: Object.assign(new Error("slot_failed"), { code: "slot_failed" }) });
   await adapters.chatgpt.prepare({ taskId: "latest-state" });
   const failed = await adapters.chatgpt.commit({ taskId: "latest-state" });

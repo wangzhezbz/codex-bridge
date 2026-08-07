@@ -13,7 +13,7 @@ const ABORT_PHASES = [
 ];
 const RECORD_KEYS = [
   "schemaVersion", "taskId", "componentId", "mode", "phase", "rootPath",
-  "slots", "paths", "versions", "identities", "integrities", "ownershipBefore",
+  "slots", "paths", "versions", "identities", "integrities", "runtimeMetadata", "ownershipBefore",
 ];
 const SLOT_KEYS = ["current", "previous", "staging", "retiring"];
 const VERSION_KEYS = ["incoming", "current", "previous"];
@@ -203,6 +203,24 @@ function normalizeRecord(value) {
     throw journalError("transaction_record_invalid");
   }
   const paths = Object.fromEntries(SLOT_KEYS.map((key) => [key, path.win32.join(rootPath, expectedSlots[key])]));
+  let runtimeMetadata = null;
+  if (value.mode === "promote") {
+    if (!hasExactKeys(value.runtimeMetadata, ["entrypointPath", "requiredFiles", "health"])
+      || value.runtimeMetadata.health !== "pending-verify"
+      || typeof value.runtimeMetadata.entrypointPath !== "string"
+      || !Array.isArray(value.runtimeMetadata.requiredFiles) || value.runtimeMetadata.requiredFiles.length === 0) {
+      throw journalError("transaction_record_invalid");
+    }
+    const candidates = [value.runtimeMetadata.entrypointPath, ...value.runtimeMetadata.requiredFiles];
+    if (candidates.some((candidate) => typeof candidate !== "string"
+      || path.win32.normalize(candidate) !== candidate
+      || !candidate.toLowerCase().startsWith(`${paths.current.toLowerCase()}\\`))) {
+      throw journalError("transaction_record_invalid");
+    }
+    runtimeMetadata = structuredClone(value.runtimeMetadata);
+  } else if (value.runtimeMetadata !== null) {
+    throw journalError("transaction_record_invalid");
+  }
   const ownershipBefore = normalizeOwnershipBefore(value.ownershipBefore, {
     componentId: value.componentId,
     rootPath,
@@ -223,6 +241,7 @@ function normalizeRecord(value) {
     versions,
     identities,
     integrities,
+    runtimeMetadata,
     ownershipBefore,
   };
 }

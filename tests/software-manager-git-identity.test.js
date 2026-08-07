@@ -11,13 +11,14 @@ const INSTALL_ROOT_CAPABILITY = await authorizeInstallRoot({
   access: async () => {},
   realpath: async (value) => value,
   lstat: async () => ({
+    dev: 1, ino: 1,
     isDirectory: () => true,
     isSymbolicLink: () => false,
     isReparsePoint: () => false,
   }),
 });
 
-function fixture() {
+function fixture({ missingAfterDelete = false } = {}) {
   const calls = [];
   const hashes = new Map([
     ["D:\\CBApps\\downloads\\git-2.51.0.exe", HASH],
@@ -35,10 +36,19 @@ function fixture() {
     return pin;
   }
   const fileCapabilities = {
-    async pinArchiveFileNoFollow(filePath) { calls.push(["pin-file", filePath]); return filePin(filePath); },
+    async pinArchiveFileNoFollow(filePath) {
+      calls.push(["pin-file", filePath]);
+      if (missingAfterDelete && deleted.some((record) => record.path === filePath)) {
+        throw Object.assign(new Error("missing"), { code: "ENOENT" });
+      }
+      return filePin(filePath);
+    },
     async openDirectoryNoFollow(directoryPath) {
       calls.push(["pin-directory", directoryPath]);
-      return { async close() { calls.push(["close-directory", directoryPath]); } };
+      return {
+        async listChildren() { calls.push(["list-directory", directoryPath]); return []; },
+        async close() { calls.push(["close-directory", directoryPath]); },
+      };
     },
   };
   const deleted = [];
@@ -101,6 +111,15 @@ test("rejects a changed registration and unregistered arbitrary installation tar
   await assert.rejects(capabilities.pinPlan({ targetDir: "E:\\Git" }), /git_identity_unregistered_target_rejected/u);
 });
 
+test("a first managed install pins the install-root parent and repeatedly proves the Git child is absent", async () => {
+  const { calls, capabilities } = fixture();
+  const pin = await capabilities.pinPlan({ targetDir: "D:\\CBApps\\Git", targetMustBeAbsent: true });
+  await capabilities.revalidate(pin, { targetMustBeAbsent: true });
+  assert.equal(calls.filter(([kind, value]) => kind === "pin-directory" && value === "D:\\CBApps").length, 1);
+  assert.equal(calls.filter(([kind]) => kind === "list-directory").length, 2);
+  await capabilities.release(pin);
+});
+
 test("retained installers are restricted to the managed downloads directory and deleted through the bound store", async () => {
   const { capabilities, deleted } = fixture();
   const retained = { path: "D:\\CBApps\\downloads\\git-2.51.0.exe", sha256: HASH, version: "2.51.0" };
@@ -117,4 +136,12 @@ test("retained installers are restricted to the managed downloads directory and 
     ...retained,
     version: "2.50.0",
   }), /git_retained_installer_path_rejected/u);
+});
+
+test("retained installer cleanup is idempotent when deletion succeeded before ownership cleanup was saved", async () => {
+  const { capabilities, deleted } = fixture({ missingAfterDelete: true });
+  const retained = { path: "D:\\CBApps\\downloads\\git-2.51.0.exe", sha256: HASH, version: "2.51.0" };
+  assert.deepEqual(await capabilities.discardRetainedInstaller(retained), { deleted: true, missing: false });
+  assert.deepEqual(await capabilities.discardRetainedInstaller(retained), { deleted: false, missing: true });
+  assert.equal(deleted.length, 1);
 });

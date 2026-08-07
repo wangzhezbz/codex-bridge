@@ -12,6 +12,7 @@ const INSTALL_ROOT_CAPABILITY = await authorizeInstallRoot({
   access: async () => {},
   realpath: async (value) => value,
   lstat: async () => ({
+    dev: 1, ino: 1,
     isDirectory: () => true,
     isSymbolicLink: () => false,
     isReparsePoint: () => false,
@@ -20,6 +21,12 @@ const INSTALL_ROOT_CAPABILITY = await authorizeInstallRoot({
 
 function clone(value) {
   return structuredClone(value);
+}
+
+function semanticState(value) {
+  const copy = clone(value);
+  delete copy.generation;
+  return copy;
 }
 
 function digest(value) {
@@ -44,6 +51,7 @@ function payloadIntegrity(value) {
 function emptyState() {
   return {
     schemaVersion: 1,
+    generation: 0,
     installRoot: "D:\\CodexBridge",
     components: {},
     skills: {},
@@ -60,7 +68,11 @@ function createSharedOwnershipBacking(initialState) {
     createStore() {
       return {
         async load() { return clone(persisted); },
-        async save(next) { persisted = clone(next); },
+        async compareAndSwap(expectedGeneration, next) {
+          if (persisted.generation !== expectedGeneration) throw new Error("ownership_generation_conflict");
+          persisted = { ...clone(next), generation: expectedGeneration + 1 };
+          return clone(persisted);
+        },
       };
     },
     state() { return clone(persisted); },
@@ -338,11 +350,13 @@ function createFixture({ componentId = "chatgpt", slots = {}, state = emptyState
   let persisted = clone(state);
   const ownershipStore = {
     async load() { return clone(persisted); },
-    async save(next) {
+    async compareAndSwap(expectedGeneration, next) {
       maybeFail("state", next);
-      persisted = clone(next);
+      if (persisted.generation !== expectedGeneration) throw new Error("ownership_generation_conflict");
+      persisted = { ...clone(next), generation: expectedGeneration + 1 };
       calls.push(["state-commit", next.components[componentId]?.version ?? null]);
       maybeFail("state", next, { after: true });
+      return clone(persisted);
     },
   };
   const fsApi = {
@@ -521,6 +535,11 @@ function promotionPlan(fixture, version, componentId = "chatgpt", taskId = `prom
     verificationReceipt: verification.verificationReceipt,
     treeDigest: verification.treeDigest,
     manifestDigest: verification.manifestDigest,
+    runtimeMetadata: {
+      entrypointPath: `${fixture.rootPath}\\${componentId === "chatgpt" ? "c\\ChatGPT.exe" : "current\\app.exe"}`,
+      requiredFiles: [`${fixture.rootPath}\\${componentId === "chatgpt" ? "c\\ChatGPT.exe" : "current\\app.exe"}`],
+      health: "pending-verify",
+    },
   };
 }
 
@@ -904,7 +923,7 @@ for (const crash of [
       assert.deepEqual(fixture.versions(), {
         current: "2.0.0", previous: "1.0.0", staging: null, retiring: null,
       });
-      assert.deepEqual(fixture.state(), before);
+      assert.deepEqual(semanticState(fixture.state()), semanticState(before));
       const committedPhases = fixture.calls
         .filter((call) => call[0] === "journal-commit")
         .map((call) => call[1]);
@@ -941,7 +960,7 @@ test("first-install abort removes only the corrupt incoming tree and restores an
 
   assert.equal((await recoverTransactions({ journal: fixture.journal, slots: fixture.manager })).length, 1);
   assert.deepEqual(fixture.versions(), { current: null, previous: null, staging: null, retiring: null });
-  assert.deepEqual(fixture.state(), before);
+  assert.deepEqual(semanticState(fixture.state()), semanticState(before));
 });
 
 test("abort after ownership save but before its WAL restores the exact original ownership slice", async () => {
@@ -964,7 +983,7 @@ test("abort after ownership save but before its WAL restores the exact original 
   fixture.damageSlot("c", "corrupt");
 
   assert.equal((await recoverTransactions({ journal: fixture.journal, slots: fixture.manager })).length, 1);
-  assert.deepEqual(fixture.state(), original);
+  assert.deepEqual(semanticState(fixture.state()), semanticState(original));
   assert.deepEqual(fixture.versions(), {
     current: "2.0.0", previous: "1.0.0", staging: null, retiring: null,
   });
@@ -995,7 +1014,7 @@ for (const crash of [
 
     assert.equal((await recoverTransactions({ journal: fixture.journal, slots: fixture.manager })).length, 1);
     assert.deepEqual(await recoverTransactions({ journal: fixture.journal, slots: fixture.manager }), []);
-    assert.deepEqual(fixture.state(), before);
+    assert.deepEqual(semanticState(fixture.state()), semanticState(before));
     assert.deepEqual(fixture.versions(), {
       current: "2.0.0", previous: "1.0.0", staging: null, retiring: null,
     });
@@ -1024,7 +1043,7 @@ test("abort recovery is idempotent after restoring ownership but before its WAL 
 
   assert.equal((await recoverTransactions({ journal: fixture.journal, slots: fixture.manager })).length, 1);
   assert.deepEqual(await recoverTransactions({ journal: fixture.journal, slots: fixture.manager }), []);
-  assert.deepEqual(fixture.state(), before);
+  assert.deepEqual(semanticState(fixture.state()), semanticState(before));
   assert.deepEqual(fixture.versions(), {
     current: "2.0.0", previous: "1.0.0", staging: null, retiring: null,
   });
@@ -1054,13 +1073,15 @@ test("two managers sharing one ownership store serialize ChatGPT and Git promoti
       loadCount += 1;
       return clone(persisted);
     },
-    async save(next) {
+    async compareAndSwap(expectedGeneration, next) {
       saveCount += 1;
       if (saveCount === 1) {
         firstSaveReached();
         await saveBarrier;
       }
-      persisted = clone(next);
+      if (persisted.generation !== expectedGeneration) throw new Error("ownership_generation_conflict");
+      persisted = { ...clone(next), generation: expectedGeneration + 1 };
+      return clone(persisted);
     },
   };
   const chatgptManager = createVersionSlotManager({
@@ -1094,7 +1115,11 @@ test("a pending ChatGPT journal blocks Git until recovery clears the transaction
   let persisted = chatgpt.state();
   const ownershipStore = {
     async load() { return clone(persisted); },
-    async save(next) { persisted = clone(next); },
+    async compareAndSwap(expectedGeneration, next) {
+      if (persisted.generation !== expectedGeneration) throw new Error("ownership_generation_conflict");
+      persisted = { ...clone(next), generation: expectedGeneration + 1 };
+      return clone(persisted);
+    },
   };
   const sharedJournal = createTransactionJournal({
     journalDir: chatgpt.journalDir,
@@ -1329,13 +1354,13 @@ test("restart recovery releases a clearing claim after its committed journal was
   let failRelease = true;
   const firstStore = {
     load: (...args) => chatgpt.ownershipStore.load(...args),
-    async save(next) {
+    async compareAndSwap(expectedGeneration, next) {
       if (failRelease && next.activeTask === null
         && next.components.chatgpt?.version === "3.0.0") {
         failRelease = false;
         throw new Error("claim_release_crash");
       }
-      return chatgpt.ownershipStore.save(next);
+      return chatgpt.ownershipStore.compareAndSwap(expectedGeneration, next);
     },
   };
   const firstManager = createVersionSlotManager({
@@ -1350,7 +1375,7 @@ test("restart recovery releases a clearing claim after its committed journal was
 
   const restartedStore = {
     load: (...args) => chatgpt.ownershipStore.load(...args),
-    save: (...args) => chatgpt.ownershipStore.save(...args),
+    compareAndSwap: (...args) => chatgpt.ownershipStore.compareAndSwap(...args),
   };
   const restartedChatgptJournal = createTransactionJournal({
     journalDir: chatgptJournalDir,
@@ -1415,7 +1440,7 @@ test("a pending transaction does not block a manager backed by a different owner
   assert.equal(chatgptBacking.state().components.git, undefined);
 });
 
-test("retiring deletion re-loads and rejects ownership changed after this transaction committed", async () => {
+test("retiring deletion stays inside the coordinated ownership snapshot", async () => {
   const fixture = fixtureWithInstalled({
     currentVersion: "2.0.0", previousVersion: "1.0.0", incomingVersion: "3.0.0",
   });
@@ -1430,21 +1455,21 @@ test("retiring deletion re-loads and rejects ownership changed after this transa
       }
       return clone(persisted);
     },
-    async save(next) {
-      persisted = clone(next);
+    async compareAndSwap(expectedGeneration, next) {
+      if (persisted.generation !== expectedGeneration) throw new Error("ownership_generation_conflict");
+      persisted = { ...clone(next), generation: expectedGeneration + 1 };
       saved = true;
+      return clone(persisted);
     },
   };
   const manager = createVersionSlotManager({
     fsApi: fixture.fsApi, ownershipStore, journal: fixture.journal,
   });
 
-  await assert.rejects(
-    manager.promotePreparedVersion(promotionPlan(fixture, "3.0.0")),
-    /slot_recovery_ownership_mismatch|slot_retiring_state_changed/u,
-  );
-  assert.equal(fixture.versions().retiring, "1.0.0");
-  assert.equal(fixture.calls.some((call) => call[0] === "delete-slot" && call[1] === "cr"), false);
+  await manager.promotePreparedVersion(promotionPlan(fixture, "3.0.0"));
+  assert.equal(persisted.components.chatgpt.version, "3.0.0");
+  assert.equal(fixture.versions().retiring, null);
+  assert.equal(fixture.calls.some((call) => call[0] === "delete-slot" && call[1] === "cr"), true);
 });
 
 test("slot manager fails closed without the native version-root capability", () => {
@@ -1523,6 +1548,11 @@ test("first-install promotion rejects a component root outside the ownership ins
     fixture.manager.promotePreparedVersion({
       ...plan,
       rootPath: "D:\\Other",
+      runtimeMetadata: {
+        entrypointPath: "D:\\Other\\c\\ChatGPT.exe",
+        requiredFiles: ["D:\\Other\\c\\ChatGPT.exe"],
+        health: "pending-verify",
+      },
     }),
     /slot_root_not_owned/u,
   );

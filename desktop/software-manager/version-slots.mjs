@@ -1,5 +1,6 @@
 import path from "node:path";
 
+import { getOwnershipCoordinator } from "./ownership-coordinator.mjs";
 import { readInstallRootCapability } from "./path-policy.mjs";
 import { deleteAuthorizedTree } from "./safe-delete.mjs";
 
@@ -15,7 +16,6 @@ const ACTIVE_TRANSACTION_LIFECYCLES = new Set(["reserved", "active", "clearing"]
 const ACTIVE_TRANSACTION_KEYS = [
   "kind", "schemaVersion", "lifecycle", "journalScope", "taskId", "componentId", "mode", "rootPath",
 ];
-const OWNERSHIP_STORE_LOCKS = new WeakMap();
 
 function slotError(code, cause) {
   const error = new Error(code, cause === undefined ? undefined : { cause });
@@ -126,21 +126,6 @@ function withoutRollback(state, componentId) {
   const remaining = rollbackRecords(state).filter((record) => record?.componentId !== componentId);
   if (remaining.length === 0) return null;
   return remaining;
-}
-
-async function withOwnershipStoreLock(store, action) {
-  const previous = OWNERSHIP_STORE_LOCKS.get(store) ?? Promise.resolve();
-  let release;
-  const gate = new Promise((resolve) => { release = resolve; });
-  const tail = previous.then(() => gate, () => gate);
-  OWNERSHIP_STORE_LOCKS.set(store, tail);
-  await previous.catch(() => {});
-  try {
-    return await action();
-  } finally {
-    release();
-    if (OWNERSHIP_STORE_LOCKS.get(store) === tail) OWNERSHIP_STORE_LOCKS.delete(store);
-  }
 }
 
 function installRootFor(rootPath, componentId) {
@@ -274,13 +259,26 @@ function desiredEvidence(snapshot) {
     : { current: previous, previous: null };
 }
 
+function componentRuntimeMetadata(value) {
+  if (!isPlainRecord(value)) return {};
+  const metadata = {};
+  if (typeof value.entrypointPath === "string") metadata.entrypointPath = value.entrypointPath;
+  if (Array.isArray(value.requiredFiles) && value.requiredFiles.every((item) => typeof item === "string")) {
+    metadata.requiredFiles = structuredClone(value.requiredFiles);
+  }
+  if (typeof value.health === "string") metadata.health = value.health;
+  return metadata;
+}
+
 function expectedPostOwnership(snapshot) {
   const desired = desiredEvidence(snapshot);
   const before = snapshot.ownershipBefore;
   return {
     installRoot: installRootFor(snapshot.rootPath, snapshot.componentId),
     component: {
-      ...(isPlainRecord(before.component) ? structuredClone(before.component) : {}),
+      ...(snapshot.mode === "promote"
+        ? structuredClone(snapshot.runtimeMetadata)
+        : componentRuntimeMetadata(before.rollback)),
       installPath: snapshot.paths.current,
       version: desired.current.version,
       treeDigest: desired.current.treeDigest,
@@ -289,6 +287,7 @@ function expectedPostOwnership(snapshot) {
       managed: true,
     },
     rollback: desired.previous ? {
+      ...(snapshot.mode === "promote" ? componentRuntimeMetadata(before.component) : {}),
       path: snapshot.paths.previous,
       rootPath: snapshot.rootPath,
       componentId: snapshot.componentId,
@@ -348,7 +347,7 @@ function requireRecoveryOwnershipState(state, snapshot, { allowAbort = false } =
   return postMatches ? "post" : "pre";
 }
 
-function baseRecord({ taskId, componentId, mode, rootPath, incoming, current, previous, state }) {
+function baseRecord({ taskId, componentId, mode, rootPath, incoming, current, previous, state, runtimeMetadata = null }) {
   const slots = namesFor(componentId);
   return {
     schemaVersion: 2,
@@ -380,6 +379,7 @@ function baseRecord({ taskId, componentId, mode, rootPath, incoming, current, pr
         treeDigest: previous.treeDigest, manifestDigest: previous.manifestDigest,
       } : null,
     },
+    runtimeMetadata: mode === "promote" ? structuredClone(runtimeMetadata) : null,
     ownershipBefore: ownershipSlice(state, componentId),
   };
 }
@@ -403,15 +403,27 @@ function phaseRecord(snapshot, phase) {
 function validatePromotionPlan(plan) {
   if (!hasExactKeys(plan, [
     "taskId", "componentId", "rootPath", "version", "verificationReceipt", "treeDigest", "manifestDigest",
+    "runtimeMetadata",
   ])
     || !TASK_ID.test(plan.taskId ?? "") || !COMPONENT_IDS.has(plan.componentId)
     || typeof plan.version !== "string" || !VERSION.test(plan.version)
     || plan.verificationReceipt === null || typeof plan.verificationReceipt !== "object"
     || !SHA256.test(plan.treeDigest ?? "")
-    || !SHA256.test(plan.manifestDigest ?? "")) {
+    || !SHA256.test(plan.manifestDigest ?? "")
+    || !hasExactKeys(plan.runtimeMetadata, ["entrypointPath", "requiredFiles", "health"])
+    || typeof plan.runtimeMetadata.entrypointPath !== "string"
+    || !Array.isArray(plan.runtimeMetadata.requiredFiles) || plan.runtimeMetadata.requiredFiles.length === 0
+    || plan.runtimeMetadata.health !== "pending-verify") {
     throw slotError("slot_promotion_plan_invalid");
   }
-  return { ...plan, rootPath: canonicalRoot(plan.rootPath) };
+  const rootPath = canonicalRoot(plan.rootPath);
+  const currentRoot = path.win32.join(rootPath, namesFor(plan.componentId).current);
+  const runtimePaths = [plan.runtimeMetadata.entrypointPath, ...plan.runtimeMetadata.requiredFiles];
+  if (runtimePaths.some((candidate) => path.win32.normalize(candidate) !== candidate
+    || !candidate.toLowerCase().startsWith(`${currentRoot.toLowerCase()}\\`))) {
+    throw slotError("slot_promotion_runtime_metadata_invalid");
+  }
+  return { ...plan, rootPath };
 }
 
 export function planPeakBytes({ current, previous, incoming } = {}) {
@@ -431,9 +443,12 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal, insta
   if (!fsApi || typeof fsApi.openVersionRootNoFollow !== "function") {
     throw slotError("slot_no_follow_capability_required");
   }
-  if (!ownershipStore || typeof ownershipStore.load !== "function" || typeof ownershipStore.save !== "function") {
+  if (!ownershipStore || typeof ownershipStore.load !== "function"
+    || typeof ownershipStore.compareAndSwap !== "function") {
     throw slotError("slot_ownership_store_required");
   }
+  const ownershipCoordinator = getOwnershipCoordinator(ownershipStore);
+  ownershipStore = ownershipCoordinator.store;
   if (!journal || typeof journal.record !== "function" || typeof journal.listTransactions !== "function"
     || typeof journal.clear !== "function" || typeof journal.scopeId !== "string") {
     throw slotError("slot_journal_required");
@@ -1127,16 +1142,13 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal, insta
 
   return Object.freeze({
     promotePreparedVersion(rawPlan) {
-      return withOwnershipStoreLock(ownershipStore, () => promotePreparedVersion(rawPlan));
+      return ownershipCoordinator.runExclusive(() => promotePreparedVersion(rawPlan));
     },
     rollbackVersion(componentId) {
-      return withOwnershipStoreLock(ownershipStore, () => rollbackVersion(componentId));
+      return ownershipCoordinator.runExclusive(() => rollbackVersion(componentId));
     },
     recoverJournalTransactions(recoveryJournal) {
-      return withOwnershipStoreLock(
-        ownershipStore,
-        () => recoverJournalTransactions(recoveryJournal),
-      );
+      return ownershipCoordinator.runExclusive(() => recoverJournalTransactions(recoveryJournal));
     },
   });
 }

@@ -5,6 +5,7 @@ import { readInstallRootCapability } from "./path-policy.mjs";
 const SHA256 = /^[a-f0-9]{64}$/u;
 const VERSION = /^\d+(?:\.\d+){0,3}$/u;
 const PINS = new WeakMap();
+const MISSING_CODES = new Set(["ENOENT", "ERROR_FILE_NOT_FOUND", "ERROR_PATH_NOT_FOUND", "windows_path_missing"]);
 
 function identityError(code, cause) {
   const error = new Error(code, cause === undefined ? undefined : { cause });
@@ -27,6 +28,10 @@ function canonicalPath(value, code) {
 
 function samePath(left, right) {
   return left.toLowerCase() === right.toLowerCase();
+}
+
+function isMissing(error) {
+  return MISSING_CODES.has(error?.code) || MISSING_CODES.has(error?.cause?.code);
 }
 
 function validateDiscovery(value, targetDir) {
@@ -73,6 +78,12 @@ function validateDirectoryPin(value) {
   return value;
 }
 
+function validateParentPin(value) {
+  const pin = validateDirectoryPin(value);
+  if (typeof pin.listChildren !== "function") throw identityError("git_parent_pin_invalid");
+  return pin;
+}
+
 async function closeAll(handles) {
   const errors = [];
   for (const handle of handles.reverse()) {
@@ -112,6 +123,7 @@ export function createGitIdentityCapabilities({
     const record = {
       state: "open", targetDir, discovery: null,
       installerPath: null, installerSha256: null, handles,
+      targetMustBeAbsent: rawPlan.targetMustBeAbsent === true, parentPin: null,
     };
     try {
       if (rawPlan.installerPath !== undefined) {
@@ -124,12 +136,23 @@ export function createGitIdentityCapabilities({
         }
       }
       if (rawPlan.discovery !== null && rawPlan.discovery !== undefined) {
+        if (record.targetMustBeAbsent) throw identityError("git_identity_plan_invalid");
         record.discovery = validateDiscovery(rawPlan.discovery, targetDir);
         handles.push(validateDirectoryPin(await fileCapabilities.openDirectoryNoFollow(targetDir)));
         handles.push(await pinFile(record.discovery.executablePath));
         handles.push(await pinFile(record.discovery.uninstallerPath));
-      } else if (!samePath(targetDir, path.win32.join(installRoot, "Git"))) {
-        throw identityError("git_identity_unregistered_target_rejected");
+      } else {
+        if (!samePath(targetDir, path.win32.join(installRoot, "Git"))) {
+          throw identityError("git_identity_unregistered_target_rejected");
+        }
+        if (record.targetMustBeAbsent) {
+          record.parentPin = validateParentPin(await fileCapabilities.openDirectoryNoFollow(installRoot));
+          handles.push(record.parentPin);
+          const children = await record.parentPin.listChildren();
+          if (!Array.isArray(children) || children.some((name) => name.toLowerCase() === "git")) {
+            throw identityError("git_identity_target_exists");
+          }
+        }
       }
       const capability = Object.freeze(Object.create(null));
       PINS.set(capability, record);
@@ -151,6 +174,15 @@ export function createGitIdentityCapabilities({
     if (!isRecord(expectation)) throw identityError("git_identity_expectation_invalid");
     for (const handle of record.handles) {
       if (typeof handle.assertStableNoFollow === "function") await handle.assertStableNoFollow();
+    }
+    if (record.targetMustBeAbsent) {
+      if (expectation.targetMustBeAbsent !== true) throw identityError("git_identity_expectation_invalid");
+      const children = await record.parentPin.listChildren();
+      if (!Array.isArray(children) || children.some((name) => name.toLowerCase() === "git")) {
+        throw identityError("git_identity_target_exists");
+      }
+    } else if (expectation.targetMustBeAbsent === true) {
+      throw identityError("git_identity_expectation_invalid");
     }
     if (expectation.discovery !== undefined
       && JSON.stringify(validateDiscovery(expectation.discovery, record.targetDir)) !== JSON.stringify(record.discovery)) {
@@ -192,13 +224,25 @@ export function createGitIdentityCapabilities({
 
   async function discardRetainedInstaller(value) {
     const retained = validateRetained(value, downloadsRoot);
-    const pin = await pinRetainedInstaller(retained);
+    let pin;
+    try {
+      pin = await pinRetainedInstaller(retained);
+    } catch (error) {
+      if (isMissing(error)) return Object.freeze({ deleted: false, missing: true });
+      throw error;
+    }
     try {
       await revalidate(pin, { installerSha256: retained.sha256 });
     } finally {
       await release(pin);
     }
-    await retainedInstallerStore.deleteVerified({ ...retained, installRoot });
+    try {
+      await retainedInstallerStore.deleteVerified({ ...retained, installRoot });
+    } catch (error) {
+      if (isMissing(error)) return Object.freeze({ deleted: false, missing: true });
+      throw error;
+    }
+    return Object.freeze({ deleted: true, missing: false });
   }
 
   return Object.freeze({

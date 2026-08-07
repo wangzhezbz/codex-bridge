@@ -10,6 +10,8 @@ import {
   isValidOwnershipState,
   readFixedDirectoryCapability,
   readInstallRootCapability,
+  revalidateFixedDirectoryCapability,
+  revalidateInstallRootCapability,
   resolveSkillTarget,
   validateInstallRoot,
 } from "../desktop/software-manager/path-policy.mjs";
@@ -62,7 +64,7 @@ test("accepts a normalized writable application directory", async () => {
 });
 
 test("main-process path authorities issue opaque fixed roots only after canonical no-follow validation", async () => {
-  const directoryStat = { isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false };
+  const directoryStat = { dev: 1, ino: 10, isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false };
   const install = await authorizeInstallRoot({
     candidate: "D:\\CBApps", env: fixtureEnv(), maxRelativePath: 180, access: allowAccess,
     realpath: async (value) => value, lstat: async () => directoryStat,
@@ -78,6 +80,27 @@ test("main-process path authorities issue opaque fixed roots only after canonica
   assert.deepEqual(readFixedDirectoryCapability(skills), { kind: "skills", path: CANONICAL_SKILLS_ROOT });
   assert.deepEqual(readFixedDirectoryCapability(desktop), { kind: "desktop", path: "C:\\Users\\me\\Desktop" });
   assert.throws(() => readInstallRootCapability({ path: "D:\\CBApps" }), /capability/);
+});
+
+test("path authorities revalidate directory identity and the current peak-path budget before use", async () => {
+  let identity = 10;
+  const lstat = async () => ({
+    dev: 1, ino: identity,
+    isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false,
+  });
+  const install = await authorizeInstallRoot({
+    candidate: "D:\\CBApps", env: fixtureEnv(), maxRelativePath: 180, access: allowAccess,
+    realpath: async (value) => value, lstat,
+  });
+  const skills = await authorizeSkillsRoot({
+    candidate: CANONICAL_SKILLS_ROOT, realpath: async (value) => value, lstat,
+  });
+  assert.equal(await revalidateInstallRootCapability(install, { maxRelativePath: 180 }), "D:\\CBApps");
+  assert.deepEqual(await revalidateFixedDirectoryCapability(skills), { kind: "skills", path: CANONICAL_SKILLS_ROOT });
+  await assert.rejects(revalidateInstallRootCapability(install, { maxRelativePath: 251 }), /path_too_long/u);
+  identity = 11;
+  await assert.rejects(revalidateInstallRootCapability(install, { maxRelativePath: 180 }), /identity_changed/u);
+  await assert.rejects(revalidateFixedDirectoryCapability(skills), /identity_changed/u);
 });
 
 test("fixed path authorities reject reparse roots and a renderer-provided desktop replacement", async () => {
@@ -195,6 +218,7 @@ for (const stat of [
 test("ownership rejects sibling-prefix escapes and recognizes explicit owned paths", () => {
   const ownership = {
     schemaVersion: 1,
+    generation: 0,
     installRoot: "C:\\Tools\\CodexBridge",
     components: { git: { installPath: "C:\\Tools\\CodexBridge\\components\\git" } },
     skills: { documents: { target: "C:\\Users\\me\\.codex\\skills\\documents" } },
@@ -280,6 +304,7 @@ for (const [label, target] of [
 test("ownership metadata strings never become authorized roots", () => {
   const ownership = {
     schemaVersion: 1,
+    generation: 0,
     installRoot: null,
     components: { app: { installPath: "C:\\Owned\\app", version: "C:\\Windows" } },
     skills: { documents: { target: "C:\\Owned\\skills\\documents", sha256: "C:\\Windows" } },
@@ -306,6 +331,7 @@ test("ownership path fields must be own properties of plain records", () => {
   const inheritedComponent = Object.create({ installPath: "C:\\Windows" });
   const ownership = {
     schemaVersion: 1,
+    generation: 0,
     installRoot: null,
     components: { app: inheritedComponent },
     skills: {},
@@ -320,6 +346,7 @@ test("ownership path fields must be own properties of plain records", () => {
 function validOwnership() {
   return {
     schemaVersion: 1,
+    generation: 0,
     installRoot: null,
     components: {},
     skills: {},
@@ -333,6 +360,7 @@ function validOwnership() {
 const malformedOwnershipCases = [
   ["inherited top-level installRoot", () => Object.assign(Object.create({ installRoot: "C:\\Windows" }), {
     schemaVersion: 1,
+    generation: 0,
     components: {},
     skills: {},
     shortcuts: [],

@@ -118,6 +118,11 @@ function record(overrides = {}) {
     versions: { incoming: "3.0.0", current: "2.0.0", previous: "1.0.0" },
     identities,
     integrities,
+    runtimeMetadata: {
+      entrypointPath: `${rootPath}\\c\\ChatGPT.exe`,
+      requiredFiles: [`${rootPath}\\c\\ChatGPT.exe`],
+      health: "pending-verify",
+    },
     ownershipBefore: {
       installRoot: rootPath,
       component: {
@@ -153,6 +158,7 @@ function rollbackRecord(overrides = {}) {
     versions: { ...base.versions, incoming: null },
     identities: { ...base.identities, incoming: null },
     integrities: { ...base.integrities, incoming: null },
+    runtimeMetadata: null,
     ...overrides,
   };
 }

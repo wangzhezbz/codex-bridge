@@ -9,6 +9,7 @@ const CANONICAL_SKILLS_ROOT = "C:\\Users\\me\\.codex\\skills";
 function state(installRoot = "C:\\Tools\\CodexBridge") {
   return {
     schemaVersion: 1,
+    generation: 0,
     installRoot,
     components: {},
     skills: {},
@@ -17,6 +18,10 @@ function state(installRoot = "C:\\Tools\\CodexBridge") {
     activeTask: null,
     lastTask: null,
   };
+}
+
+function committed(value, generation) {
+  return { ...structuredClone(value), generation };
 }
 
 function createMemoryStateFs(initial = {}) {
@@ -107,10 +112,19 @@ test("save flushes ownership.json.tmp and atomically renames it", async () => {
 
   await store.save(next);
 
-  assert.deepEqual(await store.load(), next);
+  assert.deepEqual(await store.load(), committed(next, 1));
   assert.ok(calls.find(([operation]) => operation === "sync"));
   assert.ok(calls.find((call) => call[0] === "rename-entry-no-follow"
     && call[1] === "ownership.json.tmp" && call[2] === "ownership.json"));
+});
+
+test("compareAndSwap rejects a stale persisted generation without mutating ownership", async () => {
+  const memory = createMemoryStateFs();
+  const store = createOwnershipStore({ stateDir: path.resolve("state-cas"), fsApi: memory.fsApi });
+  const first = await store.compareAndSwap(0, state("C:\\First"));
+  assert.equal(first.generation, 1);
+  await assert.rejects(store.compareAndSwap(0, state("C:\\Stale")), /generation_conflict/u);
+  assert.deepEqual(await store.load(), first);
 });
 
 test("a validated previous state is retained as ownership.json.bak", async () => {
@@ -121,8 +135,8 @@ test("a validated previous state is retained as ownership.json.bak", async () =>
   await store.save(previous);
   await store.save(next);
 
-  assert.deepEqual(JSON.parse(memory.get("ownership.json.bak")), previous);
-  assert.deepEqual(await store.load(), next);
+  assert.deepEqual(JSON.parse(memory.get("ownership.json.bak")), committed(previous, 1));
+  assert.deepEqual(await store.load(), committed(next, 2));
 });
 
 test("load falls back to a validated backup after interrupted atomic rename", async () => {
@@ -133,7 +147,7 @@ test("load falls back to a validated backup after interrupted atomic rename", as
   memory.setFailFinalRename(true);
   await assert.rejects(store.save(state("C:\\Next")), /interrupted/);
 
-  assert.deepEqual(await store.load(), previous);
+  assert.deepEqual(await store.load(), committed(previous, 1));
 });
 
 test("state files that are links or reparse points are never followed", async () => {
@@ -217,6 +231,7 @@ test("identity-aware rename refuses a state entry replaced after stable open", a
 const malformedNestedStateCases = [
   ["inherited top-level installRoot", () => Object.assign(Object.create({ installRoot: "C:\\Windows" }), {
     schemaVersion: 1,
+    generation: 0,
     components: {},
     skills: {},
     shortcuts: [],
@@ -264,7 +279,7 @@ test("retains JSON metadata while only fixed path fields define ownership record
     skillsRoot: "C:\\Owned\\skills",
   });
   await store.save(next);
-  assert.deepEqual(await store.load(), next);
+  assert.deepEqual(await store.load(), committed(next, 1));
 });
 
 test("store saves and loads Skill ownership bound to its injected canonical Skills root", async () => {
@@ -280,7 +295,7 @@ test("store saves and loads Skill ownership bound to its injected canonical Skil
   });
 
   await store.save(next);
-  assert.deepEqual(await store.load(), next);
+  assert.deepEqual(await store.load(), committed(next, 1));
 });
 
 test("store fails closed for Skill ownership without an injected canonical Skills root", async () => {
