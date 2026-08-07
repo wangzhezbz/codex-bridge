@@ -204,7 +204,7 @@ function sameJson(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function isVersionTransactionClaim(value) {
+export function isVersionTransactionClaim(value) {
   if (!hasExactKeys(value, ACTIVE_TRANSACTION_KEYS)
     || value.kind !== ACTIVE_TRANSACTION_KIND || value.schemaVersion !== 1
     || !ACTIVE_TRANSACTION_LIFECYCLES.has(value.lifecycle)

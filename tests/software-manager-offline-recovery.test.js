@@ -4,6 +4,10 @@ import path from "node:path";
 
 import { createInstallRootResolver } from "../desktop/software-manager/install-root-resolver.mjs";
 import { recoverOffline } from "../desktop/software-manager/offline-recovery.mjs";
+import { authorizeInstallRoot } from "../desktop/software-manager/path-policy.mjs";
+import { createVersionSlotManager } from "../desktop/software-manager/version-slots.mjs";
+
+const JOURNAL_SCOPE = "d:\\codexbridge\\state\\offline-transactions";
 
 function ownership(installRoot = null) {
   return {
@@ -19,20 +23,69 @@ function ownership(installRoot = null) {
   };
 }
 
+function versionClaim(componentId, rootPath, lifecycle = "active", taskId = `${componentId}-task`) {
+  return {
+    kind: "software-version-slot",
+    schemaVersion: 1,
+    lifecycle,
+    journalScope: JOURNAL_SCOPE,
+    taskId,
+    componentId,
+    mode: "promote",
+    rootPath,
+  };
+}
+
 function transaction(componentId, rootPath, taskId = `${componentId}-task`) {
+  const slots = componentId === "chatgpt"
+    ? { current: "c", previous: "cp", staging: "ct", retiring: "cr" }
+    : { current: "current", previous: "previous", staging: "staging", retiring: "retiring" };
+  const paths = Object.fromEntries(Object.entries(slots).map(([key, value]) => [key, `${rootPath}\\${value}`]));
+  const incomingIdentity = { volumeSerial: "volume-1", fileId: `${componentId}-incoming` };
+  const snapshot = {
+    schemaVersion: 2,
+    taskId,
+    componentId,
+    mode: "promote",
+    phase: "prepared",
+    rootPath,
+    slots,
+    paths,
+    versions: { incoming: "1.0.0", current: null, previous: null },
+    identities: { incoming: incomingIdentity, current: null, previous: null },
+    integrities: {
+      incoming: { treeDigest: "a".repeat(64), manifestDigest: "b".repeat(64) },
+      current: null,
+      previous: null,
+    },
+    runtimeMetadata: {
+      entrypointPath: `${paths.current}\\app.exe`,
+      requiredFiles: [`${paths.current}\\app.exe`],
+      health: "pending-verify",
+    },
+    ownershipBefore: {
+      installRoot: null,
+      component: null,
+      rollback: null,
+      activeTask: versionClaim(componentId, rootPath, "active", taskId),
+      lastTask: null,
+    },
+  };
   return {
     taskId,
     componentId,
     mode: "promote",
-    records: [],
-    snapshot: { taskId, componentId, mode: "promote", rootPath },
+    records: [structuredClone(snapshot)],
+    snapshot,
   };
 }
 
-function recoveryFixture({ installRoot = null, transactions = [], authorizeError = null } = {}) {
+function recoveryFixture({ installRoot = null, activeTask = null, transactions = [], authorizeError = null } = {}) {
   const events = [];
   const persisted = ownership(installRoot);
+  persisted.activeTask = structuredClone(activeTask);
   const journal = {
+    scopeId: JOURNAL_SCOPE,
     listTransactions: async () => {
       events.push(["journal-list"]);
       return structuredClone(transactions);
@@ -68,6 +121,67 @@ function recoveryFixture({ installRoot = null, transactions = [], authorizeError
     },
     persisted,
     events,
+  };
+}
+
+function realEmptyJournalRecoveryFixture(lifecycle) {
+  let persisted = ownership(lifecycle === "clearing" ? "D:\\CBApps" : null);
+  persisted.activeTask = versionClaim("chatgpt", "D:\\CBApps", lifecycle);
+  const journalCalls = [];
+  const journal = Object.freeze({
+    scopeId: JOURNAL_SCOPE,
+    record: async () => { throw new Error("unexpected_journal_record"); },
+    listTransactions: async () => {
+      journalCalls.push("list");
+      return [];
+    },
+    clear: async () => { throw new Error("unexpected_journal_clear"); },
+  });
+  const ownershipStore = {
+    load: async () => structuredClone(persisted),
+    async compareAndSwap(expectedGeneration, next) {
+      assert.equal(expectedGeneration, persisted.generation);
+      assert.equal(next.generation, persisted.generation + 1);
+      persisted = structuredClone(next);
+      return structuredClone(persisted);
+    },
+  };
+  let versionRootOpens = 0;
+  const fsApi = {
+    openVersionRootNoFollow: async () => {
+      versionRootOpens += 1;
+      throw new Error("unexpected_version_root_open");
+    },
+  };
+  const authorizeRoot = (candidate) => authorizeInstallRoot({
+    candidate,
+    env: {},
+    maxRelativePath: 80,
+    access: async () => {},
+    realpath: async (expected) => expected,
+    lstat: async () => ({
+      dev: 7,
+      ino: 11,
+      isDirectory: () => true,
+      isSymbolicLink: () => false,
+      isReparsePoint: () => false,
+    }),
+  });
+  return {
+    input: {
+      ownershipStore,
+      journal,
+      authorizeRoot,
+      createSlots: ({ installRootCapability }) => createVersionSlotManager({
+        fsApi,
+        ownershipStore,
+        journal,
+        installRootCapability,
+      }),
+    },
+    state: () => structuredClone(persisted),
+    journalCalls,
+    versionRootOpens: () => versionRootOpens,
   };
 }
 
@@ -142,6 +256,30 @@ test("V2RayN first-install journal restores dirname(rootPath)", async () => {
   ]);
 });
 
+test("reserved-before-WAL active claim restores root authority and is released by real slot recovery", async () => {
+  const fixture = realEmptyJournalRecoveryFixture("reserved");
+  const result = await recoverOffline(fixture.input);
+  assert.deepEqual(result, { status: "recovered", installRoot: "D:\\CBApps", recovered: [] });
+  assert.equal(fixture.state().activeTask, null);
+  assert.deepEqual(fixture.journalCalls, ["list", "list"]);
+  assert.equal(fixture.versionRootOpens(), 0);
+});
+
+test("clearing claim with an already-cleared journal is released by real slot recovery", async () => {
+  const fixture = realEmptyJournalRecoveryFixture("clearing");
+  const result = await recoverOffline(fixture.input);
+  assert.equal(result.installRoot, "D:\\CBApps");
+  assert.equal(fixture.state().activeTask, null);
+  assert.equal(fixture.versionRootOpens(), 0);
+});
+
+test("active claim with a missing journal reaches the existing slot fail-closed path", async () => {
+  const fixture = realEmptyJournalRecoveryFixture("active");
+  await assert.rejects(recoverOffline(fixture.input), /slot_recovery_journal_missing/u);
+  assert.equal(fixture.state().activeTask.lifecycle, "active");
+  assert.equal(fixture.versionRootOpens(), 0);
+});
+
 test("duplicate evidence for one canonical root is accepted once", async () => {
   const fixture = recoveryFixture({
     installRoot: "D:\\CBApps\\",
@@ -163,6 +301,42 @@ test("conflicting roots fail closed before authorization or recovery", async () 
   });
   await assert.rejects(recoverOffline(fixture.input), /offline_recovery_root_conflict/u);
   assert.deepEqual(fixture.events, [["journal-list"]]);
+});
+
+test("active claim and journal root conflict fails before authorization", async () => {
+  const activeTask = versionClaim("chatgpt", "D:\\CBApps", "reserved");
+  const fixture = recoveryFixture({
+    activeTask,
+    transactions: [transaction("chatgpt", "E:\\Other", "other-task")],
+  });
+  await assert.rejects(recoverOffline(fixture.input), /offline_recovery_root_conflict/u);
+  assert.deepEqual(fixture.events, [["journal-list"]]);
+});
+
+test("malformed software-version-slot active claim fails before authorization", async () => {
+  const malformedClaims = [
+    { ...versionClaim("chatgpt", "D:\\CBApps", "reserved"), unexpected: true },
+    versionClaim("v2rayn", "D:\\CBApps\\NotV2RayN", "reserved"),
+    { ...versionClaim("chatgpt", "D:\\CBApps", "reserved"), journalScope: "d:\\foreign\\journal" },
+  ];
+  for (const activeTask of malformedClaims) {
+    const fixture = recoveryFixture({ activeTask });
+    await assert.rejects(recoverOffline(fixture.input), /offline_recovery_state_invalid/u);
+    assert.deepEqual(fixture.events, [["journal-list"]]);
+  }
+});
+
+test("V2RayN and Git journal roots require their exact fixed component leaf", async () => {
+  for (const [componentId, rootPath] of [
+    ["v2rayn", "D:\\CBApps\\NotV2RayN"],
+    ["v2rayn", "D:\\CBApps\\v2rayn"],
+    ["git", "D:\\CBApps\\NotGit"],
+    ["git", "D:\\CBApps\\git"],
+  ]) {
+    const fixture = recoveryFixture({ transactions: [transaction(componentId, rootPath)] });
+    await assert.rejects(recoverOffline(fixture.input), /offline_recovery_journal_invalid/u);
+    assert.deepEqual(fixture.events, [["journal-list"]]);
+  }
 });
 
 test("malformed journal evidence fails closed before authorization", async () => {

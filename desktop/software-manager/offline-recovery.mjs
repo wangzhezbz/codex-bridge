@@ -1,6 +1,8 @@
 import path from "node:path";
 
+import { isValidActiveTask } from "./ownership-task-schema.mjs";
 import { recoverTransactions } from "./transaction-journal.mjs";
+import { isVersionTransactionClaim } from "./version-slots.mjs";
 
 const DEPENDENCY_KEYS = Object.freeze([
   "ownershipStore",
@@ -9,6 +11,7 @@ const DEPENDENCY_KEYS = Object.freeze([
   "createSlots",
 ]);
 const COMPONENT_IDS = new Set(["chatgpt", "v2rayn", "git"]);
+const COMPONENT_ROOT_NAMES = Object.freeze({ chatgpt: null, v2rayn: "V2RayN", git: "Git" });
 const RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu;
 
 function recoveryError(code, cause) {
@@ -61,6 +64,16 @@ function canonicalInstallRoot(value) {
   return normalized;
 }
 
+function installRootFromComponentRoot(componentId, rootPath) {
+  const componentRoot = canonicalInstallRoot(rootPath);
+  if (componentId === "chatgpt") return componentRoot;
+  const installRoot = canonicalInstallRoot(path.win32.dirname(componentRoot));
+  if (componentRoot !== path.win32.join(installRoot, COMPONENT_ROOT_NAMES[componentId])) {
+    throw recoveryError("offline_recovery_component_root_invalid");
+  }
+  return installRoot;
+}
+
 function rootFromTransaction(transaction) {
   if (!isPlainRecord(transaction) || !COMPONENT_IDS.has(transaction.componentId)
     || typeof transaction.taskId !== "string" || transaction.taskId.length === 0
@@ -71,21 +84,29 @@ function rootFromTransaction(transaction) {
     || typeof transaction.snapshot.rootPath !== "string") {
     throw recoveryError("offline_recovery_journal_invalid");
   }
-  let componentRoot;
   try {
-    componentRoot = canonicalInstallRoot(transaction.snapshot.rootPath);
-  } catch (error) {
-    throw recoveryError("offline_recovery_journal_invalid", error);
-  }
-  if (transaction.componentId === "chatgpt") return componentRoot;
-  try {
-    return canonicalInstallRoot(path.win32.dirname(componentRoot));
+    return installRootFromComponentRoot(transaction.componentId, transaction.snapshot.rootPath);
   } catch (error) {
     throw recoveryError("offline_recovery_journal_invalid", error);
   }
 }
 
-function inferUniqueRoot(ownership, transactions) {
+function rootFromActiveTask(ownership, journalScope) {
+  const activeTask = ownership.activeTask;
+  if (activeTask === null || activeTask === undefined) return null;
+  if (!isPlainRecord(activeTask) || activeTask.kind !== "software-version-slot") return null;
+  if (!isValidActiveTask(activeTask, { ownership }) || !isVersionTransactionClaim(activeTask)
+    || activeTask.journalScope !== journalScope) {
+    throw recoveryError("offline_recovery_state_invalid");
+  }
+  try {
+    return installRootFromComponentRoot(activeTask.componentId, activeTask.rootPath);
+  } catch (error) {
+    throw recoveryError("offline_recovery_state_invalid", error);
+  }
+}
+
+function inferUniqueRoot(ownership, transactions, journalScope) {
   if (!isPlainRecord(ownership)
     || !(ownership.installRoot === null || typeof ownership.installRoot === "string")
     || !Array.isArray(transactions)) {
@@ -93,6 +114,8 @@ function inferUniqueRoot(ownership, transactions) {
   }
   const candidates = [];
   if (ownership.installRoot !== null) candidates.push(ownership.installRoot);
+  const activeTaskRoot = rootFromActiveTask(ownership, journalScope);
+  if (activeTaskRoot !== null) candidates.push(activeTaskRoot);
   for (const transaction of transactions) candidates.push(rootFromTransaction(transaction));
   if (candidates.length === 0) return null;
 
@@ -117,7 +140,8 @@ export async function recoverOffline(dependencies) {
   }
   const { ownershipStore, journal, authorizeRoot, createSlots } = dependencies;
   if (!ownershipStore || typeof ownershipStore.load !== "function"
-    || !journal || typeof journal.listTransactions !== "function" || typeof journal.clear !== "function"
+    || !journal || typeof journal.scopeId !== "string"
+    || typeof journal.listTransactions !== "function" || typeof journal.clear !== "function"
     || typeof authorizeRoot !== "function" || typeof createSlots !== "function") {
     throw recoveryError("offline_recovery_dependencies_invalid");
   }
@@ -129,7 +153,7 @@ export async function recoverOffline(dependencies) {
   } catch (error) {
     throw recoveryError("offline_recovery_journal_invalid", error);
   }
-  const installRoot = inferUniqueRoot(ownership, transactions);
+  const installRoot = inferUniqueRoot(ownership, transactions, journal.scopeId);
   if (installRoot === null) {
     return Object.freeze({ status: "noop", installRoot: null, recovered: Object.freeze([]) });
   }
