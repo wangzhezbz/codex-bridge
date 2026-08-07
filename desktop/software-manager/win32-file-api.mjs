@@ -13,6 +13,7 @@ const FILE_ATTRIBUTE_DIRECTORY = 0x10;
 const FILE_ATTRIBUTE_REPARSE_POINT = 0x400;
 const FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
 const FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+const FILE_FLAG_DELETE_ON_CLOSE = 0x04000000;
 const FILE_ATTRIBUTE_TAG_INFO = 9;
 const FILE_STREAM_INFO = 7;
 const FILE_ID_INFO = 18;
@@ -120,8 +121,12 @@ export function createWin32FileApi({ platform = process.platform, koffi } = {}) 
     if (creation === null || typeof options?.directory !== "boolean") {
       throw win32Error("windows_open_options_invalid");
     }
+    if (options?.deleteOnClose !== undefined && typeof options.deleteOnClose !== "boolean") {
+      throw win32Error("windows_open_options_invalid");
+    }
     const flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT
-      | (options.directory ? FILE_FLAG_BACKUP_SEMANTICS : 0);
+      | (options.directory ? FILE_FLAG_BACKUP_SEMANTICS : 0)
+      | (options.deleteOnClose ? FILE_FLAG_DELETE_ON_CLOSE : 0);
     const handle = CreateFileW(toExtendedPath(exactPath), access, share, null, creation, flags, 0);
     if (handleValue(handle) === -1n) throw failure("CreateFileW");
     return handle;

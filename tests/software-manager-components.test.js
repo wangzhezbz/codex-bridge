@@ -89,6 +89,7 @@ function fixture({
   skillsRootCapability = SKILLS_CAPABILITY, onDownload = null, onExtract = null,
   onReplaceSkill = null, onGitInstall = null, onVerifyComponent = null,
   onAuthenticode = null, onGitPin = null, gitExecutionTimeoutMs = undefined,
+  onGitUninstall = null,
 } = {}) {
   let currentState = structuredClone(state);
   let saveCount = 0;
@@ -179,7 +180,7 @@ function fixture({
       return { targetDir: plan.targetDir };
     },
     async runGitUninstaller(plan) {
-      calls.gitUninstalls.push(plan); await plan.onStarted?.(); return { installDir: plan.installDir };
+      calls.gitUninstalls.push(plan); await plan.onStarted?.(); await onGitUninstall?.(plan); return { installDir: plan.installDir };
     },
   };
   const archiveService = {
@@ -467,7 +468,7 @@ test("core verification failure on first install records failed-unhealthy and ne
 });
 
 test("an interrupted first-install health save recovers pending-verify durably and inspect never reports normal", async () => {
-  const { adapters, getState } = fixture({
+  const { adapters, calls, getState } = fixture({
     finalVerifyFailure: new Error("final"), stateSaveFailureAt: 4,
   });
   await adapters.chatgpt.prepare({ taskId: "verify-first-interrupted" });
@@ -610,7 +611,7 @@ test("managed Git update pins the existing registered target and rejects replace
   assert.deepEqual(calls.gitInstalls, []);
 });
 
-test("a third managed Git update retains only current and previous installers and retries cleanup idempotently", async () => {
+test("a third managed Git update reports cleanup persistence failure and recovers it immediately", async () => {
   const state = emptyState(INSTALL_ROOT);
   state.components.git = {
     managed: true, installPath: "D:\\CBApps\\Git", version: "2.50.0",
@@ -627,12 +628,12 @@ test("a third managed Git update retains only current and previous installers an
   const prepared = await adapters.git.prepare({ taskId: "git-third", selected: true });
   assert.equal(prepared.status, "succeeded");
   const committed = await adapters.git.commit({ taskId: "git-third" });
-  assert.equal(committed.status, "succeeded");
-  assert.equal(getState().activeTask.kind, "git-install-cleanup");
-  assert.equal(calls.discarded.length, 1);
+  assert.equal(committed.status, "failed");
+  assert.match(committed.message, /git_managed_recovered_after_state_failure/u);
+  assert.equal(getState().activeTask, null);
+  assert.equal(calls.discarded.length, 2);
   assert.equal((await adapters.git.inspectInstalled({})).status, "succeeded");
   assert.equal(calls.discarded.length, 2);
-  assert.equal(getState().activeTask, null);
   assert.equal(getState().components.git.currentInstaller.version, "2.51.0");
   assert.equal(getState().components.git.previousInstaller.version, "2.50.0");
   assert.equal(calls.discarded[0].version, "2.49.0");
@@ -651,16 +652,19 @@ test("managed Git adopts a completed fixed-target install after the final owners
     executablePath: "D:\\CBApps\\Git\\cmd\\git.exe", uninstallerPath: "D:\\CBApps\\Git\\unins000.exe",
   };
   const current = { ...installed, version: "2.50.0" };
-  const { adapters, getState } = fixture({
+  const { adapters, calls, getState } = fixture({
     state, gitDiscoveries: [current, current, installed], gitDiscovery: installed, stateSaveFailureAt: 4,
   });
   await adapters.git.prepare({ taskId: "git-adopt", selected: true });
   const committed = await adapters.git.commit({ taskId: "git-adopt" });
-  assert.equal(committed.status, "succeeded", committed.message);
-  assert.match(committed.message, /warning/u);
-  assert.equal(getState().activeTask.kind, "git-install");
+  assert.equal(committed.status, "failed", committed.message);
+  assert.match(committed.message, /recovered_after_state_failure/u);
+  assert.equal(committed.versionAfter, "2.51.0");
+  assert.equal(getState().activeTask, null);
+  const installsBeforeInspect = calls.gitInstalls.length;
   const inspected = await adapters.git.inspectInstalled({});
   assert.equal(inspected.status, "succeeded", inspected.message);
+  assert.equal(calls.gitInstalls.length, installsBeforeInspect, "strict recovery must not execute the installer twice");
   assert.equal(getState().components.git.version, "2.51.0");
   assert.equal(getState().components.git.previousInstaller.version, "2.50.0");
   assert.equal(getState().activeTask, null);
@@ -712,7 +716,7 @@ test("managed Git rollback reinstalls the retained previous installer into the s
   const restored = { ...discovery, version: "2.50.0" };
   const { adapters, calls, getState } = fixture({ state, gitDiscoveries: [discovery, restored], gitDiscovery: restored });
   const rolled = await adapters.git.rollback({ taskId: "git-rollback" });
-  assert.equal(rolled.status, "succeeded");
+  assert.equal(rolled.status, "succeeded", rolled.message);
   assert.equal(calls.gitUninstalls[0].uninstallerPath, discovery.uninstallerPath);
   assert.equal(calls.gitUninstalls[0].installDir, discovery.installDir);
   assert.equal(calls.gitUninstalls[0].timeoutMs, 900_000);
@@ -727,7 +731,7 @@ test("managed Git rollback reinstalls the retained previous installer into the s
   assert.equal(getState().components.git.previousInstaller, null);
 });
 
-test("managed Git rollback remains succeeded and is adopted after post-reinstall state failure", async () => {
+test("managed Git rollback reports failed-pending and is adopted after post-reinstall state failure", async () => {
   const state = emptyState(INSTALL_ROOT);
   state.components.git = {
     managed: true, installPath: "D:\\CBApps\\Git", version: "2.51.0",
@@ -741,12 +745,13 @@ test("managed Git rollback remains succeeded and is adopted after post-reinstall
   };
   const current = { ...rolledBack, version: "2.51.0" };
   const { adapters, calls, getState } = fixture({
-    state, gitDiscoveries: [current, rolledBack, rolledBack], gitDiscovery: rolledBack, stateSaveFailureAt: 2,
+    state, gitDiscoveries: [current, rolledBack, rolledBack], gitDiscovery: rolledBack, stateSaveFailureAt: 3,
   });
   const rolled = await adapters.git.rollback({ taskId: "git-rollback-adopt" });
-  assert.equal(rolled.status, "succeeded");
-  assert.match(rolled.message, /warning/u);
+  assert.equal(rolled.status, "failed");
+  assert.match(rolled.message, /state_save_failed/u);
   assert.equal(getState().activeTask.kind, "git-rollback");
+  assert.equal(getState().activeTask.phase, "installing");
   const recovered = await adapters.git.inspectInstalled({});
   assert.equal(recovered.status, "succeeded", recovered.message);
   assert.equal(getState().components.git.version, "2.50.0");
@@ -764,10 +769,10 @@ test("rollback crash recovery pins an absent target until the replacement instal
     currentInstaller: rejectedInstaller, previousInstaller,
   };
   state.activeTask = {
-    kind: "git-rollback", taskId: "recover-rollback", version: previousInstaller.version,
+    kind: "git-rollback", phase: "installing", taskId: "recover-rollback", version: previousInstaller.version,
     targetDir: state.components.git.installPath, executablePath: state.components.git.executablePath,
     installerPath: previousInstaller.path, installerSha256: previousInstaller.sha256,
-    rejectedInstaller,
+    rejectedInstaller, leaseScope: "git-execute", leaseNonce: "7".repeat(32),
   };
   const restored = {
     ...externalGit, version: previousInstaller.version, installDir: state.components.git.installPath,
@@ -781,6 +786,48 @@ test("rollback crash recovery pins an absent target until the replacement instal
   assert.equal(calls.gitMutableReleases.length, 1);
 });
 
+test("rollback recovery distinguishes pre-uninstall abort, post-uninstall resume, and phase mismatch", async () => {
+  const makeState = (phase, taskId) => {
+    const state = emptyState(INSTALL_ROOT);
+    const rejectedInstaller = { path: "D:\\CBApps\\downloads\\git-2.51.0.exe", sha256: DIGEST_A, version: "2.51.0" };
+    const previousInstaller = { path: "D:\\CBApps\\downloads\\git-2.50.0.exe", sha256: DIGEST_B, version: "2.50.0" };
+    state.components.git = {
+      managed: true, installPath: "D:\\CBApps\\Git", version: "2.51.0",
+      executablePath: "D:\\CBApps\\Git\\cmd\\git.exe", uninstallerPath: "D:\\CBApps\\Git\\unins000.exe",
+      currentInstaller: rejectedInstaller, previousInstaller,
+    };
+    state.activeTask = {
+      kind: "git-rollback", phase, taskId, version: previousInstaller.version,
+      targetDir: state.components.git.installPath, executablePath: state.components.git.executablePath,
+      installerPath: previousInstaller.path, installerSha256: previousInstaller.sha256,
+      rejectedInstaller, leaseScope: "git-execute", leaseNonce: "7".repeat(32),
+    };
+    return state;
+  };
+  const current = { ...externalGit, version: "2.51.0", installDir: "D:\\CBApps\\Git",
+    executablePath: "D:\\CBApps\\Git\\cmd\\git.exe", uninstallerPath: "D:\\CBApps\\Git\\unins000.exe" };
+  const restored = { ...current, version: "2.50.0" };
+
+  const preUninstall = fixture({ state: makeState("uninstalling", "fault-pre-uninstall"), gitDiscovery: current });
+  assert.equal((await preUninstall.adapters.git.inspectInstalled({})).status, "succeeded");
+  assert.equal(preUninstall.getState().activeTask, null);
+  assert.deepEqual(preUninstall.calls.gitInstalls, []);
+
+  const postUninstall = fixture({
+    state: makeState("uninstalling", "fault-post-uninstall"),
+    gitDiscoveries: [{ kind: "none" }, restored], gitDiscovery: restored,
+  });
+  assert.equal((await postUninstall.adapters.git.inspectInstalled({})).status, "succeeded");
+  assert.equal(postUninstall.getState().components.git.version, "2.50.0");
+  assert.equal(postUninstall.calls.gitInstalls.length, 1);
+
+  const mismatched = fixture({ state: makeState("installing", "fault-phase-mismatch"), gitDiscovery: current });
+  const mismatchResult = await mismatched.adapters.git.inspectInstalled({});
+  assert.equal(mismatchResult.status, "failed");
+  assert.match(mismatchResult.message, /git_rollback_recovery_phase_mismatch/u);
+  assert.deepEqual(mismatched.calls.gitInstalls, []);
+});
+
 test("Git uninstall always runs the registered uninstaller; external requires explicit selection", async () => {
   const { adapters, calls } = fixture({ gitDiscovery: externalGit });
   assert.equal((await adapters.git.uninstall({ selected: false })).status, "failed");
@@ -791,6 +838,119 @@ test("Git uninstall always runs the registered uninstaller; external requires ex
   assert.equal(typeof calls.gitUninstalls[0].onStarted, "function");
   assert.equal(calls.verified.some((item) => item.kind === "authenticode"
     && item.filePath === externalGit.uninstallerPath), true);
+});
+
+test("a hung external Git uninstall keeps a leased persistent claim visible without blocking a second adapter", async () => {
+  let unblock;
+  let signalStarted;
+  const started = new Promise((resolve) => { signalStarted = resolve; });
+  const blocked = new Promise((resolve) => { unblock = resolve; });
+  const first = fixture({
+    gitDiscovery: externalGit,
+    onGitUninstall: async () => { signalStarted(); await blocked; },
+  });
+  const removing = first.adapters.git.uninstall({ selected: true, taskId: "hung-external-remove" });
+  await started;
+  assert.equal(first.getState().activeTask.kind, "git-uninstall");
+  assert.equal(first.getState().activeTask.phase, "executing");
+  assert.equal(first.getState().activeTask.leaseScope, "git-execute");
+  const inspected = await Promise.race([
+    first.createAnotherAdapters().git.inspectInstalled({}),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("external_uninstall_probe_blocked")), 100)),
+  ]);
+  assert.equal(inspected.status, "failed");
+  assert.match(inspected.message, /component_pending_transaction/u);
+  unblock();
+  assert.equal((await removing).status, "succeeded");
+});
+
+test("a hung managed Git uninstall keeps the same live claim visible to a second adapter", async () => {
+  const state = emptyState(INSTALL_ROOT);
+  state.components.git = {
+    managed: true, installPath: "D:\\CBApps\\Git", version: "2.51.0",
+    executablePath: "D:\\CBApps\\Git\\cmd\\git.exe", uninstallerPath: "D:\\CBApps\\Git\\unins000.exe",
+    currentInstaller: { path: "D:\\CBApps\\downloads\\git-2.51.0.exe", sha256: DIGEST_A, version: "2.51.0" },
+    previousInstaller: null,
+  };
+  const registered = { ...externalGit, version: "2.51.0", installDir: state.components.git.installPath,
+    executablePath: state.components.git.executablePath, uninstallerPath: state.components.git.uninstallerPath };
+  let unblock;
+  let signalStarted;
+  const started = new Promise((resolve) => { signalStarted = resolve; });
+  const blocked = new Promise((resolve) => { unblock = resolve; });
+  const first = fixture({
+    state, gitDiscovery: registered,
+    onGitUninstall: async () => { signalStarted(); await blocked; },
+  });
+  const removing = first.adapters.git.uninstall({ selected: true, taskId: "hung-managed-remove" });
+  await started;
+  assert.deepEqual(first.getState().activeTask, {
+    kind: "git-uninstall", phase: "executing", taskId: "hung-managed-remove", managed: true,
+    version: registered.version, targetDir: registered.installDir, executablePath: registered.executablePath,
+    uninstallerPath: registered.uninstallerPath, leaseScope: "git-execute",
+    leaseNonce: first.getState().activeTask.leaseNonce,
+  });
+  const inspected = await Promise.race([
+    first.createAnotherAdapters().git.inspectInstalled({}),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("managed_uninstall_probe_blocked")), 100)),
+  ]);
+  assert.equal(inspected.status, "failed");
+  assert.match(inspected.message, /component_pending_transaction/u);
+  unblock();
+  assert.equal((await removing).status, "succeeded");
+});
+
+test("rollback persists one live lease across uninstalling and installing phases", async () => {
+  const state = emptyState(INSTALL_ROOT);
+  state.components.git = {
+    managed: true, installPath: "D:\\CBApps\\Git", version: "2.51.0",
+    executablePath: "D:\\CBApps\\Git\\cmd\\git.exe", uninstallerPath: "D:\\CBApps\\Git\\unins000.exe",
+    currentInstaller: { path: "D:\\CBApps\\downloads\\git-2.51.0.exe", sha256: DIGEST_A, version: "2.51.0" },
+    previousInstaller: { path: "D:\\CBApps\\downloads\\git-2.50.0.exe", sha256: DIGEST_B, version: "2.50.0" },
+  };
+  const current = { ...externalGit, version: "2.51.0", installDir: state.components.git.installPath,
+    executablePath: state.components.git.executablePath, uninstallerPath: state.components.git.uninstallerPath };
+  const restored = { ...current, version: "2.50.0" };
+  let unblockUninstall;
+  let signalUninstall;
+  let unblockInstall;
+  let signalInstall;
+  const uninstallStarted = new Promise((resolve) => { signalUninstall = resolve; });
+  const uninstallBlocked = new Promise((resolve) => { unblockUninstall = resolve; });
+  const installStarted = new Promise((resolve) => { signalInstall = resolve; });
+  const installBlocked = new Promise((resolve) => { unblockInstall = resolve; });
+  const first = fixture({
+    state, gitDiscoveries: [current, restored], gitDiscovery: restored,
+    onGitUninstall: async () => { signalUninstall(); await uninstallBlocked; },
+    onGitInstall: async () => { signalInstall(); await installBlocked; },
+  });
+  const rolling = first.adapters.git.rollback({ taskId: "hung-rollback-install" });
+  await uninstallStarted;
+  const uninstallingTask = first.getState().activeTask;
+  assert.equal(uninstallingTask.kind, "git-rollback");
+  assert.equal(uninstallingTask.phase, "uninstalling");
+  assert.equal(uninstallingTask.leaseScope, "git-execute");
+  const uninstallingInspection = await Promise.race([
+    first.createAnotherAdapters().git.inspectInstalled({}),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("rollback_uninstall_probe_blocked")), 100)),
+  ]);
+  assert.equal(uninstallingInspection.status, "failed");
+  assert.match(uninstallingInspection.message, /component_pending_transaction/u);
+  unblockUninstall();
+  await installStarted;
+  const task = first.getState().activeTask;
+  assert.equal(task.kind, "git-rollback");
+  assert.equal(task.phase, "installing");
+  assert.equal(task.leaseScope, "git-execute");
+  assert.equal(task.leaseNonce, uninstallingTask.leaseNonce);
+  const inspected = await Promise.race([
+    first.createAnotherAdapters().git.inspectInstalled({}),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("rollback_probe_blocked")), 100)),
+  ]);
+  assert.equal(inspected.status, "failed");
+  assert.match(inspected.message, /component_pending_transaction/u);
+  unblockInstall();
+  assert.equal((await rolling).status, "succeeded");
 });
 
 test("Git uninstall rejects an untrusted registered uninstaller before execution", async () => {
@@ -819,7 +979,8 @@ test("managed Git uninstall is recovered when deletion completed before ownershi
     state, gitDiscoveries: [registered, { kind: "none" }], stateSaveFailureAt: 2,
   });
   const removed = await adapters.git.uninstall({ selected: true, taskId: "git-uninstall-recover" });
-  assert.equal(removed.status, "succeeded");
+  assert.equal(removed.status, "failed");
+  assert.match(removed.message, /state_save_failed/u);
   assert.equal(getState().activeTask.kind, "git-uninstall");
   const inspected = await adapters.git.inspectInstalled({});
   assert.equal(inspected.status, "skipped");
@@ -1154,4 +1315,42 @@ test("a prepare claim abandoned by a crashed process is cleared on restart", asy
   assert.equal(inspected.status, "skipped");
   assert.equal(getState().activeTask, null);
   assert.equal(getState().lastTask.action, "prepare-aborted");
+});
+
+test("a migrated round3 prepare is explicitly abandoned without probing a nonexistent lease", async () => {
+  const state = emptyState();
+  state.activeTask = {
+    kind: "legacy-abandoned-prepare", originalKind: "component-prepare",
+    taskId: "round3-prepare", componentId: "chatgpt", version: "2.0.0",
+  };
+  const { adapters, getState } = fixture({ state });
+  assert.equal((await adapters.chatgpt.inspectInstalled({})).status, "skipped");
+  assert.equal(getState().activeTask, null);
+  assert.equal(getState().lastTask.action, "legacy-prepare-abandoned");
+});
+
+test("a migrated round3 Git install reconciles fresh discovery without rerunning its installer", async () => {
+  const state = emptyState(INSTALL_ROOT);
+  state.components.git = {
+    managed: true, installPath: "D:\\CBApps\\Git", version: "2.50.0",
+    executablePath: "D:\\CBApps\\Git\\cmd\\git.exe", uninstallerPath: "D:\\CBApps\\Git\\unins000.exe",
+    currentInstaller: { path: "D:\\CBApps\\downloads\\git-2.50.0.exe", sha256: DIGEST_B, version: "2.50.0" },
+    previousInstaller: null,
+  };
+  state.activeTask = {
+    kind: "legacy-git-install-recovery", taskId: "round3-git", version: "2.51.0",
+    targetDir: state.components.git.installPath, executablePath: state.components.git.executablePath,
+    installerPath: "D:\\CBApps\\downloads\\git-2.51.0.exe", installerSha256: DIGEST_A,
+    replacedInstaller: null,
+  };
+  const installed = {
+    ...externalGit, version: "2.51.0", installDir: state.components.git.installPath,
+    executablePath: state.components.git.executablePath, uninstallerPath: state.components.git.uninstallerPath,
+  };
+  const { adapters, calls, getState } = fixture({ state, gitDiscovery: installed });
+  const inspected = await adapters.git.inspectInstalled({});
+  assert.equal(inspected.status, "succeeded", inspected.message);
+  assert.equal(getState().components.git.version, "2.51.0");
+  assert.equal(getState().activeTask, null);
+  assert.equal(calls.gitInstalls.length, 0);
 });

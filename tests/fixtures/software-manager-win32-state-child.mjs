@@ -41,6 +41,12 @@ if (mode === "hold-state") {
   process.on("message", async (message) => {
     if (message === "release") { await lease.release(); process.exit(0); }
   });
+} else if (mode === "hold-operation-before-claim") {
+  const lease = await store.acquireOperationLease({ nonce, scope: "prepare", wait: true });
+  process.send?.({ type: "leased" });
+  process.on("message", async (message) => {
+    if (message === "release") { await lease.release(); process.exit(0); }
+  });
 } else if (mode === "probe-operation") {
   const current = await store.load();
   const task = current.activeTask;

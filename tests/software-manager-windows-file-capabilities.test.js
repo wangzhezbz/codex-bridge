@@ -1010,6 +1010,12 @@ test("thin Win32 layer binds only fixed Kernel32 APIs and opens no-follow with d
   assert.equal(createCalls[0][5] & 0x02000000, 0x02000000);
   assert.equal(createCalls[0][1] & 0x20, 0x20);
   assert.equal(createCalls[0][2] & 0x4, 0);
+  await api.openPath("C:\\lease", {
+    access: ["read", "delete"], share: [], disposition: "createNew",
+    directory: false, deleteOnClose: true,
+  });
+  assert.equal(createCalls[1][5] & 0x04000000, 0x04000000);
+  assert.equal(createCalls[1][2], 0);
   await api.renameByHandle(42n, 99n, "target.lnk", { replace: false });
   await api.deleteByHandle(42n, { directory: false });
   assert.equal(setInfoCalls[0][1], 3);

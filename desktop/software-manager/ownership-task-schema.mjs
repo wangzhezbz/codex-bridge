@@ -94,9 +94,16 @@ function validComponentUninstall(task, ownership) {
 function validGit(task, ownership) {
   if (!GIT_TASK.has(task.kind) || !TASK_ID.test(task.taskId ?? "")
     || !canonicalPath(task.targetDir) || !canonicalPath(task.executablePath)
-    || (task.kind !== "git-external-install"
+    || (!(task.kind === "git-external-install" || (task.kind === "git-uninstall" && task.managed === false))
       && (typeof ownership.installRoot !== "string" || !within(task.targetDir, ownership.installRoot)))) return false;
-  if (task.kind === "git-uninstall") return exact(task, ["kind", "taskId", "targetDir", "executablePath"]);
+  if (task.kind === "git-uninstall") {
+    return exact(task, [
+      "kind", "phase", "taskId", "managed", "version", "targetDir", "executablePath", "uninstallerPath",
+      "leaseScope", "leaseNonce",
+    ]) && task.phase === "executing" && typeof task.managed === "boolean" && VERSION.test(task.version)
+      && canonicalPath(task.uninstallerPath) && path.win32.dirname(task.uninstallerPath) === task.targetDir
+      && task.leaseScope === "git-execute" && LEASE_NONCE.test(task.leaseNonce);
+  }
   if (task.kind === "git-install-cleanup") return exact(task, ["kind", "taskId", "targetDir", "executablePath", "replacedInstaller"])
     && installer(task.replacedInstaller);
   if (task.kind === "git-rollback-cleanup") return exact(task, ["kind", "taskId", "targetDir", "executablePath", "rejectedInstaller"])
@@ -104,11 +111,13 @@ function validGit(task, ownership) {
   const tail = task.kind === "git-install" ? "replacedInstaller" : task.kind === "git-external-install" ? null : "rejectedInstaller";
   const keys = ["kind", "taskId", "version", "targetDir", "executablePath", "installerPath", "installerSha256"];
   if (tail) keys.push(tail);
-  if (["git-install", "git-external-install"].includes(task.kind)) keys.push("leaseScope", "leaseNonce");
+  if (task.kind === "git-rollback") keys.push("phase");
+  if (["git-install", "git-external-install", "git-rollback"].includes(task.kind)) keys.push("leaseScope", "leaseNonce");
   return exact(task, keys)
     && VERSION.test(task.version) && canonicalPath(task.installerPath) && SHA256.test(task.installerSha256)
     && (!tail || task[tail] === null || installer(task[tail]))
-    && (!["git-install", "git-external-install"].includes(task.kind)
+    && (task.kind !== "git-rollback" || ["uninstalling", "installing"].includes(task.phase))
+    && (!["git-install", "git-external-install", "git-rollback"].includes(task.kind)
       || (task.leaseScope === "git-execute" && LEASE_NONCE.test(task.leaseNonce)));
 }
 
@@ -143,6 +152,23 @@ export function isValidActiveTask(task, { ownership, skillsRoot } = {}) {
     return exact(task, ["kind", "taskId", "skillId", "version", "leaseScope", "leaseNonce"])
       && TASK_ID.test(task.taskId) && SKILL_ID.test(task.skillId) && VERSION.test(task.version)
       && task.leaseScope === "prepare" && LEASE_NONCE.test(task.leaseNonce);
+  }
+  if (task.kind === "legacy-abandoned-prepare") {
+    return exact(task, ["kind", "originalKind", "taskId", "componentId", "version"])
+      && ["component-prepare", "skill-prepare"].includes(task.originalKind)
+      && TASK_ID.test(task.taskId) && VERSION.test(task.version)
+      && (task.originalKind === "component-prepare"
+        ? ["chatgpt", "v2rayn", "git"].includes(task.componentId)
+        : SKILL_ID.test(task.componentId));
+  }
+  if (task.kind === "legacy-git-install-recovery") {
+    return exact(task, [
+      "kind", "taskId", "version", "targetDir", "executablePath", "installerPath", "installerSha256", "replacedInstaller",
+    ]) && TASK_ID.test(task.taskId) && VERSION.test(task.version)
+      && canonicalPath(task.targetDir) && canonicalPath(task.executablePath)
+      && canonicalPath(task.installerPath) && SHA256.test(task.installerSha256)
+      && typeof ownership.installRoot === "string" && within(task.targetDir, ownership.installRoot)
+      && (task.replacedInstaller === null || installer(task.replacedInstaller));
   }
   if (GIT_TASK.has(task.kind)) return validGit(task, ownership);
   if (["skill-replace", "skill-uninstall"].includes(task.kind)) return validSkill(task, skillsRoot);

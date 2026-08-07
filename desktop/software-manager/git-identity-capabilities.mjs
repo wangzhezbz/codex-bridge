@@ -207,22 +207,38 @@ export function createGitIdentityCapabilities({
 
   async function release(capability) {
     const record = requirePin(capability);
+    const errors = [];
+    for (const handle of [...record.handles].reverse()) {
+      try {
+        await handle.close();
+        record.handles.splice(record.handles.indexOf(handle), 1);
+        const mutableIndex = record.mutableHandles.indexOf(handle);
+        if (mutableIndex !== -1) record.mutableHandles.splice(mutableIndex, 1);
+        if (record.parentPin === handle) record.parentPin = null;
+      } catch (error) { errors.push(error); }
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) throw new AggregateError(errors, "git_identity_release_failed");
+    record.mutableReleased = true;
     record.state = "closed";
-    await closeAll(record.handles);
   }
 
   async function releaseMutable(capability) {
     const record = requirePin(capability);
     if (record.mutableReleased) throw identityError("git_mutable_identity_already_released");
-    record.mutableReleased = true;
-    const mutable = [...record.mutableHandles];
-    record.mutableHandles.length = 0;
-    record.parentPin = null;
-    for (const handle of mutable) {
-      const index = record.handles.indexOf(handle);
-      if (index !== -1) record.handles.splice(index, 1);
+    const errors = [];
+    for (const handle of [...record.mutableHandles].reverse()) {
+      try {
+        await handle.close();
+        record.mutableHandles.splice(record.mutableHandles.indexOf(handle), 1);
+        const handleIndex = record.handles.indexOf(handle);
+        if (handleIndex !== -1) record.handles.splice(handleIndex, 1);
+        if (record.parentPin === handle) record.parentPin = null;
+      } catch (error) { errors.push(error); }
     }
-    await closeAll(mutable);
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) throw new AggregateError(errors, "git_mutable_identity_release_failed");
+    record.mutableReleased = true;
   }
 
   async function retainInstaller(capability, value) {

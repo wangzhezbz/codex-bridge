@@ -521,7 +521,7 @@ test("Git installer command uses a fixed verified silent argument list", async (
   await fixture.host.runGitInstaller({
     installerPath: "D:\\staging\\Git.exe", targetDir: "D:\\CBApps\\Git\\current", onStarted: async () => {},
   });
-  assertCommand(fixture.calls.execFile[0], "D:\\staging\\Git.exe", [
+  assertSuspendedCommand(fixture.calls.suspendedRuns[0], "D:\\staging\\Git.exe", [
     "/VERYSILENT", "/NORESTART", "/NOCANCEL", "/SP-", "/CLOSEAPPLICATIONS",
     "/o:PathOption=Cmd", "/DIR=D:\\CBApps\\Git\\current",
   ]);
@@ -534,7 +534,7 @@ test("Git uninstaller command accepts only a direct-child uninstaller and fixed 
     installDir: "D:\\CBApps\\Git",
     onStarted: async () => {},
   });
-  assertCommand(fixture.calls.execFile[0], "D:\\CBApps\\Git\\unins000.exe", [
+  assertSuspendedCommand(fixture.calls.suspendedRuns[0], "D:\\CBApps\\Git\\unins000.exe", [
     "/VERYSILENT", "/NORESTART", "/NOCANCEL",
   ]);
   await assert.rejects(
@@ -546,61 +546,77 @@ test("Git uninstaller command accepts only a direct-child uninstaller and fixed 
   );
 });
 
-test("Git execution releases mutable pins only after spawn evidence and before process completion", async () => {
-  let allowSpawn;
+test("Git execution uses a suspended child and releases mutable pins before resume", async () => {
+  let allowCreate;
   let allowExit;
-  let started = false;
+  let released = false;
+  let resumed = false;
   let completed = false;
-  const spawnGate = new Promise((resolve) => { allowSpawn = resolve; });
+  const createGate = new Promise((resolve) => { allowCreate = resolve; });
   const exitGate = new Promise((resolve) => { allowExit = resolve; });
   const host = createWindowsHost({
     platform: "win32",
     env: {},
     electronShell: {},
-    async execFile(_file, _args, options) {
-      await spawnGate;
-      await options.onSpawn();
-      assert.equal(started, true, "the start callback releases mutable pins at spawn");
-      await exitGate;
-      completed = true;
-      return { exitCode: 0, stdout: "", stderr: "" };
+    async execFile() { throw new Error("Git must not use execFile"); },
+    suspendedProcess: {
+      async run(plan) {
+        await createGate;
+        assert.equal(released, false, "pins remain held after CreateProcessW and before the gate");
+        await plan.beforeResume();
+        assert.equal(released, true);
+        resumed = true;
+        await exitGate;
+        completed = true;
+        return { pid: 42, exitCode: 0 };
+      },
     },
   });
+  let runningError = null;
   const running = host.runGitInstaller({
     installerPath: "D:\\staging\\Git.exe",
     targetDir: "D:\\CBApps\\Git",
-    onStarted: async () => { started = true; },
-  });
+    onStarted: async () => { released = true; },
+  }).catch((error) => { runningError = error; });
   await Promise.resolve();
-  assert.equal(started, false, "pins remain held before the child is created");
-  allowSpawn();
-  while (!started) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(released, false, "pins remain held before the suspended child is created");
+  allowCreate();
+  await new Promise((resolve) => setImmediate(resolve));
+  if (runningError) throw runningError;
+  assert.equal(resumed, true);
   assert.equal(completed, false, "the installer may still be running after mutable pins are released");
   allowExit();
   await running;
 });
 
-test("Git execution forwards bounded timeout and cancellation and requires spawn evidence", async () => {
+test("Git execution forwards bounded timeout and cancellation to the suspended capability", async () => {
   const controller = new AbortController();
-  let receivedOptions;
+  let receivedPlan;
   const host = createWindowsHost({
     platform: "win32",
     env: {},
     electronShell: {},
-    async execFile(_file, _args, options) {
-      receivedOptions = options;
-      return { exitCode: 0, stdout: "", stderr: "" };
-    },
+    async execFile() { throw new Error("Git must not use execFile"); },
+    suspendedProcess: { async run(plan) { receivedPlan = plan; await plan.beforeResume(); return { pid: 42, exitCode: 0 }; } },
   });
-  await assert.rejects(host.runGitInstaller({
+  await host.runGitInstaller({
     installerPath: "D:\\staging\\Git.exe",
     targetDir: "D:\\CBApps\\Git",
     timeoutMs: 45_000,
     signal: controller.signal,
     onStarted: async () => {},
-  }), /git_process_start_evidence_missing/u);
-  assert.equal(receivedOptions.timeout, 45_000);
-  assert.equal(receivedOptions.signal, controller.signal);
+  });
+  assert.equal(receivedPlan.timeoutMs, 45_000);
+  assert.equal(receivedPlan.signal, controller.signal);
+  assert.equal(receivedPlan.executablePath, "D:\\staging\\Git.exe");
+  assert.deepEqual(receivedPlan.args.slice(-1), ["/DIR=D:\\CBApps\\Git"]);
+});
+
+test("Git execution fails closed when the suspended process capability is unavailable", async () => {
+  const host = createWindowsHost({ platform: "win32", env: {}, electronShell: {}, async execFile() {} });
+  await assert.rejects(host.runGitInstaller({
+    installerPath: "D:\\staging\\Git.exe", targetDir: "D:\\CBApps\\Git", onStarted: async () => {},
+  }), /git_suspended_process_capability_required/u);
 });
 
 for (const [label, action] of [
@@ -613,6 +629,7 @@ for (const [label, action] of [
     const fixture = fakeHost();
     await assert.rejects(action(fixture.host), /absolute|required|root|mismatch/);
     assert.equal(fixture.calls.execFile.length, 0);
+    assert.equal(fixture.calls.suspendedRuns.length, 0);
   });
 }
 
@@ -668,6 +685,7 @@ function fakeHost({
     fileInspects: [],
     fileRemoves: [],
     fileReleases: [],
+    suspendedRuns: [],
   };
   let spawnExitSettled = false;
   const spawnExit = new Promise(() => {}).finally(() => { spawnExitSettled = true; });
@@ -682,7 +700,6 @@ function fakeHost({
 
   const execFile = async (file, args, options) => {
     calls.execFile.push({ file, args: [...args], options });
-    await options.onSpawn?.();
     if (file === "reg.exe") {
       const key = args[1];
       if (!regOutputs.has(key)) return { exitCode: 1, stdout: "", stderr: "not found" };
@@ -701,6 +718,13 @@ function fakeHost({
       };
     }
     return { exitCode: 0, stdout: "", stderr: "" };
+  };
+  const suspendedProcess = {
+    async run(plan) {
+      calls.suspendedRuns.push(plan);
+      await plan.beforeResume();
+      return { pid: 4343, exitCode: 0 };
+    },
   };
 
   const registryReader = registryRecords === null ? undefined : async ({ key, fields }) => {
@@ -822,6 +846,7 @@ function fakeHost({
       processLister,
       shortcutFileApi,
       spawnDetached,
+      suspendedProcess,
       env,
     }),
     calls,
@@ -838,4 +863,9 @@ function assertCommand(call, file, args) {
   assert.equal(call.file, file);
   assert.deepEqual(call.args, args);
   assert.equal(call.options.shell, false);
+}
+
+function assertSuspendedCommand(call, executablePath, args) {
+  assert.equal(call.executablePath, executablePath);
+  assert.deepEqual(call.args, args);
 }

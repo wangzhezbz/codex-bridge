@@ -86,6 +86,25 @@ test("production Win32 locks recover after SIGKILL and operation claims stay liv
   }
 });
 
+test("production Win32 delete-on-close removes a lease killed before its claim is persisted", { skip: windowsOnly }, async () => {
+  const stateDir = await createStateDir("lease-preclaim-crash");
+  const nonce = "b".repeat(32);
+  const leasePath = path.join(stateDir, `.codexbridge-operation-prepare-${nonce}.lock`);
+  let holder;
+  try {
+    holder = child("hold-operation-before-claim", stateDir, "preclaim", nonce);
+    await waitMessage(holder, "leased");
+    await fs.access(leasePath);
+    holder.kill("SIGKILL");
+    await new Promise((resolve) => holder.once("exit", resolve));
+    holder = null;
+    await assert.rejects(fs.access(leasePath), (error) => error?.code === "ENOENT");
+  } finally {
+    if (holder) holder.kill("SIGKILL");
+    await cleanupStateDir(stateDir, nonce);
+  }
+});
+
 test("production Win32 rejects hard-link and reparse-point lock substitution", { skip: windowsOnly }, async () => {
   const stateDir = await createStateDir("attacks");
   const nativeApi = createWin32FileApi();

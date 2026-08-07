@@ -177,6 +177,7 @@ async function openPinnedPath(nativeApi, exactPath, {
   access,
   share,
   disposition = "openExisting",
+  deleteOnClose = false,
 } = {}) {
   const canonical = validateAbsolute(exactPath);
   const paths = cumulativePaths(canonical);
@@ -196,6 +197,7 @@ async function openPinnedPath(nativeApi, exactPath, {
         share: last ? share : ["read", "write"],
         disposition: last ? disposition : "openExisting",
         directory: expectedKind !== "file",
+        deleteOnClose: last && deleteOnClose,
       });
       owner.handles.add(handle);
       const info = validateInfo(await nativeApi.queryHandle(handle), expectedKind);
@@ -518,11 +520,13 @@ export function createWindowsFileCapabilities({
         try {
           pin = await openPinnedPath(nativeApi, leasePath, {
             kind: "file", access: ["read", "write", "delete", "attributes"], share: [], disposition: "createNew",
+            deleteOnClose: true,
           });
         } catch (error) {
           if (!isOccupied(error)) throw error;
           pin = await openPinnedPath(nativeApi, leasePath, {
             kind: "file", access: ["read", "write", "delete", "attributes"], share: [], disposition: "openExisting",
+            deleteOnClose: true,
           });
         }
         if (pin.leaf.info.nlink !== 1) throw capabilityError("windows_hard_link_rejected");
@@ -532,11 +536,8 @@ export function createWindowsFileCapabilities({
           async release() {
             if (released) throw capabilityError("operation_lease_already_released");
             released = true;
-            let primaryError = null;
-            try { await nativeApi.deleteByHandle(pin.leaf.handle, { directory: false }); }
-            catch (error) { primaryError = error; }
             pin.owner.closed = true;
-            await closeHandles(nativeApi, pin.owner.handles, primaryError);
+            await closeHandles(nativeApi, pin.owner.handles);
           },
         });
       } catch (error) {

@@ -279,7 +279,15 @@ export function createComponentAdapters({
 
   async function recoverAbandonedPrepareClaim(state) {
     const task = state?.activeTask;
-    if (!isRecord(task) || !["component-prepare", "skill-prepare"].includes(task.kind)) return state;
+    if (!isRecord(task) || !["component-prepare", "skill-prepare", "legacy-abandoned-prepare"].includes(task.kind)) return state;
+    if (task.kind === "legacy-abandoned-prepare") {
+      const recovered = structuredClone(state);
+      recovered.activeTask = null;
+      recovered.lastTask = {
+        taskId: task.taskId, componentId: task.componentId, action: "legacy-prepare-abandoned",
+      };
+      return saveState(recovered);
+    }
     const lease = await acquireOperationLease({ nonce: task.leaseNonce, scope: task.leaseScope, wait: false });
     if (lease === null) return state;
     try {
@@ -481,7 +489,7 @@ export function createComponentAdapters({
       };
       state = await saveState(recovered);
     }
-    const task = state.activeTask;
+    let task = state.activeTask;
     if (!isRecord(task) || !["component-uninstall", "component-shortcut"].includes(task.kind)) return state;
     if (task.kind === "component-shortcut") {
       if (!["chatgpt", "v2rayn"].includes(task.componentId) || !["reserved", "applied"].includes(task.phase)
@@ -902,14 +910,16 @@ export function createComponentAdapters({
 
   async function recoverGitTransaction() {
     let state = assertStateForManaged(await recoverAbandonedPrepareClaim(await loadState()));
-    const task = state.activeTask;
-    if (!isRecord(task) || !["git-install", "git-external-install", "git-install-cleanup", "git-rollback", "git-rollback-cleanup", "git-uninstall"].includes(task.kind)) {
+    let task = state.activeTask;
+    if (!isRecord(task) || !["git-install", "git-external-install", "git-install-cleanup", "git-rollback", "git-rollback-cleanup", "git-uninstall", "legacy-git-install-recovery"].includes(task.kind)) {
       return state;
     }
+    const legacyGitInstall = task.kind === "legacy-git-install-recovery";
+    if (legacyGitInstall) task = { ...task, kind: "git-install" };
     if (task.kind === "git-install-cleanup") return finishGitInstallCleanup(state);
     if (task.kind === "git-rollback-cleanup") return finishGitRollbackCleanup(state);
     let operationLease = null;
-    if (["git-install", "git-external-install"].includes(task.kind)) {
+    if (!legacyGitInstall && ["git-install", "git-external-install", "git-uninstall", "git-rollback"].includes(task.kind)) {
       operationLease = await acquireOperationLease({ nonce: task.leaseNonce, scope: task.leaseScope, wait: false });
       if (operationLease === null) return state;
     }
@@ -936,17 +946,24 @@ export function createComponentAdapters({
     if (task.kind === "git-uninstall") {
       if (discoveredRaw?.kind !== "none") {
         const discovered = validateExternalGit(discoveredRaw);
-        if (!managed || !exactManagedGitDiscovery(discovered, managed) || discovered.version !== managed.version) {
+        const matchesClaim = discovered.installDir === task.targetDir
+          && discovered.executablePath === task.executablePath
+          && discovered.uninstallerPath === task.uninstallerPath
+          && discovered.version === task.version;
+        if (!matchesClaim || (task.managed && (!managed || !exactManagedGitDiscovery(discovered, managed)))) {
           throw adapterError("git_uninstall_recovery_incomplete");
         }
         const aborted = structuredClone(state);
         aborted.activeTask = null;
+        aborted.lastTask = { taskId: task.taskId, componentId: "git", action: "uninstall-aborted" };
         await saveState(aborted);
         return aborted;
       }
-      if (managed) await deleteComponent({ componentId: "git", rootPath: managed.installPath, authorizedRoot: installRoot });
+      if (task.managed && managed) {
+        await deleteComponent({ componentId: "git", rootPath: managed.installPath, authorizedRoot: installRoot });
+      }
       const next = structuredClone(state);
-      delete next.components.git;
+      if (task.managed) delete next.components.git;
       next.activeTask = null;
       next.lastTask = { taskId: task.taskId, componentId: "git", action: "uninstall" };
       if (Object.keys(next.components).length === 0 && Object.keys(next.skills).length === 0) next.installRoot = null;
@@ -960,6 +977,12 @@ export function createComponentAdapters({
       return aborted;
     }
     if (discoveredRaw?.kind === "none" && task.kind === "git-rollback") {
+      if (task.phase === "uninstalling") {
+        const installing = structuredClone(state);
+        installing.activeTask.phase = "installing";
+        state = await saveState(installing);
+        task = state.activeTask;
+      }
       const installerPin = await pinRetainedInstaller({
         path: task.installerPath, sha256: task.installerSha256, version: task.version,
       });
@@ -986,6 +1009,9 @@ export function createComponentAdapters({
       throw adapterError("git_recovery_registration_mismatch");
     }
     if (managed && exactManagedGitDiscovery(discovered, managed) && discovered.version === managed.version) {
+      if (task.kind === "git-rollback" && task.phase !== "uninstalling") {
+        throw adapterError("git_rollback_recovery_phase_mismatch");
+      }
       const aborted = structuredClone(state);
       aborted.activeTask = null;
       await saveState(aborted);
@@ -1119,6 +1145,25 @@ export function createComponentAdapters({
     let prepared = null;
     let executionLease = null;
     let executionClaim = null;
+    const recoverManagedCommitFailure = async (error, before) => {
+      if (executionLease) {
+        await executionLease.release().catch(() => {});
+        executionLease = null;
+      }
+      let recovered = null;
+      let recoveryError = null;
+      try { recovered = await runOwnership(() => recoverGitTransaction()); }
+      catch (nextError) { recoveryError = nextError; }
+      const actual = recovered ? managedRecord(recovered, "git") : null;
+      return result("git", "commit", "failed", {
+        versionBefore: before,
+        versionAfter: actual?.version ?? before,
+        message: recoveryError
+          ? `git_managed_pending_recovery:${errorMessage(error)}:${errorMessage(recoveryError)}`
+          : `git_managed_recovered_after_state_failure:${errorMessage(error)}`,
+        rollbackAvailable: Boolean(actual?.previousInstaller),
+      });
+    };
     try {
       const context = rejectForbiddenContext(rawContext);
       const taskId = requireTaskId(context.taskId);
@@ -1221,19 +1266,11 @@ export function createComponentAdapters({
           return saveState(adopted);
         });
       } catch (error) {
-        return result("git", "commit", "succeeded", {
-          versionBefore: prepared.before, versionAfter: prepared.entry.version,
-          message: `git_managed_committed_with_warning:${errorMessage(error)}`,
-          rollbackAvailable: Boolean(prepared.previousRecord?.currentInstaller),
-        });
+        return recoverManagedCommitFailure(error, prepared.before);
       }
       if (next.activeTask) {
         try { await runOwnership(() => finishGitInstallCleanup(next)); } catch (error) {
-          return result("git", "commit", "succeeded", {
-            versionBefore: prepared.before, versionAfter: prepared.entry.version,
-            message: `git_managed_committed_with_warning:${errorMessage(error)}`,
-            rollbackAvailable: true,
-          });
+          return recoverManagedCommitFailure(error, prepared.before);
         }
       }
       return result("git", "commit", "succeeded", {
@@ -1272,10 +1309,14 @@ export function createComponentAdapters({
   async function uninstallGit(rawContext) {
     let pin = null;
     let before = null;
+    let executionLease = null;
+    let executionClaim = null;
     try {
+      await revalidateInstallRootCapability(installRootCapability);
       const context = rejectForbiddenContext(rawContext);
       if (context.selected !== true) throw adapterError("git_explicit_selection_required");
-      const state = await recoverGitTransaction();
+      const taskId = requireTaskId(context.taskId);
+      const state = await runOwnership(() => recoverGitTransaction());
       const managed = managedRecord(state, "git");
       if (state.activeTask !== null) throw adapterError("component_pending_transaction");
       const discovery = validateExternalGit(await windowsHost.discoverGit());
@@ -1289,16 +1330,16 @@ export function createComponentAdapters({
       const uninstallerSignature = await windowsHost.verifyAuthenticode(discovery.uninstallerPath);
       if (uninstallerSignature?.status !== "Valid") throw adapterError("git_uninstaller_authenticode_invalid");
       await revalidateGitPlan(pin, { discovery });
-      let reserved = state;
-      if (managed) {
-        const taskId = requireTaskId(context.taskId);
-        reserved = structuredClone(state);
-        reserved.activeTask = {
-          kind: "git-uninstall", taskId, targetDir: managed.installPath,
-          executablePath: managed.executablePath,
-        };
-        await saveState(reserved);
-      }
+      const execution = await reserveGitExecutionClaim(recoverGitTransaction, {
+        kind: "git-uninstall", phase: "executing", taskId, managed: Boolean(managed),
+        version: before, targetDir: discovery.installDir, executablePath: discovery.executablePath,
+        uninstallerPath: discovery.uninstallerPath,
+      }, async (current) => {
+        const currentManaged = managedRecord(current, "git");
+        if (JSON.stringify(currentManaged) !== JSON.stringify(managed)) throw adapterError("component_state_changed");
+        await revalidateGitPlan(pin, { discovery });
+      });
+      ({ claim: executionClaim, lease: executionLease } = execution);
       await windowsHost.runGitUninstaller({
         uninstallerPath: discovery.uninstallerPath, installDir: discovery.installDir,
         signal: context.signal, timeoutMs: gitExecutionTimeoutMs,
@@ -1306,34 +1347,41 @@ export function createComponentAdapters({
       });
       if (managed) {
         await deleteComponent({ componentId: "git", rootPath: managed.installPath, authorizedRoot: installRoot });
-        const next = structuredClone(reserved);
-        delete next.components.git;
-        next.activeTask = null;
-        next.lastTask = { taskId: reserved.activeTask.taskId, componentId: "git", action: "uninstall" };
-        if (Object.keys(next.components).length === 0 && Object.keys(next.skills).length === 0) next.installRoot = null;
-        try { await saveState(next); } catch (error) {
-          return result("git", "uninstall", "succeeded", {
-            versionBefore: before, versionAfter: null,
-            message: `git_managed_uninstalled_with_warning:${errorMessage(error)}`,
-          });
-        }
       }
+      await runOwnership(async () => {
+        const current = assertStateForManaged(await loadState());
+        if (JSON.stringify(current.activeTask) !== JSON.stringify(executionClaim)) {
+          throw adapterError("git_execution_claim_changed");
+        }
+        const next = structuredClone(current);
+        if (managed) delete next.components.git;
+        next.activeTask = null;
+        next.lastTask = { taskId, componentId: "git", action: "uninstall" };
+        if (managed && Object.keys(next.components).length === 0 && Object.keys(next.skills).length === 0) next.installRoot = null;
+        await saveState(next);
+      });
       return result("git", "uninstall", "succeeded", {
         versionBefore: before, versionAfter: null,
         message: managed ? "git_managed_uninstalled" : "git_external_uninstalled",
       });
     } catch (error) { return failed("git", "uninstall", error, before); }
-    finally { if (pin) await releaseGitPlan(pin).catch(() => {}); }
+    finally {
+      if (executionLease) await executionLease.release().catch(() => {});
+      if (pin) await releaseGitPlan(pin).catch(() => {});
+    }
   }
 
   async function rollbackGit(rawContext) {
     let pin = null;
     let targetPin = null;
     let before = null;
+    let executionLease = null;
+    let executionClaim = null;
     try {
+      await revalidateInstallRootCapability(installRootCapability);
       const context = rejectForbiddenContext(rawContext);
       const taskId = requireTaskId(context.taskId);
-      const state = await recoverGitTransaction();
+      const state = await runOwnership(() => recoverGitTransaction());
       const managed = managedRecord(state, "git");
       if (!managed?.previousInstaller) throw adapterError("rollback_not_available");
       before = managed.version;
@@ -1351,14 +1399,19 @@ export function createComponentAdapters({
       const signature = await windowsHost.verifyAuthenticode(managed.previousInstaller.path);
       if (signature?.status !== "Valid") throw adapterError("git_authenticode_invalid");
       await revalidateGitPlan(pin, { installerSha256: managed.previousInstaller.sha256 });
-      const reservation = structuredClone(state);
-      reservation.activeTask = {
-        kind: "git-rollback", taskId, targetDir: managed.installPath,
+      const execution = await reserveGitExecutionClaim(recoverGitTransaction, {
+        kind: "git-rollback", phase: "uninstalling", taskId, targetDir: managed.installPath,
         executablePath: managed.executablePath, version: managed.previousInstaller.version,
         installerPath: managed.previousInstaller.path, installerSha256: managed.previousInstaller.sha256,
         rejectedInstaller: managed.currentInstaller,
-      };
-      await saveState(reservation);
+      }, async (current) => {
+        if (JSON.stringify(managedRecord(current, "git")) !== JSON.stringify(managed)) {
+          throw adapterError("component_state_changed");
+        }
+        await revalidateGitPlan(targetPin, { discovery: currentDiscovery });
+        await revalidateGitPlan(pin, { installerSha256: managed.previousInstaller.sha256 });
+      });
+      ({ claim: executionClaim, lease: executionLease } = execution);
       await windowsHost.runGitUninstaller({
         uninstallerPath: currentDiscovery.uninstallerPath, installDir: currentDiscovery.installDir,
         signal: context.signal, timeoutMs: gitExecutionTimeoutMs,
@@ -1366,6 +1419,16 @@ export function createComponentAdapters({
       });
       await releaseGitPlan(targetPin);
       targetPin = null;
+      await runOwnership(async () => {
+        const current = assertStateForManaged(await loadState());
+        if (JSON.stringify(current.activeTask) !== JSON.stringify(executionClaim)) {
+          throw adapterError("git_execution_claim_changed");
+        }
+        executionClaim = { ...executionClaim, phase: "installing" };
+        const installing = structuredClone(current);
+        installing.activeTask = structuredClone(executionClaim);
+        await saveState(installing);
+      });
       targetPin = await pinGitPlan({ targetDir: managed.installPath, targetMustBeAbsent: true });
       await revalidateGitPlan(targetPin, { targetMustBeAbsent: true });
       await revalidateGitPlan(pin, { installerSha256: managed.previousInstaller.sha256 });
@@ -1381,34 +1444,31 @@ export function createComponentAdapters({
       }
       const restoredPin = await pinGitPlan({ discovery: restoredDiscovery, targetDir: managed.installPath });
       try { await revalidateGitPlan(restoredPin, { discovery: restoredDiscovery }); } finally { await releaseGitPlan(restoredPin); }
-      const next = structuredClone(reservation);
-      next.components.git = {
-        ...managed, version: managed.previousInstaller.version,
-        currentInstaller: managed.previousInstaller, previousInstaller: null,
-        uninstallerPath: restoredDiscovery.uninstallerPath,
-      };
-      next.activeTask = {
-        kind: "git-rollback-cleanup", taskId, targetDir: managed.installPath,
-        executablePath: managed.executablePath, rejectedInstaller: managed.currentInstaller,
-      };
-      try { await saveState(next); } catch (error) {
-        return result("git", "rollback", "succeeded", {
-          versionBefore: before, versionAfter: managed.previousInstaller.version,
-          message: `git_managed_rolled_back_with_warning:${errorMessage(error)}`, rollbackAvailable: false,
-        });
-      }
-      try { await finishGitRollbackCleanup(next); } catch (error) {
-        return result("git", "rollback", "succeeded", {
-          versionBefore: before, versionAfter: managed.previousInstaller.version,
-          message: `git_managed_rolled_back_with_warning:${errorMessage(error)}`, rollbackAvailable: false,
-        });
-      }
+      const next = await runOwnership(async () => {
+        const current = assertStateForManaged(await loadState());
+        if (JSON.stringify(current.activeTask) !== JSON.stringify(executionClaim)) {
+          throw adapterError("git_execution_claim_changed");
+        }
+        const adopted = structuredClone(current);
+        adopted.components.git = {
+          ...managed, version: managed.previousInstaller.version,
+          currentInstaller: managed.previousInstaller, previousInstaller: null,
+          uninstallerPath: restoredDiscovery.uninstallerPath,
+        };
+        adopted.activeTask = {
+          kind: "git-rollback-cleanup", taskId, targetDir: managed.installPath,
+          executablePath: managed.executablePath, rejectedInstaller: managed.currentInstaller,
+        };
+        return saveState(adopted);
+      });
+      await runOwnership(() => finishGitRollbackCleanup(next));
       return result("git", "rollback", "succeeded", {
         versionBefore: before, versionAfter: next.components.git.version,
         message: "git_managed_rolled_back", rollbackAvailable: false,
       });
     } catch (error) { return failed("git", "rollback", error, before); }
     finally {
+      if (executionLease) await executionLease.release().catch(() => {});
       if (targetPin) await releaseGitPlan(targetPin).catch(() => {});
       if (pin) await releaseGitPlan(pin).catch(() => {});
     }
@@ -1659,7 +1719,7 @@ export function createComponentAdapters({
     git: Object.freeze({
       inspectInstalled: coordinated(inspectGit, { install: true }), prepare: prepareGit,
       commit: commitGit, verify: coordinated(verifyGit, { install: true }),
-      uninstall: coordinated(uninstallGit, { install: true }), rollback: coordinated(rollbackGit, { install: true }),
+      uninstall: uninstallGit, rollback: rollbackGit,
     }),
     skills: Object.freeze({
       inspectInstalled: coordinated(inspectSkills, {}), prepare: prepareSkills,

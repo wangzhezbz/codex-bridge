@@ -8,6 +8,7 @@ const LEGACY_OWNERSHIP_KEYS = Object.freeze([
 ]);
 const OPERATION_LEASE_NONCE = /^[a-f0-9]{32}$/u;
 const OPERATION_LEASE_SCOPES = new Set(["prepare", "git-execute"]);
+const OWNERSHIP_KEYS = Object.freeze([...LEGACY_OWNERSHIP_KEYS, "generation"]);
 
 function stateError(code) {
   const error = new Error(code);
@@ -27,6 +28,43 @@ function emptyState() {
     activeTask: null,
     lastTask: null,
   };
+}
+
+function plainRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.getPrototypeOf(value) === Object.prototype;
+}
+
+function exactRecord(value, keys) {
+  return plainRecord(value) && Object.keys(value).length === keys.length
+    && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function migrateKnownRound3Task(value) {
+  if (!exactRecord(value, OWNERSHIP_KEYS) || !Number.isSafeInteger(value.generation) || value.generation < 0) return null;
+  const task = value.activeTask;
+  let migratedTask = null;
+  if (exactRecord(task, ["kind", "taskId", "componentId", "version"])
+    && task.kind === "component-prepare") {
+    migratedTask = {
+      kind: "legacy-abandoned-prepare", originalKind: task.kind,
+      taskId: task.taskId, componentId: task.componentId, version: task.version,
+    };
+  } else if (exactRecord(task, ["kind", "taskId", "skillId", "version"])
+    && task.kind === "skill-prepare") {
+    migratedTask = {
+      kind: "legacy-abandoned-prepare", originalKind: task.kind,
+      taskId: task.taskId, componentId: task.skillId, version: task.version,
+    };
+  } else if (exactRecord(task, [
+    "kind", "taskId", "version", "targetDir", "executablePath", "installerPath", "installerSha256", "replacedInstaller",
+  ]) && task.kind === "git-install") {
+    migratedTask = { ...structuredClone(task), kind: "legacy-git-install-recovery" };
+  }
+  if (migratedTask === null) return null;
+  const migrated = structuredClone(value);
+  migrated.activeTask = migratedTask;
+  return migrated;
 }
 
 function requireDirectoryHandle(handle) {
@@ -61,13 +99,17 @@ async function readValidated(directory, name, skillsRoot) {
     if (isValidOwnershipState(parsed, { skillsRoot })) {
       return { entry: handle.entry, status: "current", value: parsed };
     }
-    const plain = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
-      && Object.getPrototypeOf(parsed) === Object.prototype;
+    const round3 = migrateKnownRound3Task(parsed);
+    if (round3 && isValidOwnershipState(round3, { skillsRoot })) {
+      return { entry: handle.entry, status: "legacy", value: round3 };
+    }
+    const plain = plainRecord(parsed);
     if (plain && Object.keys(parsed).length === LEGACY_OWNERSHIP_KEYS.length
       && LEGACY_OWNERSHIP_KEYS.every((key) => Object.hasOwn(parsed, key))) {
       const migrated = { ...structuredClone(parsed), generation: 0 };
-      if (isValidOwnershipState(migrated, { skillsRoot })) {
-        return { entry: handle.entry, status: "legacy", value: migrated };
+      const taskMigrated = migrateKnownRound3Task(migrated) ?? migrated;
+      if (isValidOwnershipState(taskMigrated, { skillsRoot })) {
+        return { entry: handle.entry, status: "legacy", value: taskMigrated };
       }
     }
     return { entry: handle.entry, status: "invalid", value: null };

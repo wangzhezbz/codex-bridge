@@ -154,6 +154,54 @@ test("legacy ownership preserves a known active transaction during migration", a
   assert.equal(loaded.generation, 0);
 });
 
+test("a generation-bearing round3 component prepare migrates only its exact known shape", async () => {
+  const current = state("D:\\CBApps");
+  current.activeTask = {
+    kind: "component-prepare", taskId: "legacy-prepare", componentId: "chatgpt", version: "2.0.0",
+  };
+  const memory = createMemoryStateFs({
+    "ownership.json": "{broken",
+    "ownership.json.bak": JSON.stringify(current),
+  });
+  const store = createOwnershipStore({ stateDir: path.resolve("round3-prepare"), fsApi: memory.fsApi });
+  const loaded = await store.load();
+  assert.deepEqual(loaded.activeTask, {
+    kind: "legacy-abandoned-prepare", originalKind: "component-prepare",
+    taskId: "legacy-prepare", componentId: "chatgpt", version: "2.0.0",
+  });
+  assert.deepEqual(JSON.parse(memory.get("ownership.json")), loaded);
+});
+
+test("a generation-bearing round3 Git install migrates to strict discovery reconciliation", async () => {
+  const current = state("D:\\CBApps");
+  current.activeTask = {
+    kind: "git-install", taskId: "legacy-git", version: "2.51.0",
+    targetDir: "D:\\CBApps\\Git", executablePath: "D:\\CBApps\\Git\\cmd\\git.exe",
+    installerPath: "D:\\CBApps\\downloads\\git-2.51.0.exe", installerSha256: "a".repeat(64),
+    replacedInstaller: null,
+  };
+  const memory = createMemoryStateFs({ "ownership.json": JSON.stringify(current) });
+  const store = createOwnershipStore({ stateDir: path.resolve("round3-git"), fsApi: memory.fsApi });
+  const loaded = await store.load();
+  assert.equal(loaded.activeTask.kind, "legacy-git-install-recovery");
+  assert.equal(loaded.activeTask.taskId, "legacy-git");
+  assert.equal(loaded.generation, 0);
+  assert.deepEqual(JSON.parse(memory.get("ownership.json")), loaded);
+});
+
+test("round3 active tasks with an extra field stay invalid in main and backup", async () => {
+  const current = state("D:\\CBApps");
+  current.activeTask = {
+    kind: "component-prepare", taskId: "legacy-extra", componentId: "chatgpt", version: "2.0.0", surprise: true,
+  };
+  for (const name of ["ownership.json", "ownership.json.bak"]) {
+    const memory = createMemoryStateFs({ [name]: JSON.stringify(current) });
+    const store = createOwnershipStore({ stateDir: path.resolve(`round3-invalid-${name}`), fsApi: memory.fsApi });
+    await assert.rejects(store.load(), /ownership_state_invalid/u);
+    assert.equal(JSON.parse(memory.get(name)).activeTask.surprise, true);
+  }
+});
+
 test("unknown or extra legacy fields fail closed and are never replaced with an empty ownership file", async () => {
   const unknown = { ...legacyState(state("C:\\Legacy")), surprise: true };
   const serialized = JSON.stringify(unknown);

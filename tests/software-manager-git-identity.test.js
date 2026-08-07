@@ -23,7 +23,7 @@ const INSTALL_ROOT_CAPABILITY = await authorizeInstallRoot({
   }),
 });
 
-function fixture({ missingAfterDelete = false } = {}) {
+function fixture({ missingAfterDelete = false, failMutableCloseOnce = null } = {}) {
   const calls = [];
   const hashes = new Map([
     ["D:\\CBApps\\downloads\\git-2.51.0.exe", HASH],
@@ -35,7 +35,14 @@ function fixture({ missingAfterDelete = false } = {}) {
         if (!openPins.has(pin)) throw new Error("pin_closed");
         calls.push(["stable", filePath]);
       },
-      async close() { openPins.delete(pin); calls.push(["close-file", filePath]); },
+      async close() {
+        calls.push(["close-file", filePath]);
+        if (failMutableCloseOnce === filePath) {
+          failMutableCloseOnce = null;
+          throw new Error("close_once_failed");
+        }
+        openPins.delete(pin);
+      },
     };
     openPins.add(pin);
     return pin;
@@ -124,6 +131,23 @@ test("releases only mutable target pins at process start and retains the install
   await capabilities.release(pin);
   assert.equal(calls.some(([kind, value]) => kind === "close-file"
     && value === "D:\\CBApps\\downloads\\git-2.51.0.exe"), true);
+});
+
+test("a mutable close failure remains retryable and does not mark the pin released early", async () => {
+  const { calls, capabilities } = fixture({ failMutableCloseOnce: external.uninstallerPath });
+  const pin = await capabilities.pinPlan({
+    installerPath: "D:\\CBApps\\downloads\\git-2.51.0.exe",
+    installerSha256: HASH,
+    targetDir: external.installDir,
+    discovery: external,
+  });
+
+  await assert.rejects(capabilities.releaseMutable(pin), /close_once_failed/u);
+  await capabilities.releaseMutable(pin);
+  assert.equal(calls.filter(([kind, value]) => kind === "close-file"
+    && value === external.uninstallerPath).length, 2);
+  await capabilities.revalidate(pin, { installerSha256: HASH });
+  await capabilities.release(pin);
 });
 
 test("rejects a changed registration and unregistered arbitrary installation target", async () => {
