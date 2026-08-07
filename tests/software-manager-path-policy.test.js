@@ -379,6 +379,31 @@ test("activeTask registry accepts only an exact known transaction schema", () =>
   }
 });
 
+test("Git uninstall task binds external targets to a fixed registry authority and managed targets to CBApps", () => {
+  const registryKey = "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Git_is1";
+  const externalTask = {
+    kind: "git-uninstall", phase: "executing", taskId: "external-remove", mode: "external", version: "2.51.0",
+    targetDir: "C:\\Program Files\\Git", executablePath: "C:\\Program Files\\Git\\cmd\\git.exe",
+    uninstallerPath: "C:\\Program Files\\Git\\unins000.exe", registryKey,
+    leaseScope: "git-execute", leaseNonce: "a".repeat(32),
+  };
+  assert.equal(isValidOwnershipState({ ...validOwnership(), activeTask: externalTask }), true);
+  for (const activeTask of [
+    { ...externalTask, registryKey: "HKLM\\Untrusted\\Git" },
+    { ...externalTask, mode: "managed" },
+    { ...externalTask, executablePath: "C:\\Other\\git.exe" },
+    { ...externalTask, uninstallerPath: "C:\\Other\\unins000.exe" },
+  ]) {
+    assert.equal(isValidOwnershipState({ ...validOwnership(), activeTask }), false);
+  }
+  const managedTask = {
+    ...externalTask, taskId: "managed-remove", mode: "managed", targetDir: "D:\\CBApps\\Git",
+    executablePath: "D:\\CBApps\\Git\\cmd\\git.exe", uninstallerPath: "D:\\CBApps\\Git\\unins000.exe",
+  };
+  assert.equal(isValidOwnershipState({ ...validOwnership(), installRoot: "D:\\CBApps", activeTask: managedTask }), true);
+  assert.equal(isValidOwnershipState({ ...validOwnership(), installRoot: "D:\\Other", activeTask: managedTask }), false);
+});
+
 const malformedOwnershipCases = [
   ["inherited top-level installRoot", () => Object.assign(Object.create({ installRoot: "C:\\Windows" }), {
     schemaVersion: 1,

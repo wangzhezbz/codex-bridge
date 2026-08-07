@@ -939,18 +939,20 @@ export function createComponentAdapters({
       }
     const managed = managedRecord(state, "git");
     const targetDir = componentRoot(installRoot, "git");
-    if (task.targetDir !== targetDir || task.executablePath !== relativeFile(targetDir, "cmd/git.exe")) {
-      throw adapterError("git_recovery_record_invalid");
-    }
     let discoveredRaw = await windowsHost.discoverGit();
     if (task.kind === "git-uninstall") {
+      if (task.mode === "external" && managed !== null) throw adapterError("git_uninstall_recovery_mode_mismatch");
+      if (task.mode === "managed" && (!managed || task.targetDir !== targetDir
+        || task.executablePath !== relativeFile(targetDir, "cmd/git.exe"))) {
+        throw adapterError("git_recovery_record_invalid");
+      }
       if (discoveredRaw?.kind !== "none") {
         const discovered = validateExternalGit(discoveredRaw);
         const matchesClaim = discovered.installDir === task.targetDir
           && discovered.executablePath === task.executablePath
           && discovered.uninstallerPath === task.uninstallerPath
-          && discovered.version === task.version;
-        if (!matchesClaim || (task.managed && (!managed || !exactManagedGitDiscovery(discovered, managed)))) {
+          && discovered.version === task.version && discovered.registryKey === task.registryKey;
+        if (!matchesClaim || (task.mode === "managed" && !exactManagedGitDiscovery(discovered, managed))) {
           throw adapterError("git_uninstall_recovery_incomplete");
         }
         const aborted = structuredClone(state);
@@ -959,16 +961,19 @@ export function createComponentAdapters({
         await saveState(aborted);
         return aborted;
       }
-      if (task.managed && managed) {
+      if (task.mode === "managed") {
         await deleteComponent({ componentId: "git", rootPath: managed.installPath, authorizedRoot: installRoot });
       }
       const next = structuredClone(state);
-      if (task.managed) delete next.components.git;
+      if (task.mode === "managed") delete next.components.git;
       next.activeTask = null;
       next.lastTask = { taskId: task.taskId, componentId: "git", action: "uninstall" };
       if (Object.keys(next.components).length === 0 && Object.keys(next.skills).length === 0) next.installRoot = null;
       await saveState(next);
       return next;
+    }
+    if (task.targetDir !== targetDir || task.executablePath !== relativeFile(targetDir, "cmd/git.exe")) {
+      throw adapterError("git_recovery_record_invalid");
     }
     if (discoveredRaw?.kind === "none" && task.kind === "git-install" && managed === null) {
       const aborted = structuredClone(state);
@@ -1331,9 +1336,9 @@ export function createComponentAdapters({
       if (uninstallerSignature?.status !== "Valid") throw adapterError("git_uninstaller_authenticode_invalid");
       await revalidateGitPlan(pin, { discovery });
       const execution = await reserveGitExecutionClaim(recoverGitTransaction, {
-        kind: "git-uninstall", phase: "executing", taskId, managed: Boolean(managed),
+        kind: "git-uninstall", phase: "executing", taskId, mode: managed ? "managed" : "external",
         version: before, targetDir: discovery.installDir, executablePath: discovery.executablePath,
-        uninstallerPath: discovery.uninstallerPath,
+        uninstallerPath: discovery.uninstallerPath, registryKey: discovery.registryKey,
       }, async (current) => {
         const currentManaged = managedRecord(current, "git");
         if (JSON.stringify(currentManaged) !== JSON.stringify(managed)) throw adapterError("component_state_changed");

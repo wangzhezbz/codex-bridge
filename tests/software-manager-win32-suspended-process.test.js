@@ -32,7 +32,10 @@ for (const pointerSize of [8, 4]) {
       executablePath: "C:\\Program Files\\Git\\git.exe",
       args: ["", "two words", 'say "hi"'],
       cwd: "C:\\Program Files\\Git",
-      env: { Path: "C:\\Windows", SYSTEMROOT: "C:\\Windows" },
+      env: {
+        HTTP_PROXY: "http://http", ALL_PROXY: "http://all", HTTPS_PROXY: "http://https",
+        ALLUSERSPROFILE: "C:\\ProgramData",
+      },
       timeoutMs: 30_000,
       beforeResume: async () => { await Promise.resolve(); released = true; },
     });
@@ -40,12 +43,28 @@ for (const pointerSize of [8, 4]) {
     assert.deepEqual(fake.calls.resumeSawReleased, [true]);
     assert.equal(released, true);
     assert.equal(fake.calls.create[0].commandLine, '"C:\\Program Files\\Git\\git.exe" "" "two words" "say \\"hi\\""');
-    assert.deepEqual(fake.calls.create[0].environment, ["Path=C:\\Windows", "SYSTEMROOT=C:\\Windows"]);
+    assert.deepEqual(fake.calls.create[0].environment, [
+      "ALLUSERSPROFILE=C:\\ProgramData", "ALL_PROXY=http://all",
+      "HTTPS_PROXY=http://https", "HTTP_PROXY=http://http",
+    ]);
+    assert.equal(fake.calls.create[0].environmentRaw.subarray(-4).equals(Buffer.alloc(4)), true);
     assert.equal(fake.calls.create[0].startupSize, pointerSize === 8 ? 104 : 68);
     assert.deepEqual(fake.calls.closed.sort(), [11, 12]);
     assert.equal(capability.activeProcessCount(), 0);
   });
 }
+
+test("environment keys reject ASCII and Unicode case-insensitive ordinal duplicates", async () => {
+  for (const env of [{ Path: "one", PATH: "two" }, { "Å_KEY": "one", "å_key": "two" }]) {
+    const fake = fakeKernel32(8);
+    const capability = createWin32SuspendedProcessCapability({ platform: "win32", koffi: fake.koffi });
+    await assert.rejects(capability.run({
+      executablePath: "C:\\Git\\git.exe", args: [], cwd: "C:\\Git", env, timeoutMs: 30_000,
+      beforeResume: async () => {},
+    }), /windows_process_environment_duplicate/u);
+    assert.deepEqual(fake.calls.create, []);
+  }
+});
 
 test("timeout terminates the suspended-process child, waits for exit, and closes both handles", async () => {
   const fake = fakeKernel32(8, { neverExitsUntilTerminated: true });
@@ -54,6 +73,25 @@ test("timeout terminates the suspended-process child, waits for exit, and closes
     executablePath: "C:\\Git\\git.exe", args: [], cwd: "C:\\Git", env: {}, timeoutMs: 30,
     beforeResume: async () => {},
   }), /windows_process_timeout/u);
+  assert.equal(fake.calls.terminated.length, 1);
+  assert.deepEqual(fake.calls.closed.sort(), [11, 12]);
+  assert.equal(capability.activeProcessCount(), 0);
+});
+
+test("termination wait has its own deadline and still closes handles when the kernel never signals", async () => {
+  const fake = fakeKernel32(8, { neverExitsUntilTerminated: true, neverSignalsAfterTerminate: true });
+  const capability = createWin32SuspendedProcessCapability({
+    platform: "win32", koffi: fake.koffi, pollIntervalMs: 1, terminationWaitTimeoutMs: 30,
+  });
+  await assert.rejects(capability.run({
+    executablePath: "C:\\Git\\git.exe", args: [], cwd: "C:\\Git", env: {}, timeoutMs: 20,
+    beforeResume: async () => {},
+  }), (error) => {
+    const details = JSON.stringify(error, Object.getOwnPropertyNames(error));
+    assert.match(details, /windows_process_timeout/u);
+    assert.match(details, /windows_process_termination_wait_timeout/u);
+    return true;
+  });
   assert.equal(fake.calls.terminated.length, 1);
   assert.deepEqual(fake.calls.closed.sort(), [11, 12]);
   assert.equal(capability.activeProcessCount(), 0);
@@ -139,7 +177,7 @@ for (const mode of ["timeout", "abort"]) {
   });
 }
 
-function fakeKernel32(pointerSize, { neverExitsUntilTerminated = false } = {}) {
+function fakeKernel32(pointerSize, { neverExitsUntilTerminated = false, neverSignalsAfterTerminate = false } = {}) {
   let terminated = false;
   let releasedProbe = () => false;
   const calls = { create: [], resumed: [], terminated: [], closed: [], resumeSawReleased: [] };
@@ -149,7 +187,7 @@ function fakeKernel32(pointerSize, { neverExitsUntilTerminated = false } = {}) {
       const environmentText = readWide(environment, true);
       calls.create.push({
         commandLine: commandText, environment: environmentText.split("\0").filter(Boolean), cwd,
-        inherit, flags, startupSize: startup.readUInt32LE(0),
+        environmentRaw: Buffer.from(environment), inherit, flags, startupSize: startup.readUInt32LE(0),
       });
       if (pointerSize === 8) {
         info.writeBigUInt64LE(11n, 0); info.writeBigUInt64LE(12n, 8); info.writeUInt32LE(4242, 16); info.writeUInt32LE(9, 20);
@@ -159,11 +197,24 @@ function fakeKernel32(pointerSize, { neverExitsUntilTerminated = false } = {}) {
       return 1;
     },
     ResumeThread(handle) { calls.resumed.push(Number(handle)); calls.resumeSawReleased.push(releasedProbe()); return 1; },
-    WaitForSingleObject() { return neverExitsUntilTerminated && !terminated ? 258 : 0; },
+    WaitForSingleObject() {
+      return neverExitsUntilTerminated && (!terminated || neverSignalsAfterTerminate) ? 258 : 0;
+    },
     TerminateProcess(handle, code) { terminated = true; calls.terminated.push([Number(handle), code]); return 1; },
     GetExitCodeProcess(_handle, output) { output.writeUInt32LE(terminated ? 0xc000013a : 0, 0); return 1; },
     CloseHandle(handle) { calls.closed.push(Number(handle)); return 1; },
     GetLastError() { return 5; },
+    CompareStringOrdinal(left, leftLength, right, rightLength, ignoreCase) {
+      const leftValue = left.slice(0, leftLength);
+      const rightValue = right.slice(0, rightLength);
+      const a = ignoreCase ? leftValue.toUpperCase() : leftValue;
+      const b = ignoreCase ? rightValue.toUpperCase() : rightValue;
+      const limit = Math.min(a.length, b.length);
+      for (let index = 0; index < limit; index += 1) {
+        if (a.charCodeAt(index) !== b.charCodeAt(index)) return a.charCodeAt(index) < b.charCodeAt(index) ? 1 : 3;
+      }
+      return a.length === b.length ? 2 : a.length < b.length ? 1 : 3;
+    },
   };
   return {
     calls,

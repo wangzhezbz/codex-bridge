@@ -7,6 +7,11 @@ const SHA256 = /^[a-f0-9]{64}$/u;
 const LEASE_NONCE = /^[a-f0-9]{32}$/u;
 const COMPONENT = new Set(["chatgpt", "v2rayn"]);
 const GIT_TASK = new Set(["git-install", "git-external-install", "git-install-cleanup", "git-rollback", "git-rollback-cleanup", "git-uninstall"]);
+const GIT_REGISTRY_KEYS = new Set([
+  "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Git_is1",
+  "HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Git_is1",
+  "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Git_is1",
+]);
 
 function record(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -94,14 +99,20 @@ function validComponentUninstall(task, ownership) {
 function validGit(task, ownership) {
   if (!GIT_TASK.has(task.kind) || !TASK_ID.test(task.taskId ?? "")
     || !canonicalPath(task.targetDir) || !canonicalPath(task.executablePath)
-    || (!(task.kind === "git-external-install" || (task.kind === "git-uninstall" && task.managed === false))
+    || (!(task.kind === "git-external-install" || (task.kind === "git-uninstall" && task.mode === "external"))
       && (typeof ownership.installRoot !== "string" || !within(task.targetDir, ownership.installRoot)))) return false;
   if (task.kind === "git-uninstall") {
     return exact(task, [
-      "kind", "phase", "taskId", "managed", "version", "targetDir", "executablePath", "uninstallerPath",
-      "leaseScope", "leaseNonce",
-    ]) && task.phase === "executing" && typeof task.managed === "boolean" && VERSION.test(task.version)
-      && canonicalPath(task.uninstallerPath) && path.win32.dirname(task.uninstallerPath) === task.targetDir
+      "kind", "phase", "taskId", "mode", "version", "targetDir", "executablePath", "uninstallerPath",
+      "registryKey", "leaseScope", "leaseNonce",
+    ]) && task.phase === "executing" && ["managed", "external"].includes(task.mode) && VERSION.test(task.version)
+      && canonicalPath(task.uninstallerPath) && GIT_REGISTRY_KEYS.has(task.registryKey)
+      && path.win32.dirname(task.uninstallerPath) === task.targetDir
+      && /^unins\d{3}\.exe$/iu.test(path.win32.basename(task.uninstallerPath))
+      && path.win32.dirname(task.executablePath) === path.win32.join(task.targetDir, "cmd")
+      && path.win32.basename(task.executablePath).toLowerCase() === "git.exe"
+      && (task.mode !== "managed" || (typeof ownership.installRoot === "string"
+        && task.targetDir === path.win32.join(ownership.installRoot, "Git")))
       && task.leaseScope === "git-execute" && LEASE_NONCE.test(task.leaseNonce);
   }
   if (task.kind === "git-install-cleanup") return exact(task, ["kind", "taskId", "targetDir", "executablePath", "replacedInstaller"])

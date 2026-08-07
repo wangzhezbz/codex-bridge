@@ -368,7 +368,8 @@ function fixture({
 
 const externalGit = Object.freeze({
   kind: "external", ownership: "external", version: "2.50.0", installDir: "C:\\Git",
-  executablePath: "C:\\Git\\cmd\\git.exe", uninstallerPath: "C:\\Git\\unins000.exe", registryKey: "HKLM\\Git",
+  executablePath: "C:\\Git\\cmd\\git.exe", uninstallerPath: "C:\\Git\\unins000.exe",
+  registryKey: "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Git_is1",
 });
 
 test("raw context catalog and path injection fails before ownership or download", async () => {
@@ -864,6 +865,48 @@ test("a hung external Git uninstall keeps a leased persistent claim visible with
   assert.equal((await removing).status, "succeeded");
 });
 
+test("external Git uninstall recovery clears a dead claim after fresh discovery proves removal", async () => {
+  const first = fixture({
+    gitDiscoveries: [externalGit, { kind: "none" }],
+    gitDiscovery: { kind: "none" },
+    stateSaveFailureAt: 2,
+  });
+  const removed = await first.adapters.git.uninstall({ selected: true, taskId: "external-remove-recover" });
+  assert.equal(removed.status, "failed");
+  assert.equal(first.getState().activeTask.kind, "git-uninstall");
+  assert.equal(first.getState().activeTask.mode, "external");
+  assert.equal(first.getState().activeTask.registryKey, externalGit.registryKey);
+
+  const recovered = await first.createAnotherAdapters().git.inspectInstalled({});
+  assert.equal(recovered.status, "skipped", recovered.message);
+  assert.equal(first.getState().activeTask, null);
+  assert.equal(first.calls.gitUninstalls.length, 1, "recovery must never execute the uninstaller again");
+});
+
+test("external Git uninstall recovery aborts only for the same registry identity and fails closed on replacement", async () => {
+  const unchanged = fixture({
+    gitDiscoveries: [externalGit, externalGit], gitDiscovery: externalGit, stateSaveFailureAt: 2,
+  });
+  assert.equal((await unchanged.adapters.git.uninstall({ selected: true, taskId: "external-remove-unchanged" })).status, "failed");
+  assert.equal((await unchanged.createAnotherAdapters().git.inspectInstalled({})).status, "succeeded");
+  assert.equal(unchanged.getState().activeTask, null);
+  assert.equal(unchanged.calls.gitUninstalls.length, 1);
+
+  const replacement = {
+    ...externalGit,
+    registryKey: "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Git_is1",
+  };
+  const changed = fixture({
+    gitDiscoveries: [externalGit, replacement], gitDiscovery: replacement, stateSaveFailureAt: 2,
+  });
+  assert.equal((await changed.adapters.git.uninstall({ selected: true, taskId: "external-remove-replaced" })).status, "failed");
+  const recovery = await changed.createAnotherAdapters().git.inspectInstalled({});
+  assert.equal(recovery.status, "failed");
+  assert.match(recovery.message, /git_uninstall_recovery_incomplete/u);
+  assert.equal(changed.getState().activeTask.kind, "git-uninstall");
+  assert.equal(changed.calls.gitUninstalls.length, 1);
+});
+
 test("a hung managed Git uninstall keeps the same live claim visible to a second adapter", async () => {
   const state = emptyState(INSTALL_ROOT);
   state.components.git = {
@@ -885,9 +928,9 @@ test("a hung managed Git uninstall keeps the same live claim visible to a second
   const removing = first.adapters.git.uninstall({ selected: true, taskId: "hung-managed-remove" });
   await started;
   assert.deepEqual(first.getState().activeTask, {
-    kind: "git-uninstall", phase: "executing", taskId: "hung-managed-remove", managed: true,
+    kind: "git-uninstall", phase: "executing", taskId: "hung-managed-remove", mode: "managed",
     version: registered.version, targetDir: registered.installDir, executablePath: registered.executablePath,
-    uninstallerPath: registered.uninstallerPath, leaseScope: "git-execute",
+    uninstallerPath: registered.uninstallerPath, registryKey: registered.registryKey, leaseScope: "git-execute",
     leaseNonce: first.getState().activeTask.leaseNonce,
   });
   const inspected = await Promise.race([

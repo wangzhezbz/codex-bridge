@@ -55,24 +55,25 @@ function commandLine(executablePath, args) {
   return Buffer.from(`${value}\0`, "utf16le");
 }
 
-function environmentBlock(env) {
+function environmentBlock(env, compareKeys) {
   if (env === null || typeof env !== "object" || Array.isArray(env)) {
     throw processError("windows_process_environment_invalid");
   }
   const rows = [];
-  const seen = new Set();
   for (const [key, rawValue] of Object.entries(env)) {
     if (key.length === 0 || key.includes("=") || key.includes("\0") || rawValue === undefined) {
       throw processError("windows_process_environment_invalid");
     }
-    const folded = key.toUpperCase();
-    if (seen.has(folded)) throw processError("windows_process_environment_duplicate");
-    seen.add(folded);
     const value = String(rawValue);
     if (value.includes("\0")) throw processError("windows_process_environment_invalid");
     rows.push([key, `${key}=${value}`]);
   }
-  rows.sort(([left], [right]) => left.toUpperCase().localeCompare(right.toUpperCase(), "en"));
+  rows.sort(([left], [right]) => compareKeys(left, right));
+  for (let index = 1; index < rows.length; index += 1) {
+    if (compareKeys(rows[index - 1][0], rows[index][0]) === 0) {
+      throw processError("windows_process_environment_duplicate");
+    }
+  }
   const encoded = Buffer.from(`${rows.map(([, row]) => row).join("\0")}\0\0`, "utf16le");
   if (encoded.length > MAX_ENVIRONMENT_BYTES) throw processError("windows_process_environment_too_large");
   return encoded;
@@ -90,10 +91,15 @@ export function createWin32SuspendedProcessCapability({
   platform = process.platform,
   koffi,
   pollIntervalMs = 25,
+  terminationWaitTimeoutMs = 10_000,
 } = {}) {
   if (platform !== "win32") throw processError("windows_platform_required");
   if (!Number.isSafeInteger(pollIntervalMs) || pollIntervalMs < 1 || pollIntervalMs > 1_000) {
     throw processError("windows_process_poll_interval_invalid");
+  }
+  if (!Number.isSafeInteger(terminationWaitTimeoutMs)
+    || terminationWaitTimeoutMs < 1 || terminationWaitTimeoutMs > 30_000) {
+    throw processError("windows_process_termination_timeout_invalid");
   }
   const ffi = koffi ?? createRequire(import.meta.url)("koffi");
   if (!ffi || typeof ffi.load !== "function") throw processError("koffi_adapter_required");
@@ -105,6 +111,9 @@ export function createWin32SuspendedProcessCapability({
   const WaitForSingleObject = kernel32.func("__stdcall", "WaitForSingleObject", "uint32_t", ["intptr_t", "uint32_t"]);
   const TerminateProcess = kernel32.func("__stdcall", "TerminateProcess", "int", ["intptr_t", "uint32_t"]);
   const GetExitCodeProcess = kernel32.func("__stdcall", "GetExitCodeProcess", "int", ["intptr_t", "void *"]);
+  const CompareStringOrdinal = kernel32.func("__stdcall", "CompareStringOrdinal", "int", [
+    "str16", "int", "str16", "int", "int",
+  ]);
   const CloseHandle = kernel32.func("__stdcall", "CloseHandle", "int", ["intptr_t"]);
   const GetLastError = kernel32.func("__stdcall", "GetLastError", "uint32_t", []);
   const pointerSize = typeof ffi.sizeof === "function" ? ffi.sizeof("intptr_t") : 8;
@@ -124,25 +133,24 @@ export function createWin32SuspendedProcessCapability({
     if (!value) throw nativeFailure(operation);
   }
 
-  async function waitUntilExit(processHandle, { timeoutMs, signal, allowCancellation = true } = {}) {
+  function compareEnvironmentKeys(left, right) {
+    const result = Number(CompareStringOrdinal(left, left.length, right, right.length, 1));
+    if (result === 0) throw nativeFailure("CompareStringOrdinal");
+    if (![1, 2, 3].includes(result)) throw processError("windows_process_compare_result_invalid");
+    return result - 2;
+  }
+
+  async function waitUntilExit(processHandle, {
+    timeoutMs, signal, observeSignal = true, timeoutCode = "windows_process_timeout",
+  } = {}) {
     const startedAt = Date.now();
-    let terminationError = null;
     for (;;) {
       const status = Number(WaitForSingleObject(processHandle, 0)) >>> 0;
       if (status === WAIT_OBJECT_0) break;
       if (status === WAIT_FAILED) throw nativeFailure("WaitForSingleObject");
       if (status !== WAIT_TIMEOUT) throw processError("windows_process_wait_result_invalid");
-      if (allowCancellation && (signal?.aborted || Date.now() - startedAt >= timeoutMs)) {
-        const cancellation = signal?.aborted
-          ? processError("windows_process_aborted", signal.reason)
-          : processError("windows_process_timeout");
-        try { requireSuccess(TerminateProcess(processHandle, TERMINATED_EXIT_CODE), "TerminateProcess"); }
-        catch (error) { terminationError = new AggregateError([cancellation, error], cancellation.message, { cause: cancellation }); }
-        await waitUntilExit(processHandle, { timeoutMs: 10_000, allowCancellation: false });
-        cancellation.processExited = true;
-        if (terminationError) terminationError.processExited = true;
-        throw terminationError ?? cancellation;
-      }
+      if (observeSignal && signal?.aborted) throw processError("windows_process_aborted", signal.reason);
+      if (Date.now() - startedAt >= timeoutMs) throw processError(timeoutCode);
       await delay(pollIntervalMs);
     }
     const output = Buffer.alloc(4);
@@ -205,7 +213,7 @@ export function createWin32SuspendedProcessCapability({
       if (typeof beforeResume !== "function") throw processError("windows_process_resume_gate_required");
       if (signal?.aborted) throw processError("windows_process_aborted", signal.reason);
       const command = commandLine(executable, args);
-      const environment = environmentBlock(env);
+      const environment = environmentBlock(env, compareEnvironmentKeys);
       const deadline = Date.now() + timeoutMs;
       const startup = Buffer.alloc(startupSize);
       startup.writeUInt32LE(startupSize, 0);
@@ -248,7 +256,10 @@ export function createWin32SuspendedProcessCapability({
         if (processHandle !== null && !exited) {
           try {
             requireSuccess(TerminateProcess(processHandle, TERMINATED_EXIT_CODE), "TerminateProcess");
-            await waitUntilExit(processHandle, { timeoutMs: 10_000, allowCancellation: false });
+            await waitUntilExit(processHandle, {
+              timeoutMs: terminationWaitTimeoutMs, observeSignal: false,
+              timeoutCode: "windows_process_termination_wait_timeout",
+            });
             exited = true;
           } catch (terminateError) {
             primaryError = new AggregateError([error, terminateError], error.message, { cause: error });
