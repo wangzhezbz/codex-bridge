@@ -34,8 +34,31 @@ function invalid() {
 function isCanonicalBase64(value, maxLength) {
   if (typeof value !== "string" || value.length === 0 || value.length > maxLength
     || !BASE64_PATTERN.test(value)) return false;
-  const decoded = Buffer.from(value, "base64");
-  return decoded.length > 0 && decoded.toString("base64") === value;
+  try {
+    const decoded = Buffer.from(value, "base64");
+    return decoded.length > 0 && decoded.toString("base64") === value;
+  } catch {
+    return false;
+  }
+}
+
+function cloneBoundedBytes(value, maxBytes) {
+  try {
+    if (!Buffer.isBuffer(value) && !(value instanceof Uint8Array)) return null;
+    const bytes = Buffer.from(value);
+    return bytes.length > 0 && bytes.length <= maxBytes ? bytes : null;
+  } catch {
+    return null;
+  }
+}
+
+function decodeBoundedBase64(value, maxBytes) {
+  try {
+    const bytes = Buffer.from(value, "base64");
+    return bytes.length > 0 && bytes.length <= maxBytes && bytes.toString("base64") === value ? bytes : null;
+  } catch {
+    return null;
+  }
 }
 
 function decodeRecord(record) {
@@ -49,9 +72,8 @@ function decodeRecord(record) {
     || !BASE64_PATTERN.test(jsonBase64)
     || !isCanonicalBase64(signatureText, MAX_SIGNATURE_BYTES)
     || Buffer.byteLength(signatureText, "utf8") > MAX_SIGNATURE_BYTES) invalid();
-  const jsonBytes = Buffer.from(jsonBase64, "base64");
-  if (jsonBytes.length === 0 || jsonBytes.length > MAX_CATALOG_BYTES
-    || jsonBytes.toString("base64") !== jsonBase64) invalid();
+  const jsonBytes = decodeBoundedBase64(jsonBase64, MAX_CATALOG_BYTES);
+  if (!jsonBytes) invalid();
   return { catalogUrl, jsonBytes, signatureText };
 }
 
@@ -62,12 +84,10 @@ function encodeEnvelope(envelope) {
   const sourceBytes = descriptors.jsonBytes.value;
   const signatureText = descriptors.signatureText.value;
   if (catalogUrl !== CATALOG_URL
-    || (!Buffer.isBuffer(sourceBytes) && !(sourceBytes instanceof Uint8Array))
     || !isCanonicalBase64(signatureText, MAX_SIGNATURE_BYTES)
     || Buffer.byteLength(signatureText, "utf8") > MAX_SIGNATURE_BYTES) invalid();
-  let jsonBytes;
-  try { jsonBytes = Buffer.from(sourceBytes); } catch { invalid(); }
-  if (jsonBytes.length === 0 || jsonBytes.length > MAX_CATALOG_BYTES) invalid();
+  const jsonBytes = cloneBoundedBytes(sourceBytes, MAX_CATALOG_BYTES);
+  if (!jsonBytes) invalid();
   return {
     catalogUrl,
     jsonBase64: jsonBytes.toString("base64"),

@@ -64,15 +64,21 @@ function normalizeCachedEnvelope(value, catalogUrl, maxCatalogBytes, maxSignatur
   if (descriptors.catalogUrl.value !== catalogUrl) throw catalogError("catalog_cache_url_mismatch");
   const sourceBytes = descriptors.jsonBytes.value;
   const signatureText = descriptors.signatureText.value;
-  if ((!Buffer.isBuffer(sourceBytes) && !(sourceBytes instanceof Uint8Array))
-    || typeof signatureText !== "string" || signatureText.length === 0
+  if (typeof signatureText !== "string" || signatureText.length === 0
     || signatureText.length > maxSignatureBytes || Buffer.byteLength(signatureText, "utf8") > maxSignatureBytes
     || !BASE64_PATTERN.test(signatureText)) {
     throw catalogError("catalog_cache_envelope_invalid");
   }
   let jsonBytes;
-  try { jsonBytes = Buffer.from(sourceBytes); } catch { throw catalogError("catalog_cache_envelope_invalid"); }
-  if (jsonBytes.length === 0 || jsonBytes.length > maxCatalogBytes) {
+  try {
+    if (!Buffer.isBuffer(sourceBytes) && !(sourceBytes instanceof Uint8Array)) {
+      throw catalogError("catalog_cache_envelope_invalid");
+    }
+    jsonBytes = Buffer.from(sourceBytes);
+    if (jsonBytes.length === 0 || jsonBytes.length > maxCatalogBytes) {
+      throw catalogError("catalog_cache_envelope_invalid");
+    }
+  } catch {
     throw catalogError("catalog_cache_envelope_invalid");
   }
   const decodedSignature = Buffer.from(signatureText, "base64");

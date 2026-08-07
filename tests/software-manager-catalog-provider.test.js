@@ -215,6 +215,56 @@ test("catalog cache exact schema rejects symbol keys, accessors, and hostile rec
   assert.equal(cacheAccessorReads, 0);
 });
 
+test("catalog cache maps nested byte traps to its cache error without invoking hostile species", async () => {
+  const envelope = signedFixture();
+  class HostileValueBytes extends Uint8Array {
+    valueOf() { throw new Error("nested_valueof_trap"); }
+  }
+  let speciesReads = 0;
+  class HostileSpeciesBytes extends Uint8Array {
+    static get [Symbol.species]() {
+      speciesReads += 1;
+      throw new Error("nested_species_trap");
+    }
+  }
+  const trappedPrototype = new Proxy(new Uint8Array(envelope.jsonBytes), {
+    getPrototypeOf() { throw new Error("nested_getprototypeof_trap"); },
+  });
+  const trappedProxy = new Proxy(new Uint8Array(envelope.jsonBytes), {});
+  const trappedValue = new HostileValueBytes(envelope.jsonBytes);
+
+  const cache = createCatalogCache({ cacheStore: memoryCacheStore() });
+  for (const jsonBytes of [trappedPrototype, trappedProxy, trappedValue]) {
+    await assert.rejects(
+      cache.replaceEnvelope({ ...envelope, jsonBytes }),
+      (error) => error?.code === "catalog_cache_invalid",
+    );
+  }
+  await cache.replaceEnvelope({ ...envelope, jsonBytes: new HostileSpeciesBytes(envelope.jsonBytes) });
+  assert.equal(speciesReads, 0);
+});
+
+test("catalog cache decode rejects hostile nested scalar proxies without reading their traps", async () => {
+  const envelope = signedFixture();
+  let scalarTrapReads = 0;
+  const hostileBase64 = new Proxy(new String(envelope.jsonBytes.toString("base64")), {
+    get(_target, _property) { scalarTrapReads += 1; throw new Error("nested_scalar_trap"); },
+  });
+  const cache = createCatalogCache({
+    cacheStore: {
+      read: async () => ({
+        catalogUrl: envelope.catalogUrl,
+        jsonBase64: hostileBase64,
+        signatureText: envelope.signatureText,
+      }),
+      replaceAtomic: async () => {},
+    },
+  });
+
+  await assert.rejects(cache.readEnvelope(), (error) => error?.code === "catalog_cache_invalid");
+  assert.equal(scalarTrapReads, 0);
+});
+
 test("getCurrent re-verifies a valid cached envelope before returning a trusted service", async () => {
   const envelope = signedFixture();
   const store = memoryCacheStore({
@@ -297,6 +347,49 @@ test("getCurrent clones a valid Uint8Array cache view before trust verification"
   aliasedBytes.fill(0);
 
   assert.equal(service.getComponent("chatgpt").version, "1.2.3");
+});
+
+test("getCurrent maps every hostile nested byte trap to catalog_cache_envelope_invalid", async () => {
+  const envelope = signedFixture();
+  class HostileValueBytes extends Uint8Array {
+    valueOf() { throw new Error("nested_valueof_trap"); }
+  }
+  const byteCases = [
+    new Proxy(new Uint8Array(envelope.jsonBytes), {
+      getPrototypeOf() { throw new Error("nested_getprototypeof_trap"); },
+    }),
+    new Proxy(new Uint8Array(envelope.jsonBytes), {}),
+    new HostileValueBytes(envelope.jsonBytes),
+  ];
+  for (const jsonBytes of byteCases) {
+    const provider = createCachedCatalogProvider(providerOptions({
+      cache: {
+        readEnvelope: async () => ({ ...envelope, jsonBytes }),
+        replaceEnvelope: async () => {},
+      },
+    }));
+    await assert.rejects(provider.getCurrent(), (error) => error?.code === "catalog_cache_envelope_invalid");
+  }
+});
+
+test("getCurrent clones a typed-array subclass without invoking its hostile species", async () => {
+  const envelope = signedFixture();
+  let speciesReads = 0;
+  class HostileSpeciesBytes extends Uint8Array {
+    static get [Symbol.species]() {
+      speciesReads += 1;
+      throw new Error("nested_species_trap");
+    }
+  }
+  const provider = createCachedCatalogProvider(providerOptions({
+    cache: {
+      readEnvelope: async () => ({ ...envelope, jsonBytes: new HostileSpeciesBytes(envelope.jsonBytes) }),
+      replaceEnvelope: async () => {},
+    },
+  }));
+
+  assert.equal((await provider.getCurrent()).getComponent("chatgpt").version, "1.2.3");
+  assert.equal(speciesReads, 0);
 });
 
 test("refresh fetches only exact URLs with redirects disabled and caches only verified bytes", async () => {
