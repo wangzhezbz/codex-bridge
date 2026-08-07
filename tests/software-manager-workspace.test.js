@@ -78,11 +78,11 @@ function fakeWorkspaceCapabilities({ expectedInstallRootCapability = null } = {}
         const session = {
           root,
           closed: false,
-          issue(pathValue, kind) {
+          issue(pathValue, kind, { sealed = false } = {}) {
             const receipt = Object.freeze(Object.create(null));
             const node = nodes.get(key(pathValue));
             receipts.set(receipt, {
-              path: pathValue, kind, identity: node.identity, state: "issued",
+              path: pathValue, kind, identity: node.identity, state: "issued", sealed,
             });
             return receipt;
           },
@@ -124,8 +124,23 @@ function fakeWorkspaceCapabilities({ expectedInstallRootCapability = null } = {}
             if (!node || node.identity !== record.identity) throw Object.assign(new Error("windows_identity_changed"), { code: "windows_identity_changed" });
             return Object.freeze({ path: record.path, kind: record.kind, size: node.size, empty: node.empty });
           },
+          async sealIssuedFileNoFollow(receipt, { size, sha256, signal } = {}) {
+            const record = this.require(receipt);
+            const node = nodes.get(key(record.path));
+            calls.push(["seal", record.path, size, sha256]);
+            if (signal?.aborted) throw Object.assign(new Error("workspace_file_seal_cancelled"), { code: "ABORT_ERR" });
+            if (!node || node.identity !== record.identity) throw Object.assign(new Error("windows_identity_changed"), { code: "windows_identity_changed" });
+            if (record.kind !== "file" || record.sealed) throw Object.assign(new Error("workspace_file_receipt_required"), { code: "workspace_file_receipt_required" });
+            if (node.data.length !== size) throw Object.assign(new Error("workspace_file_size_mismatch"), { code: "workspace_file_size_mismatch" });
+            if (createHash("sha256").update(node.data).digest("hex") !== sha256) {
+              throw Object.assign(new Error("workspace_file_hash_mismatch"), { code: "workspace_file_hash_mismatch" });
+            }
+            record.state = "consumed";
+            return this.issue(record.path, "file", { sealed: true });
+          },
           async renameIssuedChildNoReplace(receipt, destinationName) {
             const record = this.require(receipt);
+            if (!record.sealed) throw Object.assign(new Error("workspace_sealed_file_required"), { code: "workspace_sealed_file_required" });
             const destination = path.win32.join(path.win32.dirname(record.path), destinationName);
             calls.push(["rename", record.path, destination]);
             if (nodes.has(key(destination))) throw Object.assign(new Error("entry_exists"), { code: "entry_exists" });
@@ -133,7 +148,7 @@ function fakeWorkspaceCapabilities({ expectedInstallRootCapability = null } = {}
             nodes.delete(key(record.path));
             nodes.set(key(destination), node);
             record.state = "consumed";
-            return this.issue(destination, record.kind);
+            return this.issue(destination, record.kind, { sealed: true });
           },
           async deleteIssuedChildNoFollow(receipt) {
             const record = this.require(receipt);
@@ -290,6 +305,26 @@ test("download preparation issues one exact adjacent part and promotes it by hel
   await assert.rejects(workspace.cleanupComponentPackage(download), /workspace_receipt_consumed/u);
 });
 
+test("download promotion rejects a same-length rewrite after manager verification and never publishes it", async () => {
+  const fake = fakeWorkspaceCapabilities();
+  const { downloadManager, workspace } = await createWorkspace(fake);
+  const request = downloadRequest("chatgpt", "1.2.4", ".zip");
+  const download = await workspace.prepareDownloadFile(request);
+  const verification = await downloadManager.downloadPrepared({
+    asset: { url: "https://shanhaiyouling.com/codexbridge-test/packages/chatgpt.zip", ...packageMetadata() },
+    partPath: download.partPath,
+  });
+  const hostile = Buffer.alloc(PACKAGE.length, 0x78);
+  assert.equal(hostile.length, PACKAGE.length);
+  const node = fake.nodes.get(download.partPath.toLowerCase());
+  node.data = hostile;
+  node.size = hostile.length;
+
+  await assert.rejects(download.promotePartNoReplace(verification), /workspace_file_hash_mismatch/u);
+  assert.equal(fake.nodes.has(download.path.toLowerCase()), false);
+  assert.equal(fake.calls.some(([operation]) => operation === "rename"), false);
+});
+
 test("prepared cancellation and hash failure retain only the exact part and never invoke workspace publish", async () => {
   for (const mode of ["cancel", "hash"]) {
     const fake = fakeWorkspaceCapabilities();
@@ -423,5 +458,6 @@ test("download rename collision consumes verification and requires a fresh exact
   await assert.rejects(download.promotePartNoReplace(firstVerification), /verification_receipt_consumed/u);
   const secondVerification = await downloadManager.downloadPrepared({ asset, partPath: download.partPath });
   assert.equal(await download.promotePartNoReplace(secondVerification), download.path);
+  assert.equal(fake.calls.filter(([operation]) => operation === "seal").length, 1);
   await workspace.cleanupComponentPackage(download);
 });

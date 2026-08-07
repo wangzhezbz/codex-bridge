@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import fs from "node:fs";
 import {
-  access, lstat, mkdir, mkdtemp, realpath, rename, rmdir, unlink, writeFile,
+  access, lstat, mkdir, mkdtemp, realpath, rmdir, unlink, writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -26,6 +27,7 @@ function createFakeNative(initial = []) {
   let failClose = null;
   let failRename = null;
   let failDelete = null;
+  let readChunkHook = null;
 
   const key = (value) => value.toLowerCase();
   const canonical = (value) => value.replace(/[\\]+$/u, "") || value;
@@ -89,7 +91,7 @@ function createFakeNative(initial = []) {
           throw codedError("sharing_violation", 32);
         }
       }
-      const handle = { node, options, closed: false };
+      const handle = { node, options, closed: false, position: 0 };
       handles.add(handle);
       return handle;
     },
@@ -112,6 +114,17 @@ function createFakeNative(initial = []) {
       const { node } = requireHandle(handle);
       if (node.data.length > maxBytes) throw codedError("native_file_too_large");
       return Buffer.from(node.data);
+    },
+    async readChunk(handle, maxBytes) {
+      const current = requireHandle(handle);
+      if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > 1024 * 1024) {
+        throw codedError("native_read_chunk_size_invalid");
+      }
+      if (readChunkHook) readChunkHook(current, calls);
+      const chunk = current.node.data.subarray(current.position, current.position + maxBytes);
+      current.position += chunk.length;
+      calls.push(["read-chunk", current.node.path, maxBytes, chunk.length]);
+      return Buffer.from(chunk);
     },
     async writeFile(handle, value) {
       const { node } = requireHandle(handle);
@@ -213,6 +226,7 @@ function createFakeNative(initial = []) {
     failClose(path, error) { failClose = { path, error }; },
     failRename(path, error) { failRename = { path, error }; },
     failDelete(path, error) { failDelete = { path, error }; },
+    onReadChunk(hook) { readChunkHook = hook; },
     get(path) { return nodes.get(key(path)); },
   };
 }
@@ -814,7 +828,11 @@ test("installer workspace capability issues exact direct children and mutates on
     size: 0,
     empty: true,
   });
-  const promoted = await workspace.renameIssuedChildNoReplace(part, "chatgpt-1.0.0.zip");
+  const sealed = await workspace.sealIssuedFileNoFollow(part, {
+    size: 0,
+    sha256: createHash("sha256").update(Buffer.alloc(0)).digest("hex"),
+  });
+  const promoted = await workspace.renameIssuedChildNoReplace(sealed, "chatgpt-1.0.0.zip");
   await assert.rejects(workspace.inspectIssuedChildNoFollow(part), /receipt_(?:invalid|consumed)/u);
   await assert.rejects(workspace.deleteIssuedChildNoFollow(workspace.root), /root_mutation_rejected/u);
   await workspace.deleteIssuedChildNoFollow(promoted);
@@ -825,7 +843,7 @@ test("installer workspace capability issues exact direct children and mutates on
   await assert.rejects(workspace.inspectIssuedChildNoFollow(downloads), /capability_closed/u);
 });
 
-test("installer workspace pins rename parents read-only and issued files with private delete access", async () => {
+test("installer workspace pins writable parts, seals signed bytes in chunks, and renames only sealed files", async () => {
   const fake = createFakeNative([{ path: "D:\\CBApps" }]);
   const workspace = await capabilities(fake).openInstallerWorkspaceRootNoFollow(
     await installRootAuthority("D:\\CBApps"), { maxRelativePath: 80 },
@@ -835,26 +853,58 @@ test("installer workspace pins rename parents read-only and issued files with pr
   );
   const part = await workspace.createFileChildNoFollow(downloads, "chatgpt-1.0.0.zip.part");
   await workspace.inspectIssuedChildNoFollow(part);
+  const partPath = "D:\\CBApps\\downloads\\chatgpt-1.0.0.zip.part";
+  const content = Buffer.from("signed-package-content");
+  fake.get(partPath).data = content;
+  const initialHandle = [...fake.handles].find((handle) => handle.node.path === partPath);
+  assert.deepEqual(initialHandle.options, {
+    access: ["read", "attributes"],
+    share: ["read", "write", "delete"],
+    disposition: "createNew",
+    directory: false,
+  });
+  await assert.rejects(
+    workspace.renameIssuedChildNoReplace(part, "chatgpt-1.0.0.zip"),
+    /workspace_sealed_file_required/u,
+  );
 
-  for (const [exactPath, directory, deleteAccess] of [
-    ["D:\\CBApps\\downloads", true, false],
-    ["D:\\CBApps\\downloads\\chatgpt-1.0.0.zip.part", false, true],
-  ]) {
-    const heldOpen = fake.calls.findLast((call) => call[0] === "open" && call[1] === exactPath);
-    assert.equal(heldOpen[2].access.includes("delete"), deleteAccess);
-    assert.equal(heldOpen[2].share.includes("delete"), false);
-    await assert.rejects(
-      fake.nativeApi.openPath(exactPath, {
-        access: ["delete"],
-        share: ["read", "write", "delete"],
-        disposition: "openExisting",
-        directory,
-      }),
-      /sharing_violation/u,
-    );
-  }
+  const writer = await fake.nativeApi.openPath(partPath, {
+    access: ["write"],
+    share: ["read", "write", "delete"],
+    disposition: "openExisting",
+    directory: false,
+  });
+  await assert.rejects(
+    workspace.sealIssuedFileNoFollow(part, {
+      size: content.length,
+      sha256: createHash("sha256").update(content).digest("hex"),
+    }),
+    /sharing_violation/u,
+  );
+  await fake.nativeApi.closeHandle(writer);
 
-  const promoted = await workspace.renameIssuedChildNoReplace(part, "chatgpt-1.0.0.zip");
+  const sealed = await workspace.sealIssuedFileNoFollow(part, {
+    size: content.length,
+    sha256: createHash("sha256").update(content).digest("hex"),
+  });
+  await assert.rejects(workspace.inspectIssuedChildNoFollow(part), /receipt_(?:invalid|consumed)/u);
+  const sealOpen = fake.calls.findLast((call) => call[0] === "open" && call[1] === partPath);
+  assert.deepEqual(sealOpen[2], {
+    access: ["read", "attributes", "delete"],
+    share: ["read"],
+    disposition: "openExisting",
+    directory: false,
+  });
+  assert.equal(initialHandle.closed, true);
+  assert.equal(fake.calls.filter((call) => call[0] === "read-chunk").length >= 2, true);
+  await assert.rejects(fake.nativeApi.openPath(partPath, {
+    access: ["write"],
+    share: ["read", "write", "delete"],
+    disposition: "openExisting",
+    directory: false,
+  }), /sharing_violation/u);
+
+  const promoted = await workspace.renameIssuedChildNoReplace(sealed, "chatgpt-1.0.0.zip");
   assert.equal(fake.get("D:\\CBApps\\downloads\\chatgpt-1.0.0.zip.part"), undefined);
   assert.notEqual(fake.get("D:\\CBApps\\downloads\\chatgpt-1.0.0.zip"), undefined);
   assert.equal(fake.calls.some((call) => call[0] === "rename-handle"
@@ -863,7 +913,84 @@ test("installer workspace pins rename parents read-only and issued files with pr
   await workspace.close();
 });
 
-test("real Windows installer workspace handle remains compatible with a Node write stream", {
+test("installer workspace seal rejects same-length rewrites, identity swaps, and signed hash mismatches without publishing", async () => {
+  const expected = Buffer.from("expected-package");
+  const expectedHash = createHash("sha256").update(expected).digest("hex");
+  for (const scenario of ["same-length-rewrite", "identity-swap"]) {
+    const fake = createFakeNative([{ path: "D:\\CBApps" }]);
+    const workspace = await capabilities(fake).openInstallerWorkspaceRootNoFollow(
+      await installRootAuthority("D:\\CBApps"), { maxRelativePath: 80 },
+    );
+    const downloads = await workspace.createOrOpenDirectoryChildNoFollow(
+      workspace.root, "downloads", { requireEmpty: false, role: "rename-parent" },
+    );
+    const partPath = "D:\\CBApps\\downloads\\package.zip.part";
+    const part = await workspace.createFileChildNoFollow(downloads, "package.zip.part");
+    fake.get(partPath).data = Buffer.from(expected);
+    if (scenario === "same-length-rewrite") {
+      fake.get(partPath).data = Buffer.alloc(expected.length, 0x78);
+    } else {
+      fake.replace(partPath, { kind: "file", data: expected });
+    }
+    await assert.rejects(
+      workspace.sealIssuedFileNoFollow(part, { size: expected.length, sha256: expectedHash }),
+      scenario === "same-length-rewrite" ? /workspace_file_hash_mismatch/u : /identity_changed/u,
+    );
+    assert.equal(fake.get("D:\\CBApps\\downloads\\package.zip"), undefined);
+    assert.equal(fake.calls.some((call) => call[0] === "rename-handle"), false);
+    await workspace.close();
+  }
+});
+
+test("installer workspace seal fails closed on growth, truncation, abort, and handle-close errors", async (t) => {
+  const expected = Buffer.from("expected-package");
+  const expectedHash = createHash("sha256").update(expected).digest("hex");
+  for (const scenario of ["growth", "truncation", "abort", "close-error"]) {
+    await t.test(scenario, async () => {
+      const fake = createFakeNative([{ path: "D:\\CBApps" }]);
+      const workspace = await capabilities(fake).openInstallerWorkspaceRootNoFollow(
+        await installRootAuthority("D:\\CBApps"), { maxRelativePath: 80 },
+      );
+      const downloads = await workspace.createOrOpenDirectoryChildNoFollow(
+        workspace.root, "downloads", { requireEmpty: false, role: "rename-parent" },
+      );
+      const partPath = "D:\\CBApps\\downloads\\package.zip.part";
+      const part = await workspace.createFileChildNoFollow(downloads, "package.zip.part");
+      fake.get(partPath).data = Buffer.from(expected);
+      const controller = new AbortController();
+      let hooked = false;
+      fake.onReadChunk((handle) => {
+        if (hooked) return;
+        hooked = true;
+        if (scenario === "growth") handle.node.data = Buffer.concat([handle.node.data, Buffer.from("x")]);
+        if (scenario === "truncation") handle.node.data = handle.node.data.subarray(0, handle.node.data.length - 1);
+        if (scenario === "abort") controller.abort(new Error("stop"));
+      });
+      if (scenario === "close-error") fake.failClose(partPath, new Error("close failed"));
+      await assert.rejects(
+        workspace.sealIssuedFileNoFollow(part, {
+          size: expected.length,
+          sha256: expectedHash,
+          ...(scenario === "abort" ? { signal: controller.signal } : {}),
+        }),
+        scenario === "abort" ? { code: "ABORT_ERR" }
+          : scenario === "close-error" ? /close failed/u
+            : /workspace_file_size_mismatch/u,
+      );
+      assert.equal(fake.calls.some((call) => call[0] === "rename-handle"), false);
+      const liveSealHandles = [...fake.handles].filter((handle) => handle.node.path === partPath
+        && handle.options.access.includes("delete"));
+      assert.equal(liveSealHandles.length, 0);
+      if (scenario === "close-error") {
+        await assert.rejects(workspace.inspectIssuedChildNoFollow(part), /capability_closed|receipt_consumed/u);
+      }
+      await workspace.close().catch(() => {});
+      assert.equal(fake.handles.size, 0);
+    });
+  }
+});
+
+test("real Windows installer workspace seals after Node closes and blocks same-length rewrites", {
   skip: process.platform !== "win32",
 }, async () => {
   const tempParent = await mkdtemp(join(tmpdir(), "codexbridge-installer-workspace-"));
@@ -892,20 +1019,38 @@ test("real Windows installer workspace handle remains compatible with a Node wri
       workspace.root, "downloads", { requireEmpty: false, role: "rename-parent" },
     );
     const part = await workspace.createFileChildNoFollow(downloads, "chatgpt-1.0.0.zip.part");
+    const content = Buffer.from("node-stream-compatible");
+    const contentHash = createHash("sha256").update(content).digest("hex");
     const output = fs.createWriteStream(partPath, { flags: "w" });
-    output.end(Buffer.from("node-stream-compatible"));
+    output.end(content);
     await once(output, "close");
-    assert.equal((await workspace.inspectIssuedChildNoFollow(part)).size, 22);
-    await assert.rejects(rename(partPath, `${partPath}.external`), (error) => (
+    assert.equal((await workspace.inspectIssuedChildNoFollow(part)).size, content.length);
+    const heldWriter = await fs.promises.open(partPath, "r+");
+    await assert.rejects(
+      workspace.sealIssuedFileNoFollow(part, { size: content.length, sha256: contentHash }),
+      /sharing_violation/u,
+    );
+    await heldWriter.close();
+    await writeFile(partPath, Buffer.alloc(content.length, 0x78));
+    await assert.rejects(
+      workspace.sealIssuedFileNoFollow(part, { size: content.length, sha256: contentHash }),
+      /workspace_file_hash_mismatch/u,
+    );
+    await writeFile(partPath, content);
+    const sealed = await workspace.sealIssuedFileNoFollow(part, {
+      size: content.length,
+      sha256: contentHash,
+    });
+    await assert.rejects(writeFile(partPath, Buffer.alloc(content.length, 0x79)), (error) => (
       error?.code === "EBUSY" || error?.code === "EPERM" || error?.code === "EACCES"
     ));
     await writeFile(finalPath, "occupied");
     await assert.rejects(
-      workspace.renameIssuedChildNoReplace(part, "chatgpt-1.0.0.zip"),
+      workspace.renameIssuedChildNoReplace(sealed, "chatgpt-1.0.0.zip"),
       /entry_exists/u,
     );
     await unlink(finalPath);
-    const promoted = await workspace.renameIssuedChildNoReplace(part, "chatgpt-1.0.0.zip");
+    const promoted = await workspace.renameIssuedChildNoReplace(sealed, "chatgpt-1.0.0.zip");
     await workspace.deleteIssuedChildNoFollow(promoted);
     const staging = await workspace.createOrOpenDirectoryChildNoFollow(
       workspace.root, "staging", { requireEmpty: false, role: "anchor" },
@@ -1014,11 +1159,15 @@ test("installer workspace rejects foreign receipts, collisions, and concurrent d
   );
   const part = await owned.createFileChildNoFollow(downloads, "package.zip.part");
   await assert.rejects(other.inspectIssuedChildNoFollow(part), /workspace_receipt_invalid/u);
-  await assert.rejects(owned.renameIssuedChildNoReplace(part, "occupied.zip"), /entry_exists/u);
+  const sealed = await owned.sealIssuedFileNoFollow(part, {
+    size: 0,
+    sha256: createHash("sha256").update(Buffer.alloc(0)).digest("hex"),
+  });
+  await assert.rejects(owned.renameIssuedChildNoReplace(sealed, "occupied.zip"), /entry_exists/u);
   assert.equal(fake.get("D:\\CBApps\\downloads\\occupied.zip").data.toString(), "keep");
   const results = await Promise.allSettled([
-    owned.deleteIssuedChildNoFollow(part),
-    owned.deleteIssuedChildNoFollow(part),
+    owned.deleteIssuedChildNoFollow(sealed),
+    owned.deleteIssuedChildNoFollow(sealed),
   ]);
   assert.deepEqual(results.map((result) => result.status).sort(), ["fulfilled", "rejected"]);
   assert.equal(fake.calls.filter((call) => call[0] === "delete-handle"
@@ -1320,6 +1469,39 @@ test("thin Win32 layer binds fixed Kernel32 and Ntdll APIs with a relative held-
     "FlushFileBuffers", "CreateDirectoryW", "SetFileInformationByHandle",
     "NtSetInformationFile", "RtlNtStatusToDosError",
   ]);
+});
+
+test("thin Win32 layer exposes a bounded single-chunk read primitive", () => {
+  const payload = Buffer.from("chunked-package");
+  let reads = 0;
+  let eof = false;
+  const koffi = {
+    load() {
+      return {
+        func(...definition) {
+          const name = definition.length === 4 ? definition[1] : definition[0];
+          if (name === "ReadFile") {
+            return (_handle, output, count, read) => {
+              reads += 1;
+              const chunk = eof ? Buffer.alloc(0) : payload.subarray(0, count);
+              eof = true;
+              chunk.copy(output);
+              read.writeUInt32LE(chunk.length, 0);
+              return 1;
+            };
+          }
+          return () => 1;
+        },
+      };
+    },
+    sizeof(type) { return type === "intptr_t" ? 8 : 4; },
+  };
+  const api = createWin32FileApi({ platform: "win32", koffi });
+  assert.deepEqual(api.readChunk(42n, 7), payload.subarray(0, 7));
+  assert.deepEqual(api.readChunk(42n, 7), Buffer.alloc(0));
+  assert.equal(reads, 2);
+  assert.throws(() => api.readChunk(42n, 0), /native_read_chunk_size_invalid/u);
+  assert.throws(() => api.readChunk(42n, 1024 * 1024 + 1), /native_read_chunk_size_invalid/u);
 });
 
 test("Ntdll same-directory rename uses the x86 FILE_RENAME_INFORMATION ABI", () => {

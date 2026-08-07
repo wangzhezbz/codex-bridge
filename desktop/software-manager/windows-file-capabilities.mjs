@@ -8,6 +8,7 @@ const MAX_DEPTH = 64;
 const MAX_ENTRIES = 4_096;
 const MAX_STATE_BYTES = 16 * 1_024 * 1_024;
 const MAX_ARCHIVE_BYTES = 16 * 1_024 * 1_024 * 1_024;
+const WORKSPACE_HASH_CHUNK_BYTES = 1_024 * 1_024;
 const MAX_PATH_CHARS = 32_760;
 const VERSION_MARKER_NAME = ".codexbridge-version.json";
 const STATE_LOCK_NAME = ".codexbridge-ownership.lock";
@@ -20,7 +21,7 @@ const SHA256 = /^[a-f0-9]{64}$/u;
 const DRIVE_PATH = /^[A-Za-z]:\\/u;
 const RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/iu;
 const REQUIRED_NATIVE_METHODS = [
-  "openPath", "queryHandle", "finalPath", "readFile", "writeFile", "appendFile", "flushFile",
+  "openPath", "queryHandle", "finalPath", "readFile", "readChunk", "writeFile", "appendFile", "flushFile",
   "createDirectory", "renameByHandle", "deleteByHandle", "closeHandle",
   "assertNoAlternateDataStreams", "enumerateDirectory",
 ];
@@ -579,7 +580,9 @@ export function createWindowsFileCapabilities({
     const receiptMap = new WeakMap();
     const session = Object.freeze(Object.create(null));
 
-    function issue({ path: exactPath, info, handle, kind, parent = null, role = null }) {
+    function issue({
+      path: exactPath, info, handle, kind, parent = null, role = null, sealed = false,
+    }) {
       const receipt = Object.freeze(Object.create(null));
       receiptMap.set(receipt, {
         session,
@@ -589,6 +592,7 @@ export function createWindowsFileCapabilities({
         kind,
         parent,
         role,
+        sealed,
         state: "issued",
       });
       return receipt;
@@ -644,11 +648,11 @@ export function createWindowsFileCapabilities({
       const childPath = ensureDirectChild(parentInternal.path, exactName);
       const handle = await nativeApi.openPath(childPath, {
         access: kind === "file"
-          ? ["read", "write", "attributes", "delete"]
+          ? ["read", "attributes"]
           : role === "deletable"
             ? ["read", "attributes", "traverse", "delete"]
             : ["attributes", "traverse"],
-        share: ["read", "write"],
+        share: kind === "file" ? ["read", "write", "delete"] : ["read", "write"],
         disposition,
         directory: kind === "directory",
       });
@@ -736,11 +740,115 @@ export function createWindowsFileCapabilities({
       return Object.freeze({ path: internal.path, kind: internal.kind, size: info.size, empty });
     }
 
+    async function sealIssuedFileNoFollow(receipt, options = {}) {
+      const hasSignal = options !== null && typeof options === "object"
+        && Object.hasOwn(options, "signal");
+      const optionKeys = hasSignal ? ["size", "sha256", "signal"] : ["size", "sha256"];
+      if (!hasExactKeys(options, optionKeys)
+        || !Number.isSafeInteger(options.size) || options.size < 0 || options.size > MAX_ARCHIVE_BYTES
+        || !SHA256.test(options.sha256)
+        || (hasSignal && (options.signal === null || typeof options.signal !== "object"
+          || typeof options.signal.aborted !== "boolean"))) {
+        throw capabilityError("workspace_file_seal_options_invalid");
+      }
+      const internal = requireReceipt(receipt, { claim: true });
+      if (internal.kind !== "file" || !internal.parent || internal.sealed) {
+        internal.state = "issued";
+        throw capabilityError("workspace_file_receipt_required");
+      }
+      let sealedHandle = null;
+      let primaryError = null;
+      let initialReleaseAttempted = false;
+      try {
+        throwIfAborted(options.signal);
+        await assertStable(internal, "file");
+        sealedHandle = await nativeApi.openPath(internal.path, {
+          access: ["read", "attributes", "delete"],
+          share: ["read"],
+          disposition: "openExisting",
+          directory: false,
+        });
+        pin.owner.handles.add(sealedHandle);
+        const sealedInfo = validateInfo(await nativeApi.queryHandle(sealedHandle), "file");
+        verifyIdentity(internal.identity, sealedInfo);
+        if (sealedInfo.nlink !== 1) throw capabilityError("windows_hard_link_rejected");
+        if (sealedInfo.size !== options.size) throw capabilityError("workspace_file_size_mismatch");
+        await nativeApi.assertNoAlternateDataStreams(sealedHandle);
+        const sealedPath = validateAbsolute(await nativeApi.finalPath(sealedHandle));
+        if (!samePath(sealedPath, internal.path)) throw capabilityError("windows_final_path_mismatch");
+
+        const hasher = crypto.createHash("sha256");
+        let totalBytes = 0;
+        for (;;) {
+          throwIfAborted(options.signal);
+          const chunk = await nativeApi.readChunk(sealedHandle, WORKSPACE_HASH_CHUNK_BYTES);
+          if (!Buffer.isBuffer(chunk) || chunk.length > WORKSPACE_HASH_CHUNK_BYTES) {
+            throw capabilityError("workspace_file_read_invalid");
+          }
+          if (chunk.length === 0) break;
+          totalBytes += chunk.length;
+          if (!Number.isSafeInteger(totalBytes) || totalBytes > options.size
+            || totalBytes > MAX_ARCHIVE_BYTES) {
+            throw capabilityError("workspace_file_size_mismatch");
+          }
+          hasher.update(chunk);
+        }
+        throwIfAborted(options.signal);
+        if (totalBytes !== options.size) throw capabilityError("workspace_file_size_mismatch");
+        if (hasher.digest("hex") !== options.sha256) {
+          throw capabilityError("workspace_file_hash_mismatch");
+        }
+        const finalInfo = validateInfo(await nativeApi.queryHandle(sealedHandle), "file");
+        verifyIdentity(internal.identity, finalInfo);
+        if (finalInfo.size !== options.size || finalInfo.nlink !== 1) {
+          throw capabilityError("workspace_file_size_mismatch");
+        }
+        const finalPath = validateAbsolute(await nativeApi.finalPath(sealedHandle));
+        if (!samePath(finalPath, internal.path)) throw capabilityError("windows_final_path_mismatch");
+
+        initialReleaseAttempted = true;
+        await closeOne(nativeApi, pin.owner, internal.handle);
+        internal.state = "consumed";
+        return issue({
+          path: internal.path,
+          info: finalInfo,
+          handle: sealedHandle,
+          kind: "file",
+          parent: internal.parent,
+          sealed: true,
+        });
+      } catch (error) {
+        primaryError = error;
+      }
+      if (sealedHandle) {
+        try {
+          await closeOne(nativeApi, pin.owner, sealedHandle);
+        } catch (closeError) {
+          primaryError = new AggregateError([primaryError, closeError], primaryError.message, { cause: primaryError });
+        }
+      }
+      if (initialReleaseAttempted) {
+        internal.state = "consumed";
+        try {
+          await closeOwner(nativeApi, pin.owner);
+        } catch (closeError) {
+          primaryError = new AggregateError([primaryError, closeError], primaryError.message, { cause: primaryError });
+        }
+      } else {
+        internal.state = "issued";
+      }
+      throw primaryError;
+    }
+
     async function renameIssuedChildNoReplace(receipt, destinationName) {
       const internal = requireReceipt(receipt, { claim: true });
       if (internal.kind !== "file" || !internal.parent) {
         internal.state = "issued";
         throw capabilityError("workspace_file_receipt_required");
+      }
+      if (!internal.sealed) {
+        internal.state = "issued";
+        throw capabilityError("workspace_sealed_file_required");
       }
       let destination;
       try {
@@ -763,6 +871,7 @@ export function createWindowsFileCapabilities({
           handle: internal.handle,
           kind: "file",
           parent: internal.parent,
+          sealed: true,
         });
       } catch (error) {
         if (isOccupied(error)) internal.state = "issued";
@@ -812,6 +921,7 @@ export function createWindowsFileCapabilities({
       createFileChildNoFollow,
       openFileChildNoFollow,
       inspectIssuedChildNoFollow,
+      sealIssuedFileNoFollow,
       renameIssuedChildNoReplace,
       deleteIssuedChildNoFollow,
       async close() { await closeOwner(nativeApi, pin.owner); },

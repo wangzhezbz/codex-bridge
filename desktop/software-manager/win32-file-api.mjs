@@ -22,6 +22,7 @@ const FILE_ID_BOTH_DIRECTORY_RESTART_INFO = 11;
 const FILE_DISPOSITION_INFO = 4;
 const MAX_NATIVE_PATH_CHARS = 32_768;
 const NATIVE_ENUM_BUFFER_BYTES = 64 * 1_024;
+const MAX_NATIVE_READ_CHUNK_BYTES = 1_024 * 1_024;
 
 function win32Error(code, operation, nativeCode) {
   const error = new Error(code);
@@ -275,6 +276,19 @@ export function createWin32FileApi({ platform = process.platform, koffi } = {}) 
     return output;
   }
 
+  function readChunk(handle, maxBytes) {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0
+      || maxBytes > MAX_NATIVE_READ_CHUNK_BYTES) {
+      throw win32Error("native_read_chunk_size_invalid");
+    }
+    const output = Buffer.alloc(maxBytes);
+    const read = Buffer.alloc(4);
+    requireSuccess(ReadFile(handle, output, maxBytes, read, null), "ReadFile");
+    const actual = read.readUInt32LE(0);
+    if (actual > maxBytes) throw win32Error("native_read_chunk_result_invalid");
+    return output.subarray(0, actual);
+  }
+
   function writeChunk(handle, value) {
     const input = Buffer.isBuffer(value) ? value : Buffer.from(value);
     let offset = 0;
@@ -348,6 +362,7 @@ export function createWin32FileApi({ platform = process.platform, koffi } = {}) 
     enumerateDirectory,
     finalPath,
     readFile,
+    readChunk,
     writeFile: writeChunk,
     appendFile: writeChunk,
     flushFile(handle) { requireSuccess(FlushFileBuffers(handle), "FlushFileBuffers"); },

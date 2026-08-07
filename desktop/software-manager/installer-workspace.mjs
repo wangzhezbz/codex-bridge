@@ -197,6 +197,13 @@ export function createInstallerWorkspace({
         maxRelativePath: authority.relativePath.length,
       });
       await authority.session.inspectIssuedChildNoFollow(authority.fileReceipt);
+      if (authority.phase === "partial") {
+        authority.fileReceipt = await authority.session.sealIssuedFileNoFollow(
+          authority.fileReceipt,
+          { size: authority.size, sha256: authority.sha256 },
+        );
+        authority.phase = "sealed";
+      }
       authority.fileReceipt = await authority.session.renameIssuedChildNoReplace(
         authority.fileReceipt,
         authority.finalName,
