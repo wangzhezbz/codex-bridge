@@ -487,6 +487,34 @@ test("a collision after planning fails closed and cleans only the capability-own
   ]);
 });
 
+test("shortcut creation rejects a wrong temp description before publishing the destination", async () => {
+  const desktopPath = "C:\\Users\\me\\Desktop";
+  const targetPath = "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe";
+  const fixture = fakeHost({ shortcutWrittenDescription: "not-the-owned-marker" });
+  const planned = await fixture.host.planShortcut({ desktopPath, name: "ChatGPT", targetPath });
+
+  await assert.rejects(fixture.host.createShortcut(planned.plan), /shortcut_identity_mismatch/u);
+
+  assert.equal(fixture.shortcuts.has(planned.shortcut.path), false);
+  assert.deepEqual(fixture.calls.shortcutCommits, []);
+  assert.deepEqual(fixture.calls.tempRemoves.map(({ path: shortcutPath }) => shortcutPath), [
+    `${desktopPath}\\.codexbridge-shortcut-1.lnk`,
+  ]);
+});
+
+test("shortcut creation rejects a wrong temp target before publishing the destination", async () => {
+  const desktopPath = "C:\\Users\\me\\Desktop";
+  const targetPath = "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe";
+  const fixture = fakeHost({ shortcutWrittenTarget: "C:\\Other\\ChatGPT.exe" });
+  const planned = await fixture.host.planShortcut({ desktopPath, name: "ChatGPT", targetPath });
+
+  await assert.rejects(fixture.host.createShortcut(planned.plan), /shortcut_identity_mismatch/u);
+
+  assert.equal(fixture.shortcuts.has(planned.shortcut.path), false);
+  assert.deepEqual(fixture.calls.shortcutCommits, []);
+  assert.equal(fixture.calls.tempRemoves.length, 1);
+});
+
 test("recorded shortcut inspection fails closed on a wrong target, marker, path, or malformed record", async () => {
   const desktopPath = "C:\\Users\\me\\Desktop";
   const targetPath = "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe";
@@ -732,6 +760,8 @@ function fakeHost({
   otherShortcutPaths = new Set(),
   shortcutCommitFailure = null,
   shortcutTempPath = null,
+  shortcutWrittenDescription = null,
+  shortcutWrittenTarget = null,
   spawnStarted = Promise.resolve(),
   spawnUnrefFailure = null,
 } = {}) {
@@ -825,7 +855,10 @@ function fakeHost({
     writeShortcutLink(shortcutPath, operation, options) {
       calls.shortcutWrites.push({ path: shortcutPath, operation, options });
       otherShortcutPaths.delete(shortcutPath);
-      shortcuts.set(shortcutPath, { target: options.target, description: options.description });
+      shortcuts.set(shortcutPath, {
+        target: shortcutWrittenTarget ?? options.target,
+        description: shortcutWrittenDescription ?? options.description,
+      });
       identities.set(shortcutPath, `identity-${++identitySequence}`);
       return true;
     },

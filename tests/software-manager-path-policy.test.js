@@ -220,9 +220,19 @@ test("ownership rejects sibling-prefix escapes and recognizes explicit owned pat
     schemaVersion: 1,
     generation: 0,
     installRoot: "C:\\Tools\\CodexBridge",
-    components: { git: { installPath: "C:\\Tools\\CodexBridge\\components\\git" } },
+    components: {
+      git: { installPath: "C:\\Tools\\CodexBridge\\components\\git" },
+      chatgpt: {
+        installPath: "C:\\Tools\\CodexBridge\\c",
+        entrypointPath: "C:\\Tools\\CodexBridge\\c\\ChatGPT.exe",
+      },
+    },
     skills: { documents: { target: "C:\\Users\\me\\.codex\\skills\\documents" } },
-    shortcuts: [{ path: "C:\\Users\\me\\Desktop\\CodexBridge.lnk" }],
+    shortcuts: [{
+      componentId: "chatgpt", name: "ChatGPT", path: "C:\\Users\\me\\Desktop\\ChatGPT.lnk",
+      desktopPath: "C:\\Users\\me\\Desktop",
+      targetPath: "C:\\Tools\\CodexBridge\\c\\ChatGPT.exe", creationId: "a".repeat(32),
+    }],
     rollback: [{ path: "D:\\CodexBridgeRollback\\chatgpt" }],
     activeTask: null,
     lastTask: null,
@@ -239,7 +249,7 @@ test("ownership rejects sibling-prefix escapes and recognizes explicit owned pat
     skillsRoot: CANONICAL_SKILLS_ROOT,
   }), true);
   assert.equal(isOwnedPath({
-    target: "C:\\Users\\me\\Desktop\\CodexBridge.lnk",
+    target: "C:\\Users\\me\\Desktop\\ChatGPT.lnk",
     ownership,
     skillsRoot: CANONICAL_SKILLS_ROOT,
   }), true);
@@ -305,10 +315,19 @@ test("ownership metadata strings never become authorized roots", () => {
   const ownership = {
     schemaVersion: 1,
     generation: 0,
-    installRoot: null,
-    components: { app: { installPath: "C:\\Owned\\app", version: "C:\\Windows" } },
+    installRoot: "C:\\Owned",
+    components: {
+      app: { installPath: "C:\\Owned\\app", version: "C:\\Windows" },
+      chatgpt: {
+        installPath: "C:\\Owned\\c", entrypointPath: "C:\\Owned\\c\\ChatGPT.exe",
+      },
+    },
     skills: { documents: { target: "C:\\Owned\\skills\\documents", sha256: "C:\\Windows" } },
-    shortcuts: [{ path: "C:\\Owned\\shortcut.lnk", message: "C:\\Windows" }],
+    shortcuts: [{
+      componentId: "chatgpt", name: "ChatGPT", path: "C:\\Owned\\ChatGPT.lnk",
+      desktopPath: "C:\\Owned", targetPath: "C:\\Owned\\c\\ChatGPT.exe",
+      creationId: "a".repeat(32),
+    }],
     rollback: null,
     activeTask: null,
     lastTask: { message: "C:\\Windows" },
@@ -357,9 +376,72 @@ function validOwnership() {
   };
 }
 
+test("shortcut ownership is one exact component-bound record with an owned current entrypoint", () => {
+  const targetPath = "C:\\Owned\\c\\ChatGPT.exe";
+  const shortcut = {
+    componentId: "chatgpt", name: "ChatGPT", path: "C:\\Desktop\\ChatGPT（2）.lnk",
+    desktopPath: "C:\\Desktop", targetPath, creationId: "a".repeat(32),
+  };
+  const ownership = {
+    ...validOwnership(),
+    installRoot: "C:\\Owned",
+    components: {
+      chatgpt: { managed: true, installPath: "C:\\Owned\\c", entrypointPath: targetPath, version: "2.0.0" },
+    },
+    shortcuts: [shortcut],
+  };
+  assert.equal(isValidOwnershipState(ownership), true);
+  const v2Target = "C:\\Owned\\V2RayN\\current\\v2rayN.exe";
+  assert.equal(isValidOwnershipState({
+    ...ownership,
+    components: {
+      v2rayn: {
+        managed: true, installPath: "C:\\Owned\\V2RayN\\current",
+        entrypointPath: v2Target, version: "7.0.4",
+      },
+    },
+    shortcuts: [{
+      componentId: "v2rayn", name: "V2RayN", path: "C:\\Desktop\\V2RayN（12）.lnk",
+      desktopPath: "C:\\Desktop", targetPath: v2Target, creationId: "b".repeat(32),
+    }],
+  }), true);
+
+  const inherited = Object.assign(Object.create({ creationId: "a".repeat(32) }), {
+    componentId: "chatgpt", name: "ChatGPT", path: "C:\\Desktop\\ChatGPT.lnk",
+    desktopPath: "C:\\Desktop", targetPath,
+  });
+  for (const invalid of [
+    { ...shortcut, extra: true },
+    { componentId: "chatgpt", name: "ChatGPT", path: "C:\\Desktop\\ChatGPT.lnk", desktopPath: "C:\\Desktop", targetPath },
+    inherited,
+    { ...shortcut, componentId: "v2rayn" },
+    { ...shortcut, name: "V2RayN" },
+    { ...shortcut, path: "C:\\Desktop\\V2RayN.lnk" },
+    { ...shortcut, path: "C:\\Desktop\\ChatGPT(2).lnk" },
+    { ...shortcut, path: "C:\\Desktop\\ChatGPT（0）.lnk" },
+    { ...shortcut, path: "C:\\Desktop\\ChatGPT（02）.lnk" },
+    { ...shortcut, targetPath: "C:\\Owned\\c\\Other.exe" },
+  ]) {
+    assert.equal(isValidOwnershipState({ ...ownership, shortcuts: [invalid] }), false);
+  }
+  assert.equal(isValidOwnershipState({ ...ownership, components: {} }), false);
+  assert.equal(isValidOwnershipState({
+    ...ownership,
+    components: {
+      chatgpt: { ...ownership.components.chatgpt, installPath: "C:\\Owned\\cp" },
+    },
+  }), false);
+});
+
 test("activeTask registry accepts only an exact known transaction schema", () => {
   const base = {
     ...validOwnership(), installRoot: "C:\\Owned",
+    components: {
+      chatgpt: {
+        managed: true, installPath: "C:\\Owned\\c",
+        entrypointPath: "C:\\Owned\\c\\ChatGPT.exe", version: "2.0.0",
+      },
+    },
     activeTask: {
       kind: "component-uninstall", taskId: "remove-chatgpt",
       componentId: "chatgpt", rootPath: "C:\\Owned",
@@ -383,6 +465,13 @@ test("activeTask registry accepts only an exact known transaction schema", () =>
     { ...shortcutTask, shortcut: { ...shortcutTask.shortcut, path: "C:\\Elsewhere\\ChatGPT.lnk" } },
     { ...shortcutTask, shortcut: { ...shortcutTask.shortcut, creationId: "renderer-value" } },
     { ...shortcutTask, shortcut: { ...shortcutTask.shortcut, name: "V2RayN" } },
+    { ...shortcutTask, shortcut: { ...shortcutTask.shortcut, path: "C:\\Desktop\\V2RayN.lnk" } },
+    { ...shortcutTask, shortcut: { ...shortcutTask.shortcut, extra: true } },
+    {
+      ...shortcutTask,
+      targetPath: "C:\\Owned\\c\\Other.exe",
+      shortcut: { ...shortcutTask.shortcut, targetPath: "C:\\Owned\\c\\Other.exe" },
+    },
     { kind: "git-install", taskId: "git", version: "2.51.0", targetDir: "D:\\Elsewhere\\Git", executablePath: "D:\\Elsewhere\\Git\\cmd\\git.exe", installerPath: "C:\\Temp\\git.exe", installerSha256: "a".repeat(64), replacedInstaller: null },
     { kind: "skill-replace", phase: "reserved", taskId: "skill", skillId: "documents", skillsRoot: CANONICAL_SKILLS_ROOT, target: `${CANONICAL_SKILLS_ROOT}\\documents`, version: "1.0.0", packageSha256: "x".repeat(64), skillMdSha256: "a".repeat(64), treeDigest: "b".repeat(64), manifestDigest: "c".repeat(64), previousEvidence: { kind: "absent" } },
     { kind: "git-install-cleanup", taskId: "git", targetDir: "C:\\Owned\\Git", executablePath: "C:\\Owned\\Git\\cmd\\git.exe", replacedInstaller: null },

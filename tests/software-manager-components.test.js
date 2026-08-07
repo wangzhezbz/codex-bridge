@@ -508,6 +508,94 @@ test("real Windows host recovery adopts one created shortcut after applied-state
   assert.equal(realHost.shortcuts.size, 0);
 });
 
+test("reserved shortcut collision recovery clears the WAL without adopting or deleting the occupied link", async () => {
+  const realHost = realShortcutHostFixture();
+  let plannedShortcut = null;
+  let raceOnce = true;
+  const racingHost = {
+    ...realHost.host,
+    async planShortcut(request) {
+      const planned = await realHost.host.planShortcut(request);
+      plannedShortcut = planned.shortcut;
+      return planned;
+    },
+    async createShortcut(plan) {
+      if (raceOnce) {
+        raceOnce = false;
+        realHost.shortcuts.set(plannedShortcut.path, {
+          target: "C:\\Other\\ChatGPT.exe",
+          description: "user-owned shortcut",
+        });
+      }
+      return realHost.host.createShortcut(plan);
+    },
+  };
+  const { adapters, getState } = fixture({ windowsHostOverride: racingHost });
+  assert.equal((await adapters.chatgpt.prepare({ taskId: "shortcut-collision-race" })).status, "succeeded");
+  const committed = await adapters.chatgpt.commit({ taskId: "shortcut-collision-race" });
+  assert.equal(committed.status, "succeeded");
+  assert.match(committed.message, /shortcut_plan_occupied/u);
+  assert.equal(getState().activeTask.phase, "reserved");
+  const occupiedPath = plannedShortcut.path;
+
+  assert.equal((await adapters.chatgpt.inspectInstalled({})).status, "succeeded");
+  assert.equal(getState().activeTask, null);
+  assert.deepEqual(getState().shortcuts, []);
+  assert.deepEqual(realHost.shortcuts.get(occupiedPath), {
+    target: "C:\\Other\\ChatGPT.exe",
+    description: "user-owned shortcut",
+  });
+
+  assert.equal((await adapters.chatgpt.prepare({ taskId: "after-shortcut-collision-update" })).status, "succeeded");
+  assert.equal((await adapters.chatgpt.commit({ taskId: "after-shortcut-collision-update" })).status, "succeeded");
+  assert.equal(getState().shortcuts.length, 1);
+  const ownedPath = getState().shortcuts[0].path;
+  assert.notEqual(ownedPath, occupiedPath);
+  assert.equal((await adapters.chatgpt.uninstall({ taskId: "after-shortcut-collision" })).status, "succeeded");
+  assert.equal(realHost.shortcuts.has(occupiedPath), true);
+  assert.equal(realHost.shortcuts.has(ownedPath), false);
+  assert.deepEqual(realHost.calls.removes, [ownedPath]);
+});
+
+test("reserved shortcut host failure recovers as absent and does not block later operations", async () => {
+  const { adapters, getState } = fixture({ shortcutFailure: new Error("host failed") });
+  assert.equal((await adapters.v2rayn.prepare({ taskId: "shortcut-host-failure" })).status, "succeeded");
+  const committed = await adapters.v2rayn.commit({ taskId: "shortcut-host-failure" });
+  assert.equal(committed.status, "succeeded");
+  assert.equal(getState().activeTask.phase, "reserved");
+
+  assert.equal((await adapters.v2rayn.inspectInstalled({})).status, "succeeded");
+  assert.equal(getState().activeTask, null);
+  assert.deepEqual(getState().shortcuts, []);
+  assert.equal((await adapters.v2rayn.uninstall({ taskId: "after-shortcut-host-failure" })).status, "succeeded");
+});
+
+test("applied shortcut marker mismatch remains pending and never adopts or deletes the occupied link", async () => {
+  const targetPath = "D:\\CBApps\\c\\ChatGPT.exe";
+  const shortcutPath = `${DESKTOP}\\ChatGPT.lnk`;
+  const state = emptyState(INSTALL_ROOT);
+  state.components.chatgpt = {
+    managed: true, installPath: "D:\\CBApps\\c", version: "2.0.0",
+    entrypointPath: targetPath, requiredFiles: [targetPath], health: "healthy",
+  };
+  state.activeTask = {
+    kind: "component-shortcut", phase: "applied", taskId: "applied-mismatch", componentId: "chatgpt",
+    desktopPath: DESKTOP, targetPath,
+    shortcut: {
+      name: "ChatGPT", path: shortcutPath, desktopPath: DESKTOP,
+      targetPath, creationId: "e".repeat(32),
+    },
+  };
+  const realHost = realShortcutHostFixture();
+  realHost.shortcuts.set(shortcutPath, { target: targetPath, description: "user-owned shortcut" });
+  const { adapters, getState } = fixture({ state, windowsHostOverride: realHost.host });
+
+  assert.equal((await adapters.chatgpt.inspectInstalled({})).status, "failed");
+  assert.equal(getState().activeTask.phase, "applied");
+  assert.equal(realHost.shortcuts.has(shortcutPath), true);
+  assert.deepEqual(realHost.calls.removes, []);
+});
+
 test("component adapter rejects malformed shortcut plan evidence before reserving or creating", async () => {
   const realHost = realShortcutHostFixture();
   const malformedHost = {

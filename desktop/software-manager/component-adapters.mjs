@@ -516,7 +516,17 @@ export function createComponentAdapters({
         desktopPath,
         targetPath: task.targetPath,
       }, "shortcut_recovery_record_invalid");
-      const recovered = await inspectRecordedShortcut(shortcut);
+      let recovered;
+      try {
+        recovered = await inspectRecordedShortcut(shortcut);
+      } catch (error) {
+        if (task.phase !== "reserved"
+          || !["shortcut_identity_mismatch", "shortcut_path_not_file"].includes(error?.code)) throw error;
+        next.activeTask = null;
+        next.lastTask = { taskId: task.taskId, componentId: task.componentId, action: "shortcut-aborted" };
+        await saveState(next);
+        return next;
+      }
       if (recovered?.kind === "absent") {
         next.activeTask = null;
         next.lastTask = { taskId: task.taskId, componentId: task.componentId, action: "shortcut-aborted" };

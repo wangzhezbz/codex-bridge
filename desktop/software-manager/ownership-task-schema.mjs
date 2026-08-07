@@ -13,6 +13,7 @@ const GIT_REGISTRY_KEYS = new Set([
   "HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Git_is1",
   "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Git_is1",
 ]);
+const SHORTCUT_RECORD_KEYS = Object.freeze(["name", "path", "desktopPath", "targetPath", "creationId"]);
 
 function record(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -78,17 +79,53 @@ function validVersionSlot(task, ownership) {
     && (ownership.installRoot === null || within(task.rootPath, ownership.installRoot));
 }
 
-function validShortcut(task) {
+function validShortcutName(componentId, name, shortcutPath) {
+  if (componentId === "chatgpt") return name === "ChatGPT"
+    && /^ChatGPT(?:（[1-9]\d*）)?\.lnk$/u.test(path.win32.basename(shortcutPath));
+  if (componentId === "v2rayn") return name === "V2RayN"
+    && /^V2RayN(?:（[1-9]\d*）)?\.lnk$/u.test(path.win32.basename(shortcutPath));
+  return false;
+}
+
+export function isValidShortcutRecord(value, {
+  componentId,
+  desktopPath,
+  targetPath,
+  includeComponentId = false,
+} = {}) {
+  const keys = includeComponentId ? ["componentId", ...SHORTCUT_RECORD_KEYS] : SHORTCUT_RECORD_KEYS;
+  if (!exact(value, keys)) return false;
+  const boundComponentId = includeComponentId ? value.componentId : componentId;
+  return COMPONENT.has(boundComponentId)
+    && (!includeComponentId || componentId === undefined || componentId === boundComponentId)
+    && canonicalPath(value.path) && canonicalPath(value.desktopPath) && canonicalPath(value.targetPath)
+    && path.win32.dirname(value.path) === value.desktopPath
+    && (desktopPath === undefined || value.desktopPath === desktopPath)
+    && (targetPath === undefined || value.targetPath === targetPath)
+    && SHORTCUT_CREATION_ID.test(value.creationId)
+    && validShortcutName(boundComponentId, value.name, value.path);
+}
+
+export function isShortcutBoundToCurrent(value, ownership, componentId = value?.componentId) {
+  if (!COMPONENT.has(componentId) || !record(ownership) || !canonicalPath(ownership.installRoot)) return false;
+  const component = ownership.components?.[componentId];
+  if (!record(component)) return false;
+  const currentPath = componentId === "chatgpt"
+    ? path.win32.join(ownership.installRoot, "c")
+    : path.win32.join(ownership.installRoot, "V2RayN", "current");
+  return component.installPath === currentPath && component.entrypointPath === value?.targetPath;
+}
+
+function validShortcut(task, ownership) {
   const common = ["kind", "phase", "taskId", "componentId", "desktopPath", "targetPath", "shortcut"];
   const keys = common;
   if (!exact(task, keys) || task.kind !== "component-shortcut" || !["reserved", "applied"].includes(task.phase)
     || !TASK_ID.test(task.taskId) || !COMPONENT.has(task.componentId)
     || !canonicalPath(task.desktopPath) || !canonicalPath(task.targetPath)) return false;
-  return exact(task.shortcut, ["name", "path", "desktopPath", "targetPath", "creationId"])
-    && task.shortcut.desktopPath === task.desktopPath && task.shortcut.targetPath === task.targetPath
-    && task.shortcut.name === (task.componentId === "chatgpt" ? "ChatGPT" : "V2RayN")
-    && SHORTCUT_CREATION_ID.test(task.shortcut.creationId) && canonicalPath(task.shortcut.path)
-    && path.win32.dirname(task.shortcut.path) === task.desktopPath;
+  return isShortcutBoundToCurrent(task.shortcut, ownership, task.componentId)
+    && isValidShortcutRecord(task.shortcut, {
+      componentId: task.componentId, desktopPath: task.desktopPath, targetPath: task.targetPath,
+    });
 }
 
 function validComponentUninstall(task, ownership) {
@@ -154,7 +191,7 @@ export function isValidActiveTask(task, { ownership, skillsRoot } = {}) {
   if (task === null) return true;
   if (!record(task) || !record(ownership) || !Number.isSafeInteger(ownership.generation)) return false;
   if (task.kind === "software-version-slot") return validVersionSlot(task, ownership);
-  if (task.kind === "component-shortcut") return validShortcut(task);
+  if (task.kind === "component-shortcut") return validShortcut(task, ownership);
   if (task.kind === "component-uninstall") return validComponentUninstall(task, ownership);
   if (task.kind === "component-prepare") {
     return exact(task, ["kind", "taskId", "componentId", "version", "leaseScope", "leaseNonce"])

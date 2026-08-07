@@ -620,7 +620,10 @@ export function createWindowsHost({
         }
         activeTemp = sealedTemp;
         const current = await readShortcut(electronShell, activeTemp.path);
-        if (pathKey(current.target) !== pathKey(targetPath)) throw hostError("shortcut_target_mismatch");
+        if (pathKey(current.target) !== pathKey(targetPath)
+          || current.description !== shortcutDescription(name, creationId)) {
+          throw hostError("shortcut_identity_mismatch");
+        }
 
         let status;
         try {

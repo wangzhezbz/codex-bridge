@@ -1,5 +1,9 @@
 import path from "node:path";
-import { isValidActiveTask } from "./ownership-task-schema.mjs";
+import {
+  isShortcutBoundToCurrent,
+  isValidActiveTask,
+  isValidShortcutRecord,
+} from "./ownership-task-schema.mjs";
 
 const SKILL_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const WINDOWS_MAX_PATH_WITHOUT_TERMINATOR = 259;
@@ -152,6 +156,13 @@ function isSkillRecordMap(value, skillsRoot) {
   });
 }
 
+function isShortcutRecordList(value, ownership) {
+  return Array.isArray(value) && value.every((shortcut) => {
+    if (!isValidShortcutRecord(shortcut, { includeComponentId: true })) return false;
+    return isShortcutBoundToCurrent(shortcut, ownership);
+  });
+}
+
 export function isValidOwnershipState(value, { skillsRoot } = {}) {
   if (!isPlainObject(value) || Object.keys(value).length !== OWNERSHIP_KEYS.length
     || !OWNERSHIP_KEYS.every((key) => Object.hasOwn(value, key))) return false;
@@ -163,7 +174,7 @@ export function isValidOwnershipState(value, { skillsRoot } = {}) {
     && (value.installRoot === null || isOwnershipPath(value.installRoot))
     && isRecordMap(value.components, "installPath")
     && isSkillRecordMap(value.skills, skillsRoot)
-    && Array.isArray(value.shortcuts) && value.shortcuts.every((record) => isPathRecord(record, "path"))
+    && isShortcutRecordList(value.shortcuts, value)
     && validRollback
     && isValidActiveTask(value.activeTask, { ownership: value, skillsRoot })
     && (value.lastTask === null || (isPlainObject(value.lastTask) && isJsonValue(value.lastTask)));

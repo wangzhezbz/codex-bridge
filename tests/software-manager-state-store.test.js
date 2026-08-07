@@ -405,12 +405,42 @@ test("malformed persisted nested state fails closed without mutation", async () 
   assert.equal(memory.calls.some(([operation]) => ["write", "unlink-entry-no-follow", "rename-entry-no-follow"].includes(operation)), false);
 });
 
+test("legacy shortcut ownership without an unforgeable marker fails closed without dropping the record", async () => {
+  const legacyShortcutState = {
+    ...state(),
+    components: {
+      chatgpt: {
+        installPath: "C:\\Tools\\CodexBridge\\c",
+        entrypointPath: "C:\\Tools\\CodexBridge\\c\\ChatGPT.exe",
+      },
+    },
+    shortcuts: [{ path: "C:\\Users\\me\\Desktop\\ChatGPT.lnk" }],
+  };
+  const raw = JSON.stringify(legacyShortcutState);
+  const memory = createMemoryStateFs({ "ownership.json": raw });
+  const store = createOwnershipStore({ stateDir: path.resolve("state"), fsApi: memory.fsApi });
+
+  await assert.rejects(store.load(), { code: "ownership_state_invalid" });
+  assert.equal(memory.get("ownership.json"), raw);
+  assert.equal(memory.calls.some(([operation]) => ["write", "unlink-entry-no-follow", "rename-entry-no-follow"].includes(operation)), false);
+});
+
 test("retains JSON metadata while only fixed path fields define ownership records", async () => {
   const next = {
     ...state(),
-    components: { app: { installPath: "C:\\Owned\\app", version: "C:\\Windows" } },
+    components: {
+      app: { installPath: "C:\\Owned\\app", version: "C:\\Windows" },
+      chatgpt: {
+        installPath: "C:\\Tools\\CodexBridge\\c",
+        entrypointPath: "C:\\Tools\\CodexBridge\\c\\ChatGPT.exe",
+      },
+    },
     skills: { documents: { sha256: "C:\\Windows", target: "C:\\Owned\\skills\\documents" } },
-    shortcuts: [{ message: "C:\\Windows", path: "C:\\Owned\\shortcut.lnk" }],
+    shortcuts: [{
+      componentId: "chatgpt", name: "ChatGPT", path: "C:\\Owned\\ChatGPT.lnk",
+      desktopPath: "C:\\Owned", targetPath: "C:\\Tools\\CodexBridge\\c\\ChatGPT.exe",
+      creationId: "a".repeat(32),
+    }],
     rollback: [{ path: "C:\\Owned\\rollback", reason: "update" }],
     activeTask: null,
     lastTask: { message: "C:\\Windows", progress: 50 },
