@@ -138,6 +138,7 @@ let lastHealth = null;
 let tray = null;
 let isQuitting = false;
 let managedQuitReady = false;
+let managedAppQuitPromise = null;
 let routerRestartTimer = null;
 let routerConfigRecoveryTimer = null;
 let routerConfigRecoveryInFlight = false;
@@ -884,6 +885,7 @@ async function createSoftwareManagerRuntimeService() {
   const slots = createVersionSlotManager({ fsApi: fileCapabilities, ownershipStore, journal });
 
   const rootCapabilities = new Map();
+  const candidateRootTokens = new Set();
   let selectedRootToken = null;
   const installRootResolver = Object.freeze({
     getCurrentToken: () => selectedRootToken,
@@ -896,10 +898,10 @@ async function createSoftwareManagerRuntimeService() {
         realpath: (target) => fs.promises.realpath(target),
         lstat: (target) => fs.promises.lstat(target),
       });
-      const token = crypto.randomBytes(24).toString("base64url");
-      rootCapabilities.clear();
+      let token;
+      do { token = crypto.randomBytes(24).toString("base64url"); } while (rootCapabilities.has(token));
       rootCapabilities.set(token, capability);
-      selectedRootToken = token;
+      candidateRootTokens.add(token);
       return { token, capability };
     },
     async resolve(token) {
@@ -910,6 +912,24 @@ async function createSoftwareManagerRuntimeService() {
         throw error;
       }
       return capability;
+    },
+    async adopt(token) {
+      if (!candidateRootTokens.has(token) || !rootCapabilities.has(token)) {
+        const error = new Error("software_manager_install_root_invalid");
+        error.code = "software_manager_install_root_invalid";
+        throw error;
+      }
+      const previous = selectedRootToken;
+      selectedRootToken = token;
+      candidateRootTokens.delete(token);
+      if (previous && previous !== token) rootCapabilities.delete(previous);
+      for (const candidate of candidateRootTokens) rootCapabilities.delete(candidate);
+      candidateRootTokens.clear();
+    },
+    async discard(token) {
+      if (!candidateRootTokens.delete(token)) return false;
+      rootCapabilities.delete(token);
+      return true;
     },
   });
   const unavailable = softwareManagerUnavailableAdapter();
@@ -3078,9 +3098,21 @@ function writeLocalExecutorJson(res, statusCode, body) {
   res.end(JSON.stringify(body));
 }
 
-async function requestManagedAppQuit(reason = "application") {
-  cancelRouterRestartTimer();
+function requestManagedAppQuit(reason = "application") {
+  if (managedAppQuitPromise) {
+    return managedAppQuitPromise;
+  }
+  let tracked = runManagedAppQuit(reason);
+  tracked = tracked.finally(() => {
+    if (managedAppQuitPromise === tracked) managedAppQuitPromise = null;
+  });
+  managedAppQuitPromise = tracked;
+  return tracked;
+}
+
+async function runManagedAppQuit(reason = "application") {
   if (managedQuitReady) {
+    cancelRouterRestartTimer();
     app.quit();
     return { ok: true, alreadyReady: true };
   }
@@ -3117,7 +3149,12 @@ async function requestManagedAppQuit(reason = "application") {
   if (!softwareDecision.allowQuit) {
     return { ok: false, cancelled: true, reason: softwareDecision.reason };
   }
-  return (await loadRouterLifecycleController()).quit({ reason });
+  try {
+    cancelRouterRestartTimer();
+    return await (await loadRouterLifecycleController()).quit({ reason });
+  } finally {
+    softwareDecision.releaseReservation?.();
+  }
 }
 
 function reportManagedQuitFailure(reason, error) {

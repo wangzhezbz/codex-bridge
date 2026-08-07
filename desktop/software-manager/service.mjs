@@ -290,7 +290,8 @@ export function createSoftwareManagerService({
   const loadOwnership = requireMethod(ownershipStore, "load", "software_manager_ownership_store_required");
   if (typeof recoverTransactions !== "function") throw serviceError("software_manager_recovery_required");
   if (!installRootResolver || typeof installRootResolver.resolve !== "function"
-    || typeof installRootResolver.choose !== "function" || typeof installRootResolver.getCurrentToken !== "function") {
+    || typeof installRootResolver.choose !== "function" || typeof installRootResolver.getCurrentToken !== "function"
+    || typeof installRootResolver.adopt !== "function" || typeof installRootResolver.discard !== "function") {
     throw serviceError("software_manager_install_root_resolver_required");
   }
   if (!clock || typeof clock.now !== "function" || typeof taskIdFactory !== "function") {
@@ -323,6 +324,7 @@ export function createSoftwareManagerService({
   let externalTask = null;
   let currentTask = null;
   let startReserved = false;
+  let quitReservation = null;
   let entryTail = Promise.resolve();
   let taskSequence = 0;
   let taskNamespace = randomUUID().replaceAll("-", "").slice(0, 24);
@@ -899,11 +901,14 @@ export function createSoftwareManagerService({
 
   async function startTask(rawRequest) {
     if (platform !== "win32") throw serviceError("software_manager_platform_disabled");
+    if (quitReservation) throw serviceError("software_manager_quit_reserved");
     if (startReserved || currentTask) throw serviceError("software_manager_task_running");
     startReserved = true;
     return withEntryGate(async () => {
       try {
+        if (quitReservation) throw serviceError("software_manager_quit_reserved");
         await ensureRecoveryInGate();
+        if (quitReservation) throw serviceError("software_manager_quit_reserved");
         const service = await currentCatalog();
         if (!service) throw serviceError("software_manager_catalog_unavailable");
         const state = await loadOwnership();
@@ -914,7 +919,9 @@ export function createSoftwareManagerService({
         }
         const request = validateRequest(rawRequest, service, state);
         const adapters = await resolveAdapters(service, request.installRootToken);
+        if (quitReservation) throw serviceError("software_manager_quit_reserved");
         await ensureRecoveryInGate();
+        if (quitReservation) throw serviceError("software_manager_quit_reserved");
         const taskId = issueTaskId();
         const startedAt = now();
         const task = {
@@ -1066,7 +1073,9 @@ export function createSoftwareManagerService({
 
   async function refresh() {
     if (platform !== "win32") return buildSnapshot({ inspect: false });
+    if (quitReservation) throw serviceError("software_manager_quit_reserved");
     return withEntryGate(async () => {
+      if (quitReservation) throw serviceError("software_manager_quit_reserved");
       if (currentTask) throw serviceError("software_manager_task_running");
       await ensureRecoveryInGate();
       try {
@@ -1088,36 +1097,55 @@ export function createSoftwareManagerService({
 
   async function chooseInstallRoot(candidate) {
     if (platform !== "win32") throw serviceError("software_manager_platform_disabled");
+    if (quitReservation) throw serviceError("software_manager_quit_reserved");
     return withEntryGate(async () => {
+      if (quitReservation) throw serviceError("software_manager_quit_reserved");
       if (currentTask) throw serviceError("software_manager_task_running");
       await ensureRecoveryInGate();
-      const chosen = await installRootResolver.choose(candidate);
-      const token = typeof chosen === "string" ? chosen : chosen?.token;
-      if (typeof token !== "string" || !OPAQUE_TOKEN.test(token)) throw serviceError("software_manager_install_root_invalid");
-      await ensureRecoveryInGate();
-      const service = await currentCatalog();
-      const entries = catalogEntries(service);
-      if (!service || catalogFailure) throw serviceError("software_manager_catalog_unavailable", catalogFailure ?? undefined);
-      let candidateInspection;
+      let token = null;
+      let adopted = false;
       try {
+        const chosen = await installRootResolver.choose(candidate);
+        token = typeof chosen === "string" ? chosen : chosen?.token;
+        if (typeof token !== "string" || !OPAQUE_TOKEN.test(token)) {
+          throw serviceError("software_manager_install_root_invalid");
+        }
+        await ensureRecoveryInGate();
+        const service = await currentCatalog();
+        const entries = catalogEntries(service);
+        if (!service || catalogFailure) {
+          throw serviceError("software_manager_catalog_unavailable", catalogFailure ?? undefined);
+        }
         const ownership = await loadOwnership();
-        candidateInspection = await inspectAll(
+        const candidateInspection = await inspectAll(
           await resolveAdapters(service, token),
           entries,
           Object.keys(ownership?.skills ?? {}),
         );
+        if ([...candidateInspection.components, ...candidateInspection.skills].some(({ status }) => status === "failed")) {
+          throw serviceError("software_manager_snapshot_failed");
+        }
+        const snapshot = await buildSnapshot({ inspect: false, inspectionOverride: candidateInspection });
+        await ensureRecoveryInGate();
+        await installRootResolver.adopt(token);
+        adopted = true;
+        selectedInstallRootToken = token;
+        lastInspection = candidateInspection;
+        emit({ type: "snapshot", snapshot });
+        return Object.freeze({ installRootToken: token });
       } catch (error) {
+        if (!adopted && typeof token === "string" && token !== selectedInstallRootToken) {
+          try {
+            await installRootResolver.discard(token);
+          } catch (discardError) {
+            throw new AggregateError([error, discardError], error?.message || "software_manager_install_root_failed", {
+              cause: error,
+            });
+          }
+        }
+        if (error?.code) throw error;
         throw serviceError("software_manager_snapshot_failed", error);
       }
-      if ([...candidateInspection.components, ...candidateInspection.skills].some(({ status }) => status === "failed")) {
-        throw serviceError("software_manager_snapshot_failed");
-      }
-      const snapshot = await buildSnapshot({ inspect: false, inspectionOverride: candidateInspection });
-      await ensureRecoveryInGate();
-      selectedInstallRootToken = token;
-      lastInspection = candidateInspection;
-      emit({ type: "snapshot", snapshot });
-      return Object.freeze({ installRootToken: token });
     });
   }
 
@@ -1137,17 +1165,58 @@ export function createSoftwareManagerService({
   }
 
   function hasCriticalTask() {
-    return Boolean(currentTask?.critical || externalTask);
+    return Boolean(currentTask?.critical || externalTask || recoveryFailure);
   }
 
   function prepareForQuit() {
-    // The main process must await an asynchronous service entry first so this
-    // synchronous decision observes any newly persisted external claim.
-    if (externalTask) return { allowQuit: false, reason: "critical" };
+    // beginQuit() owns the async recovery/entry gate. This remains synchronous
+    // so the caller cannot accidentally await across a state transition.
+    if (externalTask || recoveryFailure) return { allowQuit: false, reason: "critical" };
     if (!currentTask) return { allowQuit: true };
     if (currentTask.acceptedCancel) return { allowQuit: false, reason: "cancelling", canCancel: false };
     if (currentTask.critical) return { allowQuit: false, reason: "critical" };
     return { allowQuit: false, reason: "running", canCancel: Boolean(currentTask.cancellable) };
+  }
+
+  async function beginQuit() {
+    if (quitReservation) throw serviceError("software_manager_quit_reserved");
+    const reservation = Object.freeze(Object.create(null));
+    quitReservation = reservation;
+    try {
+      if (currentTask) {
+        // startTask already owns the entry gate for its full execution. The
+        // synchronously published reservation blocks every later acceptance,
+        // while this snapshot lets Main offer cancellation without waiting for
+        // the running task to finish.
+        await Promise.resolve();
+        return Object.freeze({ ...prepareForQuit(), reservation });
+      }
+      const decision = await withEntryGate(async () => {
+        await refreshRecoveryStateInGate();
+        return prepareForQuit();
+      });
+      return Object.freeze({ ...decision, reservation });
+    } catch (error) {
+      if (quitReservation === reservation) quitReservation = null;
+      throw error;
+    }
+  }
+
+  function releaseQuit(reservation) {
+    if (!reservation || quitReservation !== reservation) return false;
+    quitReservation = null;
+    return true;
+  }
+
+  async function refreshQuit(reservation) {
+    if (!reservation || quitReservation !== reservation) {
+      throw serviceError("software_manager_quit_reservation_invalid");
+    }
+    return withEntryGate(async () => {
+      if (quitReservation !== reservation) throw serviceError("software_manager_quit_reservation_invalid");
+      await refreshRecoveryStateInGate();
+      return prepareForQuit();
+    });
   }
 
   function subscribe(listener) {
@@ -1173,6 +1242,9 @@ export function createSoftwareManagerService({
     recoverPending,
     hasCriticalTask,
     prepareForQuit,
+    beginQuit,
+    refreshQuit,
+    releaseQuit,
     subscribe,
   });
 }

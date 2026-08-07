@@ -369,8 +369,12 @@ test("normal tray and update quit delegate late-safe cleanup without before-quit
   assert.match(beforeQuit, /requestManagedAppQuit\("before-quit"\)/);
 
   const quitBody = functionBody("requestManagedAppQuit");
-  assert.match(quitBody, /^function requestManagedAppQuit\([^)]*\)\s*\{\s*cancelRouterRestartTimer\(\);/);
-  assert.match(quitBody, /return \(await loadRouterLifecycleController\(\)\)\.quit\(\{ reason \}\);/);
+  assert.match(quitBody, /if \(managedAppQuitPromise\)[\s\S]*?return managedAppQuitPromise/);
+  assert.match(quitBody, /runManagedAppQuit\(reason\)/);
+  const runQuitBody = functionBody("runManagedAppQuit");
+  assert.match(runQuitBody, /softwareDecision\.allowQuit[\s\S]*?cancelRouterRestartTimer\(\)/);
+  assert.match(runQuitBody, /loadRouterLifecycleController\(\)\)\.quit\(\{ reason \}\)/);
+  assert.match(runQuitBody, /finally[\s\S]*?releaseReservation/);
   assert.doesNotMatch(quitBody, /chatgptBridgeService\.stop\(\)/);
   assert.doesNotMatch(quitBody, /\bkill\s*\(/);
 
@@ -404,7 +408,7 @@ test("Router watchdog uses declared lifecycle state and every explicit shutdown 
     /onUnexpectedExit:\s*async\s*\(\{ code, isCurrent \}\)[\s\S]*?await broadcastState\(\);[\s\S]*?if \(!isCurrent\(\)\)[\s\S]*?scheduleRouterRestart\(code\)/,
   );
   assert.match(functionBody("stopRouterWithManagedConfigCleanup"), /cancelRouterRestartTimer\(\)/);
-  assert.match(functionBody("requestManagedAppQuit"), /cancelRouterRestartTimer\(\)/);
+  assert.match(functionBody("runManagedAppQuit"), /cancelRouterRestartTimer\(\)/);
 });
 
 test("Router watchdog exhaustion restores managed configuration and retries recovery failures", () => {

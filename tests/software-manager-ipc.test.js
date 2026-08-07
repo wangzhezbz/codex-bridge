@@ -33,12 +33,22 @@ function fixture({
   }));
   const calls = [];
   let listener;
+  const quitReservation = {};
   const service = {
     getSnapshot: async () => { calls.push(["getSnapshot"]); return snapshot(); },
     refresh: async () => { calls.push(["refresh"]); return snapshot(); },
     startTask: async (request) => { calls.push(["startTask", request]); return { ok: true }; },
     cancelTask: () => { calls.push(["cancelTask"]); return { cancelled: true }; },
     prepareForQuit: () => { calls.push(["prepareForQuit"]); return decision; },
+    beginQuit: async () => { calls.push(["beginQuit"]); return { ...decision, reservation: quitReservation }; },
+    refreshQuit: async (reservation) => {
+      calls.push(["refreshQuit", reservation]);
+      return reservation === quitReservation ? { allowQuit: true } : { allowQuit: false, reason: "critical" };
+    },
+    releaseQuit: (reservation) => {
+      calls.push(["releaseQuit", reservation]);
+      return reservation === quitReservation;
+    },
     subscribe: (next) => { listener = next; return () => { listener = null; }; },
   };
   let serviceLoads = 0;
@@ -157,16 +167,23 @@ test("directory selection returns only a cancelled flag or one opaque token", as
   assert.deepEqual(await cancelled.invoke("softwareManager:selectInstallRoot"), { cancelled: true });
 });
 
-test("true quit awaits the service refresh/recovery gate before synchronous prepareForQuit", async () => {
+test("true quit awaits the atomic service quit reservation before returning allow", async () => {
   const order = [];
+  const reservation = {};
   const service = {
-    getSnapshot: async () => { order.push("gate:start"); await Promise.resolve(); order.push("gate:end"); },
-    prepareForQuit: () => { order.push("prepare"); return { allowQuit: true }; },
+    beginQuit: async () => {
+      order.push("gate:start"); await Promise.resolve(); order.push("gate:end");
+      return { allowQuit: true, reservation };
+    },
+    refreshQuit: async () => ({ allowQuit: true }),
+    releaseQuit: (value) => { order.push("release"); return value === reservation; },
   };
-  assert.deepEqual(await prepareSoftwareManagerQuit({ platform: "win32", getService: async () => service }), {
-    allowQuit: true,
-  });
-  assert.deepEqual(order, ["gate:start", "gate:end", "prepare"]);
+  const result = await prepareSoftwareManagerQuit({ platform: "win32", getService: async () => service });
+  assert.equal(result.allowQuit, true);
+  assert.equal(typeof result.releaseReservation, "function");
+  assert.deepEqual(order, ["gate:start", "gate:end"]);
+  assert.equal(result.releaseReservation(), true);
+  assert.deepEqual(order, ["gate:start", "gate:end", "release"]);
 });
 
 test("critical true quit is blocked and cancellable true quit has explicit background/cancel choices", async () => {
@@ -178,6 +195,7 @@ test("critical true quit is blocked and cancellable true quit has explicit backg
     showCritical: async (reason) => { notices.push(reason); },
   }), { allowQuit: false, reason: "critical" });
   assert.deepEqual(notices, ["critical"]);
+  assert.equal(critical.calls.some(([name]) => name === "releaseQuit"), true);
 
   const background = fixture({ decision: { allowQuit: false, reason: "running", canCancel: true } });
   assert.deepEqual(await prepareSoftwareManagerQuit({
@@ -186,21 +204,81 @@ test("critical true quit is blocked and cancellable true quit has explicit backg
     confirmRunning: async () => "background",
   }), { allowQuit: false, reason: "background" });
   assert.equal(background.calls.some(([name]) => name === "cancelTask"), false);
+  assert.equal(background.calls.some(([name]) => name === "releaseQuit"), true);
 
-  let prepared = 0;
   const cancellableService = {
     getSnapshot: async () => ({}),
-    prepareForQuit: () => (++prepared === 1
-      ? { allowQuit: false, reason: "running", canCancel: true }
-      : { allowQuit: true }),
+    beginQuit: async () => ({
+      allowQuit: false, reason: "running", canCancel: true, reservation: cancellableService.reservation,
+    }),
+    refreshQuit: async () => ({ allowQuit: true }),
     cancelTask: () => ({ cancelled: true }),
+    reservation: {},
+    releaseQuit: () => true,
   };
-  assert.deepEqual(await prepareSoftwareManagerQuit({
+  const cancelled = await prepareSoftwareManagerQuit({
     platform: "win32",
     getService: async () => cancellableService,
     confirmRunning: async () => "cancel-and-quit",
     waitForTask: async () => {},
-  }), { allowQuit: true });
+  });
+  assert.equal(cancelled.allowQuit, true);
+  assert.equal(typeof cancelled.releaseReservation, "function");
+});
+
+test("quit UI failures release the atomic reservation instead of permanently blocking tasks", async () => {
+  const value = fixture({ decision: { allowQuit: false, reason: "critical" } });
+  await assert.rejects(
+    prepareSoftwareManagerQuit({
+      platform: "win32",
+      getService: async () => value.service,
+      showCritical: async () => { throw new Error("dialog failed"); },
+    }),
+    /dialog failed/,
+  );
+  assert.equal(value.calls.filter(([name]) => name === "releaseQuit").length, 1);
+});
+
+test("main coalesces the entire software decision and Router quit and preserves watchdog on blocked exits", () => {
+  const mainSource = require("node:fs").readFileSync(new URL("../desktop/main.cjs", import.meta.url), "utf8");
+  const request = mainSource.match(/function requestManagedAppQuit\([^)]*\)[\s\S]*?\n\}/u)?.[0] ?? "";
+  const run = mainSource.match(/async function runManagedAppQuit\([^)]*\)[\s\S]*?\n\}/u)?.[0] ?? "";
+  assert.match(mainSource, /let managedAppQuitPromise = null/u);
+  assert.match(request, /if \(managedAppQuitPromise\)\s*\{\s*return managedAppQuitPromise/u);
+  assert.match(request, /managedAppQuitPromise = tracked/u);
+  assert.match(request, /finally/u);
+  const decisionIndex = run.indexOf("softwareDecision.allowQuit");
+  const timerIndex = run.lastIndexOf("cancelRouterRestartTimer()");
+  const routerIndex = run.indexOf("loadRouterLifecycleController");
+  assert.equal(decisionIndex >= 0 && timerIndex > decisionIndex && routerIndex > timerIndex, true);
+  assert.match(run, /releaseReservation/u);
+});
+
+test("two simultaneous main quit requests execute one shared software and Router flow", async () => {
+  const mainSource = require("node:fs").readFileSync(new URL("../desktop/main.cjs", import.meta.url), "utf8");
+  const request = mainSource.match(/function requestManagedAppQuit\([^)]*\)[\s\S]*?\n\}/u)?.[0] ?? "";
+  let resolveRun;
+  let runs = 0;
+  const runManagedAppQuit = async () => {
+    runs += 1;
+    await new Promise((resolve) => { resolveRun = resolve; });
+    return { ok: true };
+  };
+  const create = new Function(
+    "runManagedAppQuit",
+    `let managedAppQuitPromise = null; ${request}; return requestManagedAppQuit;`,
+  );
+  const requestQuit = create(runManagedAppQuit);
+  const first = requestQuit("tray");
+  const second = requestQuit("before-quit");
+  assert.equal(first, second);
+  assert.equal(runs, 1);
+  resolveRun();
+  await first;
+  const third = requestQuit("update");
+  assert.equal(runs, 2);
+  resolveRun();
+  await third;
 });
 
 test("closing a window remains hide-to-tray and does not become a task cancellation path", () => {

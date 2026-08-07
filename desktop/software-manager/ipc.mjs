@@ -177,29 +177,45 @@ export async function prepareSoftwareManagerQuit({
   if (platform !== "win32") return { allowQuit: true };
   if (typeof getService !== "function") throw new TypeError("software manager service provider required");
   const service = await getService();
-
-  // This async entry is deliberately before the synchronous decision.  When
-  // idle it refreshes durable recovery state; while a local task runs it still
-  // yields through the service boundary without changing the task.
-  await service.getSnapshot();
-  const decision = service.prepareForQuit();
-  if (decision?.allowQuit === true) return { allowQuit: true };
-  if (decision?.reason !== "running" || decision.canCancel !== true) {
-    await showCritical(decision?.reason ?? "critical");
-    return { allowQuit: false, reason: decision?.reason ?? "critical" };
+  if (typeof service.beginQuit !== "function" || typeof service.releaseQuit !== "function"
+    || typeof service.refreshQuit !== "function") {
+    throw ipcError("software_manager_quit_contract_invalid");
   }
+  const decision = await service.beginQuit();
+  const reservation = decision?.reservation;
+  let held = true;
+  const releaseReservation = () => {
+    if (!held) return false;
+    held = false;
+    return service.releaseQuit(reservation);
+  };
+  try {
+    if (decision?.allowQuit === true) return { allowQuit: true, releaseReservation };
+    if (decision?.reason !== "running" || decision.canCancel !== true) {
+      await showCritical(decision?.reason ?? "critical");
+      releaseReservation();
+      return { allowQuit: false, reason: decision?.reason ?? "critical" };
+    }
 
-  const choice = await confirmRunning();
-  if (choice !== "cancel-and-quit") return { allowQuit: false, reason: "background" };
-  const cancelled = service.cancelTask();
-  if (cancelled?.cancelled !== true) {
-    await showCritical(cancelled?.reason ?? "critical");
-    return { allowQuit: false, reason: cancelled?.reason ?? "critical" };
+    const choice = await confirmRunning();
+    if (choice !== "cancel-and-quit") {
+      releaseReservation();
+      return { allowQuit: false, reason: "background" };
+    }
+    const cancelled = service.cancelTask();
+    if (cancelled?.cancelled !== true) {
+      await showCritical(cancelled?.reason ?? "critical");
+      releaseReservation();
+      return { allowQuit: false, reason: cancelled?.reason ?? "critical" };
+    }
+    await waitForTask(service);
+    const afterCancel = await service.refreshQuit(reservation);
+    if (afterCancel?.allowQuit === true) return { allowQuit: true, releaseReservation };
+    await showCritical(afterCancel?.reason ?? "critical");
+    releaseReservation();
+    return { allowQuit: false, reason: afterCancel?.reason ?? "critical" };
+  } catch (error) {
+    releaseReservation();
+    throw error;
   }
-  await waitForTask(service);
-  await service.getSnapshot();
-  const afterCancel = service.prepareForQuit();
-  return afterCancel?.allowQuit === true
-    ? { allowQuit: true }
-    : { allowQuit: false, reason: afterCancel?.reason ?? "critical" };
 }

@@ -120,6 +120,8 @@ function fixtureService(options = {}) {
       choose: async () => ({ token: "root_token_00000001", capability: { kind: "root" } }),
       resolve: async () => ({ kind: "root" }),
       getCurrentToken: () => "root_token_00000001",
+      adopt: async () => {},
+      discard: async () => {},
     },
     adapterFactory: options.adapterFactory,
     logSink: options.logSink,
@@ -136,7 +138,7 @@ test("module exposes the complete service interface", () => {
   const { service } = fixtureService();
   for (const method of [
     "getSnapshot", "chooseInstallRoot", "refresh", "startTask", "cancelTask",
-    "recoverPending", "hasCriticalTask", "prepareForQuit", "subscribe",
+    "recoverPending", "hasCriticalTask", "prepareForQuit", "beginQuit", "refreshQuit", "releaseQuit", "subscribe",
   ]) assert.equal(typeof service[method], "function", method);
 });
 
@@ -196,11 +198,15 @@ test("rollback tab is present only for a recent eligible adapter record", async 
 test("chooseInstallRoot returns only an opaque token and adapters receive only resolved authority", async () => {
   const seen = [];
   const events = [];
+  const adopted = [];
+  const discarded = [];
   const { service } = fixtureService({
     installRootResolver: {
       choose: async (candidate) => { seen.push(candidate); return { token: "opaque_root_123456", capability: { proof: 7 } }; },
       resolve: async (token) => { seen.push(token); return { proof: 7 }; },
       getCurrentToken: () => "opaque_root_123456",
+      adopt: async (token) => { adopted.push(token); },
+      discard: async (token) => { discarded.push(token); },
     },
     adapterFactory: ({ installRootCapability }) => {
       assert.deepEqual(installRootCapability, { proof: 7 });
@@ -219,7 +225,49 @@ test("chooseInstallRoot returns only an opaque token and adapters receive only r
   assert.equal(result.status, "succeeded");
   assert.equal(seen.includes("C:\\Chosen"), true);
   assert.equal(seen.filter((value) => value !== "C:\\Chosen").every((value) => value === "opaque_root_123456"), true);
+  assert.deepEqual(adopted, ["opaque_root_123456"]);
+  assert.deepEqual(discarded, []);
   assert.equal(JSON.stringify(result).includes("C:\\Chosen"), false);
+});
+
+test("a failed install-root candidate is discarded without revoking the committed token", async () => {
+  const oldToken = "root_token_00000001";
+  const candidateToken = "root_token_00000002";
+  const available = new Set([oldToken]);
+  let current = oldToken;
+  const events = [];
+  const { service } = fixtureService({
+    installRootResolver: {
+      getCurrentToken: () => current,
+      choose: async () => { available.add(candidateToken); return { token: candidateToken }; },
+      resolve: async (token) => {
+        if (!available.has(token)) throw new Error("unknown root token");
+        return { token };
+      },
+      adopt: async (token) => {
+        assert.equal(token, candidateToken);
+        available.delete(current);
+        current = token;
+      },
+      discard: async (token) => { if (token !== current) available.delete(token); },
+    },
+    adapterFactory: async ({ installRootCapability }) => {
+      if (installRootCapability.token === candidateToken) throw new Error("candidate inspection failed");
+      return {
+        chatgpt: adapterFixture("chatgpt"), v2rayn: adapterFixture("v2rayn"),
+        git: adapterFixture("git"), skills: skillsAdapterFixture(),
+      };
+    },
+  });
+  service.subscribe((event) => events.push(event));
+  await assert.rejects(service.chooseInstallRoot("C:\\Candidate"), /software_manager_snapshot_failed/);
+  assert.equal(current, oldToken);
+  assert.deepEqual(await service.startTask({
+    kind: "install", componentIds: ["chatgpt"], skillIds: [], installRootToken: oldToken,
+  }).then(({ status }) => status), "succeeded");
+  assert.equal(available.has(oldToken), true);
+  assert.equal(available.has(candidateToken), false);
+  assert.equal(events.some(({ type }) => type === "snapshot"), false);
 });
 
 test("request schema is exact, ordered, duplicate-free, and authority-safe", async () => {
@@ -636,6 +684,63 @@ test("quit decisions distinguish idle, cancellable running, and critical", async
   assert.deepEqual(service.prepareForQuit(), { allowQuit: true });
 });
 
+test("quit reservation is atomic with a start waiting on recovery and blocks later starts until release", async () => {
+  const recovery = deferred();
+  const { service } = fixtureService({ recoverTransactions: () => recovery.promise });
+  const starting = service.startTask({ kind: "install", componentIds: ["chatgpt"], skillIds: [] });
+  const quitting = service.beginQuit();
+  recovery.resolve([]);
+  await assert.rejects(starting, /software_manager_quit_reserved/);
+  const decision = await quitting;
+  assert.equal(decision.allowQuit, true);
+  assert.equal(typeof decision.reservation, "object");
+  await assert.rejects(
+    service.startTask({ kind: "install", componentIds: ["chatgpt"], skillIds: [] }),
+    /software_manager_quit_reserved/,
+  );
+  assert.equal(service.releaseQuit(decision.reservation), true);
+  assert.equal((await service.startTask({ kind: "install", componentIds: ["chatgpt"], skillIds: [] })).status, "succeeded");
+});
+
+test("quit reservation observes an accepted running task without waiting for that task to finish", async () => {
+  const entered = deferred();
+  const { service } = fixtureService({
+    chatgpt: {
+      prepare: async ({ signal }) => {
+        entered.resolve();
+        await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+        return operationResult("chatgpt", "prepare", "failed");
+      },
+    },
+  });
+  const running = service.startTask({ kind: "install", componentIds: ["chatgpt"], skillIds: [] });
+  await entered.promise;
+  const decision = await Promise.race([
+    service.beginQuit(),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("quit reservation waited for running task")), 100)),
+  ]);
+  assert.deepEqual(
+    { allowQuit: decision.allowQuit, reason: decision.reason, canCancel: decision.canCancel },
+    { allowQuit: false, reason: "running", canCancel: true },
+  );
+  assert.deepEqual(service.cancelTask(), { cancelled: true });
+  await running;
+  assert.deepEqual(await service.refreshQuit(decision.reservation), { allowQuit: true });
+  assert.equal(service.releaseQuit(decision.reservation), true);
+});
+
+test("recovery failure makes synchronous and reserved quit decisions fail closed", async () => {
+  const { service } = fixtureService({
+    recoverTransactions: async () => { throw new Error("recovery failed"); },
+  });
+  assert.equal((await service.recoverPending()).pending, true);
+  assert.deepEqual(service.prepareForQuit(), { allowQuit: false, reason: "critical" });
+  const decision = await service.beginQuit();
+  assert.equal(decision.allowQuit, false);
+  assert.equal(decision.reason, "critical");
+  assert.equal(service.releaseQuit(decision.reservation), true);
+});
+
 test("finishing log drain is non-critical and non-cancellable across cancel, quit, and snapshot", async () => {
   const entered = deferred();
   const release = deferred();
@@ -682,6 +787,8 @@ test("an external durable claim is one consistent effective critical task", asyn
       choose: async () => { chooseCalls += 1; return { token: "root_token_00000002" }; },
       resolve: async () => ({ kind: "root" }),
       getCurrentToken: () => "root_token_00000001",
+      adopt: async () => {},
+      discard: async () => {},
     },
   });
   const snapshot = await service.getSnapshot();
@@ -872,6 +979,8 @@ test("fresh ownership recheck catches claims created during refresh, root choice
         choose: async () => { claim(); return { token: "root_token_00000002" }; },
         resolve: async () => ({ kind: "root" }),
         getCurrentToken: () => "root_token_00000001",
+        adopt: async () => {},
+        discard: async () => {},
       };
     } else {
       options.adapterFactory = async () => {
@@ -924,6 +1033,8 @@ test("install-root choice stays transactional when a durable claim appears durin
       choose: async () => ({ token: candidateToken }),
       resolve: async (token) => ({ token }),
       getCurrentToken: () => oldToken,
+      adopt: async () => {},
+      discard: async () => {},
     },
     recoverTransactions: async () => {},
   });
