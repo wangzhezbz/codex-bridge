@@ -87,6 +87,23 @@ test("catalog rejects a signature after one JSON byte changes", () => {
   );
 });
 
+test("catalog rejects signed JSON bytes that are not valid UTF-8 before parsing", () => {
+  const jsonBytes = Buffer.from(JSON.stringify({
+    schemaVersion: 1,
+    components: [componentFixture()],
+    skills: [],
+  }));
+  const nameOffset = jsonBytes.indexOf(Buffer.from("ChatGPT"));
+  assert.notEqual(nameOffset, -1);
+  jsonBytes[nameOffset] = 0xff;
+  const signatureText = sign("RSA-SHA256", jsonBytes, privateKey).toString("base64");
+
+  assert.throws(
+    () => verifyCatalogEnvelope({ jsonBytes, signatureText, publicKeyPem: PUBLIC_KEY_PEM, catalogUrl: TEST_CATALOG_URL }),
+    (error) => error?.code === "catalog_json_invalid",
+  );
+});
+
 test("catalog rejects an unknown component ID", () => {
   assert.throws(() => parseCatalog({ schemaVersion: 1, components: [componentFixture({ id: "unknown" })], skills: [] }), /component_id/i);
 });

@@ -10,6 +10,7 @@ const FIXED_SIGNATURE_URL = `${FIXED_CATALOG_URL}.sig`;
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
 const SIGNATURE_WHITESPACE = /[ \t\r\n]/gu;
 const SIGNATURE_TEXT_CHARS = /^[A-Za-z0-9+/= \t\r\n]+$/u;
+const ENVELOPE_KEYS = Object.freeze(["catalogUrl", "jsonBytes", "signatureText"]);
 
 function positiveSafeInteger(value, code) {
   if (!Number.isSafeInteger(value) || value <= 0) throw catalogError(code);
@@ -36,6 +37,49 @@ function decodeSignatureText(bytes) {
     throw catalogError("catalog_signature_text_invalid");
   }
   return compact;
+}
+
+function exactDataRecordDescriptors(value, keys) {
+  try {
+    if (value === null || typeof value !== "object" || Array.isArray(value)
+      || Object.getPrototypeOf(value) !== Object.prototype) return null;
+    const ownKeys = Reflect.ownKeys(value);
+    if (ownKeys.length !== keys.length || !ownKeys.every((key) => typeof key === "string" && keys.includes(key))) {
+      return null;
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    for (const key of keys) {
+      const descriptor = descriptors[key];
+      if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, "value")) return null;
+    }
+    return descriptors;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeCachedEnvelope(value, catalogUrl, maxCatalogBytes, maxSignatureBytes) {
+  const descriptors = exactDataRecordDescriptors(value, ENVELOPE_KEYS);
+  if (!descriptors) throw catalogError("catalog_cache_envelope_invalid");
+  if (descriptors.catalogUrl.value !== catalogUrl) throw catalogError("catalog_cache_url_mismatch");
+  const sourceBytes = descriptors.jsonBytes.value;
+  const signatureText = descriptors.signatureText.value;
+  if ((!Buffer.isBuffer(sourceBytes) && !(sourceBytes instanceof Uint8Array))
+    || typeof signatureText !== "string" || signatureText.length === 0
+    || signatureText.length > maxSignatureBytes || Buffer.byteLength(signatureText, "utf8") > maxSignatureBytes
+    || !BASE64_PATTERN.test(signatureText)) {
+    throw catalogError("catalog_cache_envelope_invalid");
+  }
+  let jsonBytes;
+  try { jsonBytes = Buffer.from(sourceBytes); } catch { throw catalogError("catalog_cache_envelope_invalid"); }
+  if (jsonBytes.length === 0 || jsonBytes.length > maxCatalogBytes) {
+    throw catalogError("catalog_cache_envelope_invalid");
+  }
+  const decodedSignature = Buffer.from(signatureText, "base64");
+  if (decodedSignature.length === 0 || decodedSignature.toString("base64") !== signatureText) {
+    throw catalogError("catalog_cache_envelope_invalid");
+  }
+  return { catalogUrl, jsonBytes, signatureText };
 }
 
 async function raceWithSignal(promise, signal) {
@@ -145,18 +189,19 @@ export function createCachedCatalogProvider({
   positiveSafeInteger(timeoutMs, "catalog_provider_timeout_invalid");
   positiveSafeInteger(maxCatalogBytes, "catalog_provider_limit_invalid");
   positiveSafeInteger(maxSignatureBytes, "catalog_provider_limit_invalid");
+  const offlineRefresh = Promise.resolve(null);
+  let refreshInFlight = null;
 
   async function getCurrent() {
     if (publicKeyPem === null) return null;
-    const envelope = await cache.readEnvelope();
-    if (envelope === null) return null;
-    if (envelope.catalogUrl !== catalogUrl) throw catalogError("catalog_cache_url_mismatch");
+    const cached = await cache.readEnvelope();
+    if (cached === null) return null;
+    const envelope = normalizeCachedEnvelope(cached, catalogUrl, maxCatalogBytes, maxSignatureBytes);
     const catalog = verifyCatalogEnvelope({ ...envelope, publicKeyPem });
     return createTrustedCatalogService(catalog);
   }
 
-  async function refresh() {
-    if (publicKeyPem === null) return null;
+  async function performRefresh() {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(timeoutError()), timeoutMs);
     timer.unref?.();
@@ -172,6 +217,18 @@ export function createCachedCatalogProvider({
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  function refresh() {
+    if (publicKeyPem === null) return offlineRefresh;
+    if (refreshInFlight !== null) return refreshInFlight;
+    const operation = Promise.resolve().then(performRefresh);
+    refreshInFlight = operation;
+    const release = () => {
+      if (refreshInFlight === operation) refreshInFlight = null;
+    };
+    operation.then(release, release);
+    return operation;
   }
 
   return Object.freeze({ getCurrent, refresh });

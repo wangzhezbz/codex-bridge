@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { TextDecoder } from "node:util";
 
 import { CATALOG_PUBLIC_KEY_SPKI } from "./catalog-public-key.mjs";
 import {
@@ -67,11 +68,12 @@ export function verifyCatalogEnvelope({ jsonBytes, signatureText, publicKeyPem =
   const signature = Buffer.from(String(signatureText).replace(/^\uFEFF/, "").replace(/\s+/g, ""), "base64");
   if (!crypto.verify("RSA-SHA256", jsonBytes, publicKeyPem, signature)) throw catalogError("catalog_signature_invalid");
   try {
-    const catalog = parseCatalog(JSON.parse(Buffer.from(jsonBytes).toString("utf8")));
+    const jsonText = new TextDecoder("utf-8", { fatal: true }).decode(jsonBytes);
+    const catalog = parseCatalog(JSON.parse(jsonText));
     VERIFIED_CATALOGS.set(catalog, { catalogUrl: url.href });
     return catalog;
   } catch (error) {
-    if (error?.code) throw error;
+    if (typeof error?.code === "string" && error.code.startsWith("catalog_")) throw error;
     throw catalogError("catalog_json_invalid");
   }
 }

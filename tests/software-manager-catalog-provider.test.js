@@ -47,7 +47,7 @@ function memoryCacheStore(initial = null) {
   return {
     replacements,
     async read() { return record === null ? null : structuredClone(record); },
-    async replace(next) {
+    async replaceAtomic(next) {
       replacements.push(structuredClone(next));
       record = structuredClone(next);
     },
@@ -123,6 +123,46 @@ test("catalog cache atomically replaces one exact bounded envelope record", asyn
   assert.deepEqual(await cache.readEnvelope(), envelope);
 });
 
+test("catalog cache requires the narrow atomic replacement capability", () => {
+  assert.throws(
+    () => createCatalogCache({ cacheStore: { read: async () => null, replace: async () => {} } }),
+    /catalog_cache_store_invalid/u,
+  );
+});
+
+test("catalog cache calls only replaceAtomic even when a weak replace method is present", async () => {
+  const calls = [];
+  const cache = createCatalogCache({
+    cacheStore: {
+      read: async () => null,
+      replace: async () => { calls.push("replace"); },
+      replaceAtomic: async () => { calls.push("replaceAtomic"); },
+    },
+  });
+
+  await cache.replaceEnvelope(signedFixture());
+
+  assert.deepEqual(calls, ["replaceAtomic"]);
+});
+
+test("an atomic cache replacement failure leaves the prior envelope readable", async () => {
+  const prior = signedFixture("1.0.0");
+  const incoming = signedFixture("2.0.0");
+  const priorRecord = {
+    catalogUrl: prior.catalogUrl,
+    jsonBase64: prior.jsonBytes.toString("base64"),
+    signatureText: prior.signatureText,
+  };
+  const store = {
+    async read() { return structuredClone(priorRecord); },
+    async replaceAtomic() { throw new Error("atomic_replace_failed"); },
+  };
+  const cache = createCatalogCache({ cacheStore: store });
+
+  await assert.rejects(cache.replaceEnvelope(incoming), /atomic_replace_failed/u);
+  assert.deepEqual(await cache.readEnvelope(), prior);
+});
+
 test("catalog cache rejects malformed, oversized, and non-canonical single records", async () => {
   const valid = signedFixture();
   const validRecord = {
@@ -146,6 +186,33 @@ test("catalog cache rejects malformed, oversized, and non-canonical single recor
     const cache = createCatalogCache({ cacheStore: memoryCacheStore(record) });
     await assert.rejects(cache.readEnvelope(), /catalog_cache_invalid/u);
   }
+});
+
+test("catalog cache exact schema rejects symbol keys, accessors, and hostile records", async () => {
+  const valid = signedFixture();
+  const record = {
+    catalogUrl: valid.catalogUrl,
+    jsonBase64: valid.jsonBytes.toString("base64"),
+    signatureText: valid.signatureText,
+  };
+  const symbolRecord = { ...record, [Symbol("extra")]: true };
+  const accessorRecord = { ...record };
+  let cacheAccessorReads = 0;
+  Object.defineProperty(accessorRecord, "signatureText", {
+    enumerable: true,
+    get() { cacheAccessorReads += 1; return valid.signatureText; },
+  });
+  const hostileRecord = new Proxy(record, {
+    getPrototypeOf() { throw new Error("hostile_cache_record"); },
+  });
+
+  for (const value of [symbolRecord, accessorRecord, hostileRecord]) {
+    const cache = createCatalogCache({
+      cacheStore: { read: async () => value, replaceAtomic: async () => {} },
+    });
+    await assert.rejects(cache.readEnvelope(), /catalog_cache_invalid/u);
+  }
+  assert.equal(cacheAccessorReads, 0);
 });
 
 test("getCurrent re-verifies a valid cached envelope before returning a trusted service", async () => {
@@ -186,6 +253,52 @@ test("getCurrent rejects a cache implementation that changes the envelope catalo
   await assert.rejects(provider.getCurrent(), /catalog_cache_url_mismatch/u);
 });
 
+test("getCurrent independently rejects malformed or aliased cache envelope records", async () => {
+  const envelope = signedFixture();
+  const accessorEnvelope = { ...envelope };
+  let providerAccessorReads = 0;
+  Object.defineProperty(accessorEnvelope, "signatureText", {
+    enumerable: true,
+    get() { providerAccessorReads += 1; return envelope.signatureText; },
+  });
+  const symbolEnvelope = { ...envelope, [Symbol("extra")]: true };
+  const proxiedBytes = new Proxy(new Uint8Array(envelope.jsonBytes), {});
+  const cases = [
+    { ...envelope, extra: true },
+    symbolEnvelope,
+    Object.assign(Object.create(null), envelope),
+    { ...envelope, jsonBytes: Buffer.alloc(2_000_001) },
+    { ...envelope, jsonBytes: "not-bytes" },
+    { ...envelope, signatureText: `${envelope.signatureText}\n` },
+    { ...envelope, signatureText: "AB==" },
+    accessorEnvelope,
+    { ...envelope, jsonBytes: proxiedBytes },
+  ];
+  for (const cachedEnvelope of cases) {
+    const provider = createCachedCatalogProvider(providerOptions({
+      cache: { readEnvelope: async () => cachedEnvelope, replaceEnvelope: async () => {} },
+    }));
+    await assert.rejects(provider.getCurrent(), /catalog_cache_envelope_invalid/u);
+  }
+  assert.equal(providerAccessorReads, 0);
+});
+
+test("getCurrent clones a valid Uint8Array cache view before trust verification", async () => {
+  const envelope = signedFixture();
+  const aliasedBytes = new Uint8Array(envelope.jsonBytes);
+  const provider = createCachedCatalogProvider(providerOptions({
+    cache: {
+      readEnvelope: async () => ({ ...envelope, jsonBytes: aliasedBytes }),
+      replaceEnvelope: async () => {},
+    },
+  }));
+
+  const service = await provider.getCurrent();
+  aliasedBytes.fill(0);
+
+  assert.equal(service.getComponent("chatgpt").version, "1.2.3");
+});
+
 test("refresh fetches only exact URLs with redirects disabled and caches only verified bytes", async () => {
   const envelope = signedFixture("2.0.0");
   const calls = [];
@@ -205,6 +318,88 @@ test("refresh fetches only exact URLs with redirects disabled and caches only ve
   assert.equal(service.getComponent("chatgpt").version, "2.0.0");
   assert.deepEqual(calls.map(({ url }) => url), [TEST_CATALOG_URL, TEST_SIGNATURE_URL]);
   assert.equal(calls.every(({ options }) => options.redirect === "error" && options.signal instanceof AbortSignal), true);
+  assert.equal(store.replacements.length, 1);
+});
+
+test("overlapping refresh calls are one single-flight promise and one committed fetch pair", async () => {
+  const envelope = signedFixture("3.0.0");
+  let releaseCatalog;
+  const catalogGate = new Promise((resolve) => { releaseCatalog = resolve; });
+  const calls = [];
+  const store = memoryCacheStore();
+  const provider = createCachedCatalogProvider(providerOptions({
+    cache: createCatalogCache({ cacheStore: store }),
+    fetchImpl: async (url) => {
+      calls.push(url);
+      if (url === TEST_CATALOG_URL) {
+        await catalogGate;
+        return response(envelope.jsonBytes);
+      }
+      return response(envelope.signatureText);
+    },
+  }));
+
+  const first = provider.refresh();
+  const second = provider.refresh();
+  const samePromise = first === second;
+  releaseCatalog();
+  const [firstService, secondService] = await Promise.all([first, second]);
+
+  assert.equal(samePromise, true);
+  assert.equal(firstService, secondService);
+  assert.deepEqual(calls, [TEST_CATALOG_URL, TEST_SIGNATURE_URL]);
+  assert.equal(store.replacements.length, 1);
+});
+
+test("a synchronously reentrant fetch wrapper cannot start a second refresh flight", async () => {
+  const envelope = signedFixture("3.1.0");
+  const calls = [];
+  const store = memoryCacheStore();
+  let provider;
+  let reentrantPromise;
+  let didReenter = false;
+  provider = createCachedCatalogProvider(providerOptions({
+    cache: createCatalogCache({ cacheStore: store }),
+    fetchImpl: async (url) => {
+      calls.push(url);
+      if (url === TEST_CATALOG_URL && !didReenter) {
+        didReenter = true;
+        reentrantPromise = provider.refresh();
+      }
+      return url === TEST_CATALOG_URL ? response(envelope.jsonBytes) : response(envelope.signatureText);
+    },
+  }));
+
+  const outerPromise = provider.refresh();
+  const service = await outerPromise;
+
+  assert.equal(reentrantPromise, outerPromise);
+  assert.equal(service.getComponent("chatgpt").version, "3.1.0");
+  assert.deepEqual(calls, [TEST_CATALOG_URL, TEST_SIGNATURE_URL]);
+  assert.equal(store.replacements.length, 1);
+});
+
+test("a failed single-flight refresh releases its promise so a later refresh can retry", async () => {
+  const envelope = signedFixture("4.0.0");
+  let catalogAttempts = 0;
+  const store = memoryCacheStore();
+  const provider = createCachedCatalogProvider(providerOptions({
+    cache: createCatalogCache({ cacheStore: store }),
+    fetchImpl: async (url) => {
+      if (url === TEST_CATALOG_URL && catalogAttempts++ === 0) throw new Error("first_fetch_failed");
+      return url === TEST_CATALOG_URL ? response(envelope.jsonBytes) : response(envelope.signatureText);
+    },
+  }));
+
+  const failed = provider.refresh();
+  const joinedFailure = provider.refresh();
+  assert.equal(joinedFailure, failed);
+  await assert.rejects(failed, /first_fetch_failed/u);
+  const retry = provider.refresh();
+
+  assert.notEqual(retry, failed);
+  assert.equal((await retry).getComponent("chatgpt").version, "4.0.0");
+  assert.equal(catalogAttempts, 2);
   assert.equal(store.replacements.length, 1);
 });
 
