@@ -124,6 +124,10 @@ function requireFile(value, writable = false) {
   return value;
 }
 
+function sameRecord(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
 async function readNamed(directory, name, installRoot) {
   const opened = await directory.openFileNoFollow(name, "r");
   if (opened === null) return null;
@@ -154,6 +158,60 @@ export function createSkillPrepareJournal({ journalDir, fsApi, installRoot } = {
     return requireDirectory(await fsApi.openJournalDirectoryNoFollow(journalDir));
   }
 
+  async function readPhase(directory, taskId, skillId, phase) {
+    const final = await readNamed(directory, fileName(taskId, skillId, phase), root);
+    const temp = await readNamed(directory, fileName(taskId, skillId, phase, true), root);
+    if (final && temp && !sameRecord(final.record, temp.record)) {
+      throw journalError("skill_prepare_journal_conflict");
+    }
+    return { final, temp, record: final?.record ?? temp?.record ?? null };
+  }
+
+  async function settleTemp(directory, tempName, destination, expectedRecord) {
+    const temp = await readNamed(directory, tempName, root);
+    const final = await readNamed(directory, destination, root);
+    if (final) {
+      if (!sameRecord(final.record, expectedRecord)
+        || (temp && !sameRecord(temp.record, expectedRecord))) {
+        throw journalError("skill_prepare_journal_conflict");
+      }
+      if (temp) await directory.unlinkEntryNoFollow(temp.entry);
+      return expectedRecord;
+    }
+    if (!temp) throw journalError("skill_prepare_journal_conflict");
+    if (!sameRecord(temp.record, expectedRecord)) {
+      throw journalError("skill_prepare_journal_conflict");
+    }
+    try {
+      await directory.renameEntryNoFollow(temp.entry, destination);
+      return expectedRecord;
+    } catch (error) {
+      const published = await readNamed(directory, destination, root);
+      if (!published || !sameRecord(published.record, expectedRecord)) throw error;
+      const leftover = await readNamed(directory, tempName, root);
+      if (leftover) {
+        if (!sameRecord(leftover.record, expectedRecord)) {
+          throw journalError("skill_prepare_journal_conflict");
+        }
+        await directory.unlinkEntryNoFollow(leftover.entry);
+      }
+      return expectedRecord;
+    }
+  }
+
+  function checkedNames(value) {
+    if (!Array.isArray(value) || value.length > 4_096) {
+      throw journalError("skill_prepare_journal_limit_exceeded");
+    }
+    for (const name of value) {
+      if (typeof name !== "string") throw journalError("skill_prepare_journal_corrupt");
+      if (name.startsWith("skill-prepare-") && !FILE_NAME.test(name) && !TEMP_FILE_NAME.test(name)) {
+        throw journalError("skill_prepare_journal_corrupt");
+      }
+    }
+    return value;
+  }
+
   async function load({ taskId, skillId } = {}) {
     if (!TASK_ID.test(taskId ?? "") || !SKILL_ID.test(skillId ?? "")) {
       throw journalError("skill_prepare_lookup_invalid");
@@ -162,8 +220,8 @@ export function createSkillPrepareJournal({ journalDir, fsApi, installRoot } = {
     try {
       const records = [];
       for (const phase of PHASES) {
-        const value = await readNamed(directory, fileName(taskId, skillId, phase), root);
-        if (value) records.push(value.record);
+        const value = await readPhase(directory, taskId, skillId, phase);
+        if (value.record) records.push(value.record);
       }
       if (records.length === 0) return null;
       const phases = records.map((record) => record.phase);
@@ -197,47 +255,61 @@ export function createSkillPrepareJournal({ journalDir, fsApi, installRoot } = {
     }
   }
 
-  async function list() {
+  async function list({ claimLease } = {}) {
     const directory = await openDirectory();
-    let names;
+    const livePairs = new Set();
     try {
-      names = await directory.listFileNamesNoFollow();
-      if (!Array.isArray(names) || names.length > 4_096) {
-        throw journalError("skill_prepare_journal_limit_exceeded");
-      }
-      const finalNames = new Set(names.filter((name) => typeof name === "string" && FILE_NAME.test(name)));
+      const names = checkedNames(await directory.listFileNamesNoFollow());
       for (const name of names) {
-        if (typeof name !== "string" || !TEMP_FILE_NAME.test(name)) continue;
+        if (!TEMP_FILE_NAME.test(name)) continue;
         const temp = await readNamed(directory, name, root);
-        const destination = name.slice(0, -4);
-        const final = await readNamed(directory, destination, root);
-        if (final) {
-          if (JSON.stringify(final.record) !== JSON.stringify(temp.record)) {
-            throw journalError("skill_prepare_journal_conflict");
-          }
-          await directory.unlinkEntryNoFollow(temp.entry);
-        } else {
-          await directory.renameEntryNoFollow(temp.entry, destination);
+        if (!temp) continue;
+        if (typeof claimLease !== "function") {
+          throw journalError("skill_prepare_lease_claim_required");
         }
-        finalNames.add(destination);
+        const pairKey = `${temp.record.taskId}\0${temp.record.skillId}`;
+        const lease = await claimLease({
+          nonce: temp.record.leaseNonce, scope: temp.record.leaseScope,
+        });
+        if (lease === null) {
+          livePairs.add(pairKey);
+          continue;
+        }
+        if (!lease || typeof lease.release !== "function") {
+          throw journalError("skill_prepare_lease_claim_invalid");
+        }
+        const destination = name.slice(0, -4);
+        try {
+          const current = await readNamed(directory, name, root);
+          if (!current) continue;
+          await settleTemp(directory, name, destination, current.record);
+        } finally {
+          await lease.release();
+        }
       }
-      names = [...finalNames];
     } finally {
       await directory.close();
     }
     const pairs = new Map();
     const directoryForRead = await openDirectory();
     try {
+      const names = checkedNames(await directoryForRead.listFileNamesNoFollow());
       for (const name of names) {
+        if (!FILE_NAME.test(name)) continue;
         const opened = await readNamed(directoryForRead, name, root);
+        if (!opened) continue;
         const key = `${opened.record.taskId}\0${opened.record.skillId}`;
+        if (livePairs.has(key)) continue;
         pairs.set(key, { taskId: opened.record.taskId, skillId: opened.record.skillId });
       }
     } finally {
       await directoryForRead.close();
     }
     const result = [];
-    for (const pair of pairs.values()) result.push((await load(pair)).snapshot);
+    for (const pair of pairs.values()) {
+      const transaction = await load(pair);
+      if (transaction) result.push(transaction.snapshot);
+    }
     return result;
   }
 
@@ -247,10 +319,20 @@ export function createSkillPrepareJournal({ journalDir, fsApi, installRoot } = {
     const priorPhase = existing?.snapshot.phase ?? null;
     if (existing?.records.some((item) => item.phase === normalized.phase)) {
       const prior = existing.records.find((item) => item.phase === normalized.phase);
-      if (!prior || JSON.stringify(prior) !== JSON.stringify(normalized)) {
+      if (!prior || !sameRecord(prior, normalized)) {
         throw journalError("skill_prepare_journal_conflict");
       }
-      return prior;
+      const directory = await openDirectory();
+      try {
+        return await settleTemp(
+          directory,
+          fileName(normalized.taskId, normalized.skillId, normalized.phase, true),
+          fileName(normalized.taskId, normalized.skillId, normalized.phase),
+          normalized,
+        );
+      } finally {
+        await directory.close();
+      }
     }
     const allowed = priorPhase === null ? normalized.phase === "intent"
       : priorPhase === "intent" ? normalized.phase === "bound"
@@ -263,22 +345,19 @@ export function createSkillPrepareJournal({ journalDir, fsApi, installRoot } = {
     try {
       const existingTemp = await readNamed(directory, tempName, root);
       if (existingTemp) {
-        if (JSON.stringify(existingTemp.record) !== JSON.stringify(normalized)) {
+        if (!sameRecord(existingTemp.record, normalized)) {
           throw journalError("skill_prepare_journal_conflict");
         }
-        await directory.renameEntryNoFollow(existingTemp.entry, destination);
-        return normalized;
+        return settleTemp(directory, tempName, destination, normalized);
       }
       const temp = requireFile(await directory.openFileNoFollow(tempName, "wx"), true);
-      const entry = temp.entry;
       try {
         await temp.writeFile(`${JSON.stringify(normalized)}\n`, "utf8");
         await temp.sync();
       } finally {
         await temp.close();
       }
-      await directory.renameEntryNoFollow(entry, destination);
-      return normalized;
+      return settleTemp(directory, tempName, destination, normalized);
     } finally {
       await directory.close();
     }
@@ -290,11 +369,20 @@ export function createSkillPrepareJournal({ journalDir, fsApi, installRoot } = {
     const directory = await openDirectory();
     try {
       for (const record of transaction.records) {
-        const opened = await readNamed(directory, fileName(taskId, skillId, record.phase), root);
-        if (!opened || JSON.stringify(opened.record) !== JSON.stringify(record)) {
+        const opened = await readPhase(directory, taskId, skillId, record.phase);
+        if (!opened.record || !sameRecord(opened.record, record)) {
           throw journalError("skill_prepare_journal_conflict");
         }
-        await directory.unlinkEntryNoFollow(opened.entry);
+        if (opened.final) await directory.unlinkEntryNoFollow(opened.final.entry);
+        if (opened.temp) {
+          const current = await readNamed(
+            directory, fileName(taskId, skillId, record.phase, true), root,
+          );
+          if (current) {
+            if (!sameRecord(current.record, record)) throw journalError("skill_prepare_journal_conflict");
+            await directory.unlinkEntryNoFollow(current.entry);
+          }
+        }
       }
     } finally {
       await directory.close();

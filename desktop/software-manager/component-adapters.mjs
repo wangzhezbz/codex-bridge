@@ -1554,7 +1554,10 @@ export function createComponentAdapters({
     try { context = rejectForbiddenContext(rawContext); requireTaskId(context.taskId); }
     catch (error) { return [await failed("skills", "prepare", error)]; }
     const taskId = context.taskId;
-    try { await reconcilePreparedSkillSources(); }
+    try {
+      await runOwnership(() => recoverSkillTransaction());
+      await reconcilePreparedSkillSources();
+    }
     catch (error) { return [await failed("skills", "prepare", error)]; }
     const ids = Array.isArray(context.skillIds) ? context.skillIds : [];
     const pending = new Map();
@@ -1617,18 +1620,20 @@ export function createComponentAdapters({
         operationLease = null;
         results.push(result(id, "prepare", "succeeded", { versionAfter: entry.version, message: "skill_prepared" }));
       } catch (error) {
-        if (claim) {
-          await clearPrepareClaim(claim, operationLease).catch(() => {});
-          claim = null;
+        const heldLease = operationLease;
+        try {
+          if (claim) {
+            await clearPrepareClaim(claim, heldLease, { releaseLease: false }).catch(() => {});
+            claim = null;
+          }
+          if (downloadRecord) await cleanupSkillPackage(downloadRecord).catch(() => {});
+          if (stagingReceipt) await cleanupAbandonedPrepare(stagingReceipt).catch(() => {});
+          if (typeof id === "string" && SKILL_ID.test(id)) {
+            await discardPreparedSkillSources({ taskId, skillIds: [id] }).catch(() => {});
+          }
+        } finally {
+          await heldLease?.release().catch(() => {});
           operationLease = null;
-        } else if (operationLease) {
-          await operationLease.release().catch(() => {});
-          operationLease = null;
-        }
-        if (downloadRecord) await cleanupSkillPackage(downloadRecord).catch(() => {});
-        if (stagingReceipt) await cleanupAbandonedPrepare(stagingReceipt).catch(() => {});
-        if (typeof id === "string" && SKILL_ID.test(id)) {
-          await discardPreparedSkillSources({ taskId, skillIds: [id] }).catch(() => {});
         }
         results.push(await failed(typeof id === "string" ? id : "skills", "prepare", error));
       }
@@ -1646,7 +1651,6 @@ export function createComponentAdapters({
     const results = [];
     for (const id of Array.isArray(context.skillIds) ? context.skillIds : []) {
       const prepared = pending.get(id);
-      let prepareLeaseReleased = false;
       try {
         if (!prepared) throw adapterError("skill_not_prepared");
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath: prepared.maxRelativePath });
@@ -1735,12 +1739,10 @@ export function createComponentAdapters({
           versionBefore: before, versionAfter: prepared.entry.version, message: "skill_replaced",
         }));
       } catch (error) {
-        await prepared?.operationLease?.release().catch(() => {});
-        prepareLeaseReleased = true;
         await discardPreparedSkillSources({ taskId: context.taskId, skillIds: [id] }).catch(() => {});
         results.push(await failed(id, "commit", error));
       } finally {
-        if (!prepareLeaseReleased) await prepared?.operationLease?.release().catch(() => {});
+        await prepared?.operationLease?.release().catch(() => {});
       }
     }
     return results;
@@ -1751,8 +1753,8 @@ export function createComponentAdapters({
       const context = rejectForbiddenContext(rawContext);
       await revalidateInstallRootCapability(installRootCapability);
       await revalidateFixedDirectoryCapability(skillsRootCapability);
-      await reconcilePreparedSkillSources();
       const state = await recoverSkillTransaction();
+      await reconcilePreparedSkillSources();
       if (state.activeTask !== null) throw adapterError("component_pending_transaction");
       const ids = Array.isArray(context.skillIds) ? context.skillIds : Object.keys(state.skills);
       return ids.map((id) => {
@@ -1774,19 +1776,36 @@ export function createComponentAdapters({
       throw adapterError("skill_prepare_discard_invalid");
     }
     const pending = preparedSkills.get(context.taskId);
+    const held = [];
     if (pending) {
-      const releaseErrors = [];
       for (const skillId of skillIds) {
         const prepared = pending.get(skillId);
         if (!prepared) continue;
         pending.delete(skillId);
-        try { await prepared.operationLease?.release(); } catch (error) { releaseErrors.push(error); }
+        held.push(prepared.operationLease);
       }
       if (pending.size === 0) preparedSkills.delete(context.taskId);
-      if (releaseErrors.length === 1) throw releaseErrors[0];
-      if (releaseErrors.length > 1) throw new AggregateError(releaseErrors, "skill_prepare_lease_release_failed");
     }
-    return discardPreparedSkillSources({ taskId: context.taskId, skillIds });
+    let discarded;
+    let cleanupError = null;
+    try {
+      discarded = await discardPreparedSkillSources({ taskId: context.taskId, skillIds });
+    } catch (error) {
+      cleanupError = error;
+    }
+    const releaseErrors = [];
+    for (const lease of held) {
+      try { await lease?.release(); } catch (error) { releaseErrors.push(error); }
+    }
+    if (cleanupError && releaseErrors.length > 0) {
+      throw new AggregateError([cleanupError, ...releaseErrors], "skill_prepare_discard_failed");
+    }
+    if (cleanupError) throw cleanupError;
+    if (releaseErrors.length === 1) throw releaseErrors[0];
+    if (releaseErrors.length > 1) {
+      throw new AggregateError(releaseErrors, "skill_prepare_lease_release_failed");
+    }
+    return discarded;
   }
 
   async function verifySkills(rawContext) {

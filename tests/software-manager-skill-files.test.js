@@ -399,6 +399,10 @@ function prepareRecord(phase, overrides = {}) {
   };
 }
 
+async function claimDeadPrepareLease() {
+  return { async release() {} };
+}
+
 test("Skill swap journal rejects extra, legacy, and foreign records without deleting anything", async () => {
   const memory = createMemoryJournalFs();
   const journal = createSkillSwapJournal({
@@ -499,7 +503,7 @@ test("Skill prepare journal publishes a flushed temp-only intent during startup 
   const restarted = createSkillPrepareJournal({
     journalDir: "D:\\CBState\\skill-prepares", fsApi: memory.fsApi, installRoot: "D:\\CBApps",
   });
-  const records = await restarted.list();
+  const records = await restarted.list({ claimLease: claimDeadPrepareLease });
   assert.equal(records.length, 1);
   assert.equal(records[0].phase, "intent");
   assert.equal([...memory.entries.keys()].some((name) => name.endsWith(".tmp")), false);
@@ -517,9 +521,147 @@ test("Skill prepare journal rejects a mismatched temp record without deleting ei
   const restarted = createSkillPrepareJournal({
     journalDir: "D:\\CBState\\skill-prepares", fsApi: memory.fsApi, installRoot: "D:\\CBApps",
   });
-  await assert.rejects(restarted.list(), /skill_prepare_journal_conflict/u);
+  await assert.rejects(
+    restarted.list({ claimLease: claimDeadPrepareLease }),
+    /skill_prepare_journal_conflict/u,
+  );
   assert.equal(memory.entries.has(finalName), true);
   assert.equal(memory.entries.has(tempName), true);
+  assert.equal(memory.calls.some(([operation]) => operation === "unlink"), false);
+});
+
+test("Skill prepare journal clears bound and sealed temp-only records after publication failure", async (t) => {
+  for (const phase of ["bound", "sealed"]) {
+    await t.test(phase, async () => {
+      const memory = createMemoryJournalFs();
+      let failTarget = true;
+      const failingFs = {
+        async openJournalDirectoryNoFollow(...args) {
+          const directory = await memory.fsApi.openJournalDirectoryNoFollow(...args);
+          const rename = directory.renameEntryNoFollow.bind(directory);
+          directory.renameEntryNoFollow = async (entry, destination) => {
+            if (failTarget && destination.endsWith(`.${phase}.json`)) {
+              failTarget = false;
+              throw new Error(`test_${phase}_publish_failed`);
+            }
+            return rename(entry, destination);
+          };
+          return directory;
+        },
+      };
+      const journal = createSkillPrepareJournal({
+        journalDir: "D:\\CBState\\skill-prepares", fsApi: failingFs, installRoot: "D:\\CBApps",
+      });
+      await journal.record(prepareRecord("intent"));
+      if (phase === "sealed") await journal.record(prepareRecord("bound"));
+      await assert.rejects(journal.record(prepareRecord(phase)), new RegExp(`test_${phase}_publish_failed`, "u"));
+      assert.equal((await journal.load({ taskId: "skill-task", skillId: "documents" })).snapshot.phase, phase);
+
+      assert.equal(await journal.clear({ taskId: "skill-task", skillId: "documents" }), true);
+      const restarted = createSkillPrepareJournal({
+        journalDir: "D:\\CBState\\skill-prepares", fsApi: memory.fsApi, installRoot: "D:\\CBApps",
+      });
+      assert.deepEqual(await restarted.list({ claimLease: claimDeadPrepareLease }), []);
+      assert.equal([...memory.entries.keys()].some((name) => name.startsWith("skill-prepare-")), false);
+    });
+  }
+});
+
+test("Skill prepare journal leaves a live writer temp untouched and publishes it only after lease death", async () => {
+  const memory = createMemoryJournalFs();
+  const crashingFs = {
+    async openJournalDirectoryNoFollow(...args) {
+      const directory = await memory.fsApi.openJournalDirectoryNoFollow(...args);
+      directory.renameEntryNoFollow = async () => { throw new Error("test_writer_crash"); };
+      return directory;
+    },
+  };
+  const crashing = createSkillPrepareJournal({
+    journalDir: "D:\\CBState\\skill-prepares", fsApi: crashingFs, installRoot: "D:\\CBApps",
+  });
+  await assert.rejects(crashing.record(prepareRecord("intent")), /test_writer_crash/u);
+  const restarted = createSkillPrepareJournal({
+    journalDir: "D:\\CBState\\skill-prepares", fsApi: memory.fsApi, installRoot: "D:\\CBApps",
+  });
+  assert.deepEqual(await restarted.list({ claimLease: async () => null }), []);
+  assert.equal([...memory.entries.keys()].some((name) => name.endsWith(".tmp")), true);
+  assert.equal((await restarted.list({ claimLease: claimDeadPrepareLease }))[0].phase, "intent");
+  assert.equal([...memory.entries.keys()].some((name) => name.endsWith(".tmp")), false);
+});
+
+test("Skill prepare journal tolerates temp disappearance and equivalent publication races", async (t) => {
+  await t.test("temp disappears after lease claim", async () => {
+    const memory = createMemoryJournalFs();
+    const crashingFs = {
+      async openJournalDirectoryNoFollow(...args) {
+        const directory = await memory.fsApi.openJournalDirectoryNoFollow(...args);
+        directory.renameEntryNoFollow = async () => { throw new Error("test_writer_crash"); };
+        return directory;
+      },
+    };
+    const crashing = createSkillPrepareJournal({
+      journalDir: "D:\\CBState\\skill-prepares", fsApi: crashingFs, installRoot: "D:\\CBApps",
+    });
+    await assert.rejects(crashing.record(prepareRecord("intent")), /test_writer_crash/u);
+    const restarted = createSkillPrepareJournal({
+      journalDir: "D:\\CBState\\skill-prepares", fsApi: memory.fsApi, installRoot: "D:\\CBApps",
+    });
+    const records = await restarted.list({
+      claimLease: async () => {
+        const tempName = [...memory.entries.keys()].find((name) => name.endsWith(".tmp"));
+        memory.entries.delete(tempName);
+        return { async release() {} };
+      },
+    });
+    assert.deepEqual(records, []);
+  });
+
+  await t.test("another actor publishes the same final", async () => {
+    const memory = createMemoryJournalFs();
+    const crashingFs = {
+      async openJournalDirectoryNoFollow(...args) {
+        const directory = await memory.fsApi.openJournalDirectoryNoFollow(...args);
+        directory.renameEntryNoFollow = async () => { throw new Error("test_writer_crash"); };
+        return directory;
+      },
+    };
+    const crashing = createSkillPrepareJournal({
+      journalDir: "D:\\CBState\\skill-prepares", fsApi: crashingFs, installRoot: "D:\\CBApps",
+    });
+    await assert.rejects(crashing.record(prepareRecord("intent")), /test_writer_crash/u);
+    const racingFs = {
+      async openJournalDirectoryNoFollow(...args) {
+        const directory = await memory.fsApi.openJournalDirectoryNoFollow(...args);
+        directory.renameEntryNoFollow = async (entry, destination) => {
+          memory.replace(destination, memory.entries.get(entry.name).data);
+          throw Object.assign(new Error("exists"), { code: "EEXIST" });
+        };
+        return directory;
+      },
+    };
+    const restarted = createSkillPrepareJournal({
+      journalDir: "D:\\CBState\\skill-prepares", fsApi: racingFs, installRoot: "D:\\CBApps",
+    });
+    const records = await restarted.list({ claimLease: claimDeadPrepareLease });
+    assert.equal(records[0].phase, "intent");
+    assert.equal([...memory.entries.keys()].some((name) => name.endsWith(".tmp")), false);
+  });
+});
+
+test("Skill prepare journal rejects malformed owned names but ignores unrelated files", async () => {
+  const memory = createMemoryJournalFs({
+    "skill-prepare-broken.json": "{}",
+    "unrelated-service.tmp": "leave me alone",
+  });
+  const journal = createSkillPrepareJournal({
+    journalDir: "D:\\CBState\\skill-prepares", fsApi: memory.fsApi, installRoot: "D:\\CBApps",
+  });
+  await assert.rejects(
+    journal.list({ claimLease: claimDeadPrepareLease }),
+    /skill_prepare_journal_corrupt/u,
+  );
+  assert.equal(memory.entries.has("skill-prepare-broken.json"), true);
+  assert.equal(memory.entries.has("unrelated-service.tmp"), true);
   assert.equal(memory.calls.some(([operation]) => operation === "unlink"), false);
 });
 

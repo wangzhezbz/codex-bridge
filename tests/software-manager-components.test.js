@@ -90,9 +90,11 @@ function fixture({
   skillsRootCapability = SKILLS_CAPABILITY, desktopCapability = DESKTOP_CAPABILITY,
   onDownload = null, onExtract = null,
   onReplaceSkill = null, onGitInstall = null, onVerifyComponent = null,
+  onDiscardPreparedSkill = null,
   onAuthenticode = null, onGitPin = null, gitExecutionTimeoutMs = undefined,
   onGitUninstall = null,
   windowsHostOverride = null,
+  initialPreparedSkillSources = [], recoverReservedSkillFromPreparedSource = false,
 } = {}) {
   let currentState = structuredClone(state);
   let saveCount = 0;
@@ -105,6 +107,7 @@ function fixture({
     reconciledSkills: [], skillOperations: [],
     cleanedSkillPackages: [], cleanedSkillStaging: [],
     begunSkillSources: [], boundSkillSources: [], discardedSkillSources: [],
+    skillRecoveryOrder: [], discardLeaseBusy: [],
   };
   const archiveReceipts = new WeakSet();
   const packageProofs = new WeakMap();
@@ -123,6 +126,9 @@ function fixture({
   const deletedSkillTargets = new Set();
   const operationLeases = new Map();
   const preparedSkillSources = new Map();
+  for (const record of initialPreparedSkillSources) {
+    preparedSkillSources.set(`${record.taskId}:${record.skillId}`, structuredClone(record));
+  }
   const ownershipStore = {
     async acquireOperationLease({ nonce, scope, wait = true }) {
       const key = `${scope}:${nonce}`;
@@ -296,9 +302,20 @@ function fixture({
     },
     async discardPrepared(plan) {
       calls.discardedSkillSources.push(structuredClone(plan));
+      for (const skillId of plan.skillIds) {
+        const record = preparedSkillSources.get(`${plan.taskId}:${skillId}`);
+        if (!record) continue;
+        const competingLease = await ownershipStore.acquireOperationLease({
+          nonce: record.leaseNonce, scope: record.leaseScope, wait: false,
+        });
+        calls.discardLeaseBusy.push(competingLease === null);
+        await competingLease?.release();
+      }
+      await onDiscardPreparedSkill?.(plan);
       return plan.skillIds.map((skillId) => preparedSkillSources.delete(`${plan.taskId}:${skillId}`));
     },
     async reconcilePreparedSources() {
+      calls.skillRecoveryOrder.push("prepare-reconcile");
       let recovered = 0;
       for (const [key, record] of preparedSkillSources) {
         const lease = await ownershipStore.acquireOperationLease({
@@ -405,8 +422,24 @@ function fixture({
       return structuredClone(evidence);
     },
     async reconcileReplacement(plan) {
+      calls.skillRecoveryOrder.push("swap-reconcile");
       calls.reconciledSkills.push(structuredClone(plan));
       calls.skillOperations.push(["reconcile", plan.target]);
+      if (recoverReservedSkillFromPreparedSource) {
+        const key = `${plan.taskId}:${path.win32.basename(plan.target)}`;
+        const source = preparedSkillSources.get(key);
+        if (!source || source.phase !== "sealed") throw new Error("skill_recovery_source_missing");
+        installedSkillEvidence.set(plan.target, {
+          kind: "directory", identity: { volumeSerial: "v", fileId: "recovered-from-source" },
+          treeDigest: plan.expected.treeDigest,
+          manifestDigest: plan.expected.manifestDigest,
+          skillMdSha256: plan.expected.skillMdSha256,
+        });
+        preparedSkillSources.delete(key);
+        calls.discardedSkillSources.push({
+          taskId: plan.taskId, skillIds: [path.win32.basename(plan.target)], recovery: "swap-prepared",
+        });
+      }
       return { status: "completed" };
     },
   };
@@ -476,6 +509,7 @@ function fixture({
   return {
     adapters, calls, getState: () => structuredClone(currentState),
     createAnotherAdapters: () => createComponentAdapters(adapterOptions),
+    reconcilePreparedSkillSources: () => skillFiles.reconcilePreparedSources(),
     preparedSkillSourceCount: () => preparedSkillSources.size,
     simulateProcessCrash: () => operationLeases.clear(),
   };
@@ -1530,6 +1564,54 @@ test("Skill replacement consumes a source receipt, reserves ownership, and adopt
   assert.deepEqual(calls.skillOperations.slice(0, 2).map(([operation]) => operation), ["reconcile", "inspect"]);
 });
 
+test("Skill entrypoints recover a reserved swap before reclaiming its dead prepared-source lease", async (t) => {
+  for (const entrypoint of ["inspect", "prepare"]) {
+    await t.test(entrypoint, async () => {
+      const target = path.win32.join(SKILLS_ROOT, "documents");
+      const state = emptyState(INSTALL_ROOT);
+      state.activeTask = {
+        kind: "skill-replace",
+        phase: "reserved",
+        taskId: "swap-crash",
+        swapId: "5".repeat(32),
+        skillId: "documents",
+        skillsRoot: SKILLS_ROOT,
+        target,
+        version: "1.0.0",
+        packageSha256: DIGEST_B,
+        skillMdSha256: SKILL_HASH,
+        treeDigest: DIGEST_A,
+        manifestDigest: DIGEST_B,
+        previousEvidence: { kind: "absent" },
+      };
+      const preparedSource = {
+        taskId: "swap-crash",
+        skillId: "documents",
+        leaseScope: "prepare",
+        leaseNonce: "6".repeat(32),
+        phase: "sealed",
+      };
+      const current = fixture({
+        state,
+        initialPreparedSkillSources: [preparedSource],
+        recoverReservedSkillFromPreparedSource: true,
+      });
+      if (entrypoint === "inspect") {
+        const result = await current.adapters.skills.inspectInstalled({ skillIds: ["documents"] });
+        assert.equal(result[0].status, "succeeded", JSON.stringify(result[0]));
+      } else {
+        assert.deepEqual(await current.adapters.skills.prepare({ taskId: "next-task", skillIds: [] }), []);
+      }
+      assert.deepEqual(current.calls.skillRecoveryOrder.slice(0, 2), ["swap-reconcile", "prepare-reconcile"]);
+      assert.equal(current.preparedSkillSourceCount(), 0);
+      assert.equal(current.getState().activeTask, null);
+      assert.equal(current.getState().skills.documents.version, "1.0.0");
+      assert.equal(current.calls.discardedSkillSources.filter((item) => item.recovery === "swap-prepared").length, 1);
+      assert.equal(current.calls.discardedSkillSources.filter((item) => item.recovery === true).length, 0);
+    });
+  }
+});
+
 test("Skill uninstall is independently recovered after deletion completed before state save", async () => {
   const state = emptyState(INSTALL_ROOT);
   state.skills.documents = {
@@ -1695,6 +1777,58 @@ test("a second adapter skips a live sealed Skill prepare and reclaims it only af
   await second.skills.inspectInstalled({ skillIds: ["documents"] });
   assert.equal(shared.preparedSkillSourceCount(), 0);
   assert.equal(shared.calls.discardedSkillSources.filter((item) => item.recovery === true).length, 1);
+});
+
+test("Skill owner keeps its prepare lease until exact discard finishes", async () => {
+  let enteredResolve;
+  let cleanupResolve;
+  const entered = new Promise((resolve) => { enteredResolve = resolve; });
+  const cleanupBlocked = new Promise((resolve) => { cleanupResolve = resolve; });
+  const shared = fixture({
+    onDiscardPreparedSkill: async () => {
+      enteredResolve();
+      await cleanupBlocked;
+    },
+  });
+  const prepared = await shared.adapters.skills.prepare({ taskId: "lease-discard", skillIds: ["documents"] });
+  assert.equal(prepared[0].status, "succeeded");
+
+  const discarding = shared.adapters.skills.discardPrepared({
+    taskId: "lease-discard", skillIds: ["documents"],
+  });
+  await entered;
+  assert.equal(await shared.reconcilePreparedSkillSources(), 0);
+  assert.equal(shared.preparedSkillSourceCount(), 1);
+  assert.equal(shared.calls.discardedSkillSources.some((item) => item.recovery === true), false);
+
+  cleanupResolve();
+  assert.deepEqual(await discarding, [true]);
+  assert.equal(shared.preparedSkillSourceCount(), 0);
+  assert.deepEqual(shared.calls.discardLeaseBusy, [true]);
+  assert.equal(shared.calls.discardedSkillSources.filter((item) => item.recovery === true).length, 0);
+});
+
+test("Skill prepare and commit failure cleanup retain the owner lease through source deletion", async (t) => {
+  await t.test("prepare failure", async () => {
+    const shared = fixture({ onExtract: async () => { throw new Error("test_extract_failed"); } });
+    const [prepared] = await shared.adapters.skills.prepare({ taskId: "lease-prepare-failure", skillIds: ["documents"] });
+    assert.equal(prepared.status, "failed");
+    assert.deepEqual(shared.calls.discardLeaseBusy, [true]);
+    assert.equal(shared.preparedSkillSourceCount(), 0);
+  });
+
+  await t.test("commit failure", async () => {
+    const shared = fixture({ onReplaceSkill: async () => { throw new Error("test_replace_failed"); } });
+    assert.equal((await shared.adapters.skills.prepare({
+      taskId: "lease-commit-failure", skillIds: ["documents"],
+    }))[0].status, "succeeded");
+    const [committed] = await shared.adapters.skills.commit({
+      taskId: "lease-commit-failure", skillIds: ["documents"],
+    });
+    assert.equal(committed.status, "failed");
+    assert.deepEqual(shared.calls.discardLeaseBusy, [true]);
+    assert.equal(shared.preparedSkillSourceCount(), 0);
+  });
 });
 
 for (const [stage, hook] of [

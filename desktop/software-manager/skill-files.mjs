@@ -287,7 +287,11 @@ export function createSkillFileService({
   }
 
   async function reconcilePreparedSources() {
-    const records = await preparedJournal.list();
+    const records = await preparedJournal.list({
+      claimLease: ({ nonce, scope }) => prepareLeaseStore.acquireOperationLease({
+        nonce, scope, wait: false,
+      }),
+    });
     let recovered = 0;
     for (const record of records) {
       const lease = await prepareLeaseStore.acquireOperationLease({
