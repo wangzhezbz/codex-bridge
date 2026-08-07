@@ -11,7 +11,7 @@ function operationResult(componentId, action, status = "succeeded", extra = {}) 
     action,
     status,
     versionBefore: null,
-    versionAfter: status === "succeeded" ? "2.0.0" : null,
+    versionAfter: status === "succeeded" && action !== "uninstall" ? "2.0.0" : null,
     message: `${componentId}_${action}_${status}`,
     rollbackAvailable: false,
     ...extra,
@@ -126,6 +126,8 @@ function fixtureService(options = {}) {
     clock: options.clock ?? { now: () => 1_700_000_000_000 + tick++ },
     taskIdFactory: options.taskIdFactory ?? (() => "task-1"),
     maxPendingLogWrites: options.maxPendingLogWrites,
+    logWriteTimeoutMs: options.logWriteTimeoutMs,
+    maxListenerQueue: options.maxListenerQueue,
   });
   return { service, calls, state, adapters };
 }
@@ -457,6 +459,7 @@ test("late progress after abort cannot re-enable cancellation", async () => {
   assert.equal(signal.aborted, true);
   release.resolve();
   await late.promise;
+  await Promise.resolve();
   assert.equal(progressEvents.at(-1).cancellable, false);
   assert.equal(service.hasCriticalTask(), false);
   finish.resolve();
@@ -495,6 +498,40 @@ test("a stale prepare progress callback cannot downgrade critical commit state",
   assert.equal((await running).status, "succeeded");
 });
 
+test("critical commit scope ends before the next component prepare without reviving stale progress", async () => {
+  let staleProgress;
+  const secondEntered = deferred();
+  let secondSignal;
+  const events = [];
+  const { service } = fixtureService({
+    chatgpt: {
+      prepare: async ({ onProgress }) => { staleProgress = onProgress; return operationResult("chatgpt", "prepare"); },
+    },
+    v2rayn: {
+      prepare: async ({ signal, onProgress }) => {
+        secondSignal = signal;
+        await onProgress({ phase: "download", percent: 1, message: "second-ready" });
+        secondEntered.resolve();
+        await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+        return operationResult("v2rayn", "prepare", "failed");
+      },
+    },
+  });
+  service.subscribe((event) => { if (event.type === "progress") events.push(event); });
+  const running = service.startTask({ kind: "install", componentIds: ["chatgpt", "v2rayn"], skillIds: [] });
+  await secondEntered.promise;
+  assert.equal(service.hasCriticalTask(), false);
+  assert.deepEqual(service.prepareForQuit(), { allowQuit: false, reason: "running", canCancel: true });
+  const before = events.length;
+  await staleProgress({ phase: "download", percent: 99, message: "stale-first" });
+  assert.equal(events.length, before);
+  assert.deepEqual(service.cancelTask(), { cancelled: true });
+  assert.equal(secondSignal.aborted, true);
+  const result = await running;
+  assert.equal(result.status, "cancelled");
+  assert.deepEqual(result.components.map(({ status }) => status), ["succeeded", "failed"]);
+});
+
 test("only an accepted cancellable-phase cancel makes the final result cancelled", async () => {
   const entered = deferred();
   const release = deferred();
@@ -514,6 +551,28 @@ test("only an accepted cancellable-phase cancel makes the final result cancelled
   release.resolve();
   const result = await running;
   assert.equal(result.status, "cancelled");
+});
+
+test("accepted cancellation has one stable cancelling state for cancel and quit", async () => {
+  const entered = deferred();
+  const release = deferred();
+  const { service } = fixtureService({
+    chatgpt: {
+      prepare: async ({ signal }) => {
+        entered.resolve(signal);
+        await release.promise;
+        return operationResult("chatgpt", "prepare", "failed");
+      },
+    },
+  });
+  const running = service.startTask({ kind: "install", componentIds: ["chatgpt"], skillIds: [] });
+  const signal = await entered.promise;
+  assert.deepEqual(service.cancelTask(), { cancelled: true });
+  assert.equal(signal.aborted, true);
+  assert.deepEqual(service.cancelTask(), { cancelled: false, reason: "already_cancelled" });
+  assert.deepEqual(service.prepareForQuit(), { allowQuit: false, reason: "cancelling", canCancel: false });
+  release.resolve();
+  assert.equal((await running).status, "cancelled");
 });
 
 test("cancel is disabled before critical commit and no AbortSignal reaches critical code", async () => {
@@ -603,6 +662,9 @@ test("an external durable claim is one consistent effective critical task", asyn
     },
   });
   const snapshot = await service.getSnapshot();
+  assert.deepEqual(Object.keys(snapshot.task).sort(), [
+    "cancellable", "componentId", "critical", "external", "kind", "phase", "taskId",
+  ]);
   assert.equal(snapshot.task.external, true);
   assert.equal(snapshot.task.critical, true);
   assert.equal(JSON.stringify(snapshot).includes("N".repeat(32)), false);
@@ -612,6 +674,93 @@ test("an external durable claim is one consistent effective critical task", asyn
   await assert.rejects(service.chooseInstallRoot("C:\\New"), /software_manager_pending_recovery/);
   await assert.rejects(service.refresh(), /software_manager_pending_recovery/);
   assert.equal(chooseCalls, 0);
+});
+
+test("external skill claims expose only the public kind and normalized component id", async () => {
+  const state = {
+    activeTask: {
+      kind: "skill-prepare", taskId: "other", skillId: "documents", target: "C:\\secret\\documents",
+      digest: "f".repeat(64), nonce: "N".repeat(32),
+    },
+    components: {}, skills: {}, rollback: null,
+  };
+  const { service } = fixtureService({ state });
+  const task = (await service.getSnapshot()).task;
+  assert.deepEqual({ ...task }, {
+    external: true,
+    critical: true,
+    cancellable: false,
+    taskId: "other",
+    kind: "skill-prepare",
+    phase: "skill-prepare",
+    componentId: "documents",
+  });
+  assert.equal(JSON.stringify(task).includes("secret"), false);
+  assert.equal(JSON.stringify(task).includes("N".repeat(32)), false);
+});
+
+test("snapshot retries stale recovery through the entry gate after an external claim clears", async () => {
+  const state = {
+    activeTask: { kind: "component-prepare", taskId: "other", componentId: "chatgpt", version: "2.0.0" },
+    components: {}, skills: {}, rollback: null,
+  };
+  let recoveries = 0;
+  const { service } = fixtureService({ state, recoverTransactions: async () => { recoveries += 1; } });
+  assert.equal((await service.getSnapshot()).pendingRecovery, true);
+  state.activeTask = null;
+  const snapshot = await service.getSnapshot();
+  assert.equal(snapshot.pendingRecovery, false);
+  assert.equal(snapshot.readOnly, false);
+  assert.equal(recoveries, 2);
+});
+
+test("refresh and root choice enter the gate before retrying one stale recovery", async () => {
+  const state = {
+    activeTask: { kind: "component-prepare", taskId: "other", componentId: "chatgpt", version: "2.0.0" },
+    components: {}, skills: {}, rollback: null,
+  };
+  let recoveries = 0;
+  const { service } = fixtureService({ state, recoverTransactions: async () => { recoveries += 1; } });
+  assert.equal((await service.getSnapshot()).pendingRecovery, true);
+  state.activeTask = null;
+  const [refreshed, chosen] = await Promise.all([service.refresh(), service.chooseInstallRoot("C:\\Chosen")]);
+  assert.equal(refreshed.pendingRecovery, false);
+  assert.match(chosen.installRootToken, /^root_token_/u);
+  assert.equal(recoveries, 2);
+});
+
+test("concurrent explicit recovery callers share one recovery execution", async () => {
+  const entered = deferred();
+  const release = deferred();
+  let recoveries = 0;
+  const { service } = fixtureService({
+    recoverTransactions: async () => { recoveries += 1; entered.resolve(); await release.promise; },
+  });
+  const first = service.recoverPending();
+  const second = service.recoverPending();
+  await entered.promise;
+  assert.equal(recoveries, 1);
+  release.resolve();
+  assert.deepEqual(await first, await second);
+  assert.equal(recoveries, 1);
+});
+
+test("entry gate preserves refresh-before-start ordering in the same turn", async () => {
+  const order = [];
+  const serviceCatalog = catalogFixture();
+  const { service } = fixtureService({
+    catalogProvider: {
+      getCurrent: () => serviceCatalog,
+      refresh: async () => { order.push("refresh"); return serviceCatalog; },
+    },
+    chatgpt: {
+      prepare: async () => { order.push("prepare"); return operationResult("chatgpt", "prepare"); },
+    },
+  });
+  const refreshing = service.refresh();
+  const starting = service.startTask({ kind: "install", componentIds: ["chatgpt"], skillIds: [] });
+  await Promise.all([refreshing, starting]);
+  assert.deepEqual(order.slice(0, 2), ["refresh", "prepare"]);
 });
 
 test("recovery cannot re-enter while a service task owns the unified entry gate", async () => {
@@ -641,6 +790,26 @@ test("malformed or mismatched component results cannot impersonate success", asy
   }
 });
 
+test("adapter versions and action-specific null semantics are strict", async () => {
+  const malformed = [
+    operationResult("chatgpt", "prepare", "succeeded", { versionAfter: "not-a-version" }),
+    operationResult("chatgpt", "prepare", "succeeded", { versionAfter: null }),
+    operationResult("chatgpt", "prepare", "failed", { versionBefore: "1.2.beta" }),
+  ];
+  for (const value of malformed) {
+    const { service } = fixtureService({ chatgpt: { prepare: async () => value } });
+    const result = await service.startTask({ kind: "install", componentIds: ["chatgpt"], skillIds: [] });
+    assert.equal(result.components[0].status, "failed");
+    assert.match(result.components[0].message, /adapter_result_invalid/);
+  }
+  const { service } = fixtureService({
+    chatgpt: { uninstall: async () => operationResult("chatgpt", "uninstall", "succeeded", { versionAfter: "2.0.0" }) },
+  });
+  const uninstall = await service.startTask({ kind: "uninstall", componentIds: ["chatgpt"], skillIds: [] });
+  assert.equal(uninstall.components[0].status, "failed");
+  assert.match(uninstall.components[0].message, /adapter_result_invalid/);
+});
+
 test("Skill adapter output rejects duplicate, missing, unknown, or extra IDs as one malformed batch", async () => {
   const catalogService = catalogFixture({ skills: [skillEntry("documents"), skillEntry("spreadsheets")] });
   const badOutputs = [
@@ -664,6 +833,23 @@ test("overall status needs a real success; skipped plus failed is failed", async
   });
   const result = await service.startTask({ kind: "install", componentIds: ["chatgpt", "v2rayn"], skillIds: [] });
   assert.equal(result.status, "failed");
+});
+
+test("overall status treats all-skipped and success-plus-skipped as succeeded", async () => {
+  const { service: allSkipped } = fixtureService({
+    chatgpt: { prepare: async () => operationResult("chatgpt", "prepare", "skipped") },
+    v2rayn: { prepare: async () => operationResult("v2rayn", "prepare", "skipped") },
+  });
+  assert.equal((await allSkipped.startTask({
+    kind: "install", componentIds: ["chatgpt", "v2rayn"], skillIds: [],
+  })).status, "succeeded");
+
+  const { service: mixed } = fixtureService({
+    v2rayn: { prepare: async () => operationResult("v2rayn", "prepare", "skipped") },
+  });
+  assert.equal((await mixed.startTask({
+    kind: "install", componentIds: ["chatgpt", "v2rayn"], skillIds: [],
+  })).status, "succeeded");
 });
 
 test("Skill results remain per-item and one failure does not erase another success", async () => {
@@ -762,6 +948,59 @@ test("bounded asynchronous disk sink failure never fails a task", async () => {
   await new Promise((resolve) => setImmediate(resolve));
 });
 
+test("a hung log sink times out, degrades once, and cannot hold task completion", async () => {
+  let writes = 0;
+  const { service } = fixtureService({
+    logWriteTimeoutMs: 20,
+    logSink: { write: async () => { writes += 1; await new Promise(() => {}); } },
+  });
+  const outcome = await Promise.race([
+    service.startTask({ kind: "install", componentIds: ["chatgpt"], skillIds: [] }),
+    new Promise((resolve) => setTimeout(() => resolve("timed-out"), 500)),
+  ]);
+  assert.notEqual(outcome, "timed-out");
+  assert.equal(outcome.status, "succeeded");
+  const snapshot = await service.getSnapshot();
+  assert.deepEqual({ ...snapshot.logging }, {
+    degraded: true,
+    pendingWrites: 0,
+    error: "software_manager_log_sink_degraded",
+    recovery: "restart-service",
+  });
+  assert.equal(writes, 1);
+  assert.equal(snapshot.logs.filter(({ message }) => message === "software_manager_log_sink_degraded").length, 1);
+});
+
+test("non-awaited progress uses a truly bounded log queue and cancellation remains bounded", async () => {
+  const entered = deferred();
+  const release = deferred();
+  const { service } = fixtureService({
+    maxPendingLogWrites: 4,
+    logWriteTimeoutMs: 20,
+    logSink: { write: async () => new Promise(() => {}) },
+    chatgpt: {
+      prepare: async ({ signal, onProgress }) => {
+        for (let index = 0; index < 1_000; index += 1) {
+          onProgress({ phase: "download", percent: index % 100, message: `burst-${index}` });
+        }
+        entered.resolve(signal);
+        await release.promise;
+        return operationResult("chatgpt", "prepare", "failed");
+      },
+    },
+  });
+  const running = service.startTask({ kind: "install", componentIds: ["chatgpt"], skillIds: [] });
+  await entered.promise;
+  const during = await service.getSnapshot();
+  assert.equal(during.logging.pendingWrites <= 4, true);
+  assert.deepEqual(service.cancelTask(), { cancelled: true });
+  assert.deepEqual(service.prepareForQuit(), { allowQuit: false, reason: "cancelling", canCancel: false });
+  release.resolve();
+  const outcome = await Promise.race([running, new Promise((resolve) => setTimeout(() => resolve("timed-out"), 500))]);
+  assert.notEqual(outcome, "timed-out");
+  assert.equal(outcome.status, "cancelled");
+});
+
 test("disk log writes are lossless and ordered and task completion drains the queue", async () => {
   const gate = deferred();
   const started = deferred();
@@ -817,7 +1056,24 @@ test("redaction preserves normal text while bounding deep hostile structures wit
   const { service } = fixtureService({
     chatgpt: {
       prepare: async ({ onProgress }) => {
-        await onProgress({ phase: "download", percent: 1, message: "ordinary update message", hostile, api_key: "'QUOTED'" });
+        await onProgress({
+          phase: "download",
+          percent: 1,
+          message: [
+            "ordinary update message",
+            "sk-proj-abcdefghijklmnopqrstuvwxyz012345",
+            "sk-svcacct-abcdefghijklmnopqrstuvwxyz012345",
+            "sk-ant-abcdefghijklmnopqrstuvwxyz012345",
+            "xai-abcdefghijklmnopqrstuvwxyz012345",
+            "AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ012345",
+            "hf_abcdefghijklmnopqrstuvwxyz012345",
+            "https://private.example/path?q=secret",
+            "file:///C:/private/token.txt",
+            "\\\\server\\share\\private.txt",
+          ].join(" "),
+          hostile,
+          api_key: "'QUOTED'",
+        });
         return operationResult("chatgpt", "prepare");
       },
     },
@@ -833,6 +1089,15 @@ test("redaction preserves normal text while bounding deep hostile structures wit
     "sk-123456789012345678901234567890",
     "dXNlcjpwYXNz",
     "QUOTED",
+    "sk-proj-abcdefghijklmnopqrstuvwxyz012345",
+    "sk-svcacct-abcdefghijklmnopqrstuvwxyz012345",
+    "sk-ant-abcdefghijklmnopqrstuvwxyz012345",
+    "xai-abcdefghijklmnopqrstuvwxyz012345",
+    "AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ012345",
+    "hf_abcdefghijklmnopqrstuvwxyz012345",
+    "private.example",
+    "file:///C:/private",
+    "server\\share\\private",
   ]) assert.equal(text.includes(secret), false);
   assert.equal(text.length < 200_000, true);
   assert.equal(Object.getPrototypeOf(events[0]), null);
@@ -875,6 +1140,51 @@ test("async subscribers are ordered per listener, do not block the service, and 
   assert.deepEqual(observed, ["start", "end", "start", "end"]);
 });
 
+test("slow listeners have bounded coalescing queues without losing the latest progress or finished", async () => {
+  const gate = deferred();
+  const observed = [];
+  let held = false;
+  const { service } = fixtureService({
+    maxListenerQueue: 8,
+    chatgpt: {
+      prepare: async ({ onProgress }) => {
+        for (let index = 0; index < 1_000; index += 1) {
+          onProgress({ phase: "download", percent: index % 100, message: `listener-${index}` });
+        }
+        return operationResult("chatgpt", "prepare");
+      },
+    },
+  });
+  service.subscribe(async (event) => {
+    observed.push(event);
+    if (!held && event.type === "progress") { held = true; await gate.promise; }
+  });
+  const result = await service.startTask({ kind: "install", componentIds: ["chatgpt"], skillIds: [] });
+  assert.equal(result.status, "succeeded");
+  gate.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(observed.length <= 12, true);
+  assert.equal(observed.some(({ type, message }) => type === "progress" && message === "listener-999"), true);
+  assert.equal(observed.some(({ type }) => type === "finished"), true);
+});
+
+test("repeated subscription of the same function has independent unsubscribe identity", async () => {
+  let received = 0;
+  const listener = () => { received += 1; };
+  const { service } = fixtureService();
+  const first = service.subscribe(listener);
+  const second = service.subscribe(listener);
+  await service.refresh();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(received, 2);
+  first();
+  await service.refresh();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(received, 3);
+  second();
+});
+
 test("subscription count is bounded and unsubscribe releases capacity", () => {
   const { service } = fixtureService();
   const unsubscribers = Array.from({ length: 32 }, () => service.subscribe(() => {}));
@@ -889,6 +1199,16 @@ test("duplicate injected task IDs are replaced with unique process-safe IDs", as
   const second = await service.startTask({ kind: "install", componentIds: ["chatgpt"], skillIds: [] });
   assert.notEqual(first.taskId, second.taskId);
   assert.match(second.taskId, /^software-/u);
+});
+
+test("thousands of repeated injected task IDs remain unique without an unbounded history contract", async () => {
+  const { service } = fixtureService({ taskIdFactory: () => "same-task" });
+  const ids = new Set();
+  for (let index = 0; index < 1_000; index += 1) {
+    const result = await service.startTask({ kind: "install", componentIds: ["chatgpt"], skillIds: [] });
+    ids.add(result.taskId);
+  }
+  assert.equal(ids.size, 1_000);
 });
 
 test("finished event uses deterministic fake-clock timestamps and a unified result", async () => {
