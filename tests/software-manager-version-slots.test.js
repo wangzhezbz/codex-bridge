@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import { Writable } from "node:stream";
 import test from "node:test";
 
 import { authorizeInstallRoot } from "../desktop/software-manager/path-policy.mjs";
@@ -140,9 +141,17 @@ function createFixture({ componentId = "chatgpt", slots = {}, state = emptyState
     throw error;
   }
 
-  function openVersionRootNoFollow(exactRoot) {
-    calls.push(["open-version-root", exactRoot]);
+  function openVersionRootNoFollow(exactRoot, { expectedRootIdentity = null } = {}) {
+    calls.push(["open-version-root", exactRoot, clone(expectedRootIdentity)]);
     assert.equal(exactRoot, rootPath);
+    if (expectedRootIdentity !== null) {
+      const componentRoot = rootSlots.get("V2RayN");
+      if (!componentRoot) throw Object.assign(new Error("entry_missing"), { code: "entry_missing" });
+      if (componentRoot.identity.volumeSerial !== expectedRootIdentity.volumeSerial
+        || componentRoot.identity.fileId !== expectedRootIdentity.fileId) {
+        throw new Error("windows_identity_changed");
+      }
+    }
     const liveSlots = roots.get(exactRoot.toLowerCase());
     let closed = false;
     const descriptors = new WeakMap();
@@ -360,8 +369,95 @@ function createFixture({ componentId = "chatgpt", slots = {}, state = emptyState
     },
   };
   const fsApi = {
-    openVersionRootNoFollow: async (value) => openVersionRootNoFollow(value),
+    openVersionRootNoFollow: async (value, options) => openVersionRootNoFollow(value, options),
     openJournalDirectoryNoFollow: async (value) => openJournalDirectoryNoFollow(value),
+    async openInstallerWorkspaceRootNoFollow() {
+      const receipts = new WeakMap();
+      const root = Object.freeze({});
+      receipts.set(root, { kind: "root" });
+      const files = new Map();
+      const issue = (value) => {
+        const receipt = Object.freeze({});
+        receipts.set(receipt, value);
+        return receipt;
+      };
+      return {
+        root,
+        async createOrOpenDirectoryChildNoFollow(parent, name, options) {
+          const parentInfo = receipts.get(parent);
+          assert.ok(parentInfo);
+          if (name === "V2RayN") {
+            assert.equal(parentInfo.kind, "root");
+            return issue({ kind: "component-root" });
+          }
+          throw new Error(`unexpected_create_or_open:${name}:${options?.role}`);
+        },
+        async openDirectoryChildNoFollow(parent, name) {
+          const parentInfo = receipts.get(parent);
+          assert.ok(parentInfo);
+          const node = rootSlots.get(name);
+          return node ? issue({ kind: "staging", node, name }) : null;
+        },
+        async createDirectoryChildNoFollow(parent, name, options) {
+          assert.ok(receipts.get(parent));
+          assert.equal(options?.role, "deletable");
+          if (rootSlots.has(name)) throw new Error("entry_exists");
+          const node = {
+            identity: { volumeSerial: "vol", fileId: `prepared-${++identitySeed}` },
+            files: new Map(),
+          };
+          rootSlots.set(name, node);
+          return issue({ kind: "staging", node, name });
+        },
+        async openFileChildNoFollow(parent, name) {
+          const parentInfo = receipts.get(parent);
+          const key = `${parentInfo?.kind}:${name}`;
+          return files.has(key) ? issue({ kind: "file", key, data: files.get(key), sealed: false }) : null;
+        },
+        async createFileChildNoFollow(parent, name) {
+          const parentInfo = receipts.get(parent);
+          const key = `${parentInfo?.kind}:${name}`;
+          if (files.has(key)) throw new Error("entry_exists");
+          files.set(key, Buffer.alloc(0));
+          return issue({ kind: "file", key, data: Buffer.alloc(0), sealed: false });
+        },
+        async createIssuedFileWriteStreamNoFollow(receipt) {
+          const internal = receipts.get(receipt);
+          return new Writable({
+            write(chunk, _encoding, callback) {
+              internal.data = Buffer.concat([internal.data, Buffer.from(chunk)]);
+              files.set(internal.key, internal.data);
+              callback();
+            },
+          });
+        },
+        async sealIssuedFileNoFollow(receipt, expected) {
+          const internal = receipts.get(receipt);
+          const data = files.get(internal.key);
+          assert.equal(data.length, expected.size);
+          assert.equal(crypto.createHash("sha256").update(data).digest("hex"), expected.sha256);
+          internal.sealed = true;
+          return receipt;
+        },
+        async describeIssuedDirectoryNoFollow(receipt) {
+          const internal = receipts.get(receipt);
+          maybeFail("workspace-describe", { kind: internal?.kind, name: internal?.name });
+          return { path: `${rootPath}\\${internal.name}`, identity: clone(internal.node.identity), created: true };
+        },
+        async inspectIssuedChildNoFollow(receipt) {
+          const internal = receipts.get(receipt);
+          assert.equal(internal?.kind, "staging");
+          maybeFail("workspace-inspect", { kind: internal.kind, name: internal.name });
+          return { path: `${rootPath}\\${internal.name}`, kind: "directory", size: 0, empty: internal.node.files.size === 0 };
+        },
+        async deleteIssuedChildNoFollow(receipt) {
+          const internal = receipts.get(receipt);
+          if (internal.kind === "file") files.delete(internal.key);
+          else rootSlots.delete(internal.name);
+        },
+        async close() {},
+      };
+    },
   };
   const journalDir = "D:\\CodexBridge\\State\\transactions";
   const journal = createTransactionJournal({ journalDir, fsApi });
@@ -405,6 +501,19 @@ function createFixture({ componentId = "chatgpt", slots = {}, state = emptyState
       }));
     },
     state() { return clone(persisted); },
+    replaceV2RootIdentity() {
+      const componentRoot = rootSlots.get("V2RayN");
+      if (!componentRoot) throw new Error("fixture_v2_root_missing");
+      componentRoot.identity = { volumeSerial: "foreign", fileId: `replacement-${++identitySeed}` };
+    },
+    addForeignV2Root() {
+      if (rootSlots.has("V2RayN")) throw new Error("fixture_v2_root_occupied");
+      rootSlots.set("V2RayN", {
+        identity: { volumeSerial: "foreign", fileId: `reappeared-${++identitySeed}` },
+        files: new Map(),
+      });
+    },
+    slotExists(name) { return rootSlots.has(name); },
     setState(next) { persisted = clone(next); },
     resetCalls() { calls.length = 0; },
     damageSlot(name, mode) {
@@ -423,6 +532,11 @@ function createFixture({ componentId = "chatgpt", slots = {}, state = emptyState
       assert.ok(node, `expected slot ${name}`);
       node.files.set("payload.bin", value);
     },
+    replaceSlotIdentity(name) {
+      const node = rootSlots.get(name);
+      assert.ok(node, `expected slot ${name}`);
+      node.identity = { volumeSerial: "vol", fileId: `replacement-${++identitySeed}` };
+    },
     rewriteSlotMarker(name, version) {
       const node = rootSlots.get(name);
       assert.ok(node, `expected slot ${name}`);
@@ -431,8 +545,8 @@ function createFixture({ componentId = "chatgpt", slots = {}, state = emptyState
     forgetVerificationReceipts() {
       verificationReceipts = new WeakMap();
     },
-    issueVerificationReceipt(version, requestedComponentId = componentId) {
-      const stagingName = requestedComponentId === "chatgpt" ? "ct" : "staging";
+    issueVerificationReceipt(version, requestedComponentId = componentId, sourceName = null) {
+      const stagingName = sourceName ?? (requestedComponentId === "chatgpt" ? "ct" : "staging");
       const node = rootSlots.get(stagingName);
       assert.ok(node, `expected staging slot ${stagingName}`);
       const integrity = integrityFor(node);
@@ -446,6 +560,10 @@ function createFixture({ componentId = "chatgpt", slots = {}, state = emptyState
         ...integrity,
       });
       return { verificationReceipt, ...integrity };
+    },
+    slotIdentity(name) {
+      const node = rootSlots.get(name);
+      return node ? clone(node.identity) : null;
     },
   };
 }
@@ -525,8 +643,11 @@ function fixtureWithInstalled({ currentVersion, previousVersion = null, incoming
   });
 }
 
-function promotionPlan(fixture, version, componentId = "chatgpt", taskId = `promote-${version.replaceAll(".", "-")}`) {
-  const verification = fixture.issueVerificationReceipt(version, componentId);
+function promotionPlan(
+  fixture, version, componentId = "chatgpt", taskId = `promote-${version.replaceAll(".", "-")}`,
+  sourceName = null,
+) {
+  const verification = fixture.issueVerificationReceipt(version, componentId, sourceName);
   return {
     taskId,
     componentId,
@@ -535,6 +656,7 @@ function promotionPlan(fixture, version, componentId = "chatgpt", taskId = `prom
     verificationReceipt: verification.verificationReceipt,
     treeDigest: verification.treeDigest,
     manifestDigest: verification.manifestDigest,
+    prepareLeaseNonce: "e".repeat(32),
     runtimeMetadata: {
       entrypointPath: `${fixture.rootPath}\\${componentId === "chatgpt" ? "c\\ChatGPT.exe" : "current\\app.exe"}`,
       requiredFiles: [`${fixture.rootPath}\\${componentId === "chatgpt" ? "c\\ChatGPT.exe" : "current\\app.exe"}`],
@@ -549,6 +671,327 @@ test("first install promotes only the verified staging slot and creates no rollb
   assert.deepEqual(fixture.versions(), { current: "1.0.0", previous: null, staging: null, retiring: null });
   assert.equal(fixture.state().components.chatgpt.version, "1.0.0");
   assert.equal(fixture.state().rollback, null);
+});
+
+test("legacy schema-v2 transaction records without prepare metadata still recover", async () => {
+  const fixture = createFixture({ slots: { ct: null } });
+  fixture.fail("rename", new Error("legacy_record_crash"), {
+    after: true, match: ({ from, to }) => from === "ct" && to === "c",
+  });
+  await assert.rejects(
+    fixture.manager.promotePreparedVersion(promotionPlan(fixture, "1.0.0")),
+    /legacy_record_crash/u,
+  );
+  const directory = await fixture.fsApi.openJournalDirectoryNoFollow(fixture.journalDir);
+  for (const name of await directory.listFileNamesNoFollow()) {
+    const file = await directory.openFileNoFollow(name, "r");
+    const record = JSON.parse(await file.readFile("utf8"));
+    delete record.priorPrepare;
+    delete record.prepareSource;
+    await file.writeFile(`${JSON.stringify(record)}\n`, "utf8");
+    await file.close();
+  }
+  await directory.close();
+  const [pending] = await fixture.journal.listTransactions();
+  assert.ok(pending.records.every((record) => record.priorPrepare === null
+    && record.prepareSource === null));
+  assert.equal((await recoverTransactions({ journal: fixture.journal, slots: fixture.manager })).length, 1);
+  assert.deepEqual(fixture.versions(), {
+    current: "1.0.0", previous: null, staging: null, retiring: null,
+  });
+});
+
+test("archive prepare WAL moves only its bound task source into the fixed staging slot", async () => {
+  const stagingName = `.codexbridge-prepare-${"c".repeat(32)}`;
+  const taskId = "archive-source-promote";
+  const fixture = createFixture({ slots: { [stagingName]: null } });
+  const claimed = fixture.state();
+  claimed.activeTask = {
+    kind: "component-prepare", taskId, componentId: "chatgpt", version: "1.0.0",
+    stagingName, stagingIdentity: fixture.slotIdentity(stagingName),
+    leaseScope: "prepare", leaseNonce: "e".repeat(32),
+  };
+  fixture.setState(claimed);
+  await fixture.manager.promotePreparedVersion(
+    promotionPlan(fixture, "1.0.0", "chatgpt", taskId, stagingName),
+  );
+  assert.deepEqual(fixture.versions(), { current: "1.0.0", previous: null, staging: null, retiring: null });
+  assert.equal(fixture.calls.some(([operation, from, to]) => operation === "rename-slot"
+    && from === stagingName && to === "ct"), true);
+});
+
+test("archive prepare WAL recovers when the source moved before the prepare claim transitioned", async () => {
+  const stagingName = `.codexbridge-prepare-${"d".repeat(32)}`;
+  const taskId = "archive-source-crash";
+  const fixture = createFixture({ slots: { [stagingName]: null } });
+  const claimed = fixture.state();
+  claimed.activeTask = {
+    kind: "component-prepare", taskId, componentId: "chatgpt", version: "1.0.0",
+    stagingName, stagingIdentity: fixture.slotIdentity(stagingName),
+    leaseScope: "prepare", leaseNonce: "e".repeat(32),
+  };
+  fixture.setState(claimed);
+  fixture.fail("state", new Error("crash_before_claim_transition"));
+  await assert.rejects(fixture.manager.promotePreparedVersion(
+    promotionPlan(fixture, "1.0.0", "chatgpt", taskId, stagingName),
+  ), /crash_before_claim_transition/u);
+  assert.equal(fixture.state().activeTask.kind, "component-prepare");
+  await recoverTransactions({ journal: fixture.journal, slots: fixture.manager });
+  assert.equal(fixture.state().components.chatgpt.version, "1.0.0");
+  assert.equal(fixture.state().activeTask, null);
+});
+
+test("prepared staging is bound to the durable claim and only that exact identity is discarded", async () => {
+  const fixture = createFixture();
+  const claimed = fixture.state();
+  claimed.activeTask = {
+    kind: "component-prepare", taskId: "bound-staging", componentId: "chatgpt", version: "1.0.0",
+    stagingName: `.codexbridge-prepare-${"a".repeat(32)}`,
+    leaseScope: "prepare", leaseNonce: "bound-lease",
+  };
+  fixture.setState(claimed);
+  const bound = await fixture.manager.bindPreparedVersion({
+    componentId: "chatgpt", taskId: "bound-staging", leaseNonce: "bound-lease",
+  });
+  assert.deepEqual(bound.stagingIdentity, fixture.state().activeTask.stagingIdentity);
+  assert.equal(await fixture.manager.discardPreparedVersion({
+    componentId: "chatgpt", taskId: "bound-staging", leaseNonce: "bound-lease",
+  }), true);
+  assert.deepEqual(fixture.versions(), { current: null, previous: null, staging: null, retiring: null });
+});
+
+test("failed prepared-directory inspection removes every exact unbound directory", async (t) => {
+  for (const scenario of [
+    { label: "first V2 root describe", componentId: "v2rayn", failKind: "workspace-describe", name: "V2RayN" },
+    { label: "staging inspect", componentId: "chatgpt", failKind: "workspace-inspect" },
+    { label: "staging describe", componentId: "chatgpt", failKind: "workspace-describe" },
+  ]) {
+    await t.test(scenario.label, async () => {
+      const fixture = createFixture({ componentId: scenario.componentId });
+      const taskId = `bind-fault-${scenario.label.replaceAll(" ", "-").toLowerCase()}`;
+      const stagingName = `.codexbridge-prepare-${scenario.componentId === "v2rayn" ? "a" : scenario.failKind.endsWith("inspect") ? "b" : "c"}`
+        .padEnd(53, scenario.componentId === "v2rayn" ? "a" : scenario.failKind.endsWith("inspect") ? "b" : "c");
+      const claimed = fixture.state();
+      claimed.activeTask = {
+        kind: "component-prepare", taskId, componentId: scenario.componentId, version: "1.0.0",
+        stagingName, leaseScope: "prepare", leaseNonce: "fault-lease",
+      };
+      fixture.setState(claimed);
+      fixture.fail(scenario.failKind, new Error(`forced_${scenario.failKind}`), {
+        match: ({ name }) => scenario.name === undefined || name === scenario.name,
+      });
+      await assert.rejects(fixture.manager.bindPreparedVersion({
+        componentId: scenario.componentId, taskId, leaseNonce: "fault-lease",
+      }), new RegExp(`forced_${scenario.failKind}`, "u"));
+      assert.equal(fixture.slotExists(stagingName), false);
+      if (scenario.componentId === "v2rayn") assert.equal(fixture.slotExists("V2RayN"), false);
+      assert.equal(await fixture.manager.discardPreparedVersion({
+        componentId: scenario.componentId, taskId, leaseNonce: "fault-lease",
+      }), false);
+    });
+  }
+});
+
+test("prepared staging discard fails closed after a same-name identity replacement", async () => {
+  const fixture = createFixture();
+  const claimed = fixture.state();
+  claimed.activeTask = {
+    kind: "component-prepare", taskId: "foreign-staging", componentId: "chatgpt", version: "1.0.0",
+    stagingName: `.codexbridge-prepare-${"b".repeat(32)}`,
+    leaseScope: "prepare", leaseNonce: "foreign-lease",
+  };
+  fixture.setState(claimed);
+  await fixture.manager.bindPreparedVersion({
+    componentId: "chatgpt", taskId: "foreign-staging", leaseNonce: "foreign-lease",
+  });
+  fixture.replaceSlotIdentity(claimed.activeTask.stagingName);
+  await assert.rejects(fixture.manager.discardPreparedVersion({
+    componentId: "chatgpt", taskId: "foreign-staging", leaseNonce: "foreign-lease",
+  }), /slot_discard_identity_changed/u);
+  assert.notEqual(fixture.state().activeTask, null);
+});
+
+test("unbound prepared staging is never adopted or deleted even when it is empty", async () => {
+  const stagingName = `.codexbridge-prepare-${"7".repeat(32)}`;
+  const fixture = createFixture({ slots: { [stagingName]: null } });
+  const claimed = fixture.state();
+  claimed.activeTask = {
+    kind: "component-prepare", taskId: "unbound-occupied", componentId: "chatgpt", version: "1.0.0",
+    stagingName, leaseScope: "prepare", leaseNonce: "unbound-lease",
+  };
+  fixture.setState(claimed);
+  await assert.rejects(fixture.manager.discardPreparedVersion({
+    componentId: "chatgpt", taskId: "unbound-occupied", leaseNonce: "unbound-lease",
+  }), /slot_prepare_unbound_occupied/u);
+  assert.equal(fixture.slotExists(stagingName), true);
+  assert.notEqual(fixture.state().activeTask, null);
+});
+
+test("first V2RayN prepare atomically owns and discards its exact new component root", async () => {
+  const fixture = createFixture({ componentId: "v2rayn" });
+  const claimed = fixture.state();
+  claimed.activeTask = {
+    kind: "component-prepare", taskId: "first-v2-root", componentId: "v2rayn", version: "1.0.0",
+    stagingName: `.codexbridge-prepare-${"8".repeat(32)}`,
+    leaseScope: "prepare", leaseNonce: "first-v2-lease",
+  };
+  fixture.setState(claimed);
+  const bound = await fixture.manager.bindPreparedVersion({
+    componentId: "v2rayn", taskId: "first-v2-root", leaseNonce: "first-v2-lease",
+  });
+  assert.ok(bound.componentRootIdentity);
+  assert.equal(fixture.slotExists("V2RayN"), true);
+  assert.equal(await fixture.manager.discardPreparedVersion({
+    componentId: "v2rayn", taskId: "first-v2-root", leaseNonce: "first-v2-lease",
+  }), true);
+  assert.equal(fixture.slotExists("V2RayN"), false);
+});
+
+test("first V2RayN promotion rejects a same-path replacement of its owned component root", async () => {
+  const fixture = createFixture({ componentId: "v2rayn" });
+  const taskId = "first-v2-root-replaced";
+  const stagingName = `.codexbridge-prepare-${"3".repeat(32)}`;
+  const claimed = fixture.state();
+  claimed.activeTask = {
+    kind: "component-prepare", taskId, componentId: "v2rayn", version: "1.0.0",
+    stagingName, leaseScope: "prepare", leaseNonce: "e".repeat(32),
+  };
+  fixture.setState(claimed);
+  await fixture.manager.bindPreparedVersion({
+    componentId: "v2rayn", taskId, leaseNonce: "e".repeat(32),
+  });
+  fixture.replaceV2RootIdentity();
+  await assert.rejects(
+    fixture.manager.promotePreparedVersion(
+      promotionPlan(fixture, "1.0.0", "v2rayn", taskId, stagingName),
+    ),
+    /windows_identity_changed/u,
+  );
+  assert.equal(fixture.state().activeTask.kind, "component-prepare");
+  assert.deepEqual(await fixture.journal.listTransactions(), []);
+});
+
+test("foreign pre-existing V2RayN root is never adopted by first prepare", async () => {
+  const fixture = createFixture({ componentId: "v2rayn", slots: { V2RayN: null } });
+  const claimed = fixture.state();
+  claimed.activeTask = {
+    kind: "component-prepare", taskId: "foreign-v2-root", componentId: "v2rayn", version: "1.0.0",
+    stagingName: `.codexbridge-prepare-${"9".repeat(32)}`,
+    leaseScope: "prepare", leaseNonce: "foreign-v2-lease",
+  };
+  fixture.setState(claimed);
+  await assert.rejects(fixture.manager.bindPreparedVersion({
+    componentId: "v2rayn", taskId: "foreign-v2-root", leaseNonce: "foreign-v2-lease",
+  }), /slot_component_root_occupied/u);
+  assert.equal(fixture.slotExists("V2RayN"), true);
+  assert.notEqual(fixture.state().activeTask, null);
+});
+
+test("first V2RayN bind save ambiguity recovers a durable bound claim after exact live cleanup", async () => {
+  const fixture = createFixture({ componentId: "v2rayn" });
+  const claimed = fixture.state();
+  claimed.activeTask = {
+    kind: "component-prepare", taskId: "v2-save-ambiguous", componentId: "v2rayn", version: "1.0.0",
+    stagingName: `.codexbridge-prepare-${"6".repeat(32)}`,
+    leaseScope: "prepare", leaseNonce: "v2-save-lease",
+  };
+  fixture.setState(claimed);
+  fixture.fail("state", new Error("save_after_write"), {
+    after: true,
+    match: (next) => next.activeTask?.componentRootIdentity !== undefined,
+  });
+  await assert.rejects(fixture.manager.bindPreparedVersion({
+    componentId: "v2rayn", taskId: "v2-save-ambiguous", leaseNonce: "v2-save-lease",
+  }), /save_after_write/u);
+  assert.equal(fixture.slotExists("V2RayN"), false);
+  assert.ok(fixture.state().activeTask.componentRootIdentity);
+  assert.equal(await fixture.manager.discardPreparedVersion({
+    componentId: "v2rayn", taskId: "v2-save-ambiguous", leaseNonce: "v2-save-lease",
+  }), true);
+});
+
+test("first V2RayN abort recovery is idempotent after its exact component root is deleted", async (t) => {
+  for (const [label, armFailure] of [
+    ["before abort cleanup WAL", (fixture) => fixture.fail(
+      "journal-write", new Error("crash_before_abort_cleanup_wal"), {
+        match: ({ name }) => name === "v2rayn.abort_cleanup_committed.json.tmp",
+      },
+    )],
+    ["after abort cleanup WAL", (fixture) => fixture.fail(
+      "state", new Error("crash_after_abort_cleanup_wal"), {
+        match: (next) => next.activeTask?.kind === "software-version-slot"
+          && next.activeTask.lifecycle === "clearing",
+      },
+    )],
+  ]) {
+    await t.test(label, async () => {
+      const fixture = createFixture({ componentId: "v2rayn" });
+      const taskId = `v2-abort-${label.startsWith("before") ? "before" : "after"}`;
+      const stagingName = `.codexbridge-prepare-${label.startsWith("before") ? "4" : "5"}`.padEnd(53, label.startsWith("before") ? "4" : "5");
+      const claimed = fixture.state();
+      claimed.activeTask = {
+        kind: "component-prepare", taskId, componentId: "v2rayn", version: "1.0.0",
+        stagingName, leaseScope: "prepare", leaseNonce: "e".repeat(32),
+      };
+      fixture.setState(claimed);
+      await fixture.manager.bindPreparedVersion({
+        componentId: "v2rayn", taskId, leaseNonce: "e".repeat(32),
+      });
+      fixture.fail("rename", new Error("crash_first_v2_promote"), {
+        after: true, match: ({ from, to }) => from === "staging" && to === "current",
+      });
+      await assert.rejects(fixture.manager.promotePreparedVersion(
+        promotionPlan(fixture, "1.0.0", "v2rayn", taskId, stagingName),
+      ), /crash_first_v2_promote/u);
+      fixture.damageSlot("current", "corrupt");
+      armFailure(fixture);
+      await assert.rejects(recoverTransactions({ journal: fixture.journal, slots: fixture.manager }), /crash_/u);
+      assert.equal(fixture.slotExists("V2RayN"), false);
+      assert.equal((await recoverTransactions({ journal: fixture.journal, slots: fixture.manager })).length, 1);
+      assert.equal(fixture.state().activeTask, null);
+      assert.equal(fixture.state().installRoot, null);
+      assert.deepEqual(await fixture.journal.listTransactions(), []);
+    });
+  }
+});
+
+test("first V2RayN abort finish rejects a foreign root that reappears after cleanup WAL", async () => {
+  const fixture = createFixture({ componentId: "v2rayn" });
+  const taskId = "v2-abort-foreign-reappeared";
+  const stagingName = `.codexbridge-prepare-${"2".repeat(32)}`;
+  const claimed = fixture.state();
+  claimed.activeTask = {
+    kind: "component-prepare", taskId, componentId: "v2rayn", version: "1.0.0",
+    stagingName, leaseScope: "prepare", leaseNonce: "e".repeat(32),
+  };
+  fixture.setState(claimed);
+  await fixture.manager.bindPreparedVersion({
+    componentId: "v2rayn", taskId, leaseNonce: "e".repeat(32),
+  });
+  fixture.fail("rename", new Error("crash_first_v2_promote"), {
+    after: true, match: ({ from, to }) => from === "staging" && to === "current",
+  });
+  await assert.rejects(fixture.manager.promotePreparedVersion(
+    promotionPlan(fixture, "1.0.0", "v2rayn", taskId, stagingName),
+  ), /crash_first_v2_promote/u);
+  fixture.damageSlot("current", "corrupt");
+  fixture.fail("state", new Error("crash_after_abort_cleanup_wal"), {
+    match: (next) => next.activeTask?.kind === "software-version-slot"
+      && next.activeTask.lifecycle === "clearing",
+  });
+  await assert.rejects(
+    recoverTransactions({ journal: fixture.journal, slots: fixture.manager }),
+    /crash_after_abort_cleanup_wal/u,
+  );
+  assert.equal(fixture.slotExists("V2RayN"), false);
+  fixture.addForeignV2Root();
+  await assert.rejects(
+    recoverTransactions({ journal: fixture.journal, slots: fixture.manager }),
+    /slot_component_root_identity_changed/u,
+  );
+  assert.notEqual(fixture.state().activeTask, null);
+  assert.equal((await fixture.journal.listTransactions()).length, 1);
+  assert.equal(fixture.slotExists("V2RayN"), true);
 });
 
 test("first managed ChatGPT commit atomically claims a null installRoot while promoting CBApps\\ct to CBApps\\c", async () => {
@@ -960,7 +1403,9 @@ test("first-install abort removes only the corrupt incoming tree and restores an
 
   assert.equal((await recoverTransactions({ journal: fixture.journal, slots: fixture.manager })).length, 1);
   assert.deepEqual(fixture.versions(), { current: null, previous: null, staging: null, retiring: null });
-  assert.deepEqual(semanticState(fixture.state()), semanticState(before));
+  const expected = semanticState(before);
+  expected.installRoot = null;
+  assert.deepEqual(semanticState(fixture.state()), expected);
 });
 
 test("abort after ownership save but before its WAL restores the exact original ownership slice", async () => {

@@ -564,12 +564,7 @@ export function createWindowsFileCapabilities({
     if (pin) {
       try {
         if (raw.expectedIdentity === null) {
-          let count = 0;
-          for await (const entry of nativeApi.enumerateDirectory(pin.leaf.handle, { limit: 1 })) {
-            if (!entry || entry.reparse === true) throw capabilityError("windows_reparse_point_rejected");
-            count += 1;
-          }
-          if (count !== 0) throw capabilityError("skill_prepare_intent_not_empty");
+          throw capabilityError("skill_prepare_unbound_occupied");
         } else {
           verifyIdentity(raw.expectedIdentity, pin.leaf.info);
           if (raw.expectedEvidence !== null) {
@@ -598,23 +593,6 @@ export function createWindowsFileCapabilities({
     }
     if (primaryError) throw primaryError;
 
-    const taskPath = path.win32.dirname(sourcePath);
-    let taskPin;
-    try {
-      taskPin = await openPinnedPath(nativeApi, taskPath, {
-        kind: "directory", access: ["read", "attributes", "delete"], share: ["read", "write"],
-      });
-      let count = 0;
-      for await (const entry of nativeApi.enumerateDirectory(taskPin.leaf.handle, { limit: 1 })) {
-        if (!entry || entry.reparse === true) throw capabilityError("windows_reparse_point_rejected");
-        count += 1;
-      }
-      if (count === 0) await nativeApi.deleteByHandle(taskPin.leaf.handle, { directory: true });
-    } catch (error) {
-      if (!isMissing(error)) throw error;
-    } finally {
-      if (taskPin) await closeOwner(nativeApi, taskPin.owner);
-    }
     return Object.freeze({ deleted: Boolean(pin), absent: !pin });
   }
 
@@ -859,7 +837,7 @@ export function createWindowsFileCapabilities({
     const session = Object.freeze(Object.create(null));
 
     function issue({
-      path: exactPath, info, handle, kind, parent = null, role = null, sealed = false,
+      path: exactPath, info, handle, kind, parent = null, role = null, sealed = false, created = false,
     }) {
       const receipt = Object.freeze(Object.create(null));
       receiptMap.set(receipt, {
@@ -871,6 +849,7 @@ export function createWindowsFileCapabilities({
         parent,
         role,
         sealed,
+        created,
         state: "issued",
       });
       return receipt;
@@ -933,6 +912,100 @@ export function createWindowsFileCapabilities({
       if (primaryError) throw primaryError;
     }
 
+    async function openVerifiedFileHandle(internal, { access, share }) {
+      let handle = null;
+      try {
+        handle = await nativeApi.openPath(internal.path, {
+          access, share, disposition: "openExisting", directory: false,
+        });
+        pin.owner.handles.add(handle);
+        const info = validateInfo(await nativeApi.queryHandle(handle), "file");
+        verifyIdentity(internal.identity, info);
+        if (info.nlink !== 1) throw capabilityError("windows_hard_link_rejected");
+        await nativeApi.assertNoAlternateDataStreams(handle);
+        const finalPath = validateAbsolute(await nativeApi.finalPath(handle));
+        if (!samePath(finalPath, internal.path)) throw capabilityError("windows_final_path_mismatch");
+        return handle;
+      } catch (error) {
+        if (handle) {
+          await closeOne(nativeApi, pin.owner, handle).catch((closeError) => {
+            throw new AggregateError([error, closeError], error.message, { cause: error });
+          });
+        }
+        throw error;
+      }
+    }
+
+    async function openVerifiedDirectoryHandle(internal, { access, share }) {
+      const parentInternal = internal.parent
+        ? requireReceipt(internal.parent, { directory: true })
+        : null;
+      let handle = null;
+      try {
+        if (parentInternal) await assertStable(parentInternal, "directory");
+        handle = await nativeApi.openPath(internal.path, {
+          access, share, disposition: "openExisting", directory: true,
+        });
+        pin.owner.handles.add(handle);
+        const info = validateInfo(await nativeApi.queryHandle(handle), "directory");
+        verifyIdentity(internal.identity, info);
+        if (info.nlink !== 1) throw capabilityError("windows_hard_link_rejected");
+        await nativeApi.assertNoAlternateDataStreams(handle, { directory: true });
+        const finalPath = validateAbsolute(await nativeApi.finalPath(handle));
+        if (!samePath(finalPath, internal.path)) throw capabilityError("windows_final_path_mismatch");
+        if (parentInternal) await assertStable(parentInternal, "directory");
+        return handle;
+      } catch (error) {
+        if (handle) {
+          await closeOne(nativeApi, pin.owner, handle).catch((closeError) => {
+            throw new AggregateError([error, closeError], error.message, { cause: error });
+          });
+        }
+        throw error;
+      }
+    }
+
+    async function downgradeIssuedFileHandle(internal) {
+      const original = internal.handle;
+      const bridge = await openVerifiedFileHandle(internal, {
+        access: ["read", "attributes"], share: ["read", "write", "delete"],
+      });
+      internal.handle = bridge;
+      await closeOne(nativeApi, pin.owner, original);
+      const readOnly = await openVerifiedFileHandle(internal, {
+        access: ["read", "attributes"], share: ["read"],
+      });
+      internal.handle = readOnly;
+      await closeOne(nativeApi, pin.owner, bridge);
+      return readOnly;
+    }
+
+    async function acquireIssuedFileMutationHandle(internal) {
+      await assertStable(internal, "file");
+      await assertDirectChildBinding(internal);
+      const readOnly = internal.handle;
+      internal.handle = null;
+      await closeOne(nativeApi, pin.owner, readOnly);
+      const mutation = await openVerifiedFileHandle(internal, {
+        access: ["attributes", "delete"], share: ["read", "delete"],
+      });
+      internal.handle = mutation;
+      await assertDirectChildBinding(internal);
+      return mutation;
+    }
+
+    async function acquireIssuedDirectoryMutationHandle(internal) {
+      await assertStable(internal, "directory");
+      const readOnly = internal.handle;
+      internal.handle = null;
+      await closeOne(nativeApi, pin.owner, readOnly);
+      const mutation = await openVerifiedDirectoryHandle(internal, {
+        access: ["read", "attributes", "traverse", "delete"], share: ["read", "delete"],
+      });
+      internal.handle = mutation;
+      return mutation;
+    }
+
     async function listAtMostOne(internal) {
       try {
         for await (const entry of nativeApi.enumerateDirectory(internal.handle, { limit: 1 })) {
@@ -948,7 +1021,7 @@ export function createWindowsFileCapabilities({
       }
     }
 
-    async function openDirectChild(parent, name, { kind, disposition, role = null }) {
+    async function openDirectChild(parent, name, { kind, disposition, role = null, created = false }) {
       const parentInternal = requireReceipt(parent, { directory: true });
       const exactName = validateChildName(name);
       await assertStable(parentInternal, "directory");
@@ -956,10 +1029,8 @@ export function createWindowsFileCapabilities({
       const handle = await nativeApi.openPath(childPath, {
         access: kind === "file"
           ? ["read", "write", "attributes", "delete"]
-          : role === "deletable"
-            ? ["read", "attributes", "traverse", "delete"]
-            : ["attributes", "traverse"],
-        share: kind === "file" ? ["read"] : ["read", "write"],
+          : ["read", "attributes", "traverse"],
+        share: kind === "file" ? ["read"] : role === "rename-parent" ? ["read", "write"] : ["read"],
         disposition,
         directory: kind === "directory",
       });
@@ -971,13 +1042,29 @@ export function createWindowsFileCapabilities({
         const finalPath = validateAbsolute(await nativeApi.finalPath(handle));
         if (!samePath(finalPath, childPath)) throw capabilityError("windows_final_path_mismatch");
         await assertStable(parentInternal, "directory");
-        return issue({ path: finalPath, info, handle, kind, parent, role });
+        return issue({ path: finalPath, info, handle, kind, parent, role, created });
       } catch (error) {
         await closeOne(nativeApi, pin.owner, handle).catch((closeError) => {
           throw new AggregateError([error, closeError], error.message, { cause: error });
         });
         throw error;
       }
+    }
+
+    async function openExistingDirectoryChildAfterCreateTransition(parent, name, role) {
+      let lastError = null;
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        try {
+          return await openDirectChild(parent, name, {
+            kind: "directory", disposition: "openExisting", role, created: false,
+          });
+        } catch (error) {
+          if (!isSharingViolation(error)) throw error;
+          lastError = error;
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        }
+      }
+      throw lastError;
     }
 
     async function createOrOpenDirectoryChildNoFollow(parent, name, options = {}) {
@@ -992,20 +1079,21 @@ export function createWindowsFileCapabilities({
       }
       const requireEmpty = options.requireEmpty ?? false;
       const role = options.role ?? "deletable";
-      const parentInternal = requireReceipt(parent, { directory: true });
       const exactName = validateChildName(name);
-      await assertStable(parentInternal, "directory");
-      const childPath = ensureDirectChild(parentInternal.path, exactName);
+      let receipt = null;
       try {
-        await nativeApi.createDirectory(childPath);
+        receipt = await openExistingDirectoryChildAfterCreateTransition(parent, exactName, role);
       } catch (error) {
-        if (!isOccupied(error)) throw error;
+        if (!isMissing(error)) throw error;
+        try {
+          receipt = await createDirectoryChildAtomic(parent, exactName, role, {
+            finalShare: role === "rename-parent" ? ["read", "write"] : ["read"],
+          });
+        } catch (createError) {
+          if (!isOccupied(createError)) throw createError;
+          receipt = await openExistingDirectoryChildAfterCreateTransition(parent, exactName, role);
+        }
       }
-      const receipt = await openDirectChild(parent, exactName, {
-        kind: "directory",
-        disposition: "openExisting",
-        role,
-      });
       if (requireEmpty) {
         const internal = requireReceipt(receipt, { directory: true });
         let empty;
@@ -1025,6 +1113,109 @@ export function createWindowsFileCapabilities({
         }
       }
       return receipt;
+    }
+
+    async function createDirectoryChildAtomic(parent, name, role, { finalShare }) {
+      const parentInternal = requireReceipt(parent, { directory: true });
+      const exactName = validateChildName(name);
+      await assertStable(parentInternal, "directory");
+      const childPath = ensureDirectChild(parentInternal.path, exactName);
+      const handle = await nativeApi.createDirectoryAtNoFollow(parentInternal.handle, exactName, {
+        access: ["read", "attributes", "traverse", "delete"],
+        share: ["read"],
+      });
+      pin.owner.handles.add(handle);
+      let createdInfo = null;
+      let receipt = null;
+      let originalClosed = false;
+      try {
+        const info = validateInfo(await nativeApi.queryHandle(handle), "directory");
+        createdInfo = info;
+        if (info.nlink !== 1) throw capabilityError("windows_hard_link_rejected");
+        await nativeApi.assertNoAlternateDataStreams(handle, { directory: true });
+        const finalPath = validateAbsolute(await nativeApi.finalPath(handle));
+        if (!samePath(finalPath, childPath)) throw capabilityError("windows_final_path_mismatch");
+        await assertStable(parentInternal, "directory");
+        receipt = issue({
+          path: finalPath, info, handle, kind: "directory", parent, role, created: true,
+        });
+        const internal = requireReceipt(receipt, { directory: true });
+        const bridge = await openVerifiedDirectoryHandle(internal, {
+          access: ["attributes", "traverse"], share: ["read", "write", "delete"],
+        });
+        internal.handle = bridge;
+        await closeOne(nativeApi, pin.owner, handle);
+        originalClosed = true;
+        const readOnly = await openVerifiedDirectoryHandle(internal, {
+          access: ["read", "attributes", "traverse"], share: finalShare,
+        });
+        internal.handle = readOnly;
+        await closeOne(nativeApi, pin.owner, bridge);
+        return receipt;
+      } catch (error) {
+        const cleanupErrors = [];
+        const internal = receipt ? receiptMap.get(receipt) : null;
+        const auxiliaryHandles = new Set([internal?.handle].filter((value) => value && value !== handle));
+        for (const liveHandle of auxiliaryHandles) {
+          try { await closeOne(nativeApi, pin.owner, liveHandle); }
+          catch (closeError) { cleanupErrors.push(closeError); }
+        }
+        let cleanupHandle = null;
+        const cleanupHandleIsExactCreate = !originalClosed;
+        if (!originalClosed) {
+          cleanupHandle = handle;
+        } else if (createdInfo !== null) {
+          try {
+            cleanupHandle = await nativeApi.openPath(childPath, {
+              access: ["read", "attributes", "traverse", "delete"], share: ["read", "delete"],
+              disposition: "openExisting", directory: true,
+            });
+            pin.owner.handles.add(cleanupHandle);
+          } catch (cleanupOpenError) { cleanupErrors.push(cleanupOpenError); }
+        } else {
+          cleanupErrors.push(capabilityError("workspace_atomic_cleanup_identity_unavailable"));
+        }
+        if (cleanupHandle) try {
+          if (!cleanupHandleIsExactCreate) {
+            const current = validateInfo(await nativeApi.queryHandle(cleanupHandle), "directory");
+            verifyIdentity(createdInfo.identity, current);
+            if (current.nlink !== 1) throw capabilityError("windows_hard_link_rejected");
+            const cleanupPath = validateAbsolute(await nativeApi.finalPath(cleanupHandle));
+            if (!samePath(cleanupPath, childPath)) throw capabilityError("windows_final_path_mismatch");
+            await assertStable(parentInternal, "directory");
+            let empty = true;
+            for await (const entry of nativeApi.enumerateDirectory(cleanupHandle, { limit: 1 })) {
+              if (!entry || entry.reparse === true) throw capabilityError("windows_reparse_point_rejected");
+              empty = false;
+            }
+            if (!empty) throw capabilityError("workspace_directory_not_empty");
+          }
+          await nativeApi.deleteByHandle(cleanupHandle, { directory: true });
+        } catch (cleanupError) { cleanupErrors.push(cleanupError); }
+        if (cleanupHandle) {
+          try {
+            if (pin.owner.handles.has(cleanupHandle)) await closeOne(nativeApi, pin.owner, cleanupHandle);
+            else await nativeApi.closeHandle(cleanupHandle);
+          }
+          catch (closeError) { cleanupErrors.push(closeError); }
+        }
+        if (cleanupErrors.length > 0) {
+          throw new AggregateError([error, ...cleanupErrors], error.message, { cause: error });
+        }
+        throw error;
+      }
+    }
+
+    async function createDirectoryChildNoFollow(parent, name, options = {}) {
+      const hasRole = options !== null && typeof options === "object" && Object.hasOwn(options, "role");
+      if (!hasExactKeys(options, hasRole ? ["role"] : [])
+        || (hasRole && options.role !== "deletable")) {
+        throw capabilityError("workspace_directory_options_invalid");
+      }
+      if (typeof nativeApi.createDirectoryAtNoFollow !== "function") {
+        throw capabilityError("workspace_atomic_directory_create_required");
+      }
+      return createDirectoryChildAtomic(parent, name, "deletable", { finalShare: ["read"] });
     }
 
     async function openDirectoryChildNoFollow(parent, name, options = {}) {
@@ -1065,15 +1256,35 @@ export function createWindowsFileCapabilities({
       return Object.freeze({ path: internal.path, kind: internal.kind, size: info.size, empty });
     }
 
+    async function describeIssuedDirectoryNoFollow(receipt) {
+      const internal = requireReceipt(receipt, { directory: true });
+      await assertStable(internal, "directory");
+      return Object.freeze({
+        path: internal.path,
+        identity: Object.freeze({ ...internal.identity }),
+        created: internal.created === true,
+      });
+    }
+
     async function resetIssuedFileNoFollow(receipt, options = {}) {
-      if (!hasExactKeys(options, []) ) throw capabilityError("workspace_file_reset_options_invalid");
+      const hasSignal = options !== null && typeof options === "object"
+        && Object.hasOwn(options, "signal");
+      if (!hasExactKeys(options, hasSignal ? ["signal"] : [])
+        || (hasSignal && (options.signal === null || typeof options.signal !== "object"
+          || typeof options.signal.aborted !== "boolean"))) {
+        throw capabilityError("workspace_file_reset_options_invalid");
+      }
       const internal = requireReceipt(receipt);
       if (internal.kind !== "file" || !internal.parent || internal.sealed || internal.writer) {
         throw capabilityError("workspace_file_receipt_required");
       }
+      throwIfAborted(options.signal);
       await assertStable(internal, "file");
+      throwIfAborted(options.signal);
       await nativeApi.setFilePosition(internal.handle, 0);
+      throwIfAborted(options.signal);
       await nativeApi.truncateFile(internal.handle, 0);
+      throwIfAborted(options.signal);
       await nativeApi.flushFile(internal.handle);
       const current = await assertStable(internal, "file");
       if (current.size !== 0) throw capabilityError("workspace_file_reset_failed");
@@ -1190,10 +1401,13 @@ export function createWindowsFileCapabilities({
         if (finalInfo.size !== options.size || finalInfo.nlink !== 1) {
           throw capabilityError("workspace_file_size_mismatch");
         }
+        internal.sealed = true;
+        await downgradeIssuedFileHandle(internal);
+        const readOnlyInfo = await assertStable(internal, "file");
         internal.state = "consumed";
         return issue({
           path: internal.path,
-          info: finalInfo,
+          info: readOnlyInfo,
           handle: internal.handle,
           kind: "file",
           parent: internal.parent,
@@ -1238,6 +1452,8 @@ export function createWindowsFileCapabilities({
         throw capabilityError("workspace_sealed_file_required");
       }
       let destination;
+      let mutationHandle = null;
+      let primaryError = null;
       try {
         const parentInternal = requireReceipt(internal.parent, { directory: true });
         if (parentInternal.role !== "rename-parent") {
@@ -1246,13 +1462,17 @@ export function createWindowsFileCapabilities({
         const name = validateChildName(destinationName);
         destination = ensureDirectChild(parentInternal.path, name);
         await assertStable(parentInternal, "directory");
-        await assertStable(internal, "file");
-        await nativeApi.renameByHandle(internal.handle, parentInternal.handle, name, { replace: false });
+        mutationHandle = await acquireIssuedFileMutationHandle(internal);
+        await nativeApi.renameByHandle(mutationHandle, parentInternal.handle, name, { replace: false });
         internal.path = destination;
         await assertStable(internal, "file");
-        const current = validateInfo(await nativeApi.queryHandle(internal.handle), "file");
+        const mutationPath = validateAbsolute(await nativeApi.finalPath(mutationHandle));
+        if (!samePath(mutationPath, destination)) throw capabilityError("windows_final_path_mismatch");
+        await downgradeIssuedFileHandle(internal);
+        mutationHandle = null;
+        const current = await assertStable(internal, "file");
         internal.state = "consumed";
-        return issue({
+        const renamed = issue({
           path: destination,
           info: current,
           handle: internal.handle,
@@ -1260,10 +1480,21 @@ export function createWindowsFileCapabilities({
           parent: internal.parent,
           sealed: true,
         });
+        return renamed;
       } catch (error) {
-        if (isOccupied(error)) internal.state = "issued";
+        primaryError = error;
+        if (mutationHandle) {
+          try {
+            await downgradeIssuedFileHandle(internal);
+            mutationHandle = null;
+          }
+          catch (closeError) {
+            primaryError = new AggregateError([error, closeError], error.message, { cause: error });
+          }
+        }
+        if (isOccupied(error) && mutationHandle === null) internal.state = "issued";
         else internal.state = "consumed";
-        throw error;
+        throw primaryError;
       }
     }
 
@@ -1274,6 +1505,7 @@ export function createWindowsFileCapabilities({
         throw capabilityError("workspace_root_mutation_rejected");
       }
       let primaryError = null;
+      let mutationHandle = null;
       try {
         await assertStable(internal);
         if (internal.kind === "directory" && !(await listAtMostOne(internal))) {
@@ -1284,13 +1516,29 @@ export function createWindowsFileCapabilities({
           internal.state = "issued";
           throw capabilityError("workspace_directory_not_deletable");
         }
-        await nativeApi.deleteByHandle(internal.handle, { directory: internal.kind === "directory" });
+        if (internal.kind === "directory") {
+          mutationHandle = await acquireIssuedDirectoryMutationHandle(internal);
+          if (!(await listAtMostOne(internal))) throw capabilityError("workspace_directory_not_empty");
+        }
+        if (internal.kind === "file" && internal.sealed) {
+          mutationHandle = await acquireIssuedFileMutationHandle(internal);
+        }
+        await nativeApi.deleteByHandle(mutationHandle ?? internal.handle, { directory: internal.kind === "directory" });
         internal.state = "consumed";
       } catch (error) {
         if (internal.state === "busy") internal.state = "consumed";
         primaryError = error;
       }
       if (internal.state === "consumed") {
+        if (mutationHandle) {
+          try { await closeOne(nativeApi, pin.owner, mutationHandle); }
+          catch (closeError) {
+            if (primaryError) primaryError = new AggregateError(
+              [primaryError, closeError], primaryError.message, { cause: primaryError },
+            );
+            else primaryError = closeError;
+          }
+        }
         try {
           await closeOne(nativeApi, pin.owner, internal.handle);
         } catch (closeError) {
@@ -1304,11 +1552,13 @@ export function createWindowsFileCapabilities({
 
     return Object.freeze({
       root,
+      createDirectoryChildNoFollow,
       createOrOpenDirectoryChildNoFollow,
       openDirectoryChildNoFollow,
       createFileChildNoFollow,
       openFileChildNoFollow,
       inspectIssuedChildNoFollow,
+      describeIssuedDirectoryNoFollow,
       resetIssuedFileNoFollow,
       createIssuedFileWriteStreamNoFollow,
       sealIssuedFileNoFollow,
@@ -1319,12 +1569,18 @@ export function createWindowsFileCapabilities({
     });
   }
 
-  async function openStableDirectoryNoFollow(rootPath, { versionSlots = false } = {}) {
+  async function openStableDirectoryNoFollow(rootPath, {
+    versionSlots = false, expectedRootIdentity = null,
+  } = {}) {
     const pin = await openPinnedPath(nativeApi, rootPath, {
       kind: "directory",
       access: ["read", "attributes"],
       share: ["read", "write"],
     });
+    if (expectedRootIdentity !== null) {
+      try { verifyIdentity(expectedRootIdentity, pin.leaf.info); }
+      catch (error) { return closeHandles(nativeApi, pin.owner.handles, error); }
+    }
     pin.owner.enumerated = 0;
     const descriptorMap = new WeakMap();
 
@@ -1729,8 +1985,15 @@ export function createWindowsFileCapabilities({
     return openStableDirectoryNoFollow(rootPath);
   }
 
-  async function openVersionRootNoFollow(rootPath) {
-    return openStableDirectoryNoFollow(rootPath, { versionSlots: true });
+  async function openVersionRootNoFollow(rootPath, options = {}) {
+    const hasExpectedRootIdentity = options !== null && typeof options === "object"
+      && Object.hasOwn(options, "expectedRootIdentity");
+    if (!hasExactKeys(options, hasExpectedRootIdentity ? ["expectedRootIdentity"] : [])) {
+      throw capabilityError("version_root_options_invalid");
+    }
+    const expectedRootIdentity = options.expectedRootIdentity ?? null;
+    if (expectedRootIdentity !== null) identityKey(expectedRootIdentity);
+    return openStableDirectoryNoFollow(rootPath, { versionSlots: true, expectedRootIdentity });
   }
 
   async function pinArchiveFileNoFollow(archivePath) {
@@ -1754,12 +2017,25 @@ export function createWindowsFileCapabilities({
     });
   }
 
-  async function openArchiveDestinationNoFollow(destinationPath) {
+  async function openArchiveDestinationNoFollow(destinationPath, options = {}) {
+    const hasExpectedIdentity = options !== null && typeof options === "object"
+      && Object.hasOwn(options, "expectedIdentity");
+    if (!hasExactKeys(options, hasExpectedIdentity ? ["expectedIdentity"] : [])) {
+      throw capabilityError("archive_destination_options_invalid");
+    }
+    const expectedIdentity = options.expectedIdentity ?? null;
+    if (expectedIdentity !== null && !hasExactKeys(expectedIdentity, ["volumeSerial", "fileId"])) {
+      throw capabilityError("archive_destination_identity_invalid");
+    }
     const pin = await openPinnedPath(nativeApi, destinationPath, {
       kind: "directory",
       access: ["read", "attributes"],
       share: ["read"],
     });
+    if (expectedIdentity !== null) {
+      try { verifyIdentity(expectedIdentity, pin.leaf.info); }
+      catch (error) { return closeHandles(nativeApi, pin.owner.handles, error); }
+    }
     const tracked = new Map([["", { ...pin.leaf, relative: "", directory: true, expectedSize: 0 }]]);
     const directories = new Map([["", tracked.get("")]]);
 
@@ -1796,23 +2072,31 @@ export function createWindowsFileCapabilities({
           continue;
         }
         const childPath = ensureDirectChild(record.path, segments[index]);
-        await nativeApi.createDirectory(childPath);
-        const handle = await nativeApi.openPath(childPath, {
-          access: ["read", "attributes"], share: ["read"], disposition: "openExisting", directory: true,
+        if (typeof nativeApi.createDirectoryAtNoFollow !== "function") {
+          throw capabilityError("archive_atomic_directory_create_required");
+        }
+        const handle = await nativeApi.createDirectoryAtNoFollow(record.handle, segments[index], {
+          access: ["read", "attributes", "traverse", "delete"], share: ["read"],
         });
         pin.owner.handles.add(handle);
         try {
           const info = validateInfo(await nativeApi.queryHandle(handle), "directory");
           if (info.nlink !== 1) throw capabilityError("windows_hard_link_rejected");
+          await nativeApi.assertNoAlternateDataStreams(handle, { directory: true });
           const finalPath = validateAbsolute(await nativeApi.finalPath(handle));
           if (!samePath(finalPath, childPath)) throw capabilityError("windows_final_path_mismatch");
           record = { handle, info, path: finalPath, relative, directory: true, expectedSize: 0 };
           directories.set(relative, record);
           tracked.set(relative, record);
         } catch (error) {
-          await closeOne(nativeApi, pin.owner, handle).catch((closeError) => {
-            throw new AggregateError([error, closeError], error.message, { cause: error });
-          });
+          const cleanupErrors = [];
+          try { await nativeApi.deleteByHandle(handle, { directory: true }); }
+          catch (cleanupError) { cleanupErrors.push(cleanupError); }
+          try { await closeOne(nativeApi, pin.owner, handle); }
+          catch (closeError) { cleanupErrors.push(closeError); }
+          if (cleanupErrors.length > 0) {
+            throw new AggregateError([error, ...cleanupErrors], error.message, { cause: error });
+          }
           throw error;
         }
       }

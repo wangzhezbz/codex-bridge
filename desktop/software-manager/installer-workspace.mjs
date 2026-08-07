@@ -86,9 +86,11 @@ function validateDownloadManager(value) {
 function requireSession(value) {
   const methods = [
     "createOrOpenDirectoryChildNoFollow",
+    "createDirectoryChildNoFollow",
     "createFileChildNoFollow",
     "openFileChildNoFollow",
     "inspectIssuedChildNoFollow",
+    "describeIssuedDirectoryNoFollow",
     "resetIssuedFileNoFollow",
     "createIssuedFileWriteStreamNoFollow",
     "sealIssuedFileNoFollow",
@@ -134,13 +136,22 @@ export function createInstallerWorkspace({
         await revalidateInstallRootCapability(installRootCapability, {
           maxRelativePath: authority.relativePath.length,
         });
-        return authority.session.inspectIssuedChildNoFollow(authority.fileReceipt);
+        const inspected = await authority.session.inspectIssuedChildNoFollow(authority.fileReceipt);
+        if (authority.phase === "adopted" && inspected.size !== authority.size) {
+          throw workspaceError("workspace_existing_package_mismatch");
+        }
+        return inspected;
       },
-      async reset() {
+      async reset({ signal } = {}) {
         if (authority.state !== "issued" || authority.phase !== "partial") {
           throw workspaceError("workspace_receipt_consumed");
         }
-        authority.fileReceipt = await authority.session.resetIssuedFileNoFollow(authority.fileReceipt, {});
+        await revalidateInstallRootCapability(installRootCapability, {
+          maxRelativePath: authority.relativePath.length,
+        });
+        authority.fileReceipt = await authority.session.resetIssuedFileNoFollow(
+          authority.fileReceipt, signal === undefined ? {} : { signal },
+        );
       },
       async createWriteStream({ append, maxBytes, signal }) {
         if (authority.state !== "issued" || authority.phase !== "partial") {
@@ -161,11 +172,11 @@ export function createInstallerWorkspace({
         await revalidateInstallRootCapability(installRootCapability, {
           maxRelativePath: authority.relativePath.length,
         });
-        if (authority.phase === "partial") {
+        if (authority.phase === "partial" || authority.phase === "adopted") {
           authority.fileReceipt = await authority.session.sealIssuedFileNoFollow(
             authority.fileReceipt, { size, sha256, signal },
           );
-          authority.phase = "sealed";
+          authority.phase = authority.phase === "adopted" ? "promoted" : "sealed";
         } else {
           const inspected = await authority.session.inspectIssuedChildNoFollow(authority.fileReceipt);
           if (inspected.size !== size) throw workspaceError("workspace_file_size_mismatch");
@@ -282,15 +293,23 @@ export function createInstallerWorkspace({
       } else {
         await authority.session.inspectIssuedChildNoFollow(authority.fileReceipt);
       }
-      authority.fileReceipt = await authority.session.renameIssuedChildNoReplace(
-        authority.fileReceipt,
-        authority.finalName,
-      );
-      authority.phase = "promoted";
+      if (authority.phase === "sealed") {
+        authority.fileReceipt = await authority.session.renameIssuedChildNoReplace(
+          authority.fileReceipt,
+          authority.finalName,
+        );
+        authority.phase = "promoted";
+      }
       authority.state = "issued";
       const packageProof = Object.freeze(Object.create(null));
       promotedPackageProofs.set(packageProof, { state: "issued", authority });
-      return Object.freeze({ path: record.path, packageProof, downloadRecord: record });
+      return Object.freeze({
+        path: record.path,
+        size: authority.size,
+        sha256: authority.sha256,
+        packageProof,
+        downloadRecord: record,
+      });
     } catch (error) {
       if (isOccupied(error)) {
         authority.state = "issued";
@@ -320,8 +339,7 @@ export function createInstallerWorkspace({
           session.root, "downloads", { requireEmpty: false, role: "rename-parent" },
         );
         const occupied = await session.openFileChildNoFollow(downloads, finalName);
-        if (occupied) throw workspaceError("workspace_package_collision");
-        const fileReceipt = await createOrOpenPart(session, downloads, partName);
+        const fileReceipt = occupied ?? await createOrOpenPart(session, downloads, partName);
         let record;
         record = makeReceipt({
           kind: "download",
@@ -335,7 +353,8 @@ export function createInstallerWorkspace({
         authorities.set(record, {
           kind: "download",
           state: "issued",
-          phase: "partial",
+          phase: occupied ? "adopted" : "partial",
+          adoptedExisting: Boolean(occupied),
           key,
           session,
           fileReceipt,
@@ -417,8 +436,9 @@ export function createInstallerWorkspace({
       const task = await session.createOrOpenDirectoryChildNoFollow(
         staging, `task-${taskId}`, { requireEmpty: false, role: "deletable" },
       );
-      const leaf = await session.createOrOpenDirectoryChildNoFollow(
-        task, leafName, { requireEmpty: true, role: "deletable" },
+      const taskDescription = await session.describeIssuedDirectoryNoFollow(task);
+      const leaf = await session.createDirectoryChildNoFollow(
+        task, leafName, { role: "deletable" },
       );
       const record = makeReceipt({
         kind,
@@ -433,6 +453,7 @@ export function createInstallerWorkspace({
         ...fields,
         session,
         taskReceipt: task,
+        taskCreated: taskDescription.created === true,
         leafReceipt: leaf,
         relativePath,
       });
@@ -481,7 +502,9 @@ export function createInstallerWorkspace({
       if (!leaf.empty) throw workspaceError("workspace_directory_not_empty");
       await authority.session.deleteIssuedChildNoFollow(authority.leafReceipt);
       const task = await authority.session.inspectIssuedChildNoFollow(authority.taskReceipt);
-      if (task.empty) await authority.session.deleteIssuedChildNoFollow(authority.taskReceipt);
+      if (authority.taskCreated && task.empty) {
+        await authority.session.deleteIssuedChildNoFollow(authority.taskReceipt);
+      }
     } catch (error) {
       primaryError = error;
     }
@@ -497,7 +520,7 @@ export function createInstallerWorkspace({
         await revalidateInstallRootCapability(installRootCapability, {
           maxRelativePath: authority.relativePath.length,
         });
-        if (authority.phase === "partial") {
+        if (authority.phase === "partial" || authority.adoptedExisting) {
           await authority.session.inspectIssuedChildNoFollow(authority.fileReceipt);
         } else {
           await authority.session.deleteIssuedChildNoFollow(authority.fileReceipt);
@@ -512,7 +535,7 @@ export function createInstallerWorkspace({
     return cleanupStaging(record, authority);
   }
 
-  async function cleanupComponentPackage(record) {
+  async function settleComponentPackage(record, { deleteFile }) {
     const authority = claimRecord(record, "download");
     if (authority.phase !== "promoted") {
       authority.state = "issued";
@@ -523,13 +546,29 @@ export function createInstallerWorkspace({
       await revalidateInstallRootCapability(installRootCapability, {
         maxRelativePath: authority.relativePath.length,
       });
-      await authority.session.deleteIssuedChildNoFollow(authority.fileReceipt);
+      if (deleteFile) {
+        await authority.session.deleteIssuedChildNoFollow(authority.fileReceipt);
+      } else {
+        const inspected = await authority.session.inspectIssuedChildNoFollow(authority.fileReceipt);
+        if (inspected.path !== authority.finalPath || inspected.kind !== "file"
+          || inspected.size !== authority.size) {
+          throw workspaceError("workspace_package_proof_mismatch");
+        }
+      }
     } catch (error) {
       primaryError = error;
     }
     pending.delete(authority.key);
     await closeWithPrimary(authority, primaryError);
     return true;
+  }
+
+  async function cleanupComponentPackage(record) {
+    return settleComponentPackage(record, { deleteFile: true });
+  }
+
+  async function releaseComponentPackage(record) {
+    return settleComponentPackage(record, { deleteFile: false });
   }
 
   async function sealSkillStaging(record, packageProof, context = {}) {
@@ -606,15 +645,21 @@ export function createInstallerWorkspace({
       || expected.size !== authority.size || expected.sha256 !== authority.sha256) {
       throw workspaceError("workspace_package_proof_mismatch");
     }
-    await revalidateInstallRootCapability(installRootCapability, {
-      maxRelativePath: authority.relativePath.length,
-    });
-    const inspected = await authority.session.inspectIssuedChildNoFollow(authority.fileReceipt);
-    if (inspected.path !== expected.path || inspected.kind !== "file" || inspected.size !== expected.size) {
-      throw workspaceError("workspace_package_proof_mismatch");
+    proofRecord.state = "busy";
+    try {
+      await revalidateInstallRootCapability(installRootCapability, {
+        maxRelativePath: authority.relativePath.length,
+      });
+      const inspected = await authority.session.inspectIssuedChildNoFollow(authority.fileReceipt);
+      if (inspected.path !== expected.path || inspected.kind !== "file" || inspected.size !== expected.size) {
+        throw workspaceError("workspace_package_proof_mismatch");
+      }
+      proofRecord.state = "consumed";
+      return Object.freeze({ path: expected.path, size: expected.size, sha256: expected.sha256 });
+    } catch (error) {
+      proofRecord.state = "issued";
+      throw error;
     }
-    proofRecord.state = "consumed";
-    return Object.freeze({ path: expected.path, size: expected.size, sha256: expected.sha256 });
   }
 
   return Object.freeze({
@@ -625,6 +670,7 @@ export function createInstallerWorkspace({
     prepareSkillStaging,
     cleanupAbandonedPrepare,
     cleanupComponentPackage,
+    releaseComponentPackage,
     sealSkillStaging,
     consumePromotedPackageProof,
   });

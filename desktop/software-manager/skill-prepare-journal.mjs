@@ -128,13 +128,14 @@ function sameRecord(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-export async function inferPreparedSkillInstallRoot({ journalDir, fsApi, taskId, skillId } = {}) {
+async function inferPreparedSkillRoots({ journalDir, fsApi, taskId = null, skillId = null } = {}) {
+  const exactTask = taskId !== null || skillId !== null;
   if (!fsApi || typeof fsApi.openJournalDirectoryNoFollow !== "function"
-    || !TASK_ID.test(taskId ?? "") || !SKILL_ID.test(skillId ?? "")) {
+    || (exactTask && (!TASK_ID.test(taskId ?? "") || !SKILL_ID.test(skillId ?? "")))) {
     throw journalError("skill_prepare_lookup_invalid");
   }
   canonical(journalDir);
-  const expectedHash = recordKey(taskId, skillId);
+  const expectedHash = exactTask ? recordKey(taskId, skillId) : null;
   const directory = requireDirectory(await fsApi.openJournalDirectoryNoFollow(journalDir));
   const roots = new Map();
   try {
@@ -143,7 +144,7 @@ export async function inferPreparedSkillInstallRoot({ journalDir, fsApi, taskId,
     for (const name of names) {
       if (typeof name !== "string") throw journalError("skill_prepare_journal_corrupt");
       const match = FILE_NAME.exec(name) ?? TEMP_FILE_NAME.exec(name);
-      if (!match || match[1] !== expectedHash) continue;
+      if (!match || (expectedHash !== null && match[1] !== expectedHash)) continue;
       const opened = await directory.openFileNoFollow(name, "r");
       if (opened === null) continue;
       const file = requireFile(opened);
@@ -154,7 +155,9 @@ export async function inferPreparedSkillInstallRoot({ journalDir, fsApi, taskId,
         }
         const root = canonical(parsed?.installRoot);
         const normalized = normalizeRecord(parsed, root);
-        if (normalized.taskId !== taskId || normalized.skillId !== skillId || normalized.phase !== match[2]) {
+        if ((exactTask && (normalized.taskId !== taskId || normalized.skillId !== skillId))
+          || normalized.phase !== match[2]
+          || match[1] !== recordKey(normalized.taskId, normalized.skillId)) {
           throw journalError("skill_prepare_journal_conflict");
         }
         roots.set(root.toLowerCase(), root);
@@ -167,6 +170,14 @@ export async function inferPreparedSkillInstallRoot({ journalDir, fsApi, taskId,
   }
   if (roots.size > 1) throw journalError("skill_prepare_install_root_conflict");
   return roots.size === 0 ? null : roots.values().next().value;
+}
+
+export async function inferPreparedSkillInstallRoot(options = {}) {
+  return inferPreparedSkillRoots(options);
+}
+
+export async function inferAnyPreparedSkillInstallRoot({ journalDir, fsApi } = {}) {
+  return inferPreparedSkillRoots({ journalDir, fsApi });
 }
 
 function isOccupied(error) {
@@ -306,9 +317,11 @@ export function createSkillPrepareJournal({ journalDir, fsApi, installRoot } = {
     }
   }
 
-  async function list({ claimLease } = {}) {
+  async function list({ claimLease, diagnostics = false } = {}) {
+    if (typeof diagnostics !== "boolean") throw journalError("skill_prepare_list_invalid");
     const directory = await openDirectory();
     const liveHashes = new Set();
+    const liveRecords = new Map();
     try {
       const names = checkedNames(await directory.listFileNamesNoFollow());
       const pendingTemps = [];
@@ -332,10 +345,12 @@ export function createSkillPrepareJournal({ journalDir, fsApi, installRoot } = {
           throw journalError("skill_prepare_lease_claim_required");
         }
         const lease = await claimLease({
+          taskId: temp.record.taskId, skillId: temp.record.skillId,
           nonce: temp.record.leaseNonce, scope: temp.record.leaseScope,
         });
         if (lease === null) {
           liveHashes.add(hash);
+          liveRecords.set(hash, temp.record);
           continue;
         }
         if (!lease || typeof lease.release !== "function") {
@@ -359,9 +374,19 @@ export function createSkillPrepareJournal({ journalDir, fsApi, installRoot } = {
       const names = checkedNames(await directoryForRead.listFileNamesNoFollow());
       for (const name of names) {
         const finalMatch = FILE_NAME.exec(name);
-        if (!finalMatch || liveHashes.has(finalMatch[1])) continue;
-        const opened = await readNamed(directoryForRead, name, root);
+        if (!finalMatch) continue;
+        let opened;
+        try {
+          opened = await readNamed(directoryForRead, name, root);
+        } catch (error) {
+          if (!liveHashes.has(finalMatch[1]) || !isSharingViolation(error)) throw error;
+          continue;
+        }
         if (!opened) continue;
+        if (liveHashes.has(finalMatch[1])) {
+          liveRecords.set(finalMatch[1], opened.record);
+          continue;
+        }
         const key = `${opened.record.taskId}\0${opened.record.skillId}`;
         pairs.set(key, { taskId: opened.record.taskId, skillId: opened.record.skillId });
       }
@@ -373,7 +398,19 @@ export function createSkillPrepareJournal({ journalDir, fsApi, installRoot } = {
       const transaction = await load(pair);
       if (transaction) result.push(transaction.snapshot);
     }
-    return result;
+    if (!diagnostics) return result;
+    const live = [...liveRecords.entries()].map(([journalHash, record]) => ({
+      journalHash, taskId: record.taskId, skillId: record.skillId,
+      leaseScope: record.leaseScope, leaseNonce: record.leaseNonce,
+    }));
+    const unresolved = [...liveHashes]
+      .filter((journalHash) => !liveRecords.has(journalHash))
+      .map((journalHash) => ({ journalHash }));
+    return Object.freeze({
+      records: Object.freeze(result.map((record) => Object.freeze(record))),
+      live: Object.freeze(live.map((record) => Object.freeze(record))),
+      unresolved: Object.freeze(unresolved.map((record) => Object.freeze(record))),
+    });
   }
 
   async function record(raw) {

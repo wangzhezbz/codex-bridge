@@ -313,9 +313,9 @@ function requireZipDestinationHandle(handle) {
   return handle;
 }
 
-async function extractZip({ archivePath, destination, signal, fsApi, verification }) {
+async function extractZip({ archivePath, destination, destinationIdentity, signal, fsApi, verification }) {
   throwIfAborted(signal);
-  const enumerated = await enumerateZip(archivePath, signal);
+  let enumerated;
   let destinationHandle;
   let result;
   let primaryError;
@@ -324,8 +324,9 @@ async function extractZip({ archivePath, destination, signal, fsApi, verificatio
     if (typeof fsApi?.openArchiveDestinationNoFollow !== "function") {
       throw archiveError("archive_no_follow_capability_required");
     }
-    destinationHandle = await fsApi.openArchiveDestinationNoFollow(destination);
+    destinationHandle = await fsApi.openArchiveDestinationNoFollow(destination, { expectedIdentity: destinationIdentity });
     requireZipDestinationHandle(destinationHandle);
+    enumerated = await enumerateZip(archivePath, signal);
     for (const entry of enumerated.entries) {
       throwIfAborted(signal);
       if (entry.directory) {
@@ -361,7 +362,7 @@ async function extractZip({ archivePath, destination, signal, fsApi, verificatio
   return finishWithClose({
     primaryError,
     result,
-    resources: [destinationHandle, { close: () => closeZipFile(enumerated.zipFile) }],
+    resources: [destinationHandle, enumerated ? { close: () => closeZipFile(enumerated.zipFile) } : null],
   });
 }
 
@@ -580,7 +581,7 @@ function validateVerifiedTree(tree, destination, inspectedEntries) {
 }
 
 async function extractSevenZip({
-  archivePath, destination, signal, sevenZipPath, spawnFile, spawnStream, fsApi, verification,
+  archivePath, destination, destinationIdentity, signal, sevenZipPath, spawnFile, spawnStream, fsApi, verification,
 }) {
   throwIfAborted(signal);
   if (typeof fsApi?.pinArchiveFileNoFollow !== "function"
@@ -597,14 +598,14 @@ async function extractSevenZip({
     throwIfAborted(signal);
     await archivePin.assertStableNoFollow();
     throwIfAborted(signal);
-    const inspected = await inspectSevenZip({ archivePath, signal, sevenZipPath, spawnFile });
-    throwIfAborted(signal);
-    await archivePin.assertStableNoFollow();
-    throwIfAborted(signal);
-    destinationHandle = await fsApi.openArchiveDestinationNoFollow(destination);
+    destinationHandle = await fsApi.openArchiveDestinationNoFollow(destination, { expectedIdentity: destinationIdentity });
     requireSevenZipDestinationHandle(destinationHandle);
     throwIfAborted(signal);
     await destinationHandle.assertEmptyNoFollow();
+    throwIfAborted(signal);
+    const inspected = await inspectSevenZip({ archivePath, signal, sevenZipPath, spawnFile });
+    throwIfAborted(signal);
+    await archivePin.assertStableNoFollow();
     throwIfAborted(signal);
     for (const entry of inspected.entries) {
       throwIfAborted(signal);
@@ -673,21 +674,34 @@ export function createArchiveService({ sevenZipPath, spawnFile, spawnStream, fsA
       })).publicResult;
     },
 
-    async extractArchive({ format, archivePath, destination, signal, verification: rawVerification } = {}) {
+    async extractArchive({
+      format, archivePath, destination, destinationIdentity = null, signal, verification: rawVerification,
+    } = {}) {
       throwIfAborted(signal);
       const exactFormat = validateFormat(format);
       const exactArchivePath = requireAbsolutePath(archivePath, "archive_path_rejected");
       const exactDestination = requireAbsolutePath(destination, "archive_destination_rejected");
+      if (destinationIdentity === null) {
+        throw archiveError("archive_destination_identity_required");
+      }
+      if (!destinationIdentity || typeof destinationIdentity !== "object"
+        || Object.keys(destinationIdentity).length !== 2
+        || typeof destinationIdentity.volumeSerial !== "string" || destinationIdentity.volumeSerial.length === 0
+        || typeof destinationIdentity.fileId !== "string" || destinationIdentity.fileId.length === 0) {
+        throw archiveError("archive_destination_identity_rejected");
+      }
       const verification = normalizeVerification(rawVerification);
       if (exactFormat === "zip") {
         return extractZip({
-          archivePath: exactArchivePath, destination: exactDestination, signal, fsApi, verification,
+          archivePath: exactArchivePath, destination: exactDestination, destinationIdentity,
+          signal, fsApi, verification,
         });
       }
       if (!bundledSevenZipPath) throw archiveError("archive_7z_path_required");
       return extractSevenZip({
         archivePath: exactArchivePath,
         destination: exactDestination,
+        destinationIdentity,
         signal,
         sevenZipPath: bundledSevenZipPath,
         spawnFile,

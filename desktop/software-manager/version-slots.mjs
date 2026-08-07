@@ -1,5 +1,4 @@
 import path from "node:path";
-
 import { getOwnershipCoordinator } from "./ownership-coordinator.mjs";
 import { readInstallRootCapability } from "./path-policy.mjs";
 import { deleteAuthorizedTree } from "./safe-delete.mjs";
@@ -9,6 +8,7 @@ const COMPONENT_ROOT_NAMES = Object.freeze({ chatgpt: null, v2rayn: "V2RayN", gi
 const SLOT_KEYS = ["current", "previous", "staging", "retiring"];
 const VERSION = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/u;
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
+const PREPARE_NAME = /^\.codexbridge-prepare-[a-f0-9]{32}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
 const RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/iu;
 const ACTIVE_TRANSACTION_KIND = "software-version-slot";
@@ -21,6 +21,11 @@ function slotError(code, cause) {
   const error = new Error(code, cause === undefined ? undefined : { cause });
   error.code = code;
   return error;
+}
+
+function isMissing(error) {
+  return error?.code === "entry_missing" || error?.code === "ENOENT"
+    || error?.nativeCode === 2 || error?.nativeCode === 3;
 }
 
 function isPlainRecord(value) {
@@ -347,7 +352,10 @@ function requireRecoveryOwnershipState(state, snapshot, { allowAbort = false } =
   return postMatches ? "post" : "pre";
 }
 
-function baseRecord({ taskId, componentId, mode, rootPath, incoming, current, previous, state, runtimeMetadata = null }) {
+function baseRecord({
+  taskId, componentId, mode, rootPath, incoming, current, previous, state,
+  runtimeMetadata = null, priorPrepare = null, prepareSource = null,
+}) {
   const slots = namesFor(componentId);
   return {
     schemaVersion: 2,
@@ -381,6 +389,8 @@ function baseRecord({ taskId, componentId, mode, rootPath, incoming, current, pr
     },
     runtimeMetadata: mode === "promote" ? structuredClone(runtimeMetadata) : null,
     ownershipBefore: ownershipSlice(state, componentId),
+    priorPrepare: mode === "promote" ? structuredClone(priorPrepare) : null,
+    prepareSource: mode === "promote" ? structuredClone(prepareSource) : null,
   };
 }
 
@@ -403,13 +413,14 @@ function phaseRecord(snapshot, phase) {
 function validatePromotionPlan(plan) {
   if (!hasExactKeys(plan, [
     "taskId", "componentId", "rootPath", "version", "verificationReceipt", "treeDigest", "manifestDigest",
-    "runtimeMetadata",
+    "runtimeMetadata", "prepareLeaseNonce",
   ])
     || !TASK_ID.test(plan.taskId ?? "") || !COMPONENT_IDS.has(plan.componentId)
     || typeof plan.version !== "string" || !VERSION.test(plan.version)
     || plan.verificationReceipt === null || typeof plan.verificationReceipt !== "object"
     || !SHA256.test(plan.treeDigest ?? "")
     || !SHA256.test(plan.manifestDigest ?? "")
+    || typeof plan.prepareLeaseNonce !== "string" || plan.prepareLeaseNonce.length === 0
     || !hasExactKeys(plan.runtimeMetadata, ["entrypointPath", "requiredFiles", "health"])
     || typeof plan.runtimeMetadata.entrypointPath !== "string"
     || !Array.isArray(plan.runtimeMetadata.requiredFiles) || plan.runtimeMetadata.requiredFiles.length === 0
@@ -492,21 +503,40 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal, insta
     if (!claimMatches(state?.activeTask, transaction, journalScope, allowedLifecycles)) {
       throw slotError("slot_active_transaction_changed");
     }
-    await ownershipStore.save({ ...structuredClone(state), activeTask: null });
+    const released = { ...structuredClone(state), activeTask: null };
+    if (Object.keys(released.components ?? {}).length === 0
+      && Object.keys(released.skills ?? {}).length === 0) {
+      released.installRoot = null;
+    }
+    await ownershipStore.save(released);
     return true;
   }
 
-  async function beginTransaction(state, snapshot) {
+  async function restorePriorClaim(transaction, priorActiveTask, allowedLifecycles) {
+    const current = await ownershipStore.load();
+    if (!claimMatches(current?.activeTask, transaction, journalScope, allowedLifecycles)) {
+      throw slotError("slot_active_transaction_changed");
+    }
+    await ownershipStore.save({ ...structuredClone(current), activeTask: structuredClone(priorActiveTask) });
+  }
+
+  async function beginTransaction(state, snapshot, { priorActiveTask = null, journalAlreadyRecorded = false } = {}) {
     const expectedActive = transactionClaim(snapshot, journalScope, "active");
     if (!sameJson(snapshot.ownershipBefore.activeTask, expectedActive)) {
       throw slotError("slot_active_transaction_invalid");
     }
     const reserved = transactionClaim(snapshot, journalScope, "reserved");
+    if (priorActiveTask !== null && journalAlreadyRecorded) {
+      const current = await ownershipStore.load();
+      if (!sameJson(current?.activeTask, priorActiveTask)) throw slotError("slot_prepare_claim_invalid");
+      await ownershipStore.save({ ...structuredClone(current), activeTask: expectedActive });
+      return;
+    }
     try {
       await ownershipStore.save({ ...structuredClone(state), activeTask: reserved });
     } catch (error) {
       try {
-        await releaseMatchingClaim(snapshot, new Set(["reserved"]));
+        await restorePriorClaim(snapshot, priorActiveTask, new Set(["reserved"]));
       } catch {
         // A persisted reservation remains recoverable by its journal scope.
       }
@@ -524,7 +554,7 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal, insta
       } catch {
         // Ambiguous journal state must retain its persistent reservation.
       }
-      if (!durable) await releaseMatchingClaim(snapshot, new Set(["reserved"]));
+      if (!durable) await restorePriorClaim(snapshot, priorActiveTask, new Set(["reserved"]));
       throw error;
     }
     const reservedState = await ownershipStore.load();
@@ -561,8 +591,202 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal, insta
     }
   }
 
-  async function openRoot(rootPath) {
-    return validateRootCapability(await fsApi.openVersionRootNoFollow(rootPath));
+  async function openRoot(rootPath, expectedRootIdentity = null) {
+    return validateRootCapability(await fsApi.openVersionRootNoFollow(rootPath, {
+      expectedRootIdentity,
+    }));
+  }
+
+  function preparedRootIdentity(snapshot) {
+    if (snapshot.componentId !== "v2rayn") return null;
+    return snapshot.priorPrepare?.componentRootIdentity ?? null;
+  }
+
+  async function materializePreparedSource(snapshot, heldRoot = null) {
+    if (snapshot.prepareSource === null) return;
+    const root = heldRoot ?? await openRoot(snapshot.rootPath, preparedRootIdentity(snapshot));
+    try {
+      const source = validateOpenedSlot(
+        await root.openSlotNoFollow(snapshot.prepareSource.name),
+        snapshot.prepareSource.name, snapshot.componentId, { allowIncomplete: true },
+      );
+      const fixed = validateOpenedSlot(
+        await root.openSlotNoFollow(snapshot.slots.staging),
+        snapshot.slots.staging, snapshot.componentId,
+      );
+      if (fixed !== null) {
+        if (!sameIdentity(fixed.descriptor.identity, snapshot.prepareSource.identity)
+          || source !== null) throw slotError("slot_prepare_source_conflict");
+        return;
+      }
+      if (!source || !sameIdentity(source.descriptor.identity, snapshot.prepareSource.identity)) {
+        throw slotError("slot_prepare_source_identity_changed");
+      }
+      await root.renameSlotNoReplace(source.descriptor, snapshot.slots.staging);
+    } finally {
+      if (heldRoot === null) await root.close();
+    }
+  }
+
+  async function requireExistingManagedV2Root(state) {
+    const component = state?.components?.v2rayn;
+    if (!isPlainRecord(component) || component.managed !== true) {
+      throw slotError("slot_component_root_occupied");
+    }
+    const rootPath = path.win32.join(authorizedInstallRoot, "V2RayN");
+    const heldRoot = await openRoot(rootPath);
+    try {
+      const current = validateOpenedSlot(
+        await heldRoot.openSlotNoFollow("current"), "current", "v2rayn",
+      );
+      const previous = validateOpenedSlot(
+        await heldRoot.openSlotNoFollow("previous"), "previous", "v2rayn",
+      );
+      requireManagedState(state, "v2rayn", rootPath, current?.evidence ?? null, previous?.evidence ?? null);
+    } finally { await heldRoot.close(); }
+  }
+
+  async function bindTaskUniqueStaging(active, state) {
+    if (typeof fsApi.openInstallerWorkspaceRootNoFollow !== "function"
+      || installRootCapability === null) {
+      throw slotError("slot_staging_create_capability_required");
+    }
+    const workspace = await fsApi.openInstallerWorkspaceRootNoFollow(
+      installRootCapability, { maxRelativePath: 96 },
+    );
+    let staging = null;
+    let componentRoot = null;
+    let componentRootCreated = false;
+    try {
+      if (!workspace?.root
+        || typeof workspace.inspectIssuedChildNoFollow !== "function"
+        || typeof workspace.openDirectoryChildNoFollow !== "function"
+        || typeof workspace.close !== "function") {
+        throw slotError("slot_staging_create_capability_invalid");
+      }
+      if (typeof workspace.describeIssuedDirectoryNoFollow !== "function"
+        || typeof workspace.createDirectoryChildNoFollow !== "function"
+        || typeof workspace.deleteIssuedChildNoFollow !== "function") {
+        throw slotError("slot_staging_create_capability_invalid");
+      }
+      let parent = workspace.root;
+      let componentRootIdentity = null;
+      if (active.componentId === "v2rayn") {
+        componentRoot = await workspace.openDirectoryChildNoFollow(
+          parent, "V2RayN", { role: "anchor" },
+        );
+        if (componentRoot === null) {
+          componentRoot = await workspace.createDirectoryChildNoFollow(
+            parent, "V2RayN", { role: "deletable" },
+          );
+          componentRootCreated = true;
+          const description = await workspace.describeIssuedDirectoryNoFollow(componentRoot);
+          componentRootIdentity = structuredClone(description.identity);
+        } else {
+          await requireExistingManagedV2Root(state);
+        }
+        parent = componentRoot;
+      }
+      staging = await workspace.createDirectoryChildNoFollow(
+        parent, active.stagingName, { role: "deletable" },
+      );
+      const inspected = await workspace.inspectIssuedChildNoFollow(staging);
+      if (inspected?.kind !== "directory" || inspected.empty !== true) {
+        throw slotError("slot_bind_staging_invalid");
+      }
+      const description = await workspace.describeIssuedDirectoryNoFollow(staging);
+      return {
+        workspace,
+        staging,
+        identity: structuredClone(description.identity),
+        componentRoot,
+        componentRootCreated,
+        componentRootIdentity,
+      };
+    } catch (error) {
+      const cleanupErrors = [];
+      if (staging !== null) {
+        try { await workspace.deleteIssuedChildNoFollow(staging); }
+        catch (cleanupError) { cleanupErrors.push(cleanupError); }
+      }
+      if (componentRootCreated && componentRoot !== null) {
+        try { await workspace.deleteIssuedChildNoFollow(componentRoot); }
+        catch (cleanupError) { cleanupErrors.push(cleanupError); }
+      }
+      try { await workspace?.close?.(); }
+      catch (closeError) { cleanupErrors.push(closeError); }
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError([error, ...cleanupErrors], error.message, { cause: error });
+      }
+      throw error;
+    }
+  }
+
+  async function discardUnboundPreparedIntent(active) {
+    if (typeof fsApi.openInstallerWorkspaceRootNoFollow !== "function"
+      || installRootCapability === null) throw slotError("slot_staging_create_capability_required");
+    const workspace = await fsApi.openInstallerWorkspaceRootNoFollow(
+      installRootCapability, { maxRelativePath: 96 },
+    );
+    try {
+      let parent = workspace.root;
+      if (active.componentId === "v2rayn") {
+        const state = await ownershipStore.load();
+        parent = await workspace.openDirectoryChildNoFollow(parent, "V2RayN", { role: "anchor" });
+        if (parent === null) {
+          if (isPlainRecord(state?.components?.v2rayn)
+            && state.components.v2rayn.managed === true) {
+            throw slotError("slot_component_root_missing");
+          }
+          return false;
+        }
+        await requireExistingManagedV2Root(state);
+      }
+      const staging = await workspace.openDirectoryChildNoFollow(
+        parent, active.stagingName, { role: "deletable" },
+      );
+      if (staging !== null) throw slotError("slot_prepare_unbound_occupied");
+      return false;
+    } finally { await workspace.close(); }
+  }
+
+  async function discardBoundPreparedComponentRoot(active) {
+    if (active.componentId !== "v2rayn" || !active.componentRootIdentity) return false;
+    const workspace = await fsApi.openInstallerWorkspaceRootNoFollow(
+      installRootCapability, { maxRelativePath: 96 },
+    );
+    try {
+      const componentRoot = await workspace.openDirectoryChildNoFollow(
+        workspace.root, "V2RayN", { role: "deletable" },
+      );
+      if (componentRoot === null) return false;
+      const description = await workspace.describeIssuedDirectoryNoFollow(componentRoot);
+      if (!sameIdentity(description.identity, active.componentRootIdentity)) {
+        throw slotError("slot_component_root_identity_changed");
+      }
+      const inspected = await workspace.inspectIssuedChildNoFollow(componentRoot);
+      if (inspected.empty !== true) throw slotError("slot_component_root_not_empty");
+      await workspace.deleteIssuedChildNoFollow(componentRoot);
+      return true;
+    } finally { await workspace.close(); }
+  }
+
+  async function boundPreparedComponentRootStatus(active) {
+    if (active.componentId !== "v2rayn" || !active.componentRootIdentity) return "not-applicable";
+    const workspace = await fsApi.openInstallerWorkspaceRootNoFollow(
+      installRootCapability, { maxRelativePath: 96 },
+    );
+    try {
+      const componentRoot = await workspace.openDirectoryChildNoFollow(
+        workspace.root, "V2RayN", { role: "anchor" },
+      );
+      if (componentRoot === null) return "absent";
+      const description = await workspace.describeIssuedDirectoryNoFollow(componentRoot);
+      if (!sameIdentity(description.identity, active.componentRootIdentity)) {
+        return "foreign";
+      }
+      return "exact";
+    } finally { await workspace.close(); }
   }
 
   async function inspectLayout(snapshot, {
@@ -570,7 +794,25 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal, insta
     allowIncompleteRetiring = false,
     allowIncompleteAny = false,
   } = {}) {
-    const root = await openRoot(snapshot.rootPath);
+    let root;
+    try {
+      root = await openRoot(snapshot.rootPath, preparedRootIdentity(snapshot));
+    } catch (error) {
+      const preparedRootMayBeDeleted = snapshot.componentId === "v2rayn"
+        && snapshot.priorPrepare?.componentRootIdentity
+        && snapshot.versions.current === null && snapshot.versions.previous === null;
+      if (preparedRootMayBeDeleted && isMissing(error)) {
+        const componentRootStatus = await boundPreparedComponentRootStatus({
+          componentId: "v2rayn",
+          componentRootIdentity: snapshot.priorPrepare.componentRootIdentity,
+        });
+        if (componentRootStatus === "absent") {
+          return Object.fromEntries(SLOT_KEYS.map((key) => [key, null]));
+        }
+        if (componentRootStatus === "foreign") throw slotError("slot_component_root_identity_changed");
+      }
+      throw error;
+    }
     try {
       const layout = {};
       for (const key of SLOT_KEYS) {
@@ -650,7 +892,7 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal, insta
     if (layout[destinationKey] !== null) throw slotError("slot_destination_occupied");
 
     await journal.record(phaseRecord(snapshot, phase));
-    const root = await openRoot(snapshot.rootPath);
+    const root = await openRoot(snapshot.rootPath, preparedRootIdentity(snapshot));
     try {
       const source = validateOpenedSlot(
         await root.openSlotNoFollow(snapshot.slots[sourceKey]),
@@ -676,7 +918,7 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal, insta
     if (location !== sourceKey) throw slotError("slot_complete_version_missing");
     if (layout[destinationKey] !== null) throw slotError("slot_destination_occupied");
 
-    const root = await openRoot(snapshot.rootPath);
+    const root = await openRoot(snapshot.rootPath, preparedRootIdentity(snapshot));
     try {
       const source = validateOpenedSlot(
         await root.openSlotNoFollow(snapshot.slots[sourceKey]),
@@ -722,7 +964,7 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal, insta
     if (layout[location].evidence !== null) throw slotError("slot_abort_complete_version_protected");
     if (layout.staging !== null) throw slotError("slot_destination_occupied");
 
-    const root = await openRoot(snapshot.rootPath);
+    const root = await openRoot(snapshot.rootPath, preparedRootIdentity(snapshot));
     try {
       const source = validateOpenedSlot(
         await root.openSlotNoFollow(snapshot.slots[location]),
@@ -752,30 +994,51 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal, insta
     const layout = await inspectLayout(snapshot, { allowIncompleteAny: true });
     assertAbortLayout(layout, snapshot);
     const location = locateByIdentity(layout, target);
-    if (location === null) return;
-    const candidate = layout[location];
-    if (candidate.evidence !== null) throw slotError("slot_abort_complete_version_protected");
-    if (location !== "staging") throw slotError("slot_abort_incoming_not_isolated");
-    const root = await openRoot(snapshot.rootPath);
-    try {
-      const opened = validateOpenedSlot(
-        await root.openSlotNoFollow(snapshot.slots.staging),
-        snapshot.slots.staging,
-        snapshot.componentId,
-        { allowIncomplete: true },
-      );
-      if (!opened || opened.evidence !== null
-        || !sameIdentity(opened.descriptor.identity, target.identity)) {
-        throw slotError("slot_abort_target_changed");
+    if (location !== null) {
+      const candidate = layout[location];
+      if (candidate.evidence !== null) throw slotError("slot_abort_complete_version_protected");
+      if (location !== "staging") throw slotError("slot_abort_incoming_not_isolated");
+      const root = await openRoot(snapshot.rootPath, preparedRootIdentity(snapshot));
+      try {
+        const opened = validateOpenedSlot(
+          await root.openSlotNoFollow(snapshot.slots.staging),
+          snapshot.slots.staging,
+          snapshot.componentId,
+          { allowIncomplete: true },
+        );
+        if (!opened || opened.evidence !== null
+          || !sameIdentity(opened.descriptor.identity, target.identity)) {
+          throw slotError("slot_abort_target_changed");
+        }
+        await deleteAuthorizedTree({
+          target: snapshot.paths.staging,
+          authorizedRoot: snapshot.rootPath,
+          rootHandle: root,
+          targetDescriptor: opened.descriptor,
+        });
+      } finally {
+        await root.close();
       }
-      await deleteAuthorizedTree({
-        target: snapshot.paths.staging,
-        authorizedRoot: snapshot.rootPath,
-        rootHandle: root,
-        targetDescriptor: opened.descriptor,
-      });
-    } finally {
-      await root.close();
+    }
+    const preparedComponentRootIdentity = snapshot.priorPrepare?.componentRootIdentity ?? null;
+    if (snapshot.componentId === "v2rayn" && preparedComponentRootIdentity !== null) {
+      const workspace = await fsApi.openInstallerWorkspaceRootNoFollow(
+        installRootCapability, { maxRelativePath: 96 },
+      );
+      try {
+        const componentRoot = await workspace.openDirectoryChildNoFollow(
+          workspace.root, "V2RayN", { role: "deletable" },
+        );
+        if (componentRoot !== null) {
+          const description = await workspace.describeIssuedDirectoryNoFollow(componentRoot);
+          if (!sameIdentity(description.identity, preparedComponentRootIdentity)) {
+            throw slotError("slot_component_root_identity_changed");
+          }
+          const inspected = await workspace.inspectIssuedChildNoFollow(componentRoot);
+          if (inspected.empty !== true) throw slotError("slot_component_root_not_empty");
+          await workspace.deleteIssuedChildNoFollow(componentRoot);
+        }
+      } finally { await workspace.close(); }
     }
   }
 
@@ -818,6 +1081,17 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal, insta
     )) {
       throw slotError("slot_abort_ownership_mismatch");
     }
+    if (preparedRootIdentity(snapshot) !== null) {
+      const componentRootStatus = await boundPreparedComponentRootStatus({
+        componentId: "v2rayn",
+        componentRootIdentity: preparedRootIdentity(snapshot),
+      });
+      if (componentRootStatus !== "absent") {
+        throw slotError(componentRootStatus === "foreign"
+          ? "slot_component_root_identity_changed"
+          : "slot_component_root_reappeared");
+      }
+    }
     const layout = await inspectLayout(snapshot, { allowIncompleteAny: true });
     assertAbortLayout(layout, snapshot);
     const abortTarget = evidenceFromSnapshot(
@@ -855,7 +1129,7 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal, insta
     if (requireRecoveryOwnershipState(state, snapshot) !== "post") {
       throw slotError("slot_retiring_state_changed");
     }
-    const root = await openRoot(snapshot.rootPath);
+    const root = await openRoot(snapshot.rootPath, preparedRootIdentity(snapshot));
     try {
       const current = validateOpenedSlot(
         await root.openSlotNoFollow(snapshot.slots.current), snapshot.slots.current, snapshot.componentId,
@@ -942,18 +1216,40 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal, insta
     const plan = validatePromotionPlan(rawPlan);
     const slots = namesFor(plan.componentId);
     const state = await ownershipStore.load();
-    await requireNoPendingTransaction(state);
-    requireManagerAuthorizedRoot(state, plan.rootPath, plan.componentId, { allowUnclaimed: true });
-    const root = await openRoot(plan.rootPath);
+    const prepareClaim = state?.activeTask ?? null;
+    const pending = await journal.listTransactions();
+    if (!Array.isArray(pending)) throw slotError("slot_journal_invalid");
+    if (pending.length !== 0) throw slotError("slot_pending_transaction");
+    if (prepareClaim !== null && prepareClaim.kind !== "component-prepare") {
+      throw slotError("slot_pending_transaction");
+    }
+    if (prepareClaim !== null && (prepareClaim.kind !== "component-prepare"
+      || prepareClaim.taskId !== plan.taskId || prepareClaim.componentId !== plan.componentId
+      || prepareClaim.version !== plan.version || prepareClaim.leaseScope !== "prepare"
+      || prepareClaim.leaseNonce !== plan.prepareLeaseNonce)) {
+      throw slotError("slot_prepare_claim_invalid");
+    }
+    requireManagerAuthorizedRoot(state, plan.rootPath, plan.componentId, {
+      allowUnclaimed: prepareClaim === null,
+    });
+    const root = await openRoot(plan.rootPath, prepareClaim?.componentRootIdentity ?? null);
     let incoming;
     let current;
     let previous;
     let snapshot;
     try {
+      const prepareSourceName = prepareClaim?.stagingName ?? slots.staging;
       const staging = validateOpenedSlot(
-        await root.openSlotNoFollow(slots.staging), slots.staging, plan.componentId, { allowIncomplete: true },
+        await root.openSlotNoFollow(prepareSourceName), prepareSourceName, plan.componentId, { allowIncomplete: true },
       );
       if (!staging) throw slotError("slot_staging_missing");
+      if (prepareClaim !== null && (!prepareClaim.stagingIdentity
+        || !sameIdentity(staging.descriptor.identity, prepareClaim.stagingIdentity))) {
+        throw slotError("slot_staging_identity_changed");
+      }
+      if (prepareClaim !== null && await root.openSlotNoFollow(slots.staging) !== null) {
+        throw slotError("slot_destination_occupied");
+      }
       const openedCurrent = validateOpenedSlot(
         await root.openSlotNoFollow(slots.current), slots.current, plan.componentId,
       );
@@ -979,16 +1275,34 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal, insta
         ...structuredClone(state),
         activeTask: transactionClaim(descriptor, journalScope, "active"),
       };
-      snapshot = baseRecord({ ...descriptor, incoming, current, previous, state: claimedState });
-      await beginTransaction(state, snapshot);
-      const sealed = validateEvidence(await root.sealPreparedSlotNoFollow(staging.descriptor, {
-        schemaVersion: 2,
-        componentId: plan.componentId,
-        version: plan.version,
-        treeDigest: plan.treeDigest,
-        manifestDigest: plan.manifestDigest,
-      }, plan.verificationReceipt), plan.componentId);
-      if (!evidenceMatches(sealed, incoming)) throw slotError("slot_staging_integrity_mismatch");
+      snapshot = baseRecord({
+        ...descriptor, incoming, current, previous, state: claimedState,
+        priorPrepare: prepareClaim,
+        prepareSource: prepareClaim === null ? null : {
+          name: prepareClaim.stagingName,
+          path: path.win32.join(plan.rootPath, prepareClaim.stagingName),
+          identity: structuredClone(prepareClaim.stagingIdentity),
+        },
+      });
+      if (prepareClaim !== null) {
+        await journal.record(snapshot);
+        const sealed = validateEvidence(await root.sealPreparedSlotNoFollow(staging.descriptor, {
+          schemaVersion: 2, componentId: plan.componentId, version: plan.version,
+          treeDigest: plan.treeDigest, manifestDigest: plan.manifestDigest,
+        }, plan.verificationReceipt), plan.componentId);
+        if (!evidenceMatches(sealed, incoming)) throw slotError("slot_staging_integrity_mismatch");
+        await root.renameSlotNoReplace(staging.descriptor, slots.staging);
+        await beginTransaction(state, snapshot, {
+          priorActiveTask: prepareClaim, journalAlreadyRecorded: true,
+        });
+      } else {
+        await beginTransaction(state, snapshot);
+        const sealed = validateEvidence(await root.sealPreparedSlotNoFollow(staging.descriptor, {
+          schemaVersion: 2, componentId: plan.componentId, version: plan.version,
+          treeDigest: plan.treeDigest, manifestDigest: plan.manifestDigest,
+        }, plan.verificationReceipt), plan.componentId);
+        if (!evidenceMatches(sealed, incoming)) throw slotError("slot_staging_integrity_mismatch");
+      }
     } finally {
       await root.close();
     }
@@ -997,6 +1311,120 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal, insta
     await executeTransaction(snapshot);
     await finishAndClearTransaction(transaction);
     return { componentId: plan.componentId, version: plan.version, rollbackAvailable: current !== null };
+  }
+
+  async function discardPreparedVersion(rawPlan) {
+    if (!hasExactKeys(rawPlan, ["componentId", "taskId", "leaseNonce"])
+      || !["chatgpt", "v2rayn"].includes(rawPlan.componentId)
+      || !TASK_ID.test(rawPlan.taskId ?? "")
+      || typeof rawPlan.leaseNonce !== "string") {
+      throw slotError("slot_discard_plan_invalid");
+    }
+    let state = await ownershipStore.load();
+    let active = state?.activeTask;
+    if (!active || active.kind !== "component-prepare"
+      || active.componentId !== rawPlan.componentId || active.taskId !== rawPlan.taskId
+      || active.leaseNonce !== rawPlan.leaseNonce || active.leaseScope !== "prepare") {
+      throw slotError("slot_discard_claim_invalid");
+    }
+    if (!active.stagingIdentity) return discardUnboundPreparedIntent(active);
+    const pending = await journal.listTransactions();
+    if (!Array.isArray(pending) || pending.length !== 0) throw slotError("slot_pending_transaction");
+    if (authorizedInstallRoot === null) throw slotError("slot_install_root_capability_invalid");
+    const rootPath = rawPlan.componentId === "chatgpt"
+      ? authorizedInstallRoot : path.win32.join(authorizedInstallRoot, "V2RayN");
+    requireManagerAuthorizedRoot(state, rootPath, rawPlan.componentId);
+    if (!PREPARE_NAME.test(active.stagingName ?? "")) throw slotError("slot_prepare_name_invalid");
+    if (active.componentRootIdentity) {
+      const componentRootStatus = await boundPreparedComponentRootStatus(active);
+      if (componentRootStatus === "absent") return true;
+      if (componentRootStatus === "foreign") throw slotError("slot_component_root_identity_changed");
+    }
+    const root = await openRoot(rootPath, active.componentRootIdentity ?? null);
+    let deleted = false;
+    try {
+      const staging = validateOpenedSlot(
+        await root.openSlotNoFollow(active.stagingName), active.stagingName, rawPlan.componentId,
+        { allowIncomplete: true },
+      );
+      if (staging) {
+        if (!sameIdentity(staging.descriptor.identity, active.stagingIdentity)) {
+          throw slotError("slot_discard_identity_changed");
+        }
+        if (staging.evidence !== null && staging.evidence.version !== active.version) {
+          throw slotError("slot_staging_complete_mismatch");
+        }
+        await deleteAuthorizedTree({
+          target: path.win32.join(rootPath, active.stagingName),
+          authorizedRoot: rootPath,
+          rootHandle: root,
+          targetDescriptor: staging.descriptor,
+        });
+        deleted = true;
+      }
+    } finally { await root.close(); }
+    if (active.componentRootIdentity) await discardBoundPreparedComponentRoot(active);
+    return deleted;
+  }
+
+  async function bindPreparedVersion(rawPlan) {
+    if (!hasExactKeys(rawPlan, ["componentId", "taskId", "leaseNonce"])
+      || !["chatgpt", "v2rayn"].includes(rawPlan.componentId)
+      || !TASK_ID.test(rawPlan.taskId ?? "") || typeof rawPlan.leaseNonce !== "string") {
+      throw slotError("slot_bind_plan_invalid");
+    }
+    const state = await ownershipStore.load();
+    const active = state?.activeTask;
+    if (!active || active.kind !== "component-prepare"
+      || active.componentId !== rawPlan.componentId || active.taskId !== rawPlan.taskId
+      || active.leaseNonce !== rawPlan.leaseNonce || active.leaseScope !== "prepare"
+      || !PREPARE_NAME.test(active.stagingName ?? "")
+      || active.stagingIdentity !== undefined) {
+      throw slotError("slot_bind_claim_invalid");
+    }
+    if (authorizedInstallRoot === null) throw slotError("slot_install_root_capability_invalid");
+    const rootPath = rawPlan.componentId === "chatgpt"
+      ? authorizedInstallRoot : path.win32.join(authorizedInstallRoot, "V2RayN");
+    requireManagerAuthorizedRoot(state, rootPath, rawPlan.componentId);
+    const binding = await bindTaskUniqueStaging(active, state);
+    let saved = false;
+    try {
+      const next = structuredClone(state);
+      next.activeTask = {
+        ...next.activeTask,
+        stagingIdentity: binding.identity,
+        ...(binding.componentRootCreated
+          ? { componentRootIdentity: binding.componentRootIdentity }
+          : {}),
+      };
+      const persisted = await ownershipStore.save(next);
+      saved = true;
+      const revalidated = await binding.workspace.describeIssuedDirectoryNoFollow(binding.staging);
+      if (!sameIdentity(revalidated.identity, binding.identity)) throw slotError("slot_staging_identity_changed");
+      if (binding.componentRootCreated) {
+        const rootDescription = await binding.workspace.describeIssuedDirectoryNoFollow(binding.componentRoot);
+        if (!sameIdentity(rootDescription.identity, binding.componentRootIdentity)) {
+          throw slotError("slot_component_root_identity_changed");
+        }
+      }
+      const empty = await binding.workspace.inspectIssuedChildNoFollow(binding.staging);
+      if (empty.empty !== true) throw slotError("slot_bind_staging_invalid");
+      return structuredClone(persisted.activeTask);
+    } catch (error) {
+      if (!saved) {
+        const cleanupErrors = [];
+        try { await binding.workspace.deleteIssuedChildNoFollow(binding.staging); }
+        catch (cleanupError) { cleanupErrors.push(cleanupError); }
+        if (binding.componentRootCreated) {
+          try { await binding.workspace.deleteIssuedChildNoFollow(binding.componentRoot); }
+          catch (cleanupError) { cleanupErrors.push(cleanupError); }
+        }
+        if (cleanupErrors.length > 0) {
+          throw new AggregateError([error, ...cleanupErrors], error.message, { cause: error });
+        }
+      }
+      throw error;
+    } finally { await binding.workspace.close(); }
   }
 
   async function rollbackVersion(componentId) {
@@ -1054,7 +1482,14 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal, insta
     if (!claimMatches(snapshotClaim, snapshot, journalScope, new Set(["active"]))) {
       throw slotError("slot_recovery_claim_invalid");
     }
-    const state = await ownershipStore.load();
+    let state = await ownershipStore.load();
+    if (snapshot.priorPrepare !== null && sameJson(state?.activeTask, snapshot.priorPrepare)) {
+      await materializePreparedSource(snapshot);
+      state = await ownershipStore.save({
+        ...structuredClone(state),
+        activeTask: transactionClaim(snapshot, journalScope, "active"),
+      });
+    }
     if (!claimMatches(state?.activeTask, snapshot, journalScope)) {
       throw slotError("slot_recovery_claim_mismatch");
     }
@@ -1143,6 +1578,12 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal, insta
   return Object.freeze({
     promotePreparedVersion(rawPlan) {
       return ownershipCoordinator.runExclusive(() => promotePreparedVersion(rawPlan));
+    },
+    discardPreparedVersion(rawPlan) {
+      return ownershipCoordinator.runExclusive(() => discardPreparedVersion(rawPlan));
+    },
+    bindPreparedVersion(rawPlan) {
+      return ownershipCoordinator.runExclusive(() => bindPreparedVersion(rawPlan));
     },
     rollbackVersion(componentId) {
       return ownershipCoordinator.runExclusive(() => rollbackVersion(componentId));

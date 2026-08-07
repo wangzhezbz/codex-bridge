@@ -126,11 +126,11 @@ function fakeWorkspaceCapabilities({ expectedInstallRootCapability = null, skill
         const session = {
           root,
           closed: false,
-          issue(pathValue, kind, { sealed = false } = {}) {
+          issue(pathValue, kind, { sealed = false, created = false } = {}) {
             const receipt = Object.freeze(Object.create(null));
             const node = nodes.get(key(pathValue));
             receipts.set(receipt, {
-              path: pathValue, kind, identity: node.identity, state: "issued", sealed,
+              path: pathValue, kind, identity: node.identity, state: "issued", sealed, created,
             });
             return receipt;
           },
@@ -147,7 +147,25 @@ function fakeWorkspaceCapabilities({ expectedInstallRootCapability = null, skill
             if (existing && existing.kind !== "directory") throw Object.assign(new Error("windows_directory_required"), { code: "windows_directory_required" });
             if (existing && requireEmpty && !existing.empty) throw Object.assign(new Error("workspace_directory_not_empty"), { code: "workspace_directory_not_empty" });
             if (!existing) add(childPath, "directory", { empty: true });
-            return this.issue(childPath, "directory");
+            return this.issue(childPath, "directory", { created: !existing });
+          },
+          async createDirectoryChildNoFollow(parentReceipt, name) {
+            const parent = this.require(parentReceipt);
+            const childPath = path.win32.join(parent.path, name);
+            calls.push(["create-directory", parent.path, name]);
+            if (nodes.has(key(childPath))) {
+              throw Object.assign(new Error("entry_exists"), { code: "entry_exists" });
+            }
+            add(childPath, "directory", { empty: true });
+            return this.issue(childPath, "directory", { created: true });
+          },
+          async describeIssuedDirectoryNoFollow(receipt) {
+            const record = this.require(receipt);
+            return {
+              path: record.path,
+              identity: { volumeSerial: "test", fileId: String(record.identity) },
+              created: record.created === true,
+            };
           },
           async createFileChildNoFollow(parentReceipt, name) {
             const parent = this.require(parentReceipt);
@@ -356,6 +374,7 @@ test("workspace derives deterministic children and rejects renderer-controlled i
     "prepareDownloadFile",
     "prepareSkillDownloadFile",
     "prepareSkillStaging",
+    "releaseComponentPackage",
     "sealSkillStaging",
   ].sort().join(","));
 });
@@ -535,6 +554,8 @@ test("download preparation issues one exact adjacent part and promotes it by hel
   });
   const promoted = await download.promotePartNoReplace(verification);
   assert.equal(promoted.path, download.path);
+  assert.equal(promoted.size, download.size);
+  assert.equal(promoted.sha256, download.sha256);
   assert.equal(promoted.packageProof !== null && typeof promoted.packageProof === "object", true);
   assert.equal(fake.nodes.has(download.partPath.toLowerCase()), false);
   assert.equal(fake.nodes.has(download.path.toLowerCase()), true);
@@ -563,6 +584,85 @@ test("download preparation issues one exact adjacent part and promotes it by hel
   await workspace.cleanupComponentPackage(download);
   assert.equal(fake.nodes.has(download.path.toLowerCase()), false);
   await assert.rejects(workspace.cleanupComponentPackage(download), /workspace_receipt_consumed/u);
+});
+
+test("a promoted installer can be released close-only while retaining the exact file and clearing pending authority", async () => {
+  const fake = fakeWorkspaceCapabilities();
+  const { workspace } = await createWorkspace(fake);
+  const request = downloadRequest("git", "2.50.0", ".exe");
+  const download = await workspace.prepareDownloadFile(request);
+  const verification = await workspace.downloadPrepared(download, {
+    asset: { url: "https://shanhaiyouling.com/codexbridge-test/packages/git.exe", ...packageMetadata() },
+  });
+  const promoted = await download.promotePartNoReplace(verification);
+
+  await workspace.releaseComponentPackage(promoted.downloadRecord);
+  assert.equal(fake.nodes.has(promoted.path.toLowerCase()), true);
+  assert.equal([...fake.sessions].every((session) => session.closed), true);
+  await assert.rejects(
+    workspace.releaseComponentPackage(promoted.downloadRecord),
+    /workspace_receipt_consumed/u,
+  );
+
+  fake.nodes.delete(promoted.path.toLowerCase());
+  const repeated = await workspace.prepareDownloadFile(request);
+  assert.equal(repeated.path, promoted.path);
+  await workspace.cleanupAbandonedPrepare(repeated);
+});
+
+test("a rebuilt workspace adopts only the same exact signed-catalog package and preserves a foreign collision", async () => {
+  const fake = fakeWorkspaceCapabilities();
+  const request = downloadRequest("git", "2.50.0", ".exe");
+  const firstWorkspace = (await createWorkspace(fake)).workspace;
+  const first = await firstWorkspace.prepareDownloadFile(request);
+  const firstVerification = await firstWorkspace.downloadPrepared(first, {
+    asset: { url: "https://shanhaiyouling.com/codexbridge-test/packages/git.exe", ...packageMetadata() },
+  });
+  const firstPromoted = await first.promotePartNoReplace(firstVerification);
+  await firstWorkspace.releaseComponentPackage(firstPromoted.downloadRecord);
+
+  const restarted = (await createWorkspace(fake)).workspace;
+  const adopted = await restarted.prepareDownloadFile(request);
+  const adoptedVerification = await restarted.downloadPrepared(adopted, {
+    asset: { url: "https://shanhaiyouling.com/codexbridge-test/packages/git.exe", ...packageMetadata() },
+  });
+  const adoptedPromoted = await adopted.promotePartNoReplace(adoptedVerification);
+  assert.equal(adoptedPromoted.path, firstPromoted.path);
+  assert.equal(fake.calls.filter(([operation]) => operation === "rename").length, 1);
+  await restarted.releaseComponentPackage(adoptedPromoted.downloadRecord);
+
+  const foreign = Buffer.from(PACKAGE);
+  foreign[0] ^= 0xff;
+  const node = fake.nodes.get(firstPromoted.path.toLowerCase());
+  node.data = foreign;
+  node.size = foreign.length;
+  const third = (await createWorkspace(fake)).workspace;
+  const rejected = await third.prepareDownloadFile(request);
+  await assert.rejects(third.downloadPrepared(rejected, {
+    asset: { url: "https://shanhaiyouling.com/codexbridge-test/packages/git.exe", ...packageMetadata() },
+  }), /workspace_file_hash_mismatch/u);
+  await third.cleanupAbandonedPrepare(rejected);
+  assert.equal(fake.nodes.get(firstPromoted.path.toLowerCase()).data.equals(foreign), true);
+});
+
+test("a promoted package proof has a synchronous single-consumer claim across concurrent verification", async () => {
+  const fake = fakeWorkspaceCapabilities();
+  const { workspace } = await createWorkspace(fake);
+  const request = downloadRequest("chatgpt", "1.2.3", ".zip");
+  const download = await workspace.prepareDownloadFile(request);
+  const verification = await workspace.downloadPrepared(download, {
+    asset: { url: "https://shanhaiyouling.com/codexbridge-test/packages/chatgpt.zip", ...packageMetadata() },
+  });
+  const promoted = await download.promotePartNoReplace(verification);
+  const expected = { path: promoted.path, size: request.size, sha256: request.sha256 };
+  const settled = await Promise.allSettled([
+    workspace.consumePromotedPackageProof(promoted.packageProof, expected),
+    workspace.consumePromotedPackageProof(promoted.packageProof, expected),
+  ]);
+  assert.equal(settled.filter(({ status }) => status === "fulfilled").length, 1);
+  const rejectedResult = settled.find(({ status }) => status === "rejected");
+  assert.match(rejectedResult.reason.message, /workspace_package_proof_consumed/u);
+  await workspace.cleanupComponentPackage(promoted.downloadRecord);
 });
 
 test("download promotion rejects an identity replacement after manager verification and never publishes it", async () => {
@@ -651,7 +751,7 @@ test("component and Skill staging reuse only empty deterministic directories and
   fake.add("D:\\CBApps\\staging\\task-busy\\chatgpt.prepare", "directory", { empty: false });
   await assert.rejects(
     workspace.prepareComponentStaging({ taskId: "busy", componentId: "chatgpt" }),
-    /workspace_directory_not_empty/u,
+    /entry_exists/u,
   );
 });
 
@@ -668,14 +768,33 @@ test("concurrent creation converges on the same exact empty staging path without
   await workspace.cleanupAbandonedPrepare(left);
 });
 
+test("live Skill cleanup removes its exact new leaf but preserves a pre-existing task parent", async () => {
+  const fake = fakeWorkspaceCapabilities();
+  const taskPath = "D:\\CBApps\\staging\\task-shared-parent";
+  fake.add("D:\\CBApps\\staging", "directory", { empty: false });
+  fake.add(taskPath, "directory", { empty: true });
+  const originalIdentity = fake.nodes.get(taskPath.toLowerCase()).identity;
+  const { workspace } = await createWorkspace(fake);
+  const skill = await workspace.prepareSkillStaging({
+    taskId: "shared-parent", skillId: "documents",
+  });
+  await workspace.cleanupAbandonedPrepare(skill);
+  assert.equal(fake.nodes.has(skill.path.toLowerCase()), false);
+  assert.equal(fake.nodes.get(taskPath.toLowerCase()).identity, originalIdentity);
+});
+
 test("package collision and foreign cleanup fail closed without deleting the occupied child", async () => {
   const fake = fakeWorkspaceCapabilities();
   fake.add("D:\\CBApps\\downloads", "directory", { empty: false });
   fake.add("D:\\CBApps\\downloads\\git-2.50.0.exe", "file", { size: 99 });
   const { workspace } = await createWorkspace(fake);
+  const request = downloadRequest("git", "2.50.0", ".exe");
+  const occupied = await workspace.prepareDownloadFile(request);
   await assert.rejects(
-    workspace.prepareDownloadFile(downloadRequest("git", "2.50.0", ".exe")),
-    /workspace_package_collision/u,
+    workspace.downloadPrepared(occupied, {
+      asset: { url: "https://example.test/git.exe", size: request.size, sha256: request.sha256 },
+    }),
+    /workspace_existing_package_mismatch/u,
   );
   assert.equal(fake.nodes.has("d:\\cbapps\\downloads\\git-2.50.0.exe"), true);
   await assert.rejects(workspace.cleanupComponentPackage(Object.freeze(Object.create(null))), /workspace_receipt_invalid/u);
@@ -694,6 +813,30 @@ test("workspace revalidates the exact install-root capability before cleanup and
   await assert.rejects(workspace.cleanupAbandonedPrepare(prepared), /identity_changed/u);
   assert.equal(fake.nodes.has(prepared.path.toLowerCase()), true);
   assert.equal(fake.calls.some(([operation]) => operation === "delete"), false);
+});
+
+test("Range fallback revalidates the install root before truncating the held partial", async () => {
+  let rootIdentity = 10;
+  const installRoot = await installRootCapability({ getIdentity: () => rootIdentity });
+  const fake = fakeWorkspaceCapabilities({ expectedInstallRootCapability: installRoot });
+  const manager = createDownloadManager({
+    async fetchImpl() {
+      rootIdentity = 11;
+      return new Response(PACKAGE, { status: 200 });
+    },
+    retryPolicy: { maxAttempts: 1, delayMs: 0 },
+  });
+  const { workspace } = await createWorkspace(fake, installRoot, manager);
+  const download = await workspace.prepareDownloadFile(downloadRequest("chatgpt", "1.0.0", ".zip"));
+  const part = fake.nodes.get(download.partPath.toLowerCase());
+  part.data = PACKAGE.subarray(0, 7);
+  part.size = part.data.length;
+  const entry = TRUSTED_CATALOG.getComponent("chatgpt");
+  await assert.rejects(workspace.downloadPrepared(download, {
+    asset: { url: entry.assetUrl, size: entry.size, sha256: entry.sha256 },
+  }), /identity_changed/u);
+  assert.equal(fake.calls.some(([operation]) => operation === "reset-file"), false);
+  assert.deepEqual(part.data, PACKAGE.subarray(0, 7));
 });
 
 test("download rename collision consumes verification and requires a fresh exact verification before retry", async () => {

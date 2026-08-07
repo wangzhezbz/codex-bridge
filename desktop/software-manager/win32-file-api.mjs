@@ -4,6 +4,7 @@ import path from "node:path";
 const GENERIC_READ = 0x80000000;
 const GENERIC_WRITE = 0x40000000;
 const DELETE = 0x00010000;
+const SYNCHRONIZE = 0x00100000;
 const FILE_SHARE_READ = 0x1;
 const FILE_SHARE_WRITE = 0x2;
 const FILE_SHARE_DELETE = 0x4;
@@ -22,6 +23,11 @@ const FILE_ID_BOTH_DIRECTORY_INFO = 10;
 const FILE_ID_BOTH_DIRECTORY_RESTART_INFO = 11;
 const FILE_DISPOSITION_INFO = 4;
 const FILE_BEGIN = 0;
+const FILE_CREATE = 2;
+const FILE_DIRECTORY_FILE = 0x00000001;
+const FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020;
+const FILE_OPEN_REPARSE_POINT = 0x00200000;
+const OBJ_CASE_INSENSITIVE = 0x00000040;
 const MAX_NATIVE_PATH_CHARS = 32_768;
 const NATIVE_ENUM_BUFFER_BYTES = 64 * 1_024;
 const MAX_NATIVE_READ_CHUNK_BYTES = 1_024 * 1_024;
@@ -184,12 +190,17 @@ export function createWin32FileApi({ platform = process.platform, koffi } = {}) 
     return handle;
   }
 
-  function assertNoAlternateDataStreams(handle) {
+  function assertNoAlternateDataStreams(handle, { directory = false } = {}) {
     const output = Buffer.alloc(NATIVE_ENUM_BUFFER_BYTES);
-    requireSuccess(
-      GetFileInformationByHandleEx(handle, FILE_STREAM_INFO, output, output.length),
-      "GetFileInformationByHandleEx(FileStreamInfo)",
-    );
+    const result = GetFileInformationByHandleEx(handle, FILE_STREAM_INFO, output, output.length);
+    if (!result) {
+      const nativeCode = Number(GetLastError());
+      if (directory && nativeCode === 38) return;
+      throw win32Error(
+        mapNativeCode(nativeCode), "GetFileInformationByHandleEx(FileStreamInfo)", nativeCode,
+      );
+    }
+    if (directory) throw win32Error("windows_alternate_data_stream_rejected");
     let offset = 0;
     for (;;) {
       if (offset + 24 > output.length) throw win32Error("windows_stream_information_invalid");
@@ -364,6 +375,76 @@ export function createWin32FileApi({ platform = process.platform, koffi } = {}) 
     requireSuccess(CreateDirectoryW(toExtendedPath(exactPath), null), "CreateDirectoryW");
   }
 
+  let NtCreateFile = null;
+  let UNICODE_STRING = null;
+  let OBJECT_ATTRIBUTES = null;
+  let IO_STATUS_BLOCK = null;
+  if (typeof ffi.struct === "function" && typeof ffi.pointer === "function"
+    && typeof ffi.out === "function" && typeof ffi.inout === "function") {
+    UNICODE_STRING = ffi.struct({ Length: "uint16_t", MaximumLength: "uint16_t", Buffer: "void *" });
+    OBJECT_ATTRIBUTES = ffi.struct({
+      Length: "uint32_t", RootDirectory: "intptr_t", ObjectName: ffi.pointer(UNICODE_STRING),
+      Attributes: "uint32_t", SecurityDescriptor: "void *", SecurityQualityOfService: "void *",
+    });
+    IO_STATUS_BLOCK = ffi.struct({ Status: "intptr_t", Information: "uintptr_t" });
+    NtCreateFile = ntdll.func("__stdcall", "NtCreateFile", "int32_t", [
+      ffi.out(ffi.pointer("intptr_t")), "uint32_t", ffi.pointer(OBJECT_ATTRIBUTES),
+      ffi.inout(ffi.pointer(IO_STATUS_BLOCK)), "void *", "uint32_t", "uint32_t",
+      "uint32_t", "uint32_t", "void *", "uint32_t",
+    ]);
+  }
+
+  function createDirectoryAtNoFollow(parentHandle, name, { access, share } = {}) {
+    if (NtCreateFile === null) throw win32Error("native_primitive_unsupported", "NtCreateFile");
+    if (typeof name !== "string" || name.length === 0 || name === "." || name === ".."
+      || /[\\/:\0]/u.test(name) || name.normalize("NFC") !== name) {
+      throw win32Error("windows_child_name_invalid");
+    }
+    const nameBytes = Buffer.from(`${name}\0`, "utf16le");
+    if (nameBytes.length - 2 > 65_534) throw win32Error("windows_child_name_invalid");
+    const unicodeName = {
+      Length: nameBytes.length - 2, MaximumLength: nameBytes.length, Buffer: nameBytes,
+    };
+    const objectAttributes = {
+      Length: ffi.sizeof(OBJECT_ATTRIBUTES), RootDirectory: handleValue(parentHandle),
+      ObjectName: unicodeName, Attributes: OBJ_CASE_INSENSITIVE,
+      SecurityDescriptor: null, SecurityQualityOfService: null,
+    };
+    const ioStatus = { Status: 0, Information: 0 };
+    const output = [null];
+    const accessMask = (maskFrom(access, {
+      read: 0x00000001, write: 0x00000002, attributes: 0x00000080, traverse: 0x00000020, delete: DELETE,
+    }, "windows_access_invalid") | SYNCHRONIZE) >>> 0;
+    const shareMask = maskFrom(share, {
+      read: FILE_SHARE_READ, write: FILE_SHARE_WRITE, delete: FILE_SHARE_DELETE,
+    }, "windows_share_invalid");
+    const status = NtCreateFile(
+      output, accessMask, objectAttributes, ioStatus, null, FILE_ATTRIBUTE_NORMAL,
+      shareMask, FILE_CREATE,
+      FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+      null, 0,
+    );
+    requireNtSuccess(status, "NtCreateFile");
+    let candidate = null;
+    try {
+      candidate = handleValue(output[0]);
+      if (candidate === 0n || candidate === -1n) {
+        candidate = null;
+        throw win32Error("windows_handle_invalid", "NtCreateFile");
+      }
+      return candidate;
+    }
+    catch (error) {
+      if (candidate !== null) {
+        try { requireSuccess(CloseHandle(candidate), "CloseHandle"); }
+        catch (closeError) {
+          throw new AggregateError([error, closeError], error.message, { cause: error });
+        }
+      }
+      throw error;
+    }
+  }
+
   function renameByHandle(handle, rootHandle, name, { replace = false } = {}) {
     if (replace) throw win32Error("windows_replace_rename_rejected");
     if (typeof name !== "string" || name.length === 0 || name === "." || name === ".."
@@ -428,6 +509,7 @@ export function createWin32FileApi({ platform = process.platform, koffi } = {}) 
     appendFile: writeChunk,
     flushFile(handle) { requireSuccess(FlushFileBuffers(handle), "FlushFileBuffers"); },
     createDirectory,
+    createDirectoryAtNoFollow,
     renameByHandle,
     deleteByHandle,
     closeHandle,

@@ -220,17 +220,20 @@ function componentFixture({ files = fakeFiles(), version = "2.0.0", execFile } =
 }
 
 test("staging verification consumes the sealed package proof and derives every path from the trusted catalog", async () => {
+  const stagingName = `.codexbridge-prepare-${"a".repeat(32)}`;
+  const stagingRoot = `D:\\CBApps\\${stagingName}`;
   const files = fakeFiles({
-    "D:\\CBApps\\ct\\ChatGPT.exe": {},
-    "D:\\CBApps\\ct\\resources\\app.asar": {},
+    [`${stagingRoot}\\ChatGPT.exe`]: {},
+    [`${stagingRoot}\\resources\\app.asar`]: {},
   });
   const fixture = componentFixture({ files });
   const result = await fixture.service.verifyComponent({
     componentId: "chatgpt",
     phase: "staging",
-    rootPath: "D:\\CBApps\\ct",
-    entrypointPath: "D:\\CBApps\\ct\\ChatGPT.exe",
-    requiredFiles: ["D:\\CBApps\\ct\\ChatGPT.exe", "D:\\CBApps\\ct\\resources\\app.asar"],
+    stagingName,
+    rootPath: stagingRoot,
+    entrypointPath: `${stagingRoot}\\ChatGPT.exe`,
+    requiredFiles: [`${stagingRoot}\\ChatGPT.exe`, `${stagingRoot}\\resources\\app.asar`],
     expectedVersion: "2.0.0",
     expectedPackageSha256: HASH,
     packageProof: PACKAGE_PROOF,
@@ -240,8 +243,8 @@ test("staging verification consumes the sealed package proof and derives every p
     path: "D:\\CBApps\\downloads\\chatgpt-2.0.0.zip", size: 123, sha256: HASH,
   }]);
   assert.deepEqual(files.calls.filter(([kind]) => kind === "pin").map(([, value]) => value), [
-    "D:\\CBApps\\ct\\ChatGPT.exe",
-    "D:\\CBApps\\ct\\resources\\app.asar",
+    `${stagingRoot}\\ChatGPT.exe`,
+    `${stagingRoot}\\resources\\app.asar`,
   ]);
 });
 
@@ -249,7 +252,8 @@ test("component verification rejects caller-substituted catalog files before con
   const files = fakeFiles({ "D:\\CBApps\\ct\\evil.exe": {} });
   const fixture = componentFixture({ files });
   await assert.rejects(fixture.service.verifyComponent({
-    componentId: "chatgpt", phase: "staging", rootPath: "D:\\CBApps\\ct",
+    componentId: "chatgpt", phase: "staging", stagingName: `.codexbridge-prepare-${"b".repeat(32)}`,
+    rootPath: "D:\\CBApps\\ct",
     entrypointPath: "D:\\CBApps\\ct\\evil.exe", requiredFiles: ["D:\\CBApps\\ct\\evil.exe"],
     expectedVersion: "2.0.0", expectedPackageSha256: HASH, packageProof: PACKAGE_PROOF,
   }), /component_catalog_path_mismatch/u);

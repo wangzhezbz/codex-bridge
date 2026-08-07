@@ -123,7 +123,20 @@ function stateSkillVersion(state, skillId) {
 }
 
 function errorMessage(error) {
-  return typeof error?.code === "string" ? error.code : "component_operation_failed";
+  if (typeof error?.code === "string") return error.code;
+  if (typeof error?.message === "string" && error.message.length > 0) return error.message;
+  return "component_operation_failed";
+}
+
+function combineOperationErrors(primaryError, cleanupErrors, fallbackCode) {
+  if (cleanupErrors.length === 0) return primaryError;
+  const errors = [primaryError, ...cleanupErrors].filter(Boolean);
+  if (errors.length === 1) return errors[0];
+  const combined = new AggregateError(errors, primaryError?.message ?? fallbackCode, {
+    cause: primaryError ?? cleanupErrors[0],
+  });
+  combined.code = typeof primaryError?.code === "string" ? primaryError.code : fallbackCode;
+  return combined;
 }
 
 function exactDiscovery(left, right) {
@@ -219,6 +232,7 @@ async function recoverSkillOwnershipState({
     const inspected = inspectedRaw?.kind === "absent"
       ? validatePreviousSkillEvidence(inspectedRaw) : validateSkillTreeEvidence(inspectedRaw);
     if (task.phase === "reserved" && sameSkillEvidence(inspected, previousEvidence)) {
+      next.installRoot ??= task.installRoot;
       next.activeTask = null;
       next.lastTask = { taskId: task.taskId, componentId: task.skillId, action: "skill-replace-aborted" };
       return saveState(next);
@@ -369,6 +383,8 @@ export function createComponentAdapters({
   const download = requireMethod(downloader, "download", "component_downloader_required");
   const extractArchive = requireMethod(archiveService, "extractArchive", "component_archive_required");
   const promotePreparedVersion = requireMethod(versionSlots, "promotePreparedVersion", "component_slots_required");
+  const discardPreparedVersion = requireMethod(versionSlots, "discardPreparedVersion", "component_slots_required");
+  const bindPreparedVersion = requireMethod(versionSlots, "bindPreparedVersion", "component_slots_required");
   const rollbackVersion = requireMethod(versionSlots, "rollbackVersion", "component_slots_required");
   let ownershipCoordinator;
   try { ownershipCoordinator = getOwnershipCoordinator(ownershipStore); } catch (error) {
@@ -397,6 +413,7 @@ export function createComponentAdapters({
   const prepareSkillStaging = requireMethod(installerWorkspace, "prepareSkillStaging", "skill_workspace_required");
   const cleanupAbandonedPrepare = requireMethod(installerWorkspace, "cleanupAbandonedPrepare", "skill_workspace_required");
   const cleanupSkillPackage = requireMethod(installerWorkspace, "cleanupComponentPackage", "skill_workspace_required");
+  const releaseComponentPackage = requireMethod(installerWorkspace, "releaseComponentPackage", "component_workspace_required");
   const planShortcut = requireMethod(windowsHost, "planShortcut", "shortcut_plan_capability_required");
   const createShortcut = requireMethod(windowsHost, "createShortcut", "shortcut_create_capability_required");
   const inspectRecordedShortcut = requireMethod(windowsHost, "inspectRecordedShortcut", "shortcut_recovery_capability_required");
@@ -430,6 +447,10 @@ export function createComponentAdapters({
         const current = await recover();
         if (current.activeTask !== null) throw adapterError("component_pending_transaction");
         const reserved = structuredClone(current);
+        if (reserved.installRoot !== null && reserved.installRoot !== installRoot) {
+          throw adapterError("component_install_root_changed");
+        }
+        reserved.installRoot = installRoot;
         reserved.activeTask = structuredClone(claim);
         return saveState(reserved);
       });
@@ -440,7 +461,9 @@ export function createComponentAdapters({
     }
   }
 
-  async function clearPrepareClaim(claim, lease, { releaseLease = true } = {}) {
+  async function clearPrepareClaim(claim, lease, {
+    releaseLease = true, retainInstallRoot = false,
+  } = {}) {
     const key = JSON.stringify(claim);
     try {
       return await runOwnership(async () => {
@@ -450,6 +473,10 @@ export function createComponentAdapters({
         }
         const cleared = structuredClone(state);
         cleared.activeTask = null;
+        if (!retainInstallRoot
+          && Object.keys(cleared.components).length === 0 && Object.keys(cleared.skills).length === 0) {
+          cleared.installRoot = null;
+        }
         return saveState(cleared);
       });
     } finally {
@@ -471,6 +498,12 @@ export function createComponentAdapters({
     const lease = await acquireOperationLease({ nonce: task.leaseNonce, scope: task.leaseScope, wait: false });
     if (lease === null) return state;
     try {
+      if (task.kind === "component-prepare" && ["chatgpt", "v2rayn"].includes(task.componentId)
+        && typeof task.stagingName === "string") {
+        await discardPreparedVersion({
+          componentId: task.componentId, taskId: task.taskId, leaseNonce: task.leaseNonce,
+        });
+      }
       const recovered = structuredClone(state);
       recovered.activeTask = null;
       recovered.lastTask = {
@@ -478,10 +511,25 @@ export function createComponentAdapters({
         componentId: task.kind === "skill-prepare" ? task.skillId : task.componentId,
         action: "prepare-aborted",
       };
+      if (Object.keys(recovered.components ?? {}).length === 0
+        && Object.keys(recovered.skills ?? {}).length === 0) {
+        recovered.installRoot = null;
+      }
       return saveState(recovered);
     } finally {
       await lease.release();
     }
+  }
+
+  async function assertPrepareClaim(claim) {
+    return runOwnership(async () => {
+      const current = assertStateForManaged(await loadState());
+      if (JSON.stringify(current.activeTask) !== JSON.stringify(claim)
+        || current.installRoot !== installRoot) {
+        throw adapterError("component_prepare_claim_changed");
+      }
+      return current;
+    });
   }
 
   async function reserveGitExecutionClaim(recover, rawClaim, validateState = async () => {}) {
@@ -505,6 +553,30 @@ export function createComponentAdapters({
     }
   }
 
+  async function transitionPreparedGitExecutionClaim(prepared, rawClaim, validateState = async () => {}) {
+    const leaseNonce = randomBytes(16).toString("hex");
+    const leaseScope = "git-execute";
+    const lease = await acquireOperationLease({ nonce: leaseNonce, scope: leaseScope, wait: true });
+    const claim = { ...structuredClone(rawClaim), leaseScope, leaseNonce };
+    try {
+      const state = await runOwnership(async () => {
+        const current = assertStateForManaged(await loadState());
+        if (JSON.stringify(current.activeTask) !== JSON.stringify(prepared.claim)
+          || current.installRoot !== installRoot) {
+          throw adapterError("component_prepare_claim_changed");
+        }
+        await validateState(current);
+        const reserved = structuredClone(current);
+        reserved.activeTask = structuredClone(claim);
+        return saveState(reserved);
+      });
+      return { claim, lease, state };
+    } catch (error) {
+      await lease.release().catch(() => {});
+      throw error;
+    }
+  }
+
   async function clearGitExecutionClaim(claim) {
     return runOwnership(async () => {
       const state = assertStateForManaged(await loadState());
@@ -514,6 +586,9 @@ export function createComponentAdapters({
       const cleared = structuredClone(state);
       cleared.activeTask = null;
       cleared.lastTask = { taskId: claim.taskId, componentId: "git", action: claim.kind };
+      if (Object.keys(cleared.components).length === 0 && Object.keys(cleared.skills).length === 0) {
+        cleared.installRoot = null;
+      }
       return saveState(cleared);
     });
   }
@@ -562,10 +637,13 @@ export function createComponentAdapters({
     return entry;
   }
 
-  function componentPeakRelativePath(componentId, entry) {
+  function componentPeakRelativePath(componentId, entry, stagingName = null) {
     const destinations = componentId === "git"
       ? [path.win32.join("Git", entry.entrypoint), path.win32.join("downloads", `git-${entry.version}.exe`)]
-      : [path.win32.relative(installRoot, slotRoot(installRoot, componentId, "staging"))];
+      : [
+        componentId === "chatgpt" ? stagingName : path.win32.join("V2RayN", stagingName),
+        componentId === "chatgpt" ? `${stagingName}.intent` : path.win32.join("V2RayN", `${stagingName}.intent`),
+      ];
     return Math.max(...destinations.map((prefix) => (
       prefix.length + (componentId === "git" ? 0 : 1 + entry.maxRelativePathLength)
     )));
@@ -684,21 +762,28 @@ export function createComponentAdapters({
     const action = "prepare";
     let claim = null;
     let operationLease = null;
+    let downloadRecord = null;
+    let stagingBound = false;
     try {
       const context = rejectForbiddenContext(rawContext);
       const taskId = requireTaskId(context.taskId);
       const entry = trustedComponent(componentId);
-      claim = { kind: "component-prepare", taskId, componentId, version: entry.version };
+      claim = {
+        kind: "component-prepare", taskId, componentId, version: entry.version,
+        stagingName: `.codexbridge-prepare-${randomBytes(16).toString("hex")}`,
+      };
       const reservation = await reservePrepareClaim(recoverComponentUninstall, claim);
       ({ claim, lease: operationLease } = reservation);
       const { state } = reservation;
       const before = managedRecord(state, componentId)?.version ?? null;
-      const maxRelativePath = componentPeakRelativePath(componentId, entry);
+      const maxRelativePath = componentPeakRelativePath(componentId, entry, claim.stagingName);
       await revalidateInstallRootCapability(installRootCapability, {
         maxRelativePath,
       });
       const rootPath = componentRoot(installRoot, componentId);
-      const staging = slotRoot(installRoot, componentId, "staging");
+      stagingBound = true;
+      claim = await bindPreparedVersion({ componentId, taskId, leaseNonce: claim.leaseNonce });
+      const staging = path.win32.join(rootPath, claim.stagingName);
       const persistentConfig = componentId === "v2rayn"
         ? await preparePersistentDirectory({ componentId, rootPath: path.win32.join(installRoot, "V2RayN-Data") })
         : null;
@@ -709,38 +794,65 @@ export function createComponentAdapters({
       });
       if (!isRecord(downloaded) || downloaded.path !== archivePath
         || downloaded.size !== entry.size || downloaded.sha256 !== entry.sha256
-        || downloaded.packageProof === null || typeof downloaded.packageProof !== "object") {
+        || downloaded.packageProof === null || typeof downloaded.packageProof !== "object"
+        || downloaded.downloadRecord === null || typeof downloaded.downloadRecord !== "object") {
         throw adapterError("component_download_evidence_invalid");
       }
+      downloadRecord = downloaded.downloadRecord;
       await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
       const receipt = validateReceipt(await extractArchive({
         format: entry.format, archivePath, destination: staging, signal: context.signal,
+        destinationIdentity: claim.stagingIdentity,
         verification: { componentId, version: entry.version },
       }), "component_verification_receipt_invalid");
       await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
       await verifyComponent({
         componentId,
         phase: "staging",
+        stagingName: claim.stagingName,
         rootPath: staging,
-        entrypointPath: componentEntrypoint(installRoot, componentId, entry, "staging"),
+        entrypointPath: relativeFile(staging, entry.entrypoint),
         requiredFiles: entry.requiredFiles.map((file) => relativeFile(staging, file)),
         expectedVersion: entry.version,
         expectedPackageSha256: entry.sha256,
         packageProof: downloaded.packageProof,
       });
+      await cleanupSkillPackage(downloadRecord);
+      downloadRecord = null;
       await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
-      let cleared;
-      try { cleared = await clearPrepareClaim(claim, operationLease); } finally { claim = null; operationLease = null; }
+      await assertPrepareClaim(claim);
       preparedComponents.set(`${componentId}\0${taskId}`, Object.freeze({
-        taskId, componentId, before, entry, rootPath, persistentConfig, ...receipt,
+        taskId, componentId, before, entry, rootPath, persistentConfig,
+        claim: structuredClone(claim), operationLease, ...receipt,
       }));
+      claim = null;
+      operationLease = null;
       return result(componentId, action, "succeeded", {
         versionBefore: before, versionAfter: entry.version, message: "component_prepared",
-        rollbackAvailable: stateRollbackAvailable(cleared, componentId),
+        rollbackAvailable: stateRollbackAvailable(state, componentId),
       });
     } catch (error) {
-      if (claim) await clearPrepareClaim(claim, operationLease).catch(() => {});
-      return failed(componentId, action, error);
+      const cleanupErrors = [];
+      if (downloadRecord) {
+        try { await cleanupSkillPackage(downloadRecord); downloadRecord = null; }
+        catch (cleanupError) { cleanupErrors.push(cleanupError); }
+      }
+      if (claim && stagingBound) {
+        try {
+          await discardPreparedVersion({ componentId, taskId: claim.taskId, leaseNonce: claim.leaseNonce });
+          stagingBound = false;
+        } catch (cleanupError) { cleanupErrors.push(cleanupError); }
+      }
+      if (claim && cleanupErrors.length === 0) {
+        try { await clearPrepareClaim(claim, operationLease); }
+        catch (cleanupError) { cleanupErrors.push(cleanupError); }
+        finally { claim = null; operationLease = null; }
+      } else if (operationLease) {
+        try { await operationLease.release(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
+        operationLease = null;
+      }
+      return failed(componentId, action,
+        combineOperationErrors(error, cleanupErrors, "component_prepare_cleanup_failed"));
     }
   }
 
@@ -749,11 +861,12 @@ export function createComponentAdapters({
     let before = null;
     let wasRunning = false;
     let oldEntrypoint = null;
+    let prepared = null;
     try {
       const context = rejectForbiddenContext(rawContext);
       const taskId = requireTaskId(context.taskId);
       const key = `${componentId}\0${taskId}`;
-      const prepared = preparedComponents.get(key);
+      prepared = preparedComponents.get(key);
       if (!prepared) throw adapterError("component_not_prepared");
       preparedComponents.delete(key);
       before = prepared.before;
@@ -781,6 +894,7 @@ export function createComponentAdapters({
       try {
         promoted = await promotePreparedVersion({
           taskId, componentId, rootPath: prepared.rootPath, version: prepared.entry.version,
+          prepareLeaseNonce: prepared.claim.leaseNonce,
           verificationReceipt: prepared.verificationReceipt,
           treeDigest: prepared.treeDigest, manifestDigest: prepared.manifestDigest,
           runtimeMetadata: {
@@ -892,7 +1006,17 @@ export function createComponentAdapters({
         rollbackAvailable: Boolean(promoted?.rollbackAvailable),
       });
     } catch (error) {
-      return failed(componentId, action, error, before);
+      const before = prepared?.before ?? null;
+      const cleanupErrors = [];
+      if (prepared?.operationLease) {
+        try { await prepared.operationLease.release(); }
+        catch (releaseError) { cleanupErrors.push(releaseError); }
+        prepared = null;
+      }
+      return failed(componentId, action,
+        combineOperationErrors(error, cleanupErrors, "component_commit_cleanup_failed"), before);
+    } finally {
+      if (prepared?.operationLease) await prepared.operationLease.release();
     }
   }
 
@@ -1095,6 +1219,9 @@ export function createComponentAdapters({
             && discovery.installDir === task.targetDir && discovery.executablePath === task.executablePath
             ? "external-install-recovered" : "external-install-aborted",
         };
+        if (Object.keys(next.components).length === 0 && Object.keys(next.skills).length === 0) {
+          next.installRoot = null;
+        }
         await saveState(next);
         return next;
       }
@@ -1139,6 +1266,9 @@ export function createComponentAdapters({
     if (discoveredRaw?.kind === "none" && task.kind === "git-install" && managed === null) {
       const aborted = structuredClone(state);
       aborted.activeTask = null;
+      if (Object.keys(aborted.components).length === 0 && Object.keys(aborted.skills).length === 0) {
+        aborted.installRoot = null;
+      }
       await saveState(aborted);
       return aborted;
     }
@@ -1245,6 +1375,7 @@ export function createComponentAdapters({
     let pin = null;
     let claim = null;
     let operationLease = null;
+    let downloadRecord = null;
     try {
       const context = rejectForbiddenContext(rawContext);
       if (context.selected !== true) throw adapterError("git_explicit_selection_required");
@@ -1273,9 +1404,11 @@ export function createComponentAdapters({
         signal: context.signal, onProgress: typeof context.onProgress === "function" ? context.onProgress : () => {},
       });
       if (!isRecord(downloaded) || downloaded.path !== installerPath
-        || downloaded.size !== entry.size || downloaded.sha256 !== entry.sha256) {
+        || downloaded.size !== entry.size || downloaded.sha256 !== entry.sha256
+        || downloaded.downloadRecord === null || typeof downloaded.downloadRecord !== "object") {
         throw adapterError("component_download_evidence_invalid");
       }
+      downloadRecord = downloaded.downloadRecord;
       await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
       const signature = await windowsHost.verifyAuthenticode(installerPath);
       if (signature?.status !== "Valid") throw adapterError("git_authenticode_invalid");
@@ -1288,22 +1421,43 @@ export function createComponentAdapters({
         targetMustBeAbsent: discovery?.kind === "none",
       });
       await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
-      try { await clearPrepareClaim(claim, operationLease); } finally { claim = null; operationLease = null; }
+      if (downloadRecord) {
+        await releaseComponentPackage(downloadRecord);
+        downloadRecord = null;
+      }
+      await assertPrepareClaim(claim);
       preparedComponents.set(`git\0${taskId}`, Object.freeze({
         taskId, mode, entry, installerPath, pin,
+        claim: structuredClone(claim), operationLease,
         discovery: discovery?.kind === "external" ? structuredClone(discovery) : null,
         before: managed?.version ?? (discovery?.kind === "external" ? discovery.version : null),
         previousRecord: managed ? structuredClone(managed) : null,
       }));
-      pin = null;
+      pin = null; claim = null; operationLease = null;
       return result("git", "prepare", "succeeded", {
         versionBefore: managed?.version ?? (discovery?.version ?? null), versionAfter: entry.version,
         message: "git_prepared", rollbackAvailable: Boolean(managed?.previousInstaller),
       });
     } catch (error) {
-      if (claim) await clearPrepareClaim(claim, operationLease).catch(() => {});
-      if (pin) await releaseGitPlan(pin).catch(() => {});
-      return failed("git", "prepare", error);
+      const cleanupErrors = [];
+      if (pin) {
+        try { await releaseGitPlan(pin); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
+        pin = null;
+      }
+      if (downloadRecord) {
+        try { await cleanupSkillPackage(downloadRecord); downloadRecord = null; }
+        catch (cleanupError) { cleanupErrors.push(cleanupError); }
+      }
+      if (claim && cleanupErrors.length === 0) {
+        try { await clearPrepareClaim(claim, operationLease); }
+        catch (cleanupError) { cleanupErrors.push(cleanupError); }
+        finally { claim = null; operationLease = null; }
+      } else if (operationLease) {
+        try { await operationLease.release(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
+        operationLease = null;
+      }
+      return failed("git", "prepare",
+        combineOperationErrors(error, cleanupErrors, "git_prepare_cleanup_failed"));
     }
   }
 
@@ -1311,9 +1465,11 @@ export function createComponentAdapters({
     let prepared = null;
     let executionLease = null;
     let executionClaim = null;
+    let prepareLease = null;
     const recoverManagedCommitFailure = async (error, before) => {
+      const cleanupErrors = [];
       if (executionLease) {
-        await executionLease.release().catch(() => {});
+        try { await executionLease.release(); } catch (releaseError) { cleanupErrors.push(releaseError); }
         executionLease = null;
       }
       let recovered = null;
@@ -1321,12 +1477,13 @@ export function createComponentAdapters({
       try { recovered = await runOwnership(() => recoverGitTransaction()); }
       catch (nextError) { recoveryError = nextError; }
       const actual = recovered ? managedRecord(recovered, "git") : null;
+      const settledError = combineOperationErrors(error, cleanupErrors, "git_commit_cleanup_failed");
       return result("git", "commit", "failed", {
         versionBefore: before,
         versionAfter: actual?.version ?? before,
         message: recoveryError
-          ? `git_managed_pending_recovery:${errorMessage(error)}:${errorMessage(recoveryError)}`
-          : `git_managed_recovered_after_state_failure:${errorMessage(error)}`,
+          ? `git_managed_pending_recovery:${errorMessage(settledError)}:${errorMessage(recoveryError)}`
+          : `git_managed_recovered_after_state_failure:${errorMessage(settledError)}`,
         rollbackAvailable: Boolean(actual?.previousInstaller),
       });
     };
@@ -1337,6 +1494,7 @@ export function createComponentAdapters({
       prepared = preparedComponents.get(key);
       if (!prepared) throw adapterError("component_not_prepared");
       preparedComponents.delete(key);
+      prepareLease = prepared.operationLease;
       if (prepared.mode === "external") {
         const fresh = validateExternalGit(await windowsHost.discoverGit());
         if (!exactDiscovery(fresh, prepared.discovery)) throw adapterError("git_external_state_changed");
@@ -1344,12 +1502,14 @@ export function createComponentAdapters({
         const signature = await windowsHost.verifyAuthenticode(prepared.installerPath);
         if (signature?.status !== "Valid") throw adapterError("git_authenticode_invalid");
         await revalidateGitPlan(prepared.pin, { discovery: fresh, installerSha256: prepared.entry.sha256 });
-        const execution = await reserveGitExecutionClaim(recoverGitTransaction, {
+        const execution = await transitionPreparedGitExecutionClaim(prepared, {
           kind: "git-external-install", taskId, version: prepared.entry.version,
           targetDir: fresh.installDir, executablePath: fresh.executablePath,
           installerPath: prepared.installerPath, installerSha256: prepared.entry.sha256,
         });
         ({ claim: executionClaim, lease: executionLease } = execution);
+        await prepareLease.release();
+        prepareLease = null;
         await windowsHost.runGitInstaller({
           installerPath: prepared.installerPath, targetDir: fresh.installDir,
           signal: context.signal, timeoutMs: gitExecutionTimeoutMs,
@@ -1363,7 +1523,7 @@ export function createComponentAdapters({
         });
       }
 
-      const execution = await reserveGitExecutionClaim(recoverGitTransaction, {
+      const execution = await transitionPreparedGitExecutionClaim(prepared, {
         kind: "git-install", taskId, version: prepared.entry.version,
         targetDir: componentRoot(installRoot, "git"), executablePath: relativeFile(componentRoot(installRoot, "git"), prepared.entry.entrypoint),
         installerPath: prepared.installerPath, installerSha256: prepared.entry.sha256,
@@ -1393,6 +1553,8 @@ export function createComponentAdapters({
         await revalidateGitPlan(prepared.pin, identityExpectation);
       });
       ({ claim: executionClaim, lease: executionLease } = execution);
+      await prepareLease.release();
+      prepareLease = null;
       const reservation = execution.state;
       await windowsHost.runGitInstaller({
         installerPath: prepared.installerPath, targetDir: componentRoot(installRoot, "git"),
@@ -1432,11 +1594,11 @@ export function createComponentAdapters({
           return saveState(adopted);
         });
       } catch (error) {
-        return recoverManagedCommitFailure(error, prepared.before);
+        return await recoverManagedCommitFailure(error, prepared.before);
       }
       if (next.activeTask) {
         try { await runOwnership(() => finishGitInstallCleanup(next)); } catch (error) {
-          return recoverManagedCommitFailure(error, prepared.before);
+          return await recoverManagedCommitFailure(error, prepared.before);
         }
       }
       return result("git", "commit", "succeeded", {
@@ -1444,10 +1606,35 @@ export function createComponentAdapters({
         message: "git_managed_committed", rollbackAvailable: Boolean(next.components.git.previousInstaller),
       });
     } catch (error) {
-      return failed("git", "commit", error, prepared?.before ?? null);
+      const before = prepared?.before ?? null;
+      const cleanupErrors = [];
+      if (prepareLease) {
+        try { await prepareLease.release(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
+        prepareLease = null;
+      }
+      if (executionLease) {
+        try { await executionLease.release(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
+        executionLease = null;
+      }
+      if (prepared?.pin) {
+        try { await releaseGitPlan(prepared.pin); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
+        prepared = null;
+      }
+      return failed("git", "commit",
+        combineOperationErrors(error, cleanupErrors, "git_commit_cleanup_failed"), before);
     } finally {
-      if (executionLease) await executionLease.release().catch(() => {});
-      if (prepared?.pin) await releaseGitPlan(prepared.pin).catch(() => {});
+      const cleanupErrors = [];
+      if (prepareLease) {
+        try { await prepareLease.release(); } catch (error) { cleanupErrors.push(error); }
+      }
+      if (executionLease) {
+        try { await executionLease.release(); } catch (error) { cleanupErrors.push(error); }
+      }
+      if (prepared?.pin) {
+        try { await releaseGitPlan(prepared.pin); } catch (error) { cleanupErrors.push(error); }
+      }
+      if (cleanupErrors.length === 1) throw cleanupErrors[0];
+      if (cleanupErrors.length > 1) throw new AggregateError(cleanupErrors, "git_commit_cleanup_failed");
     }
   }
 
@@ -1640,6 +1827,36 @@ export function createComponentAdapters({
     }
   }
 
+  function throwPreparedSkillReconciliationFailure(reconciliation) {
+    if (reconciliation?.status !== "failed") return;
+    const errors = Array.isArray(reconciliation.failed)
+      ? reconciliation.failed.map((failure) => failure?.error).filter(Boolean)
+      : [];
+    if (errors.length === 1) throw errors[0];
+    throw new AggregateError(errors, "skill_prepare_reconcile_failed", { cause: errors[0] });
+  }
+
+  async function reconcilePreparedSkillsAndReleaseTransientRoot() {
+    const reconciliation = await reconcilePreparedSkillSources();
+    throwPreparedSkillReconciliationFailure(reconciliation);
+    if (reconciliation?.status !== "complete") return reconciliation;
+    await runOwnership(async () => {
+      const current = assertStateForManaged(await loadState());
+      const canReleaseTransientRoot = current.activeTask === null
+        && current.installRoot === installRoot
+        && Object.keys(current.components).length === 0
+        && Object.keys(current.skills).length === 0;
+      if (!canReleaseTransientRoot) return current;
+      const finalReconciliation = await reconcilePreparedSkillSources();
+      throwPreparedSkillReconciliationFailure(finalReconciliation);
+      if (finalReconciliation?.status !== "complete") return current;
+      const next = structuredClone(current);
+      next.installRoot = null;
+      return saveState(next);
+    });
+    return reconciliation;
+  }
+
   async function prepareSkills(rawContext) {
     let context;
     try { context = rejectForbiddenContext(rawContext); requireTaskId(context.taskId); }
@@ -1648,7 +1865,7 @@ export function createComponentAdapters({
     try {
       await ensureSkillsAuthority();
       await runOwnership(() => recoverSkillTransaction());
-      await reconcilePreparedSkillSources();
+      await reconcilePreparedSkillsAndReleaseTransientRoot();
     }
     catch (error) { return [await failed("skills", "prepare", error)]; }
     const ids = Array.isArray(context.skillIds) ? context.skillIds : [];
@@ -1674,7 +1891,14 @@ export function createComponentAdapters({
         if (!isRecord(stagingReceipt) || stagingReceipt.path !== destination) {
           throw adapterError("skill_staging_receipt_invalid");
         }
-        await bindPreparedSkillSource({ taskId, skillId: entry.id });
+        const boundSource = await bindPreparedSkillSource({ taskId, skillId: entry.id });
+        if (!isRecord(boundSource?.identity)
+          || typeof boundSource.identity.volumeSerial !== "string"
+          || boundSource.identity.volumeSerial.length === 0
+          || typeof boundSource.identity.fileId !== "string"
+          || boundSource.identity.fileId.length === 0) {
+          throw adapterError("skill_staging_identity_invalid");
+        }
         const archivePath = path.win32.join(installRoot, "downloads", `skill-${entry.id}-${entry.version}.zip`);
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
         await revalidateFixedDirectoryCapability(activeSkillsRootCapability);
@@ -1691,7 +1915,11 @@ export function createComponentAdapters({
         downloadRecord = downloaded.downloadRecord;
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
         await revalidateFixedDirectoryCapability(activeSkillsRootCapability);
-        await extractArchive({ format: "zip", archivePath, destination, signal: context.signal });
+        await extractArchive({
+          format: "zip", archivePath, destination,
+          destinationIdentity: boundSource.identity,
+          signal: context.signal,
+        });
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
         await revalidateFixedDirectoryCapability(activeSkillsRootCapability);
         const verified = await verifyPreparedSkill({
@@ -1703,7 +1931,9 @@ export function createComponentAdapters({
         });
         const receipt = validateReceipt(verified, "skill_verification_receipt_invalid");
         if (!SHA256.test(verified.skillMdSha256 ?? "")) throw adapterError("skill_md_hash_invalid");
-        await clearPrepareClaim(claim, operationLease, { releaseLease: false });
+        await clearPrepareClaim(claim, operationLease, {
+          releaseLease: false, retainInstallRoot: true,
+        });
         pending.set(id, Object.freeze({
           entry, destination, maxRelativePath, skillMdSha256: verified.skillMdSha256,
           leaseScope: claim.leaseScope, leaseNonce: claim.leaseNonce,
@@ -1714,21 +1944,40 @@ export function createComponentAdapters({
         results.push(result(id, "prepare", "succeeded", { versionAfter: entry.version, message: "skill_prepared" }));
       } catch (error) {
         const heldLease = operationLease;
+        const cleanupErrors = [];
         try {
-          if (claim) {
-            await clearPrepareClaim(claim, heldLease, { releaseLease: false }).catch(() => {});
-            claim = null;
+          if (downloadRecord) {
+            try { await cleanupSkillPackage(downloadRecord); }
+            catch (cleanupError) {
+              if (cleanupError?.code !== "workspace_receipt_consumed") cleanupErrors.push(cleanupError);
+            }
+            downloadRecord = null;
           }
-          if (downloadRecord) await cleanupSkillPackage(downloadRecord).catch(() => {});
-          if (stagingReceipt) await cleanupAbandonedPrepare(stagingReceipt).catch(() => {});
+          if (stagingReceipt) {
+            try { await cleanupAbandonedPrepare(stagingReceipt); }
+            catch (cleanupError) {
+              if (cleanupError?.code !== "workspace_receipt_consumed") cleanupErrors.push(cleanupError);
+            }
+            stagingReceipt = null;
+          }
           if (typeof id === "string" && SKILL_ID.test(id)) {
-            await discardPreparedSkillSources({ taskId, skillIds: [id] }).catch(() => {});
+            try { await discardPreparedSkillSources({ taskId, skillIds: [id] }); }
+            catch (cleanupError) { cleanupErrors.push(cleanupError); }
+          }
+          if (claim && cleanupErrors.length === 0) {
+            try {
+              await clearPrepareClaim(claim, heldLease, { releaseLease: false });
+              claim = null;
+            } catch (cleanupError) { cleanupErrors.push(cleanupError); }
           }
         } finally {
-          await heldLease?.release().catch(() => {});
+          try { await heldLease?.release(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
           operationLease = null;
         }
-        results.push(await failed(typeof id === "string" ? id : "skills", "prepare", error));
+        results.push(await failed(
+          typeof id === "string" ? id : "skills", "prepare",
+          combineOperationErrors(error, cleanupErrors, "skill_prepare_cleanup_failed"),
+        ));
       }
     }
     return results;
@@ -1852,7 +2101,7 @@ export function createComponentAdapters({
       await revalidateInstallRootCapability(installRootCapability);
       await revalidateFixedDirectoryCapability(activeSkillsRootCapability);
       const state = await recoverSkillTransaction();
-      await reconcilePreparedSkillSources();
+      await reconcilePreparedSkillsAndReleaseTransientRoot();
       if (state.activeTask !== null) throw adapterError("component_pending_transaction");
       const ids = Array.isArray(context.skillIds) ? context.skillIds : Object.keys(state.skills);
       return ids.map((id) => {
@@ -1903,6 +2152,24 @@ export function createComponentAdapters({
     if (releaseErrors.length > 1) {
       throw new AggregateError(releaseErrors, "skill_prepare_lease_release_failed");
     }
+    await runOwnership(async () => {
+      const current = assertStateForManaged(await loadState());
+      const canReleaseTransientRoot = current.activeTask === null
+        && current.installRoot === installRoot
+        && Object.keys(current.components).length === 0
+        && Object.keys(current.skills).length === 0;
+      if (!canReleaseTransientRoot) return current;
+      const reconciliation = await reconcilePreparedSkillSources();
+      if (reconciliation?.status === "failed") {
+        const errors = reconciliation.failed.map((failure) => failure.error);
+        throw errors.length === 1 ? errors[0]
+          : new AggregateError(errors, "skill_prepare_discard_reconcile_failed", { cause: errors[0] });
+      }
+      if (reconciliation?.status !== "complete") return current;
+      const next = structuredClone(current);
+      next.installRoot = null;
+      return saveState(next);
+    });
     return discarded;
   }
 
@@ -1984,9 +2251,15 @@ export function createComponentAdapters({
   const coordinatedArchiveAdapter = (componentId) => {
     const adapter = archiveAdapter(componentId);
     return Object.freeze(Object.fromEntries(Object.entries(adapter).map(([name, operation]) => [
-      name, name === "prepare" ? operation : coordinated(operation, {
-        install: true, desktop: desktopCapabilityProvider === null, skills: false,
-      }),
+      name, name === "prepare" ? operation : async (...args) => {
+        try {
+          return await coordinated(operation, {
+            install: true, desktop: desktopCapabilityProvider === null, skills: false,
+          })(...args);
+        } catch (error) {
+          return failed(componentId, name, error);
+        }
+      },
     ])));
   };
 
@@ -1995,7 +2268,10 @@ export function createComponentAdapters({
     v2rayn: coordinatedArchiveAdapter("v2rayn"),
     git: Object.freeze({
       inspectInstalled: coordinated(inspectGit, { install: true }), prepare: prepareGit,
-      commit: commitGit, verify: coordinated(verifyGit, { install: true }),
+      commit: async (...args) => {
+        try { return await commitGit(...args); }
+        catch (error) { return failed("git", "commit", error); }
+      }, verify: coordinated(verifyGit, { install: true }),
       uninstall: uninstallGit, rollback: rollbackGit,
     }),
     skills: Object.freeze({

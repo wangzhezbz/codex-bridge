@@ -6,6 +6,7 @@ import { Readable, Transform } from "node:stream";
 
 const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
 const DOWNLOAD_MANAGER_AUTHORITIES = new WeakMap();
+const NON_RETRYABLE_SOURCE_FAILURES = new WeakSet();
 
 function downloadError(code) {
   const error = new Error(code);
@@ -70,8 +71,8 @@ export function createDownloadManager({
           publish,
         });
       } catch (error) {
-        if (signal?.aborted) throw abortError(signal);
-        if (error?.retryable === false || attempt === maxAttempts) throw error;
+        if (signal?.aborted && !(error instanceof AggregateError)) throw abortError(signal);
+        if (attempt === maxAttempts || !isRetryableDownloadFailure(error)) throw error;
         await waitForRetry(delayMs, attempt, signal);
       }
     }
@@ -95,11 +96,13 @@ export function createDownloadManager({
     async downloadPrepared({ asset, partPath = null, target = null, signal, onProgress = () => {} } = {}) {
       validateAsset(asset);
       const pathMode = typeof partPath === "string" && partPath.length > 0;
-      const targetMode = target && typeof target === "object"
-        && ["inspect", "reset", "createWriteStream", "verify"].every((name) => typeof target[name] === "function");
-      if (pathMode === targetMode) {
+      const targetProvided = target !== null && target !== undefined;
+      const targetMode = Boolean(targetProvided && typeof target === "object"
+        && ["inspect", "reset", "createWriteStream", "verify"].every((name) => typeof target[name] === "function"));
+      if (pathMode === targetProvided) {
         throw new TypeError("exactly one prepared download target is required");
       }
+      if (targetProvided && !targetMode) throw new TypeError("prepared download target is invalid");
       if (typeof onProgress !== "function") throw new TypeError("onProgress must be a function");
       const verified = await transfer({
         asset, partPath, target, signal, onProgress, publish: false,
@@ -120,7 +123,7 @@ export function createDownloadManager({
 
 async function downloadOnce(context) {
   const existingSize = context.target
-    ? (await context.target.inspect()).size
+    ? (await failFastSource(() => context.target.inspect())).size
     : await fileSize(context.fileOps, context.partPath);
   if (existingSize > context.asset.size) {
     throw nonRetryableError("partial package exceeds the catalog length");
@@ -139,14 +142,21 @@ async function downloadOnce(context) {
     append = false;
     resumed = false;
     receivedBytes = 0;
-    if (context.target) await context.target.reset();
+    try {
+      throwIfAborted(context.signal);
+      if (context.target) await failFastSource(() => context.target.reset({ signal: context.signal }));
+    } catch (error) {
+      return failWithResponseCleanup(response, error);
+    }
   } else if (append && response.status === 206) {
     const contentRange = response.headers.get("content-range");
     if (!new RegExp(`^bytes ${existingSize}-\\d+/(\\d+|\\*)$`, "i").test(contentRange ?? "")) {
-      throw nonRetryableError("resumed response has an invalid Content-Range");
+      return failWithResponseCleanup(
+        response, nonRetryableError("resumed response has an invalid Content-Range"),
+      );
     }
   } else if (response.status !== 200 && response.status !== 206) {
-    throw responseError(response);
+    return failWithResponseCleanup(response, responseError(response));
   }
 
   if (!response.body) {
@@ -167,15 +177,40 @@ async function downloadOnce(context) {
       }, callback, chunk);
     }
   });
-  const output = context.target
-    ? await context.target.createWriteStream({ append, maxBytes: context.asset.size, signal: context.signal })
-    : context.streamFs.createWriteStream(context.partPath, { flags: append ? "a" : "w" });
-
+  let output;
   try {
-    await pipeline(Readable.fromWeb(response.body), progress, output, { signal: context.signal });
+    output = context.target
+      ? await failFastSource(() => context.target.createWriteStream({
+        append, maxBytes: context.asset.size, signal: context.signal,
+      }))
+      : failFastSourceSync(() => context.streamFs.createWriteStream(
+        context.partPath, { flags: append ? "a" : "w" },
+      ));
   } catch (error) {
-    output.destroy();
-    throw error;
+    return failWithResponseCleanup(response, error);
+  }
+
+  const input = Readable.fromWeb(response.body);
+  const upstreamErrors = new WeakSet();
+  input.on("error", (error) => {
+    if (error && (typeof error === "object" || typeof error === "function")) upstreamErrors.add(error);
+  });
+  output.on("error", (error) => {
+    if (!upstreamErrors.has(error)) markFailFastSource(error);
+  });
+  try {
+    await pipeline(input, progress, output, { signal: context.signal });
+  } catch (error) {
+    let destroyError = null;
+    try { output.destroy(); } catch (nextError) { destroyError = nextError; markFailFastSource(nextError); }
+    const primary = destroyError
+      ? new AggregateError([error, destroyError], error.message, { cause: error })
+      : error;
+    if (context.signal?.aborted === true) {
+      if (error?.name === "AbortError") throw error;
+      throw context.signal.reason ?? error;
+    }
+    return failWithResponseCleanup(response, primary);
   }
 
   throwIfAborted(context.signal);
@@ -199,23 +234,25 @@ async function verifyDownloaded(context) {
   throwIfAborted(context.signal);
   let sha256;
   if (context.target) {
-    const verified = await context.target.verify({
+    const verified = await failFastSource(() => context.target.verify({
       size: context.asset.size, sha256: context.asset.sha256.toLowerCase(), signal: context.signal,
-    });
+    }));
     if (!verified || verified.size !== context.asset.size
       || verified.sha256 !== context.asset.sha256.toLowerCase()) {
       throw nonRetryableError("prepared download verification is invalid");
     }
     sha256 = verified.sha256;
   } else {
-    sha256 = await hashFile(context.streamFs, context.partPath);
+    sha256 = await failFastSource(() => hashFile(context.streamFs, context.partPath));
   }
   throwIfAborted(context.signal);
   if (sha256 !== context.asset.sha256.toLowerCase()) {
     throw nonRetryableError("download SHA256 mismatch");
   }
   throwIfAborted(context.signal);
-  if (context.publish) await context.fileOps.rename(context.partPath, context.destination);
+  if (context.publish) {
+    await failFastSource(() => context.fileOps.rename(context.partPath, context.destination));
+  }
   return {
     ...(context.publish ? { path: context.destination } : {}),
     size: context.receivedBytes,
@@ -231,14 +268,18 @@ async function fetchSignedOrigin(fetchImpl, signedUrl, headers, signal, original
     if (!REDIRECT_STATUS.has(response.status)) {
       return response;
     }
-    const location = response.headers.get("location");
-    if (!location) {
-      throw nonRetryableError("download redirect is missing Location");
+    let redirectUrl;
+    try {
+      const location = response.headers.get("location");
+      if (!location) throw nonRetryableError("download redirect is missing Location");
+      redirectUrl = new URL(location, nextUrl);
+      if (redirectUrl.origin !== originalOrigin) {
+        throw nonRetryableError("download redirect crosses the signed asset origin");
+      }
+    } catch (error) {
+      return failWithResponseCleanup(response, error);
     }
-    const redirectUrl = new URL(location, nextUrl);
-    if (redirectUrl.origin !== originalOrigin) {
-      throw nonRetryableError("download redirect crosses the signed asset origin");
-    }
+    await cancelResponseBody(response);
     nextUrl = redirectUrl.href;
   }
   throw nonRetryableError("download exceeded redirect limit");
@@ -251,6 +292,7 @@ async function fileSize(fileOps, path) {
     if (error?.code === "ENOENT") {
       return 0;
     }
+    markFailFastSource(error);
     throw error;
   }
 }
@@ -290,6 +332,62 @@ function nonRetryableError(message) {
   const error = new Error(message);
   error.retryable = false;
   return error;
+}
+
+function isRetryableDownloadFailure(error) {
+  if (error?.retryable === true) return true;
+  if (error?.retryable === false || error instanceof AggregateError) return false;
+  const transientCodes = new Set([
+    "ECONNRESET", "ETIMEDOUT", "ECONNREFUSED", "ENETRESET", "ENETUNREACH",
+    "EHOSTUNREACH", "EPIPE", "EAI_AGAIN", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_SOCKET",
+  ]);
+  const seen = new Set();
+  let current = error;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    if (NON_RETRYABLE_SOURCE_FAILURES.has(current)) return false;
+    if (transientCodes.has(current.code)) return true;
+    current = current.cause;
+  }
+  return false;
+}
+
+function markFailFastSource(error) {
+  if (error && (typeof error === "object" || typeof error === "function")) {
+    NON_RETRYABLE_SOURCE_FAILURES.add(error);
+  }
+}
+
+async function failFastSource(action) {
+  try { return await action(); }
+  catch (error) { markFailFastSource(error); throw error; }
+}
+
+function failFastSourceSync(action) {
+  try { return action(); }
+  catch (error) { markFailFastSource(error); throw error; }
+}
+
+async function failWithResponseCleanup(response, primaryError) {
+  let cleanupError = null;
+  try { await cancelResponseBody(response); } catch (error) { cleanupError = error; }
+  if (primaryError?.name === "AbortError" && cleanupError?.name === "AbortError") throw primaryError;
+  if (cleanupError) {
+    throw new AggregateError([primaryError, cleanupError], primaryError.message, { cause: primaryError });
+  }
+  throw primaryError;
+}
+
+async function cancelResponseBody(response) {
+  try {
+    await response?.body?.cancel?.();
+  } catch (error) {
+    if (response?.body?.locked === true
+      && (error?.code === "ERR_INVALID_STATE" || /ReadableStream is locked/iu.test(error?.message ?? ""))) {
+      return;
+    }
+    throw error;
+  }
 }
 
 async function waitForRetry(delayMs, attempt, signal) {

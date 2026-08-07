@@ -10,6 +10,7 @@ import { createArchiveService } from "../desktop/software-manager/archive-servic
 const fixtureFiles = [];
 const fixtureDirectories = [];
 const SEVEN_ZIP_PATH = path.resolve("test-bin", "7za.exe");
+const DESTINATION_IDENTITY = Object.freeze({ volumeSerial: "test", fileId: "destination" });
 
 after(async () => {
   for (const file of fixtureFiles) {
@@ -51,7 +52,9 @@ test("extracts ZIP bytes only after every entry passes preflight", async () => {
   const memory = memoryDestination(destination);
   const service = zipService(memory.fsApi);
 
-  const result = await service.extractArchive({ format: "zip", archivePath, destination });
+  const result = await service.extractArchive({
+    format: "zip", archivePath, destination, destinationIdentity: DESTINATION_IDENTITY,
+  });
 
   assert.equal(result.totalUnpackedBytes, 7);
   assert.equal(memory.files.get("app/readme.txt"), "hello");
@@ -76,6 +79,7 @@ test("verified extraction returns the opaque version receipt and manifest digest
     format: "zip",
     archivePath,
     destination,
+    destinationIdentity: { volumeSerial: "test", fileId: "destination" },
     verification: { componentId: "chatgpt", version: "1.0.0" },
   });
 
@@ -89,6 +93,40 @@ test("verified extraction returns the opaque version receipt and manifest digest
   });
 });
 
+test("missing destination identity is rejected before opening or writing the ZIP destination", async () => {
+  const archivePath = await writeZipFixture([{ name: "safe.txt", body: "x" }]);
+  const destination = path.resolve("staging", "missing-identity");
+  const memory = memoryDestination(destination);
+  await assert.rejects(zipService(memory.fsApi).extractArchive({
+    format: "zip", archivePath, destination,
+  }), /archive_destination_identity_required/u);
+  assert.equal(memory.openDestinationCalls, 0);
+  assert.equal(memory.createFileCalls, 0);
+});
+
+test("wrong destination identity blocks 7z listing and every output mutation", async () => {
+  const archivePath = path.resolve("packages", "wrong-identity.7z");
+  const destination = path.resolve("staging", "wrong-identity");
+  const fake = fakeSevenZip({
+    listing: sevenZipListing([{ path: "safe.txt", size: 1, attributes: "A" }]),
+  });
+  const memory = memoryDestination(destination, {
+    actualIdentity: { volumeSerial: "test", fileId: "different" },
+  });
+  const service = createArchiveService({
+    sevenZipPath: SEVEN_ZIP_PATH,
+    spawnFile: fake.spawnFile,
+    spawnStream: fake.spawnStream,
+    fsApi: memory.fsApi,
+  });
+  await assert.rejects(service.extractArchive({
+    format: "7z", archivePath, destination, destinationIdentity: DESTINATION_IDENTITY,
+  }), /archive_destination_identity_changed/u);
+  assert.equal(fake.calls.length, 0);
+  assert.equal(memory.createFileCalls, 0);
+  assert.equal(memory.archivePinClosed, true);
+});
+
 test("does not open a ZIP output file when a later entry is unsafe", async () => {
   const archivePath = await writeZipFixture([
     { name: "safe.txt", body: "would otherwise be written" },
@@ -98,10 +136,12 @@ test("does not open a ZIP output file when a later entry is unsafe", async () =>
   const memory = memoryDestination(destination);
 
   await assert.rejects(
-    zipService(memory.fsApi).extractArchive({ format: "zip", archivePath, destination }),
+    zipService(memory.fsApi).extractArchive({
+      format: "zip", archivePath, destination, destinationIdentity: DESTINATION_IDENTITY,
+    }),
     /archive_path_escape/,
   );
-  assert.equal(memory.openDestinationCalls, 0);
+  assert.equal(memory.openDestinationCalls, 1);
   assert.equal(memory.createFileCalls, 0);
 });
 
@@ -189,7 +229,10 @@ test("cancellation before ZIP extraction opens neither archive destination nor o
   controller.abort();
 
   await assert.rejects(
-    zipService(memory.fsApi).extractArchive({ format: "zip", archivePath, destination, signal: controller.signal }),
+    zipService(memory.fsApi).extractArchive({
+      format: "zip", archivePath, destination,
+      destinationIdentity: DESTINATION_IDENTITY, signal: controller.signal,
+    }),
     (error) => error?.name === "AbortError",
   );
   assert.equal(memory.openDestinationCalls, 0);
@@ -279,7 +322,9 @@ test("extracts 7z only with fixed arguments and no-follow capability verificatio
     fsApi: memory.fsApi,
   });
 
-  const result = await service.extractArchive({ format: "7z", archivePath, destination });
+  const result = await service.extractArchive({
+    format: "7z", archivePath, destination, destinationIdentity: DESTINATION_IDENTITY,
+  });
 
   assert.equal(result.totalUnpackedBytes, 12);
   assert.deepEqual(fake.calls.map((call) => call.args), [
@@ -312,7 +357,9 @@ test("7z per-entry streaming requires process success and bounded stderr", async
         spawnStream: fake.spawnStream,
         fsApi: memory.fsApi,
       });
-      await assert.rejects(service.extractArchive({ format: "7z", archivePath, destination }), expected);
+      await assert.rejects(service.extractArchive({
+        format: "7z", archivePath, destination, destinationIdentity: DESTINATION_IDENTITY,
+      }), expected);
       assert.equal(memory.closed, true);
       assert.equal(memory.archivePinClosed, true);
     });
@@ -338,7 +385,10 @@ test("cancellation during one 7z stdout stream aborts extraction and closes capa
     fsApi: memory.fsApi,
   });
   await assert.rejects(
-    service.extractArchive({ format: "7z", archivePath, destination, signal: controller.signal }),
+    service.extractArchive({
+      format: "7z", archivePath, destination,
+      destinationIdentity: DESTINATION_IDENTITY, signal: controller.signal,
+    }),
     (error) => error?.name === "AbortError" || error?.code === "ABORT_ERR",
   );
   assert.equal(memory.closed, true);
@@ -351,9 +401,13 @@ test("rejects unsafe 7z listing before invoking extraction", async () => {
   const memory = memoryDestination(path.resolve("staging", "seven-bad"));
   const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, spawnStream: fake.spawnStream, fsApi: memory.fsApi });
 
-  await assert.rejects(service.extractArchive({ format: "7z", archivePath, destination: memory.destination }), /archive_path_escape/);
+  await assert.rejects(service.extractArchive({
+    format: "7z", archivePath, destination: memory.destination,
+    destinationIdentity: DESTINATION_IDENTITY,
+  }), /archive_path_escape/);
   assert.equal(fake.calls.length, 1);
-  assert.equal(memory.openDestinationCalls, 0);
+  assert.equal(memory.openDestinationCalls, 1);
+  assert.equal(memory.createFileCalls, 0);
 });
 
 test("rejects 7z symlink and reparse metadata", async () => {
@@ -564,7 +618,9 @@ test("rejects a post-7z no-follow tree report that escapes destination", async (
   });
   const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, spawnStream: fake.spawnStream, fsApi: memory.fsApi });
 
-  await assert.rejects(service.extractArchive({ format: "7z", archivePath, destination }), /archive_output_escape/);
+  await assert.rejects(service.extractArchive({
+    format: "7z", archivePath, destination, destinationIdentity: DESTINATION_IDENTITY,
+  }), /archive_output_escape/);
 });
 
 test("7z post-extraction tree must exactly match preflight metadata", async (t) => {
@@ -593,7 +649,9 @@ test("7z post-extraction tree must exactly match preflight metadata", async (t) 
       const memory = memoryDestination(destination, { verifiedTree });
       const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, spawnStream: fake.spawnStream, fsApi: memory.fsApi });
       await assert.rejects(
-        service.extractArchive({ format: "7z", archivePath, destination }),
+        service.extractArchive({
+          format: "7z", archivePath, destination, destinationIdentity: DESTINATION_IDENTITY,
+        }),
         /archive_(?:no_follow_tree_invalid|output_mismatch)/,
       );
     });
@@ -615,7 +673,10 @@ test("cancellation during 7z no-follow verification fails closed and closes hand
   const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, spawnStream: fake.spawnStream, fsApi: memory.fsApi });
 
   await assert.rejects(
-    service.extractArchive({ format: "7z", archivePath, destination, signal: controller.signal }),
+    service.extractArchive({
+      format: "7z", archivePath, destination,
+      destinationIdentity: DESTINATION_IDENTITY, signal: controller.signal,
+    }),
     (error) => error?.name === "AbortError",
   );
   assert.equal(memory.archivePinClosed, true);
@@ -634,7 +695,9 @@ test("7z cleanup closes every available handle without hiding the primary error"
   });
   const service = createArchiveService({ sevenZipPath: SEVEN_ZIP_PATH, spawnFile: fake.spawnFile, spawnStream: fake.spawnStream, fsApi: memory.fsApi });
 
-  await assert.rejects(service.extractArchive({ format: "7z", archivePath, destination }), (error) => {
+  await assert.rejects(service.extractArchive({
+    format: "7z", archivePath, destination, destinationIdentity: DESTINATION_IDENTITY,
+  }), (error) => {
     assert.equal(error instanceof AggregateError, true);
     assert.match(error.errors[0].message, /archive_output_mismatch/);
     assert.match(error.errors[1].message, /destination_close_failed/);
@@ -664,7 +727,9 @@ test("invalid closeable 7z capability handles are still released", async (t) => 
         },
       },
     });
-    await assert.rejects(service.extractArchive({ format: "7z", archivePath, destination }), /archive_no_follow_capability_invalid/);
+    await assert.rejects(service.extractArchive({
+      format: "7z", archivePath, destination, destinationIdentity: DESTINATION_IDENTITY,
+    }), /archive_no_follow_capability_invalid/);
     assert.equal(pinClosed, true);
   });
 
@@ -686,7 +751,9 @@ test("invalid closeable 7z capability handles are still released", async (t) => 
         },
       },
     });
-    await assert.rejects(service.extractArchive({ format: "7z", archivePath, destination }), /archive_no_follow_capability_invalid/);
+    await assert.rejects(service.extractArchive({
+      format: "7z", archivePath, destination, destinationIdentity: DESTINATION_IDENTITY,
+    }), /archive_no_follow_capability_invalid/);
     assert.equal(destinationClosed, true);
     assert.equal(pinClosed, true);
   });
@@ -697,6 +764,7 @@ test("fails closed when extraction lacks stable no-follow capabilities", async (
   await t.test("ZIP destination", async () => {
     await assert.rejects(zipService({}).extractArchive({
       format: "zip", archivePath: zipPath, destination: path.resolve("staging", "missing-zip-capability"),
+      destinationIdentity: DESTINATION_IDENTITY,
     }), /archive_no_follow_capability_required/);
   });
 
@@ -711,6 +779,7 @@ test("fails closed when extraction lacks stable no-follow capabilities", async (
       format: "7z",
       archivePath: path.resolve("packages", "missing-pin.7z"),
       destination: path.resolve("staging", "missing-pin"),
+      destinationIdentity: DESTINATION_IDENTITY,
     }), /archive_no_follow_capability_required/);
   });
 });
@@ -767,6 +836,7 @@ function memoryDestination(destination, {
   receiptResult,
   destinationCloseError,
   pinCloseError,
+  actualIdentity = DESTINATION_IDENTITY,
 } = {}) {
   const files = new Map();
   const directories = new Set();
@@ -826,9 +896,14 @@ function memoryDestination(destination, {
   };
   state.root = root;
   state.fsApi = {
-    async openArchiveDestinationNoFollow(exactDestination) {
+    async openArchiveDestinationNoFollow(exactDestination, { expectedIdentity } = {}) {
       state.openDestinationCalls += 1;
       assert.equal(exactDestination, destination);
+      if (JSON.stringify(expectedIdentity) !== JSON.stringify(actualIdentity)) {
+        throw Object.assign(new Error("archive_destination_identity_changed"), {
+          code: "archive_destination_identity_changed",
+        });
+      }
       return root;
     },
     async pinArchiveFileNoFollow() {

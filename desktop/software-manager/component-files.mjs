@@ -8,6 +8,7 @@ const VERSION = /^\d+(?:\.\d+){1,3}$/u;
 const GIT_VERSION = /^(\d+(?:\.\d+){1,3})(?:\.windows\.([1-9]\d*))?$/u;
 const GIT_VERSION_OUTPUT = /^git version (\d+(?:\.\d+){1,3})\.windows\.([1-9]\d*)\r?\n?$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
+const PREPARE_NAME = /^\.codexbridge-prepare-[a-f0-9]{32}$/u;
 const MISSING_CODES = new Set(["ENOENT", "ERROR_FILE_NOT_FOUND", "ERROR_PATH_NOT_FOUND", "windows_path_missing"]);
 const COMPONENT_SLOTS = Object.freeze({
   chatgpt: Object.freeze({ staging: "ct", current: "c" }),
@@ -134,12 +135,13 @@ export function createComponentFileService({
       throw componentError("component_verification_plan_invalid");
     }
     const keys = plan.phase === "staging"
-      ? ["componentId", "phase", "rootPath", "entrypointPath", "requiredFiles", "expectedVersion", "expectedPackageSha256", "packageProof"]
+      ? ["componentId", "phase", "stagingName", "rootPath", "entrypointPath", "requiredFiles", "expectedVersion", "expectedPackageSha256", "packageProof"]
       : ["componentId", "phase", "rootPath", "entrypointPath", "requiredFiles", "expectedVersion"];
     if (!exactKeys(plan, keys) || !Array.isArray(plan.requiredFiles) || !VERSION.test(plan.expectedVersion ?? "")) {
       throw componentError("component_verification_plan_invalid");
     }
     if (plan.phase === "staging" && (!SHA256.test(plan.expectedPackageSha256 ?? "")
+      || !PREPARE_NAME.test(plan.stagingName ?? "")
       || plan.packageProof === null || typeof plan.packageProof !== "object")) {
       throw componentError("component_verification_plan_invalid");
     }
@@ -153,7 +155,9 @@ export function createComponentFileService({
     });
     const entry = catalogService.getComponent(plan.componentId);
     if (entry.version !== plan.expectedVersion) throw componentError("component_catalog_version_mismatch");
-    const expectedRoot = slotRoot(installRoot, plan.componentId, plan.phase);
+    const expectedRoot = plan.phase === "staging"
+      ? path.win32.join(componentRoot(installRoot, plan.componentId), plan.stagingName)
+      : slotRoot(installRoot, plan.componentId, plan.phase);
     const expectedEntrypoint = relativeFile(expectedRoot, entry.entrypoint);
     const expectedRequiredFiles = entry.requiredFiles.map((item) => relativeFile(expectedRoot, item));
     let rootPath;

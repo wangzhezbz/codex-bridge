@@ -3,7 +3,10 @@ import { generateKeyPairSync, sign } from "node:crypto";
 import path from "node:path";
 import test from "node:test";
 
-import { createSkillFileService } from "../desktop/software-manager/skill-files.mjs";
+import {
+  createPreparedSkillRecovery,
+  createSkillFileService,
+} from "../desktop/software-manager/skill-files.mjs";
 import { createSkillSwapJournal } from "../desktop/software-manager/skill-swap-journal.mjs";
 import {
   createSkillPrepareJournal,
@@ -203,7 +206,7 @@ function createFakeSkillCapabilities({
       if (!sourcePresent) return { deleted: false, absent: true };
       if (expectedIdentity !== null) assert.deepEqual(expectedIdentity, identity("source"));
       if (expectedEvidence !== null) assert.deepEqual(expectedEvidence, sourceEvidence);
-      if (expectedIdentity === null && sourceNonempty) throw new Error("skill_prepare_intent_not_empty");
+      if (expectedIdentity === null) throw new Error("skill_prepare_unbound_occupied");
       if (preparedDeleteCrashPending) {
         preparedDeleteCrashPending = false;
         sourceNonempty = true;
@@ -592,6 +595,19 @@ test("Skill prepare journal leaves a live writer temp untouched and publishes it
   const restarted = createSkillPrepareJournal({
     journalDir: "D:\\CBState\\skill-prepares", fsApi: memory.fsApi, installRoot: "D:\\CBApps",
   });
+  const diagnostics = await restarted.list({ claimLease: async () => null, diagnostics: true });
+  assert.deepEqual(diagnostics.records, []);
+  assert.equal(diagnostics.live.length, 1);
+  assert.deepEqual({
+    taskId: diagnostics.live[0].taskId,
+    skillId: diagnostics.live[0].skillId,
+    leaseScope: diagnostics.live[0].leaseScope,
+    leaseNonce: diagnostics.live[0].leaseNonce,
+  }, {
+    taskId: "skill-task", skillId: "documents",
+    leaseScope: "prepare", leaseNonce: LEASE_NONCE,
+  });
+  assert.deepEqual(diagnostics.unresolved, []);
   assert.deepEqual(await restarted.list({ claimLease: async () => null }), []);
   assert.equal([...memory.entries.keys()].some((name) => name.endsWith(".tmp")), true);
   assert.equal((await restarted.list({ claimLease: claimDeadPrepareLease }))[0].phase, "intent");
@@ -729,29 +745,28 @@ test("new Skill install publishes exact evidence and never touches an unrelated 
   assert.equal(capabilities.calls.some(([operation, name]) => operation === "delete" && name === "pdf"), false);
 });
 
-test("intent recovery handles pre-create absence and exact empty creation but rejects nonempty replacement", async () => {
-  for (const fixture of [
-    createFixture({ sourceInitiallyPresent: false }),
-    createFixture(),
-  ]) {
-    await fixture.service.beginPreparedSource({
-      taskId: "skill-task", skillId: "documents", leaseScope: "prepare", leaseNonce: LEASE_NONCE,
-    });
-    assert.deepEqual(await fixture.service.discardPrepared({
-      taskId: "skill-task", skillIds: ["documents"],
-    }), [true]);
-    assert.equal(await fixture.prepareJournal.load({ taskId: "skill-task", skillId: "documents" }), null);
-  }
-
-  const replaced = createFixture({ sourceInitiallyNonempty: true });
-  await replaced.service.beginPreparedSource({
+test("intent recovery clears only an absent source and never adopts or deletes an existing leaf", async () => {
+  const absent = createFixture({ sourceInitiallyPresent: false });
+  await absent.service.beginPreparedSource({
     taskId: "skill-task", skillId: "documents", leaseScope: "prepare", leaseNonce: LEASE_NONCE,
   });
-  await assert.rejects(replaced.service.discardPrepared({
+  assert.deepEqual(await absent.service.discardPrepared({
     taskId: "skill-task", skillIds: ["documents"],
-  }), /skill_prepare_intent_not_empty/u);
-  assert.equal(replaced.capabilities.sourcePresent(), true);
-  assert.equal((await replaced.prepareJournal.load({ taskId: "skill-task", skillId: "documents" })).snapshot.phase, "intent");
+  }), [true]);
+  assert.equal(await absent.prepareJournal.load({ taskId: "skill-task", skillId: "documents" }), null);
+
+  for (const replaced of [createFixture(), createFixture({ sourceInitiallyNonempty: true })]) {
+    await replaced.service.beginPreparedSource({
+      taskId: "skill-task", skillId: "documents", leaseScope: "prepare", leaseNonce: LEASE_NONCE,
+    });
+    await assert.rejects(replaced.service.discardPrepared({
+      taskId: "skill-task", skillIds: ["documents"],
+    }), /skill_prepare_unbound_occupied/u);
+    assert.equal(replaced.capabilities.sourcePresent(), true);
+    assert.equal((await replaced.prepareJournal.load({
+      taskId: "skill-task", skillId: "documents",
+    })).snapshot.phase, "intent");
+  }
 });
 
 test("prepared Skill deletion resumes from deleting after a child was removed before a crash", async () => {
@@ -764,10 +779,53 @@ test("prepared Skill deletion resumes from deleting after a child was removed be
   assert.equal(interrupted.snapshot.phase, "deleting");
   assert.equal(fixture.capabilities.sourcePresent(), true);
 
-  assert.equal(await fixture.service.reconcilePreparedSources(), 1);
+  assert.equal((await fixture.service.reconcilePreparedSources()).cleaned.length, 1);
   assert.equal(fixture.capabilities.sourcePresent(), false);
   assert.equal(await fixture.prepareJournal.load({ taskId: "skill-task", skillId: "documents" }), null);
   assert.equal(fixture.capabilities.calls.filter(([name]) => name === "delete-source-child").length, 1);
+});
+
+test("prepared Skill recovery reports an exact live lease before cleaning that journal after lease death", async () => {
+  const fixture = createFixture({ sourceInitiallyPresent: false });
+  await fixture.service.beginPreparedSource({
+    taskId: "skill-task", skillId: "documents", leaseScope: "prepare", leaseNonce: LEASE_NONCE,
+  });
+  let live = true;
+  const recovery = createPreparedSkillRecovery({
+    fileCapabilities: fixture.capabilities.fileCapabilities,
+    installRootCapability: INSTALL_CAPABILITY,
+    prepareJournal: fixture.prepareJournal,
+    prepareLeaseStore: {
+      async acquireOperationLease({ nonce, scope, wait }) {
+        assert.deepEqual({ nonce, scope, wait }, { nonce: LEASE_NONCE, scope: "prepare", wait: false });
+        if (live) return null;
+        return { async release() {} };
+      },
+    },
+  });
+
+  const blocked = await recovery.reconcilePreparedSources();
+  assert.equal(blocked.status, "live");
+  assert.deepEqual(blocked.cleaned, []);
+  assert.deepEqual(blocked.live, [{
+    taskId: "skill-task", skillId: "documents",
+    leaseScope: "prepare", leaseNonce: LEASE_NONCE,
+  }]);
+  assert.deepEqual(blocked.unresolved, []);
+  assert.deepEqual(blocked.failed, []);
+  assert.notEqual(await fixture.prepareJournal.load({ taskId: "skill-task", skillId: "documents" }), null);
+
+  live = false;
+  const completed = await recovery.reconcilePreparedSources();
+  assert.equal(completed.status, "complete");
+  assert.deepEqual(completed.cleaned, [{
+    taskId: "skill-task", skillId: "documents",
+    leaseScope: "prepare", leaseNonce: LEASE_NONCE,
+  }]);
+  assert.deepEqual(completed.live, []);
+  assert.deepEqual(completed.unresolved, []);
+  assert.deepEqual(completed.failed, []);
+  assert.equal(await fixture.prepareJournal.load({ taskId: "skill-task", skillId: "documents" }), null);
 });
 
 test("bound partial extraction records deleting before mutation and resumes safely", async () => {
@@ -783,7 +841,7 @@ test("bound partial extraction records deleting before mutation and resumes safe
   assert.equal((await fixture.prepareJournal.load({
     taskId: "skill-task", skillId: "documents",
   })).snapshot.phase, "deleting");
-  assert.equal(await fixture.service.reconcilePreparedSources(), 1);
+  assert.equal((await fixture.service.reconcilePreparedSources()).cleaned.length, 1);
   assert.equal(fixture.capabilities.sourcePresent(), false);
 });
 
@@ -919,7 +977,7 @@ test("recovery-only Skill files reconcile local journals without catalog or work
     hashFile: null,
     recoveryOnly: true,
   });
-  assert.equal(await recovery.reconcilePreparedSources(), 0);
+  assert.equal((await recovery.reconcilePreparedSources()).cleaned.length, 0);
   assert.deepEqual(await recovery.reconcileReplacement({
     taskId: "skill-task",
     swapId: SWAP_ID,

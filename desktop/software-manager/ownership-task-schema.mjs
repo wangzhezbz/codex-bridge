@@ -206,7 +206,22 @@ export function isValidActiveTask(task, { ownership, skillsRoot } = {}) {
   if (task.kind === "component-shortcut") return validShortcut(task, ownership);
   if (task.kind === "component-uninstall") return validComponentUninstall(task, ownership);
   if (task.kind === "component-prepare") {
-    return exact(task, ["kind", "taskId", "componentId", "version", "leaseScope", "leaseNonce"])
+    const common = ["kind", "taskId", "componentId", "version", "leaseScope", "leaseNonce"];
+    const archiveCommon = [...common, "stagingName"];
+    const archiveNameValid = /^\.codexbridge-prepare-[a-f0-9]{32}$/u.test(task.stagingName ?? "");
+    const boundArchive = ["chatgpt", "v2rayn"].includes(task.componentId)
+      && exact(task, [...archiveCommon, "stagingIdentity"])
+      && archiveNameValid
+      && identity(task.stagingIdentity);
+    const boundFirstV2Archive = task.componentId === "v2rayn"
+      && exact(task, [...archiveCommon, "stagingIdentity", "componentRootIdentity"])
+      && archiveNameValid
+      && identity(task.stagingIdentity)
+      && identity(task.componentRootIdentity);
+    const reservedArchive = ["chatgpt", "v2rayn"].includes(task.componentId)
+      && exact(task, archiveCommon) && archiveNameValid;
+    const legacyOrGit = exact(task, common);
+    return (legacyOrGit || reservedArchive || boundArchive || boundFirstV2Archive)
       && TASK_ID.test(task.taskId) && ["chatgpt", "v2rayn", "git"].includes(task.componentId)
       && VERSION.test(task.version) && task.leaseScope === "prepare" && LEASE_NONCE.test(task.leaseNonce);
   }

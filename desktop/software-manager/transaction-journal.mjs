@@ -14,12 +14,15 @@ const ABORT_PHASES = [
 const RECORD_KEYS = [
   "schemaVersion", "taskId", "componentId", "mode", "phase", "rootPath",
   "slots", "paths", "versions", "identities", "integrities", "runtimeMetadata", "ownershipBefore",
+  "priorPrepare", "prepareSource",
 ];
+const LEGACY_RECORD_KEYS = RECORD_KEYS.filter((key) => key !== "priorPrepare" && key !== "prepareSource");
 const SLOT_KEYS = ["current", "previous", "staging", "retiring"];
 const VERSION_KEYS = ["incoming", "current", "previous"];
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
 const VERSION = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
+const PREPARE_NAME = /^\.codexbridge-prepare-[a-f0-9]{32}$/u;
 const RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/iu;
 
 function journalError(code, cause) {
@@ -166,6 +169,9 @@ function normalizeOwnershipBefore(value, {
 }
 
 function normalizeRecord(value) {
+  if (hasExactKeys(value, LEGACY_RECORD_KEYS) && value.schemaVersion === SCHEMA_VERSION) {
+    value = { ...value, priorPrepare: null, prepareSource: null };
+  }
   if (!hasExactKeys(value, RECORD_KEYS) || value.schemaVersion !== SCHEMA_VERSION
     || !TASK_ID.test(value.taskId ?? "") || !COMPONENT_IDS.has(value.componentId)
     || !["promote", "rollback"].includes(value.mode) || !PHASES.includes(value.phase)) {
@@ -229,6 +235,49 @@ function normalizeRecord(value) {
     identities,
     integrities,
   });
+  let priorPrepare = null;
+  let prepareSource = null;
+  if (value.mode === "promote") {
+    if (value.priorPrepare === null && value.prepareSource === null) {
+      // Legacy/imported promotion records did not originate from an archive
+      // prepare claim. New archive prepares always populate both fields.
+    } else if (!(hasExactKeys(value.priorPrepare, [
+      "kind", "taskId", "componentId", "version", "stagingName", "stagingIdentity", "leaseScope", "leaseNonce",
+    ]) || (value.componentId === "v2rayn" && hasExactKeys(value.priorPrepare, [
+      "kind", "taskId", "componentId", "version", "stagingName", "stagingIdentity",
+      "componentRootIdentity", "leaseScope", "leaseNonce",
+    ])))
+      || value.priorPrepare.kind !== "component-prepare"
+      || value.priorPrepare.taskId !== value.taskId
+      || value.priorPrepare.componentId !== value.componentId
+      || value.priorPrepare.version !== versions.incoming
+      || !PREPARE_NAME.test(value.priorPrepare.stagingName ?? "")
+      || value.priorPrepare.leaseScope !== "prepare"
+      || !/^[a-f0-9]{32}$/u.test(value.priorPrepare.leaseNonce ?? "")) {
+      throw journalError("transaction_record_invalid");
+    }
+    if (value.priorPrepare !== null) {
+      const priorIdentity = normalizeIdentity(value.priorPrepare.stagingIdentity);
+      if (Object.hasOwn(value.priorPrepare, "componentRootIdentity")) {
+        normalizeIdentity(value.priorPrepare.componentRootIdentity);
+      }
+      if (!sameIdentity(priorIdentity, identities.incoming)
+      || !hasExactKeys(value.prepareSource, ["name", "path", "identity"])
+      || value.prepareSource.name !== value.priorPrepare.stagingName
+      || value.prepareSource.path !== path.win32.join(rootPath, value.prepareSource.name)
+      || !sameIdentity(normalizeIdentity(value.prepareSource.identity), identities.incoming)) {
+        throw journalError("transaction_record_invalid");
+      }
+      priorPrepare = normalizeJson(value.priorPrepare);
+      prepareSource = {
+        name: value.prepareSource.name,
+        path: value.prepareSource.path,
+        identity: normalizeIdentity(value.prepareSource.identity),
+      };
+    }
+  } else if (value.priorPrepare !== null || value.prepareSource !== null) {
+    throw journalError("transaction_record_invalid");
+  }
   return {
     schemaVersion: SCHEMA_VERSION,
     taskId: value.taskId,
@@ -243,6 +292,8 @@ function normalizeRecord(value) {
     integrities,
     runtimeMetadata,
     ownershipBefore,
+    priorPrepare,
+    prepareSource,
   };
 }
 

@@ -27,6 +27,13 @@ const INSTALL_CAPABILITY = await authorizeInstallRoot({
   maxRelativePath: 180,
   access: async () => {}, realpath: async (value) => value, lstat: async () => directoryStat,
 });
+const SECOND_INSTALL_ROOT = "E:\\CBApps";
+const SECOND_INSTALL_CAPABILITY = await authorizeInstallRoot({
+  candidate: SECOND_INSTALL_ROOT,
+  env: { SystemRoot: "C:\\Windows", ProgramFiles: "C:\\Program Files", USERPROFILE: "C:\\Users\\tester" },
+  maxRelativePath: 180,
+  access: async () => {}, realpath: async (value) => value, lstat: async () => directoryStat,
+});
 const SKILLS_CAPABILITY = await authorizeSkillsRoot({
   candidate: SKILLS_ROOT, realpath: async (value) => value, lstat: async () => directoryStat,
 });
@@ -93,6 +100,8 @@ function fixture({
   onDiscardPreparedSkill = null,
   onAuthenticode = null, onGitPin = null, gitExecutionTimeoutMs = undefined,
   onGitUninstall = null,
+  packageCleanupFailure = null, packageReleaseFailure = null,
+  preparedSkillReconcileOverride = null,
   windowsHostOverride = null,
   initialPreparedSkillSources = [], recoverReservedSkillFromPreparedSource = false,
 } = {}) {
@@ -105,13 +114,15 @@ function fixture({
     gitReleases: [], retained: [], discarded: [],
     gitMutableReleases: [],
     reconciledSkills: [], skillOperations: [],
-    cleanedSkillPackages: [], cleanedSkillStaging: [],
+    cleanedSkillPackages: [], releasedComponentPackages: [], cleanedSkillStaging: [],
     begunSkillSources: [], boundSkillSources: [], discardedSkillSources: [],
     skillRecoveryOrder: [], discardLeaseBusy: [],
+    discardedPreparedVersions: [],
   };
   const archiveReceipts = new WeakSet();
   const packageProofs = new WeakMap();
-  const downloadRecords = new WeakSet();
+  const downloadRecords = new Map();
+  const downloadedFiles = new Set();
   const skillReceipts = new WeakSet();
   const skillCompletionReceipts = new WeakSet();
   const skillProofs = new Map();
@@ -138,7 +149,7 @@ function fixture({
       return {
         nonce, scope,
         async release() {
-          if (released) throw new Error("test_operation_lease_already_released");
+          if (released) throw new Error(`test_operation_lease_already_released:${key}`);
           released = true;
           operationLeases.delete(key);
         },
@@ -227,6 +238,22 @@ function fixture({
   };
   const versionSlots = {
     previousComponents: new Map(),
+    async bindPreparedVersion(plan) {
+      return testOwnershipCoordinator.runExclusive(async (store) => {
+        const next = await store.load();
+        assert.equal(next.activeTask.taskId, plan.taskId);
+        next.activeTask = {
+          ...next.activeTask,
+          stagingIdentity: { volumeSerial: "test", fileId: `${plan.componentId}-${plan.taskId}` },
+        };
+        const saved = await store.save(next);
+        return structuredClone(saved.activeTask);
+      });
+    },
+    async discardPreparedVersion(plan) {
+      calls.discardedPreparedVersions.push(structuredClone(plan));
+      return true;
+    },
     async promotePreparedVersion(plan) {
       calls.promotions.push(plan);
       if (slotFailure) throw slotFailure;
@@ -234,6 +261,15 @@ function fixture({
       const rootPath = plan.componentId === "chatgpt" ? INSTALL_ROOT : path.win32.join(INSTALL_ROOT, "V2RayN");
       assert.equal(plan.rootPath, rootPath);
       const next = await testOwnershipCoordinator.store.load();
+      assert.equal(next.activeTask.kind, "component-prepare");
+      assert.equal(next.activeTask.taskId, plan.taskId);
+      assert.equal(next.activeTask.componentId, plan.componentId);
+      assert.equal(next.activeTask.version, plan.version);
+      assert.equal(next.activeTask.leaseScope, "prepare");
+      assert.equal(next.activeTask.leaseNonce, plan.prepareLeaseNonce);
+      assert.deepEqual(next.activeTask.stagingIdentity, {
+        volumeSerial: "test", fileId: `${plan.componentId}-${plan.taskId}`,
+      });
       this.previousComponents.set(plan.componentId, structuredClone(next.components[plan.componentId] ?? null));
       next.installRoot = INSTALL_ROOT;
       next.components[plan.componentId] = {
@@ -245,6 +281,7 @@ function fixture({
       if (this.previousComponents.get(plan.componentId)) {
         next.rollback = [{ componentId: plan.componentId, path: `${rootPath}\\previous` }];
       }
+      next.activeTask = null;
       await testOwnershipCoordinator.store.save(next);
       return { componentId: plan.componentId, version: plan.version, rollbackAvailable: state.installRoot !== null };
     },
@@ -298,7 +335,12 @@ function fixture({
     async bindPreparedSource(plan) {
       calls.boundSkillSources.push(structuredClone(plan));
       const key = `${plan.taskId}:${plan.skillId}`;
-      preparedSkillSources.set(key, { ...preparedSkillSources.get(key), phase: "bound" });
+      const bound = {
+        ...preparedSkillSources.get(key), phase: "bound",
+        identity: { volumeSerial: "skill-volume", fileId: `skill-${plan.taskId}-${plan.skillId}` },
+      };
+      preparedSkillSources.set(key, bound);
+      return structuredClone(bound);
     },
     async discardPrepared(plan) {
       calls.discardedSkillSources.push(structuredClone(plan));
@@ -315,6 +357,7 @@ function fixture({
       return plan.skillIds.map((skillId) => preparedSkillSources.delete(`${plan.taskId}:${skillId}`));
     },
     async reconcilePreparedSources() {
+      if (preparedSkillReconcileOverride) return preparedSkillReconcileOverride();
       calls.skillRecoveryOrder.push("prepare-reconcile");
       let recovered = 0;
       for (const [key, record] of preparedSkillSources) {
@@ -330,7 +373,10 @@ function fixture({
           await lease.release();
         }
       }
-      return recovered;
+      return {
+        status: preparedSkillSources.size === 0 ? "complete" : "live",
+        cleaned: Array.from({ length: recovered }), live: [], unresolved: [], failed: [],
+      };
     },
     async verifyPreparedSkill(plan) {
       assert.equal(typeof plan.taskId, "string");
@@ -342,6 +388,7 @@ function fixture({
       const boundDownload = packageProofs.get(plan.packageProof);
       assert.equal(downloadRecords.has(boundDownload), true);
       packageProofs.delete(plan.packageProof);
+      downloadedFiles.delete(downloadRecords.get(boundDownload));
       downloadRecords.delete(boundDownload);
       const verificationReceipt = Object.freeze(Object.create(null));
       skillReceipts.add(verificationReceipt);
@@ -468,10 +515,14 @@ function fixture({
     async download(plan) {
       calls.downloads.push(plan);
       await onDownload?.(plan);
+      if ([...downloadRecords.values()].includes(plan.destination)) {
+        throw new Error("test_workspace_download_still_pending");
+      }
       const packageProof = Object.freeze(Object.create(null));
       const downloadRecord = Object.freeze(Object.create(null));
       packageProofs.set(packageProof, downloadRecord);
-      downloadRecords.add(downloadRecord);
+      downloadRecords.set(downloadRecord, plan.destination);
+      downloadedFiles.add(plan.destination);
       return {
         path: plan.destination, size: plan.asset.size, sha256: plan.asset.sha256,
         packageProof, downloadRecord,
@@ -490,8 +541,17 @@ function fixture({
     async cleanupAbandonedPrepare(record) { calls.cleanedSkillStaging.push(record); },
     async cleanupComponentPackage(record) {
       assert.equal(downloadRecords.has(record), true);
+      downloadedFiles.delete(downloadRecords.get(record));
       downloadRecords.delete(record);
       calls.cleanedSkillPackages.push(record);
+      if (packageCleanupFailure) throw packageCleanupFailure;
+    },
+    async releaseComponentPackage(record) {
+      assert.equal(downloadRecords.has(record), true);
+      downloadRecords.delete(record);
+      calls.releasedComponentPackages.push(record);
+      if (typeof packageReleaseFailure === "function") await packageReleaseFailure();
+      else if (packageReleaseFailure) throw packageReleaseFailure;
     },
   };
   const adapterOptions = {
@@ -517,9 +577,20 @@ function fixture({
         compareAndSwap: ownershipStore.compareAndSwap.bind(ownershipStore),
       },
     }),
+    createAdaptersForInstallRoot: (nextInstallRootCapability) => createComponentAdapters({
+      ...adapterOptions, installRootCapability: nextInstallRootCapability,
+      ownershipStore: {
+        acquireOperationLease: ownershipStore.acquireOperationLease.bind(ownershipStore),
+        load: ownershipStore.load.bind(ownershipStore),
+        compareAndSwap: ownershipStore.compareAndSwap.bind(ownershipStore),
+      },
+    }),
     reconcilePreparedSkillSources: () => skillFiles.reconcilePreparedSources(),
     preparedSkillSourceCount: () => preparedSkillSources.size,
-    simulateProcessCrash: () => operationLeases.clear(),
+    simulateProcessCrash: () => {
+      operationLeases.clear();
+      downloadRecords.clear();
+    },
   };
 }
 
@@ -770,17 +841,20 @@ test("raw context catalog and path injection fails before ownership or download"
   assert.deepEqual(calls.downloads, []);
 });
 
-test("ChatGPT uses CBApps c/cp/ct directly and consumes the archive receipt in persistent slots", async () => {
+test("ChatGPT prepares in a task-unique directory and still commits to fixed c/cp slots", async () => {
   const { adapters, calls, getState } = fixture();
   assert.equal((await adapters.chatgpt.prepare({ taskId: "chat" })).status, "succeeded");
-  assert.equal(calls.extracts[0].destination, "D:\\CBApps\\ct");
+  const stagingRoot = calls.extracts[0].destination;
+  assert.match(stagingRoot, /^D:\\CBApps\\\.codexbridge-prepare-[a-f0-9]{32}$/u);
+  assert.deepEqual(calls.extracts[0].destinationIdentity, getState().activeTask.stagingIdentity);
   assert.deepEqual(calls.verified[0], {
     kind: "component",
     componentId: "chatgpt",
     phase: "staging",
-    rootPath: "D:\\CBApps\\ct",
-    entrypointPath: "D:\\CBApps\\ct\\ChatGPT.exe",
-    requiredFiles: ["D:\\CBApps\\ct\\ChatGPT.exe"],
+    stagingName: getState().activeTask.stagingName,
+    rootPath: stagingRoot,
+    entrypointPath: `${stagingRoot}\\ChatGPT.exe`,
+    requiredFiles: [`${stagingRoot}\\ChatGPT.exe`],
     expectedVersion: "2.0.0",
     expectedPackageSha256: DIGEST_A,
     packageProof: calls.verified[0].packageProof,
@@ -798,6 +872,204 @@ test("ChatGPT uses CBApps c/cp/ct directly and consumes the archive receipt in p
     expectedVersion: "2.0.0",
   });
   assert.equal(getState().components.chatgpt.installPath, "D:\\CBApps\\c");
+});
+
+test("archive prepare closes and deletes each exact package on success or verification failure", async () => {
+  const successful = fixture();
+  assert.equal((await successful.adapters.chatgpt.prepare({ taskId: "archive-clean-1" })).status, "succeeded");
+  assert.equal(successful.calls.cleanedSkillPackages.length, 1);
+  const another = fixture();
+  assert.equal((await another.adapters.chatgpt.prepare({ taskId: "archive-clean-2" })).status, "succeeded");
+  assert.equal(another.calls.cleanedSkillPackages.length, 1);
+
+  const failed = fixture({
+    onVerifyComponent: async () => {
+      throw Object.assign(new Error("test_archive_verify_failed"), { code: "test_archive_verify_failed" });
+    },
+  });
+  const result = await failed.adapters.v2rayn.prepare({ taskId: "archive-clean-failed" });
+  assert.equal(result.status, "failed");
+  assert.match(result.message, /test_archive_verify_failed/u);
+  assert.equal(failed.calls.cleanedSkillPackages.length, 1);
+});
+
+test("a live archive prepare cannot be discarded by another process and its owner still commits", async () => {
+  const harness = fixture();
+  const owner = harness.adapters;
+  const contender = harness.createAnotherProcessAdapters();
+  assert.equal((await owner.chatgpt.prepare({ taskId: "archive-live-owner" })).status, "succeeded");
+  assert.equal(harness.getState().activeTask.taskId, "archive-live-owner");
+
+  const blocked = await contender.chatgpt.prepare({ taskId: "archive-live-contender" });
+  assert.equal(blocked.status, "failed");
+  assert.match(blocked.message, /component_pending_transaction|component_install_root_not_owned/u);
+  assert.equal(harness.calls.discardedPreparedVersions.length, 0);
+
+  const committed = await owner.chatgpt.commit({ taskId: "archive-live-owner" });
+  assert.equal(committed.status, "succeeded", committed.message);
+  assert.equal(harness.getState().components.chatgpt.version, "2.0.0");
+});
+
+test("a dead archive prepare is discarded under its old claim before a new prepare retries", async () => {
+  const harness = fixture();
+  assert.equal((await harness.adapters.v2rayn.prepare({ taskId: "archive-dead-owner" })).status, "succeeded");
+  const abandoned = structuredClone(harness.getState().activeTask);
+  harness.simulateProcessCrash();
+
+  const restarted = harness.createAnotherProcessAdapters();
+  const retried = await restarted.v2rayn.prepare({ taskId: "archive-after-crash" });
+  assert.equal(retried.status, "succeeded", retried.message);
+  assert.deepEqual(harness.calls.discardedPreparedVersions, [{
+    componentId: "v2rayn", taskId: abandoned.taskId, leaseNonce: abandoned.leaseNonce,
+  }]);
+  assert.equal(harness.getState().activeTask.taskId, "archive-after-crash");
+});
+
+test("archive extraction failure discards only its bound staging before the next prepare", async () => {
+  let extractFailures = 1;
+  const harness = fixture({
+    onExtract: async () => {
+      if (extractFailures > 0) { extractFailures -= 1; throw new Error("partial_archive_write_failed"); }
+    },
+  });
+  const failed = await harness.adapters.chatgpt.prepare({ taskId: "archive-partial" });
+  assert.equal(failed.status, "failed");
+  assert.match(failed.message, /partial_archive_write_failed/u);
+  assert.equal(harness.calls.discardedPreparedVersions.length, 1);
+  assert.equal(harness.getState().activeTask, null);
+
+  const retried = await harness.createAnotherProcessAdapters().chatgpt.prepare({ taskId: "archive-partial-retry" });
+  assert.equal(retried.status, "succeeded", retried.message);
+});
+
+test("Git prepare hands the installer from workspace authority to its independent pin and releases failures", async () => {
+  const successful = fixture({ gitDiscovery: { kind: "none" } });
+  assert.equal((await successful.adapters.git.prepare({ taskId: "git-handoff-1", selected: true })).status, "succeeded");
+  assert.equal(successful.calls.releasedComponentPackages.length, 1);
+  assert.equal(successful.calls.cleanedSkillPackages.length, 0);
+  const another = fixture({ gitDiscovery: { kind: "none" } });
+  assert.equal((await another.adapters.git.prepare({ taskId: "git-handoff-2", selected: true })).status, "succeeded");
+  assert.equal(another.calls.releasedComponentPackages.length, 1);
+  assert.equal(another.calls.downloads.length, 1);
+  assert.equal(another.calls.gitPins[0].installerPath, "D:\\CBApps\\downloads\\git-2.51.0.exe");
+  assert.equal(another.calls.gitPins[0].installerSha256, DIGEST_A);
+
+  const failed = fixture({
+    gitDiscovery: { kind: "none" },
+    onGitPin: async () => {
+      throw Object.assign(new Error("test_git_pin_failed"), { code: "test_git_pin_failed" });
+    },
+  });
+  const result = await failed.adapters.git.prepare({ taskId: "git-handoff-failed", selected: true });
+  assert.equal(result.status, "failed");
+  assert.match(result.message, /test_git_pin_failed/u);
+  assert.equal(failed.calls.cleanedSkillPackages.length, 1);
+  assert.equal(failed.calls.releasedComponentPackages.length, 0);
+});
+
+test("Git close-only failure keeps root ownership and a rebuilt adapter safely adopts the same verified installer", async () => {
+  let releaseFailures = 1;
+  const harness = fixture({
+    gitDiscovery: { kind: "none" },
+    packageReleaseFailure: async () => {
+      if (releaseFailures > 0) {
+        releaseFailures -= 1;
+        throw Object.assign(new Error("test_workspace_close_failed"), { code: "test_workspace_close_failed" });
+      }
+    },
+  });
+  const first = await harness.adapters.git.prepare({ taskId: "git-close-failed", selected: true });
+  assert.equal(first.status, "failed");
+  assert.match(first.message, /test_workspace_close_failed/u);
+  assert.equal(harness.getState().installRoot, INSTALL_ROOT);
+  assert.equal(harness.getState().activeTask.taskId, "git-close-failed");
+
+  const restarted = harness.createAnotherAdapters();
+  const retried = await restarted.git.prepare({ taskId: "git-close-retry", selected: true });
+  assert.equal(retried.status, "succeeded", retried.message);
+  assert.equal(harness.calls.downloads.length, 2);
+  assert.equal(harness.calls.gitPins.length, 2);
+  assert.equal(harness.getState().activeTask.taskId, "git-close-retry");
+  assert.equal(harness.getState().installRoot, INSTALL_ROOT);
+});
+
+test("a failed Git commit can safely reprepare the retained same-version installer", async () => {
+  const harness = fixture({
+    gitDiscovery: { kind: "none" },
+    gitInstallFailure: Object.assign(new Error("test_git_commit_failed"), { code: "test_git_commit_failed" }),
+  });
+  assert.equal((await harness.adapters.git.prepare({ taskId: "git-commit-first", selected: true })).status, "succeeded");
+  assert.equal((await harness.adapters.git.commit({ taskId: "git-commit-first" })).status, "failed");
+  const retried = await harness.createAnotherAdapters().git.prepare({
+    taskId: "git-commit-retry", selected: true,
+  });
+  assert.equal(retried.status, "succeeded", retried.message);
+  assert.equal(harness.calls.downloads.length, 2);
+  assert.equal(harness.calls.gitPins.length >= 2, true);
+});
+
+test("a live Git prepare pins its exact root until the owner atomically starts and commits", async () => {
+  const installed = {
+    ...externalGit, version: "2.51.0", installDir: "D:\\CBApps\\Git",
+    executablePath: "D:\\CBApps\\Git\\cmd\\git.exe", uninstallerPath: "D:\\CBApps\\Git\\unins000.exe",
+  };
+  const harness = fixture({
+    gitDiscoveries: [{ kind: "none" }, { kind: "none" }, installed], gitDiscovery: installed,
+  });
+  assert.equal((await harness.adapters.git.prepare({ taskId: "git-root-a", selected: true })).status, "succeeded");
+  const rootB = harness.createAdaptersForInstallRoot(SECOND_INSTALL_CAPABILITY);
+  const blocked = await rootB.chatgpt.prepare({ taskId: "chat-root-b" });
+  assert.equal(blocked.status, "failed");
+  assert.match(blocked.message, /component_pending_transaction|component_install_root_not_owned/u);
+  assert.equal(harness.getState().installRoot, INSTALL_ROOT);
+
+  const committed = await harness.adapters.git.commit({ taskId: "git-root-a" });
+  assert.equal(committed.status, "succeeded", committed.message);
+  assert.equal(harness.getState().components.git.installPath, "D:\\CBApps\\Git");
+});
+
+test("a dead Git prepare releases its old root before another process prepares on a new root", async () => {
+  const harness = fixture({ gitDiscovery: { kind: "none" } });
+  assert.equal((await harness.adapters.git.prepare({ taskId: "git-dead-root-a", selected: true })).status, "succeeded");
+  harness.simulateProcessCrash();
+
+  const rootB = harness.createAdaptersForInstallRoot(SECOND_INSTALL_CAPABILITY);
+  const retried = await rootB.git.prepare({ taskId: "git-root-b", selected: true });
+  assert.equal(retried.status, "succeeded", retried.message);
+  assert.equal(harness.getState().installRoot, SECOND_INSTALL_ROOT);
+  assert.equal(harness.getState().activeTask.taskId, "git-root-b");
+});
+
+test("Git prepare recovers after a process dies during download or identity pin", async (t) => {
+  for (const phase of ["download", "pin"]) {
+    await t.test(phase, async () => {
+      let enteredResolve;
+      let releaseResolve;
+      let calls = 0;
+      const entered = new Promise((resolve) => { enteredResolve = resolve; });
+      const blocked = new Promise((resolve) => { releaseResolve = resolve; });
+      const pause = async () => {
+        calls += 1;
+        if (calls === 1) { enteredResolve(); await blocked; }
+      };
+      const harness = fixture({
+        gitDiscovery: { kind: "none" },
+        ...(phase === "download" ? { onDownload: pause } : { onGitPin: pause }),
+      });
+      const abandoned = harness.adapters.git.prepare({ taskId: `git-${phase}-crash`, selected: true });
+      await entered;
+      harness.simulateProcessCrash();
+
+      const recovered = await harness.createAnotherProcessAdapters().git.prepare({
+        taskId: `git-${phase}-recovered`, selected: true,
+      });
+      assert.equal(recovered.status, "succeeded", recovered.message);
+      assert.equal(harness.getState().activeTask.taskId, `git-${phase}-recovered`);
+
+      releaseResolve();
+      assert.equal((await abandoned).status, "failed");
+    });
+  }
 });
 
 test("prepare or download failure never persists the selected install root", async () => {
@@ -1091,6 +1363,80 @@ test("external Git update pins installer, registered root, git.exe and uninstall
   assert.deepEqual(calls.shortcuts, []);
 });
 
+test("external Git success and crash recovery release only a transient install root", async (t) => {
+  await t.test("success", async () => {
+    const harness = fixture({ gitDiscovery: externalGit });
+    assert.equal((await harness.adapters.git.prepare({ taskId: "external-root-success", selected: true })).status, "succeeded");
+    const committed = await harness.adapters.git.commit({ taskId: "external-root-success" });
+    assert.equal(committed.status, "succeeded", committed.message);
+    assert.equal(harness.getState().installRoot, null);
+  });
+
+  await t.test("crash recovery", async () => {
+    const updated = { ...externalGit, version: "2.51.0" };
+    let enteredResolve;
+    let releaseResolve;
+    const entered = new Promise((resolve) => { enteredResolve = resolve; });
+    const blocked = new Promise((resolve) => { releaseResolve = resolve; });
+    const harness = fixture({
+      gitDiscoveries: [externalGit, externalGit, updated], gitDiscovery: updated,
+      onGitInstall: async () => { enteredResolve(); await blocked; },
+    });
+    assert.equal((await harness.adapters.git.prepare({ taskId: "external-root-crash", selected: true })).status, "succeeded");
+    const abandoned = harness.adapters.git.commit({ taskId: "external-root-crash" });
+    await entered;
+    harness.simulateProcessCrash();
+    const inspected = await harness.createAnotherProcessAdapters().git.inspectInstalled({});
+    assert.equal(inspected.status, "succeeded", inspected.message);
+    assert.equal(harness.getState().installRoot, null);
+    releaseResolve();
+    assert.equal((await abandoned).status, "failed");
+  });
+
+  await t.test("managed ownership retained", async () => {
+    const state = emptyState(INSTALL_ROOT);
+    state.components.chatgpt = { managed: true, installPath: "D:\\CBApps\\c", version: "1.0.0" };
+    const harness = fixture({ state, gitDiscovery: externalGit });
+    assert.equal((await harness.adapters.git.prepare({ taskId: "external-root-owned", selected: true })).status, "succeeded");
+    assert.equal((await harness.adapters.git.commit({ taskId: "external-root-owned" })).status, "succeeded");
+    assert.equal(harness.getState().installRoot, INSTALL_ROOT);
+  });
+});
+
+test("managed Git crash before first installer mutation releases only an otherwise transient root", async (t) => {
+  for (const scenario of ["empty", "owned"]) {
+    await t.test(scenario, async () => {
+      let enteredResolve;
+      let releaseResolve;
+      const entered = new Promise((resolve) => { enteredResolve = resolve; });
+      const blocked = new Promise((resolve) => { releaseResolve = resolve; });
+      const state = emptyState(scenario === "owned" ? INSTALL_ROOT : null);
+      if (scenario === "owned") {
+        state.components.chatgpt = {
+          managed: true, installPath: `${INSTALL_ROOT}\\c`, version: "1.0.0",
+          entrypointPath: `${INSTALL_ROOT}\\c\\ChatGPT.exe`,
+          requiredFiles: [`${INSTALL_ROOT}\\c\\ChatGPT.exe`],
+        };
+      }
+      const harness = fixture({
+        state, gitDiscovery: { kind: "none" },
+        onGitInstall: async () => { enteredResolve(); await blocked; },
+      });
+      assert.equal((await harness.adapters.git.prepare({
+        taskId: `managed-root-${scenario}`, selected: true,
+      })).status, "succeeded");
+      const abandoned = harness.adapters.git.commit({ taskId: `managed-root-${scenario}` });
+      await entered;
+      harness.simulateProcessCrash();
+      const inspected = await harness.createAnotherProcessAdapters().git.inspectInstalled({});
+      assert.notEqual(inspected.status, "failed", inspected.message);
+      assert.equal(harness.getState().installRoot, scenario === "owned" ? INSTALL_ROOT : null);
+      releaseResolve();
+      await abandoned;
+    });
+  }
+});
+
 test("external Git target change between prepare and commit is blocked before installer execution", async () => {
   const changed = { ...externalGit, installDir: "E:\\Git", executablePath: "E:\\Git\\cmd\\git.exe", uninstallerPath: "E:\\Git\\unins000.exe" };
   const { adapters, calls } = fixture({ gitDiscoveries: [externalGit, changed], gitDiscovery: changed });
@@ -1148,7 +1494,7 @@ test("a third managed Git update reports cleanup persistence failure and recover
     executablePath: state.components.git.executablePath, uninstallerPath: state.components.git.uninstallerPath };
   const installed = { ...current, version: "2.51.0" };
   const { adapters, calls, getState } = fixture({
-    state, gitDiscoveries: [current, current, installed], gitDiscovery: installed, stateSaveFailureAt: 5,
+    state, gitDiscoveries: [current, current, installed], gitDiscovery: installed, stateSaveFailureAt: 4,
   });
   const prepared = await adapters.git.prepare({ taskId: "git-third", selected: true });
   assert.equal(prepared.status, "succeeded");
@@ -1178,7 +1524,7 @@ test("managed Git adopts a completed fixed-target install after the final owners
   };
   const current = { ...installed, version: "2.50.0" };
   const { adapters, calls, getState } = fixture({
-    state, gitDiscoveries: [current, current, installed], gitDiscovery: installed, stateSaveFailureAt: 4,
+    state, gitDiscoveries: [current, current, installed], gitDiscovery: installed, stateSaveFailureAt: 3,
   });
   await adapters.git.prepare({ taskId: "git-adopt", selected: true });
   const committed = await adapters.git.commit({ taskId: "git-adopt" });
@@ -1558,6 +1904,8 @@ test("managed Git uninstall is recovered when deletion completed before ownershi
 test("Skill replacement consumes a source receipt, reserves ownership, and adopts the new version after save failure", async () => {
   const { adapters, calls, getState } = fixture({ stateSaveFailureAt: 4 });
   assert.equal((await adapters.skills.prepare({ taskId: "skills", skillIds: ["documents"] }))[0].status, "succeeded");
+  assert.equal(getState().activeTask, null);
+  assert.equal(getState().installRoot, INSTALL_ROOT);
   const committed = await adapters.skills.commit({ taskId: "skills", skillIds: ["documents"] });
   assert.equal(committed[0].status, "succeeded");
   assert.equal(calls.replacedSkills[0].target, "C:\\Users\\tester\\.codex\\skills\\documents");
@@ -1761,6 +2109,55 @@ test("reserved Skill recovery safely clears a pre-mutation failure after verifyi
   assert.equal(getState().activeTask, null);
 });
 
+test("first-install reserved Skill abort releases its transient root after a complete prepared-source rescan", async () => {
+  const state = emptyState(null);
+  state.activeTask = {
+    kind: "skill-replace", phase: "reserved", taskId: "skill-first-abort", swapId: "4".repeat(32), skillId: "documents",
+    installRoot: INSTALL_ROOT, leaseScope: "prepare", leaseNonce: "a".repeat(32),
+    skillsRoot: SKILLS_ROOT, target: `${SKILLS_ROOT}\\documents`, version: "1.0.0",
+    packageSha256: DIGEST_B, skillMdSha256: SKILL_HASH, treeDigest: DIGEST_A, manifestDigest: DIGEST_B,
+    previousEvidence: { kind: "absent" },
+  };
+  const { adapters, getState } = fixture({ state });
+  const inspected = await adapters.skills.inspectInstalled({ skillIds: ["documents"] });
+  assert.equal(inspected[0].status, "skipped", JSON.stringify(inspected[0]));
+  assert.equal(getState().activeTask, null);
+  assert.equal(getState().installRoot, null);
+  assert.equal(getState().lastTask.action, "skill-replace-aborted");
+});
+
+test("Skill prepared-source reconciliation failure is reported and retains transient root ownership", async () => {
+  const recoveryError = Object.assign(new Error("prepared_recovery_failed"), { code: "prepared_recovery_failed" });
+  const { adapters, getState } = fixture({
+    state: emptyState(INSTALL_ROOT),
+    preparedSkillReconcileOverride: async () => ({
+      status: "failed", cleaned: [], live: [], unresolved: [], failed: [{ error: recoveryError }],
+    }),
+  });
+  const inspected = await adapters.skills.inspectInstalled({ skillIds: ["documents"] });
+  assert.equal(inspected[0].status, "failed");
+  assert.match(inspected[0].message, /prepared_recovery_failed/u);
+  const prepared = await adapters.skills.prepare({ taskId: "reconcile-failed", skillIds: ["documents"] });
+  assert.equal(prepared[0].status, "failed");
+  assert.match(prepared[0].message, /prepared_recovery_failed/u);
+  assert.equal(getState().installRoot, INSTALL_ROOT);
+});
+
+test("live Skill prepared source retains transient root and does not race cleanup", async () => {
+  let scans = 0;
+  const { adapters, getState } = fixture({
+    state: emptyState(INSTALL_ROOT),
+    preparedSkillReconcileOverride: async () => {
+      scans += 1;
+      return { status: "live", cleaned: [], live: [{ taskId: "live" }], unresolved: [], failed: [] };
+    },
+  });
+  const inspected = await adapters.skills.inspectInstalled({ skillIds: ["documents"] });
+  assert.equal(inspected[0].status, "skipped");
+  assert.equal(scans, 1);
+  assert.equal(getState().installRoot, INSTALL_ROOT);
+});
+
 test("Skills are independent and an unsigned ID cannot mutate a sibling or the root", async () => {
   const { adapters, calls } = fixture();
   const prepared = await adapters.skills.prepare({ taskId: "skills-batch", skillIds: ["documents", "unsigned"] });
@@ -1877,13 +2274,14 @@ test("Skill owner keeps its prepare lease until exact discard finishes", async (
     taskId: "lease-discard", skillIds: ["documents"],
   });
   await entered;
-  assert.equal(await shared.reconcilePreparedSkillSources(), 0);
+  assert.equal((await shared.reconcilePreparedSkillSources()).status, "live");
   assert.equal(shared.preparedSkillSourceCount(), 1);
   assert.equal(shared.calls.discardedSkillSources.some((item) => item.recovery === true), false);
 
   cleanupResolve();
   assert.deepEqual(await discarding, [true]);
   assert.equal(shared.preparedSkillSourceCount(), 0);
+  assert.equal(shared.getState().installRoot, null);
   assert.deepEqual(shared.calls.discardLeaseBusy, [true]);
   assert.equal(shared.calls.discardedSkillSources.filter((item) => item.recovery === true).length, 0);
 });

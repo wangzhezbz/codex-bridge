@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import path from "node:path";
-import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 
 import { TEST_CATALOG_ORIGIN, TEST_CATALOG_PATH } from "../../shared/software-manager/catalog-schema.mjs";
@@ -9,12 +8,16 @@ import { createArchiveService } from "./archive-service.mjs";
 import { createCatalogCache } from "./catalog-cache.mjs";
 import { createCapabilityRecordStore } from "./capability-record-store.mjs";
 import { createCachedCatalogProvider } from "./catalog-provider.mjs";
-import { createComponentAdapters, recoverSkillOwnershipOffline } from "./component-adapters.mjs";
+import { createComponentAdapters } from "./component-adapters.mjs";
 import { createComponentFileService } from "./component-files.mjs";
 import { createDownloadManager } from "./download-manager.mjs";
 import { createGitIdentityCapabilities } from "./git-identity-capabilities.mjs";
 import { createInstallRootResolver } from "./install-root-resolver.mjs";
-import { getOwnershipCoordinator } from "./ownership-coordinator.mjs";
+import { createLazyShortcutFileApi } from "./lazy-shortcut-file-api.mjs";
+import {
+  createPinnedSevenZipExecution,
+  hashPinnedFile,
+} from "./pinned-sevenzip-execution.mjs";
 import { createInstallerWorkspace } from "./installer-workspace.mjs";
 import { recoverOffline as recoverLocalTransactions } from "./offline-recovery.mjs";
 import {
@@ -25,10 +28,11 @@ import {
   resolveSkillTarget,
 } from "./path-policy.mjs";
 import { createRetainedInstallerStore } from "./retained-installer-store.mjs";
+import { createDefaultSkillRecoveryHooks } from "./skill-recovery-hooks.mjs";
 import { deleteAuthorizedTree } from "./safe-delete.mjs";
 import { createSoftwareManagerService } from "./service.mjs";
-import { createPreparedSkillRecovery, createSkillFileService } from "./skill-files.mjs";
-import { createSkillPrepareJournal, inferPreparedSkillInstallRoot } from "./skill-prepare-journal.mjs";
+import { createSkillFileService } from "./skill-files.mjs";
+import { createSkillPrepareJournal } from "./skill-prepare-journal.mjs";
 import { createSkillSwapJournal } from "./skill-swap-journal.mjs";
 import { createOwnershipStore } from "./state-store.mjs";
 import { createTransactionJournal } from "./transaction-journal.mjs";
@@ -144,7 +148,7 @@ function createBoundedLogSink(store) {
   });
 }
 
-export function bundledSevenZipPath() {
+function bundledSevenZipPath() {
   const packageEntry = createRequire(import.meta.url).resolve("7zip-bin");
   return path.win32.join(path.win32.dirname(packageEntry), "win", process.arch, "7za.exe");
 }
@@ -161,145 +165,6 @@ function fixedSevenZip(rawPath) {
   return Object.freeze({ sevenZipPath, sevenZipSha256: sha256 });
 }
 
-async function hashPinnedFile(fileCapabilities, filePath, maxBytes = 16 * 1_024 * 1_024) {
-  const pin = await fileCapabilities.pinArchiveFileNoFollow(filePath);
-  if (!pin || typeof pin.assertStableNoFollow !== "function" || typeof pin.close !== "function") {
-    throw runtimeError("software_manager_file_pin_invalid");
-  }
-  let primaryError = null;
-  let digest;
-  try {
-    await pin.assertStableNoFollow();
-    const handle = await fsPromises.open(filePath, "r");
-    try {
-      const hash = createHash("sha256");
-      let total = 0;
-      for await (const chunk of handle.createReadStream()) {
-        total += chunk.length;
-        if (!Number.isSafeInteger(total) || total > maxBytes) throw runtimeError("software_manager_file_too_large");
-        hash.update(chunk);
-      }
-      digest = hash.digest("hex");
-    } finally { await handle.close(); }
-    await pin.assertStableNoFollow();
-  } catch (error) { primaryError = error; }
-  if (primaryError) { await pin.close().catch(() => {}); throw primaryError; }
-  return { digest, pin };
-}
-
-export function createPinnedSevenZipExecution({ fileCapabilities, sevenZipPath, sevenZipSha256, execFile, spawn }) {
-  const run = requireMethod({ execFile }, "execFile", "software_manager_exec_file_required");
-  const start = requireMethod({ spawn }, "spawn", "software_manager_spawn_required");
-  async function pin() {
-    const pinned = await hashPinnedFile(fileCapabilities, sevenZipPath);
-    if (pinned.digest !== sevenZipSha256) {
-      await pinned.pin.close().catch(() => {});
-      throw runtimeError("software_manager_7z_hash_mismatch");
-    }
-    return pinned.pin;
-  }
-  async function closeAfterCompletion(completed, held) {
-    let result;
-    let primaryError = null;
-    try { result = await completed; } catch (error) { primaryError = error; }
-    let closeError = null;
-    try { await held.close(); } catch (error) { closeError = error; }
-    if (primaryError && closeError) {
-      throw new AggregateError([primaryError, closeError], primaryError.message, { cause: primaryError });
-    }
-    if (primaryError) throw primaryError;
-    if (closeError) throw closeError;
-    return result;
-  }
-  async function settleInvalidChild(child, held, primaryError, { cancel = null, completed = null } = {}) {
-    const errors = [primaryError];
-    try {
-      if (typeof cancel === "function") await cancel.call(child);
-    } catch (error) { errors.push(error); }
-    if (completed && typeof completed.then === "function") {
-      let timer = null;
-      try {
-        await Promise.race([
-          Promise.resolve(completed).catch(() => {}),
-          new Promise((resolve) => { timer = setTimeout(resolve, 250); }),
-        ]);
-      } finally { if (timer !== null) clearTimeout(timer); }
-    }
-    try { await held.close(); } catch (error) { errors.push(error); }
-    if (errors.length > 1) throw new AggregateError(errors, primaryError.message, { cause: primaryError });
-    throw primaryError;
-  }
-  return Object.freeze({
-    async spawnFile(file, args, options) {
-      if (file !== sevenZipPath) throw runtimeError("software_manager_7z_path_rejected");
-      const held = await pin();
-      return closeAfterCompletion(Promise.resolve().then(() => run(file, args, options)), held);
-    },
-    async spawnStream(file, args, options) {
-      if (file !== sevenZipPath) throw runtimeError("software_manager_7z_path_rejected");
-      const held = await pin();
-      let child;
-      try { child = await start(file, args, options); }
-      catch (error) { await held.close().catch(() => {}); throw error; }
-      let stdout;
-      let stderr;
-      let completed;
-      let cancel;
-      try {
-        stdout = child?.stdout;
-        stderr = child?.stderr;
-        completed = child?.completed;
-        cancel = child?.cancel;
-      } catch (error) {
-        return settleInvalidChild(
-          child, held, runtimeError("software_manager_spawn_result_invalid", error), { cancel, completed },
-        );
-      }
-      if (!child || typeof child !== "object" || !stdout || typeof stdout.pipe !== "function"
-        || !stderr || typeof stderr[Symbol.asyncIterator] !== "function"
-        || !completed || typeof completed.then !== "function" || typeof cancel !== "function") {
-        return settleInvalidChild(
-          child, held, runtimeError("software_manager_spawn_result_invalid"), { cancel, completed },
-        );
-      }
-      return Object.freeze({
-        stdout,
-        stderr,
-        cancel: cancel.bind(child),
-        completed: closeAfterCompletion(Promise.resolve(completed), held),
-      });
-    },
-  });
-}
-
-export function createLazyShortcutFileApi({ getDesktopCapability, fileCapabilities } = {}) {
-  const getCapability = requireMethod({ getDesktopCapability }, "getDesktopCapability", "desktop_capability_provider_required");
-  const createApi = requireMethod(fileCapabilities, "createShortcutFileApi", "shortcut_file_capability_invalid");
-  const methods = [
-    "inspectExact", "createTemp", "sealTemp", "commitNoReplace",
-    "removeTemp", "removeExact", "release",
-  ];
-  let apiPromise = null;
-  async function getApi() {
-    if (apiPromise === null) {
-      const operation = Promise.resolve().then(getCapability).then(createApi);
-      apiPromise = operation;
-      operation.catch(() => {
-        if (apiPromise === operation) apiPromise = null;
-      });
-    }
-    return apiPromise;
-  }
-  return Object.freeze(Object.fromEntries(methods.map((name) => [name, async (...args) => {
-    const api = await getApi();
-    try { return await requireMethod(api, name, "shortcut_file_capability_invalid")(...args); }
-    catch (error) {
-      apiPromise = null;
-      throw error;
-    }
-  }])));
-}
-
 function createWorkspaceDownloader({ workspace, downloadManager, catalogService }) {
   return Object.freeze({
     async download({ asset, destination, signal, onProgress }) {
@@ -309,164 +174,32 @@ function createWorkspaceDownloader({ workspace, downloadManager, catalogService 
         destination.endsWith(`\\skill-${entry.id}-${entry.version}.zip`)
       ));
       if (!component && !skill) throw runtimeError("software_manager_download_destination_invalid");
-      const record = component
-        ? await workspace.prepareDownloadFile({
-          componentId: component.id, version: component.version, extension: `.${component.format}`,
-          size: component.size, sha256: component.sha256,
-        })
-        : await workspace.prepareSkillDownloadFile({
-          skillId: skill.id, version: skill.version, size: skill.size, sha256: skill.sha256,
-        });
-      if (record.path !== destination || asset.url !== (component ?? skill).assetUrl
-        || asset.size !== record.size || asset.sha256 !== record.sha256) {
-        throw runtimeError("software_manager_download_binding_invalid");
-      }
-      const receipt = await workspace.downloadPrepared(record, { asset, signal, onProgress });
-      return record.promotePartNoReplace(receipt);
-    },
-  });
-}
-
-export function createDefaultSkillRecoveryHooks({
-  fileCapabilities, ownershipStore, dataRoot, skillsRoot,
-  skillPathAccess = { realpath: fsPromises.realpath, lstat: fsPromises.lstat },
-} = {}) {
-  const skillSwapDirectory = path.win32.join(dataRoot, "skill-swaps");
-  const skillPrepareDirectory = path.win32.join(dataRoot, "skill-prepares");
-  function createRecoverySkillFiles({ installRootCapability, skillsRootCapability }) {
-    const installRoot = readInstallRootCapability(installRootCapability);
-    return createSkillFileService({
-      fileCapabilities, installRootCapability, skillsRootCapability,
-      catalogService: null, workspace: null,
-      swapJournal: createSkillSwapJournal({ journalDir: skillSwapDirectory, fsApi: fileCapabilities, skillsRoot }),
-      prepareJournal: createSkillPrepareJournal({
-        journalDir: skillPrepareDirectory, fsApi: fileCapabilities, installRoot,
-      }),
-      prepareLeaseStore: ownershipStore, hashFile: null, recoveryOnly: true,
-    });
-  }
-  async function inferSkillInstallRoot(ownership) {
-    const task = ownership?.activeTask;
-    if (!task || !["skill-replace", "skill-uninstall", "skill-prepare"].includes(task.kind)) return null;
-    if (typeof task.taskId !== "string" || typeof task.skillId !== "string") {
-      throw runtimeError("software_manager_skill_recovery_record_invalid");
-    }
-    const preparedRoot = await inferPreparedSkillInstallRoot({
-      journalDir: skillPrepareDirectory, fsApi: fileCapabilities, taskId: task.taskId, skillId: task.skillId,
-    });
-    if (task.kind !== "skill-replace") return preparedRoot;
-    const claimRoot = requireWindowsPath(task.installRoot, "software_manager_skill_recovery_record_invalid");
-    if (preparedRoot !== null && preparedRoot.toLowerCase() !== claimRoot.toLowerCase()) {
-      throw runtimeError("software_manager_skill_recovery_record_invalid");
-    }
-    if (typeof task.swapId !== "string" || task.skillsRoot !== skillsRoot) {
-      throw runtimeError("software_manager_skill_recovery_record_invalid");
-    }
-    const transaction = await createSkillSwapJournal({
-      journalDir: skillSwapDirectory, fsApi: fileCapabilities, skillsRoot,
-    }).load({ taskId: task.taskId, swapId: task.swapId });
-    if (!transaction) return claimRoot;
-    if (transaction.snapshot.leaseScope !== task.leaseScope
-      || transaction.snapshot.leaseNonce !== task.leaseNonce) {
-      throw runtimeError("software_manager_skill_recovery_record_invalid");
-    }
-    const suffix = path.win32.join("staging", `task-${task.taskId}`, `skill-${task.skillId}.prepare`);
-    const sourcePath = transaction.snapshot.sourcePath;
-    if (typeof sourcePath !== "string" || !sourcePath.endsWith(`\\${suffix}`)) {
-      throw runtimeError("software_manager_skill_recovery_record_invalid");
-    }
-    const swapRoot = sourcePath.slice(0, -(suffix.length + 1));
-    if (swapRoot.toLowerCase() !== claimRoot.toLowerCase()) {
-      throw runtimeError("software_manager_skill_recovery_record_invalid");
-    }
-    return claimRoot;
-  }
-  async function cleanupAbandonedPreparedSkills({ installRootCapability, heldLease = null }) {
-    const installRoot = readInstallRootCapability(installRootCapability);
-    let result;
-    let primaryError = null;
-    try {
-      await createPreparedSkillRecovery({
-        fileCapabilities, installRootCapability,
-        prepareJournal: createSkillPrepareJournal({
-          journalDir: skillPrepareDirectory, fsApi: fileCapabilities, installRoot,
-        }),
-        prepareLeaseStore: ownershipStore,
-      }).reconcilePreparedSources({ heldLease });
-      const coordinator = getOwnershipCoordinator(ownershipStore);
-      result = await coordinator.runExclusive(async (store) => {
-      const current = await store.load();
-      const task = current.activeTask;
-      const isSkillPrepare = task?.kind === "skill-prepare"
-        || (task?.kind === "legacy-abandoned-prepare" && task.originalKind === "skill-prepare");
-      if (!isSkillPrepare) return current;
-      if (task.kind !== "legacy-abandoned-prepare"
-        && (typeof task.leaseNonce !== "string" || typeof task.leaseScope !== "string")) {
-        throw runtimeError("software_manager_skill_prepare_claim_invalid");
-      }
-      const lease = task.kind === "legacy-abandoned-prepare" ? { async release() {} }
-        : await ownershipStore.acquireOperationLease({ nonce: task.leaseNonce, scope: task.leaseScope, wait: false });
-      if (lease === null) return current;
+      let record = null;
       try {
-        const next = structuredClone(current);
-        next.activeTask = null;
-        next.lastTask = {
-          taskId: task.taskId,
-          componentId: task.kind === "skill-prepare" ? task.skillId : task.componentId,
-          action: "prepare-aborted",
-        };
-        return await store.save(next);
-      } finally { await lease.release(); }
-      });
-    } catch (error) { primaryError = error; }
-    let releaseError = null;
-    try { await heldLease?.lease?.release(); } catch (error) { releaseError = error; }
-    if (primaryError && releaseError) {
-      throw new AggregateError([primaryError, releaseError], primaryError.message, { cause: primaryError });
-    }
-    if (primaryError) throw primaryError;
-    if (releaseError) throw releaseError;
-    return result;
-  }
-  return Object.freeze({
-    inferSkillInstallRoot,
-    async recoverActiveSkillTransaction({ installRootCapability, skillsRootCapability }) {
-      const current = await ownershipStore.load();
-      const task = current.activeTask;
-      if (task?.kind !== "skill-replace") {
-        const recovery = await recoverSkillOwnershipOffline({
-          ownershipStore, installRootCapability, skillsRootCapability,
-          skillFiles: createRecoverySkillFiles({ installRootCapability, skillsRootCapability }),
-          resolveSkillTarget, skillPathAccess, expectedTask: task ?? null,
-        });
-        return Object.freeze({
-          status: recovery.status,
-          state: recovery.state,
-          heldLease: null,
-        });
-      }
-      const lease = await ownershipStore.acquireOperationLease({
-        nonce: task.leaseNonce, scope: task.leaseScope, wait: false,
-      });
-      if (lease === null) return Object.freeze({ status: "busy", state: current, heldLease: null });
-      const heldLease = Object.freeze({ nonce: task.leaseNonce, scope: task.leaseScope, lease });
-      try {
-        const recovery = await recoverSkillOwnershipOffline({
-          ownershipStore, installRootCapability, skillsRootCapability,
-          skillFiles: createRecoverySkillFiles({ installRootCapability, skillsRootCapability }),
-          resolveSkillTarget, skillPathAccess, expectedTask: task,
-        });
-        if (recovery.status === "changed") {
-          await lease.release();
-          return Object.freeze({ status: "changed", state: recovery.state, heldLease: null });
+        record = component
+          ? await workspace.prepareDownloadFile({
+            componentId: component.id, version: component.version, extension: `.${component.format}`,
+            size: component.size, sha256: component.sha256,
+          })
+          : await workspace.prepareSkillDownloadFile({
+            skillId: skill.id, version: skill.version, size: skill.size, sha256: skill.sha256,
+          });
+        if (record.path !== destination || asset.url !== (component ?? skill).assetUrl
+          || asset.size !== record.size || asset.sha256 !== record.sha256) {
+          throw runtimeError("software_manager_download_binding_invalid");
         }
-        return Object.freeze({ status: "recovered", state: recovery.state, heldLease });
+        const receipt = await workspace.downloadPrepared(record, { asset, signal, onProgress });
+        return await record.promotePartNoReplace(receipt);
       } catch (error) {
-        await lease.release().catch(() => {});
+        if (record === null) throw error;
+        let cleanupError = null;
+        try { await workspace.cleanupAbandonedPrepare(record); } catch (failure) { cleanupError = failure; }
+        if (cleanupError) {
+          throw new AggregateError([error, cleanupError], error.message, { cause: error });
+        }
         throw error;
       }
     },
-    cleanupAbandonedPreparedSkills,
   });
 }
 

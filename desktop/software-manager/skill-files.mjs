@@ -215,25 +215,62 @@ export function createPreparedSkillRecovery({
   }
   return Object.freeze({
     async reconcilePreparedSources({ heldLease = null } = {}) {
-      const owns = ({ nonce, scope }) => heldLease !== null
+      const owns = ({ taskId, skillId, nonce, scope }) => heldLease !== null
+        && heldLease.taskId === taskId && heldLease.skillId === skillId
         && heldLease.nonce === nonce && heldLease.scope === scope;
-      const records = await preparedJournal.list({
-        claimLease: ({ nonce, scope }) => owns({ nonce, scope })
+      const scan = await preparedJournal.list({
+        claimLease: ({ taskId, skillId, nonce, scope }) => owns({ taskId, skillId, nonce, scope })
           ? { async release() {} }
           : prepareLeaseStore.acquireOperationLease({ nonce, scope, wait: false }),
+        diagnostics: true,
       });
-      let recovered = 0;
-      for (const record of records) {
-        const lease = owns({ nonce: record.leaseNonce, scope: record.leaseScope })
+      const cleaned = [];
+      const live = scan.live.map((record) => Object.freeze({
+        taskId: record.taskId, skillId: record.skillId,
+        leaseScope: record.leaseScope, leaseNonce: record.leaseNonce,
+      }));
+      const failed = [];
+      for (const record of scan.records) {
+        const descriptor = Object.freeze({
+          taskId: record.taskId, skillId: record.skillId,
+          leaseScope: record.leaseScope, leaseNonce: record.leaseNonce,
+        });
+        const owned = owns({
+          taskId: record.taskId, skillId: record.skillId,
+          nonce: record.leaseNonce, scope: record.leaseScope,
+        });
+        const lease = owned
           ? { async release() {} }
           : await prepareLeaseStore.acquireOperationLease({
             nonce: record.leaseNonce, scope: record.leaseScope, wait: false,
           });
-        if (lease === null) continue;
-        try { await discardOne(record.taskId, record.skillId); recovered += 1; }
-        finally { await lease.release(); }
+        if (lease === null) {
+          live.push(descriptor);
+          continue;
+        }
+        let primaryError = null;
+        try {
+          await discardOne(record.taskId, record.skillId);
+          cleaned.push(descriptor);
+        } catch (error) { primaryError = error; }
+        let releaseError = null;
+        try { await lease.release(); } catch (error) { releaseError = error; }
+        if (primaryError || releaseError) {
+          const error = primaryError && releaseError
+            ? new AggregateError([primaryError, releaseError], primaryError.message, { cause: primaryError })
+            : primaryError ?? releaseError;
+          failed.push(Object.freeze({ ...descriptor, error }));
+        }
       }
-      return recovered;
+      const status = failed.length > 0 ? "failed"
+        : live.length > 0 || scan.unresolved.length > 0 ? "live" : "complete";
+      return Object.freeze({
+        status,
+        cleaned: Object.freeze(cleaned),
+        live: Object.freeze(live),
+        unresolved: scan.unresolved,
+        failed: Object.freeze(failed),
+      });
     },
   });
 }
@@ -348,26 +385,13 @@ export function createSkillFileService({
     return results;
   }
 
-  async function reconcilePreparedSources() {
-    const records = await preparedJournal.list({
-      claimLease: ({ nonce, scope }) => prepareLeaseStore.acquireOperationLease({
-        nonce, scope, wait: false,
-      }),
-    });
-    let recovered = 0;
-    for (const record of records) {
-      const lease = await prepareLeaseStore.acquireOperationLease({
-        nonce: record.leaseNonce, scope: record.leaseScope, wait: false,
-      });
-      if (lease === null) continue;
-      try {
-        await discardOnePrepared(record.taskId, record.skillId);
-        recovered += 1;
-      } finally {
-        await lease.release();
-      }
-    }
-    return recovered;
+  const preparedRecovery = createPreparedSkillRecovery({
+    fileCapabilities: files, installRootCapability,
+    prepareJournal: preparedJournal, prepareLeaseStore,
+  });
+
+  async function reconcilePreparedSources(options) {
+    return preparedRecovery.reconcilePreparedSources(options);
   }
 
   async function openRoot(authorizedRoot) {

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import fs from "node:fs";
@@ -6,8 +7,10 @@ import {
   access, lstat, mkdir, mkdtemp, realpath, rmdir, unlink, writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { createRequire } from "node:module";
 import test from "node:test";
+import { promisify } from "node:util";
 
 import { deleteAuthorizedTree } from "../desktop/software-manager/safe-delete.mjs";
 import { authorizeInstallRoot, authorizeSkillsRoot } from "../desktop/software-manager/path-policy.mjs";
@@ -15,6 +18,10 @@ import { createWin32FileApi } from "../desktop/software-manager/win32-file-api.m
 import { createWindowsFileCapabilities } from "../desktop/software-manager/windows-file-capabilities.mjs";
 import { createSkillPrepareJournal } from "../desktop/software-manager/skill-prepare-journal.mjs";
 import { MAX_SOFTWARE_PACKAGE_BYTES } from "../shared/software-manager/catalog-schema.mjs";
+
+const execFileAsync = promisify(execFileCallback);
+const require = createRequire(import.meta.url);
+const SEVEN_ZIP_PATH = join(dirname(require.resolve("7zip-bin")), "win", process.arch, "7za.exe");
 
 function codedError(code, nativeCode) {
   return Object.assign(new Error(code), { code, nativeCode });
@@ -29,6 +36,7 @@ function createFakeNative(initial = []) {
   let failClose = null;
   let failRename = null;
   let failDelete = null;
+  let failStreams = null;
   let readChunkHook = null;
   let openPathHook = null;
 
@@ -164,6 +172,7 @@ function createFakeNative(initial = []) {
     async assertNoAlternateDataStreams(handle) {
       const { node } = requireHandle(handle);
       calls.push(["streams", node.path]);
+      if (failStreams?.path?.toLowerCase() === node.path.toLowerCase()) throw failStreams.error;
       if (node.streams.some((name) => name !== "::$DATA")) throw codedError("alternate_data_stream_rejected");
     },
     async *enumerateDirectory(handle, { limit }) {
@@ -188,6 +197,16 @@ function createFakeNative(initial = []) {
       if (nodes.has(key(exactPath))) throw codedError("entry_exists", 183);
       ensureAncestors(exactPath);
       add(exactPath, { kind: "directory" });
+    },
+    async createDirectoryAtNoFollow(parentHandle, name, options) {
+      const parent = requireHandle(parentHandle).node;
+      const exactPath = `${parent.path}\\${name}`;
+      calls.push(["mkdir-at", parent.path, name, structuredClone(options)]);
+      if (nodes.has(key(exactPath))) throw codedError("entry_exists", 183);
+      const node = add(exactPath, { kind: "directory" });
+      const handle = { node, options, closed: false };
+      handles.add(handle);
+      return handle;
     },
     async renameByHandle(handle, rootHandle, name, { replace }) {
       const source = requireHandle(handle).node;
@@ -251,6 +270,7 @@ function createFakeNative(initial = []) {
     failRename(path, error) { failRename = { path, error }; },
     clearFailRename() { failRename = null; },
     failDelete(path, error) { failDelete = { path, error }; },
+    failStreams(path, error) { failStreams = { path, error }; },
     onReadChunk(hook) { readChunkHook = hook; },
     onOpenPath(hook) { openPathHook = hook; },
     get(path) { return nodes.get(key(path)); },
@@ -934,6 +954,39 @@ test("archive destination creates pinned parents and a writable exclusive file w
   assert.equal(fake.handles.size, 0);
 });
 
+test("archive nested directory creation deletes its exact failed postcondition target", async (t) => {
+  await t.test("exact cleanup", async () => {
+    const child = "C:\\work\\staging\\app";
+    const fake = createFakeNative([{ path: "C:\\work\\staging" }]);
+    fake.failStreams(child, new Error("archive_directory_ads_probe_failed"));
+    const destination = await capabilities(fake).openArchiveDestinationNoFollow("C:\\work\\staging");
+    await assert.rejects(
+      destination.ensureDirectoryPathNoFollow(["app"]),
+      /archive_directory_ads_probe_failed/u,
+    );
+    assert.equal(fake.get(child), undefined);
+    await destination.close();
+    assert.equal(fake.handles.size, 0);
+  });
+
+  await t.test("cleanup error aggregation", async () => {
+    const child = "C:\\work\\staging\\app";
+    const fake = createFakeNative([{ path: "C:\\work\\staging" }]);
+    fake.failStreams(child, new Error("archive_directory_ads_probe_failed"));
+    fake.failDelete(child, new Error("archive_directory_cleanup_failed"));
+    const destination = await capabilities(fake).openArchiveDestinationNoFollow("C:\\work\\staging");
+    await assert.rejects(destination.ensureDirectoryPathNoFollow(["app"]), (error) => {
+      assert.equal(error instanceof AggregateError, true);
+      assert.match(error.errors[0].message, /archive_directory_ads_probe_failed/u);
+      assert.match(error.errors[1].message, /archive_directory_cleanup_failed/u);
+      return true;
+    });
+    assert.notEqual(fake.get(child), undefined);
+    await destination.close();
+    assert.equal(fake.handles.size, 0);
+  });
+});
+
 test("installer workspace capability issues exact direct children and mutates only held identities", async () => {
   const fake = createFakeNative([{ path: "D:\\CBApps" }]);
   const api = capabilities(fake);
@@ -979,6 +1032,46 @@ test("installer workspace capability issues exact direct children and mutates on
   await workspace.close();
   assert.equal(fake.handles.size, 0);
   await assert.rejects(workspace.inspectIssuedChildNoFollow(downloads), /capability_closed/u);
+});
+
+test("atomic workspace directory creation cleans an exact postcondition failure and preserves cleanup errors", async (t) => {
+  await t.test("exact cleanup", async () => {
+    const child = "D:\\CBApps\\task-new";
+    const fake = createFakeNative([{ path: "D:\\CBApps" }]);
+    fake.failStreams(child, new Error("directory_ads_probe_failed"));
+    const workspace = await capabilities(fake).openInstallerWorkspaceRootNoFollow(
+      await installRootAuthority("D:\\CBApps"), { maxRelativePath: 80 },
+    );
+    await assert.rejects(workspace.createDirectoryChildNoFollow(
+      workspace.root, "task-new", { role: "deletable" },
+    ), /directory_ads_probe_failed/u);
+    assert.equal(fake.get(child), undefined);
+    assert.equal(fake.calls.some(([operation, , , options]) => operation === "mkdir-at"
+      && JSON.stringify(options?.share) === JSON.stringify(["read"])), true);
+    await workspace.close();
+    assert.equal(fake.handles.size, 0);
+  });
+
+  await t.test("cleanup error aggregation", async () => {
+    const child = "D:\\CBApps\\task-stuck";
+    const fake = createFakeNative([{ path: "D:\\CBApps" }]);
+    fake.failStreams(child, new Error("directory_ads_probe_failed"));
+    fake.failDelete(child, new Error("directory_cleanup_failed"));
+    const workspace = await capabilities(fake).openInstallerWorkspaceRootNoFollow(
+      await installRootAuthority("D:\\CBApps"), { maxRelativePath: 80 },
+    );
+    await assert.rejects(workspace.createDirectoryChildNoFollow(
+      workspace.root, "task-stuck", { role: "deletable" },
+    ), (error) => {
+      assert.equal(error instanceof AggregateError, true);
+      assert.match(error.errors[0].message, /directory_ads_probe_failed/u);
+      assert.match(error.errors[1].message, /directory_cleanup_failed/u);
+      return true;
+    });
+    assert.notEqual(fake.get(child), undefined);
+    await workspace.close();
+    assert.equal(fake.handles.size, 0);
+  });
 });
 
 test("Skill source proof copies across roots then swaps only held direct children inside Skills root", async () => {
@@ -1134,7 +1227,7 @@ test("prepared Skill cleanup is identity-bound, fail-closed for intent, and pres
     skillId: "documents",
     expectedIdentity: null,
     expectedEvidence: null,
-  }), /skill_prepare_intent_not_empty/u);
+  }), /skill_prepare_unbound_occupied/u);
 
   const sourceIdentity = structuredClone(fake.get(source).identity);
   assert.deepEqual(await api.validatePreparedSkillSourceForDeletionNoFollow({
@@ -1157,7 +1250,7 @@ test("prepared Skill cleanup is identity-bound, fail-closed for intent, and pres
   assert.equal(fake.handles.size, 0);
 });
 
-test("absent prepared Skill cleanup removes only its now-empty exact task parent", async () => {
+test("absent prepared Skill cleanup never adopts or removes an unbound task parent", async () => {
   const task = "D:\\CBApps\\staging\\task-skill-task";
   const fake = createFakeNative([
     { path: "D:\\CBApps" },
@@ -1172,7 +1265,7 @@ test("absent prepared Skill cleanup removes only its now-empty exact task parent
     expectedEvidence: null,
   });
   assert.deepEqual(result, { deleted: false, absent: true });
-  assert.equal(fake.get(task), undefined);
+  assert.notEqual(fake.get(task), undefined);
   assert.equal(fake.get("D:\\CBApps\\staging") !== undefined, true);
   assert.equal(fake.handles.size, 0);
 });
@@ -1302,14 +1395,14 @@ test("installer workspace pins writable parts, seals signed bytes in chunks, and
     sha256: createHash("sha256").update(content).digest("hex"),
   }), /workspace_file_receipt_required/u);
   await assert.rejects(workspace.inspectIssuedChildNoFollow(part), /receipt_(?:invalid|consumed)/u);
-  const bindingProbe = fake.calls.findLast((call) => call[0] === "open" && call[1] === partPath);
-  assert.deepEqual(bindingProbe[2], {
-    access: ["attributes"],
-    share: ["read", "write", "delete"],
+  const sealedHandle = fake.calls.findLast((call) => call[0] === "open" && call[1] === partPath);
+  assert.deepEqual(sealedHandle[2], {
+    access: ["read", "attributes"],
+    share: ["read"],
     disposition: "openExisting",
     directory: false,
   });
-  assert.equal(initialHandle.closed, false);
+  assert.equal(initialHandle.closed, true);
   assert.equal(fake.calls.filter((call) => call[0] === "read-chunk").length >= 2, true);
   await assert.rejects(fake.nativeApi.openPath(partPath, {
     access: ["write"],
@@ -1426,7 +1519,7 @@ test("installer workspace seal shares the catalog package-size ceiling", async (
   await workspace.close();
 });
 
-test("real Windows installer workspace seals after Node closes and blocks same-length rewrites", {
+test("real Windows installer workspace lets the bundled 7za consume a promoted package while retaining safe cleanup", {
   skip: process.platform !== "win32",
 }, async () => {
   const tempParent = await mkdtemp(join(tmpdir(), "codexbridge-installer-workspace-"));
@@ -1434,10 +1527,18 @@ test("real Windows installer workspace seals after Node closes and blocks same-l
   await mkdir(rootPath);
   const downloadsPath = join(rootPath, "downloads");
   const stagingPath = join(rootPath, "staging");
+  const preexistingTaskPath = join(stagingPath, "task-preexisting");
   const partPath = join(downloadsPath, "chatgpt-1.0.0.zip.part");
   const finalPath = join(downloadsPath, "chatgpt-1.0.0.zip");
+  const sourceArchive = join(tempParent, "source.zip");
+  const sourcePayload = join(tempParent, "payload.txt");
   let workspace = null;
   try {
+    await writeFile(sourcePayload, "real-7za-consumer-smoke");
+    await execFileAsync(SEVEN_ZIP_PATH, ["a", "-tzip", sourceArchive, sourcePayload, "-y"]);
+    const content = await fs.promises.readFile(sourceArchive);
+    await unlink(sourceArchive);
+    await unlink(sourcePayload);
     const stableRootPath = await realpath(rootPath);
     const installRoot = await authorizeInstallRoot({
       candidate: stableRootPath,
@@ -1447,15 +1548,15 @@ test("real Windows installer workspace seals after Node closes and blocks same-l
       realpath,
       lstat,
     });
-    workspace = await createWindowsFileCapabilities({
+    const fileApi = createWindowsFileCapabilities({
       platform: "win32",
       nativeApi: createWin32FileApi({ platform: "win32" }),
-    }).openInstallerWorkspaceRootNoFollow(installRoot, { maxRelativePath: 100 });
+    });
+    workspace = await fileApi.openInstallerWorkspaceRootNoFollow(installRoot, { maxRelativePath: 100 });
     const downloads = await workspace.createOrOpenDirectoryChildNoFollow(
       workspace.root, "downloads", { requireEmpty: false, role: "rename-parent" },
     );
     const part = await workspace.createFileChildNoFollow(downloads, "chatgpt-1.0.0.zip.part");
-    const content = Buffer.from("node-stream-compatible");
     const contentHash = createHash("sha256").update(content).digest("hex");
     const output = await workspace.createIssuedFileWriteStreamNoFollow(part, {
       append: false, maxBytes: content.length, signal: new AbortController().signal,
@@ -1480,6 +1581,8 @@ test("real Windows installer workspace seals after Node closes and blocks same-l
     );
     await unlink(finalPath);
     const promoted = await workspace.renameIssuedChildNoReplace(sealed, "chatgpt-1.0.0.zip");
+    const tested = await execFileAsync(SEVEN_ZIP_PATH, ["t", finalPath]);
+    assert.match(tested.stdout, /Everything is Ok/u);
     await workspace.deleteIssuedChildNoFollow(promoted);
     const staging = await workspace.createOrOpenDirectoryChildNoFollow(
       workspace.root, "staging", { requireEmpty: false, role: "anchor" },
@@ -1487,21 +1590,165 @@ test("real Windows installer workspace seals after Node closes and blocks same-l
     const task = await workspace.createOrOpenDirectoryChildNoFollow(
       staging, "task-smoke", { requireEmpty: false, role: "deletable" },
     );
-    const leaf = await workspace.createOrOpenDirectoryChildNoFollow(
-      task, "chatgpt.prepare", { requireEmpty: true, role: "deletable" },
+    const leaf = await workspace.createDirectoryChildNoFollow(
+      task, "skill-documents.prepare", { role: "deletable" },
     );
+    const leafDescription = await workspace.describeIssuedDirectoryNoFollow(leaf);
+    const inspected = await fileApi.inspectPreparedSkillSourceNoFollow({
+      installRootCapability: installRoot, taskId: "smoke", skillId: "documents",
+    });
+    assert.deepEqual(inspected.identity, leafDescription.identity);
+    const destination = await fileApi.openArchiveDestinationNoFollow(leafDescription.path, {
+      expectedIdentity: leafDescription.identity,
+    });
+    await destination.assertEmptyNoFollow();
+    await destination.close();
     await workspace.deleteIssuedChildNoFollow(leaf);
     await workspace.deleteIssuedChildNoFollow(task);
+    await mkdir(preexistingTaskPath);
+    const preexistingTask = await workspace.createOrOpenDirectoryChildNoFollow(
+      staging, "task-preexisting", { requireEmpty: false, role: "deletable" },
+    );
+    assert.equal((await workspace.describeIssuedDirectoryNoFollow(preexistingTask)).created, false);
+    const preexistingLeaf = await workspace.createDirectoryChildNoFollow(
+      preexistingTask, "skill-documents.prepare", { role: "deletable" },
+    );
+    const preexistingDescription = await workspace.describeIssuedDirectoryNoFollow(preexistingLeaf);
+    const preexistingInspected = await fileApi.inspectPreparedSkillSourceNoFollow({
+      installRootCapability: installRoot, taskId: "preexisting", skillId: "documents",
+    });
+    assert.deepEqual(preexistingInspected.identity, preexistingDescription.identity);
+    await workspace.deleteIssuedChildNoFollow(preexistingLeaf);
     await workspace.close();
     workspace = null;
   } finally {
     if (workspace) await workspace.close().catch(() => {});
     await unlink(partPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
     await unlink(finalPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
-    await rmdir(join(stagingPath, "task-smoke", "chatgpt.prepare")).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+    await unlink(sourceArchive).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+    await unlink(sourcePayload).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+    await rmdir(join(stagingPath, "task-smoke", "skill-documents.prepare")).catch((error) => { if (error?.code !== "ENOENT") throw error; });
     await rmdir(join(stagingPath, "task-smoke")).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+    await rmdir(join(preexistingTaskPath, "skill-documents.prepare")).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+    await rmdir(preexistingTaskPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
     await rmdir(stagingPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
     await rmdir(downloadsPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+    await rmdir(rootPath);
+    await rmdir(tempParent);
+  }
+});
+
+test("real Windows atomic same-name directory collision stays a plain occupied error and preserves foreign content", {
+  skip: process.platform !== "win32",
+}, async () => {
+  const tempParent = await mkdtemp(join(tmpdir(), "codexbridge-atomic-collision-"));
+  const rootPath = join(tempParent, "CBApps");
+  const foreignPath = join(rootPath, "foreign.prepare");
+  const sentinelPath = join(foreignPath, "sentinel.txt");
+  let workspace = null;
+  try {
+    await mkdir(rootPath);
+    await mkdir(foreignPath);
+    await writeFile(sentinelPath, "foreign-sentinel");
+    const stableRootPath = await realpath(rootPath);
+    const installRoot = await authorizeInstallRoot({
+      candidate: stableRootPath, env: process.env, maxRelativePath: 80,
+      access, realpath, lstat,
+    });
+    const fileApi = createWindowsFileCapabilities({
+      platform: "win32", nativeApi: createWin32FileApi({ platform: "win32" }),
+    });
+    workspace = await fileApi.openInstallerWorkspaceRootNoFollow(installRoot, { maxRelativePath: 80 });
+    const beforeReceipt = await workspace.openDirectoryChildNoFollow(
+      workspace.root, "foreign.prepare", { role: "anchor" },
+    );
+    const before = await workspace.describeIssuedDirectoryNoFollow(beforeReceipt);
+    await workspace.close();
+    workspace = await fileApi.openInstallerWorkspaceRootNoFollow(installRoot, { maxRelativePath: 80 });
+    await assert.rejects(
+      workspace.createDirectoryChildNoFollow(
+        workspace.root, "foreign.prepare", { role: "deletable" },
+      ),
+      (error) => error instanceof AggregateError === false
+        && error?.code === "entry_exists"
+        && (error?.nativeCode === 80 || error?.nativeCode === 183),
+    );
+    await workspace.close();
+    workspace = await fileApi.openInstallerWorkspaceRootNoFollow(installRoot, { maxRelativePath: 80 });
+    const afterReceipt = await workspace.openDirectoryChildNoFollow(
+      workspace.root, "foreign.prepare", { role: "anchor" },
+    );
+    const after = await workspace.describeIssuedDirectoryNoFollow(afterReceipt);
+    assert.deepEqual(after.identity, before.identity);
+    assert.equal(await fs.promises.readFile(sentinelPath, "utf8"), "foreign-sentinel");
+    await workspace.close();
+    workspace = null;
+  } finally {
+    if (workspace) await workspace.close().catch(() => {});
+    await unlink(sentinelPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+    await rmdir(foreignPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+    await rmdir(rootPath);
+    await rmdir(tempParent);
+  }
+});
+
+test("real Windows empty install root creates and safely reopens fixed ChatGPT and V2RayN staging slots", {
+  skip: process.platform !== "win32",
+}, async () => {
+  const tempParent = await mkdtemp(join(tmpdir(), "codexbridge-fixed-staging-"));
+  const rootPath = join(tempParent, "CBApps");
+  const chatgptStagingPath = join(rootPath, "ct");
+  const v2raynRootPath = join(rootPath, "V2RayN");
+  const v2raynStagingPath = join(v2raynRootPath, "staging");
+  let workspace = null;
+  try {
+    await mkdir(rootPath);
+    const stableRootPath = await realpath(rootPath);
+    const installRoot = await authorizeInstallRoot({
+      candidate: stableRootPath, env: process.env, maxRelativePath: 32,
+      access, realpath, lstat,
+    });
+    const fileApi = createWindowsFileCapabilities({
+      platform: "win32", nativeApi: createWin32FileApi({ platform: "win32" }),
+    });
+    workspace = await fileApi.openInstallerWorkspaceRootNoFollow(installRoot, { maxRelativePath: 32 });
+    const chatgptStaging = await workspace.createDirectoryChildNoFollow(
+      workspace.root, "ct", { role: "deletable" },
+    );
+    assert.equal((await workspace.inspectIssuedChildNoFollow(chatgptStaging)).empty, true);
+    const v2raynRoot = await workspace.createOrOpenDirectoryChildNoFollow(
+      workspace.root, "V2RayN", { requireEmpty: false, role: "anchor" },
+    );
+    const v2raynStaging = await workspace.createDirectoryChildNoFollow(
+      v2raynRoot, "staging", { role: "deletable" },
+    );
+    assert.equal((await workspace.inspectIssuedChildNoFollow(v2raynStaging)).empty, true);
+    await workspace.close();
+    workspace = null;
+
+    for (const [componentRoot, slotName] of [
+      [stableRootPath, "ct"],
+      [join(stableRootPath, "V2RayN"), "staging"],
+    ]) {
+      const target = join(componentRoot, slotName);
+      const versionRoot = await fileApi.openVersionRootNoFollow(componentRoot);
+      try {
+        const opened = await versionRoot.openSlotNoFollow(slotName);
+        assert.equal(opened?.markerStatus, "missing");
+        await deleteAuthorizedTree({
+          target, authorizedRoot: componentRoot, rootHandle: versionRoot,
+          targetDescriptor: opened.descriptor,
+        });
+      } finally {
+        await versionRoot.close();
+      }
+      await assert.rejects(access(target), { code: "ENOENT" });
+    }
+  } finally {
+    if (workspace) await workspace.close().catch(() => {});
+    await rmdir(chatgptStagingPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+    await rmdir(v2raynStagingPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+    await rmdir(v2raynRootPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
     await rmdir(rootPath);
     await rmdir(tempParent);
   }
@@ -1561,6 +1808,109 @@ test("installer workspace writer stays bound to one held direct-child identity f
   );
   await foreignSession.close();
   await workspace.close();
+});
+
+test("installer workspace reset honors its signal again immediately before truncation", async () => {
+  const partPath = "D:\\CBApps\\downloads\\chatgpt-1.0.0.zip.part";
+  const fake = createFakeNative([{ path: "D:\\CBApps" }]);
+  const workspace = await capabilities(fake).openInstallerWorkspaceRootNoFollow(
+    await installRootAuthority("D:\\CBApps"), { maxRelativePath: 100 },
+  );
+  const downloads = await workspace.createOrOpenDirectoryChildNoFollow(
+    workspace.root, "downloads", { requireEmpty: false, role: "rename-parent" },
+  );
+  const part = await workspace.createFileChildNoFollow(downloads, "chatgpt-1.0.0.zip.part");
+  fake.get(partPath).data = Buffer.from("partial");
+  const controller = new AbortController();
+  const originalSeek = fake.nativeApi.setFilePosition;
+  fake.nativeApi.setFilePosition = async (...args) => {
+    await originalSeek(...args);
+    controller.abort();
+  };
+  await assert.rejects(
+    workspace.resetIssuedFileNoFollow(part, { signal: controller.signal }),
+    { name: "AbortError" },
+  );
+  assert.equal(fake.calls.some(([operation]) => operation === "truncate"), false);
+  assert.equal(fake.get(partPath).data.toString(), "partial");
+  await workspace.close();
+});
+
+test("promoted package downgrades to a read-only shared handle and safely upgrades only for cleanup", async () => {
+  const partPath = "D:\\CBApps\\downloads\\chatgpt-1.0.0.zip.part";
+  const finalPath = "D:\\CBApps\\downloads\\chatgpt-1.0.0.zip";
+  const fake = createFakeNative([{ path: "D:\\CBApps" }]);
+  const workspace = await capabilities(fake).openInstallerWorkspaceRootNoFollow(
+    await installRootAuthority("D:\\CBApps"), { maxRelativePath: 100 },
+  );
+  const downloads = await workspace.createOrOpenDirectoryChildNoFollow(
+    workspace.root, "downloads", { requireEmpty: false, role: "rename-parent" },
+  );
+  const part = await workspace.createFileChildNoFollow(downloads, "chatgpt-1.0.0.zip.part");
+  const content = Buffer.from("consumer-readable-package");
+  const output = await workspace.createIssuedFileWriteStreamNoFollow(part, {
+    append: false, maxBytes: content.length, signal: new AbortController().signal,
+  });
+  await finishWritable(output, content);
+  const sealed = await workspace.sealIssuedFileNoFollow(part, {
+    size: content.length, sha256: createHash("sha256").update(content).digest("hex"),
+  });
+  const promoted = await workspace.renameIssuedChildNoReplace(sealed, "chatgpt-1.0.0.zip");
+  const held = [...fake.handles].filter((handle) => handle.node.path === finalPath);
+  assert.equal(held.length, 1);
+  assert.deepEqual(held[0].options.access, ["read", "attributes"]);
+  assert.deepEqual(held[0].options.share, ["read"]);
+  const consumer = await fake.nativeApi.openPath(finalPath, {
+    access: ["read"], share: ["read"], disposition: "openExisting", directory: false,
+  });
+  await assert.rejects(fake.nativeApi.openPath(finalPath, {
+    access: ["write"], share: ["read", "write", "delete"], disposition: "openExisting", directory: false,
+  }), /sharing_violation/u);
+  await assert.rejects(fake.nativeApi.openPath(finalPath, {
+    access: ["delete"], share: ["read", "write", "delete"], disposition: "openExisting", directory: false,
+  }), /sharing_violation/u);
+  await fake.nativeApi.closeHandle(consumer);
+  await workspace.deleteIssuedChildNoFollow(promoted);
+  assert.equal(fake.get(finalPath), undefined);
+  const mutationOpen = fake.calls.find((call) => call[0] === "open" && call[1] === finalPath
+    && call[2].access.includes("delete"));
+  assert.equal(Boolean(mutationOpen), true);
+  await workspace.close();
+  assert.equal(fake.handles.size, 0);
+  assert.equal(fake.get(partPath), undefined);
+});
+
+test("promoted package cleanup rejects a replacement in the read-pin to delete-handle gap", async () => {
+  const finalPath = "D:\\CBApps\\downloads\\chatgpt-1.0.0.zip";
+  const fake = createFakeNative([{ path: "D:\\CBApps" }]);
+  const workspace = await capabilities(fake).openInstallerWorkspaceRootNoFollow(
+    await installRootAuthority("D:\\CBApps"), { maxRelativePath: 100 },
+  );
+  const downloads = await workspace.createOrOpenDirectoryChildNoFollow(
+    workspace.root, "downloads", { requireEmpty: false, role: "rename-parent" },
+  );
+  const part = await workspace.createFileChildNoFollow(downloads, "chatgpt-1.0.0.zip.part");
+  const content = Buffer.from("verified-original");
+  const output = await workspace.createIssuedFileWriteStreamNoFollow(part, {
+    append: false, maxBytes: content.length, signal: new AbortController().signal,
+  });
+  await finishWritable(output, content);
+  const sealed = await workspace.sealIssuedFileNoFollow(part, {
+    size: content.length, sha256: createHash("sha256").update(content).digest("hex"),
+  });
+  const promoted = await workspace.renameIssuedChildNoReplace(sealed, "chatgpt-1.0.0.zip");
+  let replaceOnMutationOpen = true;
+  fake.onOpenPath(({ path: openedPath, options }) => {
+    if (replaceOnMutationOpen && openedPath === finalPath && options.access.includes("delete")) {
+      replaceOnMutationOpen = false;
+      fake.replace(finalPath, { kind: "file", data: "foreign" });
+    }
+  });
+  await assert.rejects(workspace.deleteIssuedChildNoFollow(promoted), /windows_identity_changed/u);
+  assert.equal(fake.get(finalPath).data.toString(), "foreign");
+  assert.equal(fake.calls.some((call) => call[0] === "delete-handle" && call[1] === finalPath), false);
+  await workspace.close();
+  assert.equal(fake.handles.size, 0);
 });
 
 test("installer workspace writer rejects replacement, hardlink, and reparse drift before writing foreign bytes", async (t) => {

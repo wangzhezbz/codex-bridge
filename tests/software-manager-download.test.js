@@ -202,6 +202,24 @@ test("prepared capability target resumes, writes, and verifies without reopening
   }), { target, size: asset.size, sha256: asset.sha256 });
 });
 
+test("prepared downloads reject neither or both destination modes before fetching", async () => {
+  let fetches = 0;
+  const manager = createDownloadManager({
+    async fetchImpl() { fetches += 1; throw new Error("fetch_must_not_run"); },
+  });
+  const asset = assetFor("https://shanhaiyouling.com/codexbridge-test/packages/component.zip");
+  const target = {
+    async inspect() { return { size: 0 }; },
+    async reset() {},
+    async createWriteStream() { return new Writable(); },
+    async verify() { return { size: asset.size, sha256: asset.sha256 }; },
+  };
+  await assert.rejects(manager.downloadPrepared({ asset }), /exactly one prepared download target/u);
+  await assert.rejects(manager.downloadPrepared({ asset, target: undefined }), /exactly one prepared download target/u);
+  await assert.rejects(manager.downloadPrepared({ asset, partPath: "D:\\part", target }), /exactly one prepared download target/u);
+  assert.equal(fetches, 0);
+});
+
 test("prepared verification binding mismatch consumes the receipt and cannot be retried with corrected metadata", async () => {
   await withTempDirectory(async ({ destination: fixtureDestination }) => {
     const destination = fixtureDestination();
@@ -258,6 +276,181 @@ test("restarts from zero when a server ignores the resume Range", async () => {
   }
 });
 
+test("Range fallback checks cancellation again before resetting the held target", async () => {
+  const controller = new AbortController();
+  let resets = 0;
+  let cancellations = 0;
+  const responseBody = new ReadableStream({
+    pull() {},
+    cancel() { cancellations += 1; },
+  });
+  const target = {
+    async inspect() { return { size: 9 }; },
+    async reset() { resets += 1; },
+    async createWriteStream() { throw new Error("writer_must_not_open"); },
+    async verify() { throw new Error("verify_must_not_run"); },
+  };
+  const manager = createDownloadManager({
+    async fetchImpl() {
+      controller.abort();
+      return { status: 200, headers: new Headers(), body: responseBody };
+    },
+    retryPolicy: { maxAttempts: 1, delayMs: 0 },
+  });
+  await assert.rejects(manager.downloadPrepared({
+    asset: assetFor("https://shanhaiyouling.com/codexbridge-test/packages/component.zip"),
+    target,
+    signal: controller.signal,
+  }), { name: "AbortError" });
+  assert.equal(resets, 0);
+  assert.equal(cancellations, 1);
+});
+
+test("Range fallback preserves response cleanup failure when synchronous abort is normalized", async () => {
+  const controller = new AbortController();
+  const cleanup = new Error("range_abort_body_cancel_failed");
+  const responseBody = new ReadableStream({ pull() {}, cancel() { throw cleanup; } });
+  const manager = createDownloadManager({
+    async fetchImpl() {
+      controller.abort();
+      return { status: 200, headers: new Headers(), body: responseBody };
+    },
+    retryPolicy: { maxAttempts: 1, delayMs: 0 },
+  });
+  await assert.rejects(manager.downloadPrepared({
+    asset: assetFor("https://shanhaiyouling.com/codexbridge-test/packages/component.zip"),
+    target: {
+      async inspect() { return { size: 9 }; }, async reset() {},
+      async createWriteStream() { throw new Error("writer_must_not_open"); },
+      async verify() { throw new Error("verify_must_not_run"); },
+    },
+    signal: controller.signal,
+  }), (error) => (
+    error instanceof AggregateError
+    && error.errors[0]?.name === "AbortError"
+    && error.errors[1] === cleanup
+    && error.cause?.name === "AbortError"
+  ));
+});
+
+test("reset and writer setup failures cancel the response body and preserve cleanup failures", async (t) => {
+  for (const phase of ["reset", "writer"]) {
+    await t.test(phase, async () => {
+      const primary = Object.assign(new Error(`${phase}_failed`), { retryable: false });
+      const cleanup = new Error(`${phase}_body_cancel_failed`);
+      let cancellations = 0;
+      const responseBody = new ReadableStream({
+        pull() {},
+        cancel() { cancellations += 1; throw cleanup; },
+      });
+      const target = {
+        async inspect() { return { size: phase === "reset" ? 7 : 0 }; },
+        async reset() { throw primary; },
+        async createWriteStream() { throw primary; },
+        async verify() { throw new Error("verify_must_not_run"); },
+      };
+      const manager = createDownloadManager({
+        async fetchImpl() { return { status: 200, headers: new Headers(), body: responseBody }; },
+        retryPolicy: { maxAttempts: 1, delayMs: 0 },
+      });
+      await assert.rejects(manager.downloadPrepared({
+        asset: assetFor("https://shanhaiyouling.com/codexbridge-test/packages/component.zip"), target,
+      }), (error) => (
+        error instanceof AggregateError
+        && error.cause === primary
+        && error.errors[0] === primary
+        && error.errors[1] === cleanup
+      ));
+      assert.equal(cancellations, 1);
+    });
+  }
+});
+
+test("every retryable HTTP failure cancels its response body before the next attempt", async () => {
+  let requests = 0;
+  let cancellations = 0;
+  const manager = createDownloadManager({
+    async fetchImpl() {
+      requests += 1;
+      return {
+        status: 503,
+        headers: new Headers(),
+        body: new ReadableStream({ pull() {}, cancel() { cancellations += 1; } }),
+      };
+    },
+    retryPolicy: { maxAttempts: 2, delayMs: 0 },
+  });
+  await assert.rejects(manager.downloadPrepared({
+    asset: assetFor("https://shanhaiyouling.com/codexbridge-test/packages/component.zip"),
+    target: {
+      async inspect() { return { size: 0 }; }, async reset() {},
+      async createWriteStream() { throw new Error("writer_must_not_open"); },
+      async verify() { throw new Error("verify_must_not_run"); },
+    },
+  }), /HTTP 503/u);
+  assert.equal(requests, 2);
+  assert.equal(cancellations, 2);
+});
+
+test("invalid resume ranges and cross-origin redirects cancel their response bodies", async (t) => {
+  for (const mode of ["range", "redirect"]) {
+    await t.test(mode, async () => {
+      let cancellations = 0;
+      const responseBody = new ReadableStream({ pull() {}, cancel() { cancellations += 1; } });
+      const manager = createDownloadManager({
+        async fetchImpl() {
+          return mode === "range"
+            ? { status: 206, headers: new Headers({ "Content-Range": "bytes 8-9/10" }), body: responseBody }
+            : {
+              status: 302,
+              headers: new Headers({ Location: "https://attacker.example/package.zip" }),
+              body: responseBody,
+            };
+        },
+        retryPolicy: { maxAttempts: 1, delayMs: 0 },
+      });
+      await assert.rejects(manager.downloadPrepared({
+        asset: assetFor("https://shanhaiyouling.com/codexbridge-test/packages/component.zip"),
+        target: {
+          async inspect() { return { size: mode === "range" ? 7 : 0 }; }, async reset() {},
+          async createWriteStream() { throw new Error("writer_must_not_open"); },
+          async verify() { throw new Error("verify_must_not_run"); },
+        },
+      }), mode === "range" ? /Content-Range/u : /redirect crosses/u);
+      assert.equal(cancellations, 1);
+    });
+  }
+});
+
+test("same-origin redirect bodies are cancelled before requesting the next hop", async () => {
+  let requests = 0;
+  let redirectCancellations = 0;
+  const target = {
+    async inspect() { return { size: 0 }; }, async reset() {},
+    async createWriteStream() { return new Writable({ write(_chunk, _encoding, callback) { callback(); } }); },
+    async verify({ size, sha256 }) { return { size, sha256 }; },
+  };
+  const manager = createDownloadManager({
+    async fetchImpl() {
+      requests += 1;
+      if (requests === 1) {
+        return {
+          status: 302,
+          headers: new Headers({ Location: "/codexbridge-test/packages/final.zip" }),
+          body: new ReadableStream({ pull() {}, cancel() { redirectCancellations += 1; } }),
+        };
+      }
+      return new Response(body, { status: 200 });
+    },
+    retryPolicy: { maxAttempts: 1, delayMs: 0 },
+  });
+  await manager.downloadPrepared({
+    asset: assetFor("https://shanhaiyouling.com/codexbridge-test/packages/component.zip"), target,
+  });
+  assert.equal(requests, 2);
+  assert.equal(redirectCancellations, 1);
+});
+
 test("retries a connection reset within its bounded retry budget", async () => {
   let requests = 0;
   const origin = await startServer((request, response) => {
@@ -281,6 +474,105 @@ test("retries a connection reset within its bounded retry budget", async () => {
     });
   } finally {
     await origin.close();
+  }
+});
+
+test("a local writable ECONNRESET fails fast and cancels the response without retry", async () => {
+  let fetches = 0;
+  let cancellations = 0;
+  const failure = Object.assign(new Error("local_write_reset"), { code: "ECONNRESET" });
+  const target = {
+    async inspect() { return { size: 0 }; },
+    async reset() {},
+    async createWriteStream() {
+      return new Writable({ write(_chunk, _encoding, callback) { callback(failure); } });
+    },
+    async verify() { throw new Error("verify_must_not_run"); },
+  };
+  const manager = createDownloadManager({
+    async fetchImpl() {
+      fetches += 1;
+      return new Response(new ReadableStream({
+        start(controller) { controller.enqueue(body); },
+        cancel() { cancellations += 1; },
+      }), { status: 200 });
+    },
+    retryPolicy: { maxAttempts: 3, delayMs: 0 },
+  });
+  await assert.rejects(manager.downloadPrepared({
+    asset: assetFor("https://shanhaiyouling.com/codexbridge-test/packages/component.zip"), target,
+  }), (error) => error === failure);
+  assert.equal(fetches, 1);
+  assert.equal(cancellations, 1);
+});
+
+test("an upstream response stream ECONNRESET remains retryable", async () => {
+  let fetches = 0;
+  const target = {
+    async inspect() { return { size: 0 }; },
+    async reset() {},
+    async createWriteStream() {
+      return new Writable({ write(_chunk, _encoding, callback) { callback(); } });
+    },
+    async verify({ size, sha256 }) { return { size, sha256 }; },
+  };
+  const manager = createDownloadManager({
+    async fetchImpl() {
+      fetches += 1;
+      if (fetches === 1) {
+        return new Response(new ReadableStream({
+          start(controller) {
+            controller.error(Object.assign(new Error("upstream_reset"), { code: "ECONNRESET" }));
+          },
+        }), { status: 200 });
+      }
+      return new Response(body, { status: 200 });
+    },
+    retryPolicy: { maxAttempts: 2, delayMs: 0 },
+  });
+  await manager.downloadPrepared({
+    asset: assetFor("https://shanhaiyouling.com/codexbridge-test/packages/component.zip"), target,
+  });
+  assert.equal(fetches, 2);
+});
+
+test("deterministic capability, identity, permission, receipt, and hash failures fail fast", async (t) => {
+  const cases = [
+    ["unknown target error", null, "inspect"],
+    ["capability", "workspace_file_size_mismatch", "inspect"],
+    ["identity", "windows_identity_changed", "inspect"],
+    ["permission", "EACCES", "inspect"],
+    ["receipt", "workspace_receipt_consumed", "inspect"],
+    ["hash", "workspace_file_hash_mismatch", "verify"],
+    ["network-shaped capability error", "ECONNRESET", "inspect"],
+  ];
+  for (const [name, code, phase] of cases) {
+    await t.test(name, async () => {
+      let inspections = 0;
+      let fetches = 0;
+      let verifications = 0;
+      const failure = code === null ? new Error("unknown_target_failure") : Object.assign(new Error(code), { code });
+      const target = {
+        async inspect() {
+          inspections += 1;
+          if (phase === "inspect") throw failure;
+          return { size: 0 };
+        },
+        async reset() {},
+        async createWriteStream() { return new Writable({ write(_chunk, _encoding, callback) { callback(); } }); },
+        async verify() { verifications += 1; throw failure; },
+      };
+      const manager = createDownloadManager({
+        async fetchImpl() { fetches += 1; return new Response(body, { status: 200 }); },
+        retryPolicy: { maxAttempts: 3, delayMs: 0 },
+      });
+      await assert.rejects(manager.downloadPrepared({
+        asset: assetFor("https://shanhaiyouling.com/codexbridge-test/packages/component.zip"), target,
+      }), (error) => error === failure);
+      assert.equal(inspections, 1);
+      assert.equal(fetches, phase === "verify" ? 1 : 0);
+      assert.equal(verifications, phase === "verify" ? 1 : 0);
+    });
   }
 });
 

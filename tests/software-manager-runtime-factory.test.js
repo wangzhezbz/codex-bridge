@@ -1,24 +1,25 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import {
-  bundledSevenZipPath,
-  createDefaultSkillRecoveryHooks,
-  createLazyShortcutFileApi,
-  createPinnedSevenZipExecution,
-  createProductionSoftwareManagerService,
-} from "../desktop/software-manager/runtime-factory.mjs";
+import { createProductionSoftwareManagerService } from "../desktop/software-manager/runtime-factory.mjs";
+import { createDefaultSkillRecoveryHooks } from "../desktop/software-manager/skill-recovery-hooks.mjs";
+import { createPinnedSevenZipExecution } from "../desktop/software-manager/pinned-sevenzip-execution.mjs";
+import { createLazyShortcutFileApi } from "../desktop/software-manager/lazy-shortcut-file-api.mjs";
 import { createCapabilityRecordStore } from "../desktop/software-manager/capability-record-store.mjs";
 import { authorizeInstallRoot, authorizeSkillsRoot } from "../desktop/software-manager/path-policy.mjs";
 import { createSkillPrepareJournal } from "../desktop/software-manager/skill-prepare-journal.mjs";
 import { createSkillSwapJournal } from "../desktop/software-manager/skill-swap-journal.mjs";
 
 const CATALOG_URL = "https://shanhaiyouling.com/codexbridge-install-test/component-catalog.json";
-const SEVEN_ZIP_PATH = bundledSevenZipPath();
+const require = createRequire(import.meta.url);
+const SEVEN_ZIP_PATH = path.win32.join(
+  path.win32.dirname(require.resolve("7zip-bin")), "win", process.arch, "7za.exe",
+);
 
 function memoryRecoveryFs() {
   let sequence = 0;
@@ -471,7 +472,10 @@ test("default root composition binds workspace, files, and adapters to the selec
             path: `D:\\CBApps\\downloads\\${componentId}-${version}${extension}`,
             partPath: `D:\\CBApps\\downloads\\${componentId}-${version}${extension}.part`,
             size, sha256,
-            async promotePartNoReplace(receipt) { assert.equal(receipt.bound, true); return { path: this.path }; },
+            async promotePartNoReplace(receipt) {
+              assert.equal(receipt.bound, true);
+              return { path: this.path, size: this.size, sha256: this.sha256 };
+            },
           };
           return record;
         },
@@ -506,13 +510,18 @@ test("default root composition binds workspace, files, and adapters to the selec
   assert.equal(harness.calls.includes("desktop-authority"), false);
   assert.equal(harness.calls.includes("skills-authority"), false);
   assert.equal(harness.calls.includes("windows-host"), false);
-  await seen.adapters.downloader.download({
+  const downloaded = await seen.adapters.downloader.download({
     asset: {
       url: "https://shanhaiyouling.com/codexbridge-install-test/chatgpt.zip",
       size: 1,
       sha256: "a".repeat(64),
     },
     destination: "D:\\CBApps\\downloads\\chatgpt-1.0.0.zip",
+  });
+  assert.deepEqual(downloaded, {
+    path: "D:\\CBApps\\downloads\\chatgpt-1.0.0.zip",
+    size: 1,
+    sha256: "a".repeat(64),
   });
   assert.equal(workspacePreparedCalls, 1);
   assert.equal(managerPreparedCalls, 0);
@@ -537,6 +546,40 @@ test("runtime factory injection cannot authorize a caller-selected 7z binary", a
     sevenZipPath: "C:\\attacker\\node_modules\\7zip-bin\\win\\x64\\7za.exe",
   }), /software_manager_7z_path_rejected/u);
   assert.equal(harness.calls.some((entry) => Array.isArray(entry) && entry[0] === "windows-infrastructure"), false);
+});
+
+test("malformed closeable 7z pins are always closed and preserve close failures", async (t) => {
+  const directory = await fsPromises.mkdtemp(path.join(os.tmpdir(), "codexbridge-7z-pin-"));
+  const executable = path.join(directory, "7za.exe");
+  await fsPromises.writeFile(executable, "trusted");
+  t.after(async () => {
+    await fsPromises.unlink(executable).catch(() => {});
+    await fsPromises.rmdir(directory).catch(() => {});
+  });
+  let closed = 0;
+  const execution = createPinnedSevenZipExecution({
+    fileCapabilities: {
+      async pinArchiveFileNoFollow() {
+        return {
+          async close() {
+            closed += 1;
+            throw new Error("malformed_pin_close_failed");
+          },
+        };
+      },
+    },
+    sevenZipPath: executable,
+    sevenZipSha256: createHash("sha256").update("trusted").digest("hex"),
+    async execFile() { throw new Error("exec_must_not_run"); },
+    async spawn() { throw new Error("spawn_must_not_run"); },
+  });
+  await assert.rejects(execution.spawnFile(executable, [], {}), (error) => {
+    assert.equal(error instanceof AggregateError, true);
+    assert.match(error.errors[0].message, /software_manager_file_pin_invalid/u);
+    assert.match(error.errors[1].message, /malformed_pin_close_failed/u);
+    return true;
+  });
+  assert.equal(closed, 1);
 });
 
 test("pinned 7z execution rechecks every spawn and holds the stream pin until completion", async (t) => {
@@ -723,6 +766,47 @@ test("pinned 7z file execution preserves the process failure when pin cleanup al
   });
 });
 
+test("pinned 7z startup and hash rejection preserve pin cleanup failures", async (t) => {
+  const directory = await fsPromises.mkdtemp(path.join(os.tmpdir(), "codexbridge-7z-start-errors-"));
+  const executable = path.join(directory, "7za.exe");
+  await fsPromises.writeFile(executable, "trusted");
+  t.after(async () => {
+    await fsPromises.unlink(executable).catch(() => {});
+    await fsPromises.rmdir(directory).catch(() => {});
+  });
+  const closeFailure = new Error("pin_close_failed");
+  const startFailure = new Error("spawn_start_failed");
+  const create = (sha256, spawn) => createPinnedSevenZipExecution({
+    fileCapabilities: {
+      async pinArchiveFileNoFollow() {
+        return { async assertStableNoFollow() {}, async close() { throw closeFailure; } };
+      },
+    },
+    sevenZipPath: executable,
+    sevenZipSha256: sha256,
+    async execFile() {},
+    spawn,
+  });
+  const trustedHash = createHash("sha256").update("trusted").digest("hex");
+  await assert.rejects(create(trustedHash, async () => { throw startFailure; }).spawnStream(
+    executable, [], {},
+  ), (error) => (
+    error instanceof AggregateError
+    && error.cause === startFailure
+    && error.errors[0] === startFailure
+    && error.errors[1] === closeFailure
+  ));
+  const mismatch = Object.assign(new Error("unused"), { code: "unused" });
+  await assert.rejects(create("0".repeat(64), async () => { throw mismatch; }).spawnFile(
+    executable, [], {},
+  ), (error) => (
+    error instanceof AggregateError
+    && error.cause?.code === "software_manager_7z_hash_mismatch"
+    && error.errors[0] === error.cause
+    && error.errors[1] === closeFailure
+  ));
+});
+
 test("invalid pinned 7z child getter cannot bypass pin cleanup", async (t) => {
   const directory = await fsPromises.mkdtemp(path.join(os.tmpdir(), "codexbridge-7z-getter-"));
   const executable = path.join(directory, "7za.exe");
@@ -806,6 +890,39 @@ test("default shortcut facade keeps receipts on one API instance, exposes all me
     [1, "inspect"], [1, "release"], [1, "removeExact"],
   ]);
   assert.equal(typeof shortcutFileApi.removeTemp, "function");
+});
+
+test("shortcut business failures keep the issuing API alive so its receipt can be cleaned", async () => {
+  let apiCalls = 0;
+  const shortcutFileApi = createLazyShortcutFileApi({
+    async getDesktopCapability() { return Object.freeze({ kind: "desktop" }); },
+    fileCapabilities: {
+      createShortcutFileApi() {
+        apiCalls += 1;
+        const receipts = new WeakSet();
+        return {
+          async inspectExact() { return { kind: "absent" }; },
+          async createTemp() { const receipt = {}; receipts.add(receipt); return receipt; },
+          async sealTemp(receipt) { if (!receipts.has(receipt)) throw new Error("foreign_receipt"); return receipt; },
+          async commitNoReplace(receipt) {
+            if (!receipts.has(receipt)) throw new Error("foreign_receipt");
+            throw new Error("shortcut_candidate_occupied");
+          },
+          async removeTemp(receipt) {
+            if (!receipts.has(receipt)) throw new Error("foreign_receipt");
+            return true;
+          },
+          async removeExact() {},
+          async release() {},
+        };
+      },
+    },
+  });
+  const receipt = await shortcutFileApi.createTemp();
+  await shortcutFileApi.sealTemp(receipt);
+  await assert.rejects(shortcutFileApi.commitNoReplace(receipt), /shortcut_candidate_occupied/u);
+  assert.equal(await shortcutFileApi.removeTemp(receipt), true);
+  assert.equal(apiCalls, 1);
 });
 
 test("host, Desktop, and Skills authorities are separately lazy and cached", async () => {
@@ -925,6 +1042,15 @@ test("startup recovery never cleans prepared Skills when task ownership changed 
 
 test("default Skill recovery infers a skill-only reserved root before swap and cleans its abandoned prepare", async () => {
   const fsApi = memoryRecoveryFs();
+  const deletePrepared = fsApi.deletePreparedSkillSourceNoFollow;
+  let cleanupFailures = 1;
+  fsApi.deletePreparedSkillSourceNoFollow = async (plan) => {
+    if (cleanupFailures > 0) {
+      cleanupFailures -= 1;
+      throw new Error("prepared_cleanup_failed");
+    }
+    return deletePrepared.call(fsApi, plan);
+  };
   const taskId = "skill-only";
   const skillId = "documents";
   const leaseNonce = "7".repeat(32);
@@ -980,12 +1106,333 @@ test("default Skill recovery infers a skill-only reserved root before swap and c
     },
   });
   assert.equal(await hooks.inferSkillInstallRoot(ownership), "D:\\CBApps");
-  await hooks.recoverActiveSkillTransaction({ installRootCapability, skillsRootCapability });
+  const recovered = await hooks.recoverActiveSkillTransaction({ installRootCapability, skillsRootCapability });
   assert.equal(ownership.activeTask, null);
   assert.equal(ownership.lastTask.action, "skill-replace-aborted");
+  assert.equal(ownership.installRoot, "D:\\CBApps");
+  await assert.rejects(hooks.cleanupAbandonedPreparedSkills({
+    installRootCapability, heldLease: recovered.heldLease,
+  }), /prepared_cleanup_failed/u);
+  assert.equal(ownership.installRoot, "D:\\CBApps");
   await hooks.cleanupAbandonedPreparedSkills({ installRootCapability });
   assert.equal(fsApi.deleted.length, 1);
+  assert.equal(ownership.installRoot, null);
   assert.equal(await hooks.inferSkillInstallRoot(ownership), null);
+});
+
+test("aborted Skill cleanup never clears a root claimed by concurrent work or new ownership", async (t) => {
+  for (const mode of ["active-task", "owned-component"]) {
+    await t.test(mode, async () => {
+      let ownership = state("D:\\CBApps");
+      ownership.lastTask = { taskId: "prior-abort", componentId: "documents", action: "skill-replace-aborted" };
+      if (mode === "active-task") ownership.activeTask = { kind: "component-prepare", taskId: "new-work" };
+      else ownership.components.chatgpt = { managed: true };
+      const ownershipStore = {
+        async load() { return structuredClone(ownership); },
+        async compareAndSwap(expected, next) {
+          assert.equal(expected, ownership.generation);
+          ownership = { ...structuredClone(next), generation: expected + 1 };
+          return structuredClone(ownership);
+        },
+        async acquireOperationLease() { return { async release() {} }; },
+      };
+      const hooks = createDefaultSkillRecoveryHooks({
+        fileCapabilities: memoryRecoveryFs(), ownershipStore,
+        dataRoot: "C:\\runtime-data", skillsRoot: "C:\\Users\\Example\\.codex\\skills",
+      });
+      const installRootCapability = await authorizeInstallRoot({
+        candidate: "D:\\CBApps", env: {}, maxRelativePath: 180,
+        access: async () => {}, realpath: async (value) => value,
+        lstat: async () => ({
+          dev: 1, ino: 2, isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false,
+        }),
+      });
+      await hooks.cleanupAbandonedPreparedSkills({ installRootCapability });
+      assert.equal(ownership.installRoot, "D:\\CBApps");
+      assert.equal(mode === "active-task" ? ownership.activeTask.taskId : ownership.components.chatgpt.managed, mode === "active-task" ? "new-work" : true);
+    });
+  }
+});
+
+test("a second process keeps an aborted Skill root while the exact prepare lease is live", async () => {
+  const fsApi = memoryRecoveryFs();
+  const taskId = "live-prepare";
+  const skillId = "documents";
+  const leaseNonce = "9".repeat(32);
+  const prepareJournal = createSkillPrepareJournal({
+    journalDir: "C:\\runtime-data\\skill-prepares", fsApi, installRoot: "D:\\CBApps",
+  });
+  await prepareJournal.record({
+    schemaVersion: 1, phase: "intent", taskId, skillId,
+    installRoot: "D:\\CBApps",
+    sourcePath: `D:\\CBApps\\staging\\task-${taskId}\\skill-${skillId}.prepare`,
+    leaseScope: "prepare", leaseNonce, identity: null, evidence: null,
+  });
+  let ownership = state("D:\\CBApps");
+  ownership.lastTask = { taskId, componentId: skillId, action: "skill-replace-aborted" };
+  let leaseIsLive = true;
+  let acquired = 0;
+  const ownershipStore = {
+    async load() { return structuredClone(ownership); },
+    async compareAndSwap(expected, next) {
+      assert.equal(expected, ownership.generation);
+      ownership = { ...structuredClone(next), generation: expected + 1 };
+      return structuredClone(ownership);
+    },
+    async acquireOperationLease({ nonce, scope, wait }) {
+      assert.deepEqual({ nonce, scope, wait }, { nonce: leaseNonce, scope: "prepare", wait: false });
+      if (leaseIsLive) return null;
+      acquired += 1;
+      return { async release() {} };
+    },
+  };
+  const hooks = createDefaultSkillRecoveryHooks({
+    fileCapabilities: fsApi, ownershipStore,
+    dataRoot: "C:\\runtime-data", skillsRoot: "C:\\Users\\Example\\.codex\\skills",
+  });
+  const installRootCapability = await authorizeInstallRoot({
+    candidate: "D:\\CBApps", env: {}, maxRelativePath: 180,
+    access: async () => {}, realpath: async (value) => value,
+    lstat: async () => ({
+      dev: 1, ino: 2, isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false,
+    }),
+  });
+
+  await hooks.cleanupAbandonedPreparedSkills({ installRootCapability });
+  assert.equal(ownership.installRoot, "D:\\CBApps");
+  assert.notEqual(await prepareJournal.load({ taskId, skillId }), null);
+  assert.equal(fsApi.deleted.length, 0);
+
+  leaseIsLive = false;
+  await hooks.cleanupAbandonedPreparedSkills({ installRootCapability });
+  assert.equal(acquired, 1);
+  assert.equal(await prepareJournal.load({ taskId, skillId }), null);
+  assert.equal(fsApi.deleted.length, 1);
+  assert.equal(ownership.installRoot, null);
+});
+
+test("a failed Skill prepare cleanup keeps its exact root claim for restart recovery", async () => {
+  const fsApi = memoryRecoveryFs();
+  const originalDelete = fsApi.deletePreparedSkillSourceNoFollow.bind(fsApi);
+  let deleteFailures = 1;
+  fsApi.deletePreparedSkillSourceNoFollow = async (plan) => {
+    if (deleteFailures > 0) {
+      deleteFailures -= 1;
+      throw new Error("test_skill_cleanup_failed");
+    }
+    return originalDelete(plan);
+  };
+  const taskId = "restart-prepare";
+  const skillId = "documents";
+  const leaseNonce = "d".repeat(32);
+  const prepareJournal = createSkillPrepareJournal({
+    journalDir: "C:\\runtime-data\\skill-prepares", fsApi, installRoot: "D:\\CBApps",
+  });
+  await prepareJournal.record({
+    schemaVersion: 1, phase: "intent", taskId, skillId,
+    installRoot: "D:\\CBApps",
+    sourcePath: `D:\\CBApps\\staging\\task-${taskId}\\skill-${skillId}.prepare`,
+    leaseScope: "prepare", leaseNonce, identity: null, evidence: null,
+  });
+  let ownership = state("D:\\CBApps");
+  ownership.activeTask = {
+    kind: "skill-prepare", taskId, skillId, version: "1.0.0",
+    leaseScope: "prepare", leaseNonce,
+  };
+  const ownershipStore = {
+    async load() { return structuredClone(ownership); },
+    async compareAndSwap(expected, next) {
+      assert.equal(expected, ownership.generation);
+      ownership = { ...structuredClone(next), generation: expected + 1 };
+      return structuredClone(ownership);
+    },
+    async acquireOperationLease() { return { async release() {} }; },
+  };
+  const installRootCapability = await authorizeInstallRoot({
+    candidate: "D:\\CBApps", env: {}, maxRelativePath: 180,
+    access: async () => {}, realpath: async (value) => value,
+    lstat: async () => ({
+      dev: 1, ino: 2, isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false,
+    }),
+  });
+  const createHooks = () => createDefaultSkillRecoveryHooks({
+    fileCapabilities: fsApi, ownershipStore,
+    dataRoot: "C:\\runtime-data", skillsRoot: "C:\\Users\\Example\\.codex\\skills",
+  });
+
+  await assert.rejects(
+    createHooks().cleanupAbandonedPreparedSkills({ installRootCapability }),
+    /test_skill_cleanup_failed/u,
+  );
+  assert.equal(ownership.installRoot, "D:\\CBApps");
+  assert.equal(ownership.activeTask.taskId, taskId);
+  assert.notEqual(await prepareJournal.load({ taskId, skillId }), null);
+
+  await createHooks().cleanupAbandonedPreparedSkills({ installRootCapability });
+  assert.equal(await prepareJournal.load({ taskId, skillId }), null);
+  assert.equal(ownership.activeTask, null);
+  assert.equal(ownership.lastTask.action, "prepare-aborted");
+  assert.equal(ownership.installRoot, null);
+});
+
+test("startup reclaims a first-install Skill prepared journal after prepare succeeded but commit never started", async () => {
+  const fsApi = memoryRecoveryFs();
+  const taskId = "prepared-crash";
+  const skillId = "documents";
+  const leaseNonce = "e".repeat(32);
+  const prepareJournal = createSkillPrepareJournal({
+    journalDir: "C:\\runtime-data\\skill-prepares", fsApi, installRoot: "D:\\CBApps",
+  });
+  await prepareJournal.record({
+    schemaVersion: 1, phase: "intent", taskId, skillId,
+    installRoot: "D:\\CBApps",
+    sourcePath: `D:\\CBApps\\staging\\task-${taskId}\\skill-${skillId}.prepare`,
+    leaseScope: "prepare", leaseNonce, identity: null, evidence: null,
+  });
+  let ownership = state("D:\\CBApps");
+  const ownershipStore = {
+    async load() { return structuredClone(ownership); },
+    async compareAndSwap(expected, next) {
+      assert.equal(expected, ownership.generation);
+      ownership = { ...structuredClone(next), generation: expected + 1 };
+      return structuredClone(ownership);
+    },
+    async acquireOperationLease() { return { async release() {} }; },
+  };
+  const hooks = createDefaultSkillRecoveryHooks({
+    fileCapabilities: fsApi, ownershipStore,
+    dataRoot: "C:\\runtime-data", skillsRoot: "C:\\Users\\Example\\.codex\\skills",
+  });
+  const installRootCapability = await authorizeInstallRoot({
+    candidate: "D:\\CBApps", env: {}, maxRelativePath: 180,
+    access: async () => {}, realpath: async (value) => value,
+    lstat: async () => ({
+      dev: 1, ino: 2, isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false,
+    }),
+  });
+
+  assert.equal(await hooks.inferSkillInstallRoot(ownership), "D:\\CBApps");
+  await hooks.cleanupAbandonedPreparedSkills({ installRootCapability });
+  assert.equal(await prepareJournal.load({ taskId, skillId }), null);
+  assert.equal(fsApi.deleted.length, 1);
+  assert.equal(ownership.activeTask, null);
+  assert.equal(ownership.installRoot, null);
+});
+
+test("Skill root release re-scans inside ownership commit and preserves a newly visible live prepare", async () => {
+  const backingFs = memoryRecoveryFs();
+  const prepareJournal = createSkillPrepareJournal({
+    journalDir: "C:\\runtime-data\\skill-prepares", fsApi: backingFs, installRoot: "D:\\CBApps",
+  });
+  await prepareJournal.record({
+    schemaVersion: 1, phase: "intent", taskId: "stale-scan", skillId: "documents",
+    installRoot: "D:\\CBApps",
+    sourcePath: "D:\\CBApps\\staging\\task-stale-scan\\skill-documents.prepare",
+    leaseScope: "prepare", leaseNonce: "9".repeat(32), identity: null, evidence: null,
+  });
+  let journalOpens = 0;
+  const fileCapabilities = {
+    ...backingFs,
+    async openJournalDirectoryNoFollow(...args) {
+      journalOpens += 1;
+      if (journalOpens === 1) {
+        return {
+          async listFileNamesNoFollow() { return []; },
+          async openFileNoFollow() { return null; },
+          async unlinkEntryNoFollow() {}, async renameEntryNoFollow() {}, async close() {},
+        };
+      }
+      return backingFs.openJournalDirectoryNoFollow(...args);
+    },
+  };
+  let live = true;
+  let ownership = state("D:\\CBApps");
+  const ownershipStore = {
+    async load() { return structuredClone(ownership); },
+    async compareAndSwap(expected, next) {
+      assert.equal(expected, ownership.generation);
+      ownership = { ...structuredClone(next), generation: expected + 1 };
+      return structuredClone(ownership);
+    },
+    async acquireOperationLease() {
+      return live ? null : { async release() {} };
+    },
+  };
+  const hooks = createDefaultSkillRecoveryHooks({
+    fileCapabilities, ownershipStore,
+    dataRoot: "C:\\runtime-data", skillsRoot: "C:\\Users\\Example\\.codex\\skills",
+  });
+  const installRootCapability = await authorizeInstallRoot({
+    candidate: "D:\\CBApps", env: {}, maxRelativePath: 180,
+    access: async () => {}, realpath: async (value) => value,
+    lstat: async () => ({
+      dev: 1, ino: 2, isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false,
+    }),
+  });
+
+  await hooks.cleanupAbandonedPreparedSkills({ installRootCapability });
+  assert.equal(ownership.installRoot, "D:\\CBApps");
+  assert.notEqual(await prepareJournal.load({ taskId: "stale-scan", skillId: "documents" }), null);
+
+  live = false;
+  await hooks.cleanupAbandonedPreparedSkills({ installRootCapability });
+  assert.equal(ownership.installRoot, null);
+  assert.equal(await prepareJournal.load({ taskId: "stale-scan", skillId: "documents" }), null);
+});
+
+test("startup can infer the unique legacy Skill prepare root even when ownership lost its transient root", async () => {
+  const fsApi = memoryRecoveryFs();
+  const prepareJournal = createSkillPrepareJournal({
+    journalDir: "C:\\runtime-data\\skill-prepares", fsApi, installRoot: "D:\\CBApps",
+  });
+  await prepareJournal.record({
+    schemaVersion: 1, phase: "intent", taskId: "legacy-gap", skillId: "documents",
+    installRoot: "D:\\CBApps",
+    sourcePath: "D:\\CBApps\\staging\\task-legacy-gap\\skill-documents.prepare",
+    leaseScope: "prepare", leaseNonce: "f".repeat(32), identity: null, evidence: null,
+  });
+  const ownership = state(null);
+  const hooks = createDefaultSkillRecoveryHooks({
+    fileCapabilities: fsApi,
+    ownershipStore: {
+      async load() { return structuredClone(ownership); },
+      async compareAndSwap() { throw new Error("unexpected_save"); },
+      async acquireOperationLease() { return { async release() {} }; },
+    },
+    dataRoot: "C:\\runtime-data", skillsRoot: "C:\\Users\\Example\\.codex\\skills",
+  });
+  assert.equal(await hooks.inferSkillInstallRoot(ownership), "D:\\CBApps");
+});
+
+test("aborted Skill root release retries after cleanup succeeded but its atomic state save failed", async () => {
+  let ownership = state("D:\\CBApps");
+  ownership.lastTask = { taskId: "prior-abort", componentId: "documents", action: "skill-replace-aborted" };
+  let saveFailures = 1;
+  const ownershipStore = {
+    async load() { return structuredClone(ownership); },
+    async compareAndSwap(expected, next) {
+      if (saveFailures > 0) { saveFailures -= 1; throw new Error("root_release_save_failed"); }
+      assert.equal(expected, ownership.generation);
+      ownership = { ...structuredClone(next), generation: expected + 1 };
+      return structuredClone(ownership);
+    },
+    async acquireOperationLease() { return { async release() {} }; },
+  };
+  const hooks = createDefaultSkillRecoveryHooks({
+    fileCapabilities: memoryRecoveryFs(), ownershipStore,
+    dataRoot: "C:\\runtime-data", skillsRoot: "C:\\Users\\Example\\.codex\\skills",
+  });
+  const installRootCapability = await authorizeInstallRoot({
+    candidate: "D:\\CBApps", env: {}, maxRelativePath: 180,
+    access: async () => {}, realpath: async (value) => value,
+    lstat: async () => ({
+      dev: 1, ino: 2, isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false,
+    }),
+  });
+  await assert.rejects(hooks.cleanupAbandonedPreparedSkills({ installRootCapability }), /root_release_save_failed/u);
+  assert.equal(ownership.installRoot, "D:\\CBApps");
+  await hooks.cleanupAbandonedPreparedSkills({ installRootCapability });
+  assert.equal(ownership.installRoot, null);
 });
 
 test("default Skill recovery releases task A lease without mutating a replacement task B", async () => {

@@ -202,6 +202,33 @@ test("round3 active tasks with an extra field stay invalid in main and backup", 
   }
 });
 
+test("bound archive prepare identity round-trips while Git and malformed identities fail closed", async () => {
+  const bound = state("D:\\CBApps");
+  bound.activeTask = {
+    kind: "component-prepare", taskId: "bound-archive", componentId: "chatgpt", version: "2.0.0",
+    leaseScope: "prepare", leaseNonce: "a".repeat(32),
+    stagingName: `.codexbridge-prepare-${"b".repeat(32)}`,
+    stagingIdentity: { volumeSerial: "volume", fileId: "staging" },
+  };
+  const memory = createMemoryStateFs({ "ownership.json": JSON.stringify(bound) });
+  const store = createOwnershipStore({ stateDir: path.resolve("bound-archive"), fsApi: memory.fsApi });
+  assert.deepEqual((await store.load()).activeTask, bound.activeTask);
+
+  for (const activeTask of [
+    { ...bound.activeTask, componentId: "git" },
+    { ...bound.activeTask, stagingIdentity: { volumeSerial: "volume" } },
+    { ...bound.activeTask, stagingIdentity: { volumeSerial: "volume", fileId: "staging", extra: true } },
+  ]) {
+    const invalid = state("D:\\CBApps");
+    invalid.activeTask = activeTask;
+    const invalidMemory = createMemoryStateFs({ "ownership.json": JSON.stringify(invalid) });
+    const invalidStore = createOwnershipStore({
+      stateDir: path.resolve(`bound-invalid-${Math.random()}`), fsApi: invalidMemory.fsApi,
+    });
+    await assert.rejects(invalidStore.load(), /ownership_state_invalid/u);
+  }
+});
+
 test("unknown or extra legacy fields fail closed and are never replaced with an empty ownership file", async () => {
   const unknown = { ...legacyState(state("C:\\Legacy")), surprise: true };
   const serialized = JSON.stringify(unknown);
