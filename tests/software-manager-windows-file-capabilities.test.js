@@ -1,4 +1,11 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
+import fs from "node:fs";
+import {
+  access, lstat, mkdir, mkdtemp, realpath, rename, rmdir, unlink, writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { deleteAuthorizedTree } from "../desktop/software-manager/safe-delete.mjs";
@@ -793,8 +800,8 @@ test("installer workspace capability issues exact direct children and mutates on
     await installRootAuthority("D:\\CBApps"), { maxRelativePath: 80 },
   );
   const [downloads, concurrentDownloads] = await Promise.all([
-    workspace.createOrOpenDirectoryChildNoFollow(workspace.root, "downloads", { requireEmpty: false }),
-    workspace.createOrOpenDirectoryChildNoFollow(workspace.root, "downloads", { requireEmpty: false }),
+    workspace.createOrOpenDirectoryChildNoFollow(workspace.root, "downloads", { requireEmpty: false, role: "rename-parent" }),
+    workspace.createOrOpenDirectoryChildNoFollow(workspace.root, "downloads", { requireEmpty: false, role: "rename-parent" }),
   ]);
   assert.deepEqual(
     await workspace.inspectIssuedChildNoFollow(concurrentDownloads),
@@ -818,6 +825,114 @@ test("installer workspace capability issues exact direct children and mutates on
   await assert.rejects(workspace.inspectIssuedChildNoFollow(downloads), /capability_closed/u);
 });
 
+test("installer workspace pins rename parents read-only and issued files with private delete access", async () => {
+  const fake = createFakeNative([{ path: "D:\\CBApps" }]);
+  const workspace = await capabilities(fake).openInstallerWorkspaceRootNoFollow(
+    await installRootAuthority("D:\\CBApps"), { maxRelativePath: 80 },
+  );
+  const downloads = await workspace.createOrOpenDirectoryChildNoFollow(
+    workspace.root, "downloads", { requireEmpty: false, role: "rename-parent" },
+  );
+  const part = await workspace.createFileChildNoFollow(downloads, "chatgpt-1.0.0.zip.part");
+  await workspace.inspectIssuedChildNoFollow(part);
+
+  for (const [exactPath, directory, deleteAccess] of [
+    ["D:\\CBApps\\downloads", true, false],
+    ["D:\\CBApps\\downloads\\chatgpt-1.0.0.zip.part", false, true],
+  ]) {
+    const heldOpen = fake.calls.findLast((call) => call[0] === "open" && call[1] === exactPath);
+    assert.equal(heldOpen[2].access.includes("delete"), deleteAccess);
+    assert.equal(heldOpen[2].share.includes("delete"), false);
+    await assert.rejects(
+      fake.nativeApi.openPath(exactPath, {
+        access: ["delete"],
+        share: ["read", "write", "delete"],
+        disposition: "openExisting",
+        directory,
+      }),
+      /sharing_violation/u,
+    );
+  }
+
+  const promoted = await workspace.renameIssuedChildNoReplace(part, "chatgpt-1.0.0.zip");
+  assert.equal(fake.get("D:\\CBApps\\downloads\\chatgpt-1.0.0.zip.part"), undefined);
+  assert.notEqual(fake.get("D:\\CBApps\\downloads\\chatgpt-1.0.0.zip"), undefined);
+  assert.equal(fake.calls.some((call) => call[0] === "rename-handle"
+    && call[2] === "D:\\CBApps\\downloads"), true);
+  await workspace.deleteIssuedChildNoFollow(promoted);
+  await workspace.close();
+});
+
+test("real Windows installer workspace handle remains compatible with a Node write stream", {
+  skip: process.platform !== "win32",
+}, async () => {
+  const tempParent = await mkdtemp(join(tmpdir(), "codexbridge-installer-workspace-"));
+  const rootPath = join(tempParent, `workspace-${"x".repeat(48)}`);
+  await mkdir(rootPath);
+  const downloadsPath = join(rootPath, "downloads");
+  const stagingPath = join(rootPath, "staging");
+  const partPath = join(downloadsPath, "chatgpt-1.0.0.zip.part");
+  const finalPath = join(downloadsPath, "chatgpt-1.0.0.zip");
+  let workspace = null;
+  try {
+    const stableRootPath = await realpath(rootPath);
+    const installRoot = await authorizeInstallRoot({
+      candidate: stableRootPath,
+      env: process.env,
+      maxRelativePath: 100,
+      access,
+      realpath,
+      lstat,
+    });
+    workspace = await createWindowsFileCapabilities({
+      platform: "win32",
+      nativeApi: createWin32FileApi({ platform: "win32" }),
+    }).openInstallerWorkspaceRootNoFollow(installRoot, { maxRelativePath: 100 });
+    const downloads = await workspace.createOrOpenDirectoryChildNoFollow(
+      workspace.root, "downloads", { requireEmpty: false, role: "rename-parent" },
+    );
+    const part = await workspace.createFileChildNoFollow(downloads, "chatgpt-1.0.0.zip.part");
+    const output = fs.createWriteStream(partPath, { flags: "w" });
+    output.end(Buffer.from("node-stream-compatible"));
+    await once(output, "close");
+    assert.equal((await workspace.inspectIssuedChildNoFollow(part)).size, 22);
+    await assert.rejects(rename(partPath, `${partPath}.external`), (error) => (
+      error?.code === "EBUSY" || error?.code === "EPERM" || error?.code === "EACCES"
+    ));
+    await writeFile(finalPath, "occupied");
+    await assert.rejects(
+      workspace.renameIssuedChildNoReplace(part, "chatgpt-1.0.0.zip"),
+      /entry_exists/u,
+    );
+    await unlink(finalPath);
+    const promoted = await workspace.renameIssuedChildNoReplace(part, "chatgpt-1.0.0.zip");
+    await workspace.deleteIssuedChildNoFollow(promoted);
+    const staging = await workspace.createOrOpenDirectoryChildNoFollow(
+      workspace.root, "staging", { requireEmpty: false, role: "anchor" },
+    );
+    const task = await workspace.createOrOpenDirectoryChildNoFollow(
+      staging, "task-smoke", { requireEmpty: false, role: "deletable" },
+    );
+    const leaf = await workspace.createOrOpenDirectoryChildNoFollow(
+      task, "chatgpt.prepare", { requireEmpty: true, role: "deletable" },
+    );
+    await workspace.deleteIssuedChildNoFollow(leaf);
+    await workspace.deleteIssuedChildNoFollow(task);
+    await workspace.close();
+    workspace = null;
+  } finally {
+    if (workspace) await workspace.close().catch(() => {});
+    await unlink(partPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+    await unlink(finalPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+    await rmdir(join(stagingPath, "task-smoke", "chatgpt.prepare")).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+    await rmdir(join(stagingPath, "task-smoke")).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+    await rmdir(stagingPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+    await rmdir(downloadsPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+    await rmdir(rootPath);
+    await rmdir(tempParent);
+  }
+});
+
 test("installer workspace child reuse rejects nonempty, reparse, hardlink, ADS, and identity drift", async (t) => {
   const base = [
     { path: "D:\\CBApps" },
@@ -831,6 +946,10 @@ test("installer workspace child reuse rejects nonempty, reparse, hardlink, ADS, 
   );
   await assert.rejects(
     workspace.createOrOpenDirectoryChildNoFollow(workspace.root, "extra", { requireEmpty: true, extra: true }),
+    /workspace_directory_options_invalid/u,
+  );
+  await assert.rejects(
+    workspace.createOrOpenDirectoryChildNoFollow(workspace.root, "extra", { requireEmpty: true, role: "arbitrary" }),
     /workspace_directory_options_invalid/u,
   );
   await assert.rejects(
@@ -890,7 +1009,9 @@ test("installer workspace rejects foreign receipts, collisions, and concurrent d
   const other = await api.openInstallerWorkspaceRootNoFollow(
     await installRootAuthority("D:\\Other"), { maxRelativePath: 80 },
   );
-  const downloads = await owned.createOrOpenDirectoryChildNoFollow(owned.root, "downloads", { requireEmpty: false });
+  const downloads = await owned.createOrOpenDirectoryChildNoFollow(
+    owned.root, "downloads", { requireEmpty: false, role: "rename-parent" },
+  );
   const part = await owned.createFileChildNoFollow(downloads, "package.zip.part");
   await assert.rejects(other.inspectIssuedChildNoFollow(part), /workspace_receipt_invalid/u);
   await assert.rejects(owned.renameIssuedChildNoReplace(part, "occupied.zip"), /entry_exists/u);
@@ -1109,24 +1230,35 @@ test("shortcut removeExact failure closes both held handles and aggregates close
   await shortcut.release(inspected);
 });
 
-test("thin Win32 layer binds only fixed Kernel32 APIs and opens no-follow with directory semantics", async () => {
+test("thin Win32 layer binds fixed Kernel32 and Ntdll APIs with a relative held-parent rename", async () => {
   const bindings = [];
   const createCalls = [];
   const setInfoCalls = [];
+  const ntSetInfoCalls = [];
+  let ntStatus = 0;
+  const finalPaths = new Map([
+    [42n, "C:\\safe\\source.part"],
+    [99n, "C:\\safe"],
+  ]);
   const stubs = new Map([
     ["CreateFileW", (...args) => { createCalls.push(args); return 42n; }],
     ["CloseHandle", () => 1],
     ["GetLastError", () => 0],
     ["SetFileInformationByHandle", (...args) => { setInfoCalls.push(args); return 1; }],
-    ["GetFinalPathNameByHandleW", (_handle, output) => {
-      const value = Buffer.from("C:\\safe", "utf16le");
+    ["NtSetInformationFile", (...args) => { ntSetInfoCalls.push(args); return ntStatus; }],
+    ["RtlNtStatusToDosError", (status) => {
+      assert.equal(status, -1073741771);
+      return 183;
+    }],
+    ["GetFinalPathNameByHandleW", (handle, output) => {
+      const value = Buffer.from(finalPaths.get(BigInt(handle)) ?? "C:\\safe", "utf16le");
       value.copy(output);
       return value.length / 2;
     }],
   ]);
   const koffi = {
     load(name) {
-      assert.equal(name, "Kernel32.dll");
+      assert.equal(["Kernel32.dll", "ntdll.dll"].includes(name), true);
       return {
         func(...definition) {
           bindings.push(definition);
@@ -1157,21 +1289,69 @@ test("thin Win32 layer binds only fixed Kernel32 APIs and opens no-follow with d
   assert.equal(createCalls[1][5] & 0x04000000, 0x04000000);
   assert.equal(createCalls[1][2], 0);
   await api.renameByHandle(42n, 99n, "target.lnk", { replace: false });
-  await api.deleteByHandle(42n, { directory: false });
-  assert.equal(setInfoCalls[0][1], 3);
-  assert.equal(setInfoCalls[0][2].readUInt32LE(0), 0);
-  assert.equal(setInfoCalls[0][2].readBigUInt64LE(8), 0n);
-  const renameNameLength = setInfoCalls[0][2].readUInt32LE(16);
-  assert.equal(
-    setInfoCalls[0][2].subarray(20, 20 + renameNameLength).toString("utf16le"),
-    "\\\\?\\C:\\safe\\target.lnk",
+  ntStatus = -1073741771;
+  assert.throws(
+    () => api.renameByHandle(42n, 99n, "occupied.lnk", { replace: false }),
+    /entry_exists/u,
   );
-  assert.equal(setInfoCalls[0][2].length, 24 + Buffer.byteLength("\\\\?\\C:\\safe\\target.lnk", "utf16le"));
-  assert.equal(setInfoCalls[1][1], 4);
+  ntStatus = 0;
+  finalPaths.set(99n, "D:\\other");
+  assert.throws(
+    () => api.renameByHandle(42n, 99n, "escape.lnk", { replace: false }),
+    /windows_rename_directory_mismatch/u,
+  );
+  finalPaths.set(99n, "C:\\safe");
+  await api.deleteByHandle(42n, { directory: false });
+  assert.equal(ntSetInfoCalls[0][0], 42n);
+  assert.equal(ntSetInfoCalls[0][4], 10);
+  assert.equal(ntSetInfoCalls[0][2].readUInt32LE(0), 0);
+  assert.equal(ntSetInfoCalls[0][2].readBigUInt64LE(8), 99n);
+  const renameNameLength = ntSetInfoCalls[0][2].readUInt32LE(16);
+  assert.equal(
+    ntSetInfoCalls[0][2].subarray(20, 20 + renameNameLength).toString("utf16le"),
+    "target.lnk",
+  );
+  assert.equal(ntSetInfoCalls[0][2].length, 24 + Buffer.byteLength("target.lnk", "utf16le"));
+  assert.equal(setInfoCalls[0][1], 4);
   assert.equal(bindings.every((definition) => definition[0] === "__stdcall"), true);
   assert.deepEqual(bindings.map((definition) => definition[1]), [
     "CreateFileW", "CloseHandle", "GetLastError", "GetFileInformationByHandle",
     "GetFileInformationByHandleEx", "GetFinalPathNameByHandleW", "ReadFile", "WriteFile",
     "FlushFileBuffers", "CreateDirectoryW", "SetFileInformationByHandle",
+    "NtSetInformationFile", "RtlNtStatusToDosError",
   ]);
+});
+
+test("Ntdll same-directory rename uses the x86 FILE_RENAME_INFORMATION ABI", () => {
+  const ntCalls = [];
+  const paths = new Map([[7n, "C:\\safe\\package.part"], [9n, "C:\\safe"]]);
+  const stubs = new Map([
+    ["GetFinalPathNameByHandleW", (handle, output) => {
+      const value = Buffer.from(paths.get(BigInt(handle)), "utf16le");
+      value.copy(output);
+      return value.length / 2;
+    }],
+    ["NtSetInformationFile", (...args) => { ntCalls.push(args); return 0; }],
+    ["RtlNtStatusToDosError", () => 317],
+  ]);
+  const koffi = {
+    load() {
+      return {
+        func(...definition) {
+          const name = definition.length === 4 ? definition[1] : definition[0];
+          return stubs.get(name) ?? (() => 1);
+        },
+      };
+    },
+    sizeof(type) { return type === "intptr_t" ? 4 : 4; },
+  };
+  const api = createWin32FileApi({ platform: "win32", koffi });
+  api.renameByHandle(7n, 9n, "package.zip", { replace: false });
+  const info = ntCalls[0][2];
+  assert.equal(info.readUInt32LE(0), 0);
+  assert.equal(info.readUInt32LE(4), 9);
+  const nameLength = info.readUInt32LE(8);
+  assert.equal(info.subarray(12, 12 + nameLength).toString("utf16le"), "package.zip");
+  assert.equal(info.length, 16 + Buffer.byteLength("package.zip", "utf16le"));
+  assert.equal(ntCalls[0][4], 10);
 });

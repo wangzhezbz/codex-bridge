@@ -20,7 +20,6 @@ const FILE_ID_INFO = 18;
 const FILE_ID_BOTH_DIRECTORY_INFO = 10;
 const FILE_ID_BOTH_DIRECTORY_RESTART_INFO = 11;
 const FILE_DISPOSITION_INFO = 4;
-const FILE_RENAME_INFO = 3;
 const MAX_NATIVE_PATH_CHARS = 32_768;
 const NATIVE_ENUM_BUFFER_BYTES = 64 * 1_024;
 
@@ -69,6 +68,7 @@ export function createWin32FileApi({ platform = process.platform, koffi } = {}) 
   if (!ffi || typeof ffi.load !== "function") throw win32Error("koffi_adapter_required");
 
   const kernel32 = ffi.load("Kernel32.dll");
+  const ntdll = ffi.load("ntdll.dll");
   const CreateFileW = kernel32.func("__stdcall", "CreateFileW", "intptr_t", [
     "str16", "uint32_t", "uint32_t", "void *", "uint32_t", "uint32_t", "intptr_t",
   ]);
@@ -90,6 +90,13 @@ export function createWin32FileApi({ platform = process.platform, koffi } = {}) 
   const SetFileInformationByHandle = kernel32.func(
     "__stdcall", "SetFileInformationByHandle", "int", ["intptr_t", "int", "void *", "uint32_t"],
   );
+  const NtSetInformationFile = ntdll.func(
+    "__stdcall", "NtSetInformationFile", "int32_t",
+    ["intptr_t", "void *", "void *", "uint32_t", "int"],
+  );
+  const RtlNtStatusToDosError = ntdll.func(
+    "__stdcall", "RtlNtStatusToDosError", "uint32_t", ["int32_t"],
+  );
   const pointerSize = typeof ffi.sizeof === "function" ? ffi.sizeof("intptr_t") : 8;
   if (pointerSize !== 4 && pointerSize !== 8) throw win32Error("windows_pointer_size_unsupported");
 
@@ -100,6 +107,14 @@ export function createWin32FileApi({ platform = process.platform, koffi } = {}) 
 
   function requireSuccess(result, operation) {
     if (!result) throw failure(operation);
+  }
+
+  function requireNtSuccess(status, operation) {
+    const signed = Number(status);
+    if (!Number.isInteger(signed)) throw win32Error("windows_ntstatus_invalid", operation);
+    if (signed >= 0) return;
+    const nativeCode = Number(RtlNtStatusToDosError(signed));
+    throw win32Error(mapNativeCode(nativeCode), operation, nativeCode);
   }
 
   function openPath(exactPath, options) {
@@ -283,24 +298,34 @@ export function createWin32FileApi({ platform = process.platform, koffi } = {}) 
       || /[\\/:\0]/u.test(name)) {
       throw win32Error("windows_rename_name_invalid");
     }
-    // User-mode SetFileInformationByHandle rejects a non-null RootDirectory on supported
-    // Windows builds. Resolve the already-pinned directory handle and submit one atomic,
-    // no-replace rename with an absolute target instead of falling back to path rename.
+    // This primitive intentionally supports only a same-directory rename. The caller
+    // supplies both already-open identities, and the source stays held with DELETE access
+    // while denying FILE_SHARE_DELETE to every external opener.
+    const sourcePath = finalPath(handle).replace(/[\\]+$/u, "");
     const rootPath = finalPath(rootHandle).replace(/[\\]+$/u, "");
-    const destinationPath = `${rootPath}\\${name}`;
-    if (destinationPath.length >= MAX_NATIVE_PATH_CHARS) throw win32Error("native_path_buffer_exceeded");
-    const encoded = Buffer.from(toExtendedPath(destinationPath), "utf16le");
+    const separator = sourcePath.lastIndexOf("\\");
+    if (separator <= 2 || sourcePath.slice(0, separator).normalize("NFC").toLowerCase()
+      !== rootPath.normalize("NFC").toLowerCase()) {
+      throw win32Error("windows_rename_directory_mismatch");
+    }
+    const encoded = Buffer.from(name, "utf16le");
+    if (encoded.length === 0 || encoded.length >= MAX_NATIVE_PATH_CHARS * 2) {
+      throw win32Error("native_path_buffer_exceeded");
+    }
     const rootOffset = pointerSize === 8 ? 8 : 4;
     const lengthOffset = rootOffset + pointerSize;
     const nameOffset = lengthOffset + 4;
     const structureSize = pointerSize === 8 ? 24 : 16;
     const info = Buffer.alloc(structureSize + encoded.length);
     info.writeUInt32LE(0, 0);
+    if (pointerSize === 8) info.writeBigUInt64LE(BigInt.asUintN(64, handleValue(rootHandle)), rootOffset);
+    else info.writeUInt32LE(Number(BigInt.asUintN(32, handleValue(rootHandle))), rootOffset);
     info.writeUInt32LE(encoded.length, lengthOffset);
     encoded.copy(info, nameOffset);
-    requireSuccess(
-      SetFileInformationByHandle(handle, FILE_RENAME_INFO, info, info.length),
-      "SetFileInformationByHandle(FileRenameInfo)",
+    const ioStatus = Buffer.alloc(pointerSize * 2);
+    requireNtSuccess(
+      NtSetInformationFile(handle, ioStatus, info, info.length, 10),
+      "NtSetInformationFile(FileRenameInformation)",
     );
   }
 

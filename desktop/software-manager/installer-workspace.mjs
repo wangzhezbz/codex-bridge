@@ -1,5 +1,7 @@
 import path from "node:path";
 
+import { compareVersions } from "../../shared/software-manager/catalog-schema.mjs";
+import { consumePreparedDownloadVerification } from "./download-manager.mjs";
 import { revalidateInstallRootCapability } from "./path-policy.mjs";
 
 const COMPONENT_EXTENSIONS = Object.freeze({
@@ -9,7 +11,7 @@ const COMPONENT_EXTENSIONS = Object.freeze({
 });
 const TASK_ID = /^[a-z0-9][a-z0-9-]{0,63}$/u;
 const SKILL_ID = /^[a-z0-9][a-z0-9-]{0,63}$/u;
-const VERSION = /^[A-Za-z0-9](?:[A-Za-z0-9._+-]{0,126}[A-Za-z0-9_+-])?$/u;
+const SHA256 = /^[a-f0-9]{64}$/u;
 
 function workspaceError(code, cause) {
   const error = new Error(code, cause === undefined ? undefined : { cause });
@@ -31,12 +33,25 @@ function validateComponent(componentId) {
   return componentId;
 }
 
-function validateDownload({ componentId, version, extension } = {}) {
+function validateDownload(request = {}) {
+  const { componentId, version, extension } = request;
   const component = validateComponent(componentId);
-  if (!validIdentifier(version, VERSION) || extension !== COMPONENT_EXTENSIONS[component]) {
+  try {
+    compareVersions(version, version);
+  } catch {
     throw workspaceError("workspace_identifier_invalid");
   }
-  return { componentId: component, version, extension };
+  if (extension !== COMPONENT_EXTENSIONS[component]) throw workspaceError("workspace_identifier_invalid");
+  if (!Number.isSafeInteger(request.size) || request.size <= 0 || !SHA256.test(request.sha256 ?? "")) {
+    throw workspaceError("workspace_asset_invalid");
+  }
+  return {
+    componentId: component,
+    version,
+    extension,
+    size: request.size,
+    sha256: request.sha256,
+  };
 }
 
 function validateTask(taskId) {
@@ -52,6 +67,13 @@ function validateSkill(skillId) {
 function validateFileCapabilities(value) {
   if (!value || typeof value.openInstallerWorkspaceRootNoFollow !== "function") {
     throw workspaceError("workspace_file_capabilities_invalid");
+  }
+  return value;
+}
+
+function validateDownloadManager(value) {
+  if (!value || typeof value.downloadPrepared !== "function") {
+    throw workspaceError("workspace_download_manager_invalid");
   }
   return value;
 }
@@ -76,8 +98,11 @@ function makeReceipt(fields) {
   return Object.freeze(Object.assign(Object.create(null), fields));
 }
 
-export function createInstallerWorkspace({ fileCapabilities, installRootCapability } = {}) {
+export function createInstallerWorkspace({
+  fileCapabilities, installRootCapability, downloadManager,
+} = {}) {
   const files = validateFileCapabilities(fileCapabilities);
+  const downloads = validateDownloadManager(downloadManager);
   if (!installRootCapability || typeof installRootCapability !== "object") {
     throw workspaceError("install_root_capability_invalid");
   }
@@ -116,13 +141,17 @@ export function createInstallerWorkspace({ fileCapabilities, installRootCapabili
     }
   }
 
-  function prepareOnce(key, operation) {
+  function prepareOnce(key, operation, binding = key) {
     const existing = pending.get(key);
-    if (existing) return existing;
+    if (existing) {
+      if (existing.binding !== binding) throw workspaceError("workspace_path_alias_collision");
+      return existing.promise;
+    }
     const promise = Promise.resolve().then(operation);
-    pending.set(key, promise);
+    const entry = { binding, promise };
+    pending.set(key, entry);
     promise.catch(() => {
-      if (pending.get(key) === promise) pending.delete(key);
+      if (pending.get(key) === entry) pending.delete(key);
     });
     return promise;
   }
@@ -151,8 +180,18 @@ export function createInstallerWorkspace({ fileCapabilities, installRootCapabili
     if (closeError) throw closeError;
   }
 
-  async function promotePartNoReplace(record) {
+  async function promotePartNoReplace(record, verificationReceipt) {
     const authority = claimRecord(record, "download");
+    try {
+      consumePreparedDownloadVerification(downloads, verificationReceipt, {
+        partPath: authority.partPath,
+        size: authority.size,
+        sha256: authority.sha256,
+      });
+    } catch (error) {
+      authority.state = "issued";
+      throw error;
+    }
     try {
       await revalidateInstallRootCapability(installRootCapability, {
         maxRelativePath: authority.relativePath.length,
@@ -180,12 +219,20 @@ export function createInstallerWorkspace({ fileCapabilities, installRootCapabili
     const finalName = `${request.componentId}-${request.version}${request.extension}`;
     const partName = `${finalName}.part`;
     const relativePath = path.win32.join("downloads", partName);
-    const key = `download:${request.componentId}:${request.version}:${request.extension}`;
+    const rootPath = await revalidateInstallRootCapability(installRootCapability, {
+      maxRelativePath: relativePath.length,
+    });
+    const finalPath = path.win32.join(rootPath, "downloads", finalName);
+    const key = `download:${finalPath.normalize("NFC").toLowerCase()}`;
+    const binding = [
+      request.componentId, request.version, request.extension,
+      String(request.size), request.sha256,
+    ].join("\0");
     return prepareOnce(key, async () => {
       const { rootPath, session } = await openRoot(relativePath);
       try {
         const downloads = await session.createOrOpenDirectoryChildNoFollow(
-          session.root, "downloads", { requireEmpty: false },
+          session.root, "downloads", { requireEmpty: false, role: "rename-parent" },
         );
         const occupied = await session.openFileChildNoFollow(downloads, finalName);
         if (occupied) throw workspaceError("workspace_package_collision");
@@ -196,9 +243,11 @@ export function createInstallerWorkspace({ fileCapabilities, installRootCapabili
           componentId: request.componentId,
           version: request.version,
           extension: request.extension,
-          path: path.win32.join(rootPath, "downloads", finalName),
+          size: request.size,
+          sha256: request.sha256,
+          path: finalPath,
           partPath: path.win32.join(rootPath, "downloads", partName),
-          promotePartNoReplace: () => promotePartNoReplace(record),
+          promotePartNoReplace: (verificationReceipt) => promotePartNoReplace(record, verificationReceipt),
         });
         authorities.set(record, {
           kind: "download",
@@ -208,6 +257,9 @@ export function createInstallerWorkspace({ fileCapabilities, installRootCapabili
           session,
           fileReceipt,
           finalName,
+          partPath: record.partPath,
+          size: request.size,
+          sha256: request.sha256,
           relativePath,
         });
         return record;
@@ -217,7 +269,7 @@ export function createInstallerWorkspace({ fileCapabilities, installRootCapabili
         });
         throw error;
       }
-    });
+    }, binding);
   }
 
   async function prepareStaging({ kind, key, taskId, leafName, fields }) {
@@ -225,13 +277,13 @@ export function createInstallerWorkspace({ fileCapabilities, installRootCapabili
     const { rootPath, session } = await openRoot(relativePath);
     try {
       const staging = await session.createOrOpenDirectoryChildNoFollow(
-        session.root, "staging", { requireEmpty: false },
+        session.root, "staging", { requireEmpty: false, role: "anchor" },
       );
       const task = await session.createOrOpenDirectoryChildNoFollow(
-        staging, `task-${taskId}`, { requireEmpty: false },
+        staging, `task-${taskId}`, { requireEmpty: false, role: "deletable" },
       );
       const leaf = await session.createOrOpenDirectoryChildNoFollow(
-        task, leafName, { requireEmpty: true },
+        task, leafName, { requireEmpty: true, role: "deletable" },
       );
       const record = makeReceipt({
         kind,

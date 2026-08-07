@@ -9,7 +9,10 @@ import { join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 
-import { createDownloadManager } from "../desktop/software-manager/download-manager.mjs";
+import {
+  consumePreparedDownloadVerification,
+  createDownloadManager,
+} from "../desktop/software-manager/download-manager.mjs";
 
 const body = Buffer.from("CodexBridge component package: resumable and verified.");
 
@@ -100,6 +103,88 @@ test("resumes a partial package and verifies final SHA256", async () => {
   } finally {
     await origin.close();
   }
+});
+
+test("prepared mode verifies one exact part without publishing and issues an opaque instance-bound receipt", async () => {
+  const origin = await startServer((request, response) => {
+    response.writeHead(200, { "Content-Length": body.length });
+    response.end(body);
+  });
+  try {
+    await withTempDirectory(async ({ destination: fixtureDestination }) => {
+      const destination = fixtureDestination();
+      const partPath = `${destination}.part`;
+      const asset = assetFor(`${origin.url}/component.zip`);
+      const manager = createDownloadManager();
+      const receipt = await manager.downloadPrepared({ asset, partPath });
+
+      assert.deepEqual(await readFile(partPath), body);
+      await assert.rejects(stat(destination));
+      assert.equal(Object.getPrototypeOf(receipt), null);
+      assert.deepEqual(Object.keys(receipt), []);
+      assert.equal(Object.isFrozen(receipt), true);
+
+      assert.throws(
+        () => consumePreparedDownloadVerification(manager, Object.freeze({ verified: true }), {
+          partPath, size: asset.size, sha256: asset.sha256,
+        }),
+        /verification_receipt_invalid/u,
+      );
+
+      assert.throws(
+        () => consumePreparedDownloadVerification(createDownloadManager(), receipt, {
+          partPath, size: asset.size, sha256: asset.sha256,
+        }),
+        /verification_(?:manager|receipt)_invalid/u,
+      );
+      assert.deepEqual(
+        consumePreparedDownloadVerification(manager, receipt, {
+          partPath, size: asset.size, sha256: asset.sha256,
+        }),
+        { partPath, size: asset.size, sha256: asset.sha256 },
+      );
+      assert.throws(
+        () => consumePreparedDownloadVerification(manager, receipt, {
+          partPath, size: asset.size, sha256: asset.sha256,
+        }),
+        /verification_receipt_consumed/u,
+      );
+    });
+  } finally {
+    await origin.close();
+  }
+});
+
+test("prepared verification binding mismatch consumes the receipt and cannot be retried with corrected metadata", async () => {
+  await withTempDirectory(async ({ destination: fixtureDestination }) => {
+    const destination = fixtureDestination();
+    const partPath = `${destination}.part`;
+    const asset = assetFor("https://shanhaiyouling.com/codexbridge-test/packages/component.zip");
+    await writeFile(partPath, body);
+    const manager = createDownloadManager({
+      fetchImpl() { throw new Error("complete part must not fetch"); },
+    });
+    for (const override of [
+      { partPath: `${partPath}.alias` },
+      { size: asset.size + 1 },
+      { sha256: "0".repeat(64) },
+    ]) {
+      const receipt = await manager.downloadPrepared({ asset, partPath });
+      assert.throws(
+        () => consumePreparedDownloadVerification(manager, receipt, {
+          partPath, size: asset.size, sha256: asset.sha256, ...override,
+        }),
+        /verification_binding_mismatch/u,
+      );
+      assert.throws(
+        () => consumePreparedDownloadVerification(manager, receipt, {
+          partPath, size: asset.size, sha256: asset.sha256,
+        }),
+        /verification_receipt_consumed/u,
+      );
+    }
+    await assert.rejects(stat(destination));
+  });
 });
 
 test("restarts from zero when a server ignores the resume Range", async () => {

@@ -13,6 +13,7 @@ const VERSION_MARKER_NAME = ".codexbridge-version.json";
 const STATE_LOCK_NAME = ".codexbridge-ownership.lock";
 const OPERATION_LEASE_NONCE = /^[a-f0-9]{32}$/u;
 const OPERATION_LEASE_SCOPES = new Set(["prepare", "git-execute"]);
+const WORKSPACE_DIRECTORY_ROLES = new Set(["anchor", "rename-parent", "deletable"]);
 const COMPONENT_IDS = new Set(["chatgpt", "v2rayn", "git"]);
 const VERSION = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
@@ -578,7 +579,7 @@ export function createWindowsFileCapabilities({
     const receiptMap = new WeakMap();
     const session = Object.freeze(Object.create(null));
 
-    function issue({ path: exactPath, info, handle, kind, parent = null }) {
+    function issue({ path: exactPath, info, handle, kind, parent = null, role = null }) {
       const receipt = Object.freeze(Object.create(null));
       receiptMap.set(receipt, {
         session,
@@ -587,6 +588,7 @@ export function createWindowsFileCapabilities({
         handle,
         kind,
         parent,
+        role,
         state: "issued",
       });
       return receipt;
@@ -597,6 +599,7 @@ export function createWindowsFileCapabilities({
       info: pin.leaf.info,
       handle: pin.leaf.handle,
       kind: "directory",
+      role: "anchor",
     });
 
     function requireReceipt(receipt, { directory = false, claim = false } = {}) {
@@ -634,7 +637,7 @@ export function createWindowsFileCapabilities({
       }
     }
 
-    async function openDirectChild(parent, name, { kind, disposition }) {
+    async function openDirectChild(parent, name, { kind, disposition, role = null }) {
       const parentInternal = requireReceipt(parent, { directory: true });
       const exactName = validateChildName(name);
       await assertStable(parentInternal, "directory");
@@ -642,8 +645,10 @@ export function createWindowsFileCapabilities({
       const handle = await nativeApi.openPath(childPath, {
         access: kind === "file"
           ? ["read", "write", "attributes", "delete"]
-          : ["read", "attributes", "delete"],
-        share: ["read", "write", "delete"],
+          : role === "deletable"
+            ? ["read", "attributes", "traverse", "delete"]
+            : ["attributes", "traverse"],
+        share: ["read", "write"],
         disposition,
         directory: kind === "directory",
       });
@@ -655,7 +660,7 @@ export function createWindowsFileCapabilities({
         const finalPath = validateAbsolute(await nativeApi.finalPath(handle));
         if (!samePath(finalPath, childPath)) throw capabilityError("windows_final_path_mismatch");
         await assertStable(parentInternal, "directory");
-        return issue({ path: finalPath, info, handle, kind, parent });
+        return issue({ path: finalPath, info, handle, kind, parent, role });
       } catch (error) {
         await closeOne(nativeApi, pin.owner, handle).catch((closeError) => {
           throw new AggregateError([error, closeError], error.message, { cause: error });
@@ -667,11 +672,15 @@ export function createWindowsFileCapabilities({
     async function createOrOpenDirectoryChildNoFollow(parent, name, options = {}) {
       const hasRequireEmpty = options !== null && typeof options === "object"
         && Object.hasOwn(options, "requireEmpty");
-      if (!hasExactKeys(options, hasRequireEmpty ? ["requireEmpty"] : [])
-        || (hasRequireEmpty && typeof options.requireEmpty !== "boolean")) {
+      const hasRole = options !== null && typeof options === "object" && Object.hasOwn(options, "role");
+      const keys = [...(hasRequireEmpty ? ["requireEmpty"] : []), ...(hasRole ? ["role"] : [])];
+      if (!hasExactKeys(options, keys)
+        || (hasRequireEmpty && typeof options.requireEmpty !== "boolean")
+        || (hasRole && !WORKSPACE_DIRECTORY_ROLES.has(options.role))) {
         throw capabilityError("workspace_directory_options_invalid");
       }
       const requireEmpty = options.requireEmpty ?? false;
+      const role = options.role ?? "deletable";
       const parentInternal = requireReceipt(parent, { directory: true });
       const exactName = validateChildName(name);
       await assertStable(parentInternal, "directory");
@@ -684,6 +693,7 @@ export function createWindowsFileCapabilities({
       const receipt = await openDirectChild(parent, exactName, {
         kind: "directory",
         disposition: "openExisting",
+        role,
       });
       if (requireEmpty) {
         const internal = requireReceipt(receipt, { directory: true });
@@ -735,6 +745,9 @@ export function createWindowsFileCapabilities({
       let destination;
       try {
         const parentInternal = requireReceipt(internal.parent, { directory: true });
+        if (parentInternal.role !== "rename-parent") {
+          throw capabilityError("workspace_rename_parent_required");
+        }
         const name = validateChildName(destinationName);
         destination = ensureDirectChild(parentInternal.path, name);
         await assertStable(parentInternal, "directory");
@@ -770,6 +783,10 @@ export function createWindowsFileCapabilities({
         if (internal.kind === "directory" && !(await listAtMostOne(internal))) {
           internal.state = "issued";
           throw capabilityError("workspace_directory_not_empty");
+        }
+        if (internal.kind === "directory" && internal.role !== "deletable") {
+          internal.state = "issued";
+          throw capabilityError("workspace_directory_not_deletable");
         }
         await nativeApi.deleteByHandle(internal.handle, { directory: internal.kind === "directory" });
         internal.state = "consumed";

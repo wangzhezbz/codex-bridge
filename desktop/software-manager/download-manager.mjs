@@ -5,6 +5,35 @@ import { pipeline } from "node:stream/promises";
 import { Readable, Transform } from "node:stream";
 
 const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
+const DOWNLOAD_MANAGER_AUTHORITIES = new WeakMap();
+
+function downloadError(code) {
+  const error = new Error(code);
+  error.code = code;
+  return error;
+}
+
+export function consumePreparedDownloadVerification(manager, receipt, expected) {
+  const authority = DOWNLOAD_MANAGER_AUTHORITIES.get(manager);
+  if (!authority) throw downloadError("verification_manager_invalid");
+  const verified = authority.receipts.get(receipt);
+  if (!verified) throw downloadError("verification_receipt_invalid");
+  if (verified.state !== "issued") throw downloadError("verification_receipt_consumed");
+  verified.state = "consumed";
+  if (!expected || typeof expected !== "object" || Array.isArray(expected)
+    || Object.keys(expected).length !== 3
+    || !Object.hasOwn(expected, "partPath") || !Object.hasOwn(expected, "size")
+    || !Object.hasOwn(expected, "sha256")
+    || expected.partPath !== verified.partPath || expected.size !== verified.size
+    || expected.sha256 !== verified.sha256) {
+    throw downloadError("verification_binding_mismatch");
+  }
+  return Object.freeze({
+    partPath: verified.partPath,
+    size: verified.size,
+    sha256: verified.sha256,
+  });
+}
 
 export function createDownloadManager({
   fetchImpl = globalThis.fetch,
@@ -19,8 +48,35 @@ export function createDownloadManager({
   const delayMs = retryPolicy.delayMs ?? 100;
   const fileOps = fsApi.promises ?? fsApi;
   const streamFs = typeof fsApi.createWriteStream === "function" ? fsApi : fs;
+  const receipts = new WeakMap();
 
-  return {
+  async function transfer({ asset, destination = null, partPath, signal, onProgress, publish }) {
+    const originalOrigin = new URL(asset.url).origin;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        throwIfAborted(signal);
+        return await downloadOnce({
+          asset,
+          destination,
+          partPath,
+          signal,
+          onProgress,
+          fetchImpl,
+          fileOps,
+          streamFs,
+          originalOrigin,
+          publish,
+        });
+      } catch (error) {
+        if (signal?.aborted) throw abortError(signal);
+        if (error?.retryable === false || attempt === maxAttempts) throw error;
+        await waitForRetry(delayMs, attempt, signal);
+      }
+    }
+    throw new Error("download retry budget exhausted");
+  }
+
+  const manager = Object.freeze(Object.assign(Object.create(null), {
     async download({ asset, destination, signal, onProgress = () => {} } = {}) {
       validateAsset(asset);
       if (typeof destination !== "string" || destination.length === 0) {
@@ -31,36 +87,30 @@ export function createDownloadManager({
       }
 
       const partPath = `${destination}.part`;
-      const originalOrigin = new URL(asset.url).origin;
+      return transfer({ asset, destination, partPath, signal, onProgress, publish: true });
+    },
 
-      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-        try {
-          throwIfAborted(signal);
-          const result = await downloadOnce({
-            asset,
-            destination,
-            partPath,
-            signal,
-            onProgress,
-            fetchImpl,
-            fileOps,
-            streamFs,
-            originalOrigin
-          });
-          return result;
-        } catch (error) {
-          if (signal?.aborted) {
-            throw abortError(signal);
-          }
-          if (error?.retryable === false || attempt === maxAttempts) {
-            throw error;
-          }
-          await waitForRetry(delayMs, attempt, signal);
-        }
+    async downloadPrepared({ asset, partPath, signal, onProgress = () => {} } = {}) {
+      validateAsset(asset);
+      if (typeof partPath !== "string" || partPath.length === 0) {
+        throw new TypeError("partPath must be a non-empty path");
       }
-      throw new Error("download retry budget exhausted");
-    }
-  };
+      if (typeof onProgress !== "function") throw new TypeError("onProgress must be a function");
+      const verified = await transfer({
+        asset, partPath, signal, onProgress, publish: false,
+      });
+      const receipt = Object.freeze(Object.create(null));
+      receipts.set(receipt, {
+        state: "issued",
+        partPath,
+        size: verified.size,
+        sha256: verified.sha256,
+      });
+      return receipt;
+    },
+  }));
+  DOWNLOAD_MANAGER_AUTHORITIES.set(manager, { receipts });
+  return manager;
 }
 
 async function downloadOnce(context) {
@@ -69,7 +119,7 @@ async function downloadOnce(context) {
     throw nonRetryableError("partial package exceeds the catalog length");
   }
   if (existingSize === context.asset.size) {
-    return verifyAndPromote({ ...context, receivedBytes: existingSize, resumed: existingSize > 0 });
+    return verifyDownloaded({ ...context, receivedBytes: existingSize, resumed: existingSize > 0 });
   }
 
   const requestHeaders = existingSize > 0 ? { Range: `bytes=${existingSize}-` } : {};
@@ -119,7 +169,7 @@ async function downloadOnce(context) {
   }
 
   throwIfAborted(context.signal);
-  return verifyAndPromote({ ...context, receivedBytes, resumed });
+  return verifyDownloaded({ ...context, receivedBytes, resumed });
 }
 
 function onProgressSafely(onProgress, event, callback, chunk) {
@@ -131,7 +181,7 @@ function onProgressSafely(onProgress, event, callback, chunk) {
   }
 }
 
-async function verifyAndPromote(context) {
+async function verifyDownloaded(context) {
   throwIfAborted(context.signal);
   if (context.receivedBytes !== context.asset.size) {
     throw nonRetryableError(`download length mismatch: expected ${context.asset.size}, received ${context.receivedBytes}`);
@@ -143,9 +193,9 @@ async function verifyAndPromote(context) {
     throw nonRetryableError("download SHA256 mismatch");
   }
   throwIfAborted(context.signal);
-  await context.fileOps.rename(context.partPath, context.destination);
+  if (context.publish) await context.fileOps.rename(context.partPath, context.destination);
   return {
-    path: context.destination,
+    ...(context.publish ? { path: context.destination } : {}),
     size: context.receivedBytes,
     sha256,
     resumed: context.resumed
