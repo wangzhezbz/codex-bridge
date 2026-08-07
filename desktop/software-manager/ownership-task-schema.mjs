@@ -5,6 +5,7 @@ const SKILL_ID = /^[a-z0-9][a-z0-9-]{0,63}$/u;
 const VERSION = /^\d+(?:\.\d+){0,3}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
 const LEASE_NONCE = /^[a-f0-9]{32}$/u;
+const SHORTCUT_CREATION_ID = /^[a-f0-9]{32}$/u;
 const COMPONENT = new Set(["chatgpt", "v2rayn"]);
 const GIT_TASK = new Set(["git-install", "git-external-install", "git-install-cleanup", "git-rollback", "git-rollback-cleanup", "git-uninstall"]);
 const GIT_REGISTRY_KEYS = new Set([
@@ -78,15 +79,16 @@ function validVersionSlot(task, ownership) {
 }
 
 function validShortcut(task) {
-  const common = ["kind", "phase", "taskId", "componentId", "desktopPath", "targetPath"];
-  const keys = task.phase === "applied" ? [...common, "shortcut"] : common;
+  const common = ["kind", "phase", "taskId", "componentId", "desktopPath", "targetPath", "shortcut"];
+  const keys = common;
   if (!exact(task, keys) || task.kind !== "component-shortcut" || !["reserved", "applied"].includes(task.phase)
     || !TASK_ID.test(task.taskId) || !COMPONENT.has(task.componentId)
     || !canonicalPath(task.desktopPath) || !canonicalPath(task.targetPath)) return false;
-  return task.phase === "reserved" || (exact(task.shortcut, ["name", "desktopPath", "targetPath", "reservationId", "path"])
+  return exact(task.shortcut, ["name", "path", "desktopPath", "targetPath", "creationId"])
     && task.shortcut.desktopPath === task.desktopPath && task.shortcut.targetPath === task.targetPath
-    && task.shortcut.reservationId === task.taskId && canonicalPath(task.shortcut.path)
-    && path.win32.dirname(task.shortcut.path) === task.desktopPath);
+    && task.shortcut.name === (task.componentId === "chatgpt" ? "ChatGPT" : "V2RayN")
+    && SHORTCUT_CREATION_ID.test(task.shortcut.creationId) && canonicalPath(task.shortcut.path)
+    && path.win32.dirname(task.shortcut.path) === task.desktopPath;
 }
 
 function validComponentUninstall(task, ownership) {

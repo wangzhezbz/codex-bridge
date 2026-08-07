@@ -147,6 +147,19 @@ function validateReceipt(value, code) {
   };
 }
 
+function validateShortcutRecord(value, expected, code = "shortcut_result_invalid") {
+  const keys = ["creationId", "desktopPath", "name", "path", "targetPath"];
+  if (!isRecord(value) || Object.keys(value).sort().join("\0") !== keys.join("\0")
+    || typeof value.path !== "string"
+    || typeof value.creationId !== "string" || !/^[a-f0-9]{32}$/u.test(value.creationId)
+    || value.name !== expected.name || value.desktopPath !== expected.desktopPath
+    || value.targetPath !== expected.targetPath
+    || path.win32.dirname(value.path) !== expected.desktopPath) throw adapterError(code);
+  if (expected.path !== undefined && value.path !== expected.path) throw adapterError(code);
+  if (expected.creationId !== undefined && value.creationId !== expected.creationId) throw adapterError(code);
+  return structuredClone(value);
+}
+
 function validateSkillTreeEvidence(value, code = "skill_tree_evidence_invalid") {
   if (!isRecord(value) || value.kind !== "directory" || !isRecord(value.identity)
     || typeof value.identity.volumeSerial !== "string" || value.identity.volumeSerial.length === 0
@@ -219,7 +232,9 @@ export function createComponentAdapters({
   const finalizeSkillReplacement = requireMethod(skillFiles, "finalizeReplacement", "skill_completion_capability_required");
   const verifySkillCompletionProof = requireMethod(skillFiles, "verifyCompletionProof", "skill_completion_capability_required");
   const recoverSkillCompletionProof = requireMethod(skillFiles, "recoverCompletionProof", "skill_completion_capability_required");
-  const recoverShortcutReservation = requireMethod(windowsHost, "recoverShortcutReservation", "shortcut_recovery_capability_required");
+  const planShortcut = requireMethod(windowsHost, "planShortcut", "shortcut_plan_capability_required");
+  const createShortcut = requireMethod(windowsHost, "createShortcut", "shortcut_create_capability_required");
+  const inspectRecordedShortcut = requireMethod(windowsHost, "inspectRecordedShortcut", "shortcut_recovery_capability_required");
   const pinGitPlan = requireMethod(gitIdentityCapabilities, "pinPlan", "git_identity_capability_required");
   const revalidateGitPlan = requireMethod(gitIdentityCapabilities, "revalidate", "git_identity_capability_required");
   const releaseGitPlan = requireMethod(gitIdentityCapabilities, "release", "git_identity_capability_required");
@@ -496,25 +511,20 @@ export function createComponentAdapters({
         || typeof task.taskId !== "string" || task.desktopPath !== desktopPath
         || typeof task.targetPath !== "string") throw adapterError("shortcut_recovery_record_invalid");
       const next = structuredClone(state);
-      let shortcut = task.shortcut ?? null;
-      if (task.phase === "reserved") {
-        const recovered = await recoverShortcutReservation({
-          reservationId: task.taskId, componentId: task.componentId,
-          desktopPath, targetPath: task.targetPath, name: COMPONENTS[task.componentId].shortcut,
-        });
-        if (recovered?.kind === "absent") {
-          next.activeTask = null;
-          next.lastTask = { taskId: task.taskId, componentId: task.componentId, action: "shortcut-aborted" };
-          await saveState(next);
-          return next;
-        }
-        shortcut = recovered?.kind === "shortcut" ? recovered.shortcut : null;
+      let shortcut = validateShortcutRecord(task.shortcut, {
+        name: COMPONENTS[task.componentId].shortcut,
+        desktopPath,
+        targetPath: task.targetPath,
+      }, "shortcut_recovery_record_invalid");
+      const recovered = await inspectRecordedShortcut(shortcut);
+      if (recovered?.kind === "absent") {
+        next.activeTask = null;
+        next.lastTask = { taskId: task.taskId, componentId: task.componentId, action: "shortcut-aborted" };
+        await saveState(next);
+        return next;
       }
-      if (!isRecord(shortcut) || shortcut.targetPath !== task.targetPath
-        || shortcut.desktopPath !== desktopPath || shortcut.reservationId !== task.taskId
-        || typeof shortcut.path !== "string" || path.win32.dirname(shortcut.path) !== desktopPath) {
-        throw adapterError("shortcut_recovery_evidence_invalid");
-      }
+      shortcut = recovered?.kind === "shortcut" ? recovered.shortcut : null;
+      shortcut = validateShortcutRecord(shortcut, task.shortcut, "shortcut_recovery_evidence_invalid");
       next.shortcuts = next.shortcuts.filter((record) => record?.componentId !== task.componentId);
       next.shortcuts.push({ ...structuredClone(shortcut), componentId: task.componentId });
       next.activeTask = null;
@@ -702,20 +712,24 @@ export function createComponentAdapters({
       const recordedShortcut = stateAfter?.shortcuts?.find((record) => record?.componentId === componentId);
       if (!recordedShortcut) {
         try {
+          const planned = await planShortcut({
+            name: COMPONENTS[componentId].shortcut, desktopPath, targetPath: finalEntrypoint,
+          });
+          if (!isRecord(planned) || (typeof planned.plan !== "object" && typeof planned.plan !== "function")
+            || planned.plan === null) throw adapterError("shortcut_plan_invalid");
+          const plannedShortcut = validateShortcutRecord(planned.shortcut, {
+            name: COMPONENTS[componentId].shortcut, desktopPath, targetPath: finalEntrypoint,
+          }, "shortcut_plan_invalid");
           const shortcutTask = {
             kind: "component-shortcut", phase: "reserved", taskId, componentId,
-            desktopPath, targetPath: finalEntrypoint,
+            desktopPath, targetPath: finalEntrypoint, shortcut: plannedShortcut,
           };
           const reserved = structuredClone(stateAfter);
           reserved.activeTask = shortcutTask;
           stateAfter = await saveState(reserved);
-          const shortcut = await windowsHost.createShortcut({
-            name: COMPONENTS[componentId].shortcut, desktopPath, targetPath: finalEntrypoint,
-            reservationId: taskId,
-          });
-          if (!isRecord(shortcut) || shortcut.targetPath !== finalEntrypoint || shortcut.desktopPath !== desktopPath
-            || shortcut.reservationId !== taskId || typeof shortcut.path !== "string"
-            || path.win32.dirname(shortcut.path) !== desktopPath) throw adapterError("shortcut_result_invalid");
+          const shortcut = validateShortcutRecord(
+            await createShortcut(planned.plan), plannedShortcut, "shortcut_result_invalid",
+          );
           if (stateAfter) {
             const applied = structuredClone(stateAfter);
             applied.activeTask = { ...shortcutTask, phase: "applied", shortcut: structuredClone(shortcut) };

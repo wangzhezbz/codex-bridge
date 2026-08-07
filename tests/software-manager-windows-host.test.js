@@ -10,6 +10,15 @@ const REGISTRY_KEYS = [
 ];
 const REGISTRY_FIELDS = ["DisplayName", "DisplayVersion", "InstallLocation", "UninstallString"];
 const AUTHENTICODE_COMMAND = "$s=Get-AuthenticodeSignature -LiteralPath $env:CB_SM_PACKAGE_PATH; @{Status=[string]$s.Status; Thumbprint=$s.SignerCertificate.Thumbprint; Subject=$s.SignerCertificate.Subject}|ConvertTo-Json -Compress";
+const SHORTCUT_CREATION_ID = "a".repeat(32);
+
+function ownedShortcut(path, desktopPath, targetPath, name = "ChatGPT") {
+  return { name, path, desktopPath, targetPath, creationId: SHORTCUT_CREATION_ID };
+}
+
+function shortcutFile(target, name = "ChatGPT", creationId = SHORTCUT_CREATION_ID) {
+  return { target, description: `CodexBridge:${name}:${creationId}` };
+}
 
 test("rejects construction outside Windows before any host adapter can run", () => {
   let called = false;
@@ -314,7 +323,7 @@ test("rejects Windows alternate-data-stream paths before executing them", async 
   assert.equal(fixture.calls.execFile.length, 0);
 });
 
-test("creates shortcut collision names in ChatGPT.lnk, ChatGPT（1）.lnk order without overwriting", async () => {
+test("plans and creates the first collision-safe ChatGPT shortcut without trusting a caller record", async () => {
   const desktopPath = "C:\\Users\\me\\Desktop";
   const targetPath = "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe";
   const basePath = `${desktopPath}\\ChatGPT.lnk`;
@@ -324,26 +333,28 @@ test("creates shortcut collision names in ChatGPT.lnk, ChatGPT（1）.lnk order 
     [firstCollisionPath, { target: "C:\\Other2\\ChatGPT.exe" }],
   ]) });
 
-  const record = await fixture.host.createShortcut({ desktopPath, name: "ChatGPT", targetPath });
+  const planned = await fixture.host.planShortcut({ desktopPath, name: "ChatGPT", targetPath });
+  const record = await fixture.host.createShortcut(planned.plan);
 
-  assert.deepEqual(record, {
-    path: `${desktopPath}\\ChatGPT（2）.lnk`,
-    desktopPath,
-    targetPath,
-  });
+  assert.equal(record.path, `${desktopPath}\\ChatGPT（2）.lnk`);
+  assert.equal(record.desktopPath, desktopPath);
+  assert.equal(record.targetPath, targetPath);
+  assert.equal(record.name, "ChatGPT");
+  assert.match(record.creationId, /^[a-f0-9]{32}$/u);
+  assert.deepEqual(record, planned.shortcut);
   assert.deepEqual(fixture.calls.tempCreates, [{ directory: desktopPath, suffix: ".lnk" }]);
   assert.deepEqual(fixture.calls.shortcutWrites, [{
     path: `${desktopPath}\\.codexbridge-shortcut-1.lnk`,
     operation: "create",
-    options: { target: targetPath, cwd: "D:\\CBApps\\ChatGPT\\c", description: "ChatGPT" },
+    options: {
+      target: targetPath,
+      cwd: "D:\\CBApps\\ChatGPT\\c",
+      description: `CodexBridge:ChatGPT:${record.creationId}`,
+    },
   }]);
   assert.equal(fixture.calls.tempSeals.length, 1);
   assert.equal(fixture.calls.shortcutReads[0].held, true);
-  assert.deepEqual(fixture.calls.shortcutCommits.map(({ destinationPath }) => destinationPath), [
-    basePath,
-    firstCollisionPath,
-    `${desktopPath}\\ChatGPT（2）.lnk`,
-  ]);
+  assert.deepEqual(fixture.calls.shortcutCommits.map(({ destinationPath }) => destinationPath), [record.path]);
   assert.equal(fixture.shortcuts.get(basePath).target, "C:\\Other\\ChatGPT.exe");
   assert.equal(fixture.shortcuts.get(firstCollisionPath).target, "C:\\Other2\\ChatGPT.exe");
   assert.equal(fixture.shortcuts.get(record.path).target, targetPath);
@@ -359,11 +370,11 @@ test("shortcut creation cleans only its exact temporary link when atomic commit 
   });
 
   await assert.rejects(
-    fixture.host.createShortcut({
+    fixture.host.createShortcut((await fixture.host.planShortcut({
       desktopPath,
       name: "ChatGPT",
       targetPath: "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe",
-    }),
+    })).plan),
     /shortcut_commit_failed/,
   );
 
@@ -381,11 +392,11 @@ test("shortcut creation cleans a capability-owned temp object that fails same-de
   const fixture = fakeHost({ shortcutTempPath: "D:\\Other\\.codexbridge-shortcut-1.lnk" });
 
   await assert.rejects(
-    fixture.host.createShortcut({
+    fixture.host.createShortcut((await fixture.host.planShortcut({
       desktopPath: "C:\\Users\\me\\Desktop",
       name: "ChatGPT",
       targetPath: "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe",
-    }),
+    })).plan),
     /shortcut_temp_capability_invalid/,
   );
 
@@ -410,7 +421,7 @@ test("shortcut methods fail closed without atomic shortcut filesystem capabiliti
   });
 
   await assert.rejects(
-    host.createShortcut({
+    host.planShortcut({
       desktopPath: "C:\\Users\\me\\Desktop",
       name: "ChatGPT",
       targetPath: "D:\\Owned\\ChatGPT.exe",
@@ -419,19 +430,21 @@ test("shortcut methods fail closed without atomic shortcut filesystem capabiliti
   );
   await assert.rejects(
     host.removeRecordedShortcut({
+      name: "ChatGPT",
       path: "C:\\Users\\me\\Desktop\\ChatGPT.lnk",
       desktopPath: "C:\\Users\\me\\Desktop",
       targetPath: "D:\\Owned\\ChatGPT.exe",
+      creationId: SHORTCUT_CREATION_ID,
     }),
     /shortcut_file_capability_required/,
   );
   assert.deepEqual(writes, []);
 });
 
-test("shortcut creation rejects renderer-controlled names and non-absolute targets", async () => {
+test("shortcut planning rejects renderer-controlled names and non-absolute targets", async () => {
   const fixture = fakeHost();
   await assert.rejects(
-    fixture.host.createShortcut({
+    fixture.host.planShortcut({
       desktopPath: "C:\\Users\\me\\Desktop",
       name: "..\\payload",
       targetPath: "D:\\CBApps\\app.exe",
@@ -439,10 +452,62 @@ test("shortcut creation rejects renderer-controlled names and non-absolute targe
     /shortcut_name_rejected/,
   );
   await assert.rejects(
-    fixture.host.createShortcut({ desktopPath: "C:\\Users\\me\\Desktop", name: "ChatGPT", targetPath: "app.exe" }),
+    fixture.host.planShortcut({ desktopPath: "C:\\Users\\me\\Desktop", name: "ChatGPT", targetPath: "app.exe" }),
     /executable_path_absolute_required/,
   );
   assert.equal(fixture.calls.shortcutWrites.length, 0);
+});
+
+test("shortcut creation rejects forged and replayed plans", async () => {
+  const fixture = fakeHost();
+  const request = {
+    desktopPath: "C:\\Users\\me\\Desktop",
+    name: "ChatGPT",
+    targetPath: "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe",
+  };
+  await assert.rejects(fixture.host.createShortcut({ ...request }), /shortcut_plan_invalid/u);
+  const planned = await fixture.host.planShortcut(request);
+  await fixture.host.createShortcut(planned.plan);
+  await assert.rejects(fixture.host.createShortcut(planned.plan), /shortcut_plan_invalid/u);
+  assert.equal(fixture.calls.shortcutWrites.length, 1);
+});
+
+test("a collision after planning fails closed and cleans only the capability-owned temp", async () => {
+  const desktopPath = "C:\\Users\\me\\Desktop";
+  const targetPath = "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe";
+  const fixture = fakeHost();
+  const planned = await fixture.host.planShortcut({ desktopPath, name: "ChatGPT", targetPath });
+  fixture.shortcuts.set(planned.shortcut.path, { target: "C:\\Other\\ChatGPT.exe", description: "user shortcut" });
+
+  await assert.rejects(fixture.host.createShortcut(planned.plan), /shortcut_plan_occupied/u);
+
+  assert.equal(fixture.shortcuts.get(planned.shortcut.path).target, "C:\\Other\\ChatGPT.exe");
+  assert.deepEqual(fixture.calls.tempRemoves.map(({ path: shortcutPath }) => shortcutPath), [
+    `${desktopPath}\\.codexbridge-shortcut-1.lnk`,
+  ]);
+});
+
+test("recorded shortcut inspection fails closed on a wrong target, marker, path, or malformed record", async () => {
+  const desktopPath = "C:\\Users\\me\\Desktop";
+  const targetPath = "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe";
+  const shortcutPath = `${desktopPath}\\ChatGPT.lnk`;
+  const valid = ownedShortcut(shortcutPath, desktopPath, targetPath);
+  const fixture = fakeHost({ shortcuts: new Map([[shortcutPath, shortcutFile("C:\\Other\\ChatGPT.exe")]]) });
+
+  await assert.rejects(fixture.host.inspectRecordedShortcut(valid), /shortcut_identity_mismatch/u);
+  assert.equal(fixture.calls.fileReleases.length, 1);
+  fixture.shortcuts.set(shortcutPath, { target: targetPath, description: "CodexBridge:ChatGPT:wrong" });
+  await assert.rejects(fixture.host.inspectRecordedShortcut(valid), /shortcut_identity_mismatch/u);
+  assert.equal(fixture.calls.fileReleases.length, 2);
+  await assert.rejects(
+    fixture.host.inspectRecordedShortcut({ ...valid, path: "C:\\Users\\me\\Documents\\ChatGPT.lnk" }),
+    /shortcut_path_not_desktop_child/u,
+  );
+  await assert.rejects(
+    fixture.host.inspectRecordedShortcut({ ...valid, creationId: "renderer-value" }),
+    /shortcut_creation_id_invalid/u,
+  );
+  assert.equal(fixture.calls.fileInspects.length, 2);
 });
 
 test("removes only the exact recorded desktop shortcut when its current target still matches", async () => {
@@ -451,11 +516,11 @@ test("removes only the exact recorded desktop shortcut when its current target s
   const otherPath = `${desktopPath}\\ChatGPT.lnk`;
   const targetPath = "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe";
   const fixture = fakeHost({ shortcuts: new Map([
-    [recordedPath, { target: targetPath }],
+    [recordedPath, shortcutFile(targetPath)],
     [otherPath, { target: "C:\\Other\\ChatGPT.exe" }],
   ]) });
 
-  const result = await fixture.host.removeRecordedShortcut({ path: recordedPath, desktopPath, targetPath });
+  const result = await fixture.host.removeRecordedShortcut(ownedShortcut(recordedPath, desktopPath, targetPath));
 
   assert.deepEqual(result, { removed: true, path: recordedPath });
   assert.deepEqual(fixture.calls.fileRemoves.map(({ path: shortcutPath }) => shortcutPath), [recordedPath]);
@@ -471,11 +536,11 @@ test("recorded shortcut removal distinguishes absent and non-file paths without 
   const fixture = fakeHost({ otherShortcutPaths: new Set([otherPath]) });
 
   assert.deepEqual(
-    await fixture.host.removeRecordedShortcut({ path: absentPath, desktopPath, targetPath }),
+    await fixture.host.removeRecordedShortcut(ownedShortcut(absentPath, desktopPath, targetPath)),
     { removed: false, path: absentPath },
   );
   await assert.rejects(
-    fixture.host.removeRecordedShortcut({ path: otherPath, desktopPath, targetPath }),
+    fixture.host.removeRecordedShortcut(ownedShortcut(otherPath, desktopPath, targetPath)),
     /shortcut_path_not_file/,
   );
   assert.deepEqual(fixture.calls.fileRemoves, []);
@@ -487,17 +552,17 @@ test("refuses shortcut deletion outside the recorded desktop or after target rep
   const outside = "C:\\Users\\me\\Documents\\ChatGPT.lnk";
   const inside = `${desktopPath}\\ChatGPT.lnk`;
   const fixture = fakeHost({ shortcuts: new Map([
-    [outside, { target: targetPath }],
-    [inside, { target: "C:\\Other\\ChatGPT.exe" }],
+    [outside, shortcutFile(targetPath)],
+    [inside, shortcutFile("C:\\Other\\ChatGPT.exe")],
   ]) });
 
   await assert.rejects(
-    fixture.host.removeRecordedShortcut({ path: outside, desktopPath, targetPath }),
+    fixture.host.removeRecordedShortcut(ownedShortcut(outside, desktopPath, targetPath)),
     /shortcut_path_not_desktop_child/,
   );
   await assert.rejects(
-    fixture.host.removeRecordedShortcut({ path: inside, desktopPath, targetPath }),
-    /shortcut_target_mismatch/,
+    fixture.host.removeRecordedShortcut(ownedShortcut(inside, desktopPath, targetPath)),
+    /shortcut_identity_mismatch/,
   );
   assert.deepEqual(fixture.calls.fileRemoves, []);
   assert.equal(fixture.calls.fileReleases.length, 1);
@@ -507,9 +572,9 @@ test("recorded shortcut removal reads and removes through the same held inspecti
   const desktopPath = "C:\\Users\\me\\Desktop";
   const shortcutPath = `${desktopPath}\\ChatGPT.lnk`;
   const targetPath = "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe";
-  const fixture = fakeHost({ shortcuts: new Map([[shortcutPath, { target: targetPath }]]) });
+  const fixture = fakeHost({ shortcuts: new Map([[shortcutPath, shortcutFile(targetPath)]]) });
 
-  await fixture.host.removeRecordedShortcut({ path: shortcutPath, desktopPath, targetPath });
+  await fixture.host.removeRecordedShortcut(ownedShortcut(shortcutPath, desktopPath, targetPath));
 
   assert.equal(fixture.calls.shortcutReads[0].held, true);
   assert.equal(fixture.calls.fileRemoves[0], fixture.calls.fileInspects[0].descriptor);
@@ -760,7 +825,7 @@ function fakeHost({
     writeShortcutLink(shortcutPath, operation, options) {
       calls.shortcutWrites.push({ path: shortcutPath, operation, options });
       otherShortcutPaths.delete(shortcutPath);
-      shortcuts.set(shortcutPath, { target: options.target });
+      shortcuts.set(shortcutPath, { target: options.target, description: options.description });
       identities.set(shortcutPath, `identity-${++identitySequence}`);
       return true;
     },

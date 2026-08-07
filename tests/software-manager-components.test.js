@@ -6,6 +6,7 @@ import test from "node:test";
 import { createComponentAdapters } from "../desktop/software-manager/component-adapters.mjs";
 import { createTrustedCatalogService, verifyCatalogEnvelope } from "../desktop/software-manager/catalog-trust.mjs";
 import { getOwnershipCoordinator } from "../desktop/software-manager/ownership-coordinator.mjs";
+import { createWindowsHost } from "../desktop/software-manager/windows-host.mjs";
 import {
   authorizeDesktopPath, authorizeInstallRoot, authorizeSkillsRoot,
 } from "../desktop/software-manager/path-policy.mjs";
@@ -90,6 +91,7 @@ function fixture({
   onReplaceSkill = null, onGitInstall = null, onVerifyComponent = null,
   onAuthenticode = null, onGitPin = null, gitExecutionTimeoutMs = undefined,
   onGitUninstall = null,
+  windowsHostOverride = null,
 } = {}) {
   let currentState = structuredClone(state);
   let saveCount = 0;
@@ -110,6 +112,8 @@ function fixture({
   }
   const gitPins = new WeakSet();
   const shortcutReservations = new Map();
+  const shortcutPlans = new WeakMap();
+  let shortcutSequence = 0;
   const deletedSkillTargets = new Set();
   const operationLeases = new Map();
   const ownershipStore = {
@@ -137,7 +141,7 @@ function fixture({
     },
   };
   const testOwnershipCoordinator = getOwnershipCoordinator(ownershipStore);
-  const windowsHost = {
+  const fakeWindowsHost = {
     async discoverGit() {
       const value = Array.isArray(gitDiscoveries) && gitDiscoveries.length > 0 ? gitDiscoveries.shift() : gitDiscovery;
       if (value instanceof Error) throw value;
@@ -154,22 +158,32 @@ function fixture({
       if (restartFailure) throw restartFailure;
       return { executablePath, pid: 456 };
     },
-    async createShortcut(record) {
+    async planShortcut(record) {
+      const shortcut = {
+        ...record,
+        creationId: (++shortcutSequence).toString(16).padStart(32, "0"),
+        path: path.win32.join(record.desktopPath, `${record.name}（1）.lnk`),
+      };
+      const plan = Object.freeze(Object.create(null));
+      shortcutPlans.set(plan, structuredClone(shortcut));
+      return { plan, shortcut };
+    },
+    async createShortcut(plan) {
+      const record = shortcutPlans.get(plan);
+      if (!record) throw new Error("shortcut_plan_invalid");
+      shortcutPlans.delete(plan);
       calls.shortcuts.push(record);
       if (shortcutFailure) throw shortcutFailure;
-      const shortcut = { ...record, path: path.win32.join(record.desktopPath, `${record.name}（1）.lnk`) };
-      if (typeof record.reservationId === "string") shortcutReservations.set(record.reservationId, structuredClone(shortcut));
-      return shortcut;
+      shortcutReservations.set(record.path, structuredClone(record));
+      return structuredClone(record);
     },
-    async recoverShortcutReservation({ reservationId }) {
-      const shortcut = shortcutReservations.get(reservationId);
+    async inspectRecordedShortcut(record) {
+      const shortcut = shortcutReservations.get(record.path);
       return shortcut ? { kind: "shortcut", shortcut: structuredClone(shortcut) } : { kind: "absent" };
     },
     async removeRecordedShortcut(record) {
       calls.removedShortcuts.push(record);
-      for (const [id, shortcut] of shortcutReservations) {
-        if (shortcut.path === record.path) shortcutReservations.delete(id);
-      }
+      shortcutReservations.delete(record.path);
       return { removed: true };
     },
     async runGitInstaller(plan) {
@@ -183,6 +197,7 @@ function fixture({
       calls.gitUninstalls.push(plan); await plan.onStarted?.(); await onGitUninstall?.(plan); return { installDir: plan.installDir };
     },
   };
+  const windowsHost = windowsHostOverride ?? fakeWindowsHost;
   const archiveService = {
     async extractArchive(plan) {
       calls.extracts.push(plan);
@@ -372,6 +387,147 @@ const externalGit = Object.freeze({
   registryKey: "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Git_is1",
 });
 
+function realShortcutHostFixture() {
+  const shortcuts = new Map();
+  const held = new Map();
+  const tempCapabilities = new WeakSet();
+  const sealedCapabilities = new WeakSet();
+  let sequence = 0;
+  const calls = { writes: [], removes: [] };
+  const electronShell = {
+    writeShortcutLink(shortcutPath, operation, options) {
+      calls.writes.push({ shortcutPath, operation, options: structuredClone(options) });
+      shortcuts.set(shortcutPath, { target: options.target, description: options.description });
+      return true;
+    },
+    readShortcutLink(shortcutPath) {
+      const shortcut = shortcuts.get(shortcutPath);
+      if (!shortcut) throw Object.assign(new Error("missing"), { code: "ENOENT" });
+      return structuredClone(shortcut);
+    },
+  };
+  const shortcutFileApi = {
+    async createTemp({ directory, suffix }) {
+      const capability = Object.freeze({ path: path.win32.join(directory, `.cb-shortcut-${++sequence}${suffix}`) });
+      tempCapabilities.add(capability);
+      return capability;
+    },
+    async sealTemp(capability) {
+      if (!tempCapabilities.has(capability) || !shortcuts.has(capability.path)) throw new Error("invalid_temp");
+      const sealed = Object.freeze({ path: capability.path });
+      sealedCapabilities.add(sealed);
+      held.set(sealed.path, sealed);
+      return sealed;
+    },
+    async commitNoReplace(capability, destinationPath) {
+      if (!sealedCapabilities.has(capability) || held.get(capability.path) !== capability) throw new Error("invalid_seal");
+      if (shortcuts.has(destinationPath)) return "occupied";
+      shortcuts.set(destinationPath, shortcuts.get(capability.path));
+      shortcuts.delete(capability.path);
+      held.delete(capability.path);
+      return "committed";
+    },
+    async removeTemp(capability) {
+      shortcuts.delete(capability.path);
+      held.delete(capability.path);
+    },
+    async inspectExact(shortcutPath) {
+      if (!shortcuts.has(shortcutPath)) return { kind: "absent" };
+      const descriptor = Object.freeze({ kind: "file", path: shortcutPath });
+      held.set(shortcutPath, descriptor);
+      return descriptor;
+    },
+    async removeExact(descriptor) {
+      if (held.get(descriptor.path) !== descriptor || !shortcuts.has(descriptor.path)) return false;
+      calls.removes.push(descriptor.path);
+      shortcuts.delete(descriptor.path);
+      held.delete(descriptor.path);
+      return true;
+    },
+    async release(descriptor) {
+      if (held.get(descriptor.path) === descriptor) held.delete(descriptor.path);
+    },
+  };
+  const host = createWindowsHost({
+    platform: "win32",
+    env: {},
+    electronShell,
+    shortcutFileApi,
+    registryReader: async () => null,
+    processLister: async () => [],
+    spawnDetached: async () => ({ pid: 1, started: Promise.resolve(), unref() {} }),
+    suspendedProcess: { async run() { return { pid: 1, exitCode: 0 }; } },
+    execFile: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+  });
+  return { host, shortcuts, calls };
+}
+
+test("real Windows host and component adapters adopt exact ChatGPT and V2RayN shortcuts", async (t) => {
+  for (const [componentId, expectedName, expectedTarget] of [
+    ["chatgpt", "ChatGPT", "D:\\CBApps\\c\\ChatGPT.exe"],
+    ["v2rayn", "V2RayN", "D:\\CBApps\\V2RayN\\current\\v2rayN.exe"],
+  ]) {
+    await t.test(componentId, async () => {
+      const realHost = realShortcutHostFixture();
+      const { adapters, getState } = fixture({ windowsHostOverride: realHost.host });
+      assert.equal((await adapters[componentId].prepare({ taskId: `real-${componentId}` })).status, "succeeded");
+      const committed = await adapters[componentId].commit({ taskId: `real-${componentId}` });
+      assert.equal(committed.status, "succeeded", committed.message);
+      assert.equal(committed.message, "component_committed");
+      assert.equal(getState().activeTask, null);
+      assert.equal(getState().shortcuts.length, 1);
+      assert.equal(getState().shortcuts[0].componentId, componentId);
+      assert.equal(getState().shortcuts[0].name, expectedName);
+      assert.equal(getState().shortcuts[0].targetPath, expectedTarget);
+      assert.deepEqual(realHost.shortcuts.get(getState().shortcuts[0].path), {
+        target: expectedTarget,
+        description: `CodexBridge:${expectedName}:${getState().shortcuts[0].creationId}`,
+      });
+    });
+  }
+});
+
+test("real Windows host recovery adopts one created shortcut after applied-state persistence fails", async () => {
+  const realHost = realShortcutHostFixture();
+  const { adapters, getState } = fixture({ windowsHostOverride: realHost.host, stateSaveFailureAt: 6 });
+  assert.equal((await adapters.chatgpt.prepare({ taskId: "real-shortcut-recovery" })).status, "succeeded");
+  const committed = await adapters.chatgpt.commit({ taskId: "real-shortcut-recovery" });
+  assert.equal(committed.status, "succeeded");
+  assert.match(committed.message, /shortcut_state/u);
+  assert.equal(getState().activeTask.phase, "reserved");
+  assert.equal(realHost.calls.writes.length, 1);
+
+  assert.equal((await adapters.chatgpt.inspectInstalled({})).status, "succeeded");
+  assert.equal(realHost.calls.writes.length, 1);
+  assert.equal(getState().activeTask, null);
+  assert.equal(getState().shortcuts.length, 1);
+  const recordedPath = getState().shortcuts[0].path;
+
+  assert.equal((await adapters.chatgpt.uninstall({ taskId: "real-shortcut-remove" })).status, "succeeded");
+  assert.deepEqual(realHost.calls.removes, [recordedPath]);
+  assert.equal(realHost.shortcuts.size, 0);
+});
+
+test("component adapter rejects malformed shortcut plan evidence before reserving or creating", async () => {
+  const realHost = realShortcutHostFixture();
+  const malformedHost = {
+    ...realHost.host,
+    async planShortcut(request) {
+      const planned = await realHost.host.planShortcut(request);
+      return { ...planned, shortcut: { ...planned.shortcut, rendererValue: "not-authority" } };
+    },
+  };
+  const { adapters, getState } = fixture({ windowsHostOverride: malformedHost });
+  assert.equal((await adapters.chatgpt.prepare({ taskId: "malformed-shortcut-plan" })).status, "succeeded");
+  const committed = await adapters.chatgpt.commit({ taskId: "malformed-shortcut-plan" });
+
+  assert.equal(committed.status, "succeeded");
+  assert.match(committed.message, /shortcut_plan_invalid/u);
+  assert.equal(getState().activeTask, null);
+  assert.deepEqual(getState().shortcuts, []);
+  assert.equal(realHost.calls.writes.length, 0);
+});
+
 test("raw context catalog and path injection fails before ownership or download", async () => {
   const { adapters, calls, getState } = fixture();
   const result = await adapters.chatgpt.prepare({
@@ -436,6 +592,28 @@ test("shortcut creation is reserved before mutation and adopted without duplicat
   assert.equal(calls.shortcuts.length, 1);
   assert.equal(getState().activeTask, null);
   assert.equal(getState().shortcuts.length, 1);
+});
+
+test("applied shortcut recovery never adopts a persisted record without exact host evidence", async () => {
+  const state = emptyState(INSTALL_ROOT);
+  state.components.chatgpt = {
+    managed: true, installPath: "D:\\CBApps\\c", version: "2.0.0",
+    entrypointPath: "D:\\CBApps\\c\\ChatGPT.exe", requiredFiles: ["D:\\CBApps\\c\\ChatGPT.exe"],
+    health: "healthy",
+  };
+  state.activeTask = {
+    kind: "component-shortcut", phase: "applied", taskId: "forged-applied", componentId: "chatgpt",
+    desktopPath: DESKTOP, targetPath: "D:\\CBApps\\c\\ChatGPT.exe",
+    shortcut: {
+      name: "ChatGPT", path: `${DESKTOP}\\ChatGPT.lnk`, desktopPath: DESKTOP,
+      targetPath: "D:\\CBApps\\c\\ChatGPT.exe", creationId: "f".repeat(32),
+    },
+  };
+  const { adapters, getState } = fixture({ state });
+
+  assert.equal((await adapters.chatgpt.inspectInstalled({})).status, "succeeded");
+  assert.equal(getState().activeTask, null);
+  assert.deepEqual(getState().shortcuts, []);
 });
 
 test("core verification failure rolls an update back and returns failed with the restored version", async () => {

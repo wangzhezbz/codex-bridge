@@ -366,10 +366,23 @@ test("activeTask registry accepts only an exact known transaction schema", () =>
     },
   };
   assert.equal(isValidOwnershipState(base), true);
+  const shortcutTask = {
+    kind: "component-shortcut", phase: "reserved", taskId: "shortcut", componentId: "chatgpt",
+    desktopPath: "C:\\Desktop", targetPath: "C:\\Owned\\c\\ChatGPT.exe",
+    shortcut: {
+      name: "ChatGPT", path: "C:\\Desktop\\ChatGPT.lnk", desktopPath: "C:\\Desktop",
+      targetPath: "C:\\Owned\\c\\ChatGPT.exe", creationId: "a".repeat(32),
+    },
+  };
+  assert.equal(isValidOwnershipState({ ...base, activeTask: shortcutTask }), true);
+  assert.equal(isValidOwnershipState({ ...base, activeTask: { ...shortcutTask, phase: "applied" } }), true);
   const mutations = [
     { ...base.activeTask, kind: "unknown-task" },
     { ...base.activeTask, unexpected: true },
     { kind: "component-shortcut", phase: "cleanup", taskId: "shortcut", componentId: "chatgpt", desktopPath: "C:\\Desktop", targetPath: "C:\\Owned\\c\\ChatGPT.exe" },
+    { ...shortcutTask, shortcut: { ...shortcutTask.shortcut, path: "C:\\Elsewhere\\ChatGPT.lnk" } },
+    { ...shortcutTask, shortcut: { ...shortcutTask.shortcut, creationId: "renderer-value" } },
+    { ...shortcutTask, shortcut: { ...shortcutTask.shortcut, name: "V2RayN" } },
     { kind: "git-install", taskId: "git", version: "2.51.0", targetDir: "D:\\Elsewhere\\Git", executablePath: "D:\\Elsewhere\\Git\\cmd\\git.exe", installerPath: "C:\\Temp\\git.exe", installerSha256: "a".repeat(64), replacedInstaller: null },
     { kind: "skill-replace", phase: "reserved", taskId: "skill", skillId: "documents", skillsRoot: CANONICAL_SKILLS_ROOT, target: `${CANONICAL_SKILLS_ROOT}\\documents`, version: "1.0.0", packageSha256: "x".repeat(64), skillMdSha256: "a".repeat(64), treeDigest: "b".repeat(64), manifestDigest: "c".repeat(64), previousEvidence: { kind: "absent" } },
     { kind: "git-install-cleanup", taskId: "git", targetDir: "C:\\Owned\\Git", executablePath: "C:\\Owned\\Git\\cmd\\git.exe", replacedInstaller: null },

@@ -1,4 +1,5 @@
 import path from "node:path";
+import { randomBytes } from "node:crypto";
 
 const REGISTRY_KEYS = Object.freeze([
   "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Git_is1",
@@ -382,11 +383,18 @@ async function readShortcut(electronShell, shortcutPath) {
   } catch (error) {
     throw hostError("shortcut_target_invalid", error);
   }
-  return { target };
+  return {
+    target,
+    description: typeof details.description === "string" ? details.description : "",
+  };
 }
 
 function shortcutFileName(name, collision) {
   return collision === 0 ? `${name}.lnk` : `${name}（${collision}）.lnk`;
+}
+
+function shortcutDescription(name, creationId) {
+  return `CodexBridge:${name}:${creationId}`;
 }
 
 function validateRecordedShortcut(record) {
@@ -394,13 +402,24 @@ function validateRecordedShortcut(record) {
   const desktopPath = requireDirectoryPath(record.desktopPath, "shortcut_desktop_absolute_required");
   const shortcutPath = requireDriveAbsolute(record.path, "shortcut_path_absolute_required");
   const targetPath = requireExecutablePath(record.targetPath);
+  if (!SHORTCUT_NAMES.has(record.name)) throw hostError("shortcut_name_rejected");
+  if (typeof record.creationId !== "string" || !/^[a-f0-9]{32}$/u.test(record.creationId)) {
+    throw hostError("shortcut_creation_id_invalid");
+  }
   if (pathKey(path.win32.dirname(shortcutPath)) !== pathKey(desktopPath)) {
     throw hostError("shortcut_path_not_desktop_child");
   }
   if (!/^(?:ChatGPT|V2RayN)(?:（[1-9]\d*）)?\.lnk$/u.test(path.win32.basename(shortcutPath))) {
     throw hostError("shortcut_path_rejected");
   }
-  return { desktopPath, shortcutPath, targetPath };
+  return {
+    name: record.name,
+    creationId: record.creationId,
+    desktopPath,
+    shortcutPath,
+    targetPath,
+    description: shortcutDescription(record.name, record.creationId),
+  };
 }
 
 export function createWindowsHost({
@@ -431,6 +450,7 @@ export function createWindowsHost({
     });
     return parseProcessList(result.stdout);
   });
+  const shortcutPlans = new WeakMap();
 
   return Object.freeze({
     async discoverGit() {
@@ -532,11 +552,39 @@ export function createWindowsHost({
       return { executablePath: target, pid: handle.pid };
     },
 
-    async createShortcut(record) {
+    async planShortcut(record) {
       if (!isPlainRecord(record)) throw hostError("shortcut_record_invalid");
       const desktopPath = requireDirectoryPath(record.desktopPath, "shortcut_desktop_absolute_required");
       if (!SHORTCUT_NAMES.has(record.name)) throw hostError("shortcut_name_rejected");
       const targetPath = requireExecutablePath(record.targetPath);
+      const fileApi = requireShortcutFileApi(shortcutFileApi);
+      let shortcutPath = null;
+      for (let collision = 0; collision < MAX_SHORTCUT_COLLISIONS; collision += 1) {
+        const candidate = path.win32.join(desktopPath, shortcutFileName(record.name, collision));
+        const inspected = validateShortcutInspection(await fileApi.inspectExact(candidate));
+        if (inspected.kind === "absent") {
+          shortcutPath = candidate;
+          break;
+        }
+        if (inspected.kind === "file") await fileApi.release(inspected);
+      }
+      if (shortcutPath === null) throw hostError("shortcut_collision_limit_exceeded");
+      const creationId = randomBytes(16).toString("hex");
+      const shortcut = Object.freeze({
+        name: record.name, path: shortcutPath, desktopPath, targetPath, creationId,
+      });
+      const plan = Object.freeze(Object.create(null));
+      shortcutPlans.set(plan, shortcut);
+      return Object.freeze({ plan, shortcut });
+    },
+
+    async createShortcut(plan) {
+      const shortcut = shortcutPlans.get(plan);
+      if (!shortcut) throw hostError("shortcut_plan_invalid");
+      shortcutPlans.delete(plan);
+      const {
+        name, path: shortcutPath, desktopPath, targetPath, creationId,
+      } = shortcut;
       const fileApi = requireShortcutFileApi(shortcutFileApi);
       let temp;
       try {
@@ -558,7 +606,7 @@ export function createWindowsHost({
         const created = await requireElectronMethod(electronShell, "writeShortcutLink")(
           validatedTemp.tempPath,
           "create",
-          { target: targetPath, cwd: path.win32.dirname(targetPath), description: record.name },
+          { target: targetPath, cwd: path.win32.dirname(targetPath), description: shortcutDescription(name, creationId) },
         );
         if (created !== true) throw hostError("shortcut_create_failed");
         let sealedTemp;
@@ -574,21 +622,21 @@ export function createWindowsHost({
         const current = await readShortcut(electronShell, activeTemp.path);
         if (pathKey(current.target) !== pathKey(targetPath)) throw hostError("shortcut_target_mismatch");
 
-        for (let collision = 0; collision < MAX_SHORTCUT_COLLISIONS; collision += 1) {
-          const candidate = path.win32.join(desktopPath, shortcutFileName(record.name, collision));
-          let status;
-          try {
-            status = await fileApi.commitNoReplace(activeTemp, candidate);
-          } catch (error) {
-            throw hostError("shortcut_commit_failed", error);
-          }
-          if (status === "occupied") continue;
-          if (status !== "committed") throw hostError("shortcut_commit_result_invalid");
-          committed = true;
-          result = { path: candidate, desktopPath, targetPath };
-          break;
+        let status;
+        try {
+          status = await fileApi.commitNoReplace(activeTemp, shortcutPath);
+        } catch (error) {
+          throw hostError("shortcut_commit_failed", error);
         }
-        if (!committed) throw hostError("shortcut_collision_limit_exceeded");
+        if (status === "occupied") throw hostError("shortcut_plan_occupied");
+        if (status !== "committed") throw hostError("shortcut_commit_result_invalid");
+        committed = true;
+        const final = await readShortcut(electronShell, shortcutPath);
+        if (pathKey(final.target) !== pathKey(targetPath)
+          || final.description !== shortcutDescription(name, creationId)) {
+          throw hostError("shortcut_result_mismatch");
+        }
+        result = { ...shortcut };
       } catch (error) {
         primaryError = error;
       }
@@ -597,8 +645,26 @@ export function createWindowsHost({
       return result;
     },
 
+    async inspectRecordedShortcut(record) {
+      const {
+        shortcutPath, targetPath, description,
+      } = validateRecordedShortcut(record);
+      const fileApi = requireShortcutFileApi(shortcutFileApi);
+      const inspected = validateShortcutInspection(await fileApi.inspectExact(shortcutPath));
+      if (inspected.kind === "absent") return { kind: "absent" };
+      if (inspected.kind !== "file") throw hostError("shortcut_path_not_file");
+      try {
+        const current = await readShortcut(electronShell, inspected.path);
+        if (pathKey(current.target) !== pathKey(targetPath)
+          || current.description !== description) throw hostError("shortcut_identity_mismatch");
+      } finally {
+        await fileApi.release(inspected);
+      }
+      return { kind: "shortcut", shortcut: { ...record } };
+    },
+
     async removeRecordedShortcut(record) {
-      const { shortcutPath, targetPath } = validateRecordedShortcut(record);
+      const { shortcutPath, targetPath, description } = validateRecordedShortcut(record);
       const fileApi = requireShortcutFileApi(shortcutFileApi);
       const inspected = validateShortcutInspection(await fileApi.inspectExact(shortcutPath));
       if (inspected.kind === "absent") return { removed: false, path: shortcutPath };
@@ -606,7 +672,8 @@ export function createWindowsHost({
       let removed = false;
       try {
         const current = await readShortcut(electronShell, inspected.path);
-        if (pathKey(current.target) !== pathKey(targetPath)) throw hostError("shortcut_target_mismatch");
+        if (pathKey(current.target) !== pathKey(targetPath)
+          || current.description !== description) throw hostError("shortcut_identity_mismatch");
         removed = await fileApi.removeExact(inspected);
       } catch (error) {
         try {
