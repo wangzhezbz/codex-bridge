@@ -255,6 +255,7 @@ test("workspace derives deterministic children and rejects renderer-controlled i
   assert.equal(Object.keys(workspace).sort().join(","), [
     "cleanupAbandonedPrepare",
     "cleanupComponentPackage",
+    "consumePromotedPackageProof",
     "prepareComponentStaging",
     "prepareDownloadFile",
     "prepareSkillStaging",
@@ -366,10 +367,32 @@ test("download preparation issues one exact adjacent part and promotes it by hel
     asset: { url: "https://shanhaiyouling.com/codexbridge-test/packages/chatgpt.zip", ...packageMetadata() },
     partPath: download.partPath,
   });
-  await download.promotePartNoReplace(verification);
+  const promoted = await download.promotePartNoReplace(verification);
+  assert.equal(promoted.path, download.path);
+  assert.equal(promoted.packageProof !== null && typeof promoted.packageProof === "object", true);
   assert.equal(fake.nodes.has(download.partPath.toLowerCase()), false);
   assert.equal(fake.nodes.has(download.path.toLowerCase()), true);
   assert.equal(fake.calls.filter(([operation]) => operation === "rename").length, 1);
+
+  await assert.rejects(workspace.consumePromotedPackageProof(promoted.packageProof, {
+    path: download.path,
+    size: request.size,
+    sha256: "0".repeat(64),
+  }), /workspace_package_proof_mismatch/u);
+  assert.deepEqual(await workspace.consumePromotedPackageProof(promoted.packageProof, {
+    path: download.path,
+    size: request.size,
+    sha256: request.sha256,
+  }), {
+    path: download.path,
+    size: request.size,
+    sha256: request.sha256,
+  });
+  await assert.rejects(workspace.consumePromotedPackageProof(promoted.packageProof, {
+    path: download.path,
+    size: request.size,
+    sha256: request.sha256,
+  }), /workspace_package_proof_consumed/u);
 
   await workspace.cleanupComponentPackage(download);
   assert.equal(fake.nodes.has(download.path.toLowerCase()), false);
@@ -528,7 +551,9 @@ test("download rename collision consumes verification and requires a fresh exact
   fake.nodes.delete(download.path.toLowerCase());
   await assert.rejects(download.promotePartNoReplace(firstVerification), /verification_receipt_consumed/u);
   const secondVerification = await downloadManager.downloadPrepared({ asset, partPath: download.partPath });
-  assert.equal(await download.promotePartNoReplace(secondVerification), download.path);
+  const promoted = await download.promotePartNoReplace(secondVerification);
+  assert.equal(promoted.path, download.path);
+  assert.equal(typeof promoted.packageProof, "object");
   assert.equal(fake.calls.filter(([operation]) => operation === "seal").length, 1);
   await workspace.cleanupComponentPackage(download);
 });

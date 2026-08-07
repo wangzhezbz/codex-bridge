@@ -814,10 +814,21 @@ test("installer workspace capability issues exact direct children and mutates on
   const workspace = await api.openInstallerWorkspaceRootNoFollow(
     await installRootAuthority("D:\\CBApps"), { maxRelativePath: 80 },
   );
+  assert.equal(await workspace.openDirectoryChildNoFollow(
+    workspace.root, "downloads", { role: "rename-parent" },
+  ), null);
+  assert.equal(fake.get("D:\\CBApps\\downloads"), undefined);
   const [downloads, concurrentDownloads] = await Promise.all([
     workspace.createOrOpenDirectoryChildNoFollow(workspace.root, "downloads", { requireEmpty: false, role: "rename-parent" }),
     workspace.createOrOpenDirectoryChildNoFollow(workspace.root, "downloads", { requireEmpty: false, role: "rename-parent" }),
   ]);
+  const reopenedDownloads = await workspace.openDirectoryChildNoFollow(
+    workspace.root, "downloads", { role: "rename-parent" },
+  );
+  assert.deepEqual(
+    await workspace.inspectIssuedChildNoFollow(reopenedDownloads),
+    await workspace.inspectIssuedChildNoFollow(downloads),
+  );
   assert.deepEqual(
     await workspace.inspectIssuedChildNoFollow(concurrentDownloads),
     await workspace.inspectIssuedChildNoFollow(downloads),

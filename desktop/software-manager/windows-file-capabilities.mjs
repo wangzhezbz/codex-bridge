@@ -720,6 +720,24 @@ export function createWindowsFileCapabilities({
       return receipt;
     }
 
+    async function openDirectoryChildNoFollow(parent, name, options = {}) {
+      const hasRole = options !== null && typeof options === "object" && Object.hasOwn(options, "role");
+      if (!hasExactKeys(options, hasRole ? ["role"] : [])
+        || (hasRole && !WORKSPACE_DIRECTORY_ROLES.has(options.role))) {
+        throw capabilityError("workspace_directory_options_invalid");
+      }
+      try {
+        return await openDirectChild(parent, name, {
+          kind: "directory",
+          disposition: "openExisting",
+          role: options.role ?? "deletable",
+        });
+      } catch (error) {
+        if (isMissing(error)) return null;
+        throw error;
+      }
+    }
+
     async function createFileChildNoFollow(parent, name) {
       return openDirectChild(parent, name, { kind: "file", disposition: "createNew" });
     }
@@ -919,6 +937,7 @@ export function createWindowsFileCapabilities({
     return Object.freeze({
       root,
       createOrOpenDirectoryChildNoFollow,
+      openDirectoryChildNoFollow,
       createFileChildNoFollow,
       openFileChildNoFollow,
       inspectIssuedChildNoFollow,

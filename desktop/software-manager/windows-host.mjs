@@ -13,6 +13,7 @@ const REGISTRY_FIELDS = Object.freeze([
   "UninstallString",
 ]);
 const AUTHENTICODE_COMMAND = "$s=Get-AuthenticodeSignature -LiteralPath $env:CB_SM_PACKAGE_PATH; @{Status=[string]$s.Status; Thumbprint=$s.SignerCertificate.Thumbprint; Subject=$s.SignerCertificate.Subject}|ConvertTo-Json -Compress";
+const FILE_VERSION_COMMAND = "$v=[System.Diagnostics.FileVersionInfo]::GetVersionInfo($env:CB_SM_FILE_PATH); @{FileVersion=[string]$v.FileVersion; ProductVersion=[string]$v.ProductVersion}|ConvertTo-Json -Compress";
 const PROCESS_LIST_COMMAND = "@(Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object ProcessId,ExecutablePath) | ConvertTo-Json -Compress";
 const POWERSHELL_ARGS = Object.freeze([
   "-NoLogo",
@@ -271,6 +272,25 @@ function parseAuthenticode(stdout) {
   };
 }
 
+function parseFileVersion(stdout) {
+  let parsed;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch (error) {
+    throw hostError("file_version_output_invalid", error);
+  }
+  if (!isPlainRecord(parsed)
+    || Object.keys(parsed).sort().join("\0") !== ["FileVersion", "ProductVersion"].sort().join("\0")
+    || typeof parsed.FileVersion !== "string" || typeof parsed.ProductVersion !== "string") {
+    throw hostError("file_version_output_invalid");
+  }
+  const version = /^\d+(?:\.\d+){1,3}$/u.test(parsed.ProductVersion)
+    ? parsed.ProductVersion
+    : parsed.FileVersion;
+  if (!/^\d+(?:\.\d+){1,3}$/u.test(version)) throw hostError("file_version_output_invalid");
+  return version;
+}
+
 function parseProcessList(stdout) {
   if (stdout.trim().length === 0) return [];
   let parsed;
@@ -504,6 +524,30 @@ export function createWindowsHost({
         },
       );
       return parseAuthenticode(result.stdout);
+    },
+
+    async readFileVersion(filePath) {
+      const exactPath = requireExecutablePath(filePath);
+      const systemRoot = requireDriveAbsolute(env.SystemRoot, "file_version_host_path_invalid");
+      const powershellPath = path.win32.join(
+        systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+      );
+      const metadataEnv = {
+        SystemRoot: systemRoot,
+        WINDIR: systemRoot,
+        CB_SM_FILE_PATH: exactPath,
+      };
+      const result = await runCommand(
+        execFile,
+        {},
+        powershellPath,
+        [...POWERSHELL_ARGS, FILE_VERSION_COMMAND],
+        {
+          options: { env: metadataEnv, timeout: 15_000 },
+          errorCode: "file_version_query_failed",
+        },
+      );
+      return parseFileVersion(result.stdout);
     },
 
     async stopOwnedProcesses(executablePaths) {

@@ -595,7 +595,8 @@ export function createComponentAdapters({
         signal: context.signal, onProgress: typeof context.onProgress === "function" ? context.onProgress : () => {},
       });
       if (!isRecord(downloaded) || downloaded.path !== archivePath
-        || downloaded.size !== entry.size || downloaded.sha256 !== entry.sha256) {
+        || downloaded.size !== entry.size || downloaded.sha256 !== entry.sha256
+        || downloaded.packageProof === null || typeof downloaded.packageProof !== "object") {
         throw adapterError("component_download_evidence_invalid");
       }
       await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
@@ -605,11 +606,14 @@ export function createComponentAdapters({
       }), "component_verification_receipt_invalid");
       await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
       await verifyComponent({
+        componentId,
+        phase: "staging",
         rootPath: staging,
         entrypointPath: componentEntrypoint(installRoot, componentId, entry, "staging"),
         requiredFiles: entry.requiredFiles.map((file) => relativeFile(staging, file)),
         expectedVersion: entry.version,
         expectedPackageSha256: entry.sha256,
+        packageProof: downloaded.packageProof,
       });
       await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
       let cleared;
@@ -679,9 +683,10 @@ export function createComponentAdapters({
       let coreVerifyError = null;
       try {
         await verifyComponent({
+          componentId, phase: "current",
           rootPath: slotRoot(installRoot, componentId, "current"), entrypointPath: finalEntrypoint,
           requiredFiles: finalRequiredFiles,
-          expectedVersion: prepared.entry.version, expectedPackageSha256: prepared.entry.sha256,
+          expectedVersion: prepared.entry.version,
         });
         if (componentId === "v2rayn") {
           await verifyPersistentDirectory({
@@ -807,6 +812,7 @@ export function createComponentAdapters({
         throw adapterError("component_runtime_metadata_missing");
       }
       await verifyComponent({
+        componentId, phase: "current",
         rootPath: slotRoot(installRoot, componentId, "current"),
         entrypointPath: record.entrypointPath,
         requiredFiles: record.requiredFiles,

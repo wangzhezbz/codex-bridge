@@ -10,6 +10,7 @@ const REGISTRY_KEYS = [
 ];
 const REGISTRY_FIELDS = ["DisplayName", "DisplayVersion", "InstallLocation", "UninstallString"];
 const AUTHENTICODE_COMMAND = "$s=Get-AuthenticodeSignature -LiteralPath $env:CB_SM_PACKAGE_PATH; @{Status=[string]$s.Status; Thumbprint=$s.SignerCertificate.Thumbprint; Subject=$s.SignerCertificate.Subject}|ConvertTo-Json -Compress";
+const FILE_VERSION_COMMAND = "$v=[System.Diagnostics.FileVersionInfo]::GetVersionInfo($env:CB_SM_FILE_PATH); @{FileVersion=[string]$v.FileVersion; ProductVersion=[string]$v.ProductVersion}|ConvertTo-Json -Compress";
 const SHORTCUT_CREATION_ID = "a".repeat(32);
 
 function ownedShortcut(path, desktopPath, targetPath, name = "ChatGPT") {
@@ -165,6 +166,26 @@ test("Authenticode uses one fixed PowerShell command and a child-only package en
 test("Authenticode rejects malformed output instead of treating it as unsigned metadata", async () => {
   const fixture = fakeHost({ authenticodeOutput: "not-json" });
   await assert.rejects(fixture.host.verifyAuthenticode("D:\\staging\\Git.exe"), /authenticode_output_invalid/);
+});
+
+test("file version metadata uses one fixed local command and a child-only exact path", async () => {
+  const filePath = "D:\\CBApps\\ct\\ChatGPT $(Get-ChildItem).exe";
+  const fixture = fakeHost({
+    env: { PATH: "C:\\Windows", SystemRoot: "C:\\Windows" },
+    fileVersion: { FileVersion: "2.0.0.0", ProductVersion: "2.0.0" },
+  });
+
+  assert.equal(await fixture.host.readFileVersion(filePath), "2.0.0");
+
+  const call = fixture.calls.execFile[0];
+  assertCommand(call, "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", [
+    "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+    "-Command", FILE_VERSION_COMMAND,
+  ]);
+  assert.equal(call.args.includes(filePath), false);
+  assert.equal(call.options.env.CB_SM_FILE_PATH, filePath);
+  assert.equal(Object.hasOwn(call.options.env, "PATH"), false);
+  assert.equal(call.options.timeout, 15_000);
 });
 
 test("stops only processes whose normalized absolute executable path is exactly owned", async () => {
@@ -769,6 +790,8 @@ function fakeHost({
   wherePaths = [],
   authenticode = { Status: "Valid", Thumbprint: "ABC", Subject: "CN=Signer" },
   authenticodeOutput,
+  fileVersion = { FileVersion: "1.0.0.0", ProductVersion: "1.0.0" },
+  fileVersionOutput,
   processes = [],
   shortcuts = new Map(),
   otherShortcutPaths = new Set(),
@@ -823,6 +846,13 @@ function fakeHost({
       return {
         exitCode: 0,
         stdout: authenticodeOutput ?? JSON.stringify(authenticode),
+        stderr: "",
+      };
+    }
+    if (args.at(-1) === FILE_VERSION_COMMAND) {
+      return {
+        exitCode: 0,
+        stdout: fileVersionOutput ?? JSON.stringify(fileVersion),
         stderr: "",
       };
     }

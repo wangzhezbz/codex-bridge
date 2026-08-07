@@ -112,6 +112,7 @@ export function createInstallerWorkspace({
     throw workspaceError("install_root_capability_invalid");
   }
   const authorities = new WeakMap();
+  const promotedPackageProofs = new WeakMap();
   const pending = new Map();
 
   async function openRoot(relativePath) {
@@ -225,7 +226,9 @@ export function createInstallerWorkspace({
       );
       authority.phase = "promoted";
       authority.state = "issued";
-      return record.path;
+      const packageProof = Object.freeze(Object.create(null));
+      promotedPackageProofs.set(packageProof, { state: "issued", authority });
+      return Object.freeze({ path: record.path, packageProof });
     } catch (error) {
       if (isOccupied(error)) {
         authority.state = "issued";
@@ -279,6 +282,7 @@ export function createInstallerWorkspace({
           session,
           fileReceipt,
           finalName,
+          finalPath,
           partPath: record.partPath,
           size: request.size,
           sha256: request.sha256,
@@ -418,11 +422,37 @@ export function createInstallerWorkspace({
     return true;
   }
 
+  async function consumePromotedPackageProof(proof, expected) {
+    const proofRecord = promotedPackageProofs.get(proof);
+    if (!proofRecord) throw workspaceError("workspace_package_proof_invalid");
+    if (proofRecord.state !== "issued") throw workspaceError("workspace_package_proof_consumed");
+    const authority = proofRecord.authority;
+    if (authority.state !== "issued" || authority.phase !== "promoted") {
+      throw workspaceError("workspace_package_proof_invalid");
+    }
+    if (!expected || Object.getPrototypeOf(expected) !== Object.prototype
+      || Object.keys(expected).sort().join("\0") !== ["path", "sha256", "size"].join("\0")
+      || expected.path !== authority.finalPath
+      || expected.size !== authority.size || expected.sha256 !== authority.sha256) {
+      throw workspaceError("workspace_package_proof_mismatch");
+    }
+    await revalidateInstallRootCapability(installRootCapability, {
+      maxRelativePath: authority.relativePath.length,
+    });
+    const inspected = await authority.session.inspectIssuedChildNoFollow(authority.fileReceipt);
+    if (inspected.path !== expected.path || inspected.kind !== "file" || inspected.size !== expected.size) {
+      throw workspaceError("workspace_package_proof_mismatch");
+    }
+    proofRecord.state = "consumed";
+    return Object.freeze({ path: expected.path, size: expected.size, sha256: expected.sha256 });
+  }
+
   return Object.freeze({
     prepareDownloadFile,
     prepareComponentStaging,
     prepareSkillStaging,
     cleanupAbandonedPrepare,
     cleanupComponentPackage,
+    consumePromotedPackageProof,
   });
 }

@@ -104,6 +104,7 @@ function fixture({
     gitMutableReleases: [],
   };
   const archiveReceipts = new WeakSet();
+  const packageProofs = new WeakSet();
   const skillReceipts = new WeakSet();
   const skillCompletionReceipts = new WeakSet();
   const skillProofs = new Map();
@@ -253,6 +254,15 @@ function fixture({
     async verifyComponent(plan) {
       verifyCalls += 1;
       calls.verified.push({ kind: "component", ...plan });
+      if (plan.phase === "staging") {
+        assert.equal(packageProofs.has(plan.packageProof), true);
+        packageProofs.delete(plan.packageProof);
+        assert.equal(plan.expectedPackageSha256, DIGEST_A);
+      } else {
+        assert.equal(plan.phase, "current");
+        assert.equal(Object.hasOwn(plan, "packageProof"), false);
+        assert.equal(Object.hasOwn(plan, "expectedPackageSha256"), false);
+      }
       await onVerifyComponent?.(plan);
       if (verifyCalls > 1 && finalVerifyFailure) throw finalVerifyFailure;
       return { version: plan.expectedVersion };
@@ -363,7 +373,9 @@ function fixture({
     async download(plan) {
       calls.downloads.push(plan);
       await onDownload?.(plan);
-      return { path: plan.destination, size: plan.asset.size, sha256: plan.asset.sha256 };
+      const packageProof = Object.freeze(Object.create(null));
+      packageProofs.add(packageProof);
+      return { path: plan.destination, size: plan.asset.size, sha256: plan.asset.sha256, packageProof };
     },
   };
   const adapterOptions = {
@@ -633,9 +645,29 @@ test("ChatGPT uses CBApps c/cp/ct directly and consumes the archive receipt in p
   const { adapters, calls, getState } = fixture();
   assert.equal((await adapters.chatgpt.prepare({ taskId: "chat" })).status, "succeeded");
   assert.equal(calls.extracts[0].destination, "D:\\CBApps\\ct");
+  assert.deepEqual(calls.verified[0], {
+    kind: "component",
+    componentId: "chatgpt",
+    phase: "staging",
+    rootPath: "D:\\CBApps\\ct",
+    entrypointPath: "D:\\CBApps\\ct\\ChatGPT.exe",
+    requiredFiles: ["D:\\CBApps\\ct\\ChatGPT.exe"],
+    expectedVersion: "2.0.0",
+    expectedPackageSha256: DIGEST_A,
+    packageProof: calls.verified[0].packageProof,
+  });
   const committed = await adapters.chatgpt.commit({ taskId: "chat" });
   assert.equal(committed.status, "succeeded", committed.message);
   assert.equal(calls.promotions[0].rootPath, INSTALL_ROOT);
+  assert.deepEqual(calls.verified[1], {
+    kind: "component",
+    componentId: "chatgpt",
+    phase: "current",
+    rootPath: "D:\\CBApps\\c",
+    entrypointPath: "D:\\CBApps\\c\\ChatGPT.exe",
+    requiredFiles: ["D:\\CBApps\\c\\ChatGPT.exe"],
+    expectedVersion: "2.0.0",
+  });
   assert.equal(getState().components.chatgpt.installPath, "D:\\CBApps\\c");
 });
 
