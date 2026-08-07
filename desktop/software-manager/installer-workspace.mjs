@@ -1,6 +1,9 @@
 import path from "node:path";
 
-import { compareVersions } from "../../shared/software-manager/catalog-schema.mjs";
+import {
+  compareVersions,
+  MAX_SOFTWARE_PACKAGE_BYTES,
+} from "../../shared/software-manager/catalog-schema.mjs";
 import { consumePreparedDownloadVerification } from "./download-manager.mjs";
 import { revalidateInstallRootCapability } from "./path-policy.mjs";
 
@@ -42,7 +45,8 @@ function validateDownload(request = {}) {
     throw workspaceError("workspace_identifier_invalid");
   }
   if (extension !== COMPONENT_EXTENSIONS[component]) throw workspaceError("workspace_identifier_invalid");
-  if (!Number.isSafeInteger(request.size) || request.size <= 0 || !SHA256.test(request.sha256 ?? "")) {
+  if (!Number.isSafeInteger(request.size) || request.size <= 0
+    || request.size > MAX_SOFTWARE_PACKAGE_BYTES || !SHA256.test(request.sha256 ?? "")) {
     throw workspaceError("workspace_asset_invalid");
   }
   return {
@@ -84,6 +88,7 @@ function requireSession(value) {
     "createFileChildNoFollow",
     "openFileChildNoFollow",
     "inspectIssuedChildNoFollow",
+    "sealIssuedFileNoFollow",
     "renameIssuedChildNoReplace",
     "deleteIssuedChildNoFollow",
     "close",
@@ -112,10 +117,20 @@ export function createInstallerWorkspace({
   async function openRoot(relativePath) {
     const maxRelativePath = relativePath.length;
     const rootPath = await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
-    const session = requireSession(await files.openInstallerWorkspaceRootNoFollow(
+    const openedSession = await files.openInstallerWorkspaceRootNoFollow(
       installRootCapability,
       { maxRelativePath },
-    ));
+    );
+    let session;
+    try {
+      session = requireSession(openedSession);
+    } catch (error) {
+      if (typeof openedSession?.close !== "function") throw error;
+      await openedSession.close().catch((closeError) => {
+        throw new AggregateError([error, closeError], error.message, { cause: error });
+      });
+      throw error;
+    }
     try {
       const confirmed = await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
       if (confirmed.toLowerCase() !== rootPath.toLowerCase()) throw workspaceError("install_root_identity_changed");

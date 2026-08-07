@@ -4,9 +4,13 @@ import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import test from "node:test";
 
-import { createDownloadManager } from "../desktop/software-manager/download-manager.mjs";
+import {
+  consumePreparedDownloadVerification,
+  createDownloadManager,
+} from "../desktop/software-manager/download-manager.mjs";
 import { createInstallerWorkspace } from "../desktop/software-manager/installer-workspace.mjs";
 import { authorizeInstallRoot } from "../desktop/software-manager/path-policy.mjs";
+import { MAX_SOFTWARE_PACKAGE_BYTES } from "../shared/software-manager/catalog-schema.mjs";
 
 const ROOT = "D:\\CBApps";
 const PACKAGE = Buffer.from("verified component package");
@@ -255,6 +259,73 @@ test("workspace derives deterministic children and rejects renderer-controlled i
     "prepareDownloadFile",
     "prepareSkillStaging",
   ].sort().join(","));
+});
+
+test("workspace rejects an incomplete session before file mutation and leaves download verification unconsumed", async (t) => {
+  for (const mode of ["missing", "non-function"]) {
+    await t.test(mode, async () => {
+      const fake = fakeWorkspaceCapabilities();
+      const downloadManager = fakePreparedDownloadManager(fake);
+      const receiptPath = "D:\\CBApps\\downloads\\already-verified.zip.part";
+      fake.add(receiptPath, "file");
+      const asset = {
+        url: "https://shanhaiyouling.com/codexbridge-test/packages/already-verified.zip",
+        ...packageMetadata(),
+      };
+      const verification = await downloadManager.downloadPrepared({ asset, partPath: receiptPath });
+      const originalOpen = fake.fileCapabilities.openInstallerWorkspaceRootNoFollow;
+      fake.fileCapabilities.openInstallerWorkspaceRootNoFollow = async (...args) => {
+        const session = await originalOpen(...args);
+        if (mode === "missing") delete session.sealIssuedFileNoFollow;
+        else session.sealIssuedFileNoFollow = null;
+        return session;
+      };
+      const { workspace } = await createWorkspace(
+        fake,
+        await installRootCapability(),
+        downloadManager,
+      );
+      await assert.rejects(
+        workspace.prepareDownloadFile(downloadRequest("chatgpt", "1.3.0", ".zip")),
+        /workspace_file_capabilities_invalid/u,
+      );
+      assert.equal(fake.calls.some(([operation]) => operation === "directory"
+        || operation === "create-file" || operation === "open-file"), false);
+      assert.equal([...fake.sessions].every((session) => session.closed), true);
+      assert.deepEqual(consumePreparedDownloadVerification(downloadManager, verification, {
+        partPath: receiptPath,
+        size: PACKAGE.length,
+        sha256: packageMetadata().sha256,
+      }), {
+        partPath: receiptPath,
+        size: PACKAGE.length,
+        sha256: packageMetadata().sha256,
+      });
+    });
+  }
+});
+
+test("workspace accepts the shared package ceiling and rejects larger downloads before any side effect", async () => {
+  const fake = fakeWorkspaceCapabilities();
+  let fetches = 0;
+  const downloadManager = {
+    async downloadPrepared() { fetches += 1; },
+  };
+  const { workspace } = await createWorkspace(fake, await installRootCapability(), downloadManager);
+  await assert.rejects(workspace.prepareDownloadFile({
+    ...downloadRequest("chatgpt", "1.4.0", ".zip"),
+    size: MAX_SOFTWARE_PACKAGE_BYTES + 1,
+  }), /workspace_asset_invalid/u);
+  assert.equal(fetches, 0);
+  assert.equal(fake.calls.length, 0);
+  assert.deepEqual([...fake.nodes.keys()], [ROOT.toLowerCase()]);
+
+  const accepted = await workspace.prepareDownloadFile({
+    ...downloadRequest("chatgpt", "1.4.0", ".zip"),
+    size: MAX_SOFTWARE_PACKAGE_BYTES,
+  });
+  assert.equal(accepted.partPath.endsWith("chatgpt-1.4.0.zip.part"), true);
+  await workspace.cleanupAbandonedPrepare(accepted);
 });
 
 test("download pending authority is keyed by final casefold path and rejects changed signed metadata", async () => {

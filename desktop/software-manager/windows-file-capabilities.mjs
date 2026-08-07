@@ -2,12 +2,12 @@ import crypto from "node:crypto";
 import path from "node:path";
 import { Writable } from "node:stream";
 
+import { MAX_SOFTWARE_PACKAGE_BYTES } from "../../shared/software-manager/catalog-schema.mjs";
 import { revalidateInstallRootCapability } from "./path-policy.mjs";
 
 const MAX_DEPTH = 64;
 const MAX_ENTRIES = 4_096;
 const MAX_STATE_BYTES = 16 * 1_024 * 1_024;
-const MAX_ARCHIVE_BYTES = 16 * 1_024 * 1_024 * 1_024;
 const WORKSPACE_HASH_CHUNK_BYTES = 1_024 * 1_024;
 const MAX_PATH_CHARS = 32_760;
 const VERSION_MARKER_NAME = ".codexbridge-version.json";
@@ -745,7 +745,8 @@ export function createWindowsFileCapabilities({
         && Object.hasOwn(options, "signal");
       const optionKeys = hasSignal ? ["size", "sha256", "signal"] : ["size", "sha256"];
       if (!hasExactKeys(options, optionKeys)
-        || !Number.isSafeInteger(options.size) || options.size < 0 || options.size > MAX_ARCHIVE_BYTES
+        || !Number.isSafeInteger(options.size) || options.size < 0
+        || options.size > MAX_SOFTWARE_PACKAGE_BYTES
         || !SHA256.test(options.sha256)
         || (hasSignal && (options.signal === null || typeof options.signal !== "object"
           || typeof options.signal.aborted !== "boolean"))) {
@@ -788,7 +789,7 @@ export function createWindowsFileCapabilities({
           if (chunk.length === 0) break;
           totalBytes += chunk.length;
           if (!Number.isSafeInteger(totalBytes) || totalBytes > options.size
-            || totalBytes > MAX_ARCHIVE_BYTES) {
+            || totalBytes > MAX_SOFTWARE_PACKAGE_BYTES) {
             throw capabilityError("workspace_file_size_mismatch");
           }
           hasher.update(chunk);
@@ -1101,10 +1102,10 @@ export function createWindowsFileCapabilities({
             } else {
               await nativeApi.assertNoAlternateDataStreams(handle);
               totalBytes += info.size;
-              if (!Number.isSafeInteger(totalBytes) || totalBytes > MAX_ARCHIVE_BYTES) {
+              if (!Number.isSafeInteger(totalBytes) || totalBytes > MAX_SOFTWARE_PACKAGE_BYTES) {
                 throw capabilityError("version_tree_size_exceeded");
               }
-              const content = await nativeApi.readFile(handle, MAX_ARCHIVE_BYTES);
+              const content = await nativeApi.readFile(handle, MAX_SOFTWARE_PACKAGE_BYTES);
               if (!Buffer.isBuffer(content) || content.length !== info.size) {
                 throw capabilityError("version_tree_read_invalid");
               }
@@ -1431,7 +1432,8 @@ export function createWindowsFileCapabilities({
     async function createFilePathNoFollow(rawSegments, { exclusive, size } = {}) {
       requireOpen(pin.owner);
       const segments = validateRelativeSegments(rawSegments);
-      if (exclusive !== true || !Number.isSafeInteger(size) || size < 0 || size > MAX_ARCHIVE_BYTES) {
+      if (exclusive !== true || !Number.isSafeInteger(size) || size < 0
+        || size > MAX_SOFTWARE_PACKAGE_BYTES) {
         throw capabilityError("archive_output_options_invalid");
       }
       const parent = segments.length === 1 ? pin.leaf : await ensureDirectoryPathNoFollow(segments.slice(0, -1));
@@ -1465,7 +1467,7 @@ export function createWindowsFileCapabilities({
         write(chunk, _encoding, callback) {
           const data = Buffer.from(chunk);
           written += data.length;
-          if (written > size || written > MAX_ARCHIVE_BYTES) {
+          if (written > size || written > MAX_SOFTWARE_PACKAGE_BYTES) {
             callback(capabilityError("archive_output_size_exceeded"));
             return;
           }
@@ -1555,7 +1557,9 @@ export function createWindowsFileCapabilities({
           if (!child) await inspectExtra(record, name);
           const info = validateInfo(await nativeApi.queryHandle(child.handle), child.directory ? "directory" : "file");
           totalBytes += child.directory ? 0 : info.size;
-          if (totalBytes > MAX_ARCHIVE_BYTES) throw capabilityError("archive_output_size_exceeded");
+          if (totalBytes > MAX_SOFTWARE_PACKAGE_BYTES) {
+            throw capabilityError("archive_output_size_exceeded");
+          }
           result.push({
             path: relative,
             realPath: child.path,

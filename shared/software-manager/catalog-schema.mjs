@@ -1,4 +1,5 @@
 export const COMPONENT_IDS = Object.freeze(["chatgpt", "v2rayn", "git"]);
+export const MAX_SOFTWARE_PACKAGE_BYTES = 16 * 1_024 * 1_024 * 1_024;
 export const TEST_CATALOG_ORIGIN = "https://shanhaiyouling.com";
 export const TEST_CATALOG_PATH = "/codexbridge-install-test/component-catalog.json";
 export const TEST_PACKAGE_PATH = "/codexbridge-test/packages/";
@@ -73,7 +74,7 @@ function parseComponent(component, ids) {
   if (!isSafeAssetUrl(component.assetUrl)) throw catalogError("catalog_asset_url_invalid");
   if (!isNonEmptyString(component.name) || !VERSION_PATTERN.test(component.version)
     || !["x64", "arm64"].includes(component.architecture) || !["zip", "7z", "exe"].includes(component.format)
-    || !isPositiveSafeInteger(component.size)
+    || !isSoftwarePackageSize(component.size)
     || !SHA256_PATTERN.test(component.sha256) || !isSafeRelativePath(component.entrypoint)
     || !isSafePathList(component.requiredFiles) || !isPositiveSafeInteger(component.maxRelativePathLength)
     || !isIsoDate(component.publishedAt) || typeof component.supportsRollback !== "boolean") {
@@ -89,7 +90,7 @@ function parseSkill(skill, ids) {
   ids.add(skill.id);
   if (!isSafeAssetUrl(skill.assetUrl)) throw catalogError("catalog_asset_url_invalid");
   if (!isNonEmptyString(skill.name) || !isNonEmptyString(skill.description) || !VERSION_PATTERN.test(skill.version)
-    || !isPositiveSafeInteger(skill.size)
+    || !isSoftwarePackageSize(skill.size)
     || !SHA256_PATTERN.test(skill.sha256) || !isSafePathList(skill.files) || !skill.files.includes("SKILL.md")) {
     throw catalogError("catalog_skill_invalid");
   }
@@ -110,6 +111,10 @@ function isNonEmptyString(value) {
 
 function isPositiveSafeInteger(value) {
   return Number.isSafeInteger(value) && value > 0;
+}
+
+function isSoftwarePackageSize(value) {
+  return isPositiveSafeInteger(value) && value <= MAX_SOFTWARE_PACKAGE_BYTES;
 }
 
 function isSafeId(value) {

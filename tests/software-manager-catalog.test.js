@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   compareVersions,
+  MAX_SOFTWARE_PACKAGE_BYTES,
   parseCatalog,
   resolveCatalogAssetUrl,
 } from "../shared/software-manager/catalog-schema.mjs";
@@ -64,6 +65,26 @@ test("catalog accepts a signed test-origin manifest", () => {
   const signed = signedFixture({ components: [componentFixture()], skills: [skillFixture("documents")] });
   const result = verifyCatalogEnvelope({ ...signed, catalogUrl: TEST_CATALOG_URL });
   assert.equal(result.components[0].id, "chatgpt");
+});
+
+test("catalog uses one software package byte ceiling for components and Skills", () => {
+  const accepted = parseCatalog({
+    schemaVersion: 1,
+    components: [componentFixture({ size: MAX_SOFTWARE_PACKAGE_BYTES })],
+    skills: [skillFixture("documents", { size: MAX_SOFTWARE_PACKAGE_BYTES })],
+  });
+  assert.equal(accepted.components[0].size, MAX_SOFTWARE_PACKAGE_BYTES);
+  assert.equal(accepted.skills[0].size, MAX_SOFTWARE_PACKAGE_BYTES);
+  assert.throws(() => parseCatalog({
+    schemaVersion: 1,
+    components: [componentFixture({ size: MAX_SOFTWARE_PACKAGE_BYTES + 1 })],
+    skills: [],
+  }), /catalog_component_invalid/u);
+  assert.throws(() => parseCatalog({
+    schemaVersion: 1,
+    components: [],
+    skills: [skillFixture("documents", { size: MAX_SOFTWARE_PACKAGE_BYTES + 1 })],
+  }), /catalog_skill_invalid/u);
 });
 
 test("only a signature-verified catalog can issue a fixed-ID catalog service", () => {

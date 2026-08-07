@@ -13,6 +13,7 @@ import { deleteAuthorizedTree } from "../desktop/software-manager/safe-delete.mj
 import { authorizeInstallRoot } from "../desktop/software-manager/path-policy.mjs";
 import { createWin32FileApi } from "../desktop/software-manager/win32-file-api.mjs";
 import { createWindowsFileCapabilities } from "../desktop/software-manager/windows-file-capabilities.mjs";
+import { MAX_SOFTWARE_PACKAGE_BYTES } from "../shared/software-manager/catalog-schema.mjs";
 
 function codedError(code, nativeCode) {
   return Object.assign(new Error(code), { code, nativeCode });
@@ -988,6 +989,33 @@ test("installer workspace seal fails closed on growth, truncation, abort, and ha
       assert.equal(fake.handles.size, 0);
     });
   }
+});
+
+test("installer workspace seal shares the catalog package-size ceiling", async () => {
+  const fake = createFakeNative([{ path: "D:\\CBApps" }]);
+  const workspace = await capabilities(fake).openInstallerWorkspaceRootNoFollow(
+    await installRootAuthority("D:\\CBApps"), { maxRelativePath: 80 },
+  );
+  const downloads = await workspace.createOrOpenDirectoryChildNoFollow(
+    workspace.root, "downloads", { requireEmpty: false, role: "rename-parent" },
+  );
+  const part = await workspace.createFileChildNoFollow(downloads, "package.zip.part");
+  await assert.rejects(
+    workspace.sealIssuedFileNoFollow(part, {
+      size: MAX_SOFTWARE_PACKAGE_BYTES,
+      sha256: createHash("sha256").update(Buffer.alloc(0)).digest("hex"),
+    }),
+    /workspace_file_size_mismatch/u,
+  );
+  await assert.rejects(
+    workspace.sealIssuedFileNoFollow(part, {
+      size: MAX_SOFTWARE_PACKAGE_BYTES + 1,
+      sha256: createHash("sha256").update(Buffer.alloc(0)).digest("hex"),
+    }),
+    /workspace_file_seal_options_invalid/u,
+  );
+  assert.equal(fake.calls.some((call) => call[0] === "rename-handle"), false);
+  await workspace.close();
 });
 
 test("real Windows installer workspace seals after Node closes and blocks same-length rewrites", {
