@@ -2,6 +2,8 @@ import crypto from "node:crypto";
 import path from "node:path";
 import { Writable } from "node:stream";
 
+import { revalidateInstallRootCapability } from "./path-policy.mjs";
+
 const MAX_DEPTH = 64;
 const MAX_ENTRIES = 4_096;
 const MAX_STATE_BYTES = 16 * 1_024 * 1_024;
@@ -552,6 +554,251 @@ export function createWindowsFileCapabilities({
 
   async function openJournalDirectoryNoFollow(journalDir) {
     return openRecordDirectoryNoFollow(journalDir, { includeListing: true });
+  }
+
+  async function openInstallerWorkspaceRootNoFollow(installRootCapability, { maxRelativePath } = {}) {
+    if (!Number.isSafeInteger(maxRelativePath) || maxRelativePath < 0) {
+      throw capabilityError("workspace_root_options_invalid");
+    }
+    const rootPath = await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
+    const pin = await openPinnedPath(nativeApi, rootPath, {
+      kind: "directory",
+      access: ["read", "attributes"],
+      share: ["read", "write"],
+    });
+    if (pin.leaf.info.nlink !== 1) {
+      return closeHandles(nativeApi, pin.owner.handles, capabilityError("windows_hard_link_rejected"));
+    }
+    try {
+      const confirmed = await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
+      if (!samePath(confirmed, rootPath)) throw capabilityError("install_root_identity_changed");
+    } catch (error) {
+      return closeHandles(nativeApi, pin.owner.handles, error);
+    }
+    const receiptMap = new WeakMap();
+    const session = Object.freeze(Object.create(null));
+
+    function issue({ path: exactPath, info, handle, kind, parent = null }) {
+      const receipt = Object.freeze(Object.create(null));
+      receiptMap.set(receipt, {
+        session,
+        path: exactPath,
+        identity: info.identity,
+        handle,
+        kind,
+        parent,
+        state: "issued",
+      });
+      return receipt;
+    }
+
+    const root = issue({
+      path: pin.path,
+      info: pin.leaf.info,
+      handle: pin.leaf.handle,
+      kind: "directory",
+    });
+
+    function requireReceipt(receipt, { directory = false, claim = false } = {}) {
+      requireOpen(pin.owner);
+      const internal = receiptMap.get(receipt);
+      if (!internal || internal.session !== session) throw capabilityError("workspace_receipt_invalid");
+      if (internal.state !== "issued") throw capabilityError("workspace_receipt_consumed");
+      if (directory && internal.kind !== "directory") throw capabilityError("workspace_directory_receipt_required");
+      if (claim) internal.state = "busy";
+      return internal;
+    }
+
+    async function assertStable(internal, expectedKind = internal.kind) {
+      const current = validateInfo(await nativeApi.queryHandle(internal.handle), expectedKind);
+      verifyIdentity(internal.identity, current);
+      if (current.nlink !== 1) throw capabilityError("windows_hard_link_rejected");
+      if (expectedKind === "file") await nativeApi.assertNoAlternateDataStreams(internal.handle);
+      const finalPath = validateAbsolute(await nativeApi.finalPath(internal.handle));
+      if (!samePath(finalPath, internal.path)) throw capabilityError("windows_final_path_mismatch");
+      return current;
+    }
+
+    async function listAtMostOne(internal) {
+      try {
+        for await (const entry of nativeApi.enumerateDirectory(internal.handle, { limit: 1 })) {
+          if (!entry || entry.reparse === true) throw capabilityError("windows_reparse_point_rejected");
+          validateChildName(entry.name);
+          return false;
+        }
+        return true;
+      } catch (error) {
+        if (error?.code === "native_directory_entry_limit_exceeded"
+          || error?.code === "windows_directory_limit_exceeded") return false;
+        throw error;
+      }
+    }
+
+    async function openDirectChild(parent, name, { kind, disposition }) {
+      const parentInternal = requireReceipt(parent, { directory: true });
+      const exactName = validateChildName(name);
+      await assertStable(parentInternal, "directory");
+      const childPath = ensureDirectChild(parentInternal.path, exactName);
+      const handle = await nativeApi.openPath(childPath, {
+        access: kind === "file"
+          ? ["read", "write", "attributes", "delete"]
+          : ["read", "attributes", "delete"],
+        share: ["read", "write", "delete"],
+        disposition,
+        directory: kind === "directory",
+      });
+      pin.owner.handles.add(handle);
+      try {
+        const info = validateInfo(await nativeApi.queryHandle(handle), kind);
+        if (info.nlink !== 1) throw capabilityError("windows_hard_link_rejected");
+        if (kind === "file") await nativeApi.assertNoAlternateDataStreams(handle);
+        const finalPath = validateAbsolute(await nativeApi.finalPath(handle));
+        if (!samePath(finalPath, childPath)) throw capabilityError("windows_final_path_mismatch");
+        await assertStable(parentInternal, "directory");
+        return issue({ path: finalPath, info, handle, kind, parent });
+      } catch (error) {
+        await closeOne(nativeApi, pin.owner, handle).catch((closeError) => {
+          throw new AggregateError([error, closeError], error.message, { cause: error });
+        });
+        throw error;
+      }
+    }
+
+    async function createOrOpenDirectoryChildNoFollow(parent, name, options = {}) {
+      const hasRequireEmpty = options !== null && typeof options === "object"
+        && Object.hasOwn(options, "requireEmpty");
+      if (!hasExactKeys(options, hasRequireEmpty ? ["requireEmpty"] : [])
+        || (hasRequireEmpty && typeof options.requireEmpty !== "boolean")) {
+        throw capabilityError("workspace_directory_options_invalid");
+      }
+      const requireEmpty = options.requireEmpty ?? false;
+      const parentInternal = requireReceipt(parent, { directory: true });
+      const exactName = validateChildName(name);
+      await assertStable(parentInternal, "directory");
+      const childPath = ensureDirectChild(parentInternal.path, exactName);
+      try {
+        await nativeApi.createDirectory(childPath);
+      } catch (error) {
+        if (!isOccupied(error)) throw error;
+      }
+      const receipt = await openDirectChild(parent, exactName, {
+        kind: "directory",
+        disposition: "openExisting",
+      });
+      if (requireEmpty) {
+        const internal = requireReceipt(receipt, { directory: true });
+        let empty;
+        try {
+          empty = await listAtMostOne(internal);
+        } catch (error) {
+          internal.state = "consumed";
+          await closeOne(nativeApi, pin.owner, internal.handle).catch((closeError) => {
+            throw new AggregateError([error, closeError], error.message, { cause: error });
+          });
+          throw error;
+        }
+        if (!empty) {
+          internal.state = "consumed";
+          await closeOne(nativeApi, pin.owner, internal.handle);
+          throw capabilityError("workspace_directory_not_empty");
+        }
+      }
+      return receipt;
+    }
+
+    async function createFileChildNoFollow(parent, name) {
+      return openDirectChild(parent, name, { kind: "file", disposition: "createNew" });
+    }
+
+    async function openFileChildNoFollow(parent, name) {
+      try {
+        return await openDirectChild(parent, name, { kind: "file", disposition: "openExisting" });
+      } catch (error) {
+        if (isMissing(error)) return null;
+        throw error;
+      }
+    }
+
+    async function inspectIssuedChildNoFollow(receipt) {
+      const internal = requireReceipt(receipt);
+      const info = await assertStable(internal);
+      const empty = internal.kind === "directory" ? await listAtMostOne(internal) : info.size === 0;
+      return Object.freeze({ path: internal.path, kind: internal.kind, size: info.size, empty });
+    }
+
+    async function renameIssuedChildNoReplace(receipt, destinationName) {
+      const internal = requireReceipt(receipt, { claim: true });
+      if (internal.kind !== "file" || !internal.parent) {
+        internal.state = "issued";
+        throw capabilityError("workspace_file_receipt_required");
+      }
+      let destination;
+      try {
+        const parentInternal = requireReceipt(internal.parent, { directory: true });
+        const name = validateChildName(destinationName);
+        destination = ensureDirectChild(parentInternal.path, name);
+        await assertStable(parentInternal, "directory");
+        await assertStable(internal, "file");
+        await nativeApi.renameByHandle(internal.handle, parentInternal.handle, name, { replace: false });
+        internal.path = destination;
+        await assertStable(internal, "file");
+        const current = validateInfo(await nativeApi.queryHandle(internal.handle), "file");
+        internal.state = "consumed";
+        return issue({
+          path: destination,
+          info: current,
+          handle: internal.handle,
+          kind: "file",
+          parent: internal.parent,
+        });
+      } catch (error) {
+        if (isOccupied(error)) internal.state = "issued";
+        else internal.state = "consumed";
+        throw error;
+      }
+    }
+
+    async function deleteIssuedChildNoFollow(receipt) {
+      const internal = requireReceipt(receipt, { claim: true });
+      if (!internal.parent) {
+        internal.state = "issued";
+        throw capabilityError("workspace_root_mutation_rejected");
+      }
+      let primaryError = null;
+      try {
+        await assertStable(internal);
+        if (internal.kind === "directory" && !(await listAtMostOne(internal))) {
+          internal.state = "issued";
+          throw capabilityError("workspace_directory_not_empty");
+        }
+        await nativeApi.deleteByHandle(internal.handle, { directory: internal.kind === "directory" });
+        internal.state = "consumed";
+      } catch (error) {
+        if (internal.state === "busy") internal.state = "consumed";
+        primaryError = error;
+      }
+      if (internal.state === "consumed") {
+        try {
+          await closeOne(nativeApi, pin.owner, internal.handle);
+        } catch (closeError) {
+          if (primaryError) throw new AggregateError([primaryError, closeError], primaryError.message, { cause: primaryError });
+          throw closeError;
+        }
+      }
+      if (primaryError) throw primaryError;
+      return true;
+    }
+
+    return Object.freeze({
+      root,
+      createOrOpenDirectoryChildNoFollow,
+      createFileChildNoFollow,
+      openFileChildNoFollow,
+      inspectIssuedChildNoFollow,
+      renameIssuedChildNoReplace,
+      deleteIssuedChildNoFollow,
+      async close() { await closeOwner(nativeApi, pin.owner); },
+    });
   }
 
   async function openStableDirectoryNoFollow(rootPath, { versionSlots = false } = {}) {
@@ -1531,6 +1778,7 @@ export function createWindowsFileCapabilities({
     acquireOperationLeaseNoFollow,
     openStateDirectoryNoFollow,
     openJournalDirectoryNoFollow,
+    openInstallerWorkspaceRootNoFollow,
     openDirectoryNoFollow,
     openVersionRootNoFollow,
     pinArchiveFileNoFollow,

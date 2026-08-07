@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { deleteAuthorizedTree } from "../desktop/software-manager/safe-delete.mjs";
+import { authorizeInstallRoot } from "../desktop/software-manager/path-policy.mjs";
 import { createWin32FileApi } from "../desktop/software-manager/win32-file-api.mjs";
 import { createWindowsFileCapabilities } from "../desktop/software-manager/windows-file-capabilities.mjs";
 
@@ -215,6 +216,25 @@ function capabilities(fake, randomUUID = () => "00000000-0000-4000-8000-00000000
     nativeApi: fake.nativeApi,
     fsApi: fake.fsApi,
     randomUUID,
+  });
+}
+
+async function installRootAuthority(candidate) {
+  return authorizeInstallRoot({
+    candidate,
+    env: {
+      SystemRoot: "C:\\Windows",
+      ProgramFiles: "C:\\Program Files",
+      "ProgramFiles(x86)": "C:\\Program Files (x86)",
+      USERPROFILE: "C:\\Users\\me",
+    },
+    maxRelativePath: 180,
+    access: async () => {},
+    realpath: async (value) => value,
+    lstat: async () => ({
+      dev: 1, ino: candidate.toLowerCase() === "d:\\cbapps" ? 1 : 2,
+      isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false,
+    }),
   });
 }
 
@@ -764,6 +784,126 @@ test("archive destination creates pinned parents and a writable exclusive file w
   ]);
   await destination.close();
   assert.equal(fake.handles.size, 0);
+});
+
+test("installer workspace capability issues exact direct children and mutates only held identities", async () => {
+  const fake = createFakeNative([{ path: "D:\\CBApps" }]);
+  const api = capabilities(fake);
+  const workspace = await api.openInstallerWorkspaceRootNoFollow(
+    await installRootAuthority("D:\\CBApps"), { maxRelativePath: 80 },
+  );
+  const [downloads, concurrentDownloads] = await Promise.all([
+    workspace.createOrOpenDirectoryChildNoFollow(workspace.root, "downloads", { requireEmpty: false }),
+    workspace.createOrOpenDirectoryChildNoFollow(workspace.root, "downloads", { requireEmpty: false }),
+  ]);
+  assert.deepEqual(
+    await workspace.inspectIssuedChildNoFollow(concurrentDownloads),
+    await workspace.inspectIssuedChildNoFollow(downloads),
+  );
+  const part = await workspace.createFileChildNoFollow(downloads, "chatgpt-1.0.0.zip.part");
+  assert.deepEqual(await workspace.inspectIssuedChildNoFollow(part), {
+    path: "D:\\CBApps\\downloads\\chatgpt-1.0.0.zip.part",
+    kind: "file",
+    size: 0,
+    empty: true,
+  });
+  const promoted = await workspace.renameIssuedChildNoReplace(part, "chatgpt-1.0.0.zip");
+  await assert.rejects(workspace.inspectIssuedChildNoFollow(part), /receipt_(?:invalid|consumed)/u);
+  await assert.rejects(workspace.deleteIssuedChildNoFollow(workspace.root), /root_mutation_rejected/u);
+  await workspace.deleteIssuedChildNoFollow(promoted);
+  assert.equal(fake.get("D:\\CBApps\\downloads\\chatgpt-1.0.0.zip"), undefined);
+  await assert.rejects(workspace.deleteIssuedChildNoFollow(promoted), /receipt_(?:invalid|consumed)/u);
+  await workspace.close();
+  assert.equal(fake.handles.size, 0);
+  await assert.rejects(workspace.inspectIssuedChildNoFollow(downloads), /capability_closed/u);
+});
+
+test("installer workspace child reuse rejects nonempty, reparse, hardlink, ADS, and identity drift", async (t) => {
+  const base = [
+    { path: "D:\\CBApps" },
+    { path: "D:\\CBApps\\staging" },
+    { path: "D:\\CBApps\\staging\\busy", kind: "file", data: "x" },
+  ];
+  const fake = createFakeNative(base);
+  const rootAuthority = await installRootAuthority("D:\\CBApps");
+  const workspace = await capabilities(fake).openInstallerWorkspaceRootNoFollow(
+    rootAuthority, { maxRelativePath: 80 },
+  );
+  await assert.rejects(
+    workspace.createOrOpenDirectoryChildNoFollow(workspace.root, "extra", { requireEmpty: true, extra: true }),
+    /workspace_directory_options_invalid/u,
+  );
+  await assert.rejects(
+    workspace.createOrOpenDirectoryChildNoFollow(workspace.root, "staging", { requireEmpty: true }),
+    /workspace_directory_not_empty/u,
+  );
+  await workspace.close();
+
+  for (const [label, options, expected] of [
+    ["reparse", { reparse: true }, /reparse/u],
+    ["hardlink", { nlink: 2 }, /hard_link/u],
+    ["ADS", { streams: ["::$DATA", ":evil:$DATA"] }, /alternate_data_stream/u],
+  ]) {
+    await t.test(label, async () => {
+      const hostile = createFakeNative([
+        { path: "D:\\CBApps" },
+        { path: "D:\\CBApps\\downloads" },
+        { path: "D:\\CBApps\\downloads\\package.zip.part", kind: "file", ...options },
+      ]);
+      const scoped = await capabilities(hostile).openInstallerWorkspaceRootNoFollow(
+        rootAuthority, { maxRelativePath: 80 },
+      );
+      const downloads = await scoped.createOrOpenDirectoryChildNoFollow(scoped.root, "downloads", { requireEmpty: false });
+      await assert.rejects(scoped.openFileChildNoFollow(downloads, "package.zip.part"), expected);
+      await scoped.close();
+      assert.equal(hostile.handles.size, 0);
+    });
+  }
+
+  const changed = createFakeNative([
+    { path: "D:\\CBApps" },
+    { path: "D:\\CBApps\\downloads" },
+    { path: "D:\\CBApps\\downloads\\package.zip.part", kind: "file" },
+  ]);
+  const scoped = await capabilities(changed).openInstallerWorkspaceRootNoFollow(
+    rootAuthority, { maxRelativePath: 80 },
+  );
+  const downloads = await scoped.createOrOpenDirectoryChildNoFollow(scoped.root, "downloads", { requireEmpty: false });
+  const part = await scoped.openFileChildNoFollow(downloads, "package.zip.part");
+  changed.get("D:\\CBApps\\downloads\\package.zip.part").identity = { volumeSerial: "vol-1", fileId: "changed" };
+  await assert.rejects(scoped.deleteIssuedChildNoFollow(part), /identity_changed/u);
+  assert.notEqual(changed.get("D:\\CBApps\\downloads\\package.zip.part"), undefined);
+  await scoped.close();
+});
+
+test("installer workspace rejects foreign receipts, collisions, and concurrent double consumption", async () => {
+  const fake = createFakeNative([
+    { path: "D:\\CBApps" },
+    { path: "D:\\Other" },
+    { path: "D:\\CBApps\\downloads" },
+    { path: "D:\\CBApps\\downloads\\occupied.zip", kind: "file", data: "keep" },
+  ]);
+  const api = capabilities(fake);
+  const owned = await api.openInstallerWorkspaceRootNoFollow(
+    await installRootAuthority("D:\\CBApps"), { maxRelativePath: 80 },
+  );
+  const other = await api.openInstallerWorkspaceRootNoFollow(
+    await installRootAuthority("D:\\Other"), { maxRelativePath: 80 },
+  );
+  const downloads = await owned.createOrOpenDirectoryChildNoFollow(owned.root, "downloads", { requireEmpty: false });
+  const part = await owned.createFileChildNoFollow(downloads, "package.zip.part");
+  await assert.rejects(other.inspectIssuedChildNoFollow(part), /workspace_receipt_invalid/u);
+  await assert.rejects(owned.renameIssuedChildNoReplace(part, "occupied.zip"), /entry_exists/u);
+  assert.equal(fake.get("D:\\CBApps\\downloads\\occupied.zip").data.toString(), "keep");
+  const results = await Promise.allSettled([
+    owned.deleteIssuedChildNoFollow(part),
+    owned.deleteIssuedChildNoFollow(part),
+  ]);
+  assert.deepEqual(results.map((result) => result.status).sort(), ["fulfilled", "rejected"]);
+  assert.equal(fake.calls.filter((call) => call[0] === "delete-handle"
+    && call[1].endsWith("package.zip.part")).length, 1);
+  await owned.close();
+  await other.close();
 });
 
 test("shortcut temp revalidates identity and commits by handle without replacing candidates", async () => {
