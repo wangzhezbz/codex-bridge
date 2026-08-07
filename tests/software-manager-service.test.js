@@ -896,6 +896,51 @@ test("fresh ownership recheck catches claims created during refresh, root choice
   }
 });
 
+test("install-root choice stays transactional when a durable claim appears during candidate inspection", async () => {
+  const oldToken = "root_token_old_0001";
+  const candidateToken = "root_token_new_0002";
+  const state = { activeTask: null, components: {}, skills: {}, rollback: null };
+  const prepareTokens = [];
+  const events = [];
+  const adaptersFor = (token) => ({
+    chatgpt: adapterFixture("chatgpt", {
+      inspect: async () => {
+        if (token === candidateToken) {
+          state.activeTask = { kind: "component-prepare", taskId: "claim-during-inspect", componentId: "chatgpt", version: "2.0.0" };
+        }
+        const version = token === candidateToken ? "9.0.0" : "1.0.0";
+        return operationResult("chatgpt", "inspect", "succeeded", { versionBefore: version, versionAfter: version });
+      },
+      prepare: async () => { prepareTokens.push(token); return operationResult("chatgpt", "prepare"); },
+    }),
+    v2rayn: adapterFixture("v2rayn"),
+    git: adapterFixture("git"),
+    skills: skillsAdapterFixture(),
+  });
+  const { service } = fixtureService({
+    state,
+    adapterFactory: async ({ installRootCapability }) => adaptersFor(installRootCapability.token),
+    installRootResolver: {
+      choose: async () => ({ token: candidateToken }),
+      resolve: async (token) => ({ token }),
+      getCurrentToken: () => oldToken,
+    },
+    recoverTransactions: async () => {},
+  });
+  assert.equal((await service.getSnapshot()).components.find(({ id }) => id === "chatgpt").installedVersion, "1.0.0");
+  service.subscribe((event) => { if (event.type === "snapshot") events.push(event); });
+  await assert.rejects(service.chooseInstallRoot("C:\\Candidate"), /software_manager_pending_recovery/);
+  assert.equal(events.length, 0);
+  const pending = await service.getSnapshot();
+  assert.equal(pending.pendingRecovery, true);
+  assert.equal(pending.components.find(({ id }) => id === "chatgpt").installedVersion, "1.0.0");
+
+  state.activeTask = null;
+  await service.recoverPending();
+  await service.startTask({ kind: "install", componentIds: ["chatgpt"], skillIds: [] });
+  assert.deepEqual(prepareTokens, [oldToken]);
+});
+
 test("recovery cannot re-enter while a service task owns the unified entry gate", async () => {
   const entered = deferred();
   const release = deferred();
@@ -1249,6 +1294,9 @@ test("redaction preserves normal text while bounding deep hostile structures wit
             "ssr://opaque-secret",
             "ws://private.example/socket",
             "wss://private.example/socket",
+            "socks5://private.example:1080",
+            "x://single-letter-secret",
+            "ordinary x:text label",
           ].join(" "),
           hostile,
           api_key: "'QUOTED'",
@@ -1284,7 +1332,10 @@ test("redaction preserves normal text while bounding deep hostile structures wit
     "ssr://",
     "ws://",
     "wss://",
+    "socks5://",
+    "x://",
   ]) assert.equal(text.includes(secret), false);
+  assert.equal(text.includes("ordinary x:text label"), true);
   assert.equal(text.length < 200_000, true);
   assert.equal(Object.getPrototypeOf(events[0]), null);
   assert.equal(Object.isFrozen(events[0]), true);
@@ -1376,6 +1427,48 @@ test("a listener-triggered operation does not feed back to its causal listeners 
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(firstCount, 1);
   assert.equal(secondCount, 2);
+});
+
+test("same-key listener coalescing uses only the latest event causes", async () => {
+  const bBlocked = deferred();
+  const releaseB = deferred();
+  const aNestedDone = deferred();
+  const bFeedbackDone = deferred();
+  const { service } = fixtureService();
+  let aCount = 0;
+  let bCount = 0;
+  service.subscribe(async (event) => {
+    if (event.type !== "snapshot") return;
+    aCount += 1;
+    if (aCount === 1) {
+      await bBlocked.promise;
+      await service.refresh();
+      aNestedDone.resolve();
+    }
+  });
+  service.subscribe(async (event) => {
+    if (event.type !== "snapshot") return;
+    bCount += 1;
+    if (bCount === 1) {
+      bBlocked.resolve();
+      await releaseB.promise;
+    } else if (bCount === 2) {
+      await service.refresh();
+      bFeedbackDone.resolve();
+    }
+  });
+
+  await service.refresh();
+  await aNestedDone.promise;
+  await service.refresh();
+  releaseB.resolve();
+  await Promise.race([
+    bFeedbackDone.promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("listener cause replacement timeout")), 500)),
+  ]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(bCount, 2);
+  assert.equal(aCount, 3);
 });
 
 test("causal ancestry stops two listeners from recursively refreshing each other", async () => {

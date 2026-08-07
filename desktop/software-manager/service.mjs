@@ -64,7 +64,7 @@ function decodePercent(value) {
 
 function redactString(value) {
   let text = decodePercent(String(value));
-  text = text.replace(/\b[a-z][a-z0-9+.-]{1,31}:\/\/[^\s,;"']+/giu, "[REDACTED_URL]");
+  text = text.replace(/\b[a-z][a-z0-9+.-]{0,31}:\/\/[^\s,;"']+/giu, "[REDACTED_URL]");
   text = text.replace(/\b(?:Bearer|Basic)\s+[^\s,;"']+/giu, (match) => `${match.split(/\s/u, 1)[0]} [REDACTED]`);
   text = text.replace(/\b(?:sk-(?:proj|svcacct|ant)-|xai-|pplx-|gsk_|hf_|ghp_|github_pat_)[A-Za-z0-9_-]{12,}\b/giu, "[REDACTED]");
   text = text.replace(/\bAIza[A-Za-z0-9_-]{20,}\b/gu, "[REDACTED]");
@@ -511,7 +511,7 @@ export function createSoftwareManagerService({
       const existing = record.queue.find((item) => item.key === key);
       if (existing) {
         existing.event = event;
-        existing.causes = new Set([...existing.causes, ...causes]);
+        existing.causes = new Set(causes);
         return;
       }
     }
@@ -968,7 +968,7 @@ export function createSoftwareManagerService({
     });
   }
 
-  async function buildSnapshot({ inspect = true } = {}) {
+  async function buildSnapshot({ inspect = true, inspectionOverride = null } = {}) {
     if (platform !== "win32") {
       return snapshotValue({
         platform,
@@ -993,14 +993,15 @@ export function createSoftwareManagerService({
     }
     const service = externalTask || recoveryFailure ? catalogService : await currentCatalog();
     const entries = catalogEntries(service);
+    let inspected = inspectionOverride ?? lastInspection ?? { components: [], skills: [] };
     if (service && !catalogFailure && inspect && !currentTask && !externalTask && (fixedAdapters || selectedInstallRootToken)) {
       try {
         const ownership = await loadOwnership();
-        lastInspection = await inspectAll(await resolveAdapters(service), entries, Object.keys(ownership?.skills ?? {}));
+        inspected = await inspectAll(await resolveAdapters(service), entries, Object.keys(ownership?.skills ?? {}));
+        lastInspection = inspected;
       }
       catch (error) { recoveryFailure = serviceError("software_manager_snapshot_failed", error); }
     }
-    const inspected = lastInspection ?? { components: [], skills: [] };
     const inspectById = new Map(inspected.components.map((entry) => [entry.componentId, entry]));
     const components = entries.components.map((entry) => {
       const installed = inspectById.get(entry.id);
@@ -1094,9 +1095,27 @@ export function createSoftwareManagerService({
       const token = typeof chosen === "string" ? chosen : chosen?.token;
       if (typeof token !== "string" || !OPAQUE_TOKEN.test(token)) throw serviceError("software_manager_install_root_invalid");
       await ensureRecoveryInGate();
-      selectedInstallRootToken = token;
-      const snapshot = await buildSnapshot();
+      const service = await currentCatalog();
+      const entries = catalogEntries(service);
+      if (!service || catalogFailure) throw serviceError("software_manager_catalog_unavailable", catalogFailure ?? undefined);
+      let candidateInspection;
+      try {
+        const ownership = await loadOwnership();
+        candidateInspection = await inspectAll(
+          await resolveAdapters(service, token),
+          entries,
+          Object.keys(ownership?.skills ?? {}),
+        );
+      } catch (error) {
+        throw serviceError("software_manager_snapshot_failed", error);
+      }
+      if ([...candidateInspection.components, ...candidateInspection.skills].some(({ status }) => status === "failed")) {
+        throw serviceError("software_manager_snapshot_failed");
+      }
+      const snapshot = await buildSnapshot({ inspect: false, inspectionOverride: candidateInspection });
       await ensureRecoveryInGate();
+      selectedInstallRootToken = token;
+      lastInspection = candidateInspection;
       emit({ type: "snapshot", snapshot });
       return Object.freeze({ installRootToken: token });
     });
