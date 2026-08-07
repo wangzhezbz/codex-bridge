@@ -84,6 +84,22 @@ function requireDirectoryPath(value, code) {
   return normalized;
 }
 
+function requireSystemDirectory(value) {
+  if (typeof value !== "string" || value.length >= 32_768 || value.includes("/")
+    || value.endsWith("\\") || path.win32.normalize(value) !== value) {
+    throw hostError("system_directory_path_invalid");
+  }
+  try {
+    return requireDirectoryPath(value, "system_directory_path_invalid");
+  } catch (error) {
+    if (error?.code === "system_directory_path_invalid"
+      || error?.code === "system_directory_path_invalid_root_rejected") {
+      throw hostError("system_directory_path_invalid", error);
+    }
+    throw error;
+  }
+}
+
 function pathKey(value) {
   return path.win32.normalize(value).toLowerCase();
 }
@@ -454,11 +470,13 @@ export function createWindowsHost({
   shortcutFileApi,
   spawnDetached,
   suspendedProcess,
+  getSystemDirectory,
   env = {},
 } = {}) {
   if (platform !== "win32") throw hostError("windows_platform_required");
   if (typeof execFile !== "function") throw hostError("exec_file_adapter_required");
   if (!isPlainRecord(env)) throw hostError("environment_record_required");
+  if (typeof getSystemDirectory !== "function") throw hostError("system_directory_provider_required");
   if (registryReader !== undefined && typeof registryReader !== "function") {
     throw hostError("registry_reader_invalid");
   }
@@ -466,9 +484,19 @@ export function createWindowsHost({
     throw hostError("process_lister_invalid");
   }
 
+  let systemDirectory;
+  try {
+    systemDirectory = requireSystemDirectory(getSystemDirectory());
+  } catch (error) {
+    if (error?.code === "system_directory_path_invalid") throw error;
+    throw hostError("system_directory_query_failed", error);
+  }
+  const powershellPath = path.win32.join(
+    systemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe",
+  );
   const readRegistry = registryReader ?? (async ({ key }) => readRegistryWithReg(execFile, env, key));
   const listProcesses = processLister ?? (async () => {
-    const result = await runCommand(execFile, env, "powershell.exe", [...POWERSHELL_ARGS, PROCESS_LIST_COMMAND], {
+    const result = await runCommand(execFile, {}, powershellPath, [...POWERSHELL_ARGS, PROCESS_LIST_COMMAND], {
       errorCode: "process_list_failed",
     });
     return parseProcessList(result.stdout);
@@ -515,11 +543,11 @@ export function createWindowsHost({
       const packagePath = requireExecutablePath(filePath);
       const result = await runCommand(
         execFile,
-        env,
-        "powershell.exe",
+        {},
+        powershellPath,
         [...POWERSHELL_ARGS, AUTHENTICODE_COMMAND],
         {
-          options: { env: childEnvironment(env, { CB_SM_PACKAGE_PATH: packagePath }) },
+          options: { env: { CB_SM_PACKAGE_PATH: packagePath } },
           errorCode: "authenticode_query_failed",
         },
       );
@@ -528,22 +556,13 @@ export function createWindowsHost({
 
     async readFileVersion(filePath) {
       const exactPath = requireExecutablePath(filePath);
-      const systemRoot = requireDriveAbsolute(env.SystemRoot, "file_version_host_path_invalid");
-      const powershellPath = path.win32.join(
-        systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
-      );
-      const metadataEnv = {
-        SystemRoot: systemRoot,
-        WINDIR: systemRoot,
-        CB_SM_FILE_PATH: exactPath,
-      };
       const result = await runCommand(
         execFile,
         {},
         powershellPath,
         [...POWERSHELL_ARGS, FILE_VERSION_COMMAND],
         {
-          options: { env: metadataEnv, timeout: 15_000 },
+          options: { env: { CB_SM_FILE_PATH: exactPath }, timeout: 15_000 },
           errorCode: "file_version_query_failed",
         },
       );

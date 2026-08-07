@@ -333,6 +333,26 @@ test("Git verification accepts and strictly compares an external Windows Git ver
   );
 });
 
+test("Git verification requires a positive Windows revision and rejects trailing output", async () => {
+  const gitPath = "D:\\CBApps\\Git\\cmd\\git.exe";
+  for (const stdout of [
+    "git version 2.50.0\n",
+    "git version 2.50.0.windows.0\n",
+    "git version 2.50.0.windows.1 extra\n",
+    "git version 2.50.0.windows.1\nextra\n",
+  ]) {
+    const files = fakeFiles({ [gitPath]: {} });
+    const fixture = componentFixture({ files, async execFile() {
+      return { stdout, stderr: "", exitCode: 0 };
+    } });
+    await assert.rejects(
+      fixture.service.verifyGitVersion(gitPath, "2.50.0"),
+      /git_version_mismatch/u,
+      stdout,
+    );
+  }
+});
+
 test("component deletion plans never include install root, V2RayN-Data, or unrelated children", async () => {
   const files = fakeFiles({
     "D:\\CBApps\\c": { kind: "directory" },

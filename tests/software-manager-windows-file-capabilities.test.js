@@ -1504,10 +1504,84 @@ test("thin Win32 layer binds fixed Kernel32 and Ntdll APIs with a relative held-
   assert.equal(bindings.every((definition) => definition[0] === "__stdcall"), true);
   assert.deepEqual(bindings.map((definition) => definition[1]), [
     "CreateFileW", "CloseHandle", "GetLastError", "GetFileInformationByHandle",
-    "GetFileInformationByHandleEx", "GetFinalPathNameByHandleW", "ReadFile", "WriteFile",
+    "GetFileInformationByHandleEx", "GetFinalPathNameByHandleW", "GetSystemDirectoryW", "ReadFile", "WriteFile",
     "FlushFileBuffers", "CreateDirectoryW", "SetFileInformationByHandle",
     "NtSetInformationFile", "RtlNtStatusToDosError",
   ]);
+});
+
+test("thin Win32 layer gets a strict system directory through GetSystemDirectoryW", () => {
+  const bindings = [];
+  const koffi = {
+    load() {
+      return {
+        func(...definition) {
+          const name = definition.length === 4 ? definition[1] : definition[0];
+          bindings.push(name);
+          if (name === "GetSystemDirectoryW") {
+            return (output, capacity) => {
+              const value = Buffer.from("C:\\Windows\\System32", "utf16le");
+              assert.equal(capacity > value.length / 2, true);
+              value.copy(output);
+              return value.length / 2;
+            };
+          }
+          return () => 1;
+        },
+      };
+    },
+    sizeof(type) { return type === "intptr_t" ? 8 : 4; },
+  };
+  const api = createWin32FileApi({ platform: "win32", koffi });
+  assert.equal(api.getSystemDirectory(), "C:\\Windows\\System32");
+  assert.equal(bindings.includes("GetSystemDirectoryW"), true);
+});
+
+test("GetSystemDirectoryW rejects native failure, buffer overflow, and noncanonical output", () => {
+  function apiWithSystemDirectory(stub, lastError = 5) {
+    return createWin32FileApi({
+      platform: "win32",
+      koffi: {
+        load() {
+          return {
+            func(...definition) {
+              const name = definition.length === 4 ? definition[1] : definition[0];
+              if (name === "GetSystemDirectoryW") return stub;
+              if (name === "GetLastError") return () => lastError;
+              return () => 1;
+            },
+          };
+        },
+        sizeof(type) { return type === "intptr_t" ? 8 : 4; },
+      },
+    });
+  }
+  assert.throws(
+    () => apiWithSystemDirectory(() => 0).getSystemDirectory(),
+    (error) => error?.code === "access_denied" && error?.operation === "GetSystemDirectoryW",
+  );
+  assert.throws(
+    () => apiWithSystemDirectory((_output, capacity) => capacity).getSystemDirectory(),
+    /native_path_buffer_exceeded/u,
+  );
+  assert.throws(
+    () => apiWithSystemDirectory((output) => {
+      const value = Buffer.from("Windows\\System32", "utf16le");
+      value.copy(output);
+      return value.length / 2;
+    }).getSystemDirectory(),
+    /windows_system_directory_invalid/u,
+  );
+});
+
+test("real Win32 system-directory query is isolated from process environment", {
+  skip: process.platform !== "win32",
+}, () => {
+  const before = { SystemRoot: process.env.SystemRoot, PATH: process.env.PATH };
+  const value = createWin32FileApi({ platform: "win32" }).getSystemDirectory();
+  assert.match(value, /^[A-Za-z]:\\[^/]+/u);
+  assert.equal(value.endsWith("\\"), false);
+  assert.deepEqual({ SystemRoot: process.env.SystemRoot, PATH: process.env.PATH }, before);
 });
 
 test("thin Win32 layer exposes a bounded single-chunk read primitive", () => {

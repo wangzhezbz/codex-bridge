@@ -464,6 +464,7 @@ function realShortcutHostFixture() {
   };
   const host = createWindowsHost({
     platform: "win32",
+    getSystemDirectory: () => "C:\\Windows\\System32",
     env: {},
     electronShell,
     shortcutFileApi,

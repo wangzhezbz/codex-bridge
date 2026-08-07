@@ -12,6 +12,7 @@ const REGISTRY_FIELDS = ["DisplayName", "DisplayVersion", "InstallLocation", "Un
 const AUTHENTICODE_COMMAND = "$s=Get-AuthenticodeSignature -LiteralPath $env:CB_SM_PACKAGE_PATH; @{Status=[string]$s.Status; Thumbprint=$s.SignerCertificate.Thumbprint; Subject=$s.SignerCertificate.Subject}|ConvertTo-Json -Compress";
 const FILE_VERSION_COMMAND = "$v=[System.Diagnostics.FileVersionInfo]::GetVersionInfo($env:CB_SM_FILE_PATH); @{FileVersion=[string]$v.FileVersion; ProductVersion=[string]$v.ProductVersion}|ConvertTo-Json -Compress";
 const SHORTCUT_CREATION_ID = "a".repeat(32);
+const systemDirectoryProvider = () => "C:\\Windows\\System32";
 
 function ownedShortcut(path, desktopPath, targetPath, name = "ChatGPT") {
   return { name, path, desktopPath, targetPath, creationId: SHORTCUT_CREATION_ID };
@@ -28,6 +29,24 @@ test("rejects construction outside Windows before any host adapter can run", () 
     /windows_platform_required/,
   );
   assert.equal(called, false);
+});
+
+test("requires one valid OS-backed system-directory provider on Windows", () => {
+  const base = { platform: "win32", execFile: async () => {} };
+  assert.throws(() => createWindowsHost(base), /system_directory_provider_required/u);
+  for (const getSystemDirectory of [
+    () => "Windows\\System32",
+    () => "\\\\server\\Windows\\System32",
+    () => "C:\\Windows\\System32\\",
+    () => "C:\\Windows\\..\\System32",
+    () => "C:/Windows/System32",
+    () => null,
+  ]) {
+    assert.throws(
+      () => createWindowsHost({ ...base, getSystemDirectory }),
+      /system_directory_path_invalid/u,
+    );
+  }
 });
 
 test("discovers one registered Git only when the registry and PATH executable uniquely correspond", async () => {
@@ -99,6 +118,7 @@ test("treats normal reg.exe and where.exe not-found rejections as an empty disco
   const calls = [];
   const host = createWindowsHost({
     platform: "win32",
+    getSystemDirectory: systemDirectoryProvider,
     env: {},
     electronShell: {},
     async execFile(file, args, options) {
@@ -154,13 +174,13 @@ test("Authenticode uses one fixed PowerShell command and a child-only package en
   assert.deepEqual(result, { status: "Valid", thumbprint: "ABC123", subject: "CN=Git for Windows" });
   assert.deepEqual(parentEnv, { PATH: "C:\\Windows", KEEP: "parent" });
   const call = fixture.calls.execFile[0];
-  assertCommand(call, "powershell.exe", [
+  assertCommand(call, "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", [
     "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
     "-Command", AUTHENTICODE_COMMAND,
   ]);
   assert.equal(call.args.includes(packagePath), false);
   assert.notEqual(call.options.env, parentEnv);
-  assert.deepEqual(call.options.env, { ...parentEnv, CB_SM_PACKAGE_PATH: packagePath });
+  assert.deepEqual(call.options.env, { CB_SM_PACKAGE_PATH: packagePath });
 });
 
 test("Authenticode rejects malformed output instead of treating it as unsigned metadata", async () => {
@@ -188,6 +208,54 @@ test("file version metadata uses one fixed local command and a child-only exact 
   assert.equal(call.options.timeout, 15_000);
 });
 
+test("PowerShell executable ignores hostile SystemRoot and PATH environment values", async () => {
+  const fixture = fakeHost({
+    env: { SystemRoot: "D:\\attacker", WINDIR: "E:\\attacker", PATH: "F:\\attacker" },
+    systemDirectory: "C:\\Windows\\System32",
+  });
+  await fixture.host.verifyAuthenticode("D:\\staging\\Git.exe");
+  await fixture.host.readFileVersion("D:\\CBApps\\ct\\ChatGPT.exe");
+  assert.deepEqual(
+    fixture.calls.execFile.map(({ file }) => file),
+    [
+      "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    ],
+  );
+  assert.deepEqual(fixture.calls.execFile[1].options.env, {
+    CB_SM_FILE_PATH: "D:\\CBApps\\ct\\ChatGPT.exe",
+  });
+});
+
+test("system-directory identity is captured once at construction and cannot drift", async () => {
+  let providerCalls = 0;
+  const execCalls = [];
+  const host = createWindowsHost({
+    platform: "win32",
+    getSystemDirectory() {
+      providerCalls += 1;
+      return providerCalls === 1 ? "C:\\Windows\\System32" : "D:\\replaced\\System32";
+    },
+    env: {},
+    electronShell: {},
+    async execFile(file, args) {
+      execCalls.push({ file, args });
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({ FileVersion: "2.0.0.0", ProductVersion: "2.0.0" }),
+        stderr: "",
+      };
+    },
+  });
+  await host.readFileVersion("D:\\CBApps\\ct\\ChatGPT.exe");
+  await host.readFileVersion("D:\\CBApps\\ct\\ChatGPT.exe");
+  assert.equal(providerCalls, 1);
+  assert.deepEqual(execCalls.map(({ file }) => file), [
+    "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+  ]);
+});
+
 test("stops only processes whose normalized absolute executable path is exactly owned", async () => {
   const fixture = fakeHost({ processes: [
     { pid: 11, name: "ChatGPT.exe", executablePath: "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe" },
@@ -211,6 +279,7 @@ test("revalidates PID executable ownership immediately before stopping and skips
   const calls = { list: 0, execFile: [] };
   const host = createWindowsHost({
     platform: "win32",
+    getSystemDirectory: systemDirectoryProvider,
     env: {},
     electronShell: {},
     async execFile(file, args, options) {
@@ -237,11 +306,12 @@ test("default process discovery keeps owned paths out of its fixed PowerShell co
   const ownedPath = "D:\\Owned $(Get-Process)\\ChatGPT.exe";
   const host = createWindowsHost({
     platform: "win32",
+    getSystemDirectory: systemDirectoryProvider,
     env: {},
     electronShell: {},
     async execFile(file, args, options) {
       calls.push({ file, args, options });
-      if (file === "powershell.exe") {
+      if (file === "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe") {
         return { exitCode: 0, stdout: JSON.stringify({ ProcessId: 31, ExecutablePath: ownedPath }), stderr: "" };
       }
       return { exitCode: 0, stdout: "", stderr: "" };
@@ -249,8 +319,11 @@ test("default process discovery keeps owned paths out of its fixed PowerShell co
   });
 
   assert.deepEqual(await host.stopOwnedProcesses([ownedPath]), { stoppedProcessIds: [31] });
-  const listCalls = calls.filter(({ file }) => file === "powershell.exe");
+  const listCalls = calls.filter(({ file }) => (
+    file === "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+  ));
   assert.equal(listCalls.length, 2);
+  assert.equal(listCalls.every(({ options }) => Object.keys(options.env).length === 0), true);
   assert.equal(listCalls.every(({ args }) => args.join(" ").includes(ownedPath) === false), true);
   assert.equal(listCalls.every(({ args }) => args.at(-1)
     === "@(Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object ProcessId,ExecutablePath) | ConvertTo-Json -Compress"), true);
@@ -312,6 +385,7 @@ test("launchOwned does not claim success before delayed spawn evidence and does 
 test("launchOwned fails closed when the detached-spawn capability is absent", async () => {
   const host = createWindowsHost({
     platform: "win32",
+    getSystemDirectory: systemDirectoryProvider,
     env: {},
     electronShell: {},
     async execFile() { return { exitCode: 0, stdout: "", stderr: "" }; },
@@ -435,6 +509,7 @@ test("shortcut methods fail closed without atomic shortcut filesystem capabiliti
   };
   const host = createWindowsHost({
     platform: "win32",
+    getSystemDirectory: systemDirectoryProvider,
     env: {},
     electronShell,
     spawnDetached: defaultSpawnDetached(),
@@ -684,6 +759,7 @@ test("Git execution uses a suspended child and releases mutable pins before resu
   const exitGate = new Promise((resolve) => { allowExit = resolve; });
   const host = createWindowsHost({
     platform: "win32",
+    getSystemDirectory: systemDirectoryProvider,
     env: {},
     electronShell: {},
     async execFile() { throw new Error("Git must not use execFile"); },
@@ -722,6 +798,7 @@ test("Git execution forwards bounded timeout and cancellation to the suspended c
   let receivedPlan;
   const host = createWindowsHost({
     platform: "win32",
+    getSystemDirectory: systemDirectoryProvider,
     env: {},
     electronShell: {},
     async execFile() { throw new Error("Git must not use execFile"); },
@@ -741,7 +818,9 @@ test("Git execution forwards bounded timeout and cancellation to the suspended c
 });
 
 test("Git execution fails closed when the suspended process capability is unavailable", async () => {
-  const host = createWindowsHost({ platform: "win32", env: {}, electronShell: {}, async execFile() {} });
+  const host = createWindowsHost({
+    platform: "win32", getSystemDirectory: systemDirectoryProvider, env: {}, electronShell: {}, async execFile() {},
+  });
   await assert.rejects(host.runGitInstaller({
     installerPath: "D:\\staging\\Git.exe", targetDir: "D:\\CBApps\\Git", onStarted: async () => {},
   }), /git_suspended_process_capability_required/u);
@@ -801,6 +880,7 @@ function fakeHost({
   shortcutWrittenTarget = null,
   spawnStarted = Promise.resolve(),
   spawnUnrefFailure = null,
+  systemDirectory = "C:\\Windows\\System32",
 } = {}) {
   const calls = {
     execFile: [],
@@ -842,7 +922,7 @@ function fakeHost({
         ? { exitCode: 1, stdout: "", stderr: "not found" }
         : { exitCode: 0, stdout: `${wherePaths.join("\r\n")}\r\n`, stderr: "" };
     }
-    if (file === "powershell.exe" && args.at(-1) === AUTHENTICODE_COMMAND) {
+    if (args.at(-1) === AUTHENTICODE_COMMAND) {
       return {
         exitCode: 0,
         stdout: authenticodeOutput ?? JSON.stringify(authenticode),
@@ -989,6 +1069,7 @@ function fakeHost({
       shortcutFileApi,
       spawnDetached,
       suspendedProcess,
+      getSystemDirectory: () => systemDirectory,
       env,
     }),
     calls,

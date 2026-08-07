@@ -5,8 +5,8 @@ import { isTrustedCatalogService } from "./catalog-trust.mjs";
 import { readInstallRootCapability, revalidateInstallRootCapability } from "./path-policy.mjs";
 
 const VERSION = /^\d+(?:\.\d+){1,3}$/u;
-const GIT_VERSION = /^(\d+(?:\.\d+){1,3})(?:\.windows\.(\d+))?$/u;
-const GIT_VERSION_OUTPUT = /^git version (\d+(?:\.\d+){1,3})(?:\.windows\.(\d+))?\r?\n?$/u;
+const GIT_VERSION = /^(\d+(?:\.\d+){1,3})(?:\.windows\.([1-9]\d*))?$/u;
+const GIT_VERSION_OUTPUT = /^git version (\d+(?:\.\d+){1,3})\.windows\.([1-9]\d*)\r?\n?$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
 const MISSING_CODES = new Set(["ENOENT", "ERROR_FILE_NOT_FOUND", "ERROR_PATH_NOT_FOUND", "windows_path_missing"]);
 const COMPONENT_SLOTS = Object.freeze({

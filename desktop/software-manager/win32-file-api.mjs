@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import path from "node:path";
 
 const GENERIC_READ = 0x80000000;
 const GENERIC_WRITE = 0x40000000;
@@ -63,6 +64,17 @@ function handleValue(handle) {
   throw win32Error("windows_handle_invalid");
 }
 
+function requireCanonicalSystemDirectory(value) {
+  if (typeof value !== "string" || value.length < 4 || value.length >= MAX_NATIVE_PATH_CHARS
+    || value.includes("\0") || value.includes("/") || value.endsWith("\\")
+    || !/^[A-Za-z]:\\/u.test(value) || value.startsWith("\\\\")
+    || value.split("\\").slice(1).some((segment) => segment.length === 0 || segment === "." || segment === "..")
+    || /[<>:"|?*\u0000-\u001f]/u.test(value.slice(2)) || path.win32.normalize(value) !== value) {
+    throw win32Error("windows_system_directory_invalid");
+  }
+  return value;
+}
+
 export function createWin32FileApi({ platform = process.platform, koffi } = {}) {
   if (platform !== "win32") throw win32Error("windows_platform_required");
   const ffi = koffi ?? createRequire(import.meta.url)("koffi");
@@ -83,6 +95,9 @@ export function createWin32FileApi({ platform = process.platform, koffi } = {}) 
   );
   const GetFinalPathNameByHandleW = kernel32.func(
     "__stdcall", "GetFinalPathNameByHandleW", "uint32_t", ["intptr_t", "void *", "uint32_t", "uint32_t"],
+  );
+  const GetSystemDirectoryW = kernel32.func(
+    "__stdcall", "GetSystemDirectoryW", "uint32_t", ["void *", "uint32_t"],
   );
   const ReadFile = kernel32.func("__stdcall", "ReadFile", "int", ["intptr_t", "void *", "uint32_t", "void *", "void *"]);
   const WriteFile = kernel32.func("__stdcall", "WriteFile", "int", ["intptr_t", "void *", "uint32_t", "void *", "void *"]);
@@ -258,6 +273,18 @@ export function createWin32FileApi({ platform = process.platform, koffi } = {}) 
         : value;
   }
 
+  function getSystemDirectory() {
+    const output = Buffer.alloc(MAX_NATIVE_PATH_CHARS * 2);
+    const length = Number(GetSystemDirectoryW(output, MAX_NATIVE_PATH_CHARS));
+    if (length === 0) throw failure("GetSystemDirectoryW");
+    if (!Number.isSafeInteger(length) || length >= MAX_NATIVE_PATH_CHARS) {
+      throw win32Error("native_path_buffer_exceeded", "GetSystemDirectoryW");
+    }
+    return requireCanonicalSystemDirectory(
+      output.subarray(0, length * 2).toString("utf16le"),
+    );
+  }
+
   function readFile(handle, maxBytes) {
     const info = queryHandle(handle);
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || info.size > maxBytes) {
@@ -361,6 +388,7 @@ export function createWin32FileApi({ platform = process.platform, koffi } = {}) 
     assertNoAlternateDataStreams,
     enumerateDirectory,
     finalPath,
+    getSystemDirectory,
     readFile,
     readChunk,
     writeFile: writeChunk,
