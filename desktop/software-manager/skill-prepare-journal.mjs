@@ -128,6 +128,20 @@ function sameRecord(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function isOccupied(error) {
+  return error?.code === "entry_exists" || error?.code === "EEXIST"
+    || error?.nativeCode === 80 || error?.nativeCode === 183;
+}
+
+function isSharingViolation(error) {
+  return error?.code === "sharing_violation" || error?.nativeCode === 32 || error?.nativeCode === 33;
+}
+
+function isMissingOrStale(error) {
+  return error?.code === "entry_missing" || error?.code === "ENOENT"
+    || error?.code === "stale_entry_identity" || error?.nativeCode === 2 || error?.nativeCode === 3;
+}
+
 async function readNamed(directory, name, installRoot) {
   const opened = await directory.openFileNoFollow(name, "r");
   if (opened === null) return null;
@@ -167,9 +181,11 @@ export function createSkillPrepareJournal({ journalDir, fsApi, installRoot } = {
     return { final, temp, record: final?.record ?? temp?.record ?? null };
   }
 
-  async function settleTemp(directory, tempName, destination, expectedRecord) {
-    const temp = await readNamed(directory, tempName, root);
-    const final = await readNamed(directory, destination, root);
+  async function settleTemp(directory, opened, destination, expectedRecord) {
+    const { temp } = opened;
+    const final = opened.final === undefined
+      ? await readNamed(directory, destination, root)
+      : opened.final;
     if (final) {
       if (!sameRecord(final.record, expectedRecord)
         || (temp && !sameRecord(temp.record, expectedRecord))) {
@@ -188,13 +204,7 @@ export function createSkillPrepareJournal({ journalDir, fsApi, installRoot } = {
     } catch (error) {
       const published = await readNamed(directory, destination, root);
       if (!published || !sameRecord(published.record, expectedRecord)) throw error;
-      const leftover = await readNamed(directory, tempName, root);
-      if (leftover) {
-        if (!sameRecord(leftover.record, expectedRecord)) {
-          throw journalError("skill_prepare_journal_conflict");
-        }
-        await directory.unlinkEntryNoFollow(leftover.entry);
-      }
+      if (isOccupied(error)) await directory.unlinkEntryNoFollow(temp.entry);
       return expectedRecord;
     }
   }
@@ -257,22 +267,34 @@ export function createSkillPrepareJournal({ journalDir, fsApi, installRoot } = {
 
   async function list({ claimLease } = {}) {
     const directory = await openDirectory();
-    const livePairs = new Set();
+    const liveHashes = new Set();
     try {
       const names = checkedNames(await directory.listFileNamesNoFollow());
+      const pendingTemps = [];
       for (const name of names) {
-        if (!TEMP_FILE_NAME.test(name)) continue;
-        const temp = await readNamed(directory, name, root);
+        const tempMatch = TEMP_FILE_NAME.exec(name);
+        if (!tempMatch) continue;
+        let temp;
+        try {
+          temp = await readNamed(directory, name, root);
+        } catch (error) {
+          if (!isSharingViolation(error)) throw error;
+          liveHashes.add(tempMatch[1]);
+          continue;
+        }
         if (!temp) continue;
+        pendingTemps.push({ name, hash: tempMatch[1], temp });
+      }
+      for (const { name, hash, temp } of pendingTemps) {
+        if (liveHashes.has(hash)) continue;
         if (typeof claimLease !== "function") {
           throw journalError("skill_prepare_lease_claim_required");
         }
-        const pairKey = `${temp.record.taskId}\0${temp.record.skillId}`;
         const lease = await claimLease({
           nonce: temp.record.leaseNonce, scope: temp.record.leaseScope,
         });
         if (lease === null) {
-          livePairs.add(pairKey);
+          liveHashes.add(hash);
           continue;
         }
         if (!lease || typeof lease.release !== "function") {
@@ -280,9 +302,9 @@ export function createSkillPrepareJournal({ journalDir, fsApi, installRoot } = {
         }
         const destination = name.slice(0, -4);
         try {
-          const current = await readNamed(directory, name, root);
-          if (!current) continue;
-          await settleTemp(directory, name, destination, current.record);
+          await settleTemp(directory, { temp, final: undefined }, destination, temp.record);
+        } catch (error) {
+          if (!isMissingOrStale(error)) throw error;
         } finally {
           await lease.release();
         }
@@ -295,11 +317,11 @@ export function createSkillPrepareJournal({ journalDir, fsApi, installRoot } = {
     try {
       const names = checkedNames(await directoryForRead.listFileNamesNoFollow());
       for (const name of names) {
-        if (!FILE_NAME.test(name)) continue;
+        const finalMatch = FILE_NAME.exec(name);
+        if (!finalMatch || liveHashes.has(finalMatch[1])) continue;
         const opened = await readNamed(directoryForRead, name, root);
         if (!opened) continue;
         const key = `${opened.record.taskId}\0${opened.record.skillId}`;
-        if (livePairs.has(key)) continue;
         pairs.set(key, { taskId: opened.record.taskId, skillId: opened.record.skillId });
       }
     } finally {
@@ -324,12 +346,11 @@ export function createSkillPrepareJournal({ journalDir, fsApi, installRoot } = {
       }
       const directory = await openDirectory();
       try {
-        return await settleTemp(
-          directory,
-          fileName(normalized.taskId, normalized.skillId, normalized.phase, true),
-          fileName(normalized.taskId, normalized.skillId, normalized.phase),
-          normalized,
+        const opened = await readPhase(
+          directory, normalized.taskId, normalized.skillId, normalized.phase,
         );
+        return await settleTemp(directory, opened,
+          fileName(normalized.taskId, normalized.skillId, normalized.phase), normalized);
       } finally {
         await directory.close();
       }
@@ -348,7 +369,9 @@ export function createSkillPrepareJournal({ journalDir, fsApi, installRoot } = {
         if (!sameRecord(existingTemp.record, normalized)) {
           throw journalError("skill_prepare_journal_conflict");
         }
-        return settleTemp(directory, tempName, destination, normalized);
+        return await settleTemp(
+          directory, { temp: existingTemp, final: undefined }, destination, normalized,
+        );
       }
       const temp = requireFile(await directory.openFileNoFollow(tempName, "wx"), true);
       try {
@@ -357,7 +380,9 @@ export function createSkillPrepareJournal({ journalDir, fsApi, installRoot } = {
       } finally {
         await temp.close();
       }
-      return settleTemp(directory, tempName, destination, normalized);
+      return await settleTemp(directory, {
+        temp: { entry: temp.entry, record: normalized }, final: undefined,
+      }, destination, normalized);
     } finally {
       await directory.close();
     }
@@ -374,15 +399,7 @@ export function createSkillPrepareJournal({ journalDir, fsApi, installRoot } = {
           throw journalError("skill_prepare_journal_conflict");
         }
         if (opened.final) await directory.unlinkEntryNoFollow(opened.final.entry);
-        if (opened.temp) {
-          const current = await readNamed(
-            directory, fileName(taskId, skillId, record.phase, true), root,
-          );
-          if (current) {
-            if (!sameRecord(current.record, record)) throw journalError("skill_prepare_journal_conflict");
-            await directory.unlinkEntryNoFollow(current.entry);
-          }
-        }
+        if (opened.temp) await directory.unlinkEntryNoFollow(opened.temp.entry);
       }
     } finally {
       await directory.close();

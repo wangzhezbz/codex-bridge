@@ -13,6 +13,7 @@ import { deleteAuthorizedTree } from "../desktop/software-manager/safe-delete.mj
 import { authorizeInstallRoot, authorizeSkillsRoot } from "../desktop/software-manager/path-policy.mjs";
 import { createWin32FileApi } from "../desktop/software-manager/win32-file-api.mjs";
 import { createWindowsFileCapabilities } from "../desktop/software-manager/windows-file-capabilities.mjs";
+import { createSkillPrepareJournal } from "../desktop/software-manager/skill-prepare-journal.mjs";
 import { MAX_SOFTWARE_PACKAGE_BYTES } from "../shared/software-manager/catalog-schema.mjs";
 
 function codedError(code, nativeCode) {
@@ -237,6 +238,7 @@ function createFakeNative(initial = []) {
     failOpen(path, error) { failOpen = { path, error }; },
     failClose(path, error) { failClose = { path, error }; },
     failRename(path, error) { failRename = { path, error }; },
+    clearFailRename() { failRename = null; },
     failDelete(path, error) { failDelete = { path, error }; },
     onReadChunk(hook) { readChunkHook = hook; },
     onOpenPath(hook) { openPathHook = hook; },
@@ -729,6 +731,96 @@ test("journal directory exposes bounded direct-child listing plus flushed no-rep
   assert.equal(fake.calls.some((call) => call[0] === "rename-handle" && call[4] === false), true);
   await directory.close();
   assert.equal(fake.handles.size, 0);
+});
+
+test("Skill prepare journal reuses held production descriptors for publish, recovery, and clear", async (t) => {
+  const journalDir = "C:\\work\\journal";
+  const installRoot = "C:\\work\\apps";
+  const sourcePath = `${installRoot}\\staging\\task-task1\\skill-documents.prepare`;
+  const leaseNonce = "1".repeat(32);
+  const record = (phase) => ({
+    schemaVersion: 1,
+    phase,
+    taskId: "task1",
+    skillId: "documents",
+    installRoot,
+    sourcePath,
+    leaseScope: "prepare",
+    leaseNonce,
+    identity: phase === "intent" ? null : { volumeSerial: "volume", fileId: "source" },
+    evidence: ["sealed", "deleting"].includes(phase) ? {
+      kind: "directory",
+      identity: { volumeSerial: "volume", fileId: "source" },
+      treeDigest: "a".repeat(64),
+      manifestDigest: "b".repeat(64),
+      skillMdSha256: "c".repeat(64),
+    } : null,
+  });
+  const create = (fake) => createSkillPrepareJournal({
+    journalDir,
+    installRoot,
+    fsApi: capabilities(fake),
+  });
+
+  await t.test("fresh intent bound and sealed publication", async () => {
+    const fake = createFakeNative([{ path: journalDir }, { path: installRoot }]);
+    const journal = create(fake);
+    for (const phase of ["intent", "bound", "sealed"]) await journal.record(record(phase));
+    assert.equal((await journal.load({ taskId: "task1", skillId: "documents" })).snapshot.phase, "sealed");
+    assert.equal(fake.handles.size, 0);
+  });
+
+  await t.test("dead flushed temp publication", async () => {
+    const fake = createFakeNative([{ path: journalDir }, { path: installRoot }]);
+    const journal = create(fake);
+    const tempPath = `${journalDir}\\skill-prepare-${createHash("sha256")
+      .update("task1\0documents", "utf8").digest("hex")}.intent.json.tmp`;
+    fake.failRename(tempPath, codedError("test_publish_failed"));
+    await assert.rejects(journal.record(record("intent")), /test_publish_failed/u);
+    fake.clearFailRename();
+    assert.equal((await journal.list({
+      claimLease: async () => ({ async release() {} }),
+    }))[0].phase, "intent");
+    assert.equal(fake.handles.size, 0);
+  });
+
+  await t.test("another live writer keeps its temp and predecessor hidden", async () => {
+    const fake = createFakeNative([{ path: journalDir }, { path: installRoot }]);
+    const fileCapabilities = capabilities(fake);
+    const journal = createSkillPrepareJournal({ journalDir, installRoot, fsApi: fileCapabilities });
+    await journal.record(record("intent"));
+    const recordHash = createHash("sha256").update("task1\0documents", "utf8").digest("hex");
+    const writer = await fileCapabilities.openJournalDirectoryNoFollow(journalDir);
+    const temp = await writer.openFileNoFollow(`skill-prepare-${recordHash}.bound.json.tmp`, "wx");
+    await temp.writeFile(`${JSON.stringify(record("bound"))}\n`, "utf8");
+    await temp.sync();
+    await temp.close();
+
+    assert.deepEqual(await journal.list({ claimLease: async () => {
+      throw new Error("live_writer_lease_must_not_be_probed");
+    } }), []);
+    assert.equal(fake.get(`${journalDir}\\skill-prepare-${recordHash}.bound.json.tmp`).deleted, false);
+
+    await writer.close();
+    assert.equal((await journal.list({
+      claimLease: async () => ({ async release() {} }),
+    }))[0].phase, "bound");
+    assert.equal(fake.handles.size, 0);
+  });
+
+  await t.test("temp-only clear", async () => {
+    const fake = createFakeNative([{ path: journalDir }, { path: installRoot }]);
+    const journal = create(fake);
+    await journal.record(record("intent"));
+    const tempPath = `${journalDir}\\skill-prepare-${createHash("sha256")
+      .update("task1\0documents", "utf8").digest("hex")}.bound.json.tmp`;
+    fake.failRename(tempPath, codedError("test_publish_failed"));
+    await assert.rejects(journal.record(record("bound")), /test_publish_failed/u);
+    fake.clearFailRename();
+    assert.equal(await journal.clear({ taskId: "task1", skillId: "documents" }), true);
+    assert.equal(await journal.load({ taskId: "task1", skillId: "documents" }), null);
+    assert.equal(fake.handles.size, 0);
+  });
 });
 
 test("safe-delete lists bounded names and deletes files and directories by descriptor handle", async () => {
