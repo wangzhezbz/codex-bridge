@@ -5,7 +5,9 @@ import test from "node:test";
 
 import { createSkillFileService } from "../desktop/software-manager/skill-files.mjs";
 import { createSkillSwapJournal } from "../desktop/software-manager/skill-swap-journal.mjs";
+import { createSkillPrepareJournal } from "../desktop/software-manager/skill-prepare-journal.mjs";
 import { createTrustedCatalogService, verifyCatalogEnvelope } from "../desktop/software-manager/catalog-trust.mjs";
+import { authorizeInstallRoot } from "../desktop/software-manager/path-policy.mjs";
 
 const SKILLS_ROOT = "C:\\Users\\tester\\.codex\\skills";
 const TARGET = `${SKILLS_ROOT}\\documents`;
@@ -17,7 +19,17 @@ const OLD_TREE = "d".repeat(64);
 const OLD_MANIFEST = "e".repeat(64);
 const OLD_SKILL_MD = "f".repeat(64);
 const SWAP_ID = "1".repeat(32);
-const INSTALL_CAPABILITY = Object.freeze(Object.create(null));
+const LEASE_NONCE = "2".repeat(32);
+const INSTALL_CAPABILITY = await authorizeInstallRoot({
+  candidate: "D:\\CBApps",
+  env: { SystemRoot: "C:\\Windows", ProgramFiles: "C:\\Program Files", USERPROFILE: "C:\\Users\\tester" },
+  maxRelativePath: 180,
+  access: async () => {},
+  realpath: async (value) => value,
+  lstat: async () => ({
+    dev: 1, ino: 1, isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false,
+  }),
+});
 const SKILLS_CAPABILITY = Object.freeze(Object.create(null));
 
 function trustedCatalog() {
@@ -70,7 +82,7 @@ function createMemoryJournalFs(initial = {}) {
     name, { name, identity: ++sequence, data },
   ]));
   const calls = [];
-  let crashAfterNextUnlink = false;
+  let crashAfterUnlinkCountdown = 0;
 
   function current(entry) {
     const node = entries.get(entry.name);
@@ -103,8 +115,7 @@ function createMemoryJournalFs(initial = {}) {
           calls.push(["unlink", entry.name]);
           current(entry);
           entries.delete(entry.name);
-          if (crashAfterNextUnlink) {
-            crashAfterNextUnlink = false;
+          if (crashAfterUnlinkCountdown > 0 && --crashAfterUnlinkCountdown === 0) {
             throw new Error("test_crash_after_journal_unlink");
           }
         },
@@ -124,18 +135,25 @@ function createMemoryJournalFs(initial = {}) {
     fsApi,
     calls,
     entries,
-    crashAfterUnlink() { crashAfterNextUnlink = true; },
+    crashAfterUnlink(count = 1) { crashAfterUnlinkCountdown = count; },
     replace(name, data) { entries.set(name, { name, identity: ++sequence, data }); },
   };
 }
 
-function createFakeSkillCapabilities({ existing = null } = {}) {
+function createFakeSkillCapabilities({
+  existing = null, crashAfterOldDelete = false, crashAfterPreparedChildDelete = false,
+  sourceInitiallyPresent = true, sourceInitiallyNonempty = false,
+} = {}) {
   const rootIdentity = identity("skills-root");
   const sourceEvidence = evidence("source");
   const trees = new Map();
   if (existing) trees.set("documents", structuredClone(existing));
   const calls = [];
   let preparedSequence = 0;
+  let oldDeleteCrashPending = crashAfterOldDelete;
+  let sourcePresent = sourceInitiallyPresent;
+  let sourceNonempty = sourceInitiallyNonempty;
+  let preparedDeleteCrashPending = crashAfterPreparedChildDelete;
   const sourceReceipts = new WeakMap();
   const sourceProof = Object.freeze(Object.create(null));
   sourceReceipts.set(sourceProof, { path: SOURCE, identity: identity("source"), evidence: sourceEvidence });
@@ -151,6 +169,48 @@ function createFakeSkillCapabilities({ existing = null } = {}) {
   }
 
   const fileCapabilities = {
+    async inspectPreparedSkillSourceNoFollow({ installRootCapability, taskId, skillId }) {
+      assert.equal(installRootCapability, INSTALL_CAPABILITY);
+      assert.equal(taskId, "skill-task");
+      assert.equal(skillId, "documents");
+      if (!sourcePresent) return { kind: "absent" };
+      return {
+        kind: sourceNonempty ? "nonempty" : "empty",
+        identity: identity("source"),
+        sourcePath: SOURCE,
+      };
+    },
+    async validatePreparedSkillSourceForDeletionNoFollow({
+      installRootCapability, taskId, skillId, expectedIdentity, expectedEvidence,
+    }) {
+      assert.equal(installRootCapability, INSTALL_CAPABILITY);
+      assert.equal(taskId, "skill-task");
+      assert.equal(skillId, "documents");
+      if (!sourcePresent) return { kind: "absent", sourcePath: SOURCE };
+      assert.deepEqual(expectedIdentity, identity("source"));
+      if (expectedEvidence !== null) assert.deepEqual(expectedEvidence, sourceEvidence);
+      return { kind: "directory", identity: identity("source"), sourcePath: SOURCE };
+    },
+    async deletePreparedSkillSourceNoFollow({
+      installRootCapability, taskId, skillId, expectedIdentity, expectedEvidence,
+    }) {
+      assert.equal(installRootCapability, INSTALL_CAPABILITY);
+      assert.equal(taskId, "skill-task");
+      assert.equal(skillId, "documents");
+      if (!sourcePresent) return { deleted: false, absent: true };
+      if (expectedIdentity !== null) assert.deepEqual(expectedIdentity, identity("source"));
+      if (expectedEvidence !== null) assert.deepEqual(expectedEvidence, sourceEvidence);
+      if (expectedIdentity === null && sourceNonempty) throw new Error("skill_prepare_intent_not_empty");
+      if (preparedDeleteCrashPending) {
+        preparedDeleteCrashPending = false;
+        sourceNonempty = true;
+        calls.push(["delete-source-child", SOURCE]);
+        throw new Error("test_crash_after_prepared_child_delete");
+      }
+      sourcePresent = false;
+      calls.push(["delete-source", SOURCE]);
+      return { deleted: true, absent: false };
+    },
     async verifyPreparedSkillNoFollow({ sourceProof: suppliedProof, installRootCapability, requiredFiles, expectedPackageSha256 }) {
       assert.equal(installRootCapability, INSTALL_CAPABILITY);
       const source = sourceReceipts.get(suppliedProof);
@@ -211,6 +271,10 @@ function createFakeSkillCapabilities({ existing = null } = {}) {
           const value = trees.get(name);
           if (!value || JSON.stringify(value) !== JSON.stringify(expectedEvidence)) throw new Error("skill_delete_identity_mismatch");
           trees.delete(name);
+          if (oldDeleteCrashPending && name.startsWith(".codexbridge-old-")) {
+            oldDeleteCrashPending = false;
+            throw new Error("test_crash_after_old_delete");
+          }
         },
         async close() {},
       };
@@ -223,21 +287,33 @@ function createFakeSkillCapabilities({ existing = null } = {}) {
       assert.equal(suppliedStaging, stagingReceipt);
       assert.equal(suppliedPackage, packageProof);
       assert.deepEqual(context, { skillId: "documents", expectedVersion: "1.0.0" });
+      sourceNonempty = true;
       return { sourceProof, evidence: structuredClone(sourceEvidence) };
     },
   };
   return {
     fileCapabilities, calls, trees, inspect, sourceReceipts, sourceProof,
     stagingReceipt, packageProof, workspace,
+    sourcePresent: () => sourcePresent,
+    makeSourceNonempty: () => { sourceNonempty = true; },
   };
 }
 
-function createFixture({ existing = null, crashAfterPhase = null } = {}) {
+function createFixture({
+  existing = null, crashAfterPhase = null, crashAfterOldDelete = false,
+  crashAfterPreparedChildDelete = false,
+  sourceInitiallyPresent = true, sourceInitiallyNonempty = false,
+} = {}) {
   const memory = createMemoryJournalFs();
   const durableJournal = createSkillSwapJournal({
     journalDir: "D:\\CBState\\skill-swaps",
     fsApi: memory.fsApi,
     skillsRoot: SKILLS_ROOT,
+  });
+  const prepareJournal = createSkillPrepareJournal({
+    journalDir: "D:\\CBState\\skill-prepares",
+    fsApi: memory.fsApi,
+    installRoot: "D:\\CBApps",
   });
   let crashed = false;
   const journal = crashAfterPhase === null ? durableJournal : Object.freeze({
@@ -251,7 +327,17 @@ function createFixture({ existing = null, crashAfterPhase = null } = {}) {
       return result;
     },
   });
-  const capabilities = createFakeSkillCapabilities({ existing });
+  const capabilities = createFakeSkillCapabilities({
+    existing, crashAfterOldDelete, crashAfterPreparedChildDelete,
+    sourceInitiallyPresent, sourceInitiallyNonempty,
+  });
+  const prepareLeaseStore = {
+    async acquireOperationLease({ nonce, scope }) {
+      assert.equal(nonce, LEASE_NONCE);
+      assert.equal(scope, "prepare");
+      return { async release() {} };
+    },
+  };
   const service = createSkillFileService({
     fileCapabilities: capabilities.fileCapabilities,
     installRootCapability: INSTALL_CAPABILITY,
@@ -259,13 +345,20 @@ function createFixture({ existing = null, crashAfterPhase = null } = {}) {
     catalogService: TRUSTED_CATALOG,
     workspace: capabilities.workspace,
     swapJournal: journal,
+    prepareJournal,
+    prepareLeaseStore,
     hashFile: async () => { throw new Error("raw_path_hash_forbidden"); },
   });
-  return { memory, journal, capabilities, service };
+  return { memory, journal, prepareJournal, prepareLeaseStore, capabilities, service };
 }
 
 async function prepare(service, sourceProof) {
+  await service.beginPreparedSource({
+    taskId: "skill-task", skillId: "documents", leaseScope: "prepare", leaseNonce: LEASE_NONCE,
+  });
+  await service.bindPreparedSource({ taskId: "skill-task", skillId: "documents" });
   return service.verifyPreparedSkill({
+    taskId: "skill-task",
     skillId: "documents",
     expectedVersion: "1.0.0",
     stagingReceipt: sourceProof.stagingReceipt,
@@ -287,6 +380,22 @@ function replacementPlan(verified, previousEvidence = { kind: "absent" }) {
     skillMdSha256: SKILL_MD,
     requiredFiles: ["SKILL.md", "reference.md"],
     previousEvidence,
+  };
+}
+
+function prepareRecord(phase, overrides = {}) {
+  return {
+    schemaVersion: 1,
+    phase,
+    taskId: "skill-task",
+    skillId: "documents",
+    installRoot: "D:\\CBApps",
+    sourcePath: SOURCE,
+    leaseScope: "prepare",
+    leaseNonce: LEASE_NONCE,
+    identity: phase === "intent" ? null : identity("source"),
+    evidence: ["sealed", "deleting"].includes(phase) ? evidence("source") : null,
+    ...overrides,
   };
 }
 
@@ -364,6 +473,94 @@ test("Skill swap journal resumes an interrupted cleanup from the exact cleanup-c
   assert.equal(await journal.load({ taskId: "skill-task", swapId: SWAP_ID }), null);
 });
 
+test("Skill prepare journal publishes a flushed temp-only intent during startup recovery", async () => {
+  const memory = createMemoryJournalFs();
+  let crashRename = true;
+  const crashingFs = {
+    async openJournalDirectoryNoFollow(...args) {
+      const directory = await memory.fsApi.openJournalDirectoryNoFollow(...args);
+      const rename = directory.renameEntryNoFollow.bind(directory);
+      directory.renameEntryNoFollow = async (...renameArgs) => {
+        if (crashRename) {
+          crashRename = false;
+          throw new Error("test_crash_after_temp_flush");
+        }
+        return rename(...renameArgs);
+      };
+      return directory;
+    },
+  };
+  const crashing = createSkillPrepareJournal({
+    journalDir: "D:\\CBState\\skill-prepares", fsApi: crashingFs, installRoot: "D:\\CBApps",
+  });
+  await assert.rejects(crashing.record(prepareRecord("intent")), /test_crash_after_temp_flush/u);
+  assert.equal([...memory.entries.keys()].some((name) => name.endsWith(".intent.json.tmp")), true);
+
+  const restarted = createSkillPrepareJournal({
+    journalDir: "D:\\CBState\\skill-prepares", fsApi: memory.fsApi, installRoot: "D:\\CBApps",
+  });
+  const records = await restarted.list();
+  assert.equal(records.length, 1);
+  assert.equal(records[0].phase, "intent");
+  assert.equal([...memory.entries.keys()].some((name) => name.endsWith(".tmp")), false);
+});
+
+test("Skill prepare journal rejects a mismatched temp record without deleting either entry", async () => {
+  const memory = createMemoryJournalFs();
+  const journal = createSkillPrepareJournal({
+    journalDir: "D:\\CBState\\skill-prepares", fsApi: memory.fsApi, installRoot: "D:\\CBApps",
+  });
+  await journal.record(prepareRecord("intent"));
+  const [finalName] = [...memory.entries.keys()];
+  const tempName = `${finalName}.tmp`;
+  memory.replace(tempName, `${JSON.stringify(prepareRecord("intent", { leaseNonce: "3".repeat(32) }))}\n`);
+  const restarted = createSkillPrepareJournal({
+    journalDir: "D:\\CBState\\skill-prepares", fsApi: memory.fsApi, installRoot: "D:\\CBApps",
+  });
+  await assert.rejects(restarted.list(), /skill_prepare_journal_conflict/u);
+  assert.equal(memory.entries.has(finalName), true);
+  assert.equal(memory.entries.has(tempName), true);
+  assert.equal(memory.calls.some(([operation]) => operation === "unlink"), false);
+});
+
+test("Skill prepare journal resumes clear after intent and bound records were durably removed", async () => {
+  for (const crashAfter of [1, 2]) {
+    const memory = createMemoryJournalFs();
+    const journal = createSkillPrepareJournal({
+      journalDir: "D:\\CBState\\skill-prepares", fsApi: memory.fsApi, installRoot: "D:\\CBApps",
+    });
+    await journal.record(prepareRecord("intent"));
+    await journal.record(prepareRecord("bound"));
+    await journal.record(prepareRecord("sealed"));
+    await journal.record(prepareRecord("deleting"));
+    memory.crashAfterUnlink(crashAfter);
+    await assert.rejects(journal.clear({ taskId: "skill-task", skillId: "documents" }), /test_crash/u);
+    const restarted = createSkillPrepareJournal({
+      journalDir: "D:\\CBState\\skill-prepares", fsApi: memory.fsApi, installRoot: "D:\\CBApps",
+    });
+    assert.equal((await restarted.load({ taskId: "skill-task", skillId: "documents" })).snapshot.phase, "deleting");
+    assert.equal(await restarted.clear({ taskId: "skill-task", skillId: "documents" }), true);
+    assert.equal(await restarted.load({ taskId: "skill-task", skillId: "documents" }), null);
+  }
+});
+
+test("Skill prepare journal keeps each task and Skill lifecycle independent", async () => {
+  const memory = createMemoryJournalFs();
+  const journal = createSkillPrepareJournal({
+    journalDir: "D:\\CBState\\skill-prepares", fsApi: memory.fsApi, installRoot: "D:\\CBApps",
+  });
+  await journal.record(prepareRecord("intent"));
+  await journal.record(prepareRecord("intent", {
+    skillId: "images",
+    sourcePath: "D:\\CBApps\\staging\\task-skill-task\\skill-images.prepare",
+    leaseNonce: "4".repeat(32),
+  }));
+  assert.deepEqual((await journal.list()).map(({ skillId }) => skillId).sort(), ["documents", "images"]);
+  assert.equal(await journal.clear({ taskId: "skill-task", skillId: "documents" }), true);
+  assert.equal(await journal.load({ taskId: "skill-task", skillId: "documents" }), null);
+  assert.equal((await journal.load({ taskId: "skill-task", skillId: "images" })).snapshot.leaseNonce, "4".repeat(32));
+});
+
 test("new Skill install publishes exact evidence and never touches an unrelated Skill", async () => {
   const { service, capabilities } = createFixture({ existing: null });
   capabilities.trees.set("pdf", evidence("pdf", { treeDigest: OLD_TREE }));
@@ -379,6 +576,64 @@ test("new Skill install publishes exact evidence and never touches an unrelated 
   assert.deepEqual(completed.evidence, capabilities.inspect("documents"));
   assert.equal(capabilities.inspect("pdf").identity.fileId, "pdf");
   assert.equal(capabilities.calls.some(([operation, name]) => operation === "delete" && name === "pdf"), false);
+});
+
+test("intent recovery handles pre-create absence and exact empty creation but rejects nonempty replacement", async () => {
+  for (const fixture of [
+    createFixture({ sourceInitiallyPresent: false }),
+    createFixture(),
+  ]) {
+    await fixture.service.beginPreparedSource({
+      taskId: "skill-task", skillId: "documents", leaseScope: "prepare", leaseNonce: LEASE_NONCE,
+    });
+    assert.deepEqual(await fixture.service.discardPrepared({
+      taskId: "skill-task", skillIds: ["documents"],
+    }), [true]);
+    assert.equal(await fixture.prepareJournal.load({ taskId: "skill-task", skillId: "documents" }), null);
+  }
+
+  const replaced = createFixture({ sourceInitiallyNonempty: true });
+  await replaced.service.beginPreparedSource({
+    taskId: "skill-task", skillId: "documents", leaseScope: "prepare", leaseNonce: LEASE_NONCE,
+  });
+  await assert.rejects(replaced.service.discardPrepared({
+    taskId: "skill-task", skillIds: ["documents"],
+  }), /skill_prepare_intent_not_empty/u);
+  assert.equal(replaced.capabilities.sourcePresent(), true);
+  assert.equal((await replaced.prepareJournal.load({ taskId: "skill-task", skillId: "documents" })).snapshot.phase, "intent");
+});
+
+test("prepared Skill deletion resumes from deleting after a child was removed before a crash", async () => {
+  const fixture = createFixture({ crashAfterPreparedChildDelete: true });
+  await prepare(fixture.service, fixture.capabilities);
+  await assert.rejects(fixture.service.discardPrepared({
+    taskId: "skill-task", skillIds: ["documents"],
+  }), /test_crash_after_prepared_child_delete/u);
+  const interrupted = await fixture.prepareJournal.load({ taskId: "skill-task", skillId: "documents" });
+  assert.equal(interrupted.snapshot.phase, "deleting");
+  assert.equal(fixture.capabilities.sourcePresent(), true);
+
+  assert.equal(await fixture.service.reconcilePreparedSources(), 1);
+  assert.equal(fixture.capabilities.sourcePresent(), false);
+  assert.equal(await fixture.prepareJournal.load({ taskId: "skill-task", skillId: "documents" }), null);
+  assert.equal(fixture.capabilities.calls.filter(([name]) => name === "delete-source-child").length, 1);
+});
+
+test("bound partial extraction records deleting before mutation and resumes safely", async () => {
+  const fixture = createFixture({ crashAfterPreparedChildDelete: true });
+  await fixture.service.beginPreparedSource({
+    taskId: "skill-task", skillId: "documents", leaseScope: "prepare", leaseNonce: LEASE_NONCE,
+  });
+  await fixture.service.bindPreparedSource({ taskId: "skill-task", skillId: "documents" });
+  fixture.capabilities.makeSourceNonempty();
+  await assert.rejects(fixture.service.discardPrepared({
+    taskId: "skill-task", skillIds: ["documents"],
+  }), /test_crash_after_prepared_child_delete/u);
+  assert.equal((await fixture.prepareJournal.load({
+    taskId: "skill-task", skillId: "documents",
+  })).snapshot.phase, "deleting");
+  assert.equal(await fixture.service.reconcilePreparedSources(), 1);
+  assert.equal(fixture.capabilities.sourcePresent(), false);
 });
 
 test("same-name Skill replacement moves old, publishes new, and deletes only the journal-bound old tree", async () => {
@@ -427,6 +682,8 @@ for (const phase of ["reserved", "prepared", "old_moved", "new_published", "proo
       catalogService: TRUSTED_CATALOG,
       workspace: fixture.capabilities.workspace,
       swapJournal: fixture.journal,
+      prepareJournal: fixture.prepareJournal,
+      prepareLeaseStore: fixture.prepareLeaseStore,
       hashFile: async () => { throw new Error("raw_path_hash_forbidden"); },
     });
     const reconciled = await restarted.reconcileReplacement({
@@ -437,6 +694,8 @@ for (const phase of ["reserved", "prepared", "old_moved", "new_published", "proo
     });
     assert.equal(reconciled.status, "completed");
     assert.equal((await restarted.inspectExact({ target: TARGET, authorizedRoot: SKILLS_ROOT })).treeDigest, TREE);
+    assert.equal(fixture.capabilities.sourcePresent(), false);
+    assert.equal(await fixture.prepareJournal.load({ taskId: "skill-task", skillId: "documents" }), null);
   });
 }
 
@@ -457,6 +716,29 @@ test("ambiguous identity during recovery fails closed and deletes no tree", asyn
     expected: { treeDigest: TREE, manifestDigest: MANIFEST, skillMdSha256: SKILL_MD },
   }), /skill_swap_ambiguous/u);
   assert.equal(fixture.capabilities.calls.filter(([operation]) => operation === "delete").length, deletesBefore);
+});
+
+test("proof-written recovery treats an already deleted exact old tree as completed deletion", async () => {
+  const old = evidence("old", { treeDigest: OLD_TREE, manifestDigest: OLD_MANIFEST, skillMdSha256: OLD_SKILL_MD });
+  const fixture = createFixture({ existing: old, crashAfterOldDelete: true });
+  const verified = await prepare(fixture.service, fixture.capabilities);
+  const replacement = await fixture.service.replaceExact(replacementPlan(verified, old));
+  await assert.rejects(fixture.service.finalizeReplacement({
+    completionReceipt: replacement.completionReceipt,
+    target: TARGET,
+    taskId: "skill-task",
+    swapId: SWAP_ID,
+    expected: { treeDigest: TREE, manifestDigest: MANIFEST, skillMdSha256: SKILL_MD },
+  }), /test_crash_after_old_delete/u);
+  assert.equal(fixture.capabilities.inspect(`.codexbridge-old-documents-${SWAP_ID}`).kind, "absent");
+  const recovered = await fixture.service.reconcileReplacement({
+    taskId: "skill-task",
+    swapId: SWAP_ID,
+    target: TARGET,
+    expected: { treeDigest: TREE, manifestDigest: MANIFEST, skillMdSha256: SKILL_MD },
+  });
+  assert.equal(recovered.status, "completed");
+  assert.equal(recovered.evidence.treeDigest, TREE);
 });
 
 test("exact uninstall rejects a foreign identity and preserves sibling Skills", async () => {
@@ -490,6 +772,12 @@ test("prepared tree verification requires exact SKILL.md and full manifest evide
       fsApi: createMemoryJournalFs().fsApi,
       skillsRoot: SKILLS_ROOT,
     }),
+    prepareJournal: createSkillPrepareJournal({
+      journalDir: "D:\\CBState\\skill-prepares",
+      fsApi: createMemoryJournalFs().fsApi,
+      installRoot: "D:\\CBApps",
+    }),
+    prepareLeaseStore: { async acquireOperationLease() { return { async release() {} }; } },
     hashFile: async () => { throw new Error("raw_path_hash_forbidden"); },
   });
   await assert.rejects(prepare(service, capabilities), /skill_prepared_evidence_invalid/u);

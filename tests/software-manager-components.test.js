@@ -104,6 +104,7 @@ function fixture({
     gitMutableReleases: [],
     reconciledSkills: [], skillOperations: [],
     cleanedSkillPackages: [], cleanedSkillStaging: [],
+    begunSkillSources: [], boundSkillSources: [], discardedSkillSources: [],
   };
   const archiveReceipts = new WeakSet();
   const packageProofs = new WeakMap();
@@ -121,6 +122,7 @@ function fixture({
   let shortcutSequence = 0;
   const deletedSkillTargets = new Set();
   const operationLeases = new Map();
+  const preparedSkillSources = new Map();
   const ownershipStore = {
     async acquireOperationLease({ nonce, scope, wait = true }) {
       const key = `${scope}:${nonce}`;
@@ -283,7 +285,38 @@ function fixture({
     },
   };
   const skillFiles = {
+    async beginPreparedSource(plan) {
+      calls.begunSkillSources.push(structuredClone(plan));
+      preparedSkillSources.set(`${plan.taskId}:${plan.skillId}`, { ...structuredClone(plan), phase: "intent" });
+    },
+    async bindPreparedSource(plan) {
+      calls.boundSkillSources.push(structuredClone(plan));
+      const key = `${plan.taskId}:${plan.skillId}`;
+      preparedSkillSources.set(key, { ...preparedSkillSources.get(key), phase: "bound" });
+    },
+    async discardPrepared(plan) {
+      calls.discardedSkillSources.push(structuredClone(plan));
+      return plan.skillIds.map((skillId) => preparedSkillSources.delete(`${plan.taskId}:${skillId}`));
+    },
+    async reconcilePreparedSources() {
+      let recovered = 0;
+      for (const [key, record] of preparedSkillSources) {
+        const lease = await ownershipStore.acquireOperationLease({
+          nonce: record.leaseNonce, scope: record.leaseScope, wait: false,
+        });
+        if (lease === null) continue;
+        try {
+          preparedSkillSources.delete(key);
+          calls.discardedSkillSources.push({ taskId: record.taskId, skillIds: [record.skillId], recovery: true });
+          recovered += 1;
+        } finally {
+          await lease.release();
+        }
+      }
+      return recovered;
+    },
     async verifyPreparedSkill(plan) {
+      assert.equal(typeof plan.taskId, "string");
       assert.equal(plan.skillId, "documents");
       assert.equal(plan.expectedVersion, "1.0.0");
       assert.equal(plan.stagingReceipt?.path, path.win32.join(
@@ -295,6 +328,8 @@ function fixture({
       downloadRecords.delete(boundDownload);
       const verificationReceipt = Object.freeze(Object.create(null));
       skillReceipts.add(verificationReceipt);
+      const key = `${plan.taskId}:${plan.skillId}`;
+      preparedSkillSources.set(key, { ...preparedSkillSources.get(key), phase: "sealed" });
       return { verificationReceipt, treeDigest: DIGEST_A, manifestDigest: DIGEST_B, skillMdSha256: SKILL_HASH };
     },
     async hashFile(filePath) {
@@ -309,6 +344,7 @@ function fixture({
       assert.equal(skillReceipts.has(plan.verificationReceipt), true);
       skillReceipts.delete(plan.verificationReceipt);
       calls.replacedSkills.push(plan);
+      preparedSkillSources.delete(`${plan.taskId}:${path.win32.basename(plan.target)}`);
       const completionReceipt = Object.freeze(Object.create(null));
       skillCompletionReceipts.add(completionReceipt);
       installedSkillEvidence.set(plan.target, {
@@ -440,6 +476,8 @@ function fixture({
   return {
     adapters, calls, getState: () => structuredClone(currentState),
     createAnotherAdapters: () => createComponentAdapters(adapterOptions),
+    preparedSkillSourceCount: () => preparedSkillSources.size,
+    simulateProcessCrash: () => operationLeases.clear(),
   };
 }
 
@@ -1640,6 +1678,23 @@ test("skills prepare revalidates install and skills roots after download before 
   assert.equal(calls.cleanedSkillPackages.length, 1);
   assert.equal(calls.cleanedSkillStaging.length, 1);
   assert.deepEqual(getState().skills, {});
+});
+
+test("a second adapter skips a live sealed Skill prepare and reclaims it only after the owner crashes", async () => {
+  const shared = fixture();
+  const second = shared.createAnotherAdapters();
+  const prepared = await shared.adapters.skills.prepare({ taskId: "lease-a", skillIds: ["documents"] });
+  assert.equal(prepared[0].status, "succeeded");
+  assert.equal(shared.preparedSkillSourceCount(), 1);
+
+  await second.skills.inspectInstalled({ skillIds: ["documents"] });
+  assert.equal(shared.preparedSkillSourceCount(), 1);
+  assert.equal(shared.calls.discardedSkillSources.some((item) => item.recovery === true), false);
+
+  shared.simulateProcessCrash();
+  await second.skills.inspectInstalled({ skillIds: ["documents"] });
+  assert.equal(shared.preparedSkillSourceCount(), 0);
+  assert.equal(shared.calls.discardedSkillSources.filter((item) => item.recovery === true).length, 1);
 });
 
 for (const [stage, hook] of [

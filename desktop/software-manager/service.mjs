@@ -863,25 +863,47 @@ export function createSoftwareManagerService({
   async function runPreparedSkills(adapters, ids) {
     if (ids.length === 0) return [];
     const task = currentTask;
-    const nonce = beginCancellable(task, "prepare");
-    await progress("skills", "prepare", 0, true, "software_manager_preparing_skills", undefined, false, task);
-    const prepared = await callSkills(adapters, "prepare", {
-      ...cancellableContext("skills", task, nonce),
-      skillIds: ids,
-    }, ids);
-    endCancellable(task, nonce);
-    await drainLogs();
-    if (task.acceptedCancel) {
-      return ids.map((id) => failedResult(id, "prepare", serviceError("software_manager_cancelled")));
+    const discard = () => adapterMethod(adapters, "skills", "discardPrepared")({
+      taskId: task.taskId, skillIds: ids,
+    });
+    try {
+      const nonce = beginCancellable(task, "prepare");
+      await progress("skills", "prepare", 0, true, "software_manager_preparing_skills", undefined, false, task);
+      const prepared = await callSkills(adapters, "prepare", {
+        ...cancellableContext("skills", task, nonce),
+        skillIds: ids,
+      }, ids);
+      endCancellable(task, nonce);
+      await drainLogs();
+      if (task.acceptedCancel) {
+        try {
+          await discard();
+        } catch (error) {
+          return ids.map((id) => failedResult(id, "prepare", error));
+        }
+        return ids.map((id) => failedResult(id, "prepare", serviceError("software_manager_cancelled")));
+      }
+      const ready = prepared.filter(({ status }) => status === "succeeded").map(({ componentId }) => componentId);
+      if (ready.length === 0) {
+        await discard();
+        return prepared;
+      }
+      let criticalEntered = false;
+      let committed;
+      try {
+        await enterCritical(task, "skills", "commit");
+        criticalEntered = true;
+        committed = await callSkills(adapters, "commit", { taskId: task.taskId, skillIds: ready }, ready);
+      } finally {
+        if (criticalEntered) exitCritical(task);
+        await discard().catch(() => {});
+      }
+      const committedById = new Map(committed.map((entry) => [entry.componentId, entry]));
+      return prepared.map((entry) => entry.status === "succeeded" ? committedById.get(entry.componentId) ?? entry : entry);
+    } catch (error) {
+      await discard().catch(() => {});
+      throw error;
     }
-    const ready = prepared.filter(({ status }) => status === "succeeded").map(({ componentId }) => componentId);
-    if (ready.length === 0) return prepared;
-    await enterCritical(task, "skills", "commit");
-    let committed;
-    try { committed = await callSkills(adapters, "commit", { taskId: task.taskId, skillIds: ready }, ready); }
-    finally { exitCritical(task); }
-    const committedById = new Map(committed.map((entry) => [entry.componentId, entry]));
-    return prepared.map((entry) => entry.status === "succeeded" ? committedById.get(entry.componentId) ?? entry : entry);
   }
 
   async function runCriticalComponent(adapters, id, action) {

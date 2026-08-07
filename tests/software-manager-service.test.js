@@ -76,6 +76,7 @@ function skillsAdapterFixture(options = {}) {
   return {
     inspectInstalled: (context) => invoke("inspect", context),
     prepare: (context) => invoke("prepare", context),
+    discardPrepared: (context) => invoke("discardPrepared", context),
     commit: (context) => invoke("commit", context),
     verify: (context) => invoke("verify", context),
     uninstall: (context) => invoke("uninstall", context),
@@ -601,6 +602,31 @@ test("only an accepted cancellable-phase cancel makes the final result cancelled
   assert.equal(result.status, "cancelled");
 });
 
+test("accepted Skill cancellation discards prepared sources before returning and never commits", async () => {
+  const entered = deferred();
+  const release = deferred();
+  const calls = [];
+  const { service } = fixtureService({
+    calls,
+    skills: {
+      prepare: async ({ signal }) => {
+        entered.resolve(signal);
+        await release.promise;
+        return [operationResult("documents", "prepare")];
+      },
+    },
+  });
+  const running = service.startTask({ kind: "install", componentIds: [], skillIds: ["documents"] });
+  const signal = await entered.promise;
+  assert.deepEqual(service.cancelTask(), { cancelled: true });
+  assert.equal(signal.aborted, true);
+  release.resolve();
+  assert.equal((await running).status, "cancelled");
+  assert.deepEqual(calls.filter(({ id, action }) => id === "skills" && action !== "inspect").map(({ action }) => action), [
+    "prepare", "discardPrepared",
+  ]);
+});
+
 test("accepted cancellation has one stable cancelling state for cancel and quit", async () => {
   const entered = deferred();
   const release = deferred();
@@ -1108,10 +1134,12 @@ test("Skill adapter output rejects duplicate, missing, unknown, or extra IDs as 
     [operationResult("documents", "prepare"), operationResult("spreadsheets", "prepare"), operationResult("extra", "prepare")],
   ];
   for (const output of badOutputs) {
-    const { service } = fixtureService({ catalogService, skills: { prepare: async () => output } });
+    const calls = [];
+    const { service } = fixtureService({ calls, catalogService, skills: { prepare: async () => output } });
     const result = await service.startTask({ kind: "install", componentIds: [], skillIds: ["documents", "spreadsheets"] });
     assert.equal(result.status, "failed");
     assert.deepEqual(result.skills.map(({ status }) => status), ["failed", "failed"]);
+    assert.equal(calls.some(({ id, action }) => id === "skills" && action === "discardPrepared"), true);
   }
 });
 

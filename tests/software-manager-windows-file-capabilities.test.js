@@ -29,6 +29,7 @@ function createFakeNative(initial = []) {
   let failRename = null;
   let failDelete = null;
   let readChunkHook = null;
+  let openPathHook = null;
 
   const key = (value) => value.toLowerCase();
   const canonical = (value) => value.replace(/[\\]+$/u, "") || value;
@@ -68,7 +69,17 @@ function createFakeNative(initial = []) {
     return handle;
   }
   const nativeApi = {
-    async openPath(exactPath, options) {
+    async openPath(requestedPath, options) {
+      let exactPath = requestedPath;
+      if (openPathHook) {
+        const redirected = openPathHook({
+          path: requestedPath,
+          options: structuredClone(options),
+          handles,
+          get: (value) => nodes.get(key(value)),
+        });
+        if (typeof redirected === "string") exactPath = redirected;
+      }
       calls.push(["open", exactPath, structuredClone(options)]);
       if (failOpen?.path?.toLowerCase() === exactPath.toLowerCase()) throw failOpen.error;
       let node = nodes.get(key(exactPath));
@@ -228,6 +239,7 @@ function createFakeNative(initial = []) {
     failRename(path, error) { failRename = { path, error }; },
     failDelete(path, error) { failDelete = { path, error }; },
     onReadChunk(hook) { readChunkHook = hook; },
+    onOpenPath(hook) { openPathHook = hook; },
     get(path) { return nodes.get(key(path)); },
   };
 }
@@ -957,6 +969,188 @@ test("Skill source proof copies across roots then swaps only held direct childre
     swapId: "3".repeat(32),
     expected,
   }), /skill_recovery_request_invalid/u);
+  await swap.close();
+  assert.equal(fake.handles.size, 0);
+});
+
+test("Skill exact deletion locally closes its target handle and preserves scan plus close failures", async () => {
+  const skillsRoot = "C:\\Users\\me\\.codex\\skills";
+  const target = `${skillsRoot}\\documents`;
+  const fake = createFakeNative([
+    { path: "D:\\CBApps" },
+    { path: skillsRoot },
+    { path: target },
+    { path: `${target}\\SKILL.md`, kind: "file", data: Buffer.from("skill"), reparse: true },
+  ]);
+  const api = capabilities(fake);
+  const swap = await api.openSkillRootNoFollow({
+    installRootCapability: await installRootAuthority("D:\\CBApps"),
+    skillsRootCapability: await skillsRootAuthority(skillsRoot),
+  });
+  const baselineHandles = fake.handles.size;
+  fake.failClose(target, new Error("test_target_close_failed"));
+  await assert.rejects(swap.deleteDirectChildTreeNoFollow({
+    child: { kind: "target", skillId: "documents" },
+    expectedEvidence: {
+      kind: "directory",
+      identity: fake.get(target).identity,
+      treeDigest: "a".repeat(64),
+      manifestDigest: "b".repeat(64),
+      skillMdSha256: "c".repeat(64),
+    },
+  }), (error) => {
+    const rendered = JSON.stringify(error, Object.getOwnPropertyNames(error));
+    assert.match(rendered, /windows_reparse_point_rejected/u);
+    assert.match(rendered, /test_target_close_failed/u);
+    return true;
+  });
+  assert.equal(fake.handles.size, baselineHandles);
+  await swap.close();
+  assert.equal(fake.handles.size, 0);
+});
+
+test("prepared Skill cleanup is identity-bound, fail-closed for intent, and preserves task siblings", async () => {
+  const source = "D:\\CBApps\\staging\\task-skill-task\\skill-documents.prepare";
+  const sibling = "D:\\CBApps\\staging\\task-skill-task\\skill-images.prepare";
+  const fake = createFakeNative([
+    { path: "D:\\CBApps" },
+    { path: "D:\\CBApps\\staging" },
+    { path: "D:\\CBApps\\staging\\task-skill-task" },
+    { path: source },
+    { path: `${source}\\partial.txt`, kind: "file", data: Buffer.from("partial") },
+    { path: sibling },
+  ]);
+  const api = capabilities(fake);
+  const installRootCapability = await installRootAuthority("D:\\CBApps");
+  assert.equal((await api.inspectPreparedSkillSourceNoFollow({
+    installRootCapability, taskId: "skill-task", skillId: "documents",
+  })).kind, "nonempty");
+  await assert.rejects(api.deletePreparedSkillSourceNoFollow({
+    installRootCapability,
+    taskId: "skill-task",
+    skillId: "documents",
+    expectedIdentity: null,
+    expectedEvidence: null,
+  }), /skill_prepare_intent_not_empty/u);
+
+  const sourceIdentity = structuredClone(fake.get(source).identity);
+  assert.deepEqual(await api.validatePreparedSkillSourceForDeletionNoFollow({
+    installRootCapability,
+    taskId: "skill-task",
+    skillId: "documents",
+    expectedIdentity: sourceIdentity,
+    expectedEvidence: null,
+  }), { kind: "directory", identity: sourceIdentity, sourcePath: source });
+  await api.deletePreparedSkillSourceNoFollow({
+    installRootCapability,
+    taskId: "skill-task",
+    skillId: "documents",
+    expectedIdentity: sourceIdentity,
+    expectedEvidence: null,
+  });
+  assert.equal(fake.get(source), undefined);
+  assert.notEqual(fake.get(sibling), undefined);
+  assert.notEqual(fake.get("D:\\CBApps\\staging\\task-skill-task"), undefined);
+  assert.equal(fake.handles.size, 0);
+});
+
+test("absent prepared Skill cleanup removes only its now-empty exact task parent", async () => {
+  const task = "D:\\CBApps\\staging\\task-skill-task";
+  const fake = createFakeNative([
+    { path: "D:\\CBApps" },
+    { path: "D:\\CBApps\\staging" },
+    { path: task },
+  ]);
+  const result = await capabilities(fake).deletePreparedSkillSourceNoFollow({
+    installRootCapability: await installRootAuthority("D:\\CBApps"),
+    taskId: "skill-task",
+    skillId: "documents",
+    expectedIdentity: { volumeSerial: "vol-1", fileId: "missing" },
+    expectedEvidence: null,
+  });
+  assert.deepEqual(result, { deleted: false, absent: true });
+  assert.equal(fake.get(task), undefined);
+  assert.equal(fake.get("D:\\CBApps\\staging") !== undefined, true);
+  assert.equal(fake.handles.size, 0);
+});
+
+test("Skill cross-root copy holds every nested parent against an ancestor junction swap", async () => {
+  const skillMd = Buffer.from("skill");
+  const guide = Buffer.from("guide");
+  const entries = [
+    { path: "docs", size: 0, directory: true },
+    { path: "docs/guide.md", size: guide.length, directory: false, sha256: createHash("sha256").update(guide).digest("hex") },
+    { path: "SKILL.md", size: skillMd.length, directory: false, sha256: createHash("sha256").update(skillMd).digest("hex") },
+  ].sort((left, right) => {
+    const leftKey = left.path.toLowerCase();
+    const rightKey = right.path.toLowerCase();
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : left.path.localeCompare(right.path, "en");
+  });
+  const expected = {
+    requiredFiles: ["SKILL.md", "docs/guide.md"],
+    packageSha256: "9".repeat(64),
+    treeDigest: createHash("sha256").update(JSON.stringify(entries)).digest("hex"),
+    manifestDigest: createHash("sha256").update(JSON.stringify(
+      entries.map(({ path: entryPath, size, directory }) => ({ path: entryPath, size, directory })),
+    )).digest("hex"),
+    skillMdSha256: createHash("sha256").update(skillMd).digest("hex"),
+  };
+  const source = "D:\\CBApps\\staging\\task-skill-task\\skill-documents.prepare";
+  const skillsRoot = "C:\\Users\\me\\.codex\\skills";
+  const preparedRoot = `${skillsRoot}\\.codexbridge-new-documents-${"4".repeat(32)}`;
+  const nestedParent = `${preparedRoot}\\docs`;
+  const fake = createFakeNative([
+    { path: "D:\\CBApps" },
+    { path: "D:\\CBApps\\staging" },
+    { path: "D:\\CBApps\\staging\\task-skill-task" },
+    { path: source },
+    { path: `${source}\\SKILL.md`, kind: "file", data: skillMd },
+    { path: `${source}\\docs` },
+    { path: `${source}\\docs\\guide.md`, kind: "file", data: guide },
+    { path: skillsRoot },
+    { path: "C:\\outside" },
+  ]);
+  const api = capabilities(fake);
+  const installRootCapability = await installRootAuthority("D:\\CBApps");
+  const workspace = await api.openInstallerWorkspaceRootNoFollow(installRootCapability, { maxRelativePath: 100 });
+  const staging = await workspace.openDirectoryChildNoFollow(workspace.root, "staging", { role: "anchor" });
+  const task = await workspace.openDirectoryChildNoFollow(staging, "task-skill-task", { role: "deletable" });
+  const leaf = await workspace.openDirectoryChildNoFollow(task, "skill-documents.prepare", { role: "deletable" });
+  const sealed = await workspace.sealIssuedSkillTreeNoFollow(leaf, {
+    requiredFiles: expected.requiredFiles,
+    packageSha256: expected.packageSha256,
+  });
+  await workspace.close();
+  const verified = await api.verifyPreparedSkillNoFollow({
+    sourceProof: sealed.sourceProof,
+    installRootCapability,
+    requiredFiles: expected.requiredFiles,
+    expectedPackageSha256: expected.packageSha256,
+  });
+  let outsideCreates = 0;
+  fake.onOpenPath(({ path: openedPath, options, handles, get }) => {
+    if (openedPath.toLowerCase() !== `${nestedParent}\\guide.md`.toLowerCase()
+      || options.disposition !== "createNew") return openedPath;
+    const parent = get(nestedParent);
+    const deletionBlocked = [...handles].some((handle) => handle.node === parent
+      && !handle.closed && !handle.options.share.includes("delete"));
+    if (deletionBlocked) return openedPath;
+    outsideCreates += 1;
+    return "C:\\outside\\guide.md";
+  });
+  const swap = await api.openSkillRootNoFollow({
+    installRootCapability,
+    skillsRootCapability: await skillsRootAuthority(skillsRoot),
+  });
+  const staged = await swap.stagePreparedTreeNoFollow({
+    sourceProof: verified.verificationReceipt,
+    skillId: "documents",
+    swapId: "4".repeat(32),
+    expected,
+  });
+  assert.equal(staged.treeDigest, expected.treeDigest);
+  assert.equal(outsideCreates, 0);
+  assert.equal(fake.get("C:\\outside\\guide.md"), undefined);
   await swap.close();
   assert.equal(fake.handles.size, 0);
 });

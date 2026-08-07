@@ -12,6 +12,7 @@ import {
 import { isShortcutBoundToCurrent, isValidShortcutRecord } from "./ownership-task-schema.mjs";
 
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
+const SKILL_ID = /^[a-z0-9][a-z0-9-]{0,63}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
 const FORBIDDEN_CONTEXT_KEYS = new Set(["catalog", "installRoot", "skillsRoot", "desktopPath", "rendererPath"]);
 const COMPONENTS = Object.freeze({
@@ -237,6 +238,10 @@ export function createComponentAdapters({
   const verifySkillCompletionProof = requireMethod(skillFiles, "verifyCompletionProof", "skill_completion_capability_required");
   const recoverSkillCompletionProof = requireMethod(skillFiles, "recoverCompletionProof", "skill_completion_capability_required");
   const reconcileSkillReplacement = requireMethod(skillFiles, "reconcileReplacement", "skill_reconcile_capability_required");
+  const beginPreparedSkillSource = requireMethod(skillFiles, "beginPreparedSource", "skill_prepare_lifecycle_required");
+  const bindPreparedSkillSource = requireMethod(skillFiles, "bindPreparedSource", "skill_prepare_lifecycle_required");
+  const discardPreparedSkillSources = requireMethod(skillFiles, "discardPrepared", "skill_prepare_lifecycle_required");
+  const reconcilePreparedSkillSources = requireMethod(skillFiles, "reconcilePreparedSources", "skill_prepare_lifecycle_required");
   const prepareSkillStaging = requireMethod(installerWorkspace, "prepareSkillStaging", "skill_workspace_required");
   const cleanupAbandonedPrepare = requireMethod(installerWorkspace, "cleanupAbandonedPrepare", "skill_workspace_required");
   const cleanupSkillPackage = requireMethod(installerWorkspace, "cleanupComponentPackage", "skill_workspace_required");
@@ -283,7 +288,7 @@ export function createComponentAdapters({
     }
   }
 
-  async function clearPrepareClaim(claim, lease) {
+  async function clearPrepareClaim(claim, lease, { releaseLease = true } = {}) {
     const key = JSON.stringify(claim);
     try {
       return await runOwnership(async () => {
@@ -296,7 +301,7 @@ export function createComponentAdapters({
         return saveState(cleared);
       });
     } finally {
-      await lease?.release();
+      if (releaseLease) await lease?.release();
     }
   }
 
@@ -1549,6 +1554,8 @@ export function createComponentAdapters({
     try { context = rejectForbiddenContext(rawContext); requireTaskId(context.taskId); }
     catch (error) { return [await failed("skills", "prepare", error)]; }
     const taskId = context.taskId;
+    try { await reconcilePreparedSkillSources(); }
+    catch (error) { return [await failed("skills", "prepare", error)]; }
     const ids = Array.isArray(context.skillIds) ? context.skillIds : [];
     const pending = new Map();
     preparedSkills.set(taskId, pending);
@@ -1558,18 +1565,21 @@ export function createComponentAdapters({
       let operationLease = null;
       let stagingReceipt = null;
       let downloadRecord = null;
-      let preparedVerified = false;
       try {
         const entry = trustedSkill(id);
         claim = { kind: "skill-prepare", taskId, skillId: entry.id, version: entry.version };
         const reservation = await reservePrepareClaim(recoverSkillTransaction, claim);
         ({ claim, lease: operationLease } = reservation);
         const maxRelativePath = skillInstallPeakRelativePath({ taskId, entry });
+        await beginPreparedSkillSource({
+          taskId, skillId: entry.id, leaseScope: claim.leaseScope, leaseNonce: claim.leaseNonce,
+        });
         stagingReceipt = await prepareSkillStaging({ taskId, skillId: entry.id });
         const destination = path.win32.join(installRoot, "staging", `task-${taskId}`, `skill-${entry.id}.prepare`);
         if (!isRecord(stagingReceipt) || stagingReceipt.path !== destination) {
           throw adapterError("skill_staging_receipt_invalid");
         }
+        await bindPreparedSkillSource({ taskId, skillId: entry.id });
         const archivePath = path.win32.join(installRoot, "downloads", `skill-${entry.id}-${entry.version}.zip`);
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
         await revalidateFixedDirectoryCapability(skillsRootCapability);
@@ -1590,6 +1600,7 @@ export function createComponentAdapters({
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
         await revalidateFixedDirectoryCapability(skillsRootCapability);
         const verified = await verifyPreparedSkill({
+          taskId,
           skillId: entry.id,
           expectedVersion: entry.version,
           stagingReceipt,
@@ -1597,16 +1608,28 @@ export function createComponentAdapters({
         });
         const receipt = validateReceipt(verified, "skill_verification_receipt_invalid");
         if (!SHA256.test(verified.skillMdSha256 ?? "")) throw adapterError("skill_md_hash_invalid");
-        preparedVerified = true;
-        try { await clearPrepareClaim(claim, operationLease); } finally { claim = null; operationLease = null; }
-        pending.set(id, Object.freeze({ entry, destination, maxRelativePath, skillMdSha256: verified.skillMdSha256, ...receipt }));
+        await clearPrepareClaim(claim, operationLease, { releaseLease: false });
+        claim = null;
+        pending.set(id, Object.freeze({
+          entry, destination, maxRelativePath, skillMdSha256: verified.skillMdSha256,
+          operationLease, ...receipt,
+        }));
+        operationLease = null;
         results.push(result(id, "prepare", "succeeded", { versionAfter: entry.version, message: "skill_prepared" }));
       } catch (error) {
-        if (!preparedVerified) {
-          if (downloadRecord) await cleanupSkillPackage(downloadRecord).catch(() => {});
-          if (stagingReceipt) await cleanupAbandonedPrepare(stagingReceipt).catch(() => {});
+        if (claim) {
+          await clearPrepareClaim(claim, operationLease).catch(() => {});
+          claim = null;
+          operationLease = null;
+        } else if (operationLease) {
+          await operationLease.release().catch(() => {});
+          operationLease = null;
         }
-        if (claim) await clearPrepareClaim(claim, operationLease).catch(() => {});
+        if (downloadRecord) await cleanupSkillPackage(downloadRecord).catch(() => {});
+        if (stagingReceipt) await cleanupAbandonedPrepare(stagingReceipt).catch(() => {});
+        if (typeof id === "string" && SKILL_ID.test(id)) {
+          await discardPreparedSkillSources({ taskId, skillIds: [id] }).catch(() => {});
+        }
         results.push(await failed(typeof id === "string" ? id : "skills", "prepare", error));
       }
     }
@@ -1623,6 +1646,7 @@ export function createComponentAdapters({
     const results = [];
     for (const id of Array.isArray(context.skillIds) ? context.skillIds : []) {
       const prepared = pending.get(id);
+      let prepareLeaseReleased = false;
       try {
         if (!prepared) throw adapterError("skill_not_prepared");
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath: prepared.maxRelativePath });
@@ -1710,7 +1734,14 @@ export function createComponentAdapters({
         results.push(result(id, "commit", "succeeded", {
           versionBefore: before, versionAfter: prepared.entry.version, message: "skill_replaced",
         }));
-      } catch (error) { results.push(await failed(id, "commit", error)); }
+      } catch (error) {
+        await prepared?.operationLease?.release().catch(() => {});
+        prepareLeaseReleased = true;
+        await discardPreparedSkillSources({ taskId: context.taskId, skillIds: [id] }).catch(() => {});
+        results.push(await failed(id, "commit", error));
+      } finally {
+        if (!prepareLeaseReleased) await prepared?.operationLease?.release().catch(() => {});
+      }
     }
     return results;
   }
@@ -1720,6 +1751,7 @@ export function createComponentAdapters({
       const context = rejectForbiddenContext(rawContext);
       await revalidateInstallRootCapability(installRootCapability);
       await revalidateFixedDirectoryCapability(skillsRootCapability);
+      await reconcilePreparedSkillSources();
       const state = await recoverSkillTransaction();
       if (state.activeTask !== null) throw adapterError("component_pending_transaction");
       const ids = Array.isArray(context.skillIds) ? context.skillIds : Object.keys(state.skills);
@@ -1732,6 +1764,29 @@ export function createComponentAdapters({
           });
       });
     } catch (error) { return [await failed("skills", "inspect", error)]; }
+  }
+
+  async function discardPreparedSkills(rawContext) {
+    const context = rejectForbiddenContext(rawContext);
+    requireTaskId(context.taskId);
+    const skillIds = Array.isArray(context.skillIds) ? context.skillIds : [];
+    if (new Set(skillIds).size !== skillIds.length || skillIds.some((id) => !SKILL_ID.test(id))) {
+      throw adapterError("skill_prepare_discard_invalid");
+    }
+    const pending = preparedSkills.get(context.taskId);
+    if (pending) {
+      const releaseErrors = [];
+      for (const skillId of skillIds) {
+        const prepared = pending.get(skillId);
+        if (!prepared) continue;
+        pending.delete(skillId);
+        try { await prepared.operationLease?.release(); } catch (error) { releaseErrors.push(error); }
+      }
+      if (pending.size === 0) preparedSkills.delete(context.taskId);
+      if (releaseErrors.length === 1) throw releaseErrors[0];
+      if (releaseErrors.length > 1) throw new AggregateError(releaseErrors, "skill_prepare_lease_release_failed");
+    }
+    return discardPreparedSkillSources({ taskId: context.taskId, skillIds });
   }
 
   async function verifySkills(rawContext) {
@@ -1820,6 +1875,7 @@ export function createComponentAdapters({
       inspectInstalled: coordinated(inspectSkills, {}), prepare: prepareSkills,
       commit: coordinated(commitSkills, {}), verify: coordinated(verifySkills, {}),
       uninstall: coordinated(uninstallSkills, {}),
+      discardPrepared: coordinated(discardPreparedSkills, {}),
       rollback: coordinated(async (context) => {
         try { rejectForbiddenContext(context); } catch (error) { return [await failed("skills", "rollback", error)]; }
         return (Array.isArray(context?.skillIds) ? context.skillIds : []).map((id) => result(

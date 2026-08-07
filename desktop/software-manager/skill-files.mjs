@@ -1,5 +1,6 @@
 import path from "node:path";
 import { isTrustedCatalogService } from "./catalog-trust.mjs";
+import { readInstallRootCapability } from "./path-policy.mjs";
 
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
 const SWAP_ID = /^[a-f0-9]{32}$/u;
@@ -104,8 +105,19 @@ function normalizeRequiredFiles(value) {
 
 function requireCapabilities(value) {
   if (!value || typeof value.verifyPreparedSkillNoFollow !== "function"
-    || typeof value.openSkillRootNoFollow !== "function") {
+    || typeof value.openSkillRootNoFollow !== "function"
+    || typeof value.inspectPreparedSkillSourceNoFollow !== "function"
+    || typeof value.validatePreparedSkillSourceForDeletionNoFollow !== "function"
+    || typeof value.deletePreparedSkillSourceNoFollow !== "function") {
     throw skillError("skill_file_capabilities_required");
+  }
+  return value;
+}
+
+function requirePrepareJournal(value) {
+  if (!value || typeof value.record !== "function" || typeof value.load !== "function"
+    || typeof value.list !== "function" || typeof value.clear !== "function") {
+    throw skillError("skill_prepare_journal_required");
   }
   return value;
 }
@@ -168,19 +180,129 @@ function validateProof(value) {
 
 export function createSkillFileService({
   fileCapabilities, installRootCapability, skillsRootCapability, catalogService, workspace,
-  swapJournal, hashFile,
+  swapJournal, prepareJournal, prepareLeaseStore, hashFile,
 } = {}) {
   const files = requireCapabilities(fileCapabilities);
   const journal = requireJournal(swapJournal);
+  const preparedJournal = requirePrepareJournal(prepareJournal);
+  if (!prepareLeaseStore || typeof prepareLeaseStore.acquireOperationLease !== "function") {
+    throw skillError("skill_prepare_lease_capability_required");
+  }
   const stagingWorkspace = requireWorkspace(workspace);
   if (!isTrustedCatalogService(catalogService)) throw skillError("trusted_catalog_service_required");
   if (!installRootCapability || typeof installRootCapability !== "object"
     || !skillsRootCapability || typeof skillsRootCapability !== "object") {
     throw skillError("skill_root_capabilities_required");
   }
+  const installRoot = readInstallRootCapability(installRootCapability);
   if (typeof hashFile !== "function") throw skillError("skill_hash_capability_required");
   const verificationReceipts = new WeakMap();
   const completionReceipts = new WeakMap();
+
+  function preparedSourcePath(taskId, skillId) {
+    return path.win32.join(installRoot, "staging", `task-${taskId}`, `skill-${skillId}.prepare`);
+  }
+
+  async function beginPreparedSource(raw = {}) {
+    if (!exact(raw, ["taskId", "skillId", "leaseScope", "leaseNonce"])
+      || !TASK_ID.test(raw.taskId ?? "") || !SKILL_ID.test(raw.skillId ?? "")
+      || raw.leaseScope !== "prepare" || !SWAP_ID.test(raw.leaseNonce ?? "")) {
+      throw skillError("skill_prepare_request_invalid");
+    }
+    catalogService.getSkill(raw.skillId);
+    return preparedJournal.record({
+      schemaVersion: 1,
+      phase: "intent",
+      taskId: raw.taskId,
+      skillId: raw.skillId,
+      installRoot,
+      sourcePath: preparedSourcePath(raw.taskId, raw.skillId),
+      leaseScope: raw.leaseScope,
+      leaseNonce: raw.leaseNonce,
+      identity: null,
+      evidence: null,
+    });
+  }
+
+  async function bindPreparedSource(raw = {}) {
+    if (!exact(raw, ["taskId", "skillId"]) || !TASK_ID.test(raw.taskId ?? "")
+      || !SKILL_ID.test(raw.skillId ?? "")) throw skillError("skill_prepare_request_invalid");
+    const transaction = await preparedJournal.load(raw);
+    if (!transaction || transaction.snapshot.phase !== "intent") throw skillError("skill_prepare_intent_missing");
+    const inspected = await files.inspectPreparedSkillSourceNoFollow({
+      installRootCapability, taskId: raw.taskId, skillId: raw.skillId,
+    });
+    if (!exact(inspected, ["kind", "identity", "sourcePath"]) || inspected.kind !== "empty"
+      || inspected.sourcePath !== transaction.snapshot.sourcePath) {
+      throw skillError("skill_prepare_source_not_empty");
+    }
+    const sourceIdentity = publicIdentity(inspected.identity);
+    return preparedJournal.record({
+      ...transaction.snapshot,
+      phase: "bound",
+      identity: sourceIdentity,
+      evidence: null,
+    });
+  }
+
+  async function discardOnePrepared(taskId, skillId) {
+    const transaction = await preparedJournal.load({ taskId, skillId });
+    if (!transaction) return false;
+    let record = transaction.snapshot;
+    if (["bound", "sealed"].includes(record.phase)) {
+      const validated = await files.validatePreparedSkillSourceForDeletionNoFollow({
+        installRootCapability,
+        taskId,
+        skillId,
+        expectedIdentity: record.identity,
+        expectedEvidence: record.evidence,
+      });
+      if (!plain(validated) || !["absent", "directory"].includes(validated.kind)
+        || validated.sourcePath !== record.sourcePath
+        || (validated.kind === "directory" && !sameIdentity(validated.identity, record.identity))) {
+        throw skillError("skill_prepare_delete_validation_invalid");
+      }
+      record = await preparedJournal.record({ ...record, phase: "deleting" });
+    }
+    await files.deletePreparedSkillSourceNoFollow({
+      installRootCapability,
+      taskId,
+      skillId,
+      expectedIdentity: record.identity,
+      expectedEvidence: null,
+    });
+    await preparedJournal.clear({ taskId, skillId });
+    return true;
+  }
+
+  async function discardPrepared(raw = {}) {
+    if (!exact(raw, ["taskId", "skillIds"]) || !TASK_ID.test(raw.taskId ?? "")
+      || !Array.isArray(raw.skillIds) || new Set(raw.skillIds).size !== raw.skillIds.length
+      || raw.skillIds.some((skillId) => !SKILL_ID.test(skillId))) {
+      throw skillError("skill_prepare_discard_invalid");
+    }
+    const results = [];
+    for (const skillId of raw.skillIds) results.push(await discardOnePrepared(raw.taskId, skillId));
+    return results;
+  }
+
+  async function reconcilePreparedSources() {
+    const records = await preparedJournal.list();
+    let recovered = 0;
+    for (const record of records) {
+      const lease = await prepareLeaseStore.acquireOperationLease({
+        nonce: record.leaseNonce, scope: record.leaseScope, wait: false,
+      });
+      if (lease === null) continue;
+      try {
+        await discardOnePrepared(record.taskId, record.skillId);
+        recovered += 1;
+      } finally {
+        await lease.release();
+      }
+    }
+    return recovered;
+  }
 
   async function openRoot(authorizedRoot) {
     const root = canonical(authorizedRoot, "skill_root_invalid");
@@ -196,13 +318,18 @@ export function createSkillFileService({
   }
 
   async function verifyPreparedSkill(raw) {
-    if (!exact(raw, ["skillId", "expectedVersion", "stagingReceipt", "packageProof"])
+    if (!exact(raw, ["taskId", "skillId", "expectedVersion", "stagingReceipt", "packageProof"])
+      || !TASK_ID.test(raw.taskId ?? "")
       || raw.stagingReceipt === null || typeof raw.stagingReceipt !== "object"
       || raw.packageProof === null || typeof raw.packageProof !== "object") {
       throw skillError("skill_prepared_plan_invalid");
     }
     const entry = catalogService.getSkill(raw.skillId);
     if (raw.expectedVersion !== entry.version) throw skillError("skill_catalog_version_mismatch");
+    const preparedTransaction = await preparedJournal.load({ taskId: raw.taskId, skillId: entry.id });
+    if (!preparedTransaction || preparedTransaction.snapshot.phase !== "bound") {
+      throw skillError("skill_prepare_source_unbound");
+    }
     const requiredFiles = normalizeRequiredFiles([...entry.files]);
     const sealed = await stagingWorkspace.sealSkillStaging(
       raw.stagingReceipt,
@@ -224,17 +351,28 @@ export function createSkillFileService({
     }
     const sourcePath = canonical(verified.sourcePath, "skill_prepared_evidence_invalid");
     const evidence = directoryEvidence(verified.evidence, "skill_prepared_evidence_invalid");
+    if (sourcePath !== preparedTransaction.snapshot.sourcePath
+      || !sameIdentity(evidence.identity, preparedTransaction.snapshot.identity)) {
+      throw skillError("skill_prepared_identity_changed");
+    }
     if (sealed.evidence !== undefined
       && !sameEvidence(directoryEvidence(sealed.evidence, "skill_prepared_evidence_invalid"), evidence)) {
       throw skillError("skill_prepared_evidence_invalid");
     }
     const receipt = Object.freeze(Object.create(null));
+    await preparedJournal.record({
+      ...preparedTransaction.snapshot,
+      phase: "sealed",
+      evidence,
+    });
     verificationReceipts.set(receipt, {
       sourcePath,
       sourceIdentity: evidence.identity,
       evidence,
       requiredFiles,
       packageSha256: entry.sha256,
+      taskId: raw.taskId,
+      skillId: entry.id,
       capabilityReceipt: verified.verificationReceipt,
       state: "issued",
     });
@@ -266,6 +404,7 @@ export function createSkillFileService({
     const previousEvidence = directoryEvidence(raw.previousEvidence, "skill_previous_evidence_invalid", true);
     const receipt = verificationReceipts.get(raw.verificationReceipt);
     if (!receipt || receipt.state !== "issued" || receipt.sourcePath !== source
+      || receipt.taskId !== raw.taskId || receipt.skillId !== parts.skillId
       || receipt.packageSha256.length !== 64 || !evidenceMatches(receipt.evidence, expected)
       || JSON.stringify(receipt.requiredFiles) !== JSON.stringify(expected.requiredFiles)) {
       throw skillError("skill_source_receipt_invalid");
@@ -297,6 +436,10 @@ export function createSkillFileService({
     };
   }
 
+  async function discardSourceAfterPreparedDurable(plan) {
+    await discardOnePrepared(plan.taskId, plan.skillId);
+  }
+
   async function replaceExact(raw) {
     const plan = replacementPlan(raw);
     plan.receipt.state = "busy";
@@ -318,6 +461,7 @@ export function createSkillFileService({
       if (!evidenceMatches(staged, plan.expected)) throw skillError("skill_prepared_evidence_invalid");
       const identities = { prepared: staged.identity, new: staged.identity };
       await journal.record(journalRecord(plan, session, "prepared", identities));
+      await discardSourceAfterPreparedDurable(plan);
       const current = directoryEvidence(await session.inspectDirectChildNoFollow(targetSpec), "skill_previous_evidence_invalid", true);
       if (!sameEvidence(current, plan.previousEvidence)) throw skillError("skill_previous_evidence_changed");
       if (current.kind === "directory") {
@@ -415,6 +559,7 @@ export function createSkillFileService({
         record = (await journal.load({ taskId: request.taskId, swapId: request.swapId })).snapshot;
       }
       if (record.phase === "prepared") {
+        await discardSourceAfterPreparedDurable(plan);
         const prepared = directoryEvidence(await session.inspectDirectChildNoFollow(preparedSpec), "skill_swap_ambiguous", true);
         const current = directoryEvidence(await session.inspectDirectChildNoFollow(targetSpec), "skill_swap_ambiguous", true);
         const old = directoryEvidence(await session.inspectDirectChildNoFollow(oldSpec), "skill_swap_ambiguous", true);
@@ -460,8 +605,11 @@ export function createSkillFileService({
       if (record.phase === "proof_written") {
         const old = directoryEvidence(await session.inspectDirectChildNoFollow(oldSpec), "skill_swap_ambiguous", true);
         if (record.previousEvidence.kind === "directory") {
-          if (!sameEvidence(old, record.previousEvidence)) throw skillError("skill_swap_ambiguous");
-          await session.deleteDirectChildTreeNoFollow({ child: oldSpec, expectedEvidence: record.previousEvidence });
+          if (sameEvidence(old, record.previousEvidence)) {
+            await session.deleteDirectChildTreeNoFollow({ child: oldSpec, expectedEvidence: record.previousEvidence });
+          } else if (old.kind !== "absent") {
+            throw skillError("skill_swap_ambiguous");
+          }
         } else if (old.kind !== "absent") throw skillError("skill_swap_ambiguous");
         await journal.record(journalRecord(plan, session, "cleanup_committed", identities));
         record = (await journal.load({ taskId: request.taskId, swapId: request.swapId })).snapshot;
@@ -571,6 +719,10 @@ export function createSkillFileService({
   }
 
   return Object.freeze({
+    beginPreparedSource,
+    bindPreparedSource,
+    discardPrepared,
+    reconcilePreparedSources,
     verifyPreparedSkill,
     hashFile: hashSkillFile,
     replaceExact,
