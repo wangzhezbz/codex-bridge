@@ -6,20 +6,26 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  bundledSevenZipPath,
   createDefaultSkillRecoveryHooks,
+  createLazyShortcutFileApi,
   createPinnedSevenZipExecution,
   createProductionSoftwareManagerService,
 } from "../desktop/software-manager/runtime-factory.mjs";
+import { createCapabilityRecordStore } from "../desktop/software-manager/capability-record-store.mjs";
 import { authorizeInstallRoot, authorizeSkillsRoot } from "../desktop/software-manager/path-policy.mjs";
 import { createSkillPrepareJournal } from "../desktop/software-manager/skill-prepare-journal.mjs";
+import { createSkillSwapJournal } from "../desktop/software-manager/skill-swap-journal.mjs";
 
 const CATALOG_URL = "https://shanhaiyouling.com/codexbridge-install-test/component-catalog.json";
-const SEVEN_ZIP_PATH = "C:\\Program Files\\CodexBridge\\resources\\app.asar.unpacked\\node_modules\\7zip-bin\\win\\x64\\7za.exe";
+const SEVEN_ZIP_PATH = bundledSevenZipPath();
 
 function memoryRecoveryFs() {
   let sequence = 0;
   const entries = new Map();
   const deleted = [];
+  const skillTrees = new Map();
+  const skillKey = (spec) => JSON.stringify(spec);
   const handle = (node) => ({
     entry: { name: node.name, identity: node.identity },
     async readFile() { return node.data; },
@@ -47,9 +53,28 @@ function memoryRecoveryFs() {
       return {
         rootPath: "C:\\Users\\Example\\.codex\\skills",
         rootIdentity: { volumeSerial: "volume", fileId: "skills-root" },
-        async inspectDirectChildNoFollow() { return { kind: "absent" }; },
-        async stagePreparedTreeNoFollow() {}, async recoverPreparedTreeNoFollow() {},
-        async renameDirectChildNoReplace() {}, async deleteDirectChildTreeNoFollow() {}, async close() {},
+        async inspectDirectChildNoFollow(spec) {
+          return structuredClone(skillTrees.get(skillKey(spec)) ?? { kind: "absent" });
+        },
+        async stagePreparedTreeNoFollow() {},
+        async recoverPreparedTreeNoFollow({ skillId, swapId, expected }) {
+          const evidence = {
+            kind: "directory", identity: { volumeSerial: "volume", fileId: `prepared-${swapId}` },
+            treeDigest: expected.treeDigest, manifestDigest: expected.manifestDigest,
+            skillMdSha256: expected.skillMdSha256,
+          };
+          skillTrees.set(skillKey({ kind: "prepared", skillId, swapId }), evidence);
+          return structuredClone(evidence);
+        },
+        async renameDirectChildNoReplace({ from, to }) {
+          const evidence = skillTrees.get(skillKey(from));
+          if (!evidence) throw new Error("missing_skill_tree");
+          skillTrees.delete(skillKey(from));
+          skillTrees.set(skillKey(to), evidence);
+          return structuredClone(evidence);
+        },
+        async deleteDirectChildTreeNoFollow({ child }) { skillTrees.delete(skillKey(child)); },
+        async close() {},
       };
     },
     async inspectPreparedSkillSourceNoFollow() {},
@@ -57,6 +82,61 @@ function memoryRecoveryFs() {
     async deletePreparedSkillSourceNoFollow(plan) { deleted.push(plan); },
   };
 }
+
+function memoryRecordCapabilities(initial = {}) {
+  const files = new Map(Object.entries(initial));
+  const opened = [];
+  return {
+    files,
+    opened,
+    async openStateDirectoryNoFollow() {
+      return {
+        async openFileNoFollow(name, flags) {
+          opened.push(name);
+          if (flags !== "r") throw new Error("unexpected_write");
+          if (!files.has(name)) return null;
+          return {
+            entry: { name },
+            async readFile() { return files.get(name); },
+            async close() {},
+          };
+        },
+        async unlinkEntryNoFollow() { throw new Error("unexpected_unlink"); },
+        async renameEntryNoFollow() { throw new Error("unexpected_rename"); },
+        async close() {},
+      };
+    },
+  };
+}
+
+test("capability record store falls back only from corrupt primary JSON and fails closed when backup is corrupt", async () => {
+  const recoveredFs = memoryRecordCapabilities({
+    "catalog.json": "{broken",
+    "catalog.json.bak": JSON.stringify({ schemaVersion: 1, payload: "trusted-backup" }),
+  });
+  const recovered = createCapabilityRecordStore({
+    fileCapabilities: recoveredFs, directoryPath: "C:\\data", fileName: "catalog.json",
+  });
+  assert.deepEqual(await recovered.read(), { schemaVersion: 1, payload: "trusted-backup" });
+  assert.deepEqual(recoveredFs.opened, ["catalog.json", "catalog.json.bak"]);
+
+  const corruptFs = memoryRecordCapabilities({ "catalog.json": "[]", "catalog.json.bak": "null" });
+  const corrupt = createCapabilityRecordStore({
+    fileCapabilities: corruptFs, directoryPath: "C:\\data", fileName: "catalog.json",
+  });
+  await assert.rejects(corrupt.read(), /software_manager_record_store_corrupt/u);
+
+  const ioError = Object.assign(new Error("access_denied"), { code: "EACCES" });
+  const deniedFs = memoryRecordCapabilities({ "catalog.json": "{}", "catalog.json.bak": "{}" });
+  deniedFs.openStateDirectoryNoFollow = async () => ({
+    async openFileNoFollow() { throw ioError; },
+    async unlinkEntryNoFollow() {}, async renameEntryNoFollow() {}, async close() {},
+  });
+  const denied = createCapabilityRecordStore({
+    fileCapabilities: deniedFs, directoryPath: "C:\\data", fileName: "catalog.json",
+  });
+  await assert.rejects(denied.read(), (error) => error === ioError);
+});
 
 function result(componentId, action, status = "skipped") {
   return {
@@ -101,6 +181,9 @@ function catalog() {
     name: id,
     version: "1.0.0",
     size: 1,
+    sha256: "a".repeat(64),
+    assetUrl: `https://shanhaiyouling.com/codexbridge-install-test/${id}.zip`,
+    format: id === "v2rayn" ? "7z" : id === "git" ? "exe" : "zip",
     supportsRollback: id !== "git",
   })]));
   return Object.freeze({
@@ -132,14 +215,18 @@ function fixture({
   skillAuthorityError = null,
   skillAuthorityFailures = 0,
   includeSkillRecoveryHooks = false,
+  skillRecoveryStatus = undefined,
   activeTask = null,
   rootFactories = null,
+  catalogSequence = null,
 } = {}) {
   const calls = [];
   let ownership = state(persistedRoot);
   ownership.activeTask = activeTask;
   let currentToken = null;
   let tokenSequence = 0;
+  let catalogRefreshIndex = 0;
+  let slotRecoveryOwnership;
   const tokens = new Map();
   const journal = {
     scopeId: "c:\\runtime-data\\journal",
@@ -166,7 +253,13 @@ function fixture({
         },
         async createSlots({ installRootCapability }) {
           calls.push(["slots", installRootCapability]);
-          return Object.freeze({ async recoverJournalTransactions() { calls.push("slots:recover"); return []; } });
+          return Object.freeze({
+            async recoverJournalTransactions() {
+              calls.push("slots:recover");
+              if (slotRecoveryOwnership !== undefined) ownership = structuredClone(slotRecoveryOwnership);
+              return [];
+            },
+          });
         },
         async getDesktopCapability() {
           calls.push("desktop-authority");
@@ -183,7 +276,11 @@ function fixture({
         async inferSkillInstallRoot() { calls.push("skills:infer-root"); return null; },
         async recoverActiveSkillTransaction() {
           if (includeSkillRecoveryHooks) calls.push("skills:recover-active");
+          if (skillRecoveryStatus !== undefined) {
+            return Object.freeze({ status: skillRecoveryStatus, state: structuredClone(ownership), heldLease: null });
+          }
           ownership.activeTask = null;
+          return Object.freeze({ status: "recovered", state: structuredClone(ownership), heldLease: null });
         },
         async cleanupAbandonedPreparedSkills() {
           if (includeSkillRecoveryHooks) calls.push("skills:cleanup-prepared");
@@ -194,8 +291,17 @@ function fixture({
     createCatalogProvider(options) {
       calls.push(["catalog-provider", options.publicKeyPem]);
       return Object.freeze({
-        async getCurrent() { calls.push("catalog:get"); return options.publicKeyPem === null ? null : currentCatalog; },
-        async refresh() { calls.push("catalog:refresh"); return options.publicKeyPem === null ? null : currentCatalog; },
+        async getCurrent() {
+          calls.push("catalog:get");
+          return options.publicKeyPem === null ? null : (catalogSequence?.[Math.max(0, catalogRefreshIndex - 1)] ?? currentCatalog);
+        },
+        async refresh() {
+          calls.push("catalog:refresh");
+          if (options.publicKeyPem === null) return null;
+          const selected = catalogSequence?.[Math.min(catalogRefreshIndex, catalogSequence.length - 1)] ?? currentCatalog;
+          catalogRefreshIndex += 1;
+          return selected;
+        },
       });
     },
     createRootAdapters(options) {
@@ -224,6 +330,12 @@ function fixture({
       await this.adopt(chosen.token);
       return chosen.token;
     },
+    async clearCurrent() {
+      calls.push("resolver:clear");
+      const prior = currentToken;
+      currentToken = null;
+      if (prior !== null) tokens.delete(prior);
+    },
   };
   const createInfrastructure = runtimeFactories.createWindowsInfrastructure;
   runtimeFactories.createWindowsInfrastructure = (options) => {
@@ -235,6 +347,9 @@ function fixture({
   return {
     calls,
     currentCatalog,
+    getOwnership() { return structuredClone(ownership); },
+    installRootResolver,
+    setSlotRecoveryOwnership(next) { slotRecoveryOwnership = structuredClone(next); },
     runtimeFactories,
     options: {
       platform,
@@ -314,6 +429,21 @@ test("each selected root creates only root-bound adapters and slots without pers
   assert.equal(JSON.stringify(await harness.runtimeFactories.lastInfrastructure.ownershipStore.load()).includes("root_token_"), false);
 });
 
+test("catalog refresh rebuilds adapters for the same root capability with the new catalog identity", async () => {
+  const firstCatalog = catalog();
+  const secondCatalog = catalog();
+  const harness = fixture({ catalogSequence: [firstCatalog, secondCatalog] });
+  const runtime = await createProductionSoftwareManagerService(harness.options);
+  await runtime.service.refresh();
+  await runtime.selectInstallRoot("D:\\CBApps");
+  await runtime.service.refresh();
+  const compositions = harness.calls.filter((entry) => Array.isArray(entry) && entry[0] === "root-adapters");
+  assert.equal(compositions.length, 2);
+  assert.equal(compositions[0][2], firstCatalog);
+  assert.equal(compositions[1][2], secondCatalog);
+  assert.equal(compositions[0][1], compositions[1][1]);
+});
+
 test("root adapter composition receives the fixed bundled 7z path and pinned hash", async () => {
   const harness = fixture();
   let composition;
@@ -326,10 +456,33 @@ test("root adapter composition receives the fixed bundled 7z path and pinned has
 
 test("default root composition binds workspace, files, and adapters to the selected capability", async () => {
   const seen = {};
+  let managerPreparedCalls = 0;
+  let workspacePreparedCalls = 0;
   const rootFactories = {
-    createDownloadManager(options) { seen.download = options; return { kind: "download" }; },
-    createInstallerWorkspace(options) { seen.workspace = options; return { kind: "workspace" }; },
-    createWorkspaceDownloader(options) { seen.downloader = options; return { download: async () => {} }; },
+    createDownloadManager(options) {
+      seen.download = options;
+      return { async downloadPrepared() { managerPreparedCalls += 1; throw new Error("path_reopen_forbidden"); } };
+    },
+    createInstallerWorkspace(options) {
+      seen.workspace = options;
+      return {
+        async prepareDownloadFile({ componentId, version, extension, size, sha256 }) {
+          const record = {
+            path: `D:\\CBApps\\downloads\\${componentId}-${version}${extension}`,
+            partPath: `D:\\CBApps\\downloads\\${componentId}-${version}${extension}.part`,
+            size, sha256,
+            async promotePartNoReplace(receipt) { assert.equal(receipt.bound, true); return { path: this.path }; },
+          };
+          return record;
+        },
+        async downloadPrepared(record, { asset }) {
+          workspacePreparedCalls += 1;
+          assert.equal(record.partPath.endsWith(".part"), true);
+          assert.equal(asset.url, "https://shanhaiyouling.com/codexbridge-install-test/chatgpt.zip");
+          return { bound: true };
+        },
+      };
+    },
     createArchiveService(options) { seen.archive = options; return { extractArchive: async () => {} }; },
     createComponentFileService(options) { seen.files = options; return { kind: "files" }; },
     createRetainedInstallerStore(options) {
@@ -353,6 +506,16 @@ test("default root composition binds workspace, files, and adapters to the selec
   assert.equal(harness.calls.includes("desktop-authority"), false);
   assert.equal(harness.calls.includes("skills-authority"), false);
   assert.equal(harness.calls.includes("windows-host"), false);
+  await seen.adapters.downloader.download({
+    asset: {
+      url: "https://shanhaiyouling.com/codexbridge-install-test/chatgpt.zip",
+      size: 1,
+      sha256: "a".repeat(64),
+    },
+    destination: "D:\\CBApps\\downloads\\chatgpt-1.0.0.zip",
+  });
+  assert.equal(workspacePreparedCalls, 1);
+  assert.equal(managerPreparedCalls, 0);
 });
 
 test("production composition rejects a caller-selected 7z binary before native construction", async () => {
@@ -365,6 +528,15 @@ test("production composition rejects a caller-selected 7z binary before native c
     catalogUrl: CATALOG_URL,
     sevenZipPath: "C:\\attacker\\node_modules\\7zip-bin\\win\\x64\\7za.exe",
   }), /software_manager_7z_path_rejected/u);
+});
+
+test("runtime factory injection cannot authorize a caller-selected 7z binary", async () => {
+  const harness = fixture();
+  await assert.rejects(createProductionSoftwareManagerService({
+    ...harness.options,
+    sevenZipPath: "C:\\attacker\\node_modules\\7zip-bin\\win\\x64\\7za.exe",
+  }), /software_manager_7z_path_rejected/u);
+  assert.equal(harness.calls.some((entry) => Array.isArray(entry) && entry[0] === "windows-infrastructure"), false);
 });
 
 test("pinned 7z execution rechecks every spawn and holds the stream pin until completion", async (t) => {
@@ -396,7 +568,12 @@ test("pinned 7z execution rechecks every spawn and holds the stream pin until co
     async execFile() { execCalls += 1; return { stdout: "", stderr: "" }; },
     async spawn() {
       spawnCalls += 1;
-      return { completed: new Promise((resolve) => { finishStream = resolve; }) };
+      return {
+        stdout: { pipe() {} },
+        stderr: { async *[Symbol.asyncIterator]() {} },
+        cancel() {},
+        completed: new Promise((resolve) => { finishStream = resolve; }),
+      };
     },
   });
   await execution.spawnFile(executable, ["t"], {});
@@ -417,6 +594,218 @@ test("pinned 7z execution rechecks every spawn and holds the stream pin until co
   finishStream();
   await child.completed;
   assert.equal(pinsClosed, closedBeforeCompletion + 1);
+});
+
+test("pinned 7z stream preserves prototype accessors and binds cancel to the started child", async (t) => {
+  const directory = await fsPromises.mkdtemp(path.join(os.tmpdir(), "codexbridge-7z-abi-"));
+  const executable = path.join(directory, "7za.exe");
+  await fsPromises.writeFile(executable, "trusted");
+  t.after(async () => {
+    await fsPromises.unlink(executable).catch(() => {});
+    await fsPromises.rmdir(directory).catch(() => {});
+  });
+  const stdout = { pipe() {} };
+  const stderr = { async *[Symbol.asyncIterator]() {} };
+  class Child {
+    get stdout() { return stdout; }
+    get stderr() { return stderr; }
+    get completed() { return Promise.resolve({ exitCode: 0 }); }
+    cancel() { assert.equal(this, child); this.cancelled = true; }
+  }
+  const child = new Child();
+  const execution = createPinnedSevenZipExecution({
+    fileCapabilities: {
+      async pinArchiveFileNoFollow() {
+        return { async assertStableNoFollow() {}, async close() {} };
+      },
+    },
+    sevenZipPath: executable,
+    sevenZipSha256: createHash("sha256").update("trusted").digest("hex"),
+    async execFile() {},
+    async spawn() { return child; },
+  });
+  const stream = await execution.spawnStream(executable, [], {});
+  assert.equal(stream.stdout, stdout);
+  assert.equal(stream.stderr, stderr);
+  stream.cancel();
+  assert.equal(child.cancelled, true);
+  assert.deepEqual(await stream.completed, { exitCode: 0 });
+});
+
+test("invalid pinned 7z child is cancelled and settled before its executable pin closes", async (t) => {
+  const directory = await fsPromises.mkdtemp(path.join(os.tmpdir(), "codexbridge-7z-invalid-"));
+  const executable = path.join(directory, "7za.exe");
+  await fsPromises.writeFile(executable, "trusted");
+  t.after(async () => {
+    await fsPromises.unlink(executable).catch(() => {});
+    await fsPromises.rmdir(directory).catch(() => {});
+  });
+  const order = [];
+  let finish;
+  const execution = createPinnedSevenZipExecution({
+    fileCapabilities: {
+      async pinArchiveFileNoFollow() {
+        return { async assertStableNoFollow() {}, async close() { order.push("close"); } };
+      },
+    },
+    sevenZipPath: executable,
+    sevenZipSha256: createHash("sha256").update("trusted").digest("hex"),
+    async execFile() {},
+    async spawn() {
+      return {
+        cancel() { order.push("cancel"); finish({ exitCode: 1 }); },
+        completed: new Promise((resolve) => { finish = resolve; }),
+      };
+    },
+  });
+  await assert.rejects(execution.spawnStream(executable, [], {}), /software_manager_spawn_result_invalid/u);
+  assert.deepEqual(order, ["cancel", "close"]);
+});
+
+test("pinned 7z completion preserves the process failure when pin cleanup also fails", async (t) => {
+  const directory = await fsPromises.mkdtemp(path.join(os.tmpdir(), "codexbridge-7z-errors-"));
+  const executable = path.join(directory, "7za.exe");
+  await fsPromises.writeFile(executable, "trusted");
+  t.after(async () => {
+    await fsPromises.unlink(executable).catch(() => {});
+    await fsPromises.rmdir(directory).catch(() => {});
+  });
+  const primary = new Error("process_failed");
+  const execution = createPinnedSevenZipExecution({
+    fileCapabilities: {
+      async pinArchiveFileNoFollow() {
+        return { async assertStableNoFollow() {}, async close() { throw new Error("pin_close_failed"); } };
+      },
+    },
+    sevenZipPath: executable,
+    sevenZipSha256: createHash("sha256").update("trusted").digest("hex"),
+    async execFile() {},
+    async spawn() {
+      return {
+        stdout: { pipe() {} }, stderr: { async *[Symbol.asyncIterator]() {} }, cancel() {},
+        completed: Promise.reject(primary),
+      };
+    },
+  });
+  await assert.rejects(execution.spawnStream(executable, [], {}).then(({ completed }) => completed), (error) => {
+    assert.equal(error instanceof AggregateError, true);
+    assert.equal(error.cause, primary);
+    assert.deepEqual(error.errors.map(({ message }) => message), ["process_failed", "pin_close_failed"]);
+    return true;
+  });
+});
+
+test("pinned 7z file execution preserves the process failure when pin cleanup also fails", async (t) => {
+  const directory = await fsPromises.mkdtemp(path.join(os.tmpdir(), "codexbridge-7z-file-errors-"));
+  const executable = path.join(directory, "7za.exe");
+  await fsPromises.writeFile(executable, "trusted");
+  t.after(async () => {
+    await fsPromises.unlink(executable).catch(() => {});
+    await fsPromises.rmdir(directory).catch(() => {});
+  });
+  const primary = new Error("exec_failed");
+  const execution = createPinnedSevenZipExecution({
+    fileCapabilities: {
+      async pinArchiveFileNoFollow() {
+        return { async assertStableNoFollow() {}, async close() { throw new Error("pin_close_failed"); } };
+      },
+    },
+    sevenZipPath: executable,
+    sevenZipSha256: createHash("sha256").update("trusted").digest("hex"),
+    async execFile() { throw primary; },
+    async spawn() {},
+  });
+  await assert.rejects(execution.spawnFile(executable, [], {}), (error) => {
+    assert.equal(error instanceof AggregateError, true);
+    assert.equal(error.cause, primary);
+    assert.deepEqual(error.errors.map(({ message }) => message), ["exec_failed", "pin_close_failed"]);
+    return true;
+  });
+});
+
+test("invalid pinned 7z child getter cannot bypass pin cleanup", async (t) => {
+  const directory = await fsPromises.mkdtemp(path.join(os.tmpdir(), "codexbridge-7z-getter-"));
+  const executable = path.join(directory, "7za.exe");
+  await fsPromises.writeFile(executable, "trusted");
+  t.after(async () => {
+    await fsPromises.unlink(executable).catch(() => {});
+    await fsPromises.rmdir(directory).catch(() => {});
+  });
+  let closed = 0;
+  const execution = createPinnedSevenZipExecution({
+    fileCapabilities: {
+      async pinArchiveFileNoFollow() {
+        return { async assertStableNoFollow() {}, async close() { closed += 1; } };
+      },
+    },
+    sevenZipPath: executable,
+    sevenZipSha256: createHash("sha256").update("trusted").digest("hex"),
+    async execFile() {},
+    async spawn() {
+      return Object.defineProperties({}, {
+        stdout: { get() { throw new Error("hostile_getter"); } },
+        cancel: { get() { throw new Error("must_not_reread"); } },
+        completed: { get() { throw new Error("must_not_reread"); } },
+      });
+    },
+  });
+  await assert.rejects(execution.spawnStream(executable, [], {}), (error) => (
+    error?.code === "software_manager_spawn_result_invalid" && error.cause?.message === "hostile_getter"
+  ));
+  assert.equal(closed, 1);
+});
+
+test("default shortcut facade keeps receipts on one API instance, exposes all methods, and retries denial", async () => {
+  let capabilityCalls = 0;
+  let apiCalls = 0;
+  let denyOnce = true;
+  const liveReceipts = new WeakSet();
+  const events = [];
+  const shortcutFileApi = createLazyShortcutFileApi({
+    async getDesktopCapability() {
+      capabilityCalls += 1;
+      if (denyOnce) {
+        denyOnce = false;
+        throw Object.assign(new Error("desktop_denied"), { code: "EACCES" });
+      }
+      return Object.freeze({ kind: "desktop", sequence: capabilityCalls });
+    },
+    fileCapabilities: {
+      createShortcutFileApi(capability) {
+        apiCalls += 1;
+        const instance = apiCalls;
+        const requireReceipt = (receipt) => {
+          if (!liveReceipts.has(receipt)) throw new Error("foreign_shortcut_receipt");
+        };
+        return {
+          async inspectExact() { events.push([instance, "inspect", capability.sequence]); return { kind: "absent" }; },
+          async createTemp() {
+            const receipt = Object.freeze(Object.create(null));
+            liveReceipts.add(receipt); events.push([instance, "createTemp"]); return receipt;
+          },
+          async sealTemp(receipt) { requireReceipt(receipt); events.push([instance, "sealTemp"]); return receipt; },
+          async commitNoReplace(receipt) { requireReceipt(receipt); events.push([instance, "commit"]); return { path: "desktop.lnk" }; },
+          async removeTemp(receipt) { requireReceipt(receipt); events.push([instance, "removeTemp"]); },
+          async removeExact() { events.push([instance, "removeExact"]); },
+          async release() { events.push([instance, "release"]); },
+        };
+      },
+    },
+  });
+  await assert.rejects(shortcutFileApi.inspectExact("ChatGPT.lnk"), /desktop_denied/u);
+  const receipt = await shortcutFileApi.createTemp("ChatGPT.lnk");
+  await shortcutFileApi.sealTemp(receipt);
+  await shortcutFileApi.commitNoReplace(receipt);
+  await shortcutFileApi.inspectExact("ChatGPT.lnk");
+  await shortcutFileApi.release();
+  await shortcutFileApi.removeExact("ChatGPT.lnk");
+  assert.equal(capabilityCalls, 2);
+  assert.equal(apiCalls, 1);
+  assert.deepEqual(events.map(([instance, method]) => [instance, method]), [
+    [1, "createTemp"], [1, "sealTemp"], [1, "commit"],
+    [1, "inspect"], [1, "release"], [1, "removeExact"],
+  ]);
+  assert.equal(typeof shortcutFileApi.removeTemp, "function");
 });
 
 test("host, Desktop, and Skills authorities are separately lazy and cached", async () => {
@@ -484,6 +873,23 @@ test("offline recovery uses only local ownership journal root authorization and 
   assert.equal(harness.calls.filter((entry) => Array.isArray(entry) && entry[0] === "slots").length, 1);
 });
 
+test("slot recovery clearing first-install ownership revokes the old resolver token instead of restoring the inferred root", async () => {
+  const harness = fixture({ persistedRoot: "D:\\CBApps" });
+  const runtime = await createProductionSoftwareManagerService(harness.options);
+  await runtime.service.getSnapshot();
+  const oldToken = harness.installRootResolver.getCurrentToken();
+  assert.equal(typeof oldToken, "string");
+  harness.setSlotRecoveryOwnership(state(null));
+  await runtime.recoverOffline();
+  assert.equal(harness.installRootResolver.getCurrentToken(), null);
+  assert.equal(harness.calls.includes("resolver:clear"), true);
+  assert.equal(await harness.installRootResolver.resolve(oldToken), undefined);
+  const adaptersBefore = harness.calls.filter((entry) => Array.isArray(entry) && entry[0] === "root-adapters").length;
+  await runtime.service.getSnapshot();
+  const adaptersAfter = harness.calls.filter((entry) => Array.isArray(entry) && entry[0] === "root-adapters").length;
+  assert.equal(adaptersAfter, adaptersBefore);
+});
+
 test("startup recovery orders slots before Skill reconciliation and restores the resolver token last", async () => {
   const harness = fixture({
     persistedRoot: "D:\\CBApps",
@@ -500,6 +906,21 @@ test("startup recovery orders slots before Skill reconciliation and restores the
   assert.equal(slotRecovery < activeSkill && activeSkill < preparedCleanup && preparedCleanup < adapter, true);
   assert.equal(harness.calls.includes("catalog:refresh"), false);
   assert.equal(harness.calls.includes("windows-host"), false);
+});
+
+test("startup recovery never cleans prepared Skills when task ownership changed during recovery", async () => {
+  const task = { kind: "skill-replace" };
+  const harness = fixture({
+    persistedRoot: "D:\\CBApps",
+    includeSkillRecoveryHooks: true,
+    skillRecoveryStatus: "changed",
+    activeTask: task,
+  });
+  const runtime = await createProductionSoftwareManagerService(harness.options);
+  await runtime.recoverOffline();
+  assert.equal(harness.calls.includes("skills:recover-active"), true);
+  assert.equal(harness.calls.includes("skills:cleanup-prepared"), false);
+  assert.deepEqual(harness.getOwnership().activeTask, task);
 });
 
 test("default Skill recovery infers a skill-only reserved root before swap and cleans its abandoned prepare", async () => {
@@ -534,6 +955,7 @@ test("default Skill recovery infers a skill-only reserved root before swap and c
   ownership.activeTask = {
     kind: "skill-replace", phase: "reserved", taskId, skillId,
     swapId: "8".repeat(32), skillsRoot: "C:\\Users\\Example\\.codex\\skills",
+    installRoot: "D:\\CBApps", leaseScope: "prepare", leaseNonce,
     target: "C:\\Users\\Example\\.codex\\skills\\documents",
     version: "1.0.0", packageSha256: "a".repeat(64), skillMdSha256: "b".repeat(64),
     treeDigest: "c".repeat(64), manifestDigest: "d".repeat(64), previousEvidence: { kind: "absent" },
@@ -564,6 +986,152 @@ test("default Skill recovery infers a skill-only reserved root before swap and c
   await hooks.cleanupAbandonedPreparedSkills({ installRootCapability });
   assert.equal(fsApi.deleted.length, 1);
   assert.equal(await hooks.inferSkillInstallRoot(ownership), null);
+});
+
+test("default Skill recovery releases task A lease without mutating a replacement task B", async () => {
+  const fsApi = memoryRecoveryFs();
+  const skillRoot = "C:\\Users\\Example\\.codex\\skills";
+  const installRootCapability = await authorizeInstallRoot({
+    candidate: "D:\\CBApps", env: {}, maxRelativePath: 180,
+    access: async () => {}, realpath: async (value) => value,
+    lstat: async () => ({
+      dev: 1, ino: 2, isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false,
+    }),
+  });
+  const skillsRootCapability = await authorizeSkillsRoot({
+    candidate: skillRoot, realpath: async (value) => value,
+    lstat: async () => ({
+      dev: 1, ino: 3, isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false,
+    }),
+  });
+  const task = (taskId, nonce) => ({
+    kind: "skill-replace", phase: "reserved", taskId, skillId: "documents",
+    swapId: taskId === "task-a" ? "a".repeat(32) : "b".repeat(32),
+    skillsRoot: skillRoot, installRoot: "D:\\CBApps", leaseScope: "prepare", leaseNonce: nonce,
+    target: `${skillRoot}\\documents`, version: "1.0.0",
+    packageSha256: "1".repeat(64), skillMdSha256: "2".repeat(64),
+    treeDigest: "3".repeat(64), manifestDigest: "4".repeat(64), previousEvidence: { kind: "absent" },
+  });
+  const taskA = task("task-a", "5".repeat(32));
+  const taskB = task("task-b", "6".repeat(32));
+  let ownership = state("D:\\CBApps");
+  ownership.activeTask = taskA;
+  let released = 0;
+  const ownershipStore = {
+    async load() { return structuredClone(ownership); },
+    async compareAndSwap(expected, next) {
+      assert.equal(expected, ownership.generation);
+      ownership = { ...structuredClone(next), generation: expected + 1 };
+      return structuredClone(ownership);
+    },
+    async acquireOperationLease({ nonce, scope, wait }) {
+      assert.deepEqual({ nonce, scope, wait }, { nonce: taskA.leaseNonce, scope: "prepare", wait: false });
+      ownership.activeTask = structuredClone(taskB);
+      return { async release() { released += 1; } };
+    },
+  };
+  const hooks = createDefaultSkillRecoveryHooks({
+    fileCapabilities: fsApi, ownershipStore, dataRoot: "C:\\runtime-data", skillsRoot: skillRoot,
+    skillPathAccess: {
+      realpath: async (value) => value,
+      lstat: async () => ({
+        dev: 1, ino: 4, isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false,
+      }),
+    },
+  });
+  const recovered = await hooks.recoverActiveSkillTransaction({ installRootCapability, skillsRootCapability });
+  assert.equal(recovered.status, "changed");
+  assert.equal(recovered.heldLease, null);
+  assert.equal(released, 1);
+  assert.deepEqual(ownership.activeTask, taskB);
+  assert.equal(ownership.lastTask, null);
+});
+
+test("default Skill recovery leaves a live swap WAL untouched and recovers it only after lease death", async () => {
+  const fsApi = memoryRecoveryFs();
+  const taskId = "swap-live";
+  const skillId = "documents";
+  const swapId = "a".repeat(32);
+  const leaseNonce = "b".repeat(32);
+  const skillRoot = "C:\\Users\\Example\\.codex\\skills";
+  const sourcePath = `D:\\CBApps\\staging\\task-${taskId}\\skill-${skillId}.prepare`;
+  const target = `${skillRoot}\\${skillId}`;
+  const swapJournal = createSkillSwapJournal({
+    journalDir: "C:\\runtime-data\\skill-swaps", fsApi, skillsRoot: skillRoot,
+  });
+  await swapJournal.record({
+    schemaVersion: 1, phase: "reserved", taskId, swapId, skillId,
+    skillsRoot: skillRoot, target, sourcePath, leaseScope: "prepare", leaseNonce,
+    preparedPath: `${skillRoot}\\.codexbridge-new-${skillId}-${swapId}`,
+    oldPath: `${skillRoot}\\.codexbridge-old-${skillId}-${swapId}`,
+    identities: {
+      root: { volumeSerial: "volume", fileId: "skills-root" },
+      source: { volumeSerial: "volume", fileId: "source" },
+      prepared: null, old: null, new: null,
+    },
+    previousEvidence: { kind: "absent" },
+    expectedEvidence: {
+      treeDigest: "1".repeat(64), manifestDigest: "2".repeat(64), skillMdSha256: "3".repeat(64),
+      requiredFiles: ["SKILL.md"],
+    },
+  });
+  const installRootCapability = await authorizeInstallRoot({
+    candidate: "D:\\CBApps", env: {}, maxRelativePath: 180,
+    access: async () => {}, realpath: async (value) => value,
+    lstat: async () => ({
+      dev: 1, ino: 2, isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false,
+    }),
+  });
+  const skillsRootCapability = await authorizeSkillsRoot({
+    candidate: skillRoot, realpath: async (value) => value,
+    lstat: async () => ({
+      dev: 1, ino: 3, isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false,
+    }),
+  });
+  let ownership = state("D:\\CBApps");
+  ownership.activeTask = {
+    kind: "skill-replace", phase: "reserved", taskId, swapId, skillId,
+    installRoot: "D:\\CBApps", skillsRoot: skillRoot, target,
+    version: "1.0.0", packageSha256: "4".repeat(64), skillMdSha256: "3".repeat(64),
+    treeDigest: "1".repeat(64), manifestDigest: "2".repeat(64), previousEvidence: { kind: "absent" },
+    leaseScope: "prepare", leaseNonce,
+  };
+  let live = true;
+  let released = 0;
+  const ownershipStore = {
+    async load() { return structuredClone(ownership); },
+    async compareAndSwap(expected, next) {
+      assert.equal(expected, ownership.generation);
+      ownership = { ...structuredClone(next), generation: expected + 1 };
+      return structuredClone(ownership);
+    },
+    async acquireOperationLease() {
+      if (live) return null;
+      return { async release() { released += 1; } };
+    },
+  };
+  const hooks = createDefaultSkillRecoveryHooks({
+    fileCapabilities: fsApi, ownershipStore, dataRoot: "C:\\runtime-data", skillsRoot: skillRoot,
+    skillPathAccess: {
+      realpath: async (value) => value,
+      lstat: async () => ({
+        dev: 1, ino: 4, isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false,
+      }),
+    },
+  });
+  assert.equal(await hooks.inferSkillInstallRoot(ownership), "D:\\CBApps");
+  const busy = await hooks.recoverActiveSkillTransaction({ installRootCapability, skillsRootCapability });
+  assert.equal(busy.status, "busy");
+  assert.equal(ownership.activeTask.taskId, taskId);
+  assert.notEqual(await swapJournal.load({ taskId, swapId }), null);
+
+  live = false;
+  const recovered = await hooks.recoverActiveSkillTransaction({ installRootCapability, skillsRootCapability });
+  assert.equal(recovered.status, "recovered");
+  assert.equal(ownership.activeTask, null);
+  await hooks.cleanupAbandonedPreparedSkills({ installRootCapability, heldLease: recovered.heldLease });
+  assert.equal(released, 1);
+  assert.equal(await swapJournal.load({ taskId, swapId }), null);
 });
 
 test("service events use the injected bounded structured log sink", async () => {

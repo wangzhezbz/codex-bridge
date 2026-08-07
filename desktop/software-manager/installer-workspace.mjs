@@ -89,6 +89,8 @@ function requireSession(value) {
     "createFileChildNoFollow",
     "openFileChildNoFollow",
     "inspectIssuedChildNoFollow",
+    "resetIssuedFileNoFollow",
+    "createIssuedFileWriteStreamNoFollow",
     "sealIssuedFileNoFollow",
     "sealIssuedSkillTreeNoFollow",
     "renameIssuedChildNoReplace",
@@ -117,6 +119,61 @@ export function createInstallerWorkspace({
   const authorities = new WeakMap();
   const promotedPackageProofs = new WeakMap();
   const pending = new Map();
+
+  function requireDownloadAuthority(record) {
+    const authority = authorities.get(record);
+    if (!authority || authority.kind !== "download") throw workspaceError("workspace_receipt_invalid");
+    if (authority.state !== "issued") throw workspaceError("workspace_receipt_consumed");
+    return authority;
+  }
+
+  function createDownloadTarget(authority) {
+    return Object.freeze(Object.assign(Object.create(null), {
+      async inspect() {
+        if (authority.state !== "issued") throw workspaceError("workspace_receipt_consumed");
+        await revalidateInstallRootCapability(installRootCapability, {
+          maxRelativePath: authority.relativePath.length,
+        });
+        return authority.session.inspectIssuedChildNoFollow(authority.fileReceipt);
+      },
+      async reset() {
+        if (authority.state !== "issued" || authority.phase !== "partial") {
+          throw workspaceError("workspace_receipt_consumed");
+        }
+        authority.fileReceipt = await authority.session.resetIssuedFileNoFollow(authority.fileReceipt, {});
+      },
+      async createWriteStream({ append, maxBytes, signal }) {
+        if (authority.state !== "issued" || authority.phase !== "partial") {
+          throw workspaceError("workspace_receipt_consumed");
+        }
+        await revalidateInstallRootCapability(installRootCapability, {
+          maxRelativePath: authority.relativePath.length,
+        });
+        return authority.session.createIssuedFileWriteStreamNoFollow(
+          authority.fileReceipt, { append, maxBytes, signal },
+        );
+      },
+      async verify({ size, sha256, signal }) {
+        if (authority.state !== "issued") throw workspaceError("workspace_receipt_consumed");
+        if (size !== authority.size || sha256 !== authority.sha256) {
+          throw workspaceError("workspace_download_binding_invalid");
+        }
+        await revalidateInstallRootCapability(installRootCapability, {
+          maxRelativePath: authority.relativePath.length,
+        });
+        if (authority.phase === "partial") {
+          authority.fileReceipt = await authority.session.sealIssuedFileNoFollow(
+            authority.fileReceipt, { size, sha256, signal },
+          );
+          authority.phase = "sealed";
+        } else {
+          const inspected = await authority.session.inspectIssuedChildNoFollow(authority.fileReceipt);
+          if (inspected.size !== size) throw workspaceError("workspace_file_size_mismatch");
+        }
+        return Object.freeze({ size, sha256 });
+      },
+    }));
+  }
 
   async function openRoot(relativePath) {
     const maxRelativePath = relativePath.length;
@@ -203,7 +260,7 @@ export function createInstallerWorkspace({
     const authority = claimRecord(record, "download");
     try {
       consumePreparedDownloadVerification(downloads, verificationReceipt, {
-        partPath: authority.partPath,
+        target: authority.downloadTarget,
         size: authority.size,
         sha256: authority.sha256,
       });
@@ -222,6 +279,8 @@ export function createInstallerWorkspace({
           { size: authority.size, sha256: authority.sha256 },
         );
         authority.phase = "sealed";
+      } else {
+        await authority.session.inspectIssuedChildNoFollow(authority.fileReceipt);
       }
       authority.fileReceipt = await authority.session.renameIssuedChildNoReplace(
         authority.fileReceipt,
@@ -288,6 +347,8 @@ export function createInstallerWorkspace({
           ...publicFields,
           relativePath,
         });
+        const authority = authorities.get(record);
+        authority.downloadTarget = createDownloadTarget(authority);
         return record;
       } catch (error) {
         await session.close().catch((closeError) => {
@@ -333,6 +394,16 @@ export function createInstallerWorkspace({
         version: entry.version,
         extension: ".zip",
       },
+    });
+  }
+
+  async function downloadPrepared(record, { asset, signal, onProgress } = {}) {
+    const authority = requireDownloadAuthority(record);
+    if (!asset || asset.size !== authority.size || asset.sha256 !== authority.sha256) {
+      throw workspaceError("workspace_download_binding_invalid");
+    }
+    return downloads.downloadPrepared({
+      asset, target: authority.downloadTarget, signal, onProgress,
     });
   }
 
@@ -549,6 +620,7 @@ export function createInstallerWorkspace({
   return Object.freeze({
     prepareDownloadFile,
     prepareSkillDownloadFile,
+    downloadPrepared,
     prepareComponentStaging,
     prepareSkillStaging,
     cleanupAbandonedPrepare,

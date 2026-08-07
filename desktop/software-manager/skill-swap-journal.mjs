@@ -4,6 +4,7 @@ const SCHEMA_VERSION = 1;
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
 const SWAP_ID = /^[a-f0-9]{32}$/u;
 const SKILL_ID = /^[a-z0-9][a-z0-9-]{0,63}$/u;
+const LEASE_NONCE = /^[a-f0-9]{32}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
 const PHASES = Object.freeze([
   "reserved",
@@ -14,7 +15,7 @@ const PHASES = Object.freeze([
   "cleanup_committed",
 ]);
 const RECORD_KEYS = Object.freeze([
-  "schemaVersion", "phase", "taskId", "swapId", "skillId", "skillsRoot", "target",
+  "schemaVersion", "phase", "taskId", "swapId", "skillId", "leaseScope", "leaseNonce", "skillsRoot", "target",
   "sourcePath", "preparedPath", "oldPath", "identities", "previousEvidence", "expectedEvidence",
 ]);
 
@@ -99,7 +100,8 @@ function expectedEvidence(value) {
 function normalizeRecord(value, skillsRoot) {
   if (!exact(value, RECORD_KEYS) || value.schemaVersion !== SCHEMA_VERSION
     || !PHASES.includes(value.phase) || !TASK_ID.test(value.taskId ?? "")
-    || !SWAP_ID.test(value.swapId ?? "") || !SKILL_ID.test(value.skillId ?? "")) {
+    || !SWAP_ID.test(value.swapId ?? "") || !SKILL_ID.test(value.skillId ?? "")
+    || value.leaseScope !== "prepare" || !LEASE_NONCE.test(value.leaseNonce ?? "")) {
     throw journalError("skill_swap_record_invalid");
   }
   const root = canonical(skillsRoot);
@@ -142,6 +144,8 @@ function normalizeRecord(value, skillsRoot) {
     taskId: value.taskId,
     swapId: value.swapId,
     skillId: value.skillId,
+    leaseScope: value.leaseScope,
+    leaseNonce: value.leaseNonce,
     skillsRoot: root,
     target: value.target,
     sourcePath,

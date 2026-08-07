@@ -6,7 +6,7 @@ import { createServer } from "node:http";
 import { mkdtemp, readFile, readdir, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Readable } from "node:stream";
+import { Readable, Writable } from "node:stream";
 import test from "node:test";
 
 import {
@@ -153,6 +153,53 @@ test("prepared mode verifies one exact part without publishing and issues an opa
   } finally {
     await origin.close();
   }
+});
+
+test("prepared capability target resumes, writes, and verifies without reopening a filesystem path", async () => {
+  let content = Buffer.from(body.subarray(0, 7));
+  const calls = [];
+  const target = Object.freeze({
+    async inspect() { calls.push("inspect"); return { size: content.length }; },
+    async reset() { calls.push("reset"); content = Buffer.alloc(0); },
+    async createWriteStream({ append, maxBytes }) {
+      calls.push(["writer", append, maxBytes]);
+      if (!append) content = Buffer.alloc(0);
+      return new Writable({
+        write(chunk, _encoding, callback) {
+          content = Buffer.concat([content, Buffer.from(chunk)]);
+          callback(content.length <= maxBytes ? null : new Error("too_large"));
+        },
+      });
+    },
+    async verify({ size, sha256 }) {
+      calls.push("verify");
+      assert.equal(content.length, size);
+      assert.equal(createHash("sha256").update(content).digest("hex"), sha256);
+      return { size, sha256 };
+    },
+  });
+  const manager = createDownloadManager({
+    fsApi: {
+      async stat() { throw new Error("global_stat_forbidden"); },
+      createWriteStream() { throw new Error("global_write_forbidden"); },
+      createReadStream() { throw new Error("global_hash_forbidden"); },
+    },
+    async fetchImpl(_url, { headers }) {
+      assert.equal(headers.Range, "bytes=7-");
+      return new Response(body.subarray(7), {
+        status: 206,
+        headers: { "Content-Range": `bytes 7-${body.length - 1}/${body.length}` },
+      });
+    },
+    retryPolicy: { maxAttempts: 1, delayMs: 0 },
+  });
+  const asset = assetFor("https://shanhaiyouling.com/codexbridge-test/packages/component.zip");
+  const receipt = await manager.downloadPrepared({ asset, target });
+  assert.deepEqual(content, body);
+  assert.deepEqual(calls, ["inspect", ["writer", true, body.length], "verify"]);
+  assert.deepEqual(consumePreparedDownloadVerification(manager, receipt, {
+    target, size: asset.size, sha256: asset.sha256,
+  }), { target, size: asset.size, sha256: asset.sha256 });
 });
 
 test("prepared verification binding mismatch consumes the receipt and cannot be retried with corrected metadata", async () => {

@@ -205,7 +205,9 @@ async function recoverSkillOwnershipState({
   if (task.kind === "skill-replace") {
     if (!["reserved", "applied"].includes(task.phase) || !SHA256.test(task.packageSha256 ?? "")
       || !SHA256.test(task.skillMdSha256 ?? "") || !SHA256.test(task.treeDigest ?? "")
-      || !SHA256.test(task.manifestDigest ?? "") || !/^[a-f0-9]{32}$/u.test(task.swapId ?? "")) {
+      || !SHA256.test(task.manifestDigest ?? "") || !/^[a-f0-9]{32}$/u.test(task.swapId ?? "")
+      || task.installRoot !== readInstallRootCapability(installRootCapability)
+      || task.leaseScope !== "prepare" || !/^[a-f0-9]{32}$/u.test(task.leaseNonce ?? "")) {
       throw adapterError("skill_recovery_record_invalid");
     }
     const previousEvidence = validatePreviousSkillEvidence(task.previousEvidence);
@@ -266,7 +268,7 @@ async function recoverSkillOwnershipState({
 
 export async function recoverSkillOwnershipOffline({
   ownershipStore, installRootCapability, skillsRootCapability, skillFiles,
-  resolveSkillTarget: resolveTarget, skillPathAccess = {},
+  resolveSkillTarget: resolveTarget, skillPathAccess = {}, expectedTask,
 } = {}) {
   await revalidateInstallRootCapability(installRootCapability);
   await revalidateFixedDirectoryCapability(skillsRootCapability);
@@ -276,10 +278,20 @@ export async function recoverSkillOwnershipOffline({
   try { coordinator = getOwnershipCoordinator(ownershipStore); } catch (error) {
     throw adapterError("component_ownership_store_required", error);
   }
-  return coordinator.runExclusive(async (store) => recoverSkillOwnershipState({
-    state: await store.load(), saveState: store.save.bind(store), skillsRoot, skillFiles,
-    resolveTarget, skillPathAccess, installRootCapability,
-  }));
+  const expectedTaskKey = JSON.stringify(expectedTask ?? null);
+  return coordinator.runExclusive(async (store) => {
+    const state = await store.load();
+    if (JSON.stringify(state.activeTask ?? null) !== expectedTaskKey) {
+      return Object.freeze({ status: "changed", state });
+    }
+    return Object.freeze({
+      status: "recovered",
+      state: await recoverSkillOwnershipState({
+        state, saveState: store.save.bind(store), skillsRoot, skillFiles,
+        resolveTarget, skillPathAccess, installRootCapability,
+      }),
+    });
+  });
 }
 
 export function createComponentAdapters({
@@ -572,10 +584,22 @@ export function createComponentAdapters({
   async function recoverSkillTransaction() {
     await ensureSkillsAuthority();
     const state = await recoverAbandonedPrepareClaim(await loadState());
-    return recoverSkillOwnershipState({
-      state, saveState, skillsRoot, skillFiles, resolveTarget: resolveSkillTarget,
-      skillPathAccess, installRootCapability,
-    });
+    const task = state?.activeTask;
+    if (!isRecord(task) || !["skill-replace", "skill-uninstall"].includes(task.kind)) return state;
+    if (task.kind === "skill-uninstall") {
+      return recoverSkillOwnershipState({
+        state, saveState, skillsRoot, skillFiles, resolveTarget: resolveSkillTarget,
+        skillPathAccess, installRootCapability,
+      });
+    }
+    const lease = await acquireOperationLease({ nonce: task.leaseNonce, scope: task.leaseScope, wait: false });
+    if (lease === null) return state;
+    try {
+      return await recoverSkillOwnershipState({
+        state, saveState, skillsRoot, skillFiles, resolveTarget: resolveSkillTarget,
+        skillPathAccess, installRootCapability,
+      });
+    } finally { await lease.release(); }
   }
 
   async function recoverComponentUninstall() {
@@ -1680,11 +1704,12 @@ export function createComponentAdapters({
         const receipt = validateReceipt(verified, "skill_verification_receipt_invalid");
         if (!SHA256.test(verified.skillMdSha256 ?? "")) throw adapterError("skill_md_hash_invalid");
         await clearPrepareClaim(claim, operationLease, { releaseLease: false });
-        claim = null;
         pending.set(id, Object.freeze({
           entry, destination, maxRelativePath, skillMdSha256: verified.skillMdSha256,
+          leaseScope: claim.leaseScope, leaseNonce: claim.leaseNonce,
           operationLease, ...receipt,
         }));
+        claim = null;
         operationLease = null;
         results.push(result(id, "prepare", "succeeded", { versionAfter: entry.version, message: "skill_prepared" }));
       } catch (error) {
@@ -1739,10 +1764,12 @@ export function createComponentAdapters({
         const reserved = structuredClone(state);
         const swapId = randomBytes(16).toString("hex");
         reserved.activeTask = {
-          kind: "skill-replace", phase: "reserved", taskId: context.taskId, swapId, skillId: id, skillsRoot, target,
+          kind: "skill-replace", phase: "reserved", taskId: context.taskId, swapId, skillId: id,
+          installRoot, skillsRoot, target,
           version: prepared.entry.version, packageSha256: prepared.entry.sha256,
           skillMdSha256: prepared.skillMdSha256, treeDigest: prepared.treeDigest,
           manifestDigest: prepared.manifestDigest, previousEvidence,
+          leaseScope: prepared.leaseScope, leaseNonce: prepared.leaseNonce,
         };
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath: prepared.maxRelativePath });
         await revalidateFixedDirectoryCapability(activeSkillsRootCapability);
@@ -1751,6 +1778,7 @@ export function createComponentAdapters({
         await revalidateFixedDirectoryCapability(activeSkillsRootCapability);
         const replacement = await replaceSkillExact({
           taskId: context.taskId, swapId, source: prepared.destination, target, authorizedRoot: skillsRoot, backup: false,
+          leaseScope: prepared.leaseScope, leaseNonce: prepared.leaseNonce,
           verificationReceipt: prepared.verificationReceipt,
           treeDigest: prepared.treeDigest, manifestDigest: prepared.manifestDigest,
           skillMdSha256: prepared.skillMdSha256, requiredFiles: prepared.entry.files, previousEvidence,

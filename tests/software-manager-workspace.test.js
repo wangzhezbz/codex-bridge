@@ -172,13 +172,44 @@ function fakeWorkspaceCapabilities({ expectedInstallRootCapability = null, skill
             if (!node || node.identity !== record.identity) throw Object.assign(new Error("windows_identity_changed"), { code: "windows_identity_changed" });
             return Object.freeze({ path: record.path, kind: record.kind, size: node.size, empty: node.empty });
           },
+          async resetIssuedFileNoFollow(receipt) {
+            const record = this.require(receipt);
+            const node = nodes.get(key(record.path));
+            if (!node || node.identity !== record.identity) throw Object.assign(new Error("windows_identity_changed"), { code: "windows_identity_changed" });
+            node.data = Buffer.alloc(0);
+            node.size = 0;
+            calls.push(["reset-file", record.path]);
+            return receipt;
+          },
+          async createIssuedFileWriteStreamNoFollow(receipt, { append, maxBytes, signal } = {}) {
+            const record = this.require(receipt);
+            const node = nodes.get(key(record.path));
+            if (!node || node.identity !== record.identity) throw Object.assign(new Error("windows_identity_changed"), { code: "windows_identity_changed" });
+            if (!append && node.data.length !== 0) throw new Error("workspace_file_reset_required");
+            calls.push(["writer", record.path, append]);
+            return new Writable({
+              write(chunk, _encoding, callback) {
+                if (signal?.aborted) { callback(Object.assign(new Error("aborted"), { code: "ABORT_ERR" })); return; }
+                const current = nodes.get(key(record.path));
+                if (!current || current.identity !== record.identity) {
+                  callback(Object.assign(new Error("windows_identity_changed"), { code: "windows_identity_changed" }));
+                  return;
+                }
+                const next = Buffer.concat([current.data, Buffer.from(chunk)]);
+                if (next.length > maxBytes) { callback(new Error("workspace_file_size_exceeded")); return; }
+                current.data = next;
+                current.size = next.length;
+                callback();
+              },
+            });
+          },
           async sealIssuedFileNoFollow(receipt, { size, sha256, signal } = {}) {
             const record = this.require(receipt);
             const node = nodes.get(key(record.path));
             calls.push(["seal", record.path, size, sha256]);
             if (signal?.aborted) throw Object.assign(new Error("workspace_file_seal_cancelled"), { code: "ABORT_ERR" });
             if (!node || node.identity !== record.identity) throw Object.assign(new Error("windows_identity_changed"), { code: "windows_identity_changed" });
-            if (record.kind !== "file" || record.sealed) throw Object.assign(new Error("workspace_file_receipt_required"), { code: "workspace_file_receipt_required" });
+            if (record.kind !== "file") throw Object.assign(new Error("workspace_file_receipt_required"), { code: "workspace_file_receipt_required" });
             if (node.data.length !== size) throw Object.assign(new Error("workspace_file_size_mismatch"), { code: "workspace_file_size_mismatch" });
             if (createHash("sha256").update(node.data).digest("hex") !== sha256) {
               throw Object.assign(new Error("workspace_file_hash_mismatch"), { code: "workspace_file_hash_mismatch" });
@@ -320,6 +351,7 @@ test("workspace derives deterministic children and rejects renderer-controlled i
     "cleanupAbandonedPrepare",
     "cleanupComponentPackage",
     "consumePromotedPackageProof",
+    "downloadPrepared",
     "prepareComponentStaging",
     "prepareDownloadFile",
     "prepareSkillDownloadFile",
@@ -342,9 +374,8 @@ test("workspace seals one issued Skill staging tree into an opaque source proof"
   const download = await workspace.prepareSkillDownloadFile({
     skillId: entry.id, version: entry.version, size: entry.size, sha256: entry.sha256,
   });
-  const verification = await preparedDownloadManager.downloadPrepared({
+  const verification = await workspace.downloadPrepared(download, {
     asset: { url: entry.assetUrl, size: entry.size, sha256: entry.sha256 },
-    partPath: download.partPath,
   });
   const promoted = await download.promotePartNoReplace(verification);
   const staging = await workspace.prepareSkillStaging({ taskId: "skill-task", skillId: "documents" });
@@ -381,9 +412,8 @@ test("failed Skill sealing keeps the exact promoted package recoverable until or
   const download = await workspace.prepareSkillDownloadFile({
     skillId: entry.id, version: entry.version, size: entry.size, sha256: entry.sha256,
   });
-  const verification = await preparedDownloadManager.downloadPrepared({
+  const verification = await workspace.downloadPrepared(download, {
     asset: { url: entry.assetUrl, size: entry.size, sha256: entry.sha256 },
-    partPath: download.partPath,
   });
   const promoted = await download.promotePartNoReplace(verification);
   const staging = await workspace.prepareSkillStaging({ taskId: "failed-skill", skillId: entry.id });
@@ -500,9 +530,8 @@ test("download preparation issues one exact adjacent part and promotes it by hel
     /verification_receipt_invalid/u,
   );
   assert.equal(fake.calls.some(([operation]) => operation === "rename"), false);
-  const verification = await downloadManager.downloadPrepared({
+  const verification = await workspace.downloadPrepared(download, {
     asset: { url: "https://shanhaiyouling.com/codexbridge-test/packages/chatgpt.zip", ...packageMetadata() },
-    partPath: download.partPath,
   });
   const promoted = await download.promotePartNoReplace(verification);
   assert.equal(promoted.path, download.path);
@@ -536,22 +565,17 @@ test("download preparation issues one exact adjacent part and promotes it by hel
   await assert.rejects(workspace.cleanupComponentPackage(download), /workspace_receipt_consumed/u);
 });
 
-test("download promotion rejects a same-length rewrite after manager verification and never publishes it", async () => {
+test("download promotion rejects an identity replacement after manager verification and never publishes it", async () => {
   const fake = fakeWorkspaceCapabilities();
   const { downloadManager, workspace } = await createWorkspace(fake);
   const request = downloadRequest("chatgpt", "1.2.4", ".zip");
   const download = await workspace.prepareDownloadFile(request);
-  const verification = await downloadManager.downloadPrepared({
+  const verification = await workspace.downloadPrepared(download, {
     asset: { url: "https://shanhaiyouling.com/codexbridge-test/packages/chatgpt.zip", ...packageMetadata() },
-    partPath: download.partPath,
   });
-  const hostile = Buffer.alloc(PACKAGE.length, 0x78);
-  assert.equal(hostile.length, PACKAGE.length);
-  const node = fake.nodes.get(download.partPath.toLowerCase());
-  node.data = hostile;
-  node.size = hostile.length;
+  fake.add(download.partPath, "file", { data: PACKAGE });
 
-  await assert.rejects(download.promotePartNoReplace(verification), /workspace_file_hash_mismatch/u);
+  await assert.rejects(download.promotePartNoReplace(verification), /windows_identity_changed/u);
   assert.equal(fake.nodes.has(download.path.toLowerCase()), false);
   assert.equal(fake.calls.some(([operation]) => operation === "rename"), false);
 });
@@ -567,15 +591,14 @@ test("prepared cancellation and hash failure retain only the exact part and neve
     const controller = new AbortController();
     if (mode === "cancel") controller.abort();
     await assert.rejects(
-      downloadManager.downloadPrepared({
+      workspace.downloadPrepared(prepared, {
         asset: {
           url: `https://shanhaiyouling.com/codexbridge-test/packages/${mode}.exe`,
           ...packageMetadata(),
         },
-        partPath: prepared.partPath,
         signal: controller.signal,
       }),
-      mode === "cancel" ? { name: "AbortError" } : /sha256/i,
+      mode === "cancel" ? { name: "AbortError" } : /(?:sha256|hash)/i,
     );
     assert.equal(fake.nodes.has(prepared.partPath.toLowerCase()), true);
     assert.equal(fake.nodes.has(prepared.path.toLowerCase()), false);
@@ -682,12 +705,12 @@ test("download rename collision consumes verification and requires a fresh exact
     url: "https://shanhaiyouling.com/codexbridge-test/packages/chatgpt.zip",
     ...packageMetadata(),
   };
-  const firstVerification = await downloadManager.downloadPrepared({ asset, partPath: download.partPath });
+  const firstVerification = await workspace.downloadPrepared(download, { asset });
   fake.add(download.path, "file", { size: 1 });
   await assert.rejects(download.promotePartNoReplace(firstVerification), /entry_exists/u);
   fake.nodes.delete(download.path.toLowerCase());
   await assert.rejects(download.promotePartNoReplace(firstVerification), /verification_receipt_consumed/u);
-  const secondVerification = await downloadManager.downloadPrepared({ asset, partPath: download.partPath });
+  const secondVerification = await workspace.downloadPrepared(download, { asset });
   const promoted = await download.promotePartNoReplace(secondVerification);
   assert.equal(promoted.path, download.path);
   assert.equal(typeof promoted.packageProof, "object");

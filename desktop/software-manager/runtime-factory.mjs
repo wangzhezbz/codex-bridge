@@ -7,6 +7,7 @@ import { createRequire } from "node:module";
 import { TEST_CATALOG_ORIGIN, TEST_CATALOG_PATH } from "../../shared/software-manager/catalog-schema.mjs";
 import { createArchiveService } from "./archive-service.mjs";
 import { createCatalogCache } from "./catalog-cache.mjs";
+import { createCapabilityRecordStore } from "./capability-record-store.mjs";
 import { createCachedCatalogProvider } from "./catalog-provider.mjs";
 import { createComponentAdapters, recoverSkillOwnershipOffline } from "./component-adapters.mjs";
 import { createComponentFileService } from "./component-files.mjs";
@@ -133,71 +134,6 @@ function disabledService(platform) {
   });
 }
 
-async function withRecordDirectory(fileCapabilities, directoryPath, operation) {
-  const directory = await fileCapabilities.openStateDirectoryNoFollow(directoryPath);
-  if (!directory || typeof directory.openFileNoFollow !== "function"
-    || typeof directory.unlinkEntryNoFollow !== "function"
-    || typeof directory.renameEntryNoFollow !== "function" || typeof directory.close !== "function") {
-    await directory?.close?.().catch(() => {});
-    throw runtimeError("software_manager_record_store_invalid");
-  }
-  let result;
-  let primaryError = null;
-  try { result = await operation(directory); } catch (error) { primaryError = error; }
-  try { await directory.close(); } catch (error) {
-    if (primaryError) throw new AggregateError([primaryError, error], primaryError.message, { cause: primaryError });
-    throw error;
-  }
-  if (primaryError) throw primaryError;
-  return result;
-}
-
-function createCapabilityRecordStore({ fileCapabilities, directoryPath, fileName }) {
-  const tempName = `${fileName}.tmp`;
-  const backupName = `${fileName}.bak`;
-  async function readFile(directory, name) {
-    const handle = await directory.openFileNoFollow(name, "r");
-    if (handle === null) return null;
-    try { return JSON.parse(await handle.readFile("utf8")); }
-    finally { await handle.close(); }
-  }
-  return Object.freeze({
-    async read() {
-      return withRecordDirectory(fileCapabilities, directoryPath, async (directory) => (
-        await readFile(directory, fileName) ?? await readFile(directory, backupName)
-      ));
-    },
-    async replaceAtomic(value) {
-      const lease = await fileCapabilities.acquireStateLockNoFollow(directoryPath);
-      if (!lease || typeof lease.release !== "function") throw runtimeError("software_manager_record_lock_invalid");
-      let primaryError = null;
-      try {
-        await withRecordDirectory(fileCapabilities, directoryPath, async (directory) => {
-          const stale = await directory.openFileNoFollow(tempName, "r");
-          if (stale) { const entry = stale.entry; await stale.close(); await directory.unlinkEntryNoFollow(entry); }
-          const temp = await directory.openFileNoFollow(tempName, "wx");
-          if (!temp || typeof temp.writeFile !== "function" || typeof temp.sync !== "function") {
-            throw runtimeError("software_manager_record_file_invalid");
-          }
-          const tempEntry = temp.entry;
-          try { await temp.writeFile(`${JSON.stringify(value)}\n`, "utf8"); await temp.sync(); }
-          finally { await temp.close(); }
-          const current = await directory.openFileNoFollow(fileName, "r");
-          const backup = await directory.openFileNoFollow(backupName, "r");
-          if (backup) { const entry = backup.entry; await backup.close(); await directory.unlinkEntryNoFollow(entry); }
-          if (current) { const entry = current.entry; await current.close(); await directory.renameEntryNoFollow(entry, backupName); }
-          await directory.renameEntryNoFollow(tempEntry, fileName);
-        });
-      } catch (error) { primaryError = error; }
-      try { await lease.release(); } catch (error) {
-        if (primaryError) throw new AggregateError([primaryError, error], primaryError.message, { cause: primaryError });
-        throw error;
-      }
-      if (primaryError) throw primaryError;
-    },
-  });
-}
-
 function createBoundedLogSink(store) {
   return Object.freeze({
     async write(entry) {
@@ -208,18 +144,18 @@ function createBoundedLogSink(store) {
   });
 }
 
-function bundledSevenZipPath() {
+export function bundledSevenZipPath() {
   const packageEntry = createRequire(import.meta.url).resolve("7zip-bin");
   return path.win32.join(path.win32.dirname(packageEntry), "win", process.arch, "7za.exe");
 }
 
-function fixedSevenZip(rawPath, { allowInjectedPath = false } = {}) {
+function fixedSevenZip(rawPath) {
   const architecture = process.arch;
   const sha256 = SEVEN_ZIP_SHA256[architecture];
   if (!sha256) throw runtimeError("software_manager_7z_architecture_unsupported");
   const sevenZipPath = requireWindowsPath(rawPath ?? bundledSevenZipPath(), "software_manager_7z_path_invalid");
   const controlledPath = bundledSevenZipPath();
-  if (!allowInjectedPath && sevenZipPath.toLowerCase() !== controlledPath.toLowerCase()) {
+  if (sevenZipPath.toLowerCase() !== controlledPath.toLowerCase()) {
     throw runtimeError("software_manager_7z_path_rejected");
   }
   return Object.freeze({ sevenZipPath, sevenZipSha256: sha256 });
@@ -262,12 +198,42 @@ export function createPinnedSevenZipExecution({ fileCapabilities, sevenZipPath, 
     }
     return pinned.pin;
   }
+  async function closeAfterCompletion(completed, held) {
+    let result;
+    let primaryError = null;
+    try { result = await completed; } catch (error) { primaryError = error; }
+    let closeError = null;
+    try { await held.close(); } catch (error) { closeError = error; }
+    if (primaryError && closeError) {
+      throw new AggregateError([primaryError, closeError], primaryError.message, { cause: primaryError });
+    }
+    if (primaryError) throw primaryError;
+    if (closeError) throw closeError;
+    return result;
+  }
+  async function settleInvalidChild(child, held, primaryError, { cancel = null, completed = null } = {}) {
+    const errors = [primaryError];
+    try {
+      if (typeof cancel === "function") await cancel.call(child);
+    } catch (error) { errors.push(error); }
+    if (completed && typeof completed.then === "function") {
+      let timer = null;
+      try {
+        await Promise.race([
+          Promise.resolve(completed).catch(() => {}),
+          new Promise((resolve) => { timer = setTimeout(resolve, 250); }),
+        ]);
+      } finally { if (timer !== null) clearTimeout(timer); }
+    }
+    try { await held.close(); } catch (error) { errors.push(error); }
+    if (errors.length > 1) throw new AggregateError(errors, primaryError.message, { cause: primaryError });
+    throw primaryError;
+  }
   return Object.freeze({
     async spawnFile(file, args, options) {
       if (file !== sevenZipPath) throw runtimeError("software_manager_7z_path_rejected");
       const held = await pin();
-      try { return await run(file, args, options); }
-      finally { await held.close(); }
+      return closeAfterCompletion(Promise.resolve().then(() => run(file, args, options)), held);
     },
     async spawnStream(file, args, options) {
       if (file !== sevenZipPath) throw runtimeError("software_manager_7z_path_rejected");
@@ -275,13 +241,63 @@ export function createPinnedSevenZipExecution({ fileCapabilities, sevenZipPath, 
       let child;
       try { child = await start(file, args, options); }
       catch (error) { await held.close().catch(() => {}); throw error; }
-      if (!child || typeof child !== "object" || !child.completed || typeof child.completed.then !== "function") {
-        await held.close().catch(() => {});
-        throw runtimeError("software_manager_spawn_result_invalid");
+      let stdout;
+      let stderr;
+      let completed;
+      let cancel;
+      try {
+        stdout = child?.stdout;
+        stderr = child?.stderr;
+        completed = child?.completed;
+        cancel = child?.cancel;
+      } catch (error) {
+        return settleInvalidChild(
+          child, held, runtimeError("software_manager_spawn_result_invalid", error), { cancel, completed },
+        );
       }
-      return Object.freeze({ ...child, completed: Promise.resolve(child.completed).finally(() => held.close()) });
+      if (!child || typeof child !== "object" || !stdout || typeof stdout.pipe !== "function"
+        || !stderr || typeof stderr[Symbol.asyncIterator] !== "function"
+        || !completed || typeof completed.then !== "function" || typeof cancel !== "function") {
+        return settleInvalidChild(
+          child, held, runtimeError("software_manager_spawn_result_invalid"), { cancel, completed },
+        );
+      }
+      return Object.freeze({
+        stdout,
+        stderr,
+        cancel: cancel.bind(child),
+        completed: closeAfterCompletion(Promise.resolve(completed), held),
+      });
     },
   });
+}
+
+export function createLazyShortcutFileApi({ getDesktopCapability, fileCapabilities } = {}) {
+  const getCapability = requireMethod({ getDesktopCapability }, "getDesktopCapability", "desktop_capability_provider_required");
+  const createApi = requireMethod(fileCapabilities, "createShortcutFileApi", "shortcut_file_capability_invalid");
+  const methods = [
+    "inspectExact", "createTemp", "sealTemp", "commitNoReplace",
+    "removeTemp", "removeExact", "release",
+  ];
+  let apiPromise = null;
+  async function getApi() {
+    if (apiPromise === null) {
+      const operation = Promise.resolve().then(getCapability).then(createApi);
+      apiPromise = operation;
+      operation.catch(() => {
+        if (apiPromise === operation) apiPromise = null;
+      });
+    }
+    return apiPromise;
+  }
+  return Object.freeze(Object.fromEntries(methods.map((name) => [name, async (...args) => {
+    const api = await getApi();
+    try { return await requireMethod(api, name, "shortcut_file_capability_invalid")(...args); }
+    catch (error) {
+      apiPromise = null;
+      throw error;
+    }
+  }])));
 }
 
 function createWorkspaceDownloader({ workspace, downloadManager, catalogService }) {
@@ -305,9 +321,7 @@ function createWorkspaceDownloader({ workspace, downloadManager, catalogService 
         || asset.size !== record.size || asset.sha256 !== record.sha256) {
         throw runtimeError("software_manager_download_binding_invalid");
       }
-      const receipt = await downloadManager.downloadPrepared({
-        asset, partPath: record.partPath, signal, onProgress,
-      });
+      const receipt = await workspace.downloadPrepared(record, { asset, signal, onProgress });
       return record.promotePartNoReplace(receipt);
     },
   });
@@ -340,30 +354,47 @@ export function createDefaultSkillRecoveryHooks({
     const preparedRoot = await inferPreparedSkillInstallRoot({
       journalDir: skillPrepareDirectory, fsApi: fileCapabilities, taskId: task.taskId, skillId: task.skillId,
     });
-    if (preparedRoot !== null) return preparedRoot;
-    if (task.kind !== "skill-replace" || typeof task.swapId !== "string" || task.skillsRoot !== skillsRoot) return null;
+    if (task.kind !== "skill-replace") return preparedRoot;
+    const claimRoot = requireWindowsPath(task.installRoot, "software_manager_skill_recovery_record_invalid");
+    if (preparedRoot !== null && preparedRoot.toLowerCase() !== claimRoot.toLowerCase()) {
+      throw runtimeError("software_manager_skill_recovery_record_invalid");
+    }
+    if (typeof task.swapId !== "string" || task.skillsRoot !== skillsRoot) {
+      throw runtimeError("software_manager_skill_recovery_record_invalid");
+    }
     const transaction = await createSkillSwapJournal({
       journalDir: skillSwapDirectory, fsApi: fileCapabilities, skillsRoot,
     }).load({ taskId: task.taskId, swapId: task.swapId });
-    if (!transaction) return null;
+    if (!transaction) return claimRoot;
+    if (transaction.snapshot.leaseScope !== task.leaseScope
+      || transaction.snapshot.leaseNonce !== task.leaseNonce) {
+      throw runtimeError("software_manager_skill_recovery_record_invalid");
+    }
     const suffix = path.win32.join("staging", `task-${task.taskId}`, `skill-${task.skillId}.prepare`);
     const sourcePath = transaction.snapshot.sourcePath;
     if (typeof sourcePath !== "string" || !sourcePath.endsWith(`\\${suffix}`)) {
       throw runtimeError("software_manager_skill_recovery_record_invalid");
     }
-    return sourcePath.slice(0, -(suffix.length + 1));
+    const swapRoot = sourcePath.slice(0, -(suffix.length + 1));
+    if (swapRoot.toLowerCase() !== claimRoot.toLowerCase()) {
+      throw runtimeError("software_manager_skill_recovery_record_invalid");
+    }
+    return claimRoot;
   }
-  async function cleanupAbandonedPreparedSkills({ installRootCapability }) {
+  async function cleanupAbandonedPreparedSkills({ installRootCapability, heldLease = null }) {
     const installRoot = readInstallRootCapability(installRootCapability);
-    await createPreparedSkillRecovery({
-      fileCapabilities, installRootCapability,
-      prepareJournal: createSkillPrepareJournal({
-        journalDir: skillPrepareDirectory, fsApi: fileCapabilities, installRoot,
-      }),
-      prepareLeaseStore: ownershipStore,
-    }).reconcilePreparedSources();
-    const coordinator = getOwnershipCoordinator(ownershipStore);
-    return coordinator.runExclusive(async (store) => {
+    let result;
+    let primaryError = null;
+    try {
+      await createPreparedSkillRecovery({
+        fileCapabilities, installRootCapability,
+        prepareJournal: createSkillPrepareJournal({
+          journalDir: skillPrepareDirectory, fsApi: fileCapabilities, installRoot,
+        }),
+        prepareLeaseStore: ownershipStore,
+      }).reconcilePreparedSources({ heldLease });
+      const coordinator = getOwnershipCoordinator(ownershipStore);
+      result = await coordinator.runExclusive(async (store) => {
       const current = await store.load();
       const task = current.activeTask;
       const isSkillPrepare = task?.kind === "skill-prepare"
@@ -386,17 +417,54 @@ export function createDefaultSkillRecoveryHooks({
         };
         return await store.save(next);
       } finally { await lease.release(); }
-    });
+      });
+    } catch (error) { primaryError = error; }
+    let releaseError = null;
+    try { await heldLease?.lease?.release(); } catch (error) { releaseError = error; }
+    if (primaryError && releaseError) {
+      throw new AggregateError([primaryError, releaseError], primaryError.message, { cause: primaryError });
+    }
+    if (primaryError) throw primaryError;
+    if (releaseError) throw releaseError;
+    return result;
   }
   return Object.freeze({
     inferSkillInstallRoot,
     async recoverActiveSkillTransaction({ installRootCapability, skillsRootCapability }) {
-      return recoverSkillOwnershipOffline({
-        ownershipStore, installRootCapability, skillsRootCapability,
-        skillFiles: createRecoverySkillFiles({ installRootCapability, skillsRootCapability }),
-        resolveSkillTarget,
-        skillPathAccess,
+      const current = await ownershipStore.load();
+      const task = current.activeTask;
+      if (task?.kind !== "skill-replace") {
+        const recovery = await recoverSkillOwnershipOffline({
+          ownershipStore, installRootCapability, skillsRootCapability,
+          skillFiles: createRecoverySkillFiles({ installRootCapability, skillsRootCapability }),
+          resolveSkillTarget, skillPathAccess, expectedTask: task ?? null,
+        });
+        return Object.freeze({
+          status: recovery.status,
+          state: recovery.state,
+          heldLease: null,
+        });
+      }
+      const lease = await ownershipStore.acquireOperationLease({
+        nonce: task.leaseNonce, scope: task.leaseScope, wait: false,
       });
+      if (lease === null) return Object.freeze({ status: "busy", state: current, heldLease: null });
+      const heldLease = Object.freeze({ nonce: task.leaseNonce, scope: task.leaseScope, lease });
+      try {
+        const recovery = await recoverSkillOwnershipOffline({
+          ownershipStore, installRootCapability, skillsRootCapability,
+          skillFiles: createRecoverySkillFiles({ installRootCapability, skillsRootCapability }),
+          resolveSkillTarget, skillPathAccess, expectedTask: task,
+        });
+        if (recovery.status === "changed") {
+          await lease.release();
+          return Object.freeze({ status: "changed", state: recovery.state, heldLease: null });
+        }
+        return Object.freeze({ status: "recovered", state: recovery.state, heldLease });
+      } catch (error) {
+        await lease.release().catch(() => {});
+        throw error;
+      }
     },
     cleanupAbandonedPreparedSkills,
   });
@@ -534,13 +602,10 @@ const DEFAULT_FACTORIES = Object.freeze({
   createInstallRootResolver: (options) => createInstallRootResolver(options),
   createRootAdapters: createDefaultRootAdapters,
   createWindowsHost(options) {
-    const shortcutFileApi = Object.freeze(Object.fromEntries([
-      "inspectExact", "createTemp", "sealTemp", "commitNoReplace", "removeExact", "release",
-    ].map((name) => [name, async (...args) => {
-      const capability = await options.getDesktopCapability();
-      const api = options.infrastructure.fileCapabilities.createShortcutFileApi(capability);
-      return requireMethod(api, name, "shortcut_file_capability_invalid")(...args);
-    }])));
+    const shortcutFileApi = createLazyShortcutFileApi({
+      getDesktopCapability: options.getDesktopCapability,
+      fileCapabilities: options.infrastructure.fileCapabilities,
+    });
     return createWindowsHost({
       platform: options.platform,
       execFile: options.execFile,
@@ -584,7 +649,7 @@ export async function createProductionSoftwareManagerService({
   if (publicKeyPem !== null && typeof publicKeyPem !== "string") throw runtimeError("software_manager_catalog_key_invalid");
   requireRecord(env, "software_manager_environment_invalid");
   const injectedFactories = requireRecord(runtimeFactories, "software_manager_factories_invalid");
-  const sevenZip = fixedSevenZip(sevenZipPath, { allowInjectedPath: Object.keys(injectedFactories).length > 0 });
+  const sevenZip = fixedSevenZip(sevenZipPath);
   const factories = Object.freeze({ ...DEFAULT_FACTORIES, ...injectedFactories });
   const infrastructure = await factories.createWindowsInfrastructure({
     platform, dataRoot: exactDataRoot, homeDir: exactHomeDir, getDesktopPath, env, koffi,
@@ -608,6 +673,9 @@ export async function createProductionSoftwareManagerService({
     authorizeRoot: infrastructure.authorizeRoot.bind(infrastructure),
     getPersistedRoot: async () => (await ownershipStore.load()).installRoot,
   });
+  for (const name of ["getCurrentToken", "choose", "resolve", "adopt", "discard", "restoreOwnedRoot", "clearCurrent"]) {
+    requireMethod(installRootResolver, name, "software_manager_install_root_resolver_invalid");
+  }
   const getDesktopCapability = memoizeAsync(() => infrastructure.getDesktopCapability());
   const getSkillsRootCapability = memoizeAsync(() => infrastructure.getSkillsRootCapability());
   const getWindowsHost = memoizeAsync(() => factories.createWindowsHost({
@@ -620,10 +688,16 @@ export async function createProductionSoftwareManagerService({
   }
 
   async function createRootRuntime({ catalogService, installRootCapability }) {
-    if (!catalogService || !installRootCapability || typeof installRootCapability !== "object") {
+    if (!catalogService || typeof catalogService !== "object"
+      || !installRootCapability || typeof installRootCapability !== "object") {
       throw runtimeError("software_manager_root_runtime_invalid");
     }
-    let created = rootRuntimes.get(installRootCapability);
+    let catalogs = rootRuntimes.get(installRootCapability);
+    if (!catalogs) {
+      catalogs = new WeakMap();
+      rootRuntimes.set(installRootCapability, catalogs);
+    }
+    let created = catalogs.get(catalogService);
     if (!created) {
       created = Promise.resolve().then(async () => {
         const versionSlots = await createSlots(installRootCapability);
@@ -643,9 +717,9 @@ export async function createProductionSoftwareManagerService({
           ...sevenZip,
         });
       });
-      rootRuntimes.set(installRootCapability, created);
+      catalogs.set(catalogService, created);
       created.catch(() => {
-        if (rootRuntimes.get(installRootCapability) === created) rootRuntimes.delete(installRootCapability);
+        if (catalogs.get(catalogService) === created) catalogs.delete(catalogService);
       });
     }
     return created;
@@ -670,14 +744,21 @@ export async function createProductionSoftwareManagerService({
       }
       if (["skill-replace", "skill-uninstall"].includes(current.activeTask?.kind)) {
         const skillsRootCapability = await getSkillsRootCapability();
-        await infrastructure.recoverActiveSkillTransaction({
+        const skillRecovery = await infrastructure.recoverActiveSkillTransaction({
           ownership: structuredClone(current), installRootCapability, skillsRootCapability,
         });
+        if (skillRecovery?.status === "recovered" && installRootCapability) {
+          await infrastructure.cleanupAbandonedPreparedSkills({
+            installRootCapability, heldLease: skillRecovery?.heldLease ?? null,
+          });
+        }
+      } else if (installRootCapability) {
+        await infrastructure.cleanupAbandonedPreparedSkills({ installRootCapability, heldLease: null });
       }
-      if (installRootCapability) await infrastructure.cleanupAbandonedPreparedSkills({ installRootCapability });
       current = await ownershipStore.load();
-      const restoredRoot = current.installRoot ?? installRoot;
+      const restoredRoot = current.installRoot;
       if (typeof restoredRoot === "string") await installRootResolver.restoreOwnedRoot(restoredRoot);
+      else await installRootResolver.clearCurrent();
       if (recovered.installRoot === restoredRoot) return recovered;
       return Object.freeze({ ...recovered, status: "recovered", installRoot: restoredRoot });
     });

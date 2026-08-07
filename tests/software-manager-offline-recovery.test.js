@@ -228,6 +228,18 @@ test("install-root candidates are isolated until adopt and discard never revokes
   assert.deepEqual(await resolver.resolve(adopted.token), { authorizedPath: "F:\\Adopted" });
 });
 
+test("install-root resolver can revoke the current process-local authority without persistence", async () => {
+  const resolver = createInstallRootResolver({
+    authorizeRoot: async (candidate) => Object.freeze({ authorizedPath: candidate }),
+    getPersistedRoot: () => "D:\\Current",
+  });
+  const original = await resolver.restoreOwnedRoot();
+  assert.equal(resolver.getCurrentToken(), original);
+  await resolver.clearCurrent();
+  assert.equal(resolver.getCurrentToken(), null);
+  await assert.rejects(resolver.resolve(original), /install_root_token_invalid/u);
+});
+
 test("persisted ownership root is authorized before root-bound slot recovery", async () => {
   const fixture = recoveryFixture({ installRoot: "D:\\CBApps" });
   const result = await recoverOffline(fixture.input);

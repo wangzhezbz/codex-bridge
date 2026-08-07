@@ -640,7 +640,7 @@ export function createSoftwareManagerService({
     }
     try {
       await recoverTransactions();
-      selectedInstallRootToken = installRootResolver.getCurrentToken() ?? selectedInstallRootToken;
+      selectedInstallRootToken = installRootResolver.getCurrentToken() ?? null;
       const before = await loadOwnership();
       if (before?.activeTask) {
         externalTask = publicExternalTask(before.activeTask);
@@ -679,6 +679,7 @@ export function createSoftwareManagerService({
   }
 
   async function refreshRecoveryStateInGate() {
+    selectedInstallRootToken = installRootResolver.getCurrentToken() ?? null;
     let state;
     try { state = await loadOwnership(); }
     catch (error) {
@@ -1145,7 +1146,7 @@ export function createSoftwareManagerService({
           entries,
           Object.keys(ownership?.skills ?? {}),
         );
-        if ([...candidateInspection.components, ...candidateInspection.skills].some(({ status }) => status === "failed")) {
+        if (candidateInspection.components.some(({ status }) => status === "failed")) {
           throw serviceError("software_manager_snapshot_failed");
         }
         const snapshot = await buildSnapshot({ inspect: false, inspectionOverride: candidateInspection });

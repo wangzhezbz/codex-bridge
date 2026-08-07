@@ -214,15 +214,21 @@ export function createPreparedSkillRecovery({
     return true;
   }
   return Object.freeze({
-    async reconcilePreparedSources() {
+    async reconcilePreparedSources({ heldLease = null } = {}) {
+      const owns = ({ nonce, scope }) => heldLease !== null
+        && heldLease.nonce === nonce && heldLease.scope === scope;
       const records = await preparedJournal.list({
-        claimLease: ({ nonce, scope }) => prepareLeaseStore.acquireOperationLease({ nonce, scope, wait: false }),
+        claimLease: ({ nonce, scope }) => owns({ nonce, scope })
+          ? { async release() {} }
+          : prepareLeaseStore.acquireOperationLease({ nonce, scope, wait: false }),
       });
       let recovered = 0;
       for (const record of records) {
-        const lease = await prepareLeaseStore.acquireOperationLease({
-          nonce: record.leaseNonce, scope: record.leaseScope, wait: false,
-        });
+        const lease = owns({ nonce: record.leaseNonce, scope: record.leaseScope })
+          ? { async release() {} }
+          : await prepareLeaseStore.acquireOperationLease({
+            nonce: record.leaseNonce, scope: record.leaseScope, wait: false,
+          });
         if (lease === null) continue;
         try { await discardOne(record.taskId, record.skillId); recovered += 1; }
         finally { await lease.release(); }
@@ -452,10 +458,11 @@ export function createSkillFileService({
   function replacementPlan(raw) {
     const keys = [
       "taskId", "swapId", "source", "target", "authorizedRoot", "backup", "verificationReceipt",
-      "treeDigest", "manifestDigest", "skillMdSha256", "requiredFiles", "previousEvidence",
+      "treeDigest", "manifestDigest", "skillMdSha256", "requiredFiles", "previousEvidence", "leaseScope", "leaseNonce",
     ];
     if (!exact(raw, keys) || !TASK_ID.test(raw.taskId ?? "") || !SWAP_ID.test(raw.swapId ?? "")
-      || raw.backup !== false || raw.verificationReceipt === null || typeof raw.verificationReceipt !== "object") {
+      || raw.backup !== false || raw.leaseScope !== "prepare" || !SWAP_ID.test(raw.leaseNonce ?? "")
+      || raw.verificationReceipt === null || typeof raw.verificationReceipt !== "object") {
       throw skillError("skill_replace_plan_invalid");
     }
     const parts = targetParts(raw.target, raw.authorizedRoot);
@@ -474,7 +481,10 @@ export function createSkillFileService({
       || JSON.stringify(receipt.requiredFiles) !== JSON.stringify(expected.requiredFiles)) {
       throw skillError("skill_source_receipt_invalid");
     }
-    return { ...parts, taskId: raw.taskId, swapId: raw.swapId, source, expected, previousEvidence, receipt };
+    return {
+      ...parts, taskId: raw.taskId, swapId: raw.swapId, source, expected, previousEvidence, receipt,
+      leaseScope: raw.leaseScope, leaseNonce: raw.leaseNonce,
+    };
   }
 
   function journalRecord(plan, session, phase, identities) {
@@ -484,6 +494,8 @@ export function createSkillFileService({
       taskId: plan.taskId,
       swapId: plan.swapId,
       skillId: plan.skillId,
+      leaseScope: plan.leaseScope,
+      leaseNonce: plan.leaseNonce,
       skillsRoot: plan.root,
       target: plan.target,
       sourcePath: plan.source,
@@ -586,6 +598,8 @@ export function createSkillFileService({
       expected: record.expectedEvidence,
       previousEvidence: record.previousEvidence,
       receipt: { sourceIdentity: record.identities.source },
+      leaseScope: record.leaseScope,
+      leaseNonce: record.leaseNonce,
     };
   }
 

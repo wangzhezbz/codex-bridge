@@ -479,6 +479,7 @@ test("Skill replacement active task requires one strict persisted 128-bit swapId
     phase: "reserved",
     taskId: "skill-swap",
     skillId: "documents",
+    installRoot: "C:\\Owned",
     skillsRoot: CANONICAL_SKILLS_ROOT,
     target,
     version: "1.0.0",
@@ -487,9 +488,11 @@ test("Skill replacement active task requires one strict persisted 128-bit swapId
     treeDigest: "c".repeat(64),
     manifestDigest: "d".repeat(64),
     previousEvidence: { kind: "absent" },
+    leaseScope: "prepare",
+    leaseNonce: "f".repeat(32),
   };
 
-  const valid = { ...state(), activeTask: { ...baseTask, swapId: "e".repeat(32) } };
+  const valid = { ...state("C:\\Owned"), activeTask: { ...baseTask, swapId: "e".repeat(32) } };
   const validMemory = createMemoryStateFs();
   const validStore = createOwnershipStore({
     stateDir: path.resolve("skill-swap-valid"),
@@ -501,6 +504,9 @@ test("Skill replacement active task requires one strict persisted 128-bit swapId
 
   for (const [label, activeTask] of [
     ["missing", baseTask],
+    ["missing-install-root", { ...baseTask, installRoot: undefined, swapId: "e".repeat(32) }],
+    ["foreign-install-root", { ...baseTask, installRoot: "D:\\Elsewhere", swapId: "e".repeat(32) }],
+    ["bad-lease", { ...baseTask, leaseNonce: "f".repeat(31), swapId: "e".repeat(32) }],
     ["short", { ...baseTask, swapId: "e".repeat(31) }],
     ["uppercase", { ...baseTask, swapId: "E".repeat(32) }],
     ["extra", { ...baseTask, swapId: "e".repeat(32), surprise: true }],
@@ -511,7 +517,7 @@ test("Skill replacement active task requires one strict persisted 128-bit swapId
       fsApi: memory.fsApi,
       skillsRoot: CANONICAL_SKILLS_ROOT,
     });
-    await assert.rejects(store.save({ ...state(), activeTask }), { code: "ownership_state_invalid" });
+    await assert.rejects(store.save({ ...state("C:\\Owned"), activeTask }), { code: "ownership_state_invalid" });
     assert.equal(memory.calls.length, 0);
   }
 });

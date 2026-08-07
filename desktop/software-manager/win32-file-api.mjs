@@ -21,6 +21,7 @@ const FILE_ID_INFO = 18;
 const FILE_ID_BOTH_DIRECTORY_INFO = 10;
 const FILE_ID_BOTH_DIRECTORY_RESTART_INFO = 11;
 const FILE_DISPOSITION_INFO = 4;
+const FILE_BEGIN = 0;
 const MAX_NATIVE_PATH_CHARS = 32_768;
 const NATIVE_ENUM_BUFFER_BYTES = 64 * 1_024;
 const MAX_NATIVE_READ_CHUNK_BYTES = 1_024 * 1_024;
@@ -117,6 +118,10 @@ export function createWin32FileApi({ platform = process.platform, koffi } = {}) 
   );
   const ReadFile = kernel32.func("__stdcall", "ReadFile", "int", ["intptr_t", "void *", "uint32_t", "void *", "void *"]);
   const WriteFile = kernel32.func("__stdcall", "WriteFile", "int", ["intptr_t", "void *", "uint32_t", "void *", "void *"]);
+  const SetFilePointerEx = kernel32.func(
+    "__stdcall", "SetFilePointerEx", "int", ["intptr_t", "int64_t", "void *", "uint32_t"],
+  );
+  const SetEndOfFile = kernel32.func("__stdcall", "SetEndOfFile", "int", ["intptr_t"]);
   const FlushFileBuffers = kernel32.func("__stdcall", "FlushFileBuffers", "int", ["intptr_t"]);
   const CreateDirectoryW = kernel32.func("__stdcall", "CreateDirectoryW", "int", ["str16", "void *"]);
   const SetFileInformationByHandle = kernel32.func(
@@ -345,6 +350,16 @@ export function createWin32FileApi({ platform = process.platform, koffi } = {}) 
     }
   }
 
+  function setFilePosition(handle, offset) {
+    if (!Number.isSafeInteger(offset) || offset < 0) throw win32Error("native_file_offset_invalid");
+    requireSuccess(SetFilePointerEx(handle, BigInt(offset), null, FILE_BEGIN), "SetFilePointerEx");
+  }
+
+  function truncateFile(handle, size) {
+    setFilePosition(handle, size);
+    requireSuccess(SetEndOfFile(handle), "SetEndOfFile");
+  }
+
   function createDirectory(exactPath) {
     requireSuccess(CreateDirectoryW(toExtendedPath(exactPath), null), "CreateDirectoryW");
   }
@@ -407,6 +422,8 @@ export function createWin32FileApi({ platform = process.platform, koffi } = {}) 
     getSystemDirectory,
     readFile,
     readChunk,
+    setFilePosition,
+    truncateFile,
     writeFile: writeChunk,
     appendFile: writeChunk,
     flushFile(handle) { requireSuccess(FlushFileBuffers(handle), "FlushFileBuffers"); },

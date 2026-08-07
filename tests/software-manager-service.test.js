@@ -271,6 +271,31 @@ test("a failed install-root candidate is discarded without revoking the committe
   assert.equal(events.some(({ type }) => type === "snapshot"), false);
 });
 
+test("a denied Skills inspection remains visible but does not block install-root adoption", async () => {
+  let adopted = null;
+  const { service } = fixtureService({
+    installRootResolver: {
+      choose: async () => ({ token: "root_token_00000002" }),
+      resolve: async () => ({ kind: "root" }),
+      getCurrentToken: () => adopted,
+      adopt: async (token) => { adopted = token; },
+      discard: async () => {},
+    },
+    skills: {
+      inspect: async ({ skillIds }) => skillIds.map((id) => operationResult(
+        id, "inspect", "failed", { message: "skills_root_access_denied" },
+      )),
+    },
+  });
+  assert.deepEqual(await service.chooseInstallRoot("D:\\CBApps"), {
+    installRootToken: "root_token_00000002",
+  });
+  assert.equal(adopted, "root_token_00000002");
+  const snapshot = await service.getSnapshot();
+  assert.equal(snapshot.skills.find(({ componentId }) => componentId === "documents").status, "failed");
+  assert.equal(snapshot.components.every(({ updateState }) => updateState !== "error"), true);
+});
+
 test("request schema is exact, ordered, duplicate-free, and authority-safe", async () => {
   const { service } = fixtureService();
   const invalid = [

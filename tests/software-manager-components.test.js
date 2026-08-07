@@ -509,6 +509,14 @@ function fixture({
   return {
     adapters, calls, getState: () => structuredClone(currentState),
     createAnotherAdapters: () => createComponentAdapters(adapterOptions),
+    createAnotherProcessAdapters: () => createComponentAdapters({
+      ...adapterOptions,
+      ownershipStore: {
+        acquireOperationLease: ownershipStore.acquireOperationLease.bind(ownershipStore),
+        load: ownershipStore.load.bind(ownershipStore),
+        compareAndSwap: ownershipStore.compareAndSwap.bind(ownershipStore),
+      },
+    }),
     reconcilePreparedSkillSources: () => skillFiles.reconcilePreparedSources(),
     preparedSkillSourceCount: () => preparedSkillSources.size,
     simulateProcessCrash: () => operationLeases.clear(),
@@ -1564,6 +1572,54 @@ test("Skill replacement consumes a source receipt, reserves ownership, and adopt
   assert.deepEqual(calls.skillOperations.slice(0, 2).map(([operation]) => operation), ["reconcile", "inspect"]);
 });
 
+test("Skill replace failure before swap WAL preserves root and lease evidence for restart recovery", async () => {
+  const shared = fixture({ onReplaceSkill: async () => { throw new Error("before_swap_wal"); } });
+  assert.equal((await shared.adapters.skills.prepare({ taskId: "skill-prewal", skillIds: ["documents"] }))[0].status, "succeeded");
+  const committed = await shared.adapters.skills.commit({ taskId: "skill-prewal", skillIds: ["documents"] });
+  assert.equal(committed[0].status, "failed");
+  const claim = shared.getState().activeTask;
+  assert.equal(claim.kind, "skill-replace");
+  assert.equal(claim.phase, "reserved");
+  assert.equal(claim.installRoot, INSTALL_ROOT);
+  assert.equal(claim.leaseScope, "prepare");
+  assert.match(claim.leaseNonce, /^[a-f0-9]{32}$/u);
+  assert.equal(shared.preparedSkillSourceCount(), 0);
+
+  const restarted = shared.createAnotherAdapters();
+  const inspected = await restarted.skills.inspectInstalled({ skillIds: ["documents"] });
+  assert.equal(inspected[0].status, "skipped");
+  assert.equal(shared.getState().activeTask, null);
+  assert.equal(shared.getState().lastTask.action, "skill-replace-aborted");
+});
+
+test("a live Skill replace lease blocks a second adapter before swap mutation and the owner completes normally", async () => {
+  let enteredResolve;
+  let continueResolve;
+  const entered = new Promise((resolve) => { enteredResolve = resolve; });
+  const continueCommit = new Promise((resolve) => { continueResolve = resolve; });
+  const shared = fixture({
+    onReplaceSkill: async () => { enteredResolve(); await continueCommit; },
+  });
+  assert.equal((await shared.adapters.skills.prepare({
+    taskId: "skill-live-replace", skillIds: ["documents"],
+  }))[0].status, "succeeded");
+  const committing = shared.adapters.skills.commit({
+    taskId: "skill-live-replace", skillIds: ["documents"],
+  });
+  await entered;
+  const liveClaim = shared.getState().activeTask;
+  assert.equal(liveClaim.kind, "skill-replace");
+  assert.equal(liveClaim.leaseScope, "prepare");
+  const operationsBefore = shared.calls.skillOperations.length;
+  await shared.createAnotherProcessAdapters().skills.inspectInstalled({ skillIds: ["documents"] });
+  assert.deepEqual(shared.getState().activeTask, liveClaim);
+  assert.equal(shared.calls.skillOperations.length, operationsBefore);
+  assert.equal(shared.preparedSkillSourceCount(), 1);
+  continueResolve();
+  assert.equal((await committing)[0].status, "succeeded");
+  assert.equal(shared.getState().activeTask, null);
+});
+
 test("Skill entrypoints recover a reserved swap before reclaiming its dead prepared-source lease", async (t) => {
   for (const entrypoint of ["inspect", "prepare"]) {
     await t.test(entrypoint, async () => {
@@ -1571,6 +1627,9 @@ test("Skill entrypoints recover a reserved swap before reclaiming its dead prepa
       const state = emptyState(INSTALL_ROOT);
       state.activeTask = {
         kind: "skill-replace",
+        installRoot: INSTALL_ROOT,
+        leaseScope: "prepare",
+        leaseNonce: "6".repeat(32),
         phase: "reserved",
         taskId: "swap-crash",
         swapId: "5".repeat(32),
@@ -1637,6 +1696,7 @@ test("reserved Skill recovery does not adopt a tree that only matches the expect
   };
   state.activeTask = {
     kind: "skill-replace", phase: "reserved", taskId: "skill-tree-mismatch", swapId: "1".repeat(32), skillId: "documents",
+    installRoot: INSTALL_ROOT, leaseScope: "prepare", leaseNonce: "7".repeat(32),
     skillsRoot: SKILLS_ROOT, target: state.skills.documents.target, version: "1.0.0",
     packageSha256: DIGEST_B, skillMdSha256: SKILL_HASH,
     treeDigest: DIGEST_A, manifestDigest: DIGEST_B,
@@ -1665,6 +1725,7 @@ test("forged applied Skill completion evidence is rejected without adoption", as
   const state = emptyState(INSTALL_ROOT);
   state.activeTask = {
     kind: "skill-replace", phase: "applied", taskId: "skill-forged", swapId: "2".repeat(32), skillId: "documents",
+    installRoot: INSTALL_ROOT, leaseScope: "prepare", leaseNonce: "8".repeat(32),
     skillsRoot: SKILLS_ROOT, target: "C:\\Users\\tester\\.codex\\skills\\documents", version: "1.0.0",
     packageSha256: DIGEST_B, skillMdSha256: SKILL_HASH, treeDigest: DIGEST_A, manifestDigest: DIGEST_B,
     previousEvidence: { kind: "absent" }, completionProof: { forged: true },
@@ -1685,6 +1746,7 @@ test("reserved Skill recovery safely clears a pre-mutation failure after verifyi
   };
   state.activeTask = {
     kind: "skill-replace", phase: "reserved", taskId: "skill-before-mutation", swapId: "3".repeat(32), skillId: "documents",
+    installRoot: INSTALL_ROOT, leaseScope: "prepare", leaseNonce: "9".repeat(32),
     skillsRoot: SKILLS_ROOT, target, version: "1.0.0", packageSha256: DIGEST_B,
     skillMdSha256: SKILL_HASH, treeDigest: DIGEST_A, manifestDigest: DIGEST_B,
     previousEvidence: {

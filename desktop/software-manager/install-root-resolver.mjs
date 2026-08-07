@@ -87,6 +87,12 @@ export function createInstallRootResolver({ authorizeRoot, getPersistedRoot } = 
     return token;
   }
 
+  async function clearCurrent() {
+    const prior = currentToken;
+    currentToken = null;
+    if (prior !== null) entries.delete(prior);
+  }
+
   return Object.freeze({
     getCurrentToken,
     choose,
@@ -94,5 +100,6 @@ export function createInstallRootResolver({ authorizeRoot, getPersistedRoot } = 
     adopt,
     discard,
     restoreOwnedRoot,
+    clearCurrent,
   });
 }

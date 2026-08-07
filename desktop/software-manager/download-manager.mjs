@@ -20,16 +20,17 @@ export function consumePreparedDownloadVerification(manager, receipt, expected) 
   if (!verified) throw downloadError("verification_receipt_invalid");
   if (verified.state !== "issued") throw downloadError("verification_receipt_consumed");
   verified.state = "consumed";
+  const bindingKey = verified.target ? "target" : "partPath";
   if (!expected || typeof expected !== "object" || Array.isArray(expected)
     || Object.keys(expected).length !== 3
-    || !Object.hasOwn(expected, "partPath") || !Object.hasOwn(expected, "size")
+    || !Object.hasOwn(expected, bindingKey) || !Object.hasOwn(expected, "size")
     || !Object.hasOwn(expected, "sha256")
-    || expected.partPath !== verified.partPath || expected.size !== verified.size
+    || expected[bindingKey] !== verified[bindingKey] || expected.size !== verified.size
     || expected.sha256 !== verified.sha256) {
     throw downloadError("verification_binding_mismatch");
   }
   return Object.freeze({
-    partPath: verified.partPath,
+    [bindingKey]: verified[bindingKey],
     size: verified.size,
     sha256: verified.sha256,
   });
@@ -50,7 +51,7 @@ export function createDownloadManager({
   const streamFs = typeof fsApi.createWriteStream === "function" ? fsApi : fs;
   const receipts = new WeakMap();
 
-  async function transfer({ asset, destination = null, partPath, signal, onProgress, publish }) {
+  async function transfer({ asset, destination = null, partPath = null, target = null, signal, onProgress, publish }) {
     const originalOrigin = new URL(asset.url).origin;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
@@ -59,6 +60,7 @@ export function createDownloadManager({
           asset,
           destination,
           partPath,
+          target,
           signal,
           onProgress,
           fetchImpl,
@@ -90,19 +92,22 @@ export function createDownloadManager({
       return transfer({ asset, destination, partPath, signal, onProgress, publish: true });
     },
 
-    async downloadPrepared({ asset, partPath, signal, onProgress = () => {} } = {}) {
+    async downloadPrepared({ asset, partPath = null, target = null, signal, onProgress = () => {} } = {}) {
       validateAsset(asset);
-      if (typeof partPath !== "string" || partPath.length === 0) {
-        throw new TypeError("partPath must be a non-empty path");
+      const pathMode = typeof partPath === "string" && partPath.length > 0;
+      const targetMode = target && typeof target === "object"
+        && ["inspect", "reset", "createWriteStream", "verify"].every((name) => typeof target[name] === "function");
+      if (pathMode === targetMode) {
+        throw new TypeError("exactly one prepared download target is required");
       }
       if (typeof onProgress !== "function") throw new TypeError("onProgress must be a function");
       const verified = await transfer({
-        asset, partPath, signal, onProgress, publish: false,
+        asset, partPath, target, signal, onProgress, publish: false,
       });
       const receipt = Object.freeze(Object.create(null));
       receipts.set(receipt, {
         state: "issued",
-        partPath,
+        ...(targetMode ? { target } : { partPath }),
         size: verified.size,
         sha256: verified.sha256,
       });
@@ -114,7 +119,9 @@ export function createDownloadManager({
 }
 
 async function downloadOnce(context) {
-  const existingSize = await fileSize(context.fileOps, context.partPath);
+  const existingSize = context.target
+    ? (await context.target.inspect()).size
+    : await fileSize(context.fileOps, context.partPath);
   if (existingSize > context.asset.size) {
     throw nonRetryableError("partial package exceeds the catalog length");
   }
@@ -132,6 +139,7 @@ async function downloadOnce(context) {
     append = false;
     resumed = false;
     receivedBytes = 0;
+    if (context.target) await context.target.reset();
   } else if (append && response.status === 206) {
     const contentRange = response.headers.get("content-range");
     if (!new RegExp(`^bytes ${existingSize}-\\d+/(\\d+|\\*)$`, "i").test(contentRange ?? "")) {
@@ -159,7 +167,9 @@ async function downloadOnce(context) {
       }, callback, chunk);
     }
   });
-  const output = context.streamFs.createWriteStream(context.partPath, { flags: append ? "a" : "w" });
+  const output = context.target
+    ? await context.target.createWriteStream({ append, maxBytes: context.asset.size, signal: context.signal })
+    : context.streamFs.createWriteStream(context.partPath, { flags: append ? "a" : "w" });
 
   try {
     await pipeline(Readable.fromWeb(response.body), progress, output, { signal: context.signal });
@@ -187,7 +197,19 @@ async function verifyDownloaded(context) {
     throw nonRetryableError(`download length mismatch: expected ${context.asset.size}, received ${context.receivedBytes}`);
   }
   throwIfAborted(context.signal);
-  const sha256 = await hashFile(context.streamFs, context.partPath);
+  let sha256;
+  if (context.target) {
+    const verified = await context.target.verify({
+      size: context.asset.size, sha256: context.asset.sha256.toLowerCase(), signal: context.signal,
+    });
+    if (!verified || verified.size !== context.asset.size
+      || verified.sha256 !== context.asset.sha256.toLowerCase()) {
+      throw nonRetryableError("prepared download verification is invalid");
+    }
+    sha256 = verified.sha256;
+  } else {
+    sha256 = await hashFile(context.streamFs, context.partPath);
+  }
   throwIfAborted(context.signal);
   if (sha256 !== context.asset.sha256.toLowerCase()) {
     throw nonRetryableError("download SHA256 mismatch");
