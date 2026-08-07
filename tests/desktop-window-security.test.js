@@ -157,3 +157,12 @@ test("preload exposes only narrow software-manager methods and no generic invoke
   );
   assert.doesNotMatch(source, /\bgenericInvoke\b|ipcRenderer:\s*ipcRenderer|invoke:\s*ipcRenderer\.invoke/u);
 });
+
+test("software-manager production modules stay behind the Windows gate", () => {
+  const source = fs.readFileSync(new URL("../desktop/main.cjs", import.meta.url), "utf8");
+  const runtime = source.match(/async function createSoftwareManagerRuntimeService\(\)[\s\S]*?\n\}/u)?.[0] ?? "";
+  const platformGate = runtime.indexOf('process.platform !== "win32"');
+  const factoryImport = runtime.indexOf('import("./software-manager/runtime-factory.mjs")');
+  assert.equal(platformGate >= 0 && factoryImport > platformGate, true);
+  assert.equal((runtime.match(/runtime-factory\.mjs/gu) ?? []).length, 1);
+});

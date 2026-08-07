@@ -12,7 +12,7 @@ const {
   shell,
 } = require("electron");
 const crypto = require("node:crypto");
-const { spawn } = require("node:child_process");
+const { execFile: execFileCallback, spawn } = require("node:child_process");
 const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
@@ -120,7 +120,7 @@ const ipcMain = createTrustedIpcRegistrar(electronIpcMain, () => ({
 }));
 let routerProcess = null;
 let softwareManagerIpcPromise = null;
-let softwareManagerServicePromise = null;
+let softwareManagerRuntimePromise = null;
 let chatgptBridgeService = null;
 let routerLifecyclePromise = null;
 let codexHistoryRecoveryFlowPromise = null;
@@ -832,20 +832,52 @@ async function loadRouterHealth() {
   return import("./router-health.mjs");
 }
 
-function softwareManagerUnavailableAdapter() {
-  const unavailable = async () => {
-    const error = new Error("software_manager_runtime_not_provisioned");
-    error.code = "software_manager_runtime_not_provisioned";
-    throw error;
-  };
-  return Object.freeze({
-    inspectInstalled: unavailable,
-    prepare: unavailable,
-    commit: unavailable,
-    verify: unavailable,
-    uninstall: unavailable,
-    rollback: unavailable,
+function execSoftwareManagerFile(file, args, options) {
+  return new Promise((resolve, reject) => {
+    execFileCallback(file, args, options, (error, stdout, stderr) => {
+      if (error) {
+        if (!Number.isInteger(error.exitCode) && Number.isInteger(error.code)) {
+          try { error.exitCode = error.code; } catch {}
+        }
+        reject(error);
+        return;
+      }
+      resolve({ exitCode: 0, stdout, stderr });
+    });
   });
+}
+
+function spawnSoftwareManagerProcess(file, args, options) {
+  const child = spawn(file, args, options);
+  const started = new Promise((resolve, reject) => {
+    child.once("spawn", () => resolve(true));
+    child.once("error", reject);
+  });
+  let processError = null;
+  const completed = new Promise((resolve, reject) => {
+    child.once("error", (error) => { processError = error; });
+    child.once("close", (exitCode, signal) => {
+      if (processError) {
+        reject(processError);
+        return;
+      }
+      resolve({ exitCode: Number.isInteger(exitCode) ? exitCode : 1, signal });
+    });
+  });
+  started.catch(() => {});
+  completed.catch(() => {});
+  Object.defineProperties(child, {
+    started: { configurable: false, enumerable: true, value: started },
+    completed: { configurable: false, enumerable: true, value: completed },
+    cancel: {
+      configurable: false,
+      enumerable: true,
+      value: () => {
+        if (child.exitCode === null && !child.killed) child.kill();
+      },
+    },
+  });
+  return child;
 }
 
 async function createSoftwareManagerRuntimeService() {
@@ -855,118 +887,44 @@ async function createSoftwareManagerRuntimeService() {
     throw error;
   }
   const [
-    { createSoftwareManagerService },
-    { createWin32FileApi },
-    { createWindowsFileCapabilities },
-    { createOwnershipStore },
-    { createTransactionJournal, recoverTransactions },
-    { createVersionSlotManager },
-    { authorizeInstallRoot },
+    { createProductionSoftwareManagerService },
+    { CATALOG_PUBLIC_KEY_SPKI },
   ] = await Promise.all([
-    import("./software-manager/service.mjs"),
-    import("./software-manager/win32-file-api.mjs"),
-    import("./software-manager/windows-file-capabilities.mjs"),
-    import("./software-manager/state-store.mjs"),
-    import("./software-manager/transaction-journal.mjs"),
-    import("./software-manager/version-slots.mjs"),
-    import("./software-manager/path-policy.mjs"),
+    import("./software-manager/runtime-factory.mjs"),
+    import("./software-manager/catalog-public-key.mjs"),
   ]);
-
-  const softwareRoot = path.join(dataRootDir, "software-manager");
-  const stateDir = path.join(softwareRoot, "state");
-  const journalDir = path.join(softwareRoot, "journal");
-  fs.mkdirSync(stateDir, { recursive: true });
-  fs.mkdirSync(journalDir, { recursive: true });
-  const nativeApi = createWin32FileApi({ platform: "win32", koffi: require("koffi") });
-  const fileCapabilities = createWindowsFileCapabilities({ platform: "win32", nativeApi });
-  const skillsRoot = path.join(os.homedir(), ".codex", "skills");
-  const ownershipStore = createOwnershipStore({ stateDir, fsApi: fileCapabilities, skillsRoot });
-  const journal = createTransactionJournal({ journalDir, fsApi: fileCapabilities });
-  const slots = createVersionSlotManager({ fsApi: fileCapabilities, ownershipStore, journal });
-
-  const rootCapabilities = new Map();
-  const candidateRootTokens = new Set();
-  let selectedRootToken = null;
-  const installRootResolver = Object.freeze({
-    getCurrentToken: () => selectedRootToken,
-    async choose(candidate) {
-      const capability = await authorizeInstallRoot({
-        candidate,
-        env: process.env,
-        maxRelativePath: 220,
-        access: (target) => fs.promises.access(target, fs.constants.R_OK | fs.constants.W_OK),
-        realpath: (target) => fs.promises.realpath(target),
-        lstat: (target) => fs.promises.lstat(target),
-      });
-      let token;
-      do { token = crypto.randomBytes(24).toString("base64url"); } while (rootCapabilities.has(token));
-      rootCapabilities.set(token, capability);
-      candidateRootTokens.add(token);
-      return { token, capability };
-    },
-    async resolve(token) {
-      const capability = rootCapabilities.get(token);
-      if (!capability) {
-        const error = new Error("software_manager_install_root_invalid");
-        error.code = "software_manager_install_root_invalid";
-        throw error;
-      }
-      return capability;
-    },
-    async adopt(token) {
-      if (!candidateRootTokens.has(token) || !rootCapabilities.has(token)) {
-        const error = new Error("software_manager_install_root_invalid");
-        error.code = "software_manager_install_root_invalid";
-        throw error;
-      }
-      const previous = selectedRootToken;
-      selectedRootToken = token;
-      candidateRootTokens.delete(token);
-      if (previous && previous !== token) rootCapabilities.delete(previous);
-      for (const candidate of candidateRootTokens) rootCapabilities.delete(candidate);
-      candidateRootTokens.clear();
-    },
-    async discard(token) {
-      if (!candidateRootTokens.delete(token)) return false;
-      rootCapabilities.delete(token);
-      return true;
-    },
-  });
-  const unavailable = softwareManagerUnavailableAdapter();
-  return createSoftwareManagerService({
-    platform: "win32",
-    catalogProvider: {
-      // Startup recovery is deliberately offline.  The signed catalog runtime
-      // remains read-only until its independently provisioned trust authority
-      // and production component file adapters are both present.
-      getCurrent: async () => null,
-      refresh: async () => null,
-    },
-    adapters: Object.freeze({
-      chatgpt: unavailable,
-      v2rayn: unavailable,
-      git: unavailable,
-      skills: unavailable,
-    }),
-    ownershipStore,
-    recoverTransactions: () => recoverTransactions({ journal, slots }),
-    installRootResolver,
+  return createProductionSoftwareManagerService({
+    platform: process.platform,
+    dataRoot: path.join(dataRootDir, "software-manager"),
+    homeDir: desktopHomeDir(),
+    getDesktopPath: () => app.getPath("desktop"),
+    env: process.env,
+    electronShell: shell,
+    fetchImpl: globalThis.fetch,
+    execFile: execSoftwareManagerFile,
+    spawn: spawnSoftwareManagerProcess,
+    publicKeyPem: CATALOG_PUBLIC_KEY_SPKI,
+    koffi: require("koffi"),
   });
 }
 
-function getSoftwareManagerService() {
+function getSoftwareManagerRuntime() {
   if (process.platform !== "win32") {
     const error = new Error("software_manager_platform_disabled");
     error.code = "software_manager_platform_disabled";
     return Promise.reject(error);
   }
-  if (!softwareManagerServicePromise) {
-    softwareManagerServicePromise = createSoftwareManagerRuntimeService().catch((error) => {
-      softwareManagerServicePromise = null;
+  if (!softwareManagerRuntimePromise) {
+    softwareManagerRuntimePromise = createSoftwareManagerRuntimeService().catch((error) => {
+      softwareManagerRuntimePromise = null;
       throw error;
     });
   }
-  return softwareManagerServicePromise;
+  return softwareManagerRuntimePromise;
+}
+
+async function getSoftwareManagerService() {
+  return (await getSoftwareManagerRuntime()).service;
 }
 
 function initializeSoftwareManagerIpc() {
@@ -976,13 +934,13 @@ function initializeSoftwareManagerIpc() {
         ipcMain,
         platform: process.platform,
         getService: getSoftwareManagerService,
-        selectInstallRoot: async (service) => {
+        selectInstallRoot: async () => {
           const selection = await dialog.showOpenDialog(mainWindow, {
             title: "选择软件安装位置",
             properties: ["openDirectory", "createDirectory"],
           });
           if (selection.canceled || selection.filePaths.length !== 1) return { cancelled: true };
-          return service.chooseInstallRoot(selection.filePaths[0]);
+          return (await getSoftwareManagerRuntime()).selectInstallRoot(selection.filePaths[0]);
         },
         sendEvent: (event) => sendToRenderer("softwareManager:event", event),
       });
@@ -1091,7 +1049,6 @@ app.whenReady().then(async () => {
   }
   try {
     await recoverPendingConfigTransactions();
-    configRecoveryComplete = true;
   } catch (error) {
     appendRuntimeLog(formatError("configRecovery", error));
     dialog.showErrorBox(
@@ -1104,15 +1061,25 @@ app.whenReady().then(async () => {
     return;
   }
   try {
-    await initializeSoftwareManagerIpc();
     if (process.platform === "win32") {
       // Recovery is local-only and deliberately precedes renderer access.  It
       // neither refreshes the signed catalog nor launches external software.
-      await (await getSoftwareManagerService()).recoverPending();
+      const runtime = await getSoftwareManagerRuntime();
+      await runtime.recoverOffline();
     }
+    await initializeSoftwareManagerIpc();
   } catch (error) {
     appendRuntimeLog(formatError("softwareManagerStartup", error));
+    dialog.showErrorBox(
+      "CodexBridge 软件管理恢复未完成",
+      "软件管理的本地事务恢复失败。为避免暴露未恢复状态，CodexBridge 已停止启动；请查看日志后重试。",
+    );
+    managedQuitReady = true;
+    isQuitting = true;
+    app.quit();
+    return;
   }
+  configRecoveryComplete = true;
   if (process.env.CODEXBRIDGE_DESKTOP_SMOKE !== "1") {
     createTray();
   }

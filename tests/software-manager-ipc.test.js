@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
 import test from "node:test";
 
@@ -289,14 +290,112 @@ test("closing a window remains hide-to-tray and does not become a task cancellat
   assert.doesNotMatch(closeHandler, /cancelTask|softwareManager/u);
 });
 
-test("production bootstrap is explicitly offline and not provisioned instead of faking task success", () => {
+test("main delegates Windows runtime construction and recovers offline before renderer creation", () => {
   const mainSource = require("node:fs").readFileSync(new URL("../desktop/main.cjs", import.meta.url), "utf8");
   const runtime = mainSource.match(/async function createSoftwareManagerRuntimeService\(\)[\s\S]*?\n\}/u)?.[0] ?? "";
-  assert.match(mainSource, /software_manager_runtime_not_provisioned/u);
-  assert.match(runtime, /getCurrent:\s*async \(\) => null/u);
-  assert.match(runtime, /refresh:\s*async \(\) => null/u);
-  assert.doesNotMatch(runtime, /status:\s*["']succeeded["']/u);
-  const startupRecovery = mainSource.indexOf("getSoftwareManagerService()).recoverPending()");
+  assert.match(runtime, /process\.platform !== "win32"[\s\S]*?import\("\.\/software-manager\/runtime-factory\.mjs"\)/u);
+  assert.match(runtime, /createProductionSoftwareManagerService\(\{/u);
+  for (const dependency of [
+    "platform", "dataRoot", "homeDir", "getDesktopPath", "env", "electronShell",
+    "fetchImpl", "execFile", "spawn", "publicKeyPem", "koffi",
+  ]) assert.match(runtime, new RegExp(`\\b${dependency}\\s*:`, "u"));
+  assert.match(runtime, /homeDir:\s*desktopHomeDir\(\)/u);
+  assert.doesNotMatch(mainSource, /softwareManagerUnavailableAdapter|software_manager_runtime_not_provisioned/u);
+  const startupRecovery = mainSource.indexOf("runtime.recoverOffline()");
   const createWindow = mainSource.indexOf("createWindow();", startupRecovery);
   assert.equal(startupRecovery > 0 && createWindow > startupRecovery, true);
+});
+
+test("software-manager startup recovery is fail-closed and performs no catalog or network work", () => {
+  const mainSource = require("node:fs").readFileSync(new URL("../desktop/main.cjs", import.meta.url), "utf8");
+  const startup = mainSource.match(/app\.whenReady\(\)\.then\(async \(\) => \{[\s\S]*?\n\}\);\n\napp\.on\("before-quit"/u)?.[0] ?? "";
+  const recovery = startup.indexOf("runtime.recoverOffline()");
+  const recoveryCatch = startup.indexOf("catch (error)", recovery);
+  const recoveryComplete = startup.indexOf("configRecoveryComplete = true;", recovery);
+  const createWindow = startup.indexOf("createWindow();", recovery);
+  assert.equal(
+    recovery >= 0 && recoveryCatch > recovery && recoveryComplete > recoveryCatch && createWindow > recoveryComplete,
+    true,
+  );
+  const recoveryCatchEnd = startup.indexOf("\n  }\n  configRecoveryComplete = true;", recoveryCatch);
+  const catchBody = startup.slice(recoveryCatch, recoveryCatchEnd);
+  assert.match(catchBody, /appendRuntimeLog\(formatError\("softwareManagerStartup", error\)\)/u);
+  assert.match(catchBody, /app\.quit\(\);[\s\S]*?return;/u);
+  assert.doesNotMatch(catchBody, /configRecoveryComplete = true/u);
+  assert.equal((startup.match(/configRecoveryComplete = true;/gu) ?? []).length, 1);
+  assert.doesNotMatch(startup.slice(recovery, createWindow), /\.refresh\(|\bfetch\s*\(/u);
+});
+
+test("main process spawn adapter exposes bounded start, completion, and cancellation evidence", async () => {
+  const mainSource = require("node:fs").readFileSync(new URL("../desktop/main.cjs", import.meta.url), "utf8");
+  const adapterSource = mainSource.match(/function spawnSoftwareManagerProcess\([^)]*\) \{[\s\S]*?\n\}/u)?.[0] ?? "";
+  const child = new EventEmitter();
+  Object.assign(child, {
+    pid: 321,
+    exitCode: null,
+    killed: false,
+    stdout: { pipe() {} },
+    stderr: { async *[Symbol.asyncIterator]() {} },
+    kill() { this.killed = true; },
+    unref() {},
+  });
+  const create = new Function("spawn", `${adapterSource}; return spawnSoftwareManagerProcess;`);
+  const spawnProcess = create(() => child);
+  const handle = spawnProcess("C:\\Program Files\\App\\app.exe", [], {});
+  assert.equal(handle, child);
+  assert.equal(typeof handle.started?.then, "function");
+  assert.equal(typeof handle.completed?.then, "function");
+  assert.equal(typeof handle.cancel, "function");
+  child.emit("spawn");
+  await handle.started;
+  handle.cancel();
+  assert.equal(child.killed, true);
+  child.emit("close", 0, null);
+  assert.deepEqual(await handle.completed, { exitCode: 0, signal: null });
+
+  const failedChild = new EventEmitter();
+  Object.assign(failedChild, {
+    pid: 654,
+    exitCode: null,
+    killed: false,
+    stdout: { pipe() {} },
+    stderr: { async *[Symbol.asyncIterator]() {} },
+    kill() { this.killed = true; },
+    unref() {},
+  });
+  const spawnFailedProcess = create(() => failedChild);
+  const failedHandle = spawnFailedProcess("C:\\Program Files\\App\\app.exe", [], {});
+  const processError = new Error("spawn aborted");
+  let completionSettled = false;
+  failedHandle.completed.then(
+    () => { completionSettled = true; },
+    () => { completionSettled = true; },
+  );
+  failedChild.emit("error", processError);
+  await assert.rejects(failedHandle.started, (error) => error === processError);
+  await Promise.resolve();
+  assert.equal(completionSettled, false);
+  failedChild.emit("close", null, "SIGTERM");
+  await assert.rejects(failedHandle.completed, (error) => error === processError);
+  assert.equal(completionSettled, true);
+  assert.match(adapterSource, /started\.catch\(\(\) => \{\}\)/u);
+  assert.match(adapterSource, /completed\.catch\(\(\) => \{\}\)/u);
+});
+
+test("main execFile adapter adds an explicit success exit code and preserves failures", async () => {
+  const mainSource = require("node:fs").readFileSync(new URL("../desktop/main.cjs", import.meta.url), "utf8");
+  const adapterSource = mainSource.match(/function execSoftwareManagerFile\([^)]*\) \{[\s\S]*?\n\}/u)?.[0] ?? "";
+  let callback;
+  const execFileCallback = (_file, _args, _options, done) => { callback = done; };
+  const create = new Function("execFileCallback", `${adapterSource}; return execSoftwareManagerFile;`);
+  const execFile = create(execFileCallback);
+
+  const succeeded = execFile("C:\\Program Files\\App\\app.exe", ["--version"], {});
+  callback(null, "version 1.2.3", "");
+  assert.deepEqual(await succeeded, { exitCode: 0, stdout: "version 1.2.3", stderr: "" });
+
+  const failure = Object.assign(new Error("failed"), { code: 7, stdout: "", stderr: "bad" });
+  const rejected = execFile("C:\\Program Files\\App\\app.exe", [], {});
+  callback(failure, "", "bad");
+  await assert.rejects(rejected, (error) => error === failure && error.exitCode === 7);
 });
