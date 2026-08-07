@@ -518,7 +518,9 @@ test("recorded shortcut removal reads and removes through the same held inspecti
 
 test("Git installer command uses a fixed verified silent argument list", async () => {
   const fixture = fakeHost();
-  await fixture.host.runGitInstaller({ installerPath: "D:\\staging\\Git.exe", targetDir: "D:\\CBApps\\Git\\current" });
+  await fixture.host.runGitInstaller({
+    installerPath: "D:\\staging\\Git.exe", targetDir: "D:\\CBApps\\Git\\current", onStarted: async () => {},
+  });
   assertCommand(fixture.calls.execFile[0], "D:\\staging\\Git.exe", [
     "/VERYSILENT", "/NORESTART", "/NOCANCEL", "/SP-", "/CLOSEAPPLICATIONS",
     "/o:PathOption=Cmd", "/DIR=D:\\CBApps\\Git\\current",
@@ -530,6 +532,7 @@ test("Git uninstaller command accepts only a direct-child uninstaller and fixed 
   await fixture.host.runGitUninstaller({
     uninstallerPath: "D:\\CBApps\\Git\\unins000.exe",
     installDir: "D:\\CBApps\\Git",
+    onStarted: async () => {},
   });
   assertCommand(fixture.calls.execFile[0], "D:\\CBApps\\Git\\unins000.exe", [
     "/VERYSILENT", "/NORESTART", "/NOCANCEL",
@@ -541,6 +544,63 @@ test("Git uninstaller command accepts only a direct-child uninstaller and fixed 
     }),
     /git_uninstaller_path_mismatch/,
   );
+});
+
+test("Git execution releases mutable pins only after spawn evidence and before process completion", async () => {
+  let allowSpawn;
+  let allowExit;
+  let started = false;
+  let completed = false;
+  const spawnGate = new Promise((resolve) => { allowSpawn = resolve; });
+  const exitGate = new Promise((resolve) => { allowExit = resolve; });
+  const host = createWindowsHost({
+    platform: "win32",
+    env: {},
+    electronShell: {},
+    async execFile(_file, _args, options) {
+      await spawnGate;
+      await options.onSpawn();
+      assert.equal(started, true, "the start callback releases mutable pins at spawn");
+      await exitGate;
+      completed = true;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  });
+  const running = host.runGitInstaller({
+    installerPath: "D:\\staging\\Git.exe",
+    targetDir: "D:\\CBApps\\Git",
+    onStarted: async () => { started = true; },
+  });
+  await Promise.resolve();
+  assert.equal(started, false, "pins remain held before the child is created");
+  allowSpawn();
+  while (!started) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(completed, false, "the installer may still be running after mutable pins are released");
+  allowExit();
+  await running;
+});
+
+test("Git execution forwards bounded timeout and cancellation and requires spawn evidence", async () => {
+  const controller = new AbortController();
+  let receivedOptions;
+  const host = createWindowsHost({
+    platform: "win32",
+    env: {},
+    electronShell: {},
+    async execFile(_file, _args, options) {
+      receivedOptions = options;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  });
+  await assert.rejects(host.runGitInstaller({
+    installerPath: "D:\\staging\\Git.exe",
+    targetDir: "D:\\CBApps\\Git",
+    timeoutMs: 45_000,
+    signal: controller.signal,
+    onStarted: async () => {},
+  }), /git_process_start_evidence_missing/u);
+  assert.equal(receivedOptions.timeout, 45_000);
+  assert.equal(receivedOptions.signal, controller.signal);
 });
 
 for (const [label, action] of [
@@ -622,6 +682,7 @@ function fakeHost({
 
   const execFile = async (file, args, options) => {
     calls.execFile.push({ file, args: [...args], options });
+    await options.onSpawn?.();
     if (file === "reg.exe") {
       const key = args[1];
       if (!regOutputs.has(key)) return { exitCode: 1, stdout: "", stderr: "not found" };

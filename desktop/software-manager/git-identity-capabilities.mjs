@@ -120,9 +120,12 @@ export function createGitIdentityCapabilities({
     if (!isRecord(rawPlan)) throw identityError("git_identity_plan_invalid");
     const targetDir = canonicalPath(rawPlan.targetDir, "git_identity_target_invalid");
     const handles = [];
+    const installerHandles = [];
+    const mutableHandles = [];
     const record = {
       state: "open", targetDir, discovery: null,
       installerPath: null, installerSha256: null, handles,
+      installerHandles, mutableHandles, mutableReleased: false,
       targetMustBeAbsent: rawPlan.targetMustBeAbsent === true, parentPin: null,
     };
     try {
@@ -130,7 +133,9 @@ export function createGitIdentityCapabilities({
         record.installerPath = canonicalPath(rawPlan.installerPath, "git_identity_installer_invalid");
         if (!SHA256.test(rawPlan.installerSha256 ?? "")) throw identityError("git_identity_installer_hash_invalid");
         record.installerSha256 = rawPlan.installerSha256;
-        handles.push(await pinFile(record.installerPath));
+        const installerPin = await pinFile(record.installerPath);
+        handles.push(installerPin);
+        installerHandles.push(installerPin);
         if (await hashFile(record.installerPath) !== record.installerSha256) {
           throw identityError("git_identity_installer_hash_mismatch");
         }
@@ -138,9 +143,10 @@ export function createGitIdentityCapabilities({
       if (rawPlan.discovery !== null && rawPlan.discovery !== undefined) {
         if (record.targetMustBeAbsent) throw identityError("git_identity_plan_invalid");
         record.discovery = validateDiscovery(rawPlan.discovery, targetDir);
-        handles.push(validateDirectoryPin(await fileCapabilities.openDirectoryNoFollow(targetDir)));
-        handles.push(await pinFile(record.discovery.executablePath));
-        handles.push(await pinFile(record.discovery.uninstallerPath));
+        mutableHandles.push(validateDirectoryPin(await fileCapabilities.openDirectoryNoFollow(targetDir)));
+        mutableHandles.push(await pinFile(record.discovery.executablePath));
+        mutableHandles.push(await pinFile(record.discovery.uninstallerPath));
+        handles.push(...mutableHandles);
       } else {
         if (!samePath(targetDir, path.win32.join(installRoot, "Git"))) {
           throw identityError("git_identity_unregistered_target_rejected");
@@ -148,6 +154,7 @@ export function createGitIdentityCapabilities({
         if (record.targetMustBeAbsent) {
           record.parentPin = validateParentPin(await fileCapabilities.openDirectoryNoFollow(installRoot));
           handles.push(record.parentPin);
+          mutableHandles.push(record.parentPin);
           const children = await record.parentPin.listChildren();
           if (!Array.isArray(children) || children.some((name) => name.toLowerCase() === "git")) {
             throw identityError("git_identity_target_exists");
@@ -204,6 +211,20 @@ export function createGitIdentityCapabilities({
     await closeAll(record.handles);
   }
 
+  async function releaseMutable(capability) {
+    const record = requirePin(capability);
+    if (record.mutableReleased) throw identityError("git_mutable_identity_already_released");
+    record.mutableReleased = true;
+    const mutable = [...record.mutableHandles];
+    record.mutableHandles.length = 0;
+    record.parentPin = null;
+    for (const handle of mutable) {
+      const index = record.handles.indexOf(handle);
+      if (index !== -1) record.handles.splice(index, 1);
+    }
+    await closeAll(mutable);
+  }
+
   async function retainInstaller(capability, value) {
     const record = requirePin(capability);
     const retained = validateRetained(value, downloadsRoot);
@@ -248,6 +269,7 @@ export function createGitIdentityCapabilities({
   return Object.freeze({
     pinPlan,
     revalidate,
+    releaseMutable,
     release,
     retainInstaller,
     pinRetainedInstaller,

@@ -6,6 +6,7 @@ import { createOwnershipStore } from "../desktop/software-manager/state-store.mj
 
 const CANONICAL_SKILLS_ROOT = "C:\\Users\\me\\.codex\\skills";
 const testStateLock = async () => ({ async release() {} });
+const testOperationLease = async (_stateDir, { nonce, scope }) => ({ nonce, scope, async release() {} });
 
 function state(installRoot = "C:\\Tools\\CodexBridge") {
   return {
@@ -64,6 +65,7 @@ function createMemoryStateFs(initial = {}) {
       let released = false;
       return { async release() { assert.equal(released, false); released = true; calls.push(["release-state-lock"]); } };
     },
+    acquireOperationLeaseNoFollow: testOperationLease,
     async openStateDirectoryNoFollow(stateDir) {
       calls.push(["open-directory-no-follow", stateDir]);
       return {
@@ -211,6 +213,7 @@ test("load falls back to a validated backup after interrupted atomic rename", as
 test("state files that are links or reparse points are never followed", async () => {
   const fsApi = {
     acquireStateLockNoFollow: testStateLock,
+    acquireOperationLeaseNoFollow: testOperationLease,
     async openStateDirectoryNoFollow() {
       throw Object.assign(new Error("state_reparse_point"), { code: "state_reparse_point" });
     },
@@ -223,7 +226,11 @@ test("save rejects malformed state before writing", async () => {
   let touched = false;
   const store = createOwnershipStore({
     stateDir: path.resolve("state"),
-    fsApi: { acquireStateLockNoFollow: testStateLock, async openStateDirectoryNoFollow() { touched = true; } },
+    fsApi: {
+      acquireStateLockNoFollow: testStateLock,
+      acquireOperationLeaseNoFollow: testOperationLease,
+      async openStateDirectoryNoFollow() { touched = true; },
+    },
   });
   await assert.rejects(store.save({ schemaVersion: 1 }), { code: "ownership_state_invalid" });
   assert.equal(touched, false);
@@ -241,6 +248,25 @@ test("state store fails closed when only a process-local queue exists without an
     stateDir: path.resolve("state"),
     fsApi: { async openStateDirectoryNoFollow() {} },
   }), /state_lock_capability_required/u);
+});
+
+test("an OS lock release failure always releases the in-process gate for the next operation", async () => {
+  const memory = createMemoryStateFs();
+  let releases = 0;
+  memory.fsApi.acquireStateLockNoFollow = async () => ({
+    async release() {
+      releases += 1;
+      if (releases === 1) throw Object.assign(new Error("release_failed"), { code: "release_failed" });
+    },
+  });
+  const store = createOwnershipStore({ stateDir: path.resolve("release-state"), fsApi: memory.fsApi });
+  await assert.rejects(store.load(), { code: "release_failed" });
+  const second = await Promise.race([
+    store.load(),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("memory_gate_stuck")), 100)),
+  ]);
+  assert.equal(second.generation, 0);
+  assert.equal(releases, 2);
 });
 
 test("reads through a stable handle when the state path is replaced after open", async () => {
@@ -268,6 +294,7 @@ for (const code of ["state_directory_reparse_point", "ancestor_reparse_point"]) 
       stateDir: path.resolve("state", "nested"),
       fsApi: {
         acquireStateLockNoFollow: testStateLock,
+        acquireOperationLeaseNoFollow: testOperationLease,
         async openStateDirectoryNoFollow() { throw Object.assign(new Error(code), { code }); },
       },
     });

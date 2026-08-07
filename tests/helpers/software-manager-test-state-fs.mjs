@@ -29,9 +29,9 @@ async function removeStaleLock(lockDir) {
   return true;
 }
 
-async function acquireTestLock(stateDir) {
+async function acquireTestLockDirectory(stateDir, lockDirectoryName, wait = true) {
   await fs.mkdir(stateDir, { recursive: true });
-  const lockDir = path.join(stateDir, LOCK_DIRECTORY);
+  const lockDir = path.join(stateDir, lockDirectoryName);
   const ownerPath = path.join(lockDir, OWNER_FILE);
   const deadline = Date.now() + 10_000;
   for (;;) {
@@ -49,11 +49,24 @@ async function acquireTestLock(stateDir) {
       };
     } catch (error) {
       if (!occupied(error)) throw error;
-      await removeStaleLock(lockDir);
+      const removed = await removeStaleLock(lockDir);
+      if (!wait && !removed) return null;
       if (Date.now() >= deadline) throw new Error("test_state_lock_timeout");
       await delay(10);
     }
   }
+}
+
+async function acquireTestLock(stateDir) {
+  return acquireTestLockDirectory(stateDir, LOCK_DIRECTORY);
+}
+
+async function acquireTestOperationLease(stateDir, { nonce, scope, wait = true }) {
+  if (!/^[a-f0-9]{32}$/u.test(nonce ?? "") || !["prepare", "git-execute"].includes(scope)) {
+    throw new Error("test_operation_lease_invalid");
+  }
+  const lock = await acquireTestLockDirectory(stateDir, `.ownership-test-operation-${scope}-${nonce}`, wait);
+  return lock === null ? null : { nonce, scope, release: lock.release };
 }
 
 function sameIdentity(left, right) { return left.dev === right.dev && left.ino === right.ino; }
@@ -62,6 +75,7 @@ export function createTestStateFs() {
   return Object.freeze({
     testOnly: true,
     acquireStateLockNoFollow: acquireTestLock,
+    acquireOperationLeaseNoFollow: acquireTestOperationLease,
     async openStateDirectoryNoFollow(stateDir) {
       await fs.mkdir(stateDir, { recursive: true });
       const rootStat = await fs.lstat(stateDir);

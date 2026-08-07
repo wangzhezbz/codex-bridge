@@ -1,5 +1,6 @@
 import { createOwnershipStore } from "../../desktop/software-manager/state-store.mjs";
-import { acquireTestStateLock, createTestStateFs } from "../helpers/software-manager-test-state-fs.mjs";
+import { createWin32FileApi } from "../../desktop/software-manager/win32-file-api.mjs";
+import { createWindowsFileCapabilities } from "../../desktop/software-manager/windows-file-capabilities.mjs";
 
 function state(installRoot = null) {
   return {
@@ -9,15 +10,26 @@ function state(installRoot = null) {
 }
 
 const [mode, stateDir, label = "child", nonce = "1".repeat(32)] = process.argv.slice(2);
+const fsApi = createWindowsFileCapabilities({ nativeApi: createWin32FileApi() });
+const store = createOwnershipStore({ stateDir, fsApi });
 
-if (mode === "hold") {
-  const lock = await acquireTestStateLock(stateDir);
+if (mode === "hold-state") {
+  const lock = await fsApi.acquireStateLockNoFollow(stateDir);
   process.send?.({ type: "locked" });
   process.on("message", async (message) => {
     if (message === "release") { await lock.release(); process.exit(0); }
   });
+} else if (mode === "responsive-load") {
+  const timer = setTimeout(() => process.send?.({ type: "responsive" }), 50);
+  try {
+    const loaded = await store.load();
+    clearTimeout(timer);
+    process.send?.({ type: "result", status: "loaded", generation: loaded.generation });
+  } catch (error) {
+    clearTimeout(timer);
+    process.send?.({ type: "result", status: "failed", code: error?.code ?? error?.message });
+  } finally { process.exit(0); }
 } else if (mode === "hold-operation") {
-  const store = createOwnershipStore({ stateDir, fsApi: createTestStateFs() });
   const lease = await store.acquireOperationLease({ nonce, scope: "prepare", wait: true });
   const next = state();
   next.activeTask = {
@@ -30,7 +42,6 @@ if (mode === "hold") {
     if (message === "release") { await lease.release(); process.exit(0); }
   });
 } else if (mode === "probe-operation") {
-  const store = createOwnershipStore({ stateDir, fsApi: createTestStateFs() });
   const current = await store.load();
   const task = current.activeTask;
   const lease = await store.acquireOperationLease({ nonce: task.leaseNonce, scope: task.leaseScope, wait: false });
@@ -45,7 +56,6 @@ if (mode === "hold") {
   }
   process.exit(0);
 } else {
-  const store = createOwnershipStore({ stateDir, fsApi: createTestStateFs() });
   process.send?.({ type: "ready" });
   process.on("message", async (message) => {
     if (message !== "go") return;
@@ -54,8 +64,6 @@ if (mode === "hold") {
       process.send?.({ type: "result", status: "saved", generation: saved.generation });
     } catch (error) {
       process.send?.({ type: "result", status: "failed", code: error?.code ?? error?.message });
-    } finally {
-      process.exit(0);
-    }
+    } finally { process.exit(0); }
   });
 }

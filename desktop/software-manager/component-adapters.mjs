@@ -1,4 +1,5 @@
 import path from "node:path";
+import { randomBytes } from "node:crypto";
 
 import { isTrustedCatalogService } from "./catalog-trust.mjs";
 import { getOwnershipCoordinator } from "./ownership-coordinator.mjs";
@@ -184,6 +185,7 @@ export function createComponentAdapters({
   gitIdentityCapabilities,
   resolveSkillTarget,
   skillPathAccess = {},
+  gitExecutionTimeoutMs = 15 * 60_000,
 } = {}) {
   if (!isTrustedCatalogService(catalogService)) throw adapterError("trusted_catalog_service_required");
   const installRoot = readInstallRootCapability(installRootCapability);
@@ -221,34 +223,44 @@ export function createComponentAdapters({
   const pinGitPlan = requireMethod(gitIdentityCapabilities, "pinPlan", "git_identity_capability_required");
   const revalidateGitPlan = requireMethod(gitIdentityCapabilities, "revalidate", "git_identity_capability_required");
   const releaseGitPlan = requireMethod(gitIdentityCapabilities, "release", "git_identity_capability_required");
+  const releaseMutableGitPlan = requireMethod(gitIdentityCapabilities, "releaseMutable", "git_identity_capability_required");
   const retainInstaller = requireMethod(gitIdentityCapabilities, "retainInstaller", "git_identity_capability_required");
   const pinRetainedInstaller = requireMethod(gitIdentityCapabilities, "pinRetainedInstaller", "git_identity_capability_required");
   const discardRetainedInstaller = requireMethod(gitIdentityCapabilities, "discardRetainedInstaller", "git_identity_capability_required");
+  const acquireOperationLease = requireMethod(ownershipStore, "acquireOperationLease", "operation_lease_capability_required");
   if (typeof resolveSkillTarget !== "function") throw adapterError("skill_path_resolver_required");
+  if (!Number.isSafeInteger(gitExecutionTimeoutMs) || gitExecutionTimeoutMs < 30_000
+    || gitExecutionTimeoutMs > 30 * 60_000) throw adapterError("git_execution_timeout_invalid");
 
   const preparedComponents = new Map();
   const preparedSkills = new Map();
-  const activePrepareClaims = new Set();
-  const activeGitInstallTasks = new Set();
   const runOwnership = (action) => ownershipCoordinator.runExclusive(action);
 
   async function safeLoad() {
     try { return await runOwnership(() => loadState()); } catch { return null; }
   }
 
-  async function reservePrepareClaim(recover, claim) {
-    return runOwnership(async () => {
-      const state = await recover();
-      if (state.activeTask !== null) throw adapterError("component_pending_transaction");
-      const reserved = structuredClone(state);
-      reserved.activeTask = structuredClone(claim);
-      const saved = await saveState(reserved);
-      activePrepareClaims.add(JSON.stringify(claim));
-      return saved;
-    });
+  async function reservePrepareClaim(recover, rawClaim) {
+    const leaseNonce = randomBytes(16).toString("hex");
+    const leaseScope = "prepare";
+    const lease = await acquireOperationLease({ nonce: leaseNonce, scope: leaseScope, wait: true });
+    const claim = { ...structuredClone(rawClaim), leaseScope, leaseNonce };
+    try {
+      const state = await runOwnership(async () => {
+        const current = await recover();
+        if (current.activeTask !== null) throw adapterError("component_pending_transaction");
+        const reserved = structuredClone(current);
+        reserved.activeTask = structuredClone(claim);
+        return saveState(reserved);
+      });
+      return { claim, lease, state };
+    } catch (error) {
+      await lease.release().catch(() => {});
+      throw error;
+    }
   }
 
-  async function clearPrepareClaim(claim) {
+  async function clearPrepareClaim(claim, lease) {
     const key = JSON.stringify(claim);
     try {
       return await runOwnership(async () => {
@@ -261,22 +273,61 @@ export function createComponentAdapters({
         return saveState(cleared);
       });
     } finally {
-      activePrepareClaims.delete(key);
+      await lease?.release();
     }
   }
 
   async function recoverAbandonedPrepareClaim(state) {
     const task = state?.activeTask;
-    if (!isRecord(task) || !["component-prepare", "skill-prepare"].includes(task.kind)
-      || activePrepareClaims.has(JSON.stringify(task))) return state;
-    const recovered = structuredClone(state);
-    recovered.activeTask = null;
-    recovered.lastTask = {
-      taskId: task.taskId,
-      componentId: task.kind === "skill-prepare" ? task.skillId : task.componentId,
-      action: "prepare-aborted",
-    };
-    return saveState(recovered);
+    if (!isRecord(task) || !["component-prepare", "skill-prepare"].includes(task.kind)) return state;
+    const lease = await acquireOperationLease({ nonce: task.leaseNonce, scope: task.leaseScope, wait: false });
+    if (lease === null) return state;
+    try {
+      const recovered = structuredClone(state);
+      recovered.activeTask = null;
+      recovered.lastTask = {
+        taskId: task.taskId,
+        componentId: task.kind === "skill-prepare" ? task.skillId : task.componentId,
+        action: "prepare-aborted",
+      };
+      return saveState(recovered);
+    } finally {
+      await lease.release();
+    }
+  }
+
+  async function reserveGitExecutionClaim(recover, rawClaim, validateState = async () => {}) {
+    const leaseNonce = randomBytes(16).toString("hex");
+    const leaseScope = "git-execute";
+    const lease = await acquireOperationLease({ nonce: leaseNonce, scope: leaseScope, wait: true });
+    const claim = { ...structuredClone(rawClaim), leaseScope, leaseNonce };
+    try {
+      const state = await runOwnership(async () => {
+        const current = await recover();
+        if (current.activeTask !== null) throw adapterError("component_pending_transaction");
+        await validateState(current);
+        const reserved = structuredClone(current);
+        reserved.activeTask = structuredClone(claim);
+        return saveState(reserved);
+      });
+      return { claim, lease, state };
+    } catch (error) {
+      await lease.release().catch(() => {});
+      throw error;
+    }
+  }
+
+  async function clearGitExecutionClaim(claim) {
+    return runOwnership(async () => {
+      const state = assertStateForManaged(await loadState());
+      if (JSON.stringify(state.activeTask) !== JSON.stringify(claim)) {
+        throw adapterError("git_execution_claim_changed");
+      }
+      const cleared = structuredClone(state);
+      cleared.activeTask = null;
+      cleared.lastTask = { taskId: claim.taskId, componentId: "git", action: claim.kind };
+      return saveState(cleared);
+    });
   }
 
   async function failed(componentId, action, error, hint = null) {
@@ -485,15 +536,19 @@ export function createComponentAdapters({
   async function prepareArchiveComponent(componentId, rawContext) {
     const action = "prepare";
     let claim = null;
+    let operationLease = null;
     try {
       const context = rejectForbiddenContext(rawContext);
       const taskId = requireTaskId(context.taskId);
       const entry = trustedComponent(componentId);
       claim = { kind: "component-prepare", taskId, componentId, version: entry.version };
-      const state = await reservePrepareClaim(recoverComponentUninstall, claim);
+      const reservation = await reservePrepareClaim(recoverComponentUninstall, claim);
+      ({ claim, lease: operationLease } = reservation);
+      const { state } = reservation;
       const before = managedRecord(state, componentId)?.version ?? null;
+      const maxRelativePath = componentPeakRelativePath(componentId, entry);
       await revalidateInstallRootCapability(installRootCapability, {
-        maxRelativePath: componentPeakRelativePath(componentId, entry),
+        maxRelativePath,
       });
       const rootPath = componentRoot(installRoot, componentId);
       const staging = slotRoot(installRoot, componentId, "staging");
@@ -509,10 +564,12 @@ export function createComponentAdapters({
         || downloaded.size !== entry.size || downloaded.sha256 !== entry.sha256) {
         throw adapterError("component_download_evidence_invalid");
       }
+      await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
       const receipt = validateReceipt(await extractArchive({
         format: entry.format, archivePath, destination: staging, signal: context.signal,
         verification: { componentId, version: entry.version },
       }), "component_verification_receipt_invalid");
+      await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
       await verifyComponent({
         rootPath: staging,
         entrypointPath: componentEntrypoint(installRoot, componentId, entry, "staging"),
@@ -520,8 +577,9 @@ export function createComponentAdapters({
         expectedVersion: entry.version,
         expectedPackageSha256: entry.sha256,
       });
-      const cleared = await clearPrepareClaim(claim);
-      claim = null;
+      await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
+      let cleared;
+      try { cleared = await clearPrepareClaim(claim, operationLease); } finally { claim = null; operationLease = null; }
       preparedComponents.set(`${componentId}\0${taskId}`, Object.freeze({
         taskId, componentId, before, entry, rootPath, persistentConfig, ...receipt,
       }));
@@ -530,7 +588,7 @@ export function createComponentAdapters({
         rollbackAvailable: stateRollbackAvailable(cleared, componentId),
       });
     } catch (error) {
-      if (claim) await clearPrepareClaim(claim).catch(() => {});
+      if (claim) await clearPrepareClaim(claim, operationLease).catch(() => {});
       return failed(componentId, action, error);
     }
   }
@@ -845,12 +903,30 @@ export function createComponentAdapters({
   async function recoverGitTransaction() {
     let state = assertStateForManaged(await recoverAbandonedPrepareClaim(await loadState()));
     const task = state.activeTask;
-    if (!isRecord(task) || !["git-install", "git-install-cleanup", "git-rollback", "git-rollback-cleanup", "git-uninstall"].includes(task.kind)) {
+    if (!isRecord(task) || !["git-install", "git-external-install", "git-install-cleanup", "git-rollback", "git-rollback-cleanup", "git-uninstall"].includes(task.kind)) {
       return state;
     }
-    if (task.kind === "git-install" && activeGitInstallTasks.has(task.taskId)) return state;
     if (task.kind === "git-install-cleanup") return finishGitInstallCleanup(state);
     if (task.kind === "git-rollback-cleanup") return finishGitRollbackCleanup(state);
+    let operationLease = null;
+    if (["git-install", "git-external-install"].includes(task.kind)) {
+      operationLease = await acquireOperationLease({ nonce: task.leaseNonce, scope: task.leaseScope, wait: false });
+      if (operationLease === null) return state;
+    }
+    try {
+      if (task.kind === "git-external-install") {
+        const discovery = await windowsHost.discoverGit();
+        const next = structuredClone(state);
+        next.activeTask = null;
+        next.lastTask = {
+          taskId: task.taskId, componentId: "git",
+          action: discovery?.kind === "external" && discovery.version === task.version
+            && discovery.installDir === task.targetDir && discovery.executablePath === task.executablePath
+            ? "external-install-recovered" : "external-install-aborted",
+        };
+        await saveState(next);
+        return next;
+      }
     const managed = managedRecord(state, "git");
     const targetDir = componentRoot(installRoot, "git");
     if (task.targetDir !== targetDir || task.executablePath !== relativeFile(targetDir, "cmd/git.exe")) {
@@ -884,8 +960,25 @@ export function createComponentAdapters({
       return aborted;
     }
     if (discoveredRaw?.kind === "none" && task.kind === "git-rollback") {
-      await verifyRetainedGitInstaller({ path: task.installerPath, sha256: task.installerSha256, version: task.version });
-      await windowsHost.runGitInstaller({ installerPath: task.installerPath, targetDir });
+      const installerPin = await pinRetainedInstaller({
+        path: task.installerPath, sha256: task.installerSha256, version: task.version,
+      });
+      let targetAbsencePin = null;
+      try {
+        targetAbsencePin = await pinGitPlan({ targetDir, targetMustBeAbsent: true });
+        await revalidateGitPlan(installerPin, { installerSha256: task.installerSha256 });
+        const signature = await windowsHost.verifyAuthenticode(task.installerPath);
+        if (signature?.status !== "Valid") throw adapterError("git_authenticode_invalid");
+        await revalidateGitPlan(installerPin, { installerSha256: task.installerSha256 });
+        await revalidateGitPlan(targetAbsencePin, { targetMustBeAbsent: true });
+        await windowsHost.runGitInstaller({
+          installerPath: task.installerPath, targetDir, timeoutMs: gitExecutionTimeoutMs,
+          onStarted: () => releaseMutableGitPlan(targetAbsencePin),
+        });
+      } finally {
+        if (targetAbsencePin) await releaseGitPlan(targetAbsencePin).catch(() => {});
+        await releaseGitPlan(installerPin).catch(() => {});
+      }
       discoveredRaw = await windowsHost.discoverGit();
     }
     const discovered = validateExternalGit(discoveredRaw);
@@ -932,6 +1025,9 @@ export function createComponentAdapters({
     };
     await saveState(next);
     return finishGitRollbackCleanup(next);
+    } finally {
+      if (operationLease) await operationLease.release();
+    }
   }
 
   async function inspectGit(rawContext) {
@@ -956,13 +1052,16 @@ export function createComponentAdapters({
   async function prepareGit(rawContext) {
     let pin = null;
     let claim = null;
+    let operationLease = null;
     try {
       const context = rejectForbiddenContext(rawContext);
       if (context.selected !== true) throw adapterError("git_explicit_selection_required");
       const taskId = requireTaskId(context.taskId);
       const entry = trustedComponent("git");
       claim = { kind: "component-prepare", taskId, componentId: "git", version: entry.version };
-      const state = await reservePrepareClaim(recoverGitTransaction, claim);
+      const reservation = await reservePrepareClaim(recoverGitTransaction, claim);
+      ({ claim, lease: operationLease } = reservation);
+      const { state } = reservation;
       const managed = managedRecord(state, "git");
       const discovery = await windowsHost.discoverGit();
       if (managed) {
@@ -972,8 +1071,9 @@ export function createComponentAdapters({
         }
       }
       if (!managed && discovery?.kind !== "none") validateExternalGit(discovery);
+      const maxRelativePath = componentPeakRelativePath("git", entry);
       await revalidateInstallRootCapability(installRootCapability, {
-        maxRelativePath: componentPeakRelativePath("git", entry),
+        maxRelativePath,
       });
       const installerPath = path.win32.join(installRoot, "downloads", `git-${entry.version}.exe`);
       const downloaded = await download({
@@ -984,8 +1084,10 @@ export function createComponentAdapters({
         || downloaded.size !== entry.size || downloaded.sha256 !== entry.sha256) {
         throw adapterError("component_download_evidence_invalid");
       }
+      await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
       const signature = await windowsHost.verifyAuthenticode(installerPath);
       if (signature?.status !== "Valid") throw adapterError("git_authenticode_invalid");
+      await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
       const mode = !managed && discovery?.kind === "external" ? "external" : "managed";
       const targetDir = mode === "external" ? discovery.installDir : componentRoot(installRoot, "git");
       pin = await pinGitPlan({
@@ -993,8 +1095,8 @@ export function createComponentAdapters({
         discovery: discovery?.kind === "external" ? discovery : null,
         targetMustBeAbsent: discovery?.kind === "none",
       });
-      await clearPrepareClaim(claim);
-      claim = null;
+      await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
+      try { await clearPrepareClaim(claim, operationLease); } finally { claim = null; operationLease = null; }
       preparedComponents.set(`git\0${taskId}`, Object.freeze({
         taskId, mode, entry, installerPath, pin,
         discovery: discovery?.kind === "external" ? structuredClone(discovery) : null,
@@ -1007,7 +1109,7 @@ export function createComponentAdapters({
         message: "git_prepared", rollbackAvailable: Boolean(managed?.previousInstaller),
       });
     } catch (error) {
-      if (claim) await clearPrepareClaim(claim).catch(() => {});
+      if (claim) await clearPrepareClaim(claim, operationLease).catch(() => {});
       if (pin) await releaseGitPlan(pin).catch(() => {});
       return failed("git", "prepare", error);
     }
@@ -1015,6 +1117,8 @@ export function createComponentAdapters({
 
   async function commitGit(rawContext) {
     let prepared = null;
+    let executionLease = null;
+    let executionClaim = null;
     try {
       const context = rejectForbiddenContext(rawContext);
       const taskId = requireTaskId(context.taskId);
@@ -1029,17 +1133,31 @@ export function createComponentAdapters({
         const signature = await windowsHost.verifyAuthenticode(prepared.installerPath);
         if (signature?.status !== "Valid") throw adapterError("git_authenticode_invalid");
         await revalidateGitPlan(prepared.pin, { discovery: fresh, installerSha256: prepared.entry.sha256 });
-        await windowsHost.runGitInstaller({ installerPath: prepared.installerPath, targetDir: fresh.installDir });
+        const execution = await reserveGitExecutionClaim(recoverGitTransaction, {
+          kind: "git-external-install", taskId, version: prepared.entry.version,
+          targetDir: fresh.installDir, executablePath: fresh.executablePath,
+          installerPath: prepared.installerPath, installerSha256: prepared.entry.sha256,
+        });
+        ({ claim: executionClaim, lease: executionLease } = execution);
+        await windowsHost.runGitInstaller({
+          installerPath: prepared.installerPath, targetDir: fresh.installDir,
+          signal: context.signal, timeoutMs: gitExecutionTimeoutMs,
+          onStarted: () => releaseMutableGitPlan(prepared.pin),
+        });
         await verifyGitVersion(fresh.executablePath, prepared.entry.version);
+        await clearGitExecutionClaim(executionClaim);
         return result("git", "commit", "succeeded", {
           versionBefore: prepared.before, versionAfter: prepared.entry.version,
           message: "git_external_updated", rollbackAvailable: false,
         });
       }
 
-      const reservation = await runOwnership(async () => {
-        const state = await recoverGitTransaction();
-        if (state.activeTask !== null) throw adapterError("component_pending_transaction");
+      const execution = await reserveGitExecutionClaim(recoverGitTransaction, {
+        kind: "git-install", taskId, version: prepared.entry.version,
+        targetDir: componentRoot(installRoot, "git"), executablePath: relativeFile(componentRoot(installRoot, "git"), prepared.entry.entrypoint),
+        installerPath: prepared.installerPath, installerSha256: prepared.entry.sha256,
+        replacedInstaller: prepared.previousRecord?.previousInstaller ?? null,
+      }, async (state) => {
         if (managedRecord(state, "git")?.version !== prepared.previousRecord?.version
           && !(managedRecord(state, "git") === null && prepared.previousRecord === null)) {
           throw adapterError("component_state_changed");
@@ -1062,17 +1180,14 @@ export function createComponentAdapters({
         const signature = await windowsHost.verifyAuthenticode(prepared.installerPath);
         if (signature?.status !== "Valid") throw adapterError("git_authenticode_invalid");
         await revalidateGitPlan(prepared.pin, identityExpectation);
-        const next = structuredClone(state);
-        next.activeTask = {
-          kind: "git-install", taskId, version: prepared.entry.version,
-          targetDir: componentRoot(installRoot, "git"), executablePath: relativeFile(componentRoot(installRoot, "git"), prepared.entry.entrypoint),
-          installerPath: prepared.installerPath, installerSha256: prepared.entry.sha256,
-          replacedInstaller: prepared.previousRecord?.previousInstaller ?? null,
-        };
-        return saveState(next);
       });
-      activeGitInstallTasks.add(taskId);
-      await windowsHost.runGitInstaller({ installerPath: prepared.installerPath, targetDir: componentRoot(installRoot, "git") });
+      ({ claim: executionClaim, lease: executionLease } = execution);
+      const reservation = execution.state;
+      await windowsHost.runGitInstaller({
+        installerPath: prepared.installerPath, targetDir: componentRoot(installRoot, "git"),
+        signal: context.signal, timeoutMs: gitExecutionTimeoutMs,
+        onStarted: () => releaseMutableGitPlan(prepared.pin),
+      });
       const executablePath = relativeFile(componentRoot(installRoot, "git"), prepared.entry.entrypoint);
       await verifyGitVersion(executablePath, prepared.entry.version);
       const discovered = validateExternalGit(await windowsHost.discoverGit());
@@ -1128,7 +1243,7 @@ export function createComponentAdapters({
     } catch (error) {
       return failed("git", "commit", error, prepared?.before ?? null);
     } finally {
-      if (prepared?.taskId) activeGitInstallTasks.delete(prepared.taskId);
+      if (executionLease) await executionLease.release().catch(() => {});
       if (prepared?.pin) await releaseGitPlan(prepared.pin).catch(() => {});
     }
   }
@@ -1184,7 +1299,11 @@ export function createComponentAdapters({
         };
         await saveState(reserved);
       }
-      await windowsHost.runGitUninstaller({ uninstallerPath: discovery.uninstallerPath, installDir: discovery.installDir });
+      await windowsHost.runGitUninstaller({
+        uninstallerPath: discovery.uninstallerPath, installDir: discovery.installDir,
+        signal: context.signal, timeoutMs: gitExecutionTimeoutMs,
+        onStarted: () => releaseMutableGitPlan(pin),
+      });
       if (managed) {
         await deleteComponent({ componentId: "git", rootPath: managed.installPath, authorizedRoot: installRoot });
         const next = structuredClone(reserved);
@@ -1242,11 +1361,19 @@ export function createComponentAdapters({
       await saveState(reservation);
       await windowsHost.runGitUninstaller({
         uninstallerPath: currentDiscovery.uninstallerPath, installDir: currentDiscovery.installDir,
+        signal: context.signal, timeoutMs: gitExecutionTimeoutMs,
+        onStarted: () => releaseMutableGitPlan(targetPin),
       });
       await releaseGitPlan(targetPin);
       targetPin = null;
+      targetPin = await pinGitPlan({ targetDir: managed.installPath, targetMustBeAbsent: true });
+      await revalidateGitPlan(targetPin, { targetMustBeAbsent: true });
       await revalidateGitPlan(pin, { installerSha256: managed.previousInstaller.sha256 });
-      await windowsHost.runGitInstaller({ installerPath: managed.previousInstaller.path, targetDir: managed.installPath });
+      await windowsHost.runGitInstaller({
+        installerPath: managed.previousInstaller.path, targetDir: managed.installPath,
+        signal: context.signal, timeoutMs: gitExecutionTimeoutMs,
+        onStarted: () => releaseMutableGitPlan(targetPin),
+      });
       await verifyGitVersion(managed.executablePath, managed.previousInstaller.version);
       const restoredDiscovery = validateExternalGit(await windowsHost.discoverGit());
       if (restoredDiscovery.installDir !== managed.installPath || restoredDiscovery.executablePath !== managed.executablePath) {
@@ -1298,10 +1425,12 @@ export function createComponentAdapters({
     const results = [];
     for (const id of ids) {
       let claim = null;
+      let operationLease = null;
       try {
         const entry = trustedSkill(id);
         claim = { kind: "skill-prepare", taskId, skillId: entry.id, version: entry.version };
-        await reservePrepareClaim(recoverSkillTransaction, claim);
+        const reservation = await reservePrepareClaim(recoverSkillTransaction, claim);
+        ({ claim, lease: operationLease } = reservation);
         const maxRelativePath = skillInstallPeakRelativePath({ taskId, entry });
         const destination = path.win32.join(installRoot, "staging", "skills", taskId, entry.id);
         const archivePath = path.win32.join(installRoot, "downloads", `skill-${entry.id}-${entry.version}.zip`);
@@ -1326,12 +1455,11 @@ export function createComponentAdapters({
         });
         const receipt = validateReceipt(verified, "skill_verification_receipt_invalid");
         if (!SHA256.test(verified.skillMdSha256 ?? "")) throw adapterError("skill_md_hash_invalid");
-        await clearPrepareClaim(claim);
-        claim = null;
+        try { await clearPrepareClaim(claim, operationLease); } finally { claim = null; operationLease = null; }
         pending.set(id, Object.freeze({ entry, destination, maxRelativePath, skillMdSha256: verified.skillMdSha256, ...receipt }));
         results.push(result(id, "prepare", "succeeded", { versionAfter: entry.version, message: "skill_prepared" }));
       } catch (error) {
-        if (claim) await clearPrepareClaim(claim).catch(() => {});
+        if (claim) await clearPrepareClaim(claim, operationLease).catch(() => {});
         results.push(await failed(typeof id === "string" ? id : "skills", "prepare", error));
       }
     }

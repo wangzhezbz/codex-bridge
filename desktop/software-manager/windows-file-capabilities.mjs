@@ -9,6 +9,8 @@ const MAX_ARCHIVE_BYTES = 16 * 1_024 * 1_024 * 1_024;
 const MAX_PATH_CHARS = 32_760;
 const VERSION_MARKER_NAME = ".codexbridge-version.json";
 const STATE_LOCK_NAME = ".codexbridge-ownership.lock";
+const OPERATION_LEASE_NONCE = /^[a-f0-9]{32}$/u;
+const OPERATION_LEASE_SCOPES = new Set(["prepare", "git-execute"]);
 const COMPONENT_IDS = new Set(["chatgpt", "v2rayn", "git"]);
 const VERSION = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
@@ -499,6 +501,49 @@ export function createWindowsFileCapabilities({
         if (pin) await closeOwner(nativeApi, pin.owner).catch(() => {});
         if (!isSharingViolation(error)) throw error;
         if (Date.now() >= deadline) throw capabilityError("state_lock_timeout", error);
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+  }
+
+  async function acquireOperationLeaseNoFollow(stateDir, { nonce, scope, wait = true } = {}) {
+    if (!OPERATION_LEASE_NONCE.test(nonce ?? "") || !OPERATION_LEASE_SCOPES.has(scope)
+      || typeof wait !== "boolean") throw capabilityError("operation_lease_request_invalid");
+    const leaseName = `.codexbridge-operation-${scope}-${nonce}.lock`;
+    const leasePath = ensureDirectChild(validateAbsolute(stateDir), leaseName);
+    const deadline = Date.now() + 30_000;
+    for (;;) {
+      let pin;
+      try {
+        try {
+          pin = await openPinnedPath(nativeApi, leasePath, {
+            kind: "file", access: ["read", "write", "delete", "attributes"], share: [], disposition: "createNew",
+          });
+        } catch (error) {
+          if (!isOccupied(error)) throw error;
+          pin = await openPinnedPath(nativeApi, leasePath, {
+            kind: "file", access: ["read", "write", "delete", "attributes"], share: [], disposition: "openExisting",
+          });
+        }
+        if (pin.leaf.info.nlink !== 1) throw capabilityError("windows_hard_link_rejected");
+        let released = false;
+        return Object.freeze({
+          nonce, scope,
+          async release() {
+            if (released) throw capabilityError("operation_lease_already_released");
+            released = true;
+            let primaryError = null;
+            try { await nativeApi.deleteByHandle(pin.leaf.handle, { directory: false }); }
+            catch (error) { primaryError = error; }
+            pin.owner.closed = true;
+            await closeHandles(nativeApi, pin.owner.handles, primaryError);
+          },
+        });
+      } catch (error) {
+        if (pin) await closeOwner(nativeApi, pin.owner).catch(() => {});
+        if (!isSharingViolation(error)) throw error;
+        if (!wait) return null;
+        if (Date.now() >= deadline) throw capabilityError("operation_lease_timeout", error);
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
     }
@@ -1482,6 +1527,7 @@ export function createWindowsFileCapabilities({
 
   return Object.freeze({
     acquireStateLockNoFollow,
+    acquireOperationLeaseNoFollow,
     openStateDirectoryNoFollow,
     openJournalDirectoryNoFollow,
     openDirectoryNoFollow,

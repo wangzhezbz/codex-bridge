@@ -87,7 +87,8 @@ function fixture({
   invalidAuthenticodePath = null, initialSkillEvidence = null,
   catalogService = TRUSTED_CATALOG, installRootCapability = INSTALL_CAPABILITY,
   skillsRootCapability = SKILLS_CAPABILITY, onDownload = null, onExtract = null,
-  onReplaceSkill = null, onGitInstall = null,
+  onReplaceSkill = null, onGitInstall = null, onVerifyComponent = null,
+  onAuthenticode = null, onGitPin = null, gitExecutionTimeoutMs = undefined,
 } = {}) {
   let currentState = structuredClone(state);
   let saveCount = 0;
@@ -96,6 +97,7 @@ function fixture({
     removedShortcuts: [], verified: [], gitInstalls: [], gitUninstalls: [], replacedSkills: [], deletedSkills: [],
     deletedComponents: [], hashes: [], persistentPrepared: [], persistentVerified: [], gitPins: [], gitRevalidates: [],
     gitReleases: [], retained: [], discarded: [],
+    gitMutableReleases: [],
   };
   const archiveReceipts = new WeakSet();
   const skillReceipts = new WeakSet();
@@ -108,7 +110,22 @@ function fixture({
   const gitPins = new WeakSet();
   const shortcutReservations = new Map();
   const deletedSkillTargets = new Set();
+  const operationLeases = new Map();
   const ownershipStore = {
+    async acquireOperationLease({ nonce, scope, wait = true }) {
+      const key = `${scope}:${nonce}`;
+      if (operationLeases.has(key)) return wait ? Promise.reject(new Error("test_operation_lease_busy")) : null;
+      operationLeases.set(key, true);
+      let released = false;
+      return {
+        nonce, scope,
+        async release() {
+          if (released) throw new Error("test_operation_lease_already_released");
+          released = true;
+          operationLeases.delete(key);
+        },
+      };
+    },
     async load() { return structuredClone(currentState); },
     async compareAndSwap(expectedGeneration, next) {
       saveCount += 1;
@@ -127,6 +144,7 @@ function fixture({
     },
     async verifyAuthenticode(filePath) {
       calls.verified.push({ kind: "authenticode", filePath });
+      await onAuthenticode?.(filePath);
       return { status: filePath === invalidAuthenticodePath ? "NotSigned" : "Valid" };
     },
     async stopOwnedProcesses(paths) { calls.stopped.push([...paths]); return { stoppedProcessIds: running ? [123] : [] }; },
@@ -155,11 +173,14 @@ function fixture({
     },
     async runGitInstaller(plan) {
       calls.gitInstalls.push(plan);
+      await plan.onStarted?.();
       await onGitInstall?.(plan);
       if (gitInstallFailure) throw gitInstallFailure;
       return { targetDir: plan.targetDir };
     },
-    async runGitUninstaller(plan) { calls.gitUninstalls.push(plan); return { installDir: plan.installDir }; },
+    async runGitUninstaller(plan) {
+      calls.gitUninstalls.push(plan); await plan.onStarted?.(); return { installDir: plan.installDir };
+    },
   };
   const archiveService = {
     async extractArchive(plan) {
@@ -214,6 +235,7 @@ function fixture({
     async verifyComponent(plan) {
       verifyCalls += 1;
       calls.verified.push({ kind: "component", ...plan });
+      await onVerifyComponent?.(plan);
       if (verifyCalls > 1 && finalVerifyFailure) throw finalVerifyFailure;
       return { version: plan.expectedVersion };
     },
@@ -301,10 +323,13 @@ function fixture({
   const gitIdentityCapabilities = {
     async pinPlan(plan) {
       const capability = Object.freeze(Object.create(null));
-      gitPins.add(capability); calls.gitPins.push(plan); return capability;
+      gitPins.add(capability); calls.gitPins.push(plan); await onGitPin?.(plan); return capability;
     },
     async revalidate(capability, plan) {
       assert.equal(gitPins.has(capability), true); calls.gitRevalidates.push(plan); return true;
+    },
+    async releaseMutable(capability) {
+      assert.equal(gitPins.has(capability), true); calls.gitMutableReleases.push(capability);
     },
     async release(capability) { gitPins.delete(capability); calls.gitReleases.push(capability); },
     async retainInstaller(capability, record) {
@@ -323,16 +348,21 @@ function fixture({
       return { path: plan.destination, size: plan.asset.size, sha256: plan.asset.sha256 };
     },
   };
-  const adapters = createComponentAdapters({
+  const adapterOptions = {
     catalogService,
     installRootCapability,
     skillsRootCapability,
     desktopCapability: DESKTOP_CAPABILITY,
     downloader, archiveService, versionSlots, ownershipStore, windowsHost, componentFiles, skillFiles,
     gitIdentityCapabilities,
+    ...(gitExecutionTimeoutMs === undefined ? {} : { gitExecutionTimeoutMs }),
     resolveSkillTarget: async ({ skillsRoot, skillId }) => path.win32.join(skillsRoot, skillId),
-  });
-  return { adapters, calls, getState: () => structuredClone(currentState) };
+  };
+  const adapters = createComponentAdapters(adapterOptions);
+  return {
+    adapters, calls, getState: () => structuredClone(currentState),
+    createAnotherAdapters: () => createComponentAdapters(adapterOptions),
+  };
 }
 
 const externalGit = Object.freeze({
@@ -636,6 +666,28 @@ test("managed Git adopts a completed fixed-target install after the final owners
   assert.equal(getState().activeTask, null);
 });
 
+test("an aborted Git process keeps a recoverable claim and receives the configured deadline", async () => {
+  const controller = new AbortController();
+  const abortError = Object.assign(new Error("installer_aborted"), { name: "AbortError", code: "ABORT_ERR" });
+  const first = fixture({
+    gitDiscovery: { kind: "none" },
+    gitExecutionTimeoutMs: 30_000,
+    onGitInstall(plan) {
+      assert.equal(plan.signal, controller.signal);
+      assert.equal(plan.timeoutMs, 30_000);
+      throw abortError;
+    },
+  });
+  assert.equal((await first.adapters.git.prepare({ taskId: "cancelled-git", selected: true })).status, "succeeded");
+  const committed = await first.adapters.git.commit({ taskId: "cancelled-git", signal: controller.signal });
+  assert.equal(committed.status, "failed");
+  assert.match(committed.message, /ABORT_ERR/u);
+  assert.equal(first.getState().activeTask.kind, "git-install");
+  const recovered = await first.createAnotherAdapters().git.inspectInstalled({});
+  assert.equal(recovered.status, "skipped");
+  assert.equal(first.getState().activeTask, null);
+});
+
 test("a managed Git installer failure leaves a reservation that the next inspection safely aborts", async () => {
   const { adapters, getState } = fixture({
     gitDiscovery: { kind: "none" },
@@ -661,10 +713,14 @@ test("managed Git rollback reinstalls the retained previous installer into the s
   const { adapters, calls, getState } = fixture({ state, gitDiscoveries: [discovery, restored], gitDiscovery: restored });
   const rolled = await adapters.git.rollback({ taskId: "git-rollback" });
   assert.equal(rolled.status, "succeeded");
-  assert.deepEqual(calls.gitUninstalls[0], {
-    uninstallerPath: discovery.uninstallerPath, installDir: discovery.installDir,
-  });
+  assert.equal(calls.gitUninstalls[0].uninstallerPath, discovery.uninstallerPath);
+  assert.equal(calls.gitUninstalls[0].installDir, discovery.installDir);
+  assert.equal(calls.gitUninstalls[0].timeoutMs, 900_000);
+  assert.equal(typeof calls.gitUninstalls[0].onStarted, "function");
   assert.equal(calls.gitPins.some((record) => record.discovery?.uninstallerPath === discovery.uninstallerPath), true);
+  assert.equal(calls.gitPins.some((record) => record.targetDir === state.components.git.installPath
+    && record.targetMustBeAbsent === true), true);
+  assert.equal(calls.gitMutableReleases.length, 2, "uninstaller and installer targets release only after each spawn");
   assert.equal(calls.gitInstalls[0].installerPath, state.components.git.previousInstaller.path);
   assert.equal(calls.gitInstalls[0].targetDir, "D:\\CBApps\\Git");
   assert.equal(getState().components.git.version, "2.50.0");
@@ -698,11 +754,41 @@ test("managed Git rollback remains succeeded and is adopted after post-reinstall
   assert.equal(calls.discarded.length, 1);
 });
 
+test("rollback crash recovery pins an absent target until the replacement installer starts", async () => {
+  const state = emptyState(INSTALL_ROOT);
+  const rejectedInstaller = { path: "D:\\CBApps\\downloads\\git-2.51.0.exe", sha256: DIGEST_A, version: "2.51.0" };
+  const previousInstaller = { path: "D:\\CBApps\\downloads\\git-2.50.0.exe", sha256: DIGEST_B, version: "2.50.0" };
+  state.components.git = {
+    managed: true, installPath: "D:\\CBApps\\Git", version: "2.51.0",
+    executablePath: "D:\\CBApps\\Git\\cmd\\git.exe", uninstallerPath: "D:\\CBApps\\Git\\unins000.exe",
+    currentInstaller: rejectedInstaller, previousInstaller,
+  };
+  state.activeTask = {
+    kind: "git-rollback", taskId: "recover-rollback", version: previousInstaller.version,
+    targetDir: state.components.git.installPath, executablePath: state.components.git.executablePath,
+    installerPath: previousInstaller.path, installerSha256: previousInstaller.sha256,
+    rejectedInstaller,
+  };
+  const restored = {
+    ...externalGit, version: previousInstaller.version, installDir: state.components.git.installPath,
+    executablePath: state.components.git.executablePath, uninstallerPath: state.components.git.uninstallerPath,
+  };
+  const { adapters, calls } = fixture({ state, gitDiscoveries: [{ kind: "none" }, restored], gitDiscovery: restored });
+  const inspected = await adapters.git.inspectInstalled({});
+  assert.equal(inspected.status, "succeeded", inspected.message);
+  assert.equal(calls.gitPins.some((record) => record.targetDir === state.components.git.installPath
+    && record.targetMustBeAbsent === true), true);
+  assert.equal(calls.gitMutableReleases.length, 1);
+});
+
 test("Git uninstall always runs the registered uninstaller; external requires explicit selection", async () => {
   const { adapters, calls } = fixture({ gitDiscovery: externalGit });
   assert.equal((await adapters.git.uninstall({ selected: false })).status, "failed");
   assert.equal((await adapters.git.uninstall({ selected: true, taskId: "git-uninstall" })).status, "succeeded");
-  assert.deepEqual(calls.gitUninstalls[0], { uninstallerPath: externalGit.uninstallerPath, installDir: externalGit.installDir });
+  assert.equal(calls.gitUninstalls[0].uninstallerPath, externalGit.uninstallerPath);
+  assert.equal(calls.gitUninstalls[0].installDir, externalGit.installDir);
+  assert.equal(calls.gitUninstalls[0].timeoutMs, 900_000);
+  assert.equal(typeof calls.gitUninstalls[0].onStarted, "function");
   assert.equal(calls.verified.some((item) => item.kind === "authenticode"
     && item.filePath === externalGit.uninstallerPath), true);
 });
@@ -902,6 +988,44 @@ test("skills prepare revalidates install and skills roots after download before 
   assert.deepEqual(getState().skills, {});
 });
 
+for (const [stage, hook] of [
+  ["download", "onDownload"],
+  ["extract", "onExtract"],
+  ["verification", "onVerifyComponent"],
+]) {
+  test(`archive prepare rejects install-root identity drift after ${stage}`, async () => {
+    const capabilities = await mutableDirectoryCapabilities();
+    const { adapters, calls, getState } = fixture({
+      ...capabilities,
+      [hook]: () => capabilities.driftInstall(),
+    });
+    const prepared = await adapters.chatgpt.prepare({ taskId: `archive-drift-${stage}` });
+    assert.equal(prepared.status, "failed");
+    assert.match(prepared.message, /install_root_identity_changed/u);
+    assert.equal(getState().activeTask, null);
+    assert.equal(calls.promotions.length, 0);
+  });
+}
+
+for (const [stage, hook] of [
+  ["download", "onDownload"],
+  ["authenticode", "onAuthenticode"],
+  ["identity pin", "onGitPin"],
+]) {
+  test(`Git prepare rejects install-root identity drift after ${stage}`, async () => {
+    const capabilities = await mutableDirectoryCapabilities();
+    const { adapters, calls, getState } = fixture({
+      ...capabilities,
+      [hook]: () => capabilities.driftInstall(),
+    });
+    const prepared = await adapters.git.prepare({ taskId: `git-drift-${stage.replaceAll(" ", "-")}`, selected: true });
+    assert.equal(prepared.status, "failed");
+    assert.match(prepared.message, /install_root_identity_changed/u);
+    assert.equal(getState().activeTask, null);
+    assert.equal(calls.gitInstalls.length, 0);
+  });
+}
+
 test("skills commit revalidates both roots before replacement", async () => {
   const capabilities = await mutableDirectoryCapabilities();
   const { adapters, calls, getState } = fixture(capabilities);
@@ -931,16 +1055,17 @@ test("a hung download releases the global ownership lock while its claim makes c
   const started = new Promise((resolve) => { signalStarted = resolve; });
   const blocked = new Promise((resolve) => { releaseDownload = resolve; });
   const first = fixture({ onDownload: async () => { signalStarted(); await blocked; } });
+  const secondAdapters = first.createAnotherAdapters();
   const preparing = first.adapters.chatgpt.prepare({ taskId: "hung-download" });
   await started;
 
   const inspected = await Promise.race([
-    first.adapters.chatgpt.inspectInstalled({}),
+    secondAdapters.chatgpt.inspectInstalled({}),
     new Promise((_, reject) => setTimeout(() => reject(new Error("inspect_blocked")), 100)),
   ]);
   assert.equal(inspected.status, "failed");
   assert.match(inspected.message, /component_pending_transaction/u);
-  const competing = await first.adapters.v2rayn.uninstall({ taskId: "competing-remove" });
+  const competing = await secondAdapters.v2rayn.uninstall({ taskId: "competing-remove" });
   assert.equal(competing.status, "failed");
   assert.match(competing.message, /component_pending_transaction/u);
 
@@ -968,34 +1093,61 @@ test("a hung managed Git installer releases the ownership lock and keeps the dur
   let signalStarted;
   const started = new Promise((resolve) => { signalStarted = resolve; });
   const blocked = new Promise((resolve) => { releaseInstaller = resolve; });
-  const { adapters, getState } = fixture({
+  const { adapters, calls, getState, createAnotherAdapters } = fixture({
     state, gitDiscoveries: [current, current, installed], gitDiscovery: installed,
     onGitInstall: async () => { signalStarted(); await blocked; },
   });
   assert.equal((await adapters.git.prepare({ taskId: "hung-installer", selected: true })).status, "succeeded");
+  const secondAdapters = createAnotherAdapters();
   const committing = adapters.git.commit({ taskId: "hung-installer" });
   await started;
 
   const inspected = await Promise.race([
-    adapters.git.inspectInstalled({}),
+    secondAdapters.git.inspectInstalled({}),
     new Promise((_, reject) => setTimeout(() => reject(new Error("installer_inspect_blocked")), 100)),
   ]);
   assert.equal(inspected.status, "failed");
   assert.match(inspected.message, /component_pending_transaction/u);
-  const competing = await adapters.git.uninstall({ selected: true, taskId: "competing-git-remove" });
+  const competing = await secondAdapters.git.uninstall({ selected: true, taskId: "competing-git-remove" });
   assert.equal(competing.status, "failed");
   assert.match(competing.message, /component_pending_transaction/u);
   assert.equal(getState().activeTask.kind, "git-install");
+  assert.equal(calls.gitMutableReleases.length, 1);
 
   releaseInstaller();
   assert.equal((await committing).status, "succeeded");
   assert.equal(getState().components.git.version, "2.51.0");
 });
 
+test("a hung external Git installer also persists a live lease claim visible to a second adapter", async () => {
+  let releaseInstaller;
+  let signalStarted;
+  const started = new Promise((resolve) => { signalStarted = resolve; });
+  const blocked = new Promise((resolve) => { releaseInstaller = resolve; });
+  const first = fixture({
+    gitDiscovery: externalGit,
+    onGitInstall: async () => { signalStarted(); await blocked; },
+  });
+  assert.equal((await first.adapters.git.prepare({ taskId: "hung-external", selected: true })).status, "succeeded");
+  const secondAdapters = first.createAnotherAdapters();
+  const committing = first.adapters.git.commit({ taskId: "hung-external" });
+  await started;
+  const inspected = await Promise.race([
+    secondAdapters.git.inspectInstalled({}),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("external_inspect_blocked")), 100)),
+  ]);
+  assert.equal(inspected.status, "failed");
+  assert.match(inspected.message, /component_pending_transaction/u);
+  releaseInstaller();
+  assert.equal((await committing).status, "succeeded");
+  assert.equal(first.getState().activeTask, null);
+});
+
 test("a prepare claim abandoned by a crashed process is cleared on restart", async () => {
   const state = emptyState();
   state.activeTask = {
     kind: "component-prepare", taskId: "crashed-download", componentId: "chatgpt", version: "2.0.0",
+    leaseScope: "prepare", leaseNonce: "1".repeat(32),
   };
   const { adapters, getState } = fixture({ state });
   const inspected = await adapters.chatgpt.inspectInstalled({});

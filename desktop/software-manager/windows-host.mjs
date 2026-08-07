@@ -145,6 +145,33 @@ async function runCommand(execFile, env, file, args, {
   };
 }
 
+function gitExecutionOptions(plan) {
+  const timeoutMs = plan.timeoutMs ?? 15 * 60_000;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 30_000 || timeoutMs > 30 * 60_000) {
+    throw hostError("git_execution_timeout_invalid");
+  }
+  if (plan.signal !== undefined && (typeof plan.signal !== "object"
+    || typeof plan.signal.addEventListener !== "function" || typeof plan.signal.aborted !== "boolean")) {
+    throw hostError("git_execution_signal_invalid");
+  }
+  if (typeof plan.onStarted !== "function") throw hostError("git_process_start_callback_required");
+  let started = false;
+  return {
+    options: {
+      timeout: timeoutMs,
+      ...(plan.signal ? { signal: plan.signal } : {}),
+      onSpawn: async () => {
+        if (started) throw hostError("git_process_started_twice");
+        started = true;
+        await plan.onStarted();
+      },
+    },
+    assertStarted() {
+      if (!started) throw hostError("git_process_start_evidence_missing");
+    },
+  };
+}
+
 function parseRegistryOutput(stdout) {
   const record = {};
   const allowed = new Set(REGISTRY_FIELDS);
@@ -615,9 +642,12 @@ export function createWindowsHost({
       if (!isPlainRecord(plan)) throw hostError("git_installer_plan_invalid");
       const installerPath = requireExecutablePath(plan.installerPath);
       const targetDir = requireDirectoryPath(plan.targetDir, "git_target_absolute_required");
+      const execution = gitExecutionOptions(plan);
       await runCommand(execFile, env, installerPath, [...GIT_INSTALLER_ARGS, `/DIR=${targetDir}`], {
+        options: execution.options,
         errorCode: "git_installer_failed",
       });
+      execution.assertStarted();
       return { targetDir };
     },
 
@@ -629,9 +659,12 @@ export function createWindowsHost({
         || !/^unins\d{3}\.exe$/iu.test(path.win32.basename(uninstallerPath))) {
         throw hostError("git_uninstaller_path_mismatch");
       }
+      const execution = gitExecutionOptions(plan);
       await runCommand(execFile, env, uninstallerPath, GIT_UNINSTALLER_ARGS, {
+        options: execution.options,
         errorCode: "git_uninstaller_failed",
       });
+      execution.assertStarted();
       return { installDir };
     },
   });

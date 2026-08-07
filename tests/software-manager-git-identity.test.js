@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, rmdir, unlink, writeFile, lstat } from "node:fs/promises";
+import path from "node:path";
 import test from "node:test";
 
 import { createGitIdentityCapabilities } from "../desktop/software-manager/git-identity-capabilities.mjs";
 import { authorizeInstallRoot } from "../desktop/software-manager/path-policy.mjs";
+import { createWin32FileApi } from "../desktop/software-manager/win32-file-api.mjs";
+import { createWindowsFileCapabilities } from "../desktop/software-manager/windows-file-capabilities.mjs";
 
 const HASH = "a".repeat(64);
 const INSTALL_ROOT_CAPABILITY = await authorizeInstallRoot({
@@ -96,6 +101,31 @@ test("pins the installer, registered Git root, git.exe and uninstaller and reval
   await assert.rejects(capabilities.revalidate(pin), /git_identity_capability_invalid/u);
 });
 
+test("releases only mutable target pins at process start and retains the installer identity", async () => {
+  const { calls, capabilities } = fixture();
+  const pin = await capabilities.pinPlan({
+    installerPath: "D:\\CBApps\\downloads\\git-2.51.0.exe",
+    installerSha256: HASH,
+    targetDir: external.installDir,
+    discovery: external,
+  });
+
+  await capabilities.releaseMutable(pin);
+  const closedAfterStart = calls.filter(([kind]) => kind.startsWith("close-")).map(([, value]) => value);
+  assert.deepEqual(closedAfterStart.sort(), [
+    external.executablePath,
+    external.installDir,
+    external.uninstallerPath,
+  ].sort());
+  await capabilities.revalidate(pin, { installerSha256: HASH });
+  assert.equal(calls.filter(([kind, value]) => kind === "stable"
+    && value === "D:\\CBApps\\downloads\\git-2.51.0.exe").length > 0, true);
+  await assert.rejects(capabilities.releaseMutable(pin), /git_mutable_identity_already_released/u);
+  await capabilities.release(pin);
+  assert.equal(calls.some(([kind, value]) => kind === "close-file"
+    && value === "D:\\CBApps\\downloads\\git-2.51.0.exe"), true);
+});
+
 test("rejects a changed registration and unregistered arbitrary installation target", async () => {
   const { capabilities } = fixture();
   const pin = await capabilities.pinPlan({
@@ -144,4 +174,76 @@ test("retained installer cleanup is idempotent when deletion succeeded before ow
   assert.deepEqual(await capabilities.discardRetainedInstaller(retained), { deleted: true, missing: false });
   assert.deepEqual(await capabilities.discardRetainedInstaller(retained), { deleted: false, missing: true });
   assert.equal(deleted.length, 1);
+});
+
+test("real Win32 pins block Git target mutation until the process-start release", {
+  skip: process.platform !== "win32" ? "requires production Win32 handles" : false,
+}, async () => {
+  const installRoot = path.win32.join(process.cwd(), `.tmp-cb-git-pin-${randomUUID()}`);
+  const downloadsRoot = path.win32.join(installRoot, "downloads");
+  const gitRoot = path.win32.join(installRoot, "Git");
+  const cmdRoot = path.win32.join(gitRoot, "cmd");
+  const installerPath = path.win32.join(downloadsRoot, "git-2.51.0.exe");
+  const executablePath = path.win32.join(cmdRoot, "git.exe");
+  const movedExecutablePath = path.win32.join(cmdRoot, "git-moved.exe");
+  const uninstallerPath = path.win32.join(gitRoot, "unins000.exe");
+  await mkdir(downloadsRoot, { recursive: true });
+  await mkdir(cmdRoot, { recursive: true });
+  await writeFile(installerPath, "signed installer fixture");
+  await writeFile(executablePath, "git fixture");
+  await writeFile(uninstallerPath, "uninstaller fixture");
+  const installerSha256 = createHash("sha256").update(await readFile(installerPath)).digest("hex");
+  const installRootCapability = await authorizeInstallRoot({
+    candidate: installRoot,
+    env: { SystemRoot: "C:\\Windows", ProgramFiles: "C:\\Program Files", USERPROFILE: "C:\\Users\\tester" },
+    maxRelativePath: 80,
+    access: async () => {},
+    realpath: async (value) => value,
+    lstat: async (value) => {
+      const info = await lstat(value);
+      return {
+        dev: info.dev, ino: info.ino,
+        isDirectory: () => info.isDirectory(),
+        isSymbolicLink: () => info.isSymbolicLink(),
+        isReparsePoint: () => false,
+      };
+    },
+  });
+  const fileCapabilities = createWindowsFileCapabilities({
+    nativeApi: createWin32FileApi(),
+  });
+  const capabilities = createGitIdentityCapabilities({
+    fileCapabilities,
+    installRootCapability,
+    async hashFile(value) {
+      return createHash("sha256").update(await readFile(value)).digest("hex");
+    },
+    retainedInstallerStore: { async deleteVerified() {} },
+  });
+  const discovery = {
+    kind: "external", ownership: "external", version: "2.50.0",
+    installDir: gitRoot, executablePath, uninstallerPath, registryKey: "HKLM\\Git",
+  };
+  let pin;
+  try {
+    pin = await capabilities.pinPlan({
+      installerPath, installerSha256, targetDir: gitRoot, discovery,
+    });
+    await assert.rejects(rename(executablePath, movedExecutablePath), (error) => (
+      ["EBUSY", "EPERM", "EACCES"].includes(error?.code)
+    ));
+    await capabilities.releaseMutable(pin);
+    await rename(executablePath, movedExecutablePath);
+    await capabilities.revalidate(pin, { installerSha256 });
+  } finally {
+    if (pin) await capabilities.release(pin).catch(() => {});
+    await unlink(movedExecutablePath).catch(() => {});
+    await unlink(executablePath).catch(() => {});
+    await unlink(uninstallerPath).catch(() => {});
+    await unlink(installerPath).catch(() => {});
+    await rmdir(cmdRoot).catch(() => {});
+    await rmdir(gitRoot).catch(() => {});
+    await rmdir(downloadsRoot).catch(() => {});
+    await rmdir(installRoot).catch(() => {});
+  }
 });

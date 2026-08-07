@@ -6,6 +6,8 @@ const STATE_LOCKS = new Map();
 const LEGACY_OWNERSHIP_KEYS = Object.freeze([
   "schemaVersion", "installRoot", "components", "skills", "shortcuts", "rollback", "activeTask", "lastTask",
 ]);
+const OPERATION_LEASE_NONCE = /^[a-f0-9]{32}$/u;
+const OPERATION_LEASE_SCOPES = new Set(["prepare", "git-execute"]);
 
 function stateError(code) {
   const error = new Error(code);
@@ -93,17 +95,33 @@ async function withStateLock(stateDir, fsApi, action) {
   STATE_LOCKS.set(key, tail);
   await previous.catch(() => {});
   let processLock;
+  let result;
+  let primaryError;
   try {
     processLock = await fsApi.acquireStateLockNoFollow(stateDir);
     if (!processLock || typeof processLock.release !== "function") {
       throw stateError("ownership_state_lock_capability_invalid");
     }
-    return await action();
+    result = await action();
+  } catch (error) {
+    primaryError = error;
   } finally {
-    if (processLock) await processLock.release();
-    release();
-    if (STATE_LOCKS.get(key) === tail) STATE_LOCKS.delete(key);
+    let releaseError;
+    try {
+      if (processLock) await processLock.release();
+    } catch (error) {
+      releaseError = error;
+    } finally {
+      release();
+      if (STATE_LOCKS.get(key) === tail) STATE_LOCKS.delete(key);
+    }
+    if (primaryError && releaseError) {
+      throw new AggregateError([primaryError, releaseError], primaryError.message, { cause: primaryError });
+    }
+    if (releaseError) throw releaseError;
   }
+  if (primaryError) throw primaryError;
+  return result;
 }
 
 export function createOwnershipStore({ stateDir, fsApi, skillsRoot }) {
@@ -115,6 +133,9 @@ export function createOwnershipStore({ stateDir, fsApi, skillsRoot }) {
   }
   if (typeof fsApi.acquireStateLockNoFollow !== "function") {
     throw stateError("ownership_state_lock_capability_required");
+  }
+  if (typeof fsApi.acquireOperationLeaseNoFollow !== "function") {
+    throw stateError("ownership_operation_lease_capability_required");
   }
   const mainName = "ownership.json";
   const tempName = "ownership.json.tmp";
@@ -186,6 +207,16 @@ export function createOwnershipStore({ stateDir, fsApi, skillsRoot }) {
   }
 
   return Object.freeze({
+    async acquireOperationLease({ nonce, scope, wait = true } = {}) {
+      if (!OPERATION_LEASE_NONCE.test(nonce ?? "") || !OPERATION_LEASE_SCOPES.has(scope)
+        || typeof wait !== "boolean") throw stateError("ownership_operation_lease_request_invalid");
+      const lease = await fsApi.acquireOperationLeaseNoFollow(stateDir, { nonce, scope, wait });
+      if (lease === null && !wait) return null;
+      if (!lease || lease.nonce !== nonce || lease.scope !== scope || typeof lease.release !== "function") {
+        throw stateError("ownership_operation_lease_capability_invalid");
+      }
+      return lease;
+    },
     async load() { return withStateLock(stateDir, fsApi, loadUnlocked); },
     async compareAndSwap(expectedGeneration, value) {
       if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0) {

@@ -8,8 +8,8 @@ import { fileURLToPath } from "node:url";
 
 const childPath = fileURLToPath(new URL("./fixtures/software-manager-state-child.mjs", import.meta.url));
 
-function child(mode, stateDir, label) {
-  return fork(childPath, [mode, stateDir, label], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+function child(mode, stateDir, label, nonce) {
+  return fork(childPath, [mode, stateDir, label, ...(nonce ? [nonce] : [])], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
 }
 
 function waitMessage(processHandle, type) {
@@ -81,5 +81,28 @@ test("a lock in one state directory does not block a real process using another 
     if (holder) await new Promise((resolve) => holder.once("exit", resolve));
     await cleanupStateDir(firstDir);
     await cleanupStateDir(secondDir);
+  }
+});
+
+test("a real child operation lease prevents cross-process claim recovery until its owner is killed", async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "cb-operation-lease-"));
+  const nonce = "a".repeat(32);
+  let holder;
+  try {
+    holder = child("hold-operation", stateDir, "live-download", nonce);
+    await waitMessage(holder, "claimed");
+    const liveProbe = child("probe-operation", stateDir, "probe", nonce);
+    assert.equal((await waitMessage(liveProbe, "result")).status, "live");
+    assert.equal(JSON.parse(await fs.readFile(path.join(stateDir, "ownership.json"), "utf8")).activeTask.taskId, "live-download");
+
+    holder.kill("SIGKILL");
+    await new Promise((resolve) => holder.once("exit", resolve));
+    holder = null;
+    const recovery = child("probe-operation", stateDir, "recovery", nonce);
+    assert.equal((await waitMessage(recovery, "result")).status, "recovered");
+    assert.equal(JSON.parse(await fs.readFile(path.join(stateDir, "ownership.json"), "utf8")).activeTask, null);
+  } finally {
+    if (holder) holder.kill("SIGKILL");
+    await cleanupStateDir(stateDir);
   }
 });

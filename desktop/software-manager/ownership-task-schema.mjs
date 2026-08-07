@@ -4,8 +4,9 @@ const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
 const SKILL_ID = /^[a-z0-9][a-z0-9-]{0,63}$/u;
 const VERSION = /^\d+(?:\.\d+){0,3}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
+const LEASE_NONCE = /^[a-f0-9]{32}$/u;
 const COMPONENT = new Set(["chatgpt", "v2rayn"]);
-const GIT_TASK = new Set(["git-install", "git-install-cleanup", "git-rollback", "git-rollback-cleanup", "git-uninstall"]);
+const GIT_TASK = new Set(["git-install", "git-external-install", "git-install-cleanup", "git-rollback", "git-rollback-cleanup", "git-uninstall"]);
 
 function record(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -93,16 +94,22 @@ function validComponentUninstall(task, ownership) {
 function validGit(task, ownership) {
   if (!GIT_TASK.has(task.kind) || !TASK_ID.test(task.taskId ?? "")
     || !canonicalPath(task.targetDir) || !canonicalPath(task.executablePath)
-    || typeof ownership.installRoot !== "string" || !within(task.targetDir, ownership.installRoot)) return false;
+    || (task.kind !== "git-external-install"
+      && (typeof ownership.installRoot !== "string" || !within(task.targetDir, ownership.installRoot)))) return false;
   if (task.kind === "git-uninstall") return exact(task, ["kind", "taskId", "targetDir", "executablePath"]);
   if (task.kind === "git-install-cleanup") return exact(task, ["kind", "taskId", "targetDir", "executablePath", "replacedInstaller"])
     && installer(task.replacedInstaller);
   if (task.kind === "git-rollback-cleanup") return exact(task, ["kind", "taskId", "targetDir", "executablePath", "rejectedInstaller"])
     && installer(task.rejectedInstaller);
-  const tail = task.kind === "git-install" ? "replacedInstaller" : "rejectedInstaller";
-  return exact(task, ["kind", "taskId", "version", "targetDir", "executablePath", "installerPath", "installerSha256", tail])
+  const tail = task.kind === "git-install" ? "replacedInstaller" : task.kind === "git-external-install" ? null : "rejectedInstaller";
+  const keys = ["kind", "taskId", "version", "targetDir", "executablePath", "installerPath", "installerSha256"];
+  if (tail) keys.push(tail);
+  if (["git-install", "git-external-install"].includes(task.kind)) keys.push("leaseScope", "leaseNonce");
+  return exact(task, keys)
     && VERSION.test(task.version) && canonicalPath(task.installerPath) && SHA256.test(task.installerSha256)
-    && (task[tail] === null || installer(task[tail]));
+    && (!tail || task[tail] === null || installer(task[tail]))
+    && (!["git-install", "git-external-install"].includes(task.kind)
+      || (task.leaseScope === "git-execute" && LEASE_NONCE.test(task.leaseNonce)));
 }
 
 function validSkill(task, skillsRoot) {
@@ -128,13 +135,14 @@ export function isValidActiveTask(task, { ownership, skillsRoot } = {}) {
   if (task.kind === "component-shortcut") return validShortcut(task);
   if (task.kind === "component-uninstall") return validComponentUninstall(task, ownership);
   if (task.kind === "component-prepare") {
-    return exact(task, ["kind", "taskId", "componentId", "version"])
+    return exact(task, ["kind", "taskId", "componentId", "version", "leaseScope", "leaseNonce"])
       && TASK_ID.test(task.taskId) && ["chatgpt", "v2rayn", "git"].includes(task.componentId)
-      && VERSION.test(task.version);
+      && VERSION.test(task.version) && task.leaseScope === "prepare" && LEASE_NONCE.test(task.leaseNonce);
   }
   if (task.kind === "skill-prepare") {
-    return exact(task, ["kind", "taskId", "skillId", "version"])
-      && TASK_ID.test(task.taskId) && SKILL_ID.test(task.skillId) && VERSION.test(task.version);
+    return exact(task, ["kind", "taskId", "skillId", "version", "leaseScope", "leaseNonce"])
+      && TASK_ID.test(task.taskId) && SKILL_ID.test(task.skillId) && VERSION.test(task.version)
+      && task.leaseScope === "prepare" && LEASE_NONCE.test(task.leaseNonce);
   }
   if (GIT_TASK.has(task.kind)) return validGit(task, ownership);
   if (["skill-replace", "skill-uninstall"].includes(task.kind)) return validSkill(task, skillsRoot);
