@@ -128,6 +128,47 @@ function sameRecord(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+export async function inferPreparedSkillInstallRoot({ journalDir, fsApi, taskId, skillId } = {}) {
+  if (!fsApi || typeof fsApi.openJournalDirectoryNoFollow !== "function"
+    || !TASK_ID.test(taskId ?? "") || !SKILL_ID.test(skillId ?? "")) {
+    throw journalError("skill_prepare_lookup_invalid");
+  }
+  canonical(journalDir);
+  const expectedHash = recordKey(taskId, skillId);
+  const directory = requireDirectory(await fsApi.openJournalDirectoryNoFollow(journalDir));
+  const roots = new Map();
+  try {
+    const names = await directory.listFileNamesNoFollow();
+    if (!Array.isArray(names) || names.length > 4_096) throw journalError("skill_prepare_journal_limit_exceeded");
+    for (const name of names) {
+      if (typeof name !== "string") throw journalError("skill_prepare_journal_corrupt");
+      const match = FILE_NAME.exec(name) ?? TEMP_FILE_NAME.exec(name);
+      if (!match || match[1] !== expectedHash) continue;
+      const opened = await directory.openFileNoFollow(name, "r");
+      if (opened === null) continue;
+      const file = requireFile(opened);
+      try {
+        let parsed;
+        try { parsed = JSON.parse(await file.readFile("utf8")); } catch (error) {
+          throw journalError("skill_prepare_journal_corrupt", error);
+        }
+        const root = canonical(parsed?.installRoot);
+        const normalized = normalizeRecord(parsed, root);
+        if (normalized.taskId !== taskId || normalized.skillId !== skillId || normalized.phase !== match[2]) {
+          throw journalError("skill_prepare_journal_conflict");
+        }
+        roots.set(root.toLowerCase(), root);
+      } finally {
+        await file.close();
+      }
+    }
+  } finally {
+    await directory.close();
+  }
+  if (roots.size > 1) throw journalError("skill_prepare_install_root_conflict");
+  return roots.size === 0 ? null : roots.values().next().value;
+}
+
 function isOccupied(error) {
   return error?.code === "entry_exists" || error?.code === "EEXIST"
     || error?.nativeCode === 80 || error?.nativeCode === 183;

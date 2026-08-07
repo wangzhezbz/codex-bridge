@@ -640,6 +640,7 @@ export function createSoftwareManagerService({
     }
     try {
       await recoverTransactions();
+      selectedInstallRootToken = installRootResolver.getCurrentToken() ?? selectedInstallRootToken;
       const before = await loadOwnership();
       if (before?.activeTask) {
         externalTask = publicExternalTask(before.activeTask);

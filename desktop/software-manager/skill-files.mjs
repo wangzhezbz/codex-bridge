@@ -178,24 +178,79 @@ function validateProof(value) {
   return { ...structuredClone(value), target: canonical(value.target), identity: publicIdentity(value.identity) };
 }
 
+export function createPreparedSkillRecovery({
+  fileCapabilities, installRootCapability, prepareJournal, prepareLeaseStore,
+} = {}) {
+  const files = requireCapabilities(fileCapabilities);
+  const preparedJournal = requirePrepareJournal(prepareJournal);
+  if (!installRootCapability || typeof installRootCapability !== "object") {
+    throw skillError("skill_root_capabilities_required");
+  }
+  readInstallRootCapability(installRootCapability);
+  if (!prepareLeaseStore || typeof prepareLeaseStore.acquireOperationLease !== "function") {
+    throw skillError("skill_prepare_lease_capability_required");
+  }
+  async function discardOne(taskId, skillId) {
+    const transaction = await preparedJournal.load({ taskId, skillId });
+    if (!transaction) return false;
+    let record = transaction.snapshot;
+    if (["bound", "sealed"].includes(record.phase)) {
+      const validated = await files.validatePreparedSkillSourceForDeletionNoFollow({
+        installRootCapability, taskId, skillId,
+        expectedIdentity: record.identity, expectedEvidence: record.evidence,
+      });
+      if (!plain(validated) || !["absent", "directory"].includes(validated.kind)
+        || validated.sourcePath !== record.sourcePath
+        || (validated.kind === "directory" && !sameIdentity(validated.identity, record.identity))) {
+        throw skillError("skill_prepare_delete_validation_invalid");
+      }
+      record = await preparedJournal.record({ ...record, phase: "deleting" });
+    }
+    await files.deletePreparedSkillSourceNoFollow({
+      installRootCapability, taskId, skillId,
+      expectedIdentity: record.identity, expectedEvidence: null,
+    });
+    await preparedJournal.clear({ taskId, skillId });
+    return true;
+  }
+  return Object.freeze({
+    async reconcilePreparedSources() {
+      const records = await preparedJournal.list({
+        claimLease: ({ nonce, scope }) => prepareLeaseStore.acquireOperationLease({ nonce, scope, wait: false }),
+      });
+      let recovered = 0;
+      for (const record of records) {
+        const lease = await prepareLeaseStore.acquireOperationLease({
+          nonce: record.leaseNonce, scope: record.leaseScope, wait: false,
+        });
+        if (lease === null) continue;
+        try { await discardOne(record.taskId, record.skillId); recovered += 1; }
+        finally { await lease.release(); }
+      }
+      return recovered;
+    },
+  });
+}
+
 export function createSkillFileService({
   fileCapabilities, installRootCapability, skillsRootCapability, catalogService, workspace,
-  swapJournal, prepareJournal, prepareLeaseStore, hashFile,
+  swapJournal, prepareJournal, prepareLeaseStore, hashFile, recoveryOnly = false,
 } = {}) {
+  if (typeof recoveryOnly !== "boolean") throw skillError("skill_recovery_mode_invalid");
   const files = requireCapabilities(fileCapabilities);
   const journal = requireJournal(swapJournal);
   const preparedJournal = requirePrepareJournal(prepareJournal);
   if (!prepareLeaseStore || typeof prepareLeaseStore.acquireOperationLease !== "function") {
     throw skillError("skill_prepare_lease_capability_required");
   }
-  const stagingWorkspace = requireWorkspace(workspace);
-  if (!isTrustedCatalogService(catalogService)) throw skillError("trusted_catalog_service_required");
+  const stagingWorkspace = recoveryOnly ? null : requireWorkspace(workspace);
+  if (!recoveryOnly && !isTrustedCatalogService(catalogService)) throw skillError("trusted_catalog_service_required");
   if (!installRootCapability || typeof installRootCapability !== "object"
     || !skillsRootCapability || typeof skillsRootCapability !== "object") {
     throw skillError("skill_root_capabilities_required");
   }
   const installRoot = readInstallRootCapability(installRootCapability);
-  if (typeof hashFile !== "function") throw skillError("skill_hash_capability_required");
+  if (!recoveryOnly && typeof hashFile !== "function") throw skillError("skill_hash_capability_required");
   const verificationReceipts = new WeakMap();
   const completionReceipts = new WeakMap();
 
@@ -204,6 +259,7 @@ export function createSkillFileService({
   }
 
   async function beginPreparedSource(raw = {}) {
+    if (!isTrustedCatalogService(catalogService)) throw skillError("trusted_catalog_service_required");
     if (!exact(raw, ["taskId", "skillId", "leaseScope", "leaseNonce"])
       || !TASK_ID.test(raw.taskId ?? "") || !SKILL_ID.test(raw.skillId ?? "")
       || raw.leaseScope !== "prepare" || !SWAP_ID.test(raw.leaseNonce ?? "")) {
@@ -309,6 +365,9 @@ export function createSkillFileService({
   }
 
   async function openRoot(authorizedRoot) {
+    if (!skillsRootCapability || typeof skillsRootCapability !== "object") {
+      throw skillError("skill_root_capabilities_required");
+    }
     const root = canonical(authorizedRoot, "skill_root_invalid");
     const session = requireSession(await files.openSkillRootNoFollow({
       installRootCapability, skillsRootCapability,
@@ -322,6 +381,8 @@ export function createSkillFileService({
   }
 
   async function verifyPreparedSkill(raw) {
+    if (!isTrustedCatalogService(catalogService)) throw skillError("trusted_catalog_service_required");
+    if (stagingWorkspace === null) throw skillError("skill_workspace_required");
     if (!exact(raw, ["taskId", "skillId", "expectedVersion", "stagingReceipt", "packageProof"])
       || !TASK_ID.test(raw.taskId ?? "")
       || raw.stagingReceipt === null || typeof raw.stagingReceipt !== "object"

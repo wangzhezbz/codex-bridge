@@ -187,6 +187,101 @@ function skillEvidenceMatchesExpected(evidence, task) {
     && evidence.manifestDigest === task.manifestDigest && evidence.skillMdSha256 === task.skillMdSha256;
 }
 
+async function recoverSkillOwnershipState({
+  state, saveState, skillsRoot, skillFiles, resolveTarget, skillPathAccess, installRootCapability,
+}) {
+  const task = state?.activeTask;
+  if (!isRecord(task) || !["skill-replace", "skill-uninstall"].includes(task.kind)) return state;
+  if (task.skillsRoot !== skillsRoot || typeof task.skillId !== "string"
+    || task.target !== path.win32.join(skillsRoot, task.skillId)) {
+    throw adapterError("skill_recovery_record_invalid");
+  }
+  const target = await resolveTarget({
+    skillsRoot, skillId: task.skillId, realpath: skillPathAccess.realpath, lstat: skillPathAccess.lstat,
+  });
+  if (target !== task.target) throw adapterError("skill_target_mismatch");
+  const inspectExact = requireMethod(skillFiles, "inspectExact", "skill_inspect_capability_required");
+  const next = structuredClone(state);
+  if (task.kind === "skill-replace") {
+    if (!["reserved", "applied"].includes(task.phase) || !SHA256.test(task.packageSha256 ?? "")
+      || !SHA256.test(task.skillMdSha256 ?? "") || !SHA256.test(task.treeDigest ?? "")
+      || !SHA256.test(task.manifestDigest ?? "") || !/^[a-f0-9]{32}$/u.test(task.swapId ?? "")) {
+      throw adapterError("skill_recovery_record_invalid");
+    }
+    const previousEvidence = validatePreviousSkillEvidence(task.previousEvidence);
+    await requireMethod(skillFiles, "reconcileReplacement", "skill_reconcile_capability_required")({
+      taskId: task.taskId, swapId: task.swapId, target,
+      expected: { treeDigest: task.treeDigest, manifestDigest: task.manifestDigest, skillMdSha256: task.skillMdSha256 },
+    });
+    const inspectedRaw = await inspectExact({ target, authorizedRoot: skillsRoot });
+    const inspected = inspectedRaw?.kind === "absent"
+      ? validatePreviousSkillEvidence(inspectedRaw) : validateSkillTreeEvidence(inspectedRaw);
+    if (task.phase === "reserved" && sameSkillEvidence(inspected, previousEvidence)) {
+      next.activeTask = null;
+      next.lastTask = { taskId: task.taskId, componentId: task.skillId, action: "skill-replace-aborted" };
+      return saveState(next);
+    }
+    let completionProof = task.completionProof;
+    let appliedEvidence = task.appliedEvidence;
+    if (task.phase === "reserved") {
+      if (!skillEvidenceMatchesExpected(inspected, task)) throw adapterError("skill_recovery_content_mismatch");
+      const recovered = await requireMethod(
+        skillFiles, "recoverCompletionProof", "skill_completion_capability_required",
+      )({
+        target, taskId: task.taskId, swapId: task.swapId,
+        expected: { treeDigest: task.treeDigest, manifestDigest: task.manifestDigest, skillMdSha256: task.skillMdSha256 },
+      });
+      if (!isRecord(recovered) || recovered.completionProof === undefined) {
+        throw adapterError("skill_completion_recovery_invalid");
+      }
+      completionProof = recovered.completionProof;
+      appliedEvidence = validateSkillTreeEvidence(recovered.evidence, "skill_completion_recovery_invalid");
+      if (!sameSkillEvidence(appliedEvidence, inspected)) throw adapterError("skill_completion_recovery_invalid");
+      next.activeTask = { ...structuredClone(task), phase: "applied", completionProof, appliedEvidence };
+      await saveState(next);
+    }
+    const verified = validateSkillTreeEvidence(await requireMethod(
+      skillFiles, "verifyCompletionProof", "skill_completion_capability_required",
+    )({
+      completionProof, target, taskId: task.taskId, swapId: task.swapId,
+      expected: { treeDigest: task.treeDigest, manifestDigest: task.manifestDigest, skillMdSha256: task.skillMdSha256 },
+    }), "skill_completion_proof_invalid");
+    if (!sameSkillEvidence(verified, appliedEvidence) || !sameSkillEvidence(verified, inspected)
+      || !skillEvidenceMatchesExpected(verified, task)) throw adapterError("skill_completion_proof_invalid");
+    next.skills[task.skillId] = {
+      target, version: task.version, packageSha256: task.packageSha256,
+      skillMdSha256: task.skillMdSha256, identity: verified.identity,
+      treeDigest: verified.treeDigest, manifestDigest: verified.manifestDigest,
+    };
+  } else {
+    const inspected = await inspectExact({ target, authorizedRoot: skillsRoot });
+    if (inspected?.kind !== "absent") throw adapterError("skill_uninstall_recovery_incomplete");
+    delete next.skills[task.skillId];
+  }
+  next.installRoot ??= readInstallRootCapability(installRootCapability);
+  next.activeTask = null;
+  next.lastTask = { taskId: task.taskId, componentId: task.skillId, action: task.kind };
+  return saveState(next);
+}
+
+export async function recoverSkillOwnershipOffline({
+  ownershipStore, installRootCapability, skillsRootCapability, skillFiles,
+  resolveSkillTarget: resolveTarget, skillPathAccess = {},
+} = {}) {
+  await revalidateInstallRootCapability(installRootCapability);
+  await revalidateFixedDirectoryCapability(skillsRootCapability);
+  const skillsRoot = readFixedDirectoryCapability(skillsRootCapability).path;
+  if (typeof resolveTarget !== "function") throw adapterError("skill_path_resolver_required");
+  let coordinator;
+  try { coordinator = getOwnershipCoordinator(ownershipStore); } catch (error) {
+    throw adapterError("component_ownership_store_required", error);
+  }
+  return coordinator.runExclusive(async (store) => recoverSkillOwnershipState({
+    state: await store.load(), saveState: store.save.bind(store), skillsRoot, skillFiles,
+    resolveTarget, skillPathAccess, installRootCapability,
+  }));
+}
+
 export function createComponentAdapters({
   catalogService,
   installRootCapability,
@@ -207,13 +302,58 @@ export function createComponentAdapters({
 } = {}) {
   if (!isTrustedCatalogService(catalogService)) throw adapterError("trusted_catalog_service_required");
   const installRoot = readInstallRootCapability(installRootCapability);
-  const skillsDirectory = readFixedDirectoryCapability(skillsRootCapability);
-  const desktopDirectory = readFixedDirectoryCapability(desktopCapability);
-  if (skillsDirectory.kind !== "skills" || desktopDirectory.kind !== "desktop") {
-    throw adapterError("fixed_directory_capability_mismatch");
+  const skillsCapabilityProvider = typeof skillsRootCapability === "function" ? skillsRootCapability : null;
+  const desktopCapabilityProvider = typeof desktopCapability === "function" ? desktopCapability : null;
+  let activeSkillsRootCapability = skillsCapabilityProvider ? null : skillsRootCapability;
+  let activeDesktopCapability = desktopCapabilityProvider ? null : desktopCapability;
+  let skillsRoot = null;
+  let desktopPath = null;
+  if (!skillsCapabilityProvider) {
+    const skillsDirectory = readFixedDirectoryCapability(activeSkillsRootCapability);
+    if (skillsDirectory.kind !== "skills") throw adapterError("fixed_directory_capability_mismatch");
+    skillsRoot = skillsDirectory.path;
   }
-  const skillsRoot = skillsDirectory.path;
-  const desktopPath = desktopDirectory.path;
+  if (!desktopCapabilityProvider) {
+    const desktopDirectory = readFixedDirectoryCapability(activeDesktopCapability);
+    if (desktopDirectory.kind !== "desktop") throw adapterError("fixed_directory_capability_mismatch");
+    desktopPath = desktopDirectory.path;
+  }
+  let skillsAuthorityPromise = null;
+  let desktopAuthorityPromise = null;
+  async function ensureSkillsAuthority() {
+    if (activeSkillsRootCapability) return activeSkillsRootCapability;
+    if (skillsAuthorityPromise === null) {
+      const operation = Promise.resolve().then(skillsCapabilityProvider).then((capability) => {
+        const directory = readFixedDirectoryCapability(capability);
+        if (directory.kind !== "skills") throw adapterError("fixed_directory_capability_mismatch");
+        activeSkillsRootCapability = capability;
+        skillsRoot = directory.path;
+        return capability;
+      });
+      skillsAuthorityPromise = operation;
+      operation.catch(() => {
+        if (skillsAuthorityPromise === operation) skillsAuthorityPromise = null;
+      });
+    }
+    return skillsAuthorityPromise;
+  }
+  async function ensureDesktopAuthority() {
+    if (activeDesktopCapability) return activeDesktopCapability;
+    if (desktopAuthorityPromise === null) {
+      const operation = Promise.resolve().then(desktopCapabilityProvider).then((capability) => {
+        const directory = readFixedDirectoryCapability(capability);
+        if (directory.kind !== "desktop") throw adapterError("fixed_directory_capability_mismatch");
+        activeDesktopCapability = capability;
+        desktopPath = directory.path;
+        return capability;
+      });
+      desktopAuthorityPromise = operation;
+      operation.catch(() => {
+        if (desktopAuthorityPromise === operation) desktopAuthorityPromise = null;
+      });
+    }
+    return desktopAuthorityPromise;
+  }
   const download = requireMethod(downloader, "download", "component_downloader_required");
   const extractArchive = requireMethod(archiveService, "extractArchive", "component_archive_required");
   const promotePreparedVersion = requireMethod(versionSlots, "promotePreparedVersion", "component_slots_required");
@@ -430,88 +570,12 @@ export function createComponentAdapters({
   }
 
   async function recoverSkillTransaction() {
+    await ensureSkillsAuthority();
     const state = await recoverAbandonedPrepareClaim(await loadState());
-    const task = state?.activeTask;
-    if (!isRecord(task) || !["skill-replace", "skill-uninstall"].includes(task.kind)) return state;
-    if (task.skillsRoot !== skillsRoot || typeof task.skillId !== "string"
-      || task.target !== path.win32.join(skillsRoot, task.skillId)) {
-      throw adapterError("skill_recovery_record_invalid");
-    }
-    const target = await resolveSkillTarget({
-      skillsRoot, skillId: task.skillId, realpath: skillPathAccess.realpath, lstat: skillPathAccess.lstat,
+    return recoverSkillOwnershipState({
+      state, saveState, skillsRoot, skillFiles, resolveTarget: resolveSkillTarget,
+      skillPathAccess, installRootCapability,
     });
-    if (target !== task.target) throw adapterError("skill_target_mismatch");
-    const next = structuredClone(state);
-    if (task.kind === "skill-replace") {
-      if (!["reserved", "applied"].includes(task.phase) || !SHA256.test(task.packageSha256 ?? "")
-        || !SHA256.test(task.skillMdSha256 ?? "") || !SHA256.test(task.treeDigest ?? "")
-        || !SHA256.test(task.manifestDigest ?? "") || !/^[a-f0-9]{32}$/u.test(task.swapId ?? "")) {
-        throw adapterError("skill_recovery_record_invalid");
-      }
-      const previousEvidence = validatePreviousSkillEvidence(task.previousEvidence);
-      await reconcileSkillReplacement({
-        taskId: task.taskId,
-        swapId: task.swapId,
-        target,
-        expected: {
-          treeDigest: task.treeDigest,
-          manifestDigest: task.manifestDigest,
-          skillMdSha256: task.skillMdSha256,
-        },
-      });
-      const inspectedRaw = await inspectSkillExact({ target, authorizedRoot: skillsRoot });
-      const inspected = inspectedRaw?.kind === "absent"
-        ? validatePreviousSkillEvidence(inspectedRaw)
-        : validateSkillTreeEvidence(inspectedRaw);
-      if (task.phase === "reserved" && sameSkillEvidence(inspected, previousEvidence)) {
-        next.activeTask = null;
-        next.lastTask = { taskId: task.taskId, componentId: task.skillId, action: "skill-replace-aborted" };
-        await saveState(next);
-        return next;
-      }
-      let completionProof = task.completionProof;
-      let appliedEvidence = task.appliedEvidence;
-      if (task.phase === "reserved") {
-        if (!skillEvidenceMatchesExpected(inspected, task)) throw adapterError("skill_recovery_content_mismatch");
-        const recovered = await recoverSkillCompletionProof({
-          target, taskId: task.taskId, swapId: task.swapId,
-          expected: {
-            treeDigest: task.treeDigest, manifestDigest: task.manifestDigest,
-            skillMdSha256: task.skillMdSha256,
-          },
-        });
-        if (!isRecord(recovered) || recovered.completionProof === undefined) {
-          throw adapterError("skill_completion_recovery_invalid");
-        }
-        completionProof = recovered.completionProof;
-        appliedEvidence = validateSkillTreeEvidence(recovered.evidence, "skill_completion_recovery_invalid");
-        if (!sameSkillEvidence(appliedEvidence, inspected)) throw adapterError("skill_completion_recovery_invalid");
-        next.activeTask = { ...structuredClone(task), phase: "applied", completionProof, appliedEvidence };
-        await saveState(next);
-      }
-      const verified = validateSkillTreeEvidence(await verifySkillCompletionProof({
-        completionProof, target, taskId: task.taskId, swapId: task.swapId,
-        expected: {
-          treeDigest: task.treeDigest, manifestDigest: task.manifestDigest,
-          skillMdSha256: task.skillMdSha256,
-        },
-      }), "skill_completion_proof_invalid");
-      if (!sameSkillEvidence(verified, appliedEvidence) || !sameSkillEvidence(verified, inspected)
-        || !skillEvidenceMatchesExpected(verified, task)) throw adapterError("skill_completion_proof_invalid");
-      next.skills[task.skillId] = {
-        target, version: task.version, packageSha256: task.packageSha256,
-        skillMdSha256: task.skillMdSha256, identity: verified.identity,
-        treeDigest: verified.treeDigest, manifestDigest: verified.manifestDigest,
-      };
-    } else {
-      const inspected = await inspectSkillExact({ target, authorizedRoot: skillsRoot });
-      if (inspected?.kind !== "absent") throw adapterError("skill_uninstall_recovery_incomplete");
-      delete next.skills[task.skillId];
-    }
-    next.activeTask = null;
-    next.lastTask = { taskId: task.taskId, componentId: task.skillId, action: task.kind };
-    await saveState(next);
-    return next;
   }
 
   async function recoverComponentUninstall() {
@@ -532,6 +596,7 @@ export function createComponentAdapters({
     let task = state.activeTask;
     if (!isRecord(task) || !["component-uninstall", "component-shortcut"].includes(task.kind)) return state;
     if (task.kind === "component-shortcut") {
+      await ensureDesktopAuthority();
       if (!["chatgpt", "v2rayn"].includes(task.componentId) || !["reserved", "applied"].includes(task.phase)
         || typeof task.taskId !== "string" || task.desktopPath !== desktopPath
         || typeof task.targetPath !== "string") throw adapterError("shortcut_recovery_record_invalid");
@@ -545,7 +610,7 @@ export function createComponentAdapters({
         || !isShortcutBoundToCurrent(shortcut, state, task.componentId)) {
         throw adapterError("shortcut_recovery_record_invalid");
       }
-      await revalidateFixedDirectoryCapability(desktopCapability);
+      await revalidateFixedDirectoryCapability(activeDesktopCapability);
       let recovered;
       try {
         recovered = await inspectRecordedShortcut(shortcut);
@@ -757,6 +822,7 @@ export function createComponentAdapters({
       const recordedShortcut = stateAfter?.shortcuts?.find((record) => record?.componentId === componentId);
       if (!recordedShortcut) {
         try {
+          await ensureDesktopAuthority();
           const planned = await planShortcut({
             name: COMPONENTS[componentId].shortcut, desktopPath, targetPath: finalEntrypoint,
           });
@@ -860,6 +926,7 @@ export function createComponentAdapters({
       if (!record) return result(componentId, "uninstall", "skipped", { message: "component_not_installed" });
       before = record.version;
       if (typeof record.entrypointPath !== "string") throw adapterError("component_runtime_metadata_missing");
+      if (state.shortcuts.length > 0) await ensureDesktopAuthority();
       const shortcuts = state.shortcuts.map((shortcut) => {
         if (!isValidShortcutRecord(shortcut, {
           desktopPath, includeComponentId: true,
@@ -868,10 +935,10 @@ export function createComponentAdapters({
         }
         return shortcut;
       }).filter((shortcut) => shortcut.componentId === componentId);
-      if (shortcuts.length > 0) await revalidateFixedDirectoryCapability(desktopCapability);
+      if (shortcuts.length > 0) await revalidateFixedDirectoryCapability(activeDesktopCapability);
       await windowsHost.stopOwnedProcesses([record.entrypointPath]);
       for (const shortcut of shortcuts) {
-        await revalidateFixedDirectoryCapability(desktopCapability);
+        await revalidateFixedDirectoryCapability(activeDesktopCapability);
         await windowsHost.removeRecordedShortcut(shortcut);
       }
       const taskId = TASK_ID.test(context.taskId ?? "") ? context.taskId : `uninstall-${componentId}`;
@@ -1555,6 +1622,7 @@ export function createComponentAdapters({
     catch (error) { return [await failed("skills", "prepare", error)]; }
     const taskId = context.taskId;
     try {
+      await ensureSkillsAuthority();
       await runOwnership(() => recoverSkillTransaction());
       await reconcilePreparedSkillSources();
     }
@@ -1585,7 +1653,7 @@ export function createComponentAdapters({
         await bindPreparedSkillSource({ taskId, skillId: entry.id });
         const archivePath = path.win32.join(installRoot, "downloads", `skill-${entry.id}-${entry.version}.zip`);
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
-        await revalidateFixedDirectoryCapability(skillsRootCapability);
+        await revalidateFixedDirectoryCapability(activeSkillsRootCapability);
         const downloaded = await download({
           asset: { url: entry.assetUrl, size: entry.size, sha256: entry.sha256 }, destination: archivePath,
           signal: context.signal, onProgress: typeof context.onProgress === "function" ? context.onProgress : () => {},
@@ -1598,10 +1666,10 @@ export function createComponentAdapters({
         }
         downloadRecord = downloaded.downloadRecord;
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
-        await revalidateFixedDirectoryCapability(skillsRootCapability);
+        await revalidateFixedDirectoryCapability(activeSkillsRootCapability);
         await extractArchive({ format: "zip", archivePath, destination, signal: context.signal });
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
-        await revalidateFixedDirectoryCapability(skillsRootCapability);
+        await revalidateFixedDirectoryCapability(activeSkillsRootCapability);
         const verified = await verifyPreparedSkill({
           taskId,
           skillId: entry.id,
@@ -1652,9 +1720,10 @@ export function createComponentAdapters({
     for (const id of Array.isArray(context.skillIds) ? context.skillIds : []) {
       const prepared = pending.get(id);
       try {
+        await ensureSkillsAuthority();
         if (!prepared) throw adapterError("skill_not_prepared");
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath: prepared.maxRelativePath });
-        await revalidateFixedDirectoryCapability(skillsRootCapability);
+        await revalidateFixedDirectoryCapability(activeSkillsRootCapability);
         let state = await recoverSkillTransaction();
         assertStateForManaged(state);
         if (state.activeTask !== null) throw adapterError("component_pending_transaction");
@@ -1676,10 +1745,10 @@ export function createComponentAdapters({
           manifestDigest: prepared.manifestDigest, previousEvidence,
         };
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath: prepared.maxRelativePath });
-        await revalidateFixedDirectoryCapability(skillsRootCapability);
+        await revalidateFixedDirectoryCapability(activeSkillsRootCapability);
         await saveState(reserved);
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath: prepared.maxRelativePath });
-        await revalidateFixedDirectoryCapability(skillsRootCapability);
+        await revalidateFixedDirectoryCapability(activeSkillsRootCapability);
         const replacement = await replaceSkillExact({
           taskId: context.taskId, swapId, source: prepared.destination, target, authorizedRoot: skillsRoot, backup: false,
           verificationReceipt: prepared.verificationReceipt,
@@ -1690,7 +1759,7 @@ export function createComponentAdapters({
           throw adapterError("skill_completion_receipt_invalid");
         }
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath: prepared.maxRelativePath });
-        await revalidateFixedDirectoryCapability(skillsRootCapability);
+        await revalidateFixedDirectoryCapability(activeSkillsRootCapability);
         const completed = await finalizeSkillReplacement({
           completionReceipt: replacement.completionReceipt, target, taskId: context.taskId, swapId,
           expected: {
@@ -1718,7 +1787,7 @@ export function createComponentAdapters({
           continue;
         }
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath: prepared.maxRelativePath });
-        await revalidateFixedDirectoryCapability(skillsRootCapability);
+        await revalidateFixedDirectoryCapability(activeSkillsRootCapability);
         const adopted = structuredClone(applied);
         adopted.installRoot ??= installRoot;
         adopted.skills[id] = {
@@ -1751,8 +1820,9 @@ export function createComponentAdapters({
   async function inspectSkills(rawContext) {
     try {
       const context = rejectForbiddenContext(rawContext);
+      await ensureSkillsAuthority();
       await revalidateInstallRootCapability(installRootCapability);
-      await revalidateFixedDirectoryCapability(skillsRootCapability);
+      await revalidateFixedDirectoryCapability(activeSkillsRootCapability);
       const state = await recoverSkillTransaction();
       await reconcilePreparedSkillSources();
       if (state.activeTask !== null) throw adapterError("component_pending_transaction");
@@ -1814,8 +1884,9 @@ export function createComponentAdapters({
     const results = [];
     for (const id of Array.isArray(context.skillIds) ? context.skillIds : []) {
       try {
+        await ensureSkillsAuthority();
         await revalidateInstallRootCapability(installRootCapability);
-        await revalidateFixedDirectoryCapability(skillsRootCapability);
+        await revalidateFixedDirectoryCapability(activeSkillsRootCapability);
         const state = await recoverSkillTransaction();
         if (state.activeTask !== null) throw adapterError("component_pending_transaction");
         const record = state.skills[id];
@@ -1839,8 +1910,9 @@ export function createComponentAdapters({
     const results = [];
     for (const id of Array.isArray(context.skillIds) ? context.skillIds : []) {
       try {
+        await ensureSkillsAuthority();
         await revalidateInstallRootCapability(installRootCapability);
-        await revalidateFixedDirectoryCapability(skillsRootCapability);
+        await revalidateFixedDirectoryCapability(activeSkillsRootCapability);
         const state = await recoverSkillTransaction();
         if (state.activeTask !== null) throw adapterError("component_pending_transaction");
         const record = state.skills[id];
@@ -1871,14 +1943,22 @@ export function createComponentAdapters({
 
   const coordinated = (operation, authorities) => (...args) => ownershipCoordinator.runExclusive(async () => {
     if (authorities.install) await revalidateInstallRootCapability(installRootCapability);
-    if (authorities.desktop) await revalidateFixedDirectoryCapability(desktopCapability);
-    if (authorities.skills) await revalidateFixedDirectoryCapability(skillsRootCapability);
+    if (authorities.desktop) {
+      await ensureDesktopAuthority();
+      await revalidateFixedDirectoryCapability(activeDesktopCapability);
+    }
+    if (authorities.skills) {
+      await ensureSkillsAuthority();
+      await revalidateFixedDirectoryCapability(activeSkillsRootCapability);
+    }
     return operation(...args);
   });
   const coordinatedArchiveAdapter = (componentId) => {
     const adapter = archiveAdapter(componentId);
     return Object.freeze(Object.fromEntries(Object.entries(adapter).map(([name, operation]) => [
-      name, name === "prepare" ? operation : coordinated(operation, { install: true, desktop: true, skills: false }),
+      name, name === "prepare" ? operation : coordinated(operation, {
+        install: true, desktop: desktopCapabilityProvider === null, skills: false,
+      }),
     ])));
   };
 

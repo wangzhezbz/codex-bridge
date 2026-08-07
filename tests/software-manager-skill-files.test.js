@@ -5,7 +5,10 @@ import test from "node:test";
 
 import { createSkillFileService } from "../desktop/software-manager/skill-files.mjs";
 import { createSkillSwapJournal } from "../desktop/software-manager/skill-swap-journal.mjs";
-import { createSkillPrepareJournal } from "../desktop/software-manager/skill-prepare-journal.mjs";
+import {
+  createSkillPrepareJournal,
+  inferPreparedSkillInstallRoot,
+} from "../desktop/software-manager/skill-prepare-journal.mjs";
 import { createTrustedCatalogService, verifyCatalogEnvelope } from "../desktop/software-manager/catalog-trust.mjs";
 import { authorizeInstallRoot } from "../desktop/software-manager/path-policy.mjs";
 
@@ -894,6 +897,53 @@ test("exact uninstall rejects a foreign identity and preserves sibling Skills", 
   }), /skill_delete_identity_mismatch/u);
   assert.equal(capabilities.inspect("documents").identity.fileId, "owned");
   assert.equal(capabilities.inspect("pdf").identity.fileId, "pdf");
+});
+
+test("recovery-only Skill files reconcile local journals without catalog or workspace", async () => {
+  const fixture = createFixture();
+  const recovery = createSkillFileService({
+    fileCapabilities: fixture.capabilities.fileCapabilities,
+    installRootCapability: INSTALL_CAPABILITY,
+    skillsRootCapability: SKILLS_CAPABILITY,
+    catalogService: null,
+    workspace: null,
+    swapJournal: fixture.journal,
+    prepareJournal: fixture.prepareJournal,
+    prepareLeaseStore: fixture.prepareLeaseStore,
+    hashFile: null,
+    recoveryOnly: true,
+  });
+  assert.equal(await recovery.reconcilePreparedSources(), 0);
+  assert.deepEqual(await recovery.reconcileReplacement({
+    taskId: "skill-task",
+    swapId: SWAP_ID,
+    target: TARGET,
+    expected: { treeDigest: TREE, manifestDigest: MANIFEST, skillMdSha256: SKILL_MD },
+  }), { status: "absent" });
+  await assert.rejects(recovery.beginPreparedSource({
+    taskId: "skill-task", skillId: "documents", leaseScope: "prepare", leaseNonce: LEASE_NONCE,
+  }), /trusted_catalog_service_required/u);
+});
+
+test("prepare journal infers the unique install root from an exact task and Skill binding", async () => {
+  const fixture = createFixture();
+  await fixture.prepareJournal.record({
+    schemaVersion: 1, phase: "intent", taskId: "skill-task", skillId: "documents",
+    installRoot: "D:\\CBApps", sourcePath: SOURCE,
+    leaseScope: "prepare", leaseNonce: LEASE_NONCE, identity: null, evidence: null,
+  });
+  assert.equal(await inferPreparedSkillInstallRoot({
+    journalDir: "D:\\CBState\\skill-prepares",
+    fsApi: fixture.memory.fsApi,
+    taskId: "skill-task",
+    skillId: "documents",
+  }), "D:\\CBApps");
+  assert.equal(await inferPreparedSkillInstallRoot({
+    journalDir: "D:\\CBState\\skill-prepares",
+    fsApi: fixture.memory.fsApi,
+    taskId: "other-task",
+    skillId: "documents",
+  }), null);
 });
 
 test("prepared tree verification requires exact SKILL.md and full manifest evidence", async () => {

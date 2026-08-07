@@ -1762,6 +1762,24 @@ test("skills prepare revalidates install and skills roots after download before 
   assert.deepEqual(getState().skills, {});
 });
 
+test("lazy Skills authority retries after denial without affecting components", async () => {
+  let calls = 0;
+  const provider = async () => {
+    calls += 1;
+    if (calls === 1) throw Object.assign(new Error("skills_denied"), { code: "EACCES" });
+    return SKILLS_CAPABILITY;
+  };
+  const { adapters } = fixture({ skillsRootCapability: provider });
+  const denied = await adapters.skills.inspectInstalled({ skillIds: ["documents"] });
+  assert.equal(calls, 1);
+  assert.equal(denied[0].status, "failed");
+  assert.notEqual((await adapters.chatgpt.inspectInstalled({})).status, "failed");
+  const retried = await adapters.skills.inspectInstalled({ skillIds: ["documents"] });
+  assert.equal(calls, 2);
+  assert.equal(retried[0].componentId, "documents");
+  assert.notEqual(retried[0].status, "failed");
+});
+
 test("a second adapter skips a live sealed Skill prepare and reclaims it only after the owner crashes", async () => {
   const shared = fixture();
   const second = shared.createAnotherAdapters();
