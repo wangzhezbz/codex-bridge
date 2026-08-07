@@ -124,9 +124,10 @@ function recoveryFixture({ installRoot = null, activeTask = null, transactions =
   };
 }
 
-function realEmptyJournalRecoveryFixture(lifecycle) {
+function realEmptyJournalRecoveryFixture(lifecycle, { componentId = "chatgpt" } = {}) {
+  const rootPath = componentId === "chatgpt" ? "D:\\CBApps" : `D:\\CBApps\\${componentId === "git" ? "Git" : "V2RayN"}`;
   let persisted = ownership(lifecycle === "clearing" ? "D:\\CBApps" : null);
-  persisted.activeTask = versionClaim("chatgpt", "D:\\CBApps", lifecycle);
+  persisted.activeTask = versionClaim(componentId, rootPath, lifecycle);
   const journalCalls = [];
   const journal = Object.freeze({
     scopeId: JOURNAL_SCOPE,
@@ -280,6 +281,24 @@ test("active claim with a missing journal reaches the existing slot fail-closed 
   assert.equal(fixture.versionRootOpens(), 0);
 });
 
+test("Git reserved and clearing claims with an empty journal reach real slot release", async () => {
+  for (const lifecycle of ["reserved", "clearing"]) {
+    const fixture = realEmptyJournalRecoveryFixture(lifecycle, { componentId: "git" });
+    const result = await recoverOffline(fixture.input);
+    assert.deepEqual(result, { status: "recovered", installRoot: "D:\\CBApps", recovered: [] });
+    assert.equal(fixture.state().activeTask, null);
+    assert.deepEqual(fixture.journalCalls, ["list", "list"]);
+    assert.equal(fixture.versionRootOpens(), 0);
+  }
+});
+
+test("Git active claim with a missing journal reaches the real slot fail-closed path", async () => {
+  const fixture = realEmptyJournalRecoveryFixture("active", { componentId: "git" });
+  await assert.rejects(recoverOffline(fixture.input), /slot_recovery_journal_missing/u);
+  assert.equal(fixture.state().activeTask.lifecycle, "active");
+  assert.equal(fixture.versionRootOpens(), 0);
+});
+
 test("duplicate evidence for one canonical root is accepted once", async () => {
   const fixture = recoveryFixture({
     installRoot: "D:\\CBApps\\",
@@ -318,12 +337,24 @@ test("malformed software-version-slot active claim fails before authorization", 
     { ...versionClaim("chatgpt", "D:\\CBApps", "reserved"), unexpected: true },
     versionClaim("v2rayn", "D:\\CBApps\\NotV2RayN", "reserved"),
     { ...versionClaim("chatgpt", "D:\\CBApps", "reserved"), journalScope: "d:\\foreign\\journal" },
+    { ...versionClaim("git", "D:\\CBApps\\Git", "reserved"), unexpected: true },
+    versionClaim("git", "D:\\CBApps\\NotGit", "reserved"),
+    { ...versionClaim("git", "D:\\CBApps\\Git", "reserved"), journalScope: "d:\\foreign\\journal" },
   ];
   for (const activeTask of malformedClaims) {
     const fixture = recoveryFixture({ activeTask });
     await assert.rejects(recoverOffline(fixture.input), /offline_recovery_state_invalid/u);
     assert.deepEqual(fixture.events, [["journal-list"]]);
   }
+});
+
+test("Git active claim must agree exactly with a persisted install root", async () => {
+  const fixture = recoveryFixture({
+    installRoot: "E:\\Other",
+    activeTask: versionClaim("git", "D:\\CBApps\\Git", "reserved"),
+  });
+  await assert.rejects(recoverOffline(fixture.input), /offline_recovery_state_invalid/u);
+  assert.deepEqual(fixture.events, [["journal-list"]]);
 });
 
 test("V2RayN and Git journal roots require their exact fixed component leaf", async () => {

@@ -1,6 +1,5 @@
 import path from "node:path";
 
-import { isValidActiveTask } from "./ownership-task-schema.mjs";
 import { recoverTransactions } from "./transaction-journal.mjs";
 import { isVersionTransactionClaim } from "./version-slots.mjs";
 
@@ -95,13 +94,18 @@ function rootFromActiveTask(ownership, journalScope) {
   const activeTask = ownership.activeTask;
   if (activeTask === null || activeTask === undefined) return null;
   if (!isPlainRecord(activeTask) || activeTask.kind !== "software-version-slot") return null;
-  if (!isValidActiveTask(activeTask, { ownership }) || !isVersionTransactionClaim(activeTask)
-    || activeTask.journalScope !== journalScope) {
+  if (!isVersionTransactionClaim(activeTask) || activeTask.journalScope !== journalScope) {
     throw recoveryError("offline_recovery_state_invalid");
   }
   try {
-    return installRootFromComponentRoot(activeTask.componentId, activeTask.rootPath);
+    const installRoot = installRootFromComponentRoot(activeTask.componentId, activeTask.rootPath);
+    if (ownership.installRoot !== null
+      && canonicalInstallRoot(ownership.installRoot) !== installRoot) {
+      throw recoveryError("offline_recovery_state_invalid");
+    }
+    return installRoot;
   } catch (error) {
+    if (error?.code === "offline_recovery_state_invalid") throw error;
     throw recoveryError("offline_recovery_state_invalid", error);
   }
 }
