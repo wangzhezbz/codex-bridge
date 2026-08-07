@@ -119,6 +119,8 @@ const ipcMain = createTrustedIpcRegistrar(electronIpcMain, () => ({
   trustedRendererUrl: rendererEntryUrl,
 }));
 let routerProcess = null;
+let softwareManagerIpcPromise = null;
+let softwareManagerServicePromise = null;
 let chatgptBridgeService = null;
 let routerLifecyclePromise = null;
 let codexHistoryRecoveryFlowPromise = null;
@@ -829,6 +831,149 @@ async function loadRouterHealth() {
   return import("./router-health.mjs");
 }
 
+function softwareManagerUnavailableAdapter() {
+  const unavailable = async () => {
+    const error = new Error("software_manager_runtime_not_provisioned");
+    error.code = "software_manager_runtime_not_provisioned";
+    throw error;
+  };
+  return Object.freeze({
+    inspectInstalled: unavailable,
+    prepare: unavailable,
+    commit: unavailable,
+    verify: unavailable,
+    uninstall: unavailable,
+    rollback: unavailable,
+  });
+}
+
+async function createSoftwareManagerRuntimeService() {
+  if (process.platform !== "win32") {
+    const error = new Error("software_manager_platform_disabled");
+    error.code = "software_manager_platform_disabled";
+    throw error;
+  }
+  const [
+    { createSoftwareManagerService },
+    { createWin32FileApi },
+    { createWindowsFileCapabilities },
+    { createOwnershipStore },
+    { createTransactionJournal, recoverTransactions },
+    { createVersionSlotManager },
+    { authorizeInstallRoot },
+  ] = await Promise.all([
+    import("./software-manager/service.mjs"),
+    import("./software-manager/win32-file-api.mjs"),
+    import("./software-manager/windows-file-capabilities.mjs"),
+    import("./software-manager/state-store.mjs"),
+    import("./software-manager/transaction-journal.mjs"),
+    import("./software-manager/version-slots.mjs"),
+    import("./software-manager/path-policy.mjs"),
+  ]);
+
+  const softwareRoot = path.join(dataRootDir, "software-manager");
+  const stateDir = path.join(softwareRoot, "state");
+  const journalDir = path.join(softwareRoot, "journal");
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.mkdirSync(journalDir, { recursive: true });
+  const nativeApi = createWin32FileApi({ platform: "win32", koffi: require("koffi") });
+  const fileCapabilities = createWindowsFileCapabilities({ platform: "win32", nativeApi });
+  const skillsRoot = path.join(os.homedir(), ".codex", "skills");
+  const ownershipStore = createOwnershipStore({ stateDir, fsApi: fileCapabilities, skillsRoot });
+  const journal = createTransactionJournal({ journalDir, fsApi: fileCapabilities });
+  const slots = createVersionSlotManager({ fsApi: fileCapabilities, ownershipStore, journal });
+
+  const rootCapabilities = new Map();
+  let selectedRootToken = null;
+  const installRootResolver = Object.freeze({
+    getCurrentToken: () => selectedRootToken,
+    async choose(candidate) {
+      const capability = await authorizeInstallRoot({
+        candidate,
+        env: process.env,
+        maxRelativePath: 220,
+        access: (target) => fs.promises.access(target, fs.constants.R_OK | fs.constants.W_OK),
+        realpath: (target) => fs.promises.realpath(target),
+        lstat: (target) => fs.promises.lstat(target),
+      });
+      const token = crypto.randomBytes(24).toString("base64url");
+      rootCapabilities.clear();
+      rootCapabilities.set(token, capability);
+      selectedRootToken = token;
+      return { token, capability };
+    },
+    async resolve(token) {
+      const capability = rootCapabilities.get(token);
+      if (!capability) {
+        const error = new Error("software_manager_install_root_invalid");
+        error.code = "software_manager_install_root_invalid";
+        throw error;
+      }
+      return capability;
+    },
+  });
+  const unavailable = softwareManagerUnavailableAdapter();
+  return createSoftwareManagerService({
+    platform: "win32",
+    catalogProvider: {
+      // Startup recovery is deliberately offline.  The signed catalog runtime
+      // remains read-only until its independently provisioned trust authority
+      // and production component file adapters are both present.
+      getCurrent: async () => null,
+      refresh: async () => null,
+    },
+    adapters: Object.freeze({
+      chatgpt: unavailable,
+      v2rayn: unavailable,
+      git: unavailable,
+      skills: unavailable,
+    }),
+    ownershipStore,
+    recoverTransactions: () => recoverTransactions({ journal, slots }),
+    installRootResolver,
+  });
+}
+
+function getSoftwareManagerService() {
+  if (process.platform !== "win32") {
+    const error = new Error("software_manager_platform_disabled");
+    error.code = "software_manager_platform_disabled";
+    return Promise.reject(error);
+  }
+  if (!softwareManagerServicePromise) {
+    softwareManagerServicePromise = createSoftwareManagerRuntimeService().catch((error) => {
+      softwareManagerServicePromise = null;
+      throw error;
+    });
+  }
+  return softwareManagerServicePromise;
+}
+
+function initializeSoftwareManagerIpc() {
+  if (!softwareManagerIpcPromise) {
+    softwareManagerIpcPromise = import("./software-manager/ipc.mjs").then(({ registerSoftwareManagerIpc }) => {
+      registerSoftwareManagerIpc({
+        ipcMain,
+        platform: process.platform,
+        getService: getSoftwareManagerService,
+        selectInstallRoot: async (service) => {
+          const selection = await dialog.showOpenDialog(mainWindow, {
+            title: "选择软件安装位置",
+            properties: ["openDirectory", "createDirectory"],
+          });
+          if (selection.canceled || selection.filePaths.length !== 1) return { cancelled: true };
+          return service.chooseInstallRoot(selection.filePaths[0]);
+        },
+        sendEvent: (event) => sendToRenderer("softwareManager:event", event),
+      });
+    }).catch((error) => {
+      softwareManagerIpcPromise = null;
+      throw error;
+    });
+  }
+  return softwareManagerIpcPromise;
+}
+
 function createWindow() {
   if (!configRecoveryComplete) {
     return null;
@@ -937,6 +1082,16 @@ app.whenReady().then(async () => {
     isQuitting = true;
     app.quit();
     return;
+  }
+  try {
+    await initializeSoftwareManagerIpc();
+    if (process.platform === "win32") {
+      // Recovery is local-only and deliberately precedes renderer access.  It
+      // neither refreshes the signed catalog nor launches external software.
+      await (await getSoftwareManagerService()).recoverPending();
+    }
+  } catch (error) {
+    appendRuntimeLog(formatError("softwareManagerStartup", error));
   }
   if (process.env.CODEXBRIDGE_DESKTOP_SMOKE !== "1") {
     createTray();
@@ -2928,6 +3083,39 @@ async function requestManagedAppQuit(reason = "application") {
   if (managedQuitReady) {
     app.quit();
     return { ok: true, alreadyReady: true };
+  }
+  const { prepareSoftwareManagerQuit } = await import("./software-manager/ipc.mjs");
+  const softwareDecision = await prepareSoftwareManagerQuit({
+    platform: process.platform,
+    getService: getSoftwareManagerService,
+    showCritical: async (taskReason) => {
+      await dialog.showMessageBox(mainWindow, {
+        type: "warning",
+        title: "软件管理任务正在进行",
+        message: taskReason === "cancelling"
+          ? "软件管理任务正在安全取消，请等待任务完成后再退出 CodexBridge。"
+          : "软件管理正在执行不可中断的关键步骤。为避免安装损坏，当前不能退出 CodexBridge。",
+        buttons: ["知道了"],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+      });
+    },
+    confirmRunning: async () => {
+      const result = await dialog.showMessageBox(mainWindow, {
+        type: "question",
+        title: "软件管理任务正在进行",
+        message: "软件管理任务仍可安全取消。你可以让 CodexBridge 继续在后台运行，或取消任务后退出。",
+        buttons: ["继续后台运行", "取消任务并退出"],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+      });
+      return result.response === 1 ? "cancel-and-quit" : "background";
+    },
+  });
+  if (!softwareDecision.allowQuit) {
+    return { ok: false, cancelled: true, reason: softwareDecision.reason };
   }
   return (await loadRouterLifecycleController()).quit({ reason });
 }

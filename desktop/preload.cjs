@@ -80,6 +80,19 @@ contextBridge.exposeInMainWorld("codexBridge", {
   revealFile: (target) => ipcRenderer.invoke("file:reveal", target),
   openExternal: (url) => ipcRenderer.invoke("external:open", url),
   openGitHub: () => ipcRenderer.invoke("github:open"),
+  getSoftwareManagerSnapshot: () => ipcRenderer.invoke("softwareManager:getSnapshot"),
+  selectSoftwareManagerInstallRoot: () => ipcRenderer.invoke("softwareManager:selectInstallRoot"),
+  refreshSoftwareManager: () => ipcRenderer.invoke("softwareManager:refresh"),
+  startSoftwareManagerTask: (request) => ipcRenderer.invoke("softwareManager:startTask", request),
+  cancelSoftwareManagerTask: () => ipcRenderer.invoke("softwareManager:cancelTask"),
+  onSoftwareManagerEvent: (callback) => {
+    if (typeof callback !== "function") {
+      throw new TypeError("A software manager event callback is required.");
+    }
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("softwareManager:event", listener);
+    return () => ipcRenderer.removeListener("softwareManager:event", listener);
+  },
   onLogs: (callback) => {
     ipcRenderer.on("logs:update", (_event, logs) => callback(logs));
   },

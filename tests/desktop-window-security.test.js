@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
 import test from "node:test";
+import fs from "node:fs";
 
 const require = createRequire(import.meta.url);
 let security = {};
@@ -138,4 +139,21 @@ test("IPC handlers accept only the trusted main renderer and reject every other 
     }, "OPENAI_API_KEY"),
     /Untrusted IPC sender/,
   );
+});
+
+test("preload exposes only narrow software-manager methods and no generic invoke bridge", () => {
+  const source = fs.readFileSync(new URL("../desktop/preload.cjs", import.meta.url), "utf8");
+  for (const method of [
+    "getSoftwareManagerSnapshot",
+    "selectSoftwareManagerInstallRoot",
+    "refreshSoftwareManager",
+    "startSoftwareManagerTask",
+    "cancelSoftwareManagerTask",
+    "onSoftwareManagerEvent",
+  ]) assert.match(source, new RegExp(`\\b${method}\\b`, "u"));
+  assert.match(
+    source,
+    /onSoftwareManagerEvent:[\s\S]*?return \(\) => ipcRenderer\.removeListener\("softwareManager:event", listener\)/u,
+  );
+  assert.doesNotMatch(source, /\bgenericInvoke\b|ipcRenderer:\s*ipcRenderer|invoke:\s*ipcRenderer\.invoke/u);
 });
