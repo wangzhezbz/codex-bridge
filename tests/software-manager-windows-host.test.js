@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFile as execFileCallback } from "node:child_process";
+import path from "node:path";
+import { promisify } from "node:util";
 
+import { createWin32FileApi } from "../desktop/software-manager/win32-file-api.mjs";
 import { createWindowsHost } from "../desktop/software-manager/windows-host.mjs";
 
 const REGISTRY_KEYS = [
@@ -11,6 +15,7 @@ const REGISTRY_KEYS = [
 const REGISTRY_FIELDS = ["DisplayName", "DisplayVersion", "InstallLocation", "UninstallString"];
 const AUTHENTICODE_COMMAND = "$s=Get-AuthenticodeSignature -LiteralPath $env:CB_SM_PACKAGE_PATH; @{Status=[string]$s.Status; Thumbprint=$s.SignerCertificate.Thumbprint; Subject=$s.SignerCertificate.Subject}|ConvertTo-Json -Compress";
 const FILE_VERSION_COMMAND = "$v=[System.Diagnostics.FileVersionInfo]::GetVersionInfo($env:CB_SM_FILE_PATH); @{FileVersion=[string]$v.FileVersion; ProductVersion=[string]$v.ProductVersion}|ConvertTo-Json -Compress";
+const PROCESS_LIST_COMMAND = "@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { [int64]$_.ProcessId -gt 0 } | Select-Object ProcessId,ExecutablePath) | ConvertTo-Json -Compress";
 const SHORTCUT_CREATION_ID = "a".repeat(32);
 const systemDirectoryProvider = () => "C:\\Windows\\System32";
 
@@ -258,6 +263,8 @@ test("system-directory identity is captured once at construction and cannot drif
 
 test("stops only processes whose normalized absolute executable path is exactly owned", async () => {
   const fixture = fakeHost({ processes: [
+    { pid: 0, executablePath: null },
+    { ProcessId: 0, ExecutablePath: "" },
     { pid: 11, name: "ChatGPT.exe", executablePath: "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe" },
     { pid: 12, name: "ChatGPT.exe", executablePath: "C:\\Program Files\\ChatGPT\\ChatGPT.exe" },
     { pid: 13, name: "anything.exe", executablePath: "d:/cbapps/chatgpt/c/CHATGPT.EXE" },
@@ -273,6 +280,35 @@ test("stops only processes whose normalized absolute executable path is exactly 
     ["/PID", "13", "/F"],
   ]);
   assert.equal(taskkillCalls.every(({ options }) => options.shell === false), true);
+  assert.equal(taskkillCalls.some(({ args }) => args.includes("0")), false);
+});
+
+test("PID zero is accepted only as a pathless idle record", async () => {
+  for (const record of [
+    { pid: 0, executablePath: "D:\\Owned\\ChatGPT.exe" },
+    { ProcessId: 0, ExecutablePath: "D:\\Owned\\ChatGPT.exe" },
+    { pid: 0 },
+    { pid: -1, executablePath: null },
+    { pid: 0.5, executablePath: null },
+  ]) {
+    const fixture = fakeHost({ processes: [record] });
+    await assert.rejects(
+      fixture.host.stopOwnedProcesses(["D:\\Owned\\ChatGPT.exe"]),
+      /process_list_invalid/u,
+    );
+    assert.equal(fixture.calls.execFile.some(({ file }) => file === "taskkill.exe"), false);
+  }
+});
+
+test("a noncanonical positive-PID path is skipped and never normalized into an owned match", async () => {
+  const fixture = fakeHost({ processes: [
+    { pid: 41, executablePath: "D:\\Git\\bin\\..\\usr\\bin\\bash.exe" },
+  ] });
+  assert.deepEqual(
+    await fixture.host.stopOwnedProcesses(["D:\\Git\\usr\\bin\\bash.exe"]),
+    { stoppedProcessIds: [] },
+  );
+  assert.equal(fixture.calls.execFile.some(({ file }) => file === "taskkill.exe"), false);
 });
 
 test("revalidates PID executable ownership immediately before stopping and skips a reused PID", async () => {
@@ -326,8 +362,36 @@ test("default process discovery keeps owned paths out of its fixed PowerShell co
   assert.equal(listCalls.every(({ options }) => Object.keys(options.env).length === 0), true);
   assert.equal(listCalls.every(({ args }) => args.join(" ").includes(ownedPath) === false), true);
   assert.equal(listCalls.every(({ args }) => args.at(-1)
-    === "@(Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object ProcessId,ExecutablePath) | ConvertTo-Json -Compress"), true);
+    === "@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { [int64]$_.ProcessId -gt 0 } | Select-Object ProcessId,ExecutablePath) | ConvertTo-Json -Compress"), true);
   assert.deepEqual(calls.at(-1).args, ["/PID", "31", "/F"]);
+});
+
+test("real default process discovery filters idle PID zero and performs zero stops for an unmatched path", {
+  skip: process.platform !== "win32",
+  timeout: 20_000,
+}, async () => {
+  const nativeApi = createWin32FileApi({ platform: "win32" });
+  const calls = [];
+  const run = promisify(execFileCallback);
+  const host = createWindowsHost({
+    platform: "win32",
+    getSystemDirectory: nativeApi.getSystemDirectory,
+    env: {},
+    electronShell: {},
+    async execFile(file, args, options) {
+      calls.push({ file, args: [...args], options });
+      if (path.win32.basename(file).toLowerCase() === "taskkill.exe") {
+        throw new Error("real process-list test must not stop a process");
+      }
+      return run(file, args, options);
+    },
+  });
+  assert.deepEqual(
+    await host.stopOwnedProcesses(["Z:\\CodexBridge-never-running\\not-running.exe"]),
+    { stoppedProcessIds: [] },
+  );
+  assert.equal(calls.some(({ file }) => path.win32.basename(file).toLowerCase() === "taskkill.exe"), false);
+  assert.equal(calls.filter(({ args }) => args.at(-1) === PROCESS_LIST_COMMAND).length >= 1, true);
 });
 
 test("process ownership rejects relative executable paths before listing or stopping anything", async () => {

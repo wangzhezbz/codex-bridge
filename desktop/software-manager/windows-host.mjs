@@ -14,7 +14,7 @@ const REGISTRY_FIELDS = Object.freeze([
 ]);
 const AUTHENTICODE_COMMAND = "$s=Get-AuthenticodeSignature -LiteralPath $env:CB_SM_PACKAGE_PATH; @{Status=[string]$s.Status; Thumbprint=$s.SignerCertificate.Thumbprint; Subject=$s.SignerCertificate.Subject}|ConvertTo-Json -Compress";
 const FILE_VERSION_COMMAND = "$v=[System.Diagnostics.FileVersionInfo]::GetVersionInfo($env:CB_SM_FILE_PATH); @{FileVersion=[string]$v.FileVersion; ProductVersion=[string]$v.ProductVersion}|ConvertTo-Json -Compress";
-const PROCESS_LIST_COMMAND = "@(Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object ProcessId,ExecutablePath) | ConvertTo-Json -Compress";
+const PROCESS_LIST_COMMAND = "@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { [int64]$_.ProcessId -gt 0 } | Select-Object ProcessId,ExecutablePath) | ConvertTo-Json -Compress";
 const POWERSHELL_ARGS = Object.freeze([
   "-NoLogo",
   "-NoProfile",
@@ -322,19 +322,28 @@ function validateProcessRecords(value) {
   if (!Array.isArray(value)) throw hostError("process_list_invalid");
   return value.map((record) => {
     if (!isPlainRecord(record)) throw hostError("process_list_invalid");
+    const pidKeys = ["pid", "ProcessId"].filter((key) => Object.hasOwn(record, key));
+    const pathKeys = ["executablePath", "ExecutablePath"].filter((key) => Object.hasOwn(record, key));
     const pid = record.pid ?? record.ProcessId;
     const executablePath = record.executablePath ?? record.ExecutablePath ?? null;
-    if (!Number.isSafeInteger(pid) || pid <= 0
+    if (pid === 0) {
+      if (pidKeys.length === 1 && pathKeys.length === 1
+        && (record[pathKeys[0]] === null || record[pathKeys[0]] === "")) {
+        return null;
+      }
+      throw hostError("process_list_invalid");
+    }
+    if (!Number.isSafeInteger(pid) || pid < 0
       || !(executablePath === null || typeof executablePath === "string")) {
       throw hostError("process_list_invalid");
     }
     if (executablePath === null || executablePath.length === 0) return { pid, executablePath: null };
     try {
       return { pid, executablePath: requireExecutablePath(executablePath) };
-    } catch (error) {
-      throw hostError("process_list_invalid", error);
+    } catch {
+      return null;
     }
-  });
+  }).filter((record) => record !== null);
 }
 
 function requireElectronMethod(electronShell, name) {
