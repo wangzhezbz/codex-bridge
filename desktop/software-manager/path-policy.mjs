@@ -12,6 +12,8 @@ const OWNERSHIP_KEYS = Object.freeze([
   "activeTask",
   "lastTask",
 ]);
+const INSTALL_ROOT_CAPABILITIES = new WeakMap();
+const FIXED_DIRECTORY_CAPABILITIES = new WeakMap();
 
 function policyError(code) {
   const error = new Error(code);
@@ -209,6 +211,77 @@ export async function validateInstallRoot({ candidate, env = {}, maxRelativePath
     return failed("install_root_unwritable");
   }
   return { ok: true, path: normalized };
+}
+
+function opaqueCapability() {
+  return Object.freeze(Object.create(null));
+}
+
+async function requireStableDirectory({ candidate, options, realpath, lstat, code }) {
+  if (typeof realpath !== "function" || typeof lstat !== "function") throw policyError(`${code}_resolver_invalid`);
+  const expected = normalizeCanonicalWindowsPath(candidate, options);
+  const resolved = normalizeCanonicalWindowsPath(await realpath(expected), options);
+  if (resolved.toLowerCase() !== expected.toLowerCase()) throw policyError(`${code}_identity_changed`);
+  const stat = await lstat(expected);
+  if (!stat?.isDirectory?.() || stat?.isSymbolicLink?.() || stat?.isReparsePoint?.()) {
+    throw policyError(`${code}_reparse_or_not_directory`);
+  }
+  return expected;
+}
+
+export async function authorizeInstallRoot({ candidate, env = {}, maxRelativePath, access, realpath, lstat }) {
+  const validated = await validateInstallRoot({ candidate, env, maxRelativePath, access });
+  if (!validated.ok) throw policyError(validated.error);
+  const stable = await requireStableDirectory({
+    candidate: validated.path,
+    options: {},
+    realpath,
+    lstat,
+    code: "install_root",
+  });
+  const capability = opaqueCapability();
+  INSTALL_ROOT_CAPABILITIES.set(capability, stable);
+  return capability;
+}
+
+export async function authorizeSkillsRoot({ candidate, realpath, lstat }) {
+  const stable = await requireStableDirectory({
+    candidate,
+    options: { allowCodexSkillsRoot: true },
+    realpath,
+    lstat,
+    code: "skills_root",
+  });
+  if (!/\\\.codex\\skills$/iu.test(stable)) throw policyError("skills_root_rejected");
+  const capability = opaqueCapability();
+  FIXED_DIRECTORY_CAPABILITIES.set(capability, Object.freeze({ kind: "skills", path: stable }));
+  return capability;
+}
+
+export async function authorizeDesktopPath({ getDesktopPath, realpath, lstat }) {
+  if (typeof getDesktopPath !== "function") throw policyError("desktop_resolver_invalid");
+  const stable = await requireStableDirectory({
+    candidate: getDesktopPath(),
+    options: {},
+    realpath,
+    lstat,
+    code: "desktop",
+  });
+  const capability = opaqueCapability();
+  FIXED_DIRECTORY_CAPABILITIES.set(capability, Object.freeze({ kind: "desktop", path: stable }));
+  return capability;
+}
+
+export function readInstallRootCapability(capability) {
+  const value = INSTALL_ROOT_CAPABILITIES.get(capability);
+  if (!value) throw policyError("install_root_capability_invalid");
+  return value;
+}
+
+export function readFixedDirectoryCapability(capability) {
+  const value = FIXED_DIRECTORY_CAPABILITIES.get(capability);
+  if (!value) throw policyError("fixed_directory_capability_invalid");
+  return { ...value };
 }
 
 export async function resolveSkillTarget({ skillsRoot, skillId, realpath, lstat }) {

@@ -90,7 +90,7 @@ function createJournalFs() {
 }
 
 function record(overrides = {}) {
-  const rootPath = "D:\\CodexBridge\\ChatGPT";
+  const rootPath = "D:\\CodexBridge";
   const identities = {
     incoming: { volumeSerial: "vol", fileId: "three" },
     current: { volumeSerial: "vol", fileId: "two" },
@@ -119,6 +119,7 @@ function record(overrides = {}) {
     identities,
     integrities,
     ownershipBefore: {
+      installRoot: rootPath,
       component: {
         installPath: `${rootPath}\\c`,
         version: "2.0.0",

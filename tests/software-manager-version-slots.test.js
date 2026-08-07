@@ -2,8 +2,21 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import test from "node:test";
 
+import { authorizeInstallRoot } from "../desktop/software-manager/path-policy.mjs";
 import { createTransactionJournal, recoverTransactions } from "../desktop/software-manager/transaction-journal.mjs";
 import { createVersionSlotManager, planPeakBytes } from "../desktop/software-manager/version-slots.mjs";
+
+const INSTALL_ROOT_CAPABILITY = await authorizeInstallRoot({
+  candidate: "D:\\CodexBridge",
+  maxRelativePath: 200,
+  access: async () => {},
+  realpath: async (value) => value,
+  lstat: async () => ({
+    isDirectory: () => true,
+    isSymbolicLink: () => false,
+    isReparsePoint: () => false,
+  }),
+});
 
 function clone(value) {
   return structuredClone(value);
@@ -56,7 +69,7 @@ function createSharedOwnershipBacking(initialState) {
 
 function createFixture({ componentId = "chatgpt", slots = {}, state = emptyState() } = {}) {
   const rootPath = componentId === "chatgpt"
-    ? "D:\\CodexBridge\\ChatGPT"
+    ? "D:\\CodexBridge"
     : `D:\\CodexBridge\\${componentId === "v2rayn" ? "V2RayN" : "Git"}`;
   const roots = new Map();
   const journals = new Map();
@@ -338,7 +351,12 @@ function createFixture({ componentId = "chatgpt", slots = {}, state = emptyState
   };
   const journalDir = "D:\\CodexBridge\\State\\transactions";
   const journal = createTransactionJournal({ journalDir, fsApi });
-  const manager = createVersionSlotManager({ fsApi, ownershipStore, journal });
+  const manager = createVersionSlotManager({
+    fsApi,
+    ownershipStore,
+    journal,
+    installRootCapability: INSTALL_ROOT_CAPABILITY,
+  });
 
   return {
     rootPath,
@@ -446,7 +464,7 @@ function installedState({ componentId = "chatgpt", current, previous = null, roo
 
 function fixtureWithInstalled({ currentVersion, previousVersion = null, incomingVersion = null, componentId = "chatgpt" }) {
   const rootPath = componentId === "chatgpt"
-    ? "D:\\CodexBridge\\ChatGPT"
+    ? "D:\\CodexBridge"
     : `D:\\CodexBridge\\${componentId === "v2rayn" ? "V2RayN" : "Git"}`;
   const currentName = componentId === "chatgpt" ? "c" : "current";
   const previousName = componentId === "chatgpt" ? "cp" : "previous";
@@ -512,6 +530,33 @@ test("first install promotes only the verified staging slot and creates no rollb
   assert.deepEqual(fixture.versions(), { current: "1.0.0", previous: null, staging: null, retiring: null });
   assert.equal(fixture.state().components.chatgpt.version, "1.0.0");
   assert.equal(fixture.state().rollback, null);
+});
+
+test("first managed ChatGPT commit atomically claims a null installRoot while promoting CBApps\\ct to CBApps\\c", async () => {
+  const state = emptyState();
+  state.installRoot = null;
+  const fixture = createFixture({ slots: { ct: null }, state });
+  await fixture.manager.promotePreparedVersion(promotionPlan(fixture, "1.0.0"));
+  assert.equal(fixture.state().installRoot, "D:\\CodexBridge");
+  assert.equal(fixture.state().components.chatgpt.installPath, "D:\\CodexBridge\\c");
+  assert.deepEqual(fixture.versions(), { current: "1.0.0", previous: null, staging: null, retiring: null });
+});
+
+test("an unclaimed first install requires the constructor-bound install-root capability", async () => {
+  const state = emptyState();
+  state.installRoot = null;
+  const fixture = createFixture({ state, slots: { ct: null } });
+  const managerWithoutAuthority = createVersionSlotManager({
+    fsApi: fixture.fsApi,
+    ownershipStore: fixture.ownershipStore,
+    journal: fixture.journal,
+  });
+  await assert.rejects(
+    managerWithoutAuthority.promotePreparedVersion(promotionPlan(fixture, "1.0.0")),
+    /slot_root_not_owned/u,
+  );
+  assert.equal(fixture.state().installRoot, null);
+  assert.equal(fixture.calls.some((call) => call[0] === "open-version-root"), false);
 });
 
 test("first update keeps the old current as previous and records one rollback", async () => {
@@ -1477,7 +1522,7 @@ test("first-install promotion rejects a component root outside the ownership ins
   await assert.rejects(
     fixture.manager.promotePreparedVersion({
       ...plan,
-      rootPath: "D:\\Other\\ChatGPT",
+      rootPath: "D:\\Other",
     }),
     /slot_root_not_owned/u,
   );

@@ -7,7 +7,11 @@ import {
   parseCatalog,
   resolveCatalogAssetUrl,
 } from "../shared/software-manager/catalog-schema.mjs";
-import { verifyCatalogEnvelope } from "../desktop/software-manager/catalog-trust.mjs";
+import {
+  createTrustedCatalogService,
+  isTrustedCatalogService,
+  verifyCatalogEnvelope,
+} from "../desktop/software-manager/catalog-trust.mjs";
 
 const TEST_CATALOG_URL = "https://shanhaiyouling.com/codexbridge-install-test/component-catalog.json";
 
@@ -60,6 +64,19 @@ test("catalog accepts a signed test-origin manifest", () => {
   const signed = signedFixture({ components: [componentFixture()], skills: [skillFixture("documents")] });
   const result = verifyCatalogEnvelope({ ...signed, catalogUrl: TEST_CATALOG_URL });
   assert.equal(result.components[0].id, "chatgpt");
+});
+
+test("only a signature-verified catalog can issue a fixed-ID catalog service", () => {
+  const signed = signedFixture({ components: [componentFixture()], skills: [skillFixture("documents")] });
+  const verified = verifyCatalogEnvelope({ ...signed, catalogUrl: TEST_CATALOG_URL });
+  const service = createTrustedCatalogService(verified);
+  assert.equal(isTrustedCatalogService(service), true);
+  assert.equal(service.getComponent("chatgpt").assetUrl, "https://shanhaiyouling.com/codexbridge-test/packages/chatgpt-1.2.3.zip");
+  assert.equal(service.getSkill("documents").id, "documents");
+  assert.throws(() => service.getComponent("unknown"), /catalog_component_id_invalid/);
+  assert.throws(() => createTrustedCatalogService(parseCatalog({
+    schemaVersion: 1, components: [componentFixture()], skills: [],
+  })), /catalog_not_verified/);
 });
 
 test("catalog rejects a signature after one JSON byte changes", () => {

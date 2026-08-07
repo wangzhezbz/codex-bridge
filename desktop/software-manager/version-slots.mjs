@@ -1,9 +1,10 @@
 import path from "node:path";
 
+import { readInstallRootCapability } from "./path-policy.mjs";
 import { deleteAuthorizedTree } from "./safe-delete.mjs";
 
 const COMPONENT_IDS = new Set(["chatgpt", "v2rayn", "git"]);
-const COMPONENT_ROOT_NAMES = Object.freeze({ chatgpt: "ChatGPT", v2rayn: "V2RayN", git: "Git" });
+const COMPONENT_ROOT_NAMES = Object.freeze({ chatgpt: null, v2rayn: "V2RayN", git: "Git" });
 const SLOT_KEYS = ["current", "previous", "staging", "retiring"];
 const VERSION = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/u;
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
@@ -142,17 +143,29 @@ async function withOwnershipStoreLock(store, action) {
   }
 }
 
-function requireAuthorizedRoot(state, rootPath, componentId) {
+function installRootFor(rootPath, componentId) {
+  return componentId === "chatgpt" ? rootPath : path.win32.dirname(rootPath);
+}
+
+function rootMatchesInstallRoot(rootPath, componentId, installRoot) {
+  return componentId === "chatgpt"
+    ? rootPath === installRoot
+    : path.win32.dirname(rootPath) === installRoot
+      && rootPath === path.win32.join(installRoot, COMPONENT_ROOT_NAMES[componentId]);
+}
+
+function requireAuthorizedRoot(state, rootPath, componentId, { allowUnclaimed = false } = {}) {
+  if (allowUnclaimed && state?.installRoot === null) return installRootFor(rootPath, componentId);
   let installRoot;
   try {
     installRoot = canonicalRoot(state?.installRoot);
   } catch (error) {
     throw slotError("slot_root_not_owned", error);
   }
-  if (path.win32.dirname(rootPath) !== installRoot
-    || rootPath !== path.win32.join(installRoot, COMPONENT_ROOT_NAMES[componentId])) {
+  if (!rootMatchesInstallRoot(rootPath, componentId, installRoot)) {
     throw slotError("slot_root_not_owned");
   }
+  return installRoot;
 }
 
 function evidenceMatches(left, right) {
@@ -162,8 +175,8 @@ function evidenceMatches(left, right) {
     && sameIdentity(left.identity, right.identity);
 }
 
-function requireManagedState(state, componentId, rootPath, current, previous) {
-  requireAuthorizedRoot(state, rootPath, componentId);
+function requireManagedState(state, componentId, rootPath, current, previous, { allowUnclaimed = false } = {}) {
+  requireAuthorizedRoot(state, rootPath, componentId, { allowUnclaimed });
   const component = state?.components?.[componentId];
   const names = namesFor(componentId);
   if (current === null) {
@@ -192,6 +205,7 @@ function requireManagedState(state, componentId, rootPath, current, previous) {
 
 function ownershipSlice(state, componentId) {
   return {
+    installRoot: structuredClone(state.installRoot),
     component: state.components[componentId] === undefined
       ? null
       : structuredClone(state.components[componentId]),
@@ -242,9 +256,9 @@ function claimMatches(value, transaction, journalScope, lifecycles = ACTIVE_TRAN
   return sameJson(value, transactionClaim(transaction, journalScope, value.lifecycle));
 }
 
-function managedStateMatches(state, componentId, rootPath, current, previous) {
+function managedStateMatches(state, componentId, rootPath, current, previous, options) {
   try {
-    requireManagedState(state, componentId, rootPath, current, previous);
+    requireManagedState(state, componentId, rootPath, current, previous, options);
     return true;
   } catch {
     return false;
@@ -264,6 +278,7 @@ function expectedPostOwnership(snapshot) {
   const desired = desiredEvidence(snapshot);
   const before = snapshot.ownershipBefore;
   return {
+    installRoot: installRootFor(snapshot.rootPath, snapshot.componentId),
     component: {
       ...(isPlainRecord(before.component) ? structuredClone(before.component) : {}),
       installPath: snapshot.paths.current,
@@ -301,6 +316,7 @@ function expectedAbortOwnership(snapshot) {
 
 function applyOwnershipSlice(state, componentId, slice) {
   const next = structuredClone(state);
+  next.installRoot = structuredClone(slice.installRoot);
   if (slice.component === null) delete next.components[componentId];
   else next.components[componentId] = structuredClone(slice.component);
   next.rollback = withoutRollback(next, componentId);
@@ -313,7 +329,6 @@ function applyOwnershipSlice(state, componentId, slice) {
 }
 
 function requireRecoveryOwnershipState(state, snapshot, { allowAbort = false } = {}) {
-  requireAuthorizedRoot(state, snapshot.rootPath, snapshot.componentId);
   const slice = ownershipSlice(state, snapshot.componentId);
   const preMatches = sameJson(slice, snapshot.ownershipBefore);
   const desired = desiredEvidence(snapshot);
@@ -323,14 +338,11 @@ function requireRecoveryOwnershipState(state, snapshot, { allowAbort = false } =
   const abortPrevious = snapshot.mode === "promote"
     ? evidenceFromSnapshot(snapshot, "previous")
     : null;
+  const abortCurrent = evidenceFromSnapshot(snapshot, "current");
   const abortMatches = allowAbort && sameJson(slice, expectedAbortOwnership(snapshot))
-    && managedStateMatches(
-      state,
-      snapshot.componentId,
-      snapshot.rootPath,
-      evidenceFromSnapshot(snapshot, "current"),
-      abortPrevious,
-    );
+    && managedStateMatches(state, snapshot.componentId, snapshot.rootPath, abortCurrent, abortPrevious, {
+      allowUnclaimed: abortCurrent === null && snapshot.ownershipBefore.installRoot === null,
+    });
   if (!preMatches && !postMatches && !abortMatches) throw slotError("slot_recovery_ownership_mismatch");
   if (abortMatches) return "abort";
   return postMatches ? "post" : "pre";
@@ -415,7 +427,7 @@ export function planPeakBytes({ current, previous, incoming } = {}) {
   return total;
 }
 
-export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
+export function createVersionSlotManager({ fsApi, ownershipStore, journal, installRootCapability = null }) {
   if (!fsApi || typeof fsApi.openVersionRootNoFollow !== "function") {
     throw slotError("slot_no_follow_capability_required");
   }
@@ -433,6 +445,24 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
     throw slotError("slot_journal_required", error);
   }
   if (journalScope !== journalScope.toLowerCase()) throw slotError("slot_journal_required");
+  let authorizedInstallRoot = null;
+  if (installRootCapability !== null) {
+    try {
+      authorizedInstallRoot = readInstallRootCapability(installRootCapability);
+    } catch (error) {
+      throw slotError("slot_install_root_capability_invalid", error);
+    }
+  }
+
+  function requireManagerAuthorizedRoot(state, rootPath, componentId, { allowUnclaimed = false } = {}) {
+    if (state?.installRoot !== null) return requireAuthorizedRoot(state, rootPath, componentId);
+    const derived = installRootFor(rootPath, componentId);
+    if (!allowUnclaimed || authorizedInstallRoot === null
+      || derived.toLowerCase() !== authorizedInstallRoot.toLowerCase()) {
+      throw slotError("slot_root_not_owned");
+    }
+    return authorizedInstallRoot;
+  }
 
   async function requireNoPendingTransaction(state) {
     if (state?.activeTask !== null) throw slotError("slot_pending_transaction");
@@ -755,7 +785,9 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
 
   async function finishAbortedTransaction(snapshot) {
     const state = await ownershipStore.load();
-    requireAuthorizedRoot(state, snapshot.rootPath, snapshot.componentId);
+    requireAuthorizedRoot(state, snapshot.rootPath, snapshot.componentId, {
+      allowUnclaimed: snapshot.ownershipBefore.installRoot === null,
+    });
     const expectedPrevious = snapshot.mode === "promote"
       ? evidenceFromSnapshot(snapshot, "previous")
       : null;
@@ -896,7 +928,7 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
     const slots = namesFor(plan.componentId);
     const state = await ownershipStore.load();
     await requireNoPendingTransaction(state);
-    requireAuthorizedRoot(state, plan.rootPath, plan.componentId);
+    requireManagerAuthorizedRoot(state, plan.rootPath, plan.componentId, { allowUnclaimed: true });
     const root = await openRoot(plan.rootPath);
     let incoming;
     let current;
@@ -916,7 +948,9 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
       current = openedCurrent?.evidence ?? null;
       previous = openedPrevious?.evidence ?? null;
       if (await root.openSlotNoFollow(slots.retiring) !== null) throw slotError("slot_recovery_required");
-      requireManagedState(state, plan.componentId, plan.rootPath, current, previous);
+      requireManagedState(state, plan.componentId, plan.rootPath, current, previous, {
+        allowUnclaimed: current === null && state.installRoot === null,
+      });
       incoming = validateEvidence({
         schemaVersion: 2,
         componentId: plan.componentId,
@@ -1032,6 +1066,9 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal }) {
     await prepareRecoveryClaim(transaction.snapshot, phases);
     const hasAbortPhase = [...phases].some((phase) => phase.startsWith("abort_"));
     const state = await ownershipStore.load();
+    requireManagerAuthorizedRoot(state, transaction.snapshot.rootPath, transaction.snapshot.componentId, {
+      allowUnclaimed: transaction.snapshot.ownershipBefore.installRoot === null,
+    });
     requireRecoveryOwnershipState(state, transaction.snapshot, {
       allowAbort: hasAbortPhase,
     });

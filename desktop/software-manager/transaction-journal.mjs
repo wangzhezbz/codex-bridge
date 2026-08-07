@@ -123,10 +123,17 @@ function sameIdentity(left, right) {
 function normalizeOwnershipBefore(value, {
   componentId, rootPath, paths, versions, identities, integrities,
 }) {
-  if (!hasExactKeys(value, ["component", "rollback", "activeTask", "lastTask"])) {
+  if (!hasExactKeys(value, ["installRoot", "component", "rollback", "activeTask", "lastTask"])) {
     throw journalError("transaction_record_invalid");
   }
   const normalized = normalizeJson(value);
+  if (!(normalized.installRoot === null || typeof normalized.installRoot === "string")) {
+    throw journalError("transaction_record_invalid");
+  }
+  const expectedInstallRoot = componentId === "chatgpt" ? rootPath : path.win32.dirname(rootPath);
+  if (normalized.installRoot !== null && normalized.installRoot !== expectedInstallRoot) {
+    throw journalError("transaction_record_invalid");
+  }
   if (!(normalized.activeTask === null || isPlainRecord(normalized.activeTask))
     || !(normalized.lastTask === null || isPlainRecord(normalized.lastTask))) {
     throw journalError("transaction_record_invalid");
@@ -134,6 +141,7 @@ function normalizeOwnershipBefore(value, {
   if (versions.current === null) {
     if (normalized.component !== null) throw journalError("transaction_record_invalid");
   } else if (!isPlainRecord(normalized.component)
+    || normalized.installRoot === null
     || normalized.component.installPath !== paths.current
     || normalized.component.version !== versions.current
     || normalized.component.treeDigest !== integrities.current.treeDigest

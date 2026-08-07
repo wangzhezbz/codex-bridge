@@ -3,8 +3,13 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  authorizeDesktopPath,
+  authorizeInstallRoot,
+  authorizeSkillsRoot,
   isOwnedPath,
   isValidOwnershipState,
+  readFixedDirectoryCapability,
+  readInstallRootCapability,
   resolveSkillTarget,
   validateInstallRoot,
 } from "../desktop/software-manager/path-policy.mjs";
@@ -54,6 +59,38 @@ test("accepts a normalized writable application directory", async () => {
     access: allowAccess,
   });
   assert.deepEqual(result, { ok: true, path: "C:\\Tools\\CodexBridge" });
+});
+
+test("main-process path authorities issue opaque fixed roots only after canonical no-follow validation", async () => {
+  const directoryStat = { isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false };
+  const install = await authorizeInstallRoot({
+    candidate: "D:\\CBApps", env: fixtureEnv(), maxRelativePath: 180, access: allowAccess,
+    realpath: async (value) => value, lstat: async () => directoryStat,
+  });
+  const skills = await authorizeSkillsRoot({
+    candidate: CANONICAL_SKILLS_ROOT, realpath: async (value) => value, lstat: async () => directoryStat,
+  });
+  const desktop = await authorizeDesktopPath({
+    getDesktopPath: () => "C:\\Users\\me\\Desktop",
+    realpath: async (value) => value, lstat: async () => directoryStat,
+  });
+  assert.equal(readInstallRootCapability(install), "D:\\CBApps");
+  assert.deepEqual(readFixedDirectoryCapability(skills), { kind: "skills", path: CANONICAL_SKILLS_ROOT });
+  assert.deepEqual(readFixedDirectoryCapability(desktop), { kind: "desktop", path: "C:\\Users\\me\\Desktop" });
+  assert.throws(() => readInstallRootCapability({ path: "D:\\CBApps" }), /capability/);
+});
+
+test("fixed path authorities reject reparse roots and a renderer-provided desktop replacement", async () => {
+  const reparse = { isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => true };
+  await assert.rejects(authorizeSkillsRoot({
+    candidate: CANONICAL_SKILLS_ROOT, realpath: async (value) => value, lstat: async () => reparse,
+  }), /reparse/);
+  await assert.rejects(authorizeDesktopPath({
+    getDesktopPath: () => "C:\\Users\\me\\Desktop\\..\\Documents",
+    realpath: async (value) => value, lstat: async () => ({
+      isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false,
+    }),
+  }), /noncanonical/);
 });
 
 for (const candidate of [
