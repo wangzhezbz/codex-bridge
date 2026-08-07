@@ -6,6 +6,7 @@ const VERSION = /^\d+(?:\.\d+){0,3}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
 const LEASE_NONCE = /^[a-f0-9]{32}$/u;
 const SHORTCUT_CREATION_ID = /^[a-f0-9]{32}$/u;
+const SKILL_SWAP_ID = /^[a-f0-9]{32}$/u;
 const COMPONENT = new Set(["chatgpt", "v2rayn"]);
 const GIT_TASK = new Set(["git-install", "git-external-install", "git-install-cleanup", "git-rollback", "git-rollback-cleanup", "git-uninstall"]);
 const GIT_REGISTRY_KEYS = new Set([
@@ -183,9 +184,10 @@ function validSkill(task, skillsRoot) {
     return exact(task, ["kind", "taskId", "skillId", "skillsRoot", "target"]);
   }
   if (task.kind !== "skill-replace" || !["reserved", "applied"].includes(task.phase)) return false;
-  const common = ["kind", "phase", "taskId", "skillId", "skillsRoot", "target", "version", "packageSha256", "skillMdSha256", "treeDigest", "manifestDigest", "previousEvidence"];
+  const common = ["kind", "phase", "taskId", "swapId", "skillId", "skillsRoot", "target", "version", "packageSha256", "skillMdSha256", "treeDigest", "manifestDigest", "previousEvidence"];
   const keys = task.phase === "applied" ? [...common, "completionProof", "appliedEvidence"] : common;
-  return exact(task, keys) && VERSION.test(task.version) && SHA256.test(task.packageSha256)
+  return exact(task, keys) && SKILL_SWAP_ID.test(task.swapId ?? "")
+    && VERSION.test(task.version) && SHA256.test(task.packageSha256)
     && SHA256.test(task.skillMdSha256) && SHA256.test(task.treeDigest) && SHA256.test(task.manifestDigest)
     && skillEvidence(task.previousEvidence, true)
     && (task.phase === "reserved" || (json(task.completionProof) && skillEvidence(task.appliedEvidence)));

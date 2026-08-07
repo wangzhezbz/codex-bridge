@@ -472,6 +472,50 @@ test("store saves and loads Skill ownership bound to its injected canonical Skil
   assert.deepEqual(await store.load(), committed(next, 1));
 });
 
+test("Skill replacement active task requires one strict persisted 128-bit swapId", async () => {
+  const target = `${CANONICAL_SKILLS_ROOT}\\documents`;
+  const baseTask = {
+    kind: "skill-replace",
+    phase: "reserved",
+    taskId: "skill-swap",
+    skillId: "documents",
+    skillsRoot: CANONICAL_SKILLS_ROOT,
+    target,
+    version: "1.0.0",
+    packageSha256: "a".repeat(64),
+    skillMdSha256: "b".repeat(64),
+    treeDigest: "c".repeat(64),
+    manifestDigest: "d".repeat(64),
+    previousEvidence: { kind: "absent" },
+  };
+
+  const valid = { ...state(), activeTask: { ...baseTask, swapId: "e".repeat(32) } };
+  const validMemory = createMemoryStateFs();
+  const validStore = createOwnershipStore({
+    stateDir: path.resolve("skill-swap-valid"),
+    fsApi: validMemory.fsApi,
+    skillsRoot: CANONICAL_SKILLS_ROOT,
+  });
+  await validStore.save(valid);
+  assert.equal((await validStore.load()).activeTask.swapId, "e".repeat(32));
+
+  for (const [label, activeTask] of [
+    ["missing", baseTask],
+    ["short", { ...baseTask, swapId: "e".repeat(31) }],
+    ["uppercase", { ...baseTask, swapId: "E".repeat(32) }],
+    ["extra", { ...baseTask, swapId: "e".repeat(32), surprise: true }],
+  ]) {
+    const memory = createMemoryStateFs();
+    const store = createOwnershipStore({
+      stateDir: path.resolve(`skill-swap-${label}`),
+      fsApi: memory.fsApi,
+      skillsRoot: CANONICAL_SKILLS_ROOT,
+    });
+    await assert.rejects(store.save({ ...state(), activeTask }), { code: "ownership_state_invalid" });
+    assert.equal(memory.calls.length, 0);
+  }
+});
+
 test("store fails closed for Skill ownership without an injected canonical Skills root", async () => {
   const withSkill = {
     ...state(),

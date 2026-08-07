@@ -80,7 +80,9 @@ function relativeFile(root, relativePath) {
 function skillInstallPeakRelativePath({ taskId, entry }) {
   const candidates = [
     path.win32.join("downloads", `skill-${entry.id}-${entry.version}.zip`),
-    ...entry.files.map((file) => path.win32.join("staging", "skills", taskId, entry.id, ...file.split("/"))),
+    ...entry.files.map((file) => path.win32.join(
+      "staging", `task-${taskId}`, `skill-${entry.id}.prepare`, ...file.split("/"),
+    )),
   ];
   return Math.max(...candidates.map((candidate) => candidate.length));
 }
@@ -196,6 +198,7 @@ export function createComponentAdapters({
   windowsHost,
   componentFiles,
   skillFiles,
+  installerWorkspace,
   gitIdentityCapabilities,
   resolveSkillTarget,
   skillPathAccess = {},
@@ -233,6 +236,10 @@ export function createComponentAdapters({
   const finalizeSkillReplacement = requireMethod(skillFiles, "finalizeReplacement", "skill_completion_capability_required");
   const verifySkillCompletionProof = requireMethod(skillFiles, "verifyCompletionProof", "skill_completion_capability_required");
   const recoverSkillCompletionProof = requireMethod(skillFiles, "recoverCompletionProof", "skill_completion_capability_required");
+  const reconcileSkillReplacement = requireMethod(skillFiles, "reconcileReplacement", "skill_reconcile_capability_required");
+  const prepareSkillStaging = requireMethod(installerWorkspace, "prepareSkillStaging", "skill_workspace_required");
+  const cleanupAbandonedPrepare = requireMethod(installerWorkspace, "cleanupAbandonedPrepare", "skill_workspace_required");
+  const cleanupSkillPackage = requireMethod(installerWorkspace, "cleanupComponentPackage", "skill_workspace_required");
   const planShortcut = requireMethod(windowsHost, "planShortcut", "shortcut_plan_capability_required");
   const createShortcut = requireMethod(windowsHost, "createShortcut", "shortcut_create_capability_required");
   const inspectRecordedShortcut = requireMethod(windowsHost, "inspectRecordedShortcut", "shortcut_recovery_capability_required");
@@ -433,8 +440,20 @@ export function createComponentAdapters({
     if (task.kind === "skill-replace") {
       if (!["reserved", "applied"].includes(task.phase) || !SHA256.test(task.packageSha256 ?? "")
         || !SHA256.test(task.skillMdSha256 ?? "") || !SHA256.test(task.treeDigest ?? "")
-        || !SHA256.test(task.manifestDigest ?? "")) throw adapterError("skill_recovery_record_invalid");
+        || !SHA256.test(task.manifestDigest ?? "") || !/^[a-f0-9]{32}$/u.test(task.swapId ?? "")) {
+        throw adapterError("skill_recovery_record_invalid");
+      }
       const previousEvidence = validatePreviousSkillEvidence(task.previousEvidence);
+      await reconcileSkillReplacement({
+        taskId: task.taskId,
+        swapId: task.swapId,
+        target,
+        expected: {
+          treeDigest: task.treeDigest,
+          manifestDigest: task.manifestDigest,
+          skillMdSha256: task.skillMdSha256,
+        },
+      });
       const inspectedRaw = await inspectSkillExact({ target, authorizedRoot: skillsRoot });
       const inspected = inspectedRaw?.kind === "absent"
         ? validatePreviousSkillEvidence(inspectedRaw)
@@ -450,7 +469,7 @@ export function createComponentAdapters({
       if (task.phase === "reserved") {
         if (!skillEvidenceMatchesExpected(inspected, task)) throw adapterError("skill_recovery_content_mismatch");
         const recovered = await recoverSkillCompletionProof({
-          target, taskId: task.taskId,
+          target, taskId: task.taskId, swapId: task.swapId,
           expected: {
             treeDigest: task.treeDigest, manifestDigest: task.manifestDigest,
             skillMdSha256: task.skillMdSha256,
@@ -466,7 +485,7 @@ export function createComponentAdapters({
         await saveState(next);
       }
       const verified = validateSkillTreeEvidence(await verifySkillCompletionProof({
-        completionProof, target, taskId: task.taskId,
+        completionProof, target, taskId: task.taskId, swapId: task.swapId,
         expected: {
           treeDigest: task.treeDigest, manifestDigest: task.manifestDigest,
           skillMdSha256: task.skillMdSha256,
@@ -1537,13 +1556,20 @@ export function createComponentAdapters({
     for (const id of ids) {
       let claim = null;
       let operationLease = null;
+      let stagingReceipt = null;
+      let downloadRecord = null;
+      let preparedVerified = false;
       try {
         const entry = trustedSkill(id);
         claim = { kind: "skill-prepare", taskId, skillId: entry.id, version: entry.version };
         const reservation = await reservePrepareClaim(recoverSkillTransaction, claim);
         ({ claim, lease: operationLease } = reservation);
         const maxRelativePath = skillInstallPeakRelativePath({ taskId, entry });
-        const destination = path.win32.join(installRoot, "staging", "skills", taskId, entry.id);
+        stagingReceipt = await prepareSkillStaging({ taskId, skillId: entry.id });
+        const destination = path.win32.join(installRoot, "staging", `task-${taskId}`, `skill-${entry.id}.prepare`);
+        if (!isRecord(stagingReceipt) || stagingReceipt.path !== destination) {
+          throw adapterError("skill_staging_receipt_invalid");
+        }
         const archivePath = path.win32.join(installRoot, "downloads", `skill-${entry.id}-${entry.version}.zip`);
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
         await revalidateFixedDirectoryCapability(skillsRootCapability);
@@ -1552,24 +1578,34 @@ export function createComponentAdapters({
           signal: context.signal, onProgress: typeof context.onProgress === "function" ? context.onProgress : () => {},
         });
         if (!isRecord(downloaded) || downloaded.path !== archivePath
-          || downloaded.size !== entry.size || downloaded.sha256 !== entry.sha256) {
+          || downloaded.size !== entry.size || downloaded.sha256 !== entry.sha256
+          || downloaded.packageProof === null || typeof downloaded.packageProof !== "object"
+          || downloaded.downloadRecord === null || typeof downloaded.downloadRecord !== "object") {
           throw adapterError("component_download_evidence_invalid");
         }
+        downloadRecord = downloaded.downloadRecord;
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
         await revalidateFixedDirectoryCapability(skillsRootCapability);
         await extractArchive({ format: "zip", archivePath, destination, signal: context.signal });
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
         await revalidateFixedDirectoryCapability(skillsRootCapability);
         const verified = await verifyPreparedSkill({
-          rootPath: destination, requiredFiles: entry.files.map((file) => relativeFile(destination, file)),
-          expectedPackageSha256: entry.sha256,
+          skillId: entry.id,
+          expectedVersion: entry.version,
+          stagingReceipt,
+          packageProof: downloaded.packageProof,
         });
         const receipt = validateReceipt(verified, "skill_verification_receipt_invalid");
         if (!SHA256.test(verified.skillMdSha256 ?? "")) throw adapterError("skill_md_hash_invalid");
+        preparedVerified = true;
         try { await clearPrepareClaim(claim, operationLease); } finally { claim = null; operationLease = null; }
         pending.set(id, Object.freeze({ entry, destination, maxRelativePath, skillMdSha256: verified.skillMdSha256, ...receipt }));
         results.push(result(id, "prepare", "succeeded", { versionAfter: entry.version, message: "skill_prepared" }));
       } catch (error) {
+        if (!preparedVerified) {
+          if (downloadRecord) await cleanupSkillPackage(downloadRecord).catch(() => {});
+          if (stagingReceipt) await cleanupAbandonedPrepare(stagingReceipt).catch(() => {});
+        }
         if (claim) await clearPrepareClaim(claim, operationLease).catch(() => {});
         results.push(await failed(typeof id === "string" ? id : "skills", "prepare", error));
       }
@@ -1604,8 +1640,9 @@ export function createComponentAdapters({
           ? validatePreviousSkillEvidence(previousRaw)
           : validateSkillTreeEvidence(previousRaw, "skill_previous_evidence_invalid");
         const reserved = structuredClone(state);
+        const swapId = randomBytes(16).toString("hex");
         reserved.activeTask = {
-          kind: "skill-replace", phase: "reserved", taskId: context.taskId, skillId: id, skillsRoot, target,
+          kind: "skill-replace", phase: "reserved", taskId: context.taskId, swapId, skillId: id, skillsRoot, target,
           version: prepared.entry.version, packageSha256: prepared.entry.sha256,
           skillMdSha256: prepared.skillMdSha256, treeDigest: prepared.treeDigest,
           manifestDigest: prepared.manifestDigest, previousEvidence,
@@ -1616,10 +1653,10 @@ export function createComponentAdapters({
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath: prepared.maxRelativePath });
         await revalidateFixedDirectoryCapability(skillsRootCapability);
         const replacement = await replaceSkillExact({
-          source: prepared.destination, target, authorizedRoot: skillsRoot, backup: false,
+          taskId: context.taskId, swapId, source: prepared.destination, target, authorizedRoot: skillsRoot, backup: false,
           verificationReceipt: prepared.verificationReceipt,
           treeDigest: prepared.treeDigest, manifestDigest: prepared.manifestDigest,
-          skillMdSha256: prepared.skillMdSha256, requiredFiles: prepared.entry.files,
+          skillMdSha256: prepared.skillMdSha256, requiredFiles: prepared.entry.files, previousEvidence,
         });
         if (!isRecord(replacement) || replacement.completionReceipt === undefined) {
           throw adapterError("skill_completion_receipt_invalid");
@@ -1627,7 +1664,7 @@ export function createComponentAdapters({
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath: prepared.maxRelativePath });
         await revalidateFixedDirectoryCapability(skillsRootCapability);
         const completed = await finalizeSkillReplacement({
-          completionReceipt: replacement.completionReceipt, target, taskId: context.taskId,
+          completionReceipt: replacement.completionReceipt, target, taskId: context.taskId, swapId,
           expected: {
             treeDigest: prepared.treeDigest, manifestDigest: prepared.manifestDigest,
             skillMdSha256: prepared.skillMdSha256,
@@ -1739,7 +1776,14 @@ export function createComponentAdapters({
         const reserved = structuredClone(state);
         reserved.activeTask = { kind: "skill-uninstall", taskId: `uninstall-${id}`, skillId: id, skillsRoot, target };
         await saveState(reserved);
-        await deleteSkillExact({ target, authorizedRoot: skillsRoot });
+        const expectedEvidence = validateSkillTreeEvidence({
+          kind: "directory",
+          identity: record.identity,
+          treeDigest: record.treeDigest,
+          manifestDigest: record.manifestDigest,
+          skillMdSha256: record.skillMdSha256,
+        }, "skill_owned_evidence_invalid");
+        await deleteSkillExact({ target, authorizedRoot: skillsRoot, expectedEvidence });
         const next = structuredClone(reserved);
         delete next.skills[id]; next.activeTask = null;
         await saveState(next).catch(() => {});

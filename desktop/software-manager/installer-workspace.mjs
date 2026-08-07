@@ -6,13 +6,14 @@ import {
 } from "../../shared/software-manager/catalog-schema.mjs";
 import { consumePreparedDownloadVerification } from "./download-manager.mjs";
 import { revalidateInstallRootCapability } from "./path-policy.mjs";
+import { isTrustedCatalogService } from "./catalog-trust.mjs";
 
 const COMPONENT_EXTENSIONS = Object.freeze({
   chatgpt: ".zip",
   v2rayn: ".7z",
   git: ".exe",
 });
-const TASK_ID = /^[a-z0-9][a-z0-9-]{0,63}$/u;
+const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
 const SKILL_ID = /^[a-z0-9][a-z0-9-]{0,63}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
 
@@ -89,6 +90,7 @@ function requireSession(value) {
     "openFileChildNoFollow",
     "inspectIssuedChildNoFollow",
     "sealIssuedFileNoFollow",
+    "sealIssuedSkillTreeNoFollow",
     "renameIssuedChildNoReplace",
     "deleteIssuedChildNoFollow",
     "close",
@@ -104,13 +106,14 @@ function makeReceipt(fields) {
 }
 
 export function createInstallerWorkspace({
-  fileCapabilities, installRootCapability, downloadManager,
+  fileCapabilities, installRootCapability, downloadManager, catalogService,
 } = {}) {
   const files = validateFileCapabilities(fileCapabilities);
   const downloads = validateDownloadManager(downloadManager);
   if (!installRootCapability || typeof installRootCapability !== "object") {
     throw workspaceError("install_root_capability_invalid");
   }
+  if (!isTrustedCatalogService(catalogService)) throw workspaceError("trusted_catalog_service_required");
   const authorities = new WeakMap();
   const promotedPackageProofs = new WeakMap();
   const pending = new Map();
@@ -228,7 +231,7 @@ export function createInstallerWorkspace({
       authority.state = "issued";
       const packageProof = Object.freeze(Object.create(null));
       promotedPackageProofs.set(packageProof, { state: "issued", authority });
-      return Object.freeze({ path: record.path, packageProof });
+      return Object.freeze({ path: record.path, packageProof, downloadRecord: record });
     } catch (error) {
       if (isOccupied(error)) {
         authority.state = "issued";
@@ -239,18 +242,16 @@ export function createInstallerWorkspace({
     }
   }
 
-  async function prepareDownloadFile(raw) {
-    const request = validateDownload(raw);
-    const finalName = `${request.componentId}-${request.version}${request.extension}`;
+  async function prepareDownloadRequest(request, { finalName, keyPrefix, publicFields }) {
     const partName = `${finalName}.part`;
     const relativePath = path.win32.join("downloads", partName);
     const rootPath = await revalidateInstallRootCapability(installRootCapability, {
       maxRelativePath: relativePath.length,
     });
     const finalPath = path.win32.join(rootPath, "downloads", finalName);
-    const key = `download:${finalPath.normalize("NFC").toLowerCase()}`;
+    const key = `${keyPrefix}:${finalPath.normalize("NFC").toLowerCase()}`;
     const binding = [
-      request.componentId, request.version, request.extension,
+      ...Object.values(publicFields),
       String(request.size), request.sha256,
     ].join("\0");
     return prepareOnce(key, async () => {
@@ -265,9 +266,7 @@ export function createInstallerWorkspace({
         let record;
         record = makeReceipt({
           kind: "download",
-          componentId: request.componentId,
-          version: request.version,
-          extension: request.extension,
+          ...publicFields,
           size: request.size,
           sha256: request.sha256,
           path: finalPath,
@@ -286,6 +285,7 @@ export function createInstallerWorkspace({
           partPath: record.partPath,
           size: request.size,
           sha256: request.sha256,
+          ...publicFields,
           relativePath,
         });
         return record;
@@ -296,6 +296,44 @@ export function createInstallerWorkspace({
         throw error;
       }
     }, binding);
+  }
+
+  async function prepareDownloadFile(raw) {
+    const request = validateDownload(raw);
+    return prepareDownloadRequest(request, {
+      finalName: `${request.componentId}-${request.version}${request.extension}`,
+      keyPrefix: "download",
+      publicFields: {
+        componentId: request.componentId,
+        version: request.version,
+        extension: request.extension,
+      },
+    });
+  }
+
+  async function prepareSkillDownloadFile(raw = {}) {
+    const keys = ["skillId", "version", "size", "sha256"];
+    if (!raw || Object.getPrototypeOf(raw) !== Object.prototype
+      || Object.keys(raw).sort().join("\0") !== keys.sort().join("\0")) {
+      throw workspaceError("workspace_skill_download_invalid");
+    }
+    const skillId = validateSkill(raw.skillId);
+    const entry = catalogService.getSkill(skillId);
+    if (raw.version !== entry.version || raw.size !== entry.size || raw.sha256 !== entry.sha256) {
+      throw workspaceError("workspace_skill_catalog_mismatch");
+    }
+    return prepareDownloadRequest({
+      size: entry.size,
+      sha256: entry.sha256,
+    }, {
+      finalName: `skill-${entry.id}-${entry.version}.zip`,
+      keyPrefix: "skill-download",
+      publicFields: {
+        skillId: entry.id,
+        version: entry.version,
+        extension: ".zip",
+      },
+    });
   }
 
   async function prepareStaging({ kind, key, taskId, leafName, fields }) {
@@ -321,6 +359,7 @@ export function createInstallerWorkspace({
         kind,
         state: "issued",
         key,
+        ...fields,
         session,
         taskReceipt: task,
         leafReceipt: leaf,
@@ -422,6 +461,66 @@ export function createInstallerWorkspace({
     return true;
   }
 
+  async function sealSkillStaging(record, packageProof, context = {}) {
+    const authority = claimRecord(record, "skill-staging");
+    const keys = ["skillId", "expectedVersion"];
+    if (!context || Object.getPrototypeOf(context) !== Object.prototype
+      || Object.keys(context).sort().join("\0") !== keys.sort().join("\0")) {
+      authority.state = "issued";
+      throw workspaceError("workspace_skill_evidence_invalid");
+    }
+    let entry;
+    try {
+      entry = catalogService.getSkill(context.skillId);
+    } catch (error) {
+      authority.state = "issued";
+      throw error;
+    }
+    const proofRecord = promotedPackageProofs.get(packageProof);
+    if (authority.skillId !== entry.id || context.expectedVersion !== entry.version
+      || !proofRecord || proofRecord.state !== "issued"
+      || proofRecord.authority.skillId !== entry.id || proofRecord.authority.version !== entry.version
+      || proofRecord.authority.size !== entry.size || proofRecord.authority.sha256 !== entry.sha256) {
+      authority.state = "issued";
+      throw workspaceError("workspace_skill_package_proof_mismatch");
+    }
+    proofRecord.state = "busy";
+    let packageAuthoritySettled = false;
+    let result;
+    let primaryError = null;
+    try {
+      await revalidateInstallRootCapability(installRootCapability, {
+        maxRelativePath: authority.relativePath.length,
+      });
+      await proofRecord.authority.session.inspectIssuedChildNoFollow(proofRecord.authority.fileReceipt);
+      result = await authority.session.sealIssuedSkillTreeNoFollow(
+        authority.leafReceipt,
+        { requiredFiles: [...entry.files], packageSha256: entry.sha256 },
+      );
+      if (!result || result.sourceProof === null || typeof result.sourceProof !== "object"
+        || !result.evidence || result.evidence.kind !== "directory") {
+        throw workspaceError("workspace_skill_source_proof_invalid");
+      }
+      let packageCleanupError = null;
+      try {
+        await proofRecord.authority.session.deleteIssuedChildNoFollow(proofRecord.authority.fileReceipt);
+      } catch (error) {
+        packageCleanupError = error;
+      }
+      pending.delete(proofRecord.authority.key);
+      await closeWithPrimary(proofRecord.authority, packageCleanupError);
+      packageAuthoritySettled = true;
+      proofRecord.state = "consumed";
+    } catch (error) {
+      if (proofRecord.authority.state === "consumed") packageAuthoritySettled = true;
+      proofRecord.state = packageAuthoritySettled ? "consumed" : "issued";
+      primaryError = error;
+    }
+    pending.delete(authority.key);
+    await closeWithPrimary(authority, primaryError);
+    return Object.freeze({ sourceProof: result.sourceProof, evidence: structuredClone(result.evidence) });
+  }
+
   async function consumePromotedPackageProof(proof, expected) {
     const proofRecord = promotedPackageProofs.get(proof);
     if (!proofRecord) throw workspaceError("workspace_package_proof_invalid");
@@ -449,10 +548,12 @@ export function createInstallerWorkspace({
 
   return Object.freeze({
     prepareDownloadFile,
+    prepareSkillDownloadFile,
     prepareComponentStaging,
     prepareSkillStaging,
     cleanupAbandonedPrepare,
     cleanupComponentPackage,
+    sealSkillStaging,
     consumePromotedPackageProof,
   });
 }

@@ -10,7 +10,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { deleteAuthorizedTree } from "../desktop/software-manager/safe-delete.mjs";
-import { authorizeInstallRoot } from "../desktop/software-manager/path-policy.mjs";
+import { authorizeInstallRoot, authorizeSkillsRoot } from "../desktop/software-manager/path-policy.mjs";
 import { createWin32FileApi } from "../desktop/software-manager/win32-file-api.mjs";
 import { createWindowsFileCapabilities } from "../desktop/software-manager/windows-file-capabilities.mjs";
 import { MAX_SOFTWARE_PACKAGE_BYTES } from "../shared/software-manager/catalog-schema.mjs";
@@ -255,6 +255,17 @@ async function installRootAuthority(candidate) {
     realpath: async (value) => value,
     lstat: async () => ({
       dev: 1, ino: candidate.toLowerCase() === "d:\\cbapps" ? 1 : 2,
+      isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false,
+    }),
+  });
+}
+
+async function skillsRootAuthority(candidate = "C:\\Users\\me\\.codex\\skills") {
+  return authorizeSkillsRoot({
+    candidate,
+    realpath: async (value) => value,
+    lstat: async () => ({
+      dev: 2, ino: 3,
       isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false,
     }),
   });
@@ -853,6 +864,101 @@ test("installer workspace capability issues exact direct children and mutates on
   await workspace.close();
   assert.equal(fake.handles.size, 0);
   await assert.rejects(workspace.inspectIssuedChildNoFollow(downloads), /capability_closed/u);
+});
+
+test("Skill source proof copies across roots then swaps only held direct children inside Skills root", async () => {
+  const skillMd = Buffer.from("skill");
+  const reference = Buffer.from("reference");
+  const fileEntries = [
+    { path: "reference.md", size: reference.length, directory: false, sha256: createHash("sha256").update(reference).digest("hex") },
+    { path: "SKILL.md", size: skillMd.length, directory: false, sha256: createHash("sha256").update(skillMd).digest("hex") },
+  ].sort((left, right) => left.path.localeCompare(right.path, "en"));
+  const manifest = fileEntries.map(({ path: entryPath, size, directory }) => ({ path: entryPath, size, directory }));
+  const expected = {
+    requiredFiles: ["SKILL.md", "reference.md"],
+    packageSha256: "9".repeat(64),
+    treeDigest: createHash("sha256").update(JSON.stringify(fileEntries)).digest("hex"),
+    manifestDigest: createHash("sha256").update(JSON.stringify(manifest)).digest("hex"),
+    skillMdSha256: createHash("sha256").update(skillMd).digest("hex"),
+  };
+  const source = "D:\\CBApps\\staging\\task-skill-task\\skill-documents.prepare";
+  const skillsRoot = "C:\\Users\\me\\.codex\\skills";
+  const fake = createFakeNative([
+    { path: "D:\\CBApps" },
+    { path: "D:\\CBApps\\staging" },
+    { path: "D:\\CBApps\\staging\\task-skill-task" },
+    { path: source },
+    { path: `${source}\\SKILL.md`, kind: "file", data: skillMd },
+    { path: `${source}\\reference.md`, kind: "file", data: reference },
+    { path: skillsRoot },
+  ]);
+  const api = capabilities(fake);
+  const installRootCapability = await installRootAuthority("D:\\CBApps");
+  const skillsRootCapability = await skillsRootAuthority(skillsRoot);
+  const workspace = await api.openInstallerWorkspaceRootNoFollow(installRootCapability, { maxRelativePath: 100 });
+  const staging = await workspace.openDirectoryChildNoFollow(workspace.root, "staging", { role: "anchor" });
+  const task = await workspace.openDirectoryChildNoFollow(staging, "task-skill-task", { role: "deletable" });
+  const leaf = await workspace.openDirectoryChildNoFollow(task, "skill-documents.prepare", { role: "deletable" });
+  const sealed = await workspace.sealIssuedSkillTreeNoFollow(leaf, {
+    requiredFiles: expected.requiredFiles,
+    packageSha256: expected.packageSha256,
+  });
+  assert.deepEqual(sealed.evidence, {
+    kind: "directory",
+    identity: fake.get(source).identity,
+    treeDigest: expected.treeDigest,
+    manifestDigest: expected.manifestDigest,
+    skillMdSha256: expected.skillMdSha256,
+  });
+  await workspace.close();
+  const verified = await api.verifyPreparedSkillNoFollow({
+    sourceProof: sealed.sourceProof,
+    installRootCapability,
+    requiredFiles: expected.requiredFiles,
+    expectedPackageSha256: expected.packageSha256,
+  });
+  assert.deepEqual(verified.evidence, {
+    kind: "directory",
+    identity: fake.get(source).identity,
+    treeDigest: expected.treeDigest,
+    manifestDigest: expected.manifestDigest,
+    skillMdSha256: expected.skillMdSha256,
+  });
+
+  const swap = await api.openSkillRootNoFollow({ installRootCapability, skillsRootCapability });
+  const staged = await swap.stagePreparedTreeNoFollow({
+    sourceProof: verified.verificationReceipt,
+    skillId: "documents",
+    swapId: "1".repeat(32),
+    expected,
+  });
+  assert.equal(staged.treeDigest, expected.treeDigest);
+  const published = await swap.renameDirectChildNoReplace({
+    from: { kind: "prepared", skillId: "documents", swapId: "1".repeat(32) },
+    to: { kind: "target", skillId: "documents" },
+    expectedIdentity: staged.identity,
+  });
+  assert.deepEqual(published, staged);
+  assert.equal(fake.get(`${skillsRoot}\\documents\\SKILL.md`).data.toString(), "skill");
+  assert.equal(fake.get(source)?.path, source, "cross-root source must be copied, never renamed");
+  const recovered = await swap.recoverPreparedTreeNoFollow({
+    taskId: "skill-task",
+    sourceIdentity: fake.get(source).identity,
+    skillId: "documents",
+    swapId: "2".repeat(32),
+    expected,
+  });
+  assert.equal(recovered.treeDigest, expected.treeDigest);
+  await assert.rejects(swap.recoverPreparedTreeNoFollow({
+    taskId: "skill-task",
+    sourcePath: source,
+    sourceIdentity: fake.get(source).identity,
+    skillId: "documents",
+    swapId: "3".repeat(32),
+    expected,
+  }), /skill_recovery_request_invalid/u);
+  await swap.close();
+  assert.equal(fake.handles.size, 0);
 });
 
 test("installer workspace pins writable parts, seals signed bytes in chunks, and renames only sealed files", async () => {

@@ -3,7 +3,11 @@ import path from "node:path";
 import { Writable } from "node:stream";
 
 import { MAX_SOFTWARE_PACKAGE_BYTES } from "../../shared/software-manager/catalog-schema.mjs";
-import { revalidateInstallRootCapability } from "./path-policy.mjs";
+import {
+  readFixedDirectoryCapability,
+  revalidateFixedDirectoryCapability,
+  revalidateInstallRootCapability,
+} from "./path-policy.mjs";
 
 const MAX_DEPTH = 64;
 const MAX_ENTRIES = 4_096;
@@ -339,6 +343,86 @@ export function createWindowsFileCapabilities({
     throw capabilityError("windows_file_adapter_required");
   }
   const verificationReceipts = new WeakMap();
+  const skillSourceProofs = new WeakMap();
+
+  async function scanSkillTree(rootRecord, requiredFiles) {
+    const entries = [];
+    const files = [];
+    let count = 0;
+    let total = 0;
+    async function names(record) {
+      const result = [];
+      for await (const entry of nativeApi.enumerateDirectory(record.handle, { limit: MAX_ENTRIES - count })) {
+        if (!entry || entry.reparse === true) throw capabilityError("windows_reparse_point_rejected");
+        result.push(validateChildName(entry.name));
+      }
+      return result.sort((left, right) => left.localeCompare(right, "en"));
+    }
+    async function walk(record, segments, depth) {
+      if (depth > MAX_DEPTH) throw capabilityError("skill_tree_depth_exceeded");
+      for (const name of await names(record)) {
+        count += 1;
+        if (count > MAX_ENTRIES) throw capabilityError("skill_tree_entry_count_exceeded");
+        const childPath = ensureDirectChild(record.path, name);
+        const handle = await nativeApi.openPath(childPath, {
+          access: ["read", "attributes"], share: ["read"], disposition: "openExisting", directory: true,
+        });
+        const currentSegments = [...segments, name];
+        const relative = currentSegments.join("/");
+        let primaryError = null;
+        try {
+          const info = validateInfo(await nativeApi.queryHandle(handle));
+          if (info.nlink !== 1) throw capabilityError("windows_hard_link_rejected");
+          const finalPath = validateAbsolute(await nativeApi.finalPath(handle));
+          if (!samePath(finalPath, childPath)) throw capabilityError("windows_final_path_mismatch");
+          if (info.directory) {
+            entries.push({ path: relative, size: 0, directory: true });
+            await walk({ handle, path: finalPath }, currentSegments, depth + 1);
+          } else {
+            await nativeApi.assertNoAlternateDataStreams(handle);
+            total += info.size;
+            if (!Number.isSafeInteger(total) || total > MAX_SOFTWARE_PACKAGE_BYTES) {
+              throw capabilityError("skill_tree_size_exceeded");
+            }
+            const data = await nativeApi.readFile(handle, MAX_SOFTWARE_PACKAGE_BYTES);
+            if (!Buffer.isBuffer(data) || data.length !== info.size) throw capabilityError("skill_tree_read_invalid");
+            const sha256 = crypto.createHash("sha256").update(data).digest("hex");
+            entries.push({ path: relative, size: info.size, directory: false, sha256 });
+            files.push({ path: relative, data });
+          }
+        } catch (error) {
+          primaryError = error;
+        }
+        try { await nativeApi.closeHandle(handle); } catch (closeError) {
+          if (primaryError) throw new AggregateError([primaryError, closeError], primaryError.message, { cause: primaryError });
+          throw closeError;
+        }
+        if (primaryError) throw primaryError;
+      }
+    }
+    const rootInfo = validateInfo(await nativeApi.queryHandle(rootRecord.handle), "directory");
+    verifyIdentity(rootRecord.identity, rootInfo);
+    if (rootInfo.nlink !== 1) throw capabilityError("windows_hard_link_rejected");
+    await walk(rootRecord, [], 0);
+    entries.sort(compareEntryPath);
+    const required = new Set(requiredFiles);
+    const actualFiles = new Set(entries.filter((entry) => !entry.directory).map((entry) => entry.path));
+    if ([...required].some((item) => !actualFiles.has(item))) throw capabilityError("skill_required_file_missing");
+    const skillMd = entries.find((entry) => entry.path === "SKILL.md" && !entry.directory);
+    if (!skillMd) throw capabilityError("skill_md_missing");
+    const manifest = entries.map(({ path: entryPath, size, directory }) => ({ path: entryPath, size, directory }));
+    return {
+      evidence: {
+        kind: "directory",
+        identity: publicIdentity(rootRecord.identity),
+        treeDigest: digestJson(entries),
+        manifestDigest: digestJson(manifest),
+        skillMdSha256: skillMd.sha256,
+      },
+      entries,
+      files,
+    };
+  }
 
   async function openRecordDirectoryNoFollow(stateDir, { includeListing = false } = {}) {
     const pin = await openPinnedPath(nativeApi, stateDir, {
@@ -859,6 +943,27 @@ export function createWindowsFileCapabilities({
       throw primaryError;
     }
 
+    async function sealIssuedSkillTreeNoFollow(receipt, expected = {}) {
+      const keys = ["requiredFiles", "packageSha256"];
+      if (!hasExactKeys(expected, keys) || !Array.isArray(expected.requiredFiles)
+        || expected.requiredFiles.length === 0 || !SHA256.test(expected.packageSha256 ?? "")) {
+        throw capabilityError("workspace_skill_evidence_invalid");
+      }
+      const internal = requireReceipt(receipt, { directory: true });
+      await assertStable(internal, "directory");
+      const scanned = await scanSkillTree(internal, expected.requiredFiles);
+      const sourceProof = Object.freeze(Object.create(null));
+      skillSourceProofs.set(sourceProof, {
+        state: "issued",
+        installRootCapability,
+        sourcePath: internal.path,
+        sourceIdentity: structuredClone(internal.identity),
+        expected: structuredClone(expected),
+        evidence: scanned.evidence,
+      });
+      return Object.freeze({ sourceProof, evidence: structuredClone(scanned.evidence) });
+    }
+
     async function renameIssuedChildNoReplace(receipt, destinationName) {
       const internal = requireReceipt(receipt, { claim: true });
       if (internal.kind !== "file" || !internal.parent) {
@@ -942,6 +1047,7 @@ export function createWindowsFileCapabilities({
       openFileChildNoFollow,
       inspectIssuedChildNoFollow,
       sealIssuedFileNoFollow,
+      sealIssuedSkillTreeNoFollow,
       renameIssuedChildNoReplace,
       deleteIssuedChildNoFollow,
       async close() { await closeOwner(nativeApi, pin.owner); },
@@ -1648,6 +1754,297 @@ export function createWindowsFileCapabilities({
     });
   }
 
+  function skillChildName(value) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)
+      || Object.getPrototypeOf(value) !== Object.prototype
+      || !["target", "prepared", "old"].includes(value.kind)
+      || typeof value.skillId !== "string" || !/^[a-z0-9][a-z0-9-]{0,63}$/u.test(value.skillId)) {
+      throw capabilityError("skill_child_request_invalid");
+    }
+    if (value.kind === "target") {
+      if (!hasExactKeys(value, ["kind", "skillId"])) throw capabilityError("skill_child_request_invalid");
+      return value.skillId;
+    }
+    if (!hasExactKeys(value, ["kind", "skillId", "swapId"]) || !/^[a-f0-9]{32}$/u.test(value.swapId)) {
+      throw capabilityError("skill_child_request_invalid");
+    }
+    return `.codexbridge-${value.kind === "prepared" ? "new" : "old"}-${value.skillId}-${value.swapId}`;
+  }
+
+  async function verifyPreparedSkillNoFollow({
+    sourceProof, installRootCapability, requiredFiles, expectedPackageSha256,
+  } = {}) {
+    const proof = skillSourceProofs.get(sourceProof);
+    if (!proof || proof.installRootCapability !== installRootCapability || proof.state !== "issued"
+      || !Array.isArray(requiredFiles) || JSON.stringify(requiredFiles) !== JSON.stringify(proof.expected.requiredFiles)
+      || expectedPackageSha256 !== proof.expected.packageSha256) {
+      throw capabilityError("skill_source_proof_invalid");
+    }
+    await revalidateInstallRootCapability(installRootCapability, { maxRelativePath: proof.sourcePath.length });
+    const source = await openPinnedPath(nativeApi, proof.sourcePath, {
+      kind: "directory", access: ["read", "attributes"], share: ["read"],
+    });
+    try {
+      verifyIdentity(proof.sourceIdentity, source.leaf.info);
+      const scanned = await scanSkillTree({
+        path: source.path, handle: source.leaf.handle, identity: source.leaf.info.identity,
+      }, requiredFiles);
+      if (JSON.stringify(scanned.evidence) !== JSON.stringify(proof.evidence)) {
+        throw capabilityError("skill_source_identity_changed");
+      }
+    } finally {
+      await closeOwner(nativeApi, source.owner);
+    }
+    return Object.freeze({
+      verificationReceipt: sourceProof,
+      sourcePath: proof.sourcePath,
+      evidence: structuredClone(proof.evidence),
+    });
+  }
+
+  async function openSkillRootNoFollow({ installRootCapability, skillsRootCapability } = {}) {
+    const fixed = readFixedDirectoryCapability(skillsRootCapability);
+    if (fixed.kind !== "skills") throw capabilityError("skills_root_capability_invalid");
+    await revalidateInstallRootCapability(installRootCapability);
+    await revalidateFixedDirectoryCapability(skillsRootCapability);
+    const pin = await openPinnedPath(nativeApi, fixed.path, {
+      kind: "directory", access: ["read", "attributes"], share: ["read", "write"],
+    });
+    const rootIdentity = publicIdentity(pin.leaf.info.identity);
+    const rootPath = pin.path;
+    const exactEvidence = (value, expected) => value.kind === "directory"
+      && value.treeDigest === expected.treeDigest && value.manifestDigest === expected.manifestDigest
+      && value.skillMdSha256 === expected.skillMdSha256;
+
+    async function openChild(spec, { missing = true } = {}) {
+      requireOpen(pin.owner);
+      const name = skillChildName(spec);
+      const childPath = ensureDirectChild(rootPath, name);
+      let handle;
+      try {
+        handle = await nativeApi.openPath(childPath, {
+          access: ["read", "attributes", "delete"], share: ["read", "write"],
+          disposition: "openExisting", directory: true,
+        });
+      } catch (error) {
+        if (missing && isMissing(error)) return null;
+        throw error;
+      }
+      pin.owner.handles.add(handle);
+      try {
+        const info = validateInfo(await nativeApi.queryHandle(handle), "directory");
+        if (info.nlink !== 1) throw capabilityError("windows_hard_link_rejected");
+        const finalPath = validateAbsolute(await nativeApi.finalPath(handle));
+        if (!samePath(finalPath, childPath)) throw capabilityError("windows_final_path_mismatch");
+        return { name, path: finalPath, handle, identity: info.identity };
+      } catch (error) {
+        await closeOne(nativeApi, pin.owner, handle).catch(() => {});
+        throw error;
+      }
+    }
+
+    async function inspectDirectChildNoFollow(spec) {
+      const child = await openChild(spec);
+      if (!child) return Object.freeze({ kind: "absent" });
+      try {
+        const scanned = await scanSkillTree(child, ["SKILL.md"]);
+        return Object.freeze(scanned.evidence);
+      } finally {
+        await closeOne(nativeApi, pin.owner, child.handle);
+      }
+    }
+
+    async function copySource(sourceRecord, spec, expected, { consumeProof = false } = {}) {
+      if (!sourceRecord || sourceRecord.installRootCapability !== installRootCapability
+        || (consumeProof && sourceRecord.state !== "issued")) {
+        throw capabilityError("skill_source_proof_invalid");
+      }
+      const destinationName = skillChildName(spec);
+      const destinationPath = ensureDirectChild(rootPath, destinationName);
+      const source = await openPinnedPath(nativeApi, sourceRecord.sourcePath, {
+        kind: "directory", access: ["read", "attributes"], share: ["read"],
+      });
+      let destinationHandle = null;
+      const createdHandles = [];
+      try {
+        verifyIdentity(sourceRecord.sourceIdentity, source.leaf.info);
+        const scanned = await scanSkillTree({
+          path: source.path, handle: source.leaf.handle, identity: source.leaf.info.identity,
+        }, expected.requiredFiles);
+        if (!exactEvidence(scanned.evidence, expected)) throw capabilityError("skill_source_evidence_mismatch");
+        await nativeApi.createDirectory(destinationPath);
+        destinationHandle = await nativeApi.openPath(destinationPath, {
+          access: ["read", "attributes", "delete"], share: ["read", "write"],
+          disposition: "openExisting", directory: true,
+        });
+        pin.owner.handles.add(destinationHandle);
+        const destinationInfo = validateInfo(await nativeApi.queryHandle(destinationHandle), "directory");
+        const destinationFinalPath = validateAbsolute(await nativeApi.finalPath(destinationHandle));
+        if (!samePath(destinationFinalPath, destinationPath) || destinationInfo.nlink !== 1) {
+          throw capabilityError("windows_final_path_mismatch");
+        }
+        for (const entry of scanned.entries) {
+          const outputPath = path.win32.join(destinationPath, ...entry.path.split("/"));
+          if (entry.directory) {
+            await nativeApi.createDirectory(outputPath);
+            const directoryHandle = await nativeApi.openPath(outputPath, {
+              access: ["read", "attributes", "delete"], share: ["read", "write"],
+              disposition: "openExisting", directory: true,
+            });
+            try {
+              const directoryInfo = validateInfo(await nativeApi.queryHandle(directoryHandle), "directory");
+              const directoryFinalPath = validateAbsolute(await nativeApi.finalPath(directoryHandle));
+              if (!samePath(directoryFinalPath, outputPath) || directoryInfo.nlink !== 1) {
+                throw capabilityError("windows_final_path_mismatch");
+              }
+            } finally {
+              await nativeApi.closeHandle(directoryHandle);
+            }
+            continue;
+          }
+          const sourceFile = scanned.files.find((item) => item.path === entry.path);
+          const handle = await nativeApi.openPath(outputPath, {
+            access: ["read", "write", "attributes", "delete"], share: ["read"],
+            disposition: "createNew", directory: false,
+          });
+          createdHandles.push(handle);
+          const outputInfo = validateInfo(await nativeApi.queryHandle(handle), "file");
+          if (outputInfo.nlink !== 1) throw capabilityError("windows_hard_link_rejected");
+          const outputFinalPath = validateAbsolute(await nativeApi.finalPath(handle));
+          if (!samePath(outputFinalPath, outputPath)) throw capabilityError("windows_final_path_mismatch");
+          await nativeApi.writeFile(handle, sourceFile.data);
+          await nativeApi.flushFile(handle);
+          await nativeApi.assertNoAlternateDataStreams(handle);
+          const copied = await nativeApi.readFile(handle, MAX_SOFTWARE_PACKAGE_BYTES);
+          if (crypto.createHash("sha256").update(copied).digest("hex") !== entry.sha256) {
+            throw capabilityError("skill_copy_hash_mismatch");
+          }
+        }
+        for (const handle of createdHandles.splice(0).reverse()) await nativeApi.closeHandle(handle);
+        const info = validateInfo(await nativeApi.queryHandle(destinationHandle), "directory");
+        const result = await scanSkillTree({ path: destinationPath, handle: destinationHandle, identity: info.identity }, expected.requiredFiles);
+        if (!exactEvidence(result.evidence, expected)) throw capabilityError("skill_copy_evidence_mismatch");
+        if (consumeProof) sourceRecord.state = "consumed";
+        return result.evidence;
+      } finally {
+        for (const handle of createdHandles.reverse()) await nativeApi.closeHandle(handle).catch(() => {});
+        if (destinationHandle) await closeOne(nativeApi, pin.owner, destinationHandle).catch(() => {});
+        await closeOwner(nativeApi, source.owner).catch(() => {});
+      }
+    }
+
+    async function stagePreparedTreeNoFollow({ sourceProof, skillId, swapId, expected } = {}) {
+      return copySource(
+        skillSourceProofs.get(sourceProof),
+        { kind: "prepared", skillId, swapId },
+        expected,
+        { consumeProof: true },
+      );
+    }
+
+    async function recoverPreparedTreeNoFollow(raw = {}) {
+      if (!hasExactKeys(raw, ["taskId", "sourceIdentity", "skillId", "swapId", "expected"])) {
+        throw capabilityError("skill_recovery_request_invalid");
+      }
+      const { taskId, sourceIdentity, skillId, swapId, expected } = raw;
+      if (typeof taskId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u.test(taskId)) {
+        throw capabilityError("skill_recovery_request_invalid");
+      }
+      const existing = await inspectDirectChildNoFollow({ kind: "prepared", skillId, swapId });
+      if (existing.kind !== "absent") return existing;
+      const installRoot = await revalidateInstallRootCapability(installRootCapability, {
+        maxRelativePath: path.win32.join("staging", `task-${taskId}`, `skill-${skillId}.prepare`).length,
+      });
+      const sourcePath = path.win32.join(
+        installRoot, "staging", `task-${taskId}`, `skill-${skillId}.prepare`,
+      );
+      return copySource({
+        installRootCapability,
+        sourcePath,
+        sourceIdentity: publicIdentity(sourceIdentity),
+      }, { kind: "prepared", skillId, swapId }, expected);
+    }
+
+    async function renameDirectChildNoReplace({ from, to, expectedIdentity } = {}) {
+      const source = await openChild(from, { missing: false });
+      try {
+        if (identityKey(source.identity) !== identityKey(expectedIdentity)) {
+          throw capabilityError("skill_rename_identity_mismatch");
+        }
+        const destinationName = skillChildName(to);
+        await nativeApi.renameByHandle(source.handle, pin.leaf.handle, destinationName, { replace: false });
+        const current = validateInfo(await nativeApi.queryHandle(source.handle), "directory");
+        verifyIdentity(source.identity, current);
+        const finalPath = validateAbsolute(await nativeApi.finalPath(source.handle));
+        if (!samePath(finalPath, ensureDirectChild(rootPath, destinationName))) {
+          throw capabilityError("windows_final_path_mismatch");
+        }
+        return (await scanSkillTree({ path: finalPath, handle: source.handle, identity: current.identity }, ["SKILL.md"])).evidence;
+      } finally {
+        await closeOne(nativeApi, pin.owner, source.handle).catch(() => {});
+      }
+    }
+
+    let deleteEntryCount = 0;
+    async function deleteTree(record) {
+      for (const name of await (async () => {
+        const names = [];
+        for await (const entry of nativeApi.enumerateDirectory(record.handle, { limit: MAX_ENTRIES })) {
+          if (!entry || entry.reparse === true) throw capabilityError("windows_reparse_point_rejected");
+          deleteEntryCount += 1;
+          if (deleteEntryCount > MAX_ENTRIES) throw capabilityError("skill_tree_entry_count_exceeded");
+          names.push(validateChildName(entry.name));
+        }
+        return names;
+      })()) {
+        const childPath = ensureDirectChild(record.path, name);
+        const handle = await nativeApi.openPath(childPath, {
+          access: ["read", "attributes", "delete"], share: ["read", "write"],
+          disposition: "openExisting", directory: true,
+        });
+        pin.owner.handles.add(handle);
+        try {
+          const info = validateInfo(await nativeApi.queryHandle(handle));
+          if (info.nlink !== 1) throw capabilityError("windows_hard_link_rejected");
+          const finalPath = validateAbsolute(await nativeApi.finalPath(handle));
+          if (!samePath(finalPath, childPath)) throw capabilityError("windows_final_path_mismatch");
+          const child = { path: finalPath, handle, identity: info.identity };
+          if (info.directory) await deleteTree(child);
+          else {
+            await nativeApi.assertNoAlternateDataStreams(handle);
+            await nativeApi.deleteByHandle(handle, { directory: false });
+          }
+        } finally {
+          await closeOne(nativeApi, pin.owner, handle);
+        }
+      }
+      await nativeApi.deleteByHandle(record.handle, { directory: true });
+    }
+
+    async function deleteDirectChildTreeNoFollow({ child, expectedEvidence } = {}) {
+      const opened = await openChild(child, { missing: false });
+      const scanned = await scanSkillTree(opened, ["SKILL.md"]);
+      if (JSON.stringify(scanned.evidence) !== JSON.stringify(expectedEvidence)) {
+        await closeOne(nativeApi, pin.owner, opened.handle);
+        throw capabilityError("skill_delete_identity_mismatch");
+      }
+      await deleteTree(opened);
+      await closeOne(nativeApi, pin.owner, opened.handle);
+      return true;
+    }
+
+    return Object.freeze({
+      rootPath,
+      rootIdentity,
+      inspectDirectChildNoFollow,
+      stagePreparedTreeNoFollow,
+      recoverPreparedTreeNoFollow,
+      renameDirectChildNoReplace,
+      deleteDirectChildTreeNoFollow,
+      async close() { await closeOwner(nativeApi, pin.owner); },
+    });
+  }
+
   function createShortcutFileApi() {
     const tempMap = new WeakMap();
     const inspectionMap = new WeakMap();
@@ -1929,6 +2326,8 @@ export function createWindowsFileCapabilities({
     openStateDirectoryNoFollow,
     openJournalDirectoryNoFollow,
     openInstallerWorkspaceRootNoFollow,
+    verifyPreparedSkillNoFollow,
+    openSkillRootNoFollow,
     openDirectoryNoFollow,
     openVersionRootNoFollow,
     pinArchiveFileNoFollow,

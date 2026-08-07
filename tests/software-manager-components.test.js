@@ -102,9 +102,12 @@ function fixture({
     deletedComponents: [], hashes: [], persistentPrepared: [], persistentVerified: [], gitPins: [], gitRevalidates: [],
     gitReleases: [], retained: [], discarded: [],
     gitMutableReleases: [],
+    reconciledSkills: [], skillOperations: [],
+    cleanedSkillPackages: [], cleanedSkillStaging: [],
   };
   const archiveReceipts = new WeakSet();
-  const packageProofs = new WeakSet();
+  const packageProofs = new WeakMap();
+  const downloadRecords = new WeakSet();
   const skillReceipts = new WeakSet();
   const skillCompletionReceipts = new WeakSet();
   const skillProofs = new Map();
@@ -281,6 +284,15 @@ function fixture({
   };
   const skillFiles = {
     async verifyPreparedSkill(plan) {
+      assert.equal(plan.skillId, "documents");
+      assert.equal(plan.expectedVersion, "1.0.0");
+      assert.equal(plan.stagingReceipt?.path, path.win32.join(
+        INSTALL_ROOT, "staging", `task-${plan.stagingReceipt.taskId}`, "skill-documents.prepare",
+      ));
+      const boundDownload = packageProofs.get(plan.packageProof);
+      assert.equal(downloadRecords.has(boundDownload), true);
+      packageProofs.delete(plan.packageProof);
+      downloadRecords.delete(boundDownload);
       const verificationReceipt = Object.freeze(Object.create(null));
       skillReceipts.add(verificationReceipt);
       return { verificationReceipt, treeDigest: DIGEST_A, manifestDigest: DIGEST_B, skillMdSha256: SKILL_HASH };
@@ -290,6 +302,9 @@ function fixture({
       return Array.isArray(skillHashes) && skillHashes.length > 0 ? skillHashes.shift() : SKILL_HASH;
     },
     async replaceExact(plan) {
+      assert.match(plan.swapId, /^[a-f0-9]{32}$/u);
+      assert.equal(plan.taskId.length > 0, true);
+      assert.equal(Object.hasOwn(plan, "previousEvidence"), true);
       await onReplaceSkill?.(plan);
       assert.equal(skillReceipts.has(plan.verificationReceipt), true);
       skillReceipts.delete(plan.verificationReceipt);
@@ -303,7 +318,9 @@ function fixture({
       });
       return { completionReceipt };
     },
-    async finalizeReplacement({ completionReceipt, target, expected }) {
+    async finalizeReplacement({ completionReceipt, target, taskId, swapId, expected }) {
+      assert.equal(typeof taskId, "string");
+      assert.match(swapId, /^[a-f0-9]{32}$/u);
       assert.equal(skillCompletionReceipts.has(completionReceipt), true);
       skillCompletionReceipts.delete(completionReceipt);
       const evidence = installedSkillEvidence.get(target);
@@ -314,12 +331,14 @@ function fixture({
       skillProofs.set(proof, structuredClone(evidence));
       return { completionProof: proof, evidence: structuredClone(evidence) };
     },
-    async verifyCompletionProof({ completionProof, target }) {
+    async verifyCompletionProof({ completionProof, target, swapId }) {
+      assert.match(swapId, /^[a-f0-9]{32}$/u);
       const evidence = skillProofs.get(completionProof);
       if (!evidence || !installedSkillEvidence.has(target)) throw new Error("skill_completion_proof_invalid");
       return structuredClone(evidence);
     },
-    async recoverCompletionProof({ target, expected }) {
+    async recoverCompletionProof({ target, swapId, expected }) {
+      assert.match(swapId, /^[a-f0-9]{32}$/u);
       const evidence = installedSkillEvidence.get(target);
       if (!evidence || evidence.treeDigest !== expected.treeDigest
         || evidence.manifestDigest !== expected.manifestDigest
@@ -329,9 +348,11 @@ function fixture({
       return { completionProof: proof, evidence: structuredClone(evidence) };
     },
     async deleteExact(plan) {
+      assert.equal(Object.hasOwn(plan, "expectedEvidence"), true);
       calls.deletedSkills.push(plan); deletedSkillTargets.add(plan.target); installedSkillEvidence.delete(plan.target);
     },
     async inspectExact({ target }) {
+      calls.skillOperations.push(["inspect", target]);
       if (deletedSkillTargets.has(target)) return { kind: "absent" };
       if (installedSkillEvidence.has(target)) return structuredClone(installedSkillEvidence.get(target));
       const record = currentState.skills.documents;
@@ -346,6 +367,11 @@ function fixture({
       };
       installedSkillEvidence.set(target, evidence);
       return structuredClone(evidence);
+    },
+    async reconcileReplacement(plan) {
+      calls.reconciledSkills.push(structuredClone(plan));
+      calls.skillOperations.push(["reconcile", plan.target]);
+      return { status: "completed" };
     },
   };
   const gitIdentityCapabilities = {
@@ -374,8 +400,29 @@ function fixture({
       calls.downloads.push(plan);
       await onDownload?.(plan);
       const packageProof = Object.freeze(Object.create(null));
-      packageProofs.add(packageProof);
-      return { path: plan.destination, size: plan.asset.size, sha256: plan.asset.sha256, packageProof };
+      const downloadRecord = Object.freeze(Object.create(null));
+      packageProofs.set(packageProof, downloadRecord);
+      downloadRecords.add(downloadRecord);
+      return {
+        path: plan.destination, size: plan.asset.size, sha256: plan.asset.sha256,
+        packageProof, downloadRecord,
+      };
+    },
+  };
+  const installerWorkspace = {
+    async prepareSkillStaging({ taskId, skillId }) {
+      return Object.freeze({
+        kind: "skill-staging",
+        taskId,
+        skillId,
+        path: path.win32.join(INSTALL_ROOT, "staging", `task-${taskId}`, `skill-${skillId}.prepare`),
+      });
+    },
+    async cleanupAbandonedPrepare(record) { calls.cleanedSkillStaging.push(record); },
+    async cleanupComponentPackage(record) {
+      assert.equal(downloadRecords.has(record), true);
+      downloadRecords.delete(record);
+      calls.cleanedSkillPackages.push(record);
     },
   };
   const adapterOptions = {
@@ -384,6 +431,7 @@ function fixture({
     skillsRootCapability,
     desktopCapability,
     downloader, archiveService, versionSlots, ownershipStore, windowsHost, componentFiles, skillFiles,
+    installerWorkspace,
     gitIdentityCapabilities,
     ...(gitExecutionTimeoutMs === undefined ? {} : { gitExecutionTimeoutMs }),
     resolveSkillTarget: async ({ skillsRoot, skillId }) => path.win32.join(skillsRoot, skillId),
@@ -1435,10 +1483,13 @@ test("Skill replacement consumes a source receipt, reserves ownership, and adopt
   assert.equal(calls.replacedSkills[0].target, "C:\\Users\\tester\\.codex\\skills\\documents");
   assert.equal(calls.replacedSkills[0].backup, false);
   assert.equal(getState().activeTask?.kind, "skill-replace");
+  assert.match(getState().activeTask.swapId, /^[a-f0-9]{32}$/u);
+  calls.skillOperations.length = 0;
   const recovered = await adapters.skills.inspectInstalled({ skillIds: ["documents"] });
   assert.equal(recovered[0].status, "succeeded");
   assert.equal(getState().skills.documents.version, "1.0.0");
   assert.equal(getState().activeTask, null);
+  assert.deepEqual(calls.skillOperations.slice(0, 2).map(([operation]) => operation), ["reconcile", "inspect"]);
 });
 
 test("Skill uninstall is independently recovered after deletion completed before state save", async () => {
@@ -1446,6 +1497,7 @@ test("Skill uninstall is independently recovered after deletion completed before
   state.skills.documents = {
     target: "C:\\Users\\tester\\.codex\\skills\\documents", version: "1.0.0",
     packageSha256: DIGEST_B, skillMdSha256: SKILL_HASH,
+    identity: { volumeSerial: "v", fileId: "existing" }, treeDigest: DIGEST_A, manifestDigest: DIGEST_B,
   };
   const { adapters, getState } = fixture({ state, stateSaveFailureAt: 2 });
   const removed = await adapters.skills.uninstall({ skillIds: ["documents"] });
@@ -1464,7 +1516,7 @@ test("reserved Skill recovery does not adopt a tree that only matches the expect
     packageSha256: DIGEST_A, skillMdSha256: SKILL_HASH,
   };
   state.activeTask = {
-    kind: "skill-replace", phase: "reserved", taskId: "skill-tree-mismatch", skillId: "documents",
+    kind: "skill-replace", phase: "reserved", taskId: "skill-tree-mismatch", swapId: "1".repeat(32), skillId: "documents",
     skillsRoot: SKILLS_ROOT, target: state.skills.documents.target, version: "1.0.0",
     packageSha256: DIGEST_B, skillMdSha256: SKILL_HASH,
     treeDigest: DIGEST_A, manifestDigest: DIGEST_B,
@@ -1492,7 +1544,7 @@ test("reserved Skill recovery does not adopt a tree that only matches the expect
 test("forged applied Skill completion evidence is rejected without adoption", async () => {
   const state = emptyState(INSTALL_ROOT);
   state.activeTask = {
-    kind: "skill-replace", phase: "applied", taskId: "skill-forged", skillId: "documents",
+    kind: "skill-replace", phase: "applied", taskId: "skill-forged", swapId: "2".repeat(32), skillId: "documents",
     skillsRoot: SKILLS_ROOT, target: "C:\\Users\\tester\\.codex\\skills\\documents", version: "1.0.0",
     packageSha256: DIGEST_B, skillMdSha256: SKILL_HASH, treeDigest: DIGEST_A, manifestDigest: DIGEST_B,
     previousEvidence: { kind: "absent" }, completionProof: { forged: true },
@@ -1512,7 +1564,7 @@ test("reserved Skill recovery safely clears a pre-mutation failure after verifyi
     identity: { volumeSerial: "v", fileId: "old" }, treeDigest: DIGEST_B, manifestDigest: DIGEST_A,
   };
   state.activeTask = {
-    kind: "skill-replace", phase: "reserved", taskId: "skill-before-mutation", skillId: "documents",
+    kind: "skill-replace", phase: "reserved", taskId: "skill-before-mutation", swapId: "3".repeat(32), skillId: "documents",
     skillsRoot: SKILLS_ROOT, target, version: "1.0.0", packageSha256: DIGEST_B,
     skillMdSha256: SKILL_HASH, treeDigest: DIGEST_A, manifestDigest: DIGEST_B,
     previousEvidence: {
@@ -1585,6 +1637,8 @@ test("skills prepare revalidates install and skills roots after download before 
   assert.match(prepared.message, /install_root_identity_changed/u);
   assert.equal(calls.downloads.length, 1);
   assert.equal(calls.extracts.length, 0);
+  assert.equal(calls.cleanedSkillPackages.length, 1);
+  assert.equal(calls.cleanedSkillStaging.length, 1);
   assert.deepEqual(getState().skills, {});
 });
 

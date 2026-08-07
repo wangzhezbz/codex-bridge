@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import test from "node:test";
@@ -9,11 +9,54 @@ import {
   createDownloadManager,
 } from "../desktop/software-manager/download-manager.mjs";
 import { createInstallerWorkspace } from "../desktop/software-manager/installer-workspace.mjs";
+import { createTrustedCatalogService, verifyCatalogEnvelope } from "../desktop/software-manager/catalog-trust.mjs";
 import { authorizeInstallRoot } from "../desktop/software-manager/path-policy.mjs";
 import { MAX_SOFTWARE_PACKAGE_BYTES } from "../shared/software-manager/catalog-schema.mjs";
 
 const ROOT = "D:\\CBApps";
 const PACKAGE = Buffer.from("verified component package");
+const TEST_CATALOG_URL = "https://shanhaiyouling.com/codexbridge-install-test/component-catalog.json";
+
+function trustedCatalog() {
+  const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const value = {
+    schemaVersion: 1,
+    components: [{
+      id: "chatgpt", name: "ChatGPT", version: "1.0.0", architecture: "x64",
+      assetUrl: "/codexbridge-test/packages/chatgpt.zip", size: PACKAGE.length,
+      sha256: createHash("sha256").update(PACKAGE).digest("hex"), format: "zip",
+      entrypoint: "ChatGPT.exe", requiredFiles: ["ChatGPT.exe"], maxRelativePathLength: 80,
+      publishedAt: "2026-08-07T00:00:00.000Z", supportsRollback: true,
+    }, {
+      id: "v2rayn", name: "V2RayN", version: "7.0.4", architecture: "x64",
+      assetUrl: "/codexbridge-test/packages/v2rayn.7z", size: PACKAGE.length,
+      sha256: createHash("sha256").update(PACKAGE).digest("hex"), format: "7z",
+      entrypoint: "v2rayN.exe", requiredFiles: ["v2rayN.exe"], maxRelativePathLength: 80,
+      publishedAt: "2026-08-07T00:00:00.000Z", supportsRollback: true,
+    }, {
+      id: "git", name: "Git", version: "2.50.0", architecture: "x64",
+      assetUrl: "/codexbridge-test/packages/git.exe", size: PACKAGE.length,
+      sha256: createHash("sha256").update(PACKAGE).digest("hex"), format: "exe",
+      entrypoint: "cmd/git.exe", requiredFiles: ["cmd/git.exe"], maxRelativePathLength: 80,
+      publishedAt: "2026-08-07T00:00:00.000Z", supportsRollback: true,
+    }],
+    skills: [{
+      id: "documents", name: "Documents", description: "fixture", version: "1.0.0",
+      assetUrl: "/codexbridge-test/packages/skill-documents.zip", size: PACKAGE.length,
+      sha256: createHash("sha256").update(PACKAGE).digest("hex"), files: ["SKILL.md", "reference.md"],
+    }],
+  };
+  const jsonBytes = Buffer.from(JSON.stringify(value));
+  const verified = verifyCatalogEnvelope({
+    jsonBytes,
+    signatureText: sign("RSA-SHA256", jsonBytes, privateKey).toString("base64"),
+    publicKeyPem: publicKey.export({ type: "spki", format: "pem" }),
+    catalogUrl: TEST_CATALOG_URL,
+  });
+  return createTrustedCatalogService(verified);
+}
+
+const TRUSTED_CATALOG = trustedCatalog();
 
 function packageMetadata(content = PACKAGE) {
   return {
@@ -48,10 +91,11 @@ async function installRootCapability({ identity = 10, getIdentity = () => identi
   });
 }
 
-function fakeWorkspaceCapabilities({ expectedInstallRootCapability = null } = {}) {
+function fakeWorkspaceCapabilities({ expectedInstallRootCapability = null, skillSealFailure = null } = {}) {
   const calls = [];
   const nodes = new Map([[ROOT.toLowerCase(), { kind: "directory", empty: true, identity: 1 }]]);
   const sessions = new Set();
+  const skillSourceProofs = new WeakSet();
   let identity = 2;
 
   function key(value) { return value.toLowerCase(); }
@@ -142,6 +186,24 @@ function fakeWorkspaceCapabilities({ expectedInstallRootCapability = null } = {}
             record.state = "consumed";
             return this.issue(record.path, "file", { sealed: true });
           },
+          async sealIssuedSkillTreeNoFollow(receipt, expected) {
+            const record = this.require(receipt);
+            if (record.kind !== "directory") throw new Error("workspace_directory_receipt_required");
+            calls.push(["seal-skill-tree", record.path, structuredClone(expected)]);
+            if (skillSealFailure) throw skillSealFailure;
+            const sourceProof = Object.freeze(Object.create(null));
+            skillSourceProofs.add(sourceProof);
+            return {
+              sourceProof,
+              evidence: {
+                kind: "directory",
+                identity: { volumeSerial: "v", fileId: "skill" },
+                treeDigest: "a".repeat(64),
+                manifestDigest: "b".repeat(64),
+                skillMdSha256: "c".repeat(64),
+              },
+            };
+          },
           async renameIssuedChildNoReplace(receipt, destinationName) {
             const record = this.require(receipt);
             if (!record.sealed) throw Object.assign(new Error("workspace_sealed_file_required"), { code: "workspace_sealed_file_required" });
@@ -173,6 +235,7 @@ function fakeWorkspaceCapabilities({ expectedInstallRootCapability = null } = {}
       },
     },
     sessions,
+    skillSourceProofs,
   };
 }
 
@@ -228,6 +291,7 @@ async function createWorkspace(
       fileCapabilities: fake.fileCapabilities,
       installRootCapability: rootCapability,
       downloadManager: preparedDownloadManager,
+      catalogService: TRUSTED_CATALOG,
     }),
   };
 }
@@ -258,8 +322,81 @@ test("workspace derives deterministic children and rejects renderer-controlled i
     "consumePromotedPackageProof",
     "prepareComponentStaging",
     "prepareDownloadFile",
+    "prepareSkillDownloadFile",
     "prepareSkillStaging",
+    "sealSkillStaging",
   ].sort().join(","));
+});
+
+test("workspace seals one issued Skill staging tree into an opaque source proof", async () => {
+  const installRootCapabilityValue = await installRootCapability();
+  const fake = fakeWorkspaceCapabilities({ expectedInstallRootCapability: installRootCapabilityValue });
+  const preparedDownloadManager = fakePreparedDownloadManager(fake);
+  const workspace = createInstallerWorkspace({
+    fileCapabilities: fake.fileCapabilities,
+    installRootCapability: installRootCapabilityValue,
+    downloadManager: preparedDownloadManager,
+    catalogService: TRUSTED_CATALOG,
+  });
+  const entry = TRUSTED_CATALOG.getSkill("documents");
+  const download = await workspace.prepareSkillDownloadFile({
+    skillId: entry.id, version: entry.version, size: entry.size, sha256: entry.sha256,
+  });
+  const verification = await preparedDownloadManager.downloadPrepared({
+    asset: { url: entry.assetUrl, size: entry.size, sha256: entry.sha256 },
+    partPath: download.partPath,
+  });
+  const promoted = await download.promotePartNoReplace(verification);
+  const staging = await workspace.prepareSkillStaging({ taskId: "skill-task", skillId: "documents" });
+  const context = { skillId: "documents", expectedVersion: entry.version };
+  const sealed = await workspace.sealSkillStaging(staging, promoted.packageProof, context);
+  assert.equal(fake.skillSourceProofs.has(sealed.sourceProof), true);
+  assert.equal(sealed.evidence.treeDigest, "a".repeat(64));
+  assert.deepEqual(fake.calls.find(([operation]) => operation === "seal-skill-tree").slice(2), [{
+    requiredFiles: entry.files,
+    packageSha256: entry.sha256,
+  }]);
+  assert.equal(fake.nodes.has(promoted.path.toLowerCase()), false);
+  assert.equal([...fake.sessions].every((session) => session.closed), true);
+  await assert.rejects(
+    workspace.sealSkillStaging(staging, promoted.packageProof, context),
+    /workspace_receipt_consumed/u,
+  );
+});
+
+test("failed Skill sealing keeps the exact promoted package recoverable until original-record cleanup closes it", async () => {
+  const installRootCapabilityValue = await installRootCapability();
+  const fake = fakeWorkspaceCapabilities({
+    expectedInstallRootCapability: installRootCapabilityValue,
+    skillSealFailure: new Error("test_skill_seal_failed"),
+  });
+  const preparedDownloadManager = fakePreparedDownloadManager(fake);
+  const workspace = createInstallerWorkspace({
+    fileCapabilities: fake.fileCapabilities,
+    installRootCapability: installRootCapabilityValue,
+    downloadManager: preparedDownloadManager,
+    catalogService: TRUSTED_CATALOG,
+  });
+  const entry = TRUSTED_CATALOG.getSkill("documents");
+  const download = await workspace.prepareSkillDownloadFile({
+    skillId: entry.id, version: entry.version, size: entry.size, sha256: entry.sha256,
+  });
+  const verification = await preparedDownloadManager.downloadPrepared({
+    asset: { url: entry.assetUrl, size: entry.size, sha256: entry.sha256 },
+    partPath: download.partPath,
+  });
+  const promoted = await download.promotePartNoReplace(verification);
+  const staging = await workspace.prepareSkillStaging({ taskId: "failed-skill", skillId: entry.id });
+  await assert.rejects(
+    workspace.sealSkillStaging(staging, promoted.packageProof, {
+      skillId: entry.id, expectedVersion: entry.version,
+    }),
+    /test_skill_seal_failed/u,
+  );
+  assert.equal(fake.nodes.has(promoted.path.toLowerCase()), true);
+  await workspace.cleanupComponentPackage(promoted.downloadRecord);
+  assert.equal(fake.nodes.has(promoted.path.toLowerCase()), false);
+  assert.equal([...fake.sessions].every((session) => session.closed), true);
 });
 
 test("workspace rejects an incomplete session before file mutation and leaves download verification unconsumed", async (t) => {
