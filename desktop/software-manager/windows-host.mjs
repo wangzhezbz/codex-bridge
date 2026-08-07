@@ -318,19 +318,36 @@ function parseProcessList(stdout) {
   return Array.isArray(parsed) ? parsed : [parsed];
 }
 
+function readExactProcessRecord(record) {
+  try {
+    if (!isPlainRecord(record)) throw new Error("process record must be plain");
+    const keys = Object.keys(record);
+    if (keys.length !== 2 || Reflect.ownKeys(record).length !== 2) {
+      throw new Error("process record keys invalid");
+    }
+    const camelCase = keys.includes("pid") && keys.includes("executablePath");
+    const pascalCase = keys.includes("ProcessId") && keys.includes("ExecutablePath");
+    if (camelCase === pascalCase) throw new Error("process record aliases invalid");
+    const pidKey = camelCase ? "pid" : "ProcessId";
+    const pathKey = camelCase ? "executablePath" : "ExecutablePath";
+    const pidDescriptor = Object.getOwnPropertyDescriptor(record, pidKey);
+    const pathDescriptor = Object.getOwnPropertyDescriptor(record, pathKey);
+    if (!pidDescriptor || !pathDescriptor
+      || !Object.hasOwn(pidDescriptor, "value") || !Object.hasOwn(pathDescriptor, "value")) {
+      throw new Error("process record accessors rejected");
+    }
+    return { pid: pidDescriptor.value, executablePath: pathDescriptor.value };
+  } catch (error) {
+    throw hostError("process_list_invalid", error);
+  }
+}
+
 function validateProcessRecords(value) {
   if (!Array.isArray(value)) throw hostError("process_list_invalid");
   return value.map((record) => {
-    if (!isPlainRecord(record)) throw hostError("process_list_invalid");
-    const pidKeys = ["pid", "ProcessId"].filter((key) => Object.hasOwn(record, key));
-    const pathKeys = ["executablePath", "ExecutablePath"].filter((key) => Object.hasOwn(record, key));
-    const pid = record.pid ?? record.ProcessId;
-    const executablePath = record.executablePath ?? record.ExecutablePath ?? null;
+    const { pid, executablePath } = readExactProcessRecord(record);
     if (pid === 0) {
-      if (pidKeys.length === 1 && pathKeys.length === 1
-        && (record[pathKeys[0]] === null || record[pathKeys[0]] === "")) {
-        return null;
-      }
+      if (executablePath === null || executablePath === "") return null;
       throw hostError("process_list_invalid");
     }
     if (!Number.isSafeInteger(pid) || pid < 0

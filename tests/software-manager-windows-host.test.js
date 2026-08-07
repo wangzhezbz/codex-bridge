@@ -265,10 +265,10 @@ test("stops only processes whose normalized absolute executable path is exactly 
   const fixture = fakeHost({ processes: [
     { pid: 0, executablePath: null },
     { ProcessId: 0, ExecutablePath: "" },
-    { pid: 11, name: "ChatGPT.exe", executablePath: "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe" },
-    { pid: 12, name: "ChatGPT.exe", executablePath: "C:\\Program Files\\ChatGPT\\ChatGPT.exe" },
-    { pid: 13, name: "anything.exe", executablePath: "d:/cbapps/chatgpt/c/CHATGPT.EXE" },
-    { pid: 14, name: "ChatGPT.exe", executablePath: null },
+    { pid: 11, executablePath: "D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe" },
+    { pid: 12, executablePath: "C:\\Program Files\\ChatGPT\\ChatGPT.exe" },
+    { pid: 13, executablePath: "d:/cbapps/chatgpt/c/CHATGPT.EXE" },
+    { pid: 14, executablePath: null },
   ] });
 
   const result = await fixture.host.stopOwnedProcesses(["D:\\CBApps\\ChatGPT\\c\\ChatGPT.exe"]);
@@ -298,6 +298,39 @@ test("PID zero is accepted only as a pathless idle record", async () => {
     );
     assert.equal(fixture.calls.execFile.some(({ file }) => file === "taskkill.exe"), false);
   }
+});
+
+test("process records require one exact plain alias schema and contain hostile traps", async () => {
+  let accessorRead = false;
+  const accessorRecord = { executablePath: null };
+  Object.defineProperty(accessorRecord, "pid", {
+    enumerable: true,
+    get() { accessorRead = true; throw new Error("hostile accessor"); },
+  });
+  const ownKeysProxy = new Proxy({}, {
+    ownKeys() { throw new Error("hostile ownKeys"); },
+  });
+  const prototypeProxy = new Proxy({}, {
+    getPrototypeOf() { throw new Error("hostile getPrototypeOf"); },
+  });
+  for (const record of [
+    { pid: 17, executablePath: null, extra: true },
+    { pid: 17, ExecutablePath: null },
+    { ProcessId: 17, executablePath: null },
+    { pid: 17, ProcessId: 17, executablePath: null },
+    { pid: 17 },
+    accessorRecord,
+    ownKeysProxy,
+    prototypeProxy,
+  ]) {
+    const fixture = fakeHost({ processes: [record] });
+    await assert.rejects(
+      fixture.host.stopOwnedProcesses(["D:\\Owned\\ChatGPT.exe"]),
+      (error) => error?.code === "process_list_invalid",
+    );
+    assert.equal(fixture.calls.execFile.some(({ file }) => file === "taskkill.exe"), false);
+  }
+  assert.equal(accessorRead, false);
 });
 
 test("a noncanonical positive-PID path is skipped and never normalized into an owned match", async () => {
