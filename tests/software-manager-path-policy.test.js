@@ -310,8 +310,8 @@ test("ownership metadata strings never become authorized roots", () => {
     skills: { documents: { target: "C:\\Owned\\skills\\documents", sha256: "C:\\Windows" } },
     shortcuts: [{ path: "C:\\Owned\\shortcut.lnk", message: "C:\\Windows" }],
     rollback: null,
-    activeTask: { message: "C:\\Windows" },
-    lastTask: null,
+    activeTask: null,
+    lastTask: { message: "C:\\Windows" },
   };
 
   assert.equal(isOwnedPath({ target: "C:\\Owned\\app\\bin.exe", ownership, skillsRoot: "C:\\Owned\\skills" }), true);
@@ -356,6 +356,28 @@ function validOwnership() {
     lastTask: null,
   };
 }
+
+test("activeTask registry accepts only an exact known transaction schema", () => {
+  const base = {
+    ...validOwnership(), installRoot: "C:\\Owned",
+    activeTask: {
+      kind: "component-uninstall", taskId: "remove-chatgpt",
+      componentId: "chatgpt", rootPath: "C:\\Owned",
+    },
+  };
+  assert.equal(isValidOwnershipState(base), true);
+  const mutations = [
+    { ...base.activeTask, kind: "unknown-task" },
+    { ...base.activeTask, unexpected: true },
+    { kind: "component-shortcut", phase: "cleanup", taskId: "shortcut", componentId: "chatgpt", desktopPath: "C:\\Desktop", targetPath: "C:\\Owned\\c\\ChatGPT.exe" },
+    { kind: "git-install", taskId: "git", version: "2.51.0", targetDir: "D:\\Elsewhere\\Git", executablePath: "D:\\Elsewhere\\Git\\cmd\\git.exe", installerPath: "C:\\Temp\\git.exe", installerSha256: "a".repeat(64), replacedInstaller: null },
+    { kind: "skill-replace", phase: "reserved", taskId: "skill", skillId: "documents", skillsRoot: CANONICAL_SKILLS_ROOT, target: `${CANONICAL_SKILLS_ROOT}\\documents`, version: "1.0.0", packageSha256: "x".repeat(64), skillMdSha256: "a".repeat(64), treeDigest: "b".repeat(64), manifestDigest: "c".repeat(64), previousEvidence: { kind: "absent" } },
+    { kind: "git-install-cleanup", taskId: "git", targetDir: "C:\\Owned\\Git", executablePath: "C:\\Owned\\Git\\cmd\\git.exe", replacedInstaller: null },
+  ];
+  for (const activeTask of mutations) {
+    assert.equal(isValidOwnershipState({ ...base, activeTask }, { skillsRoot: CANONICAL_SKILLS_ROOT }), false);
+  }
+});
 
 const malformedOwnershipCases = [
   ["inherited top-level installRoot", () => Object.assign(Object.create({ installRoot: "C:\\Windows" }), {

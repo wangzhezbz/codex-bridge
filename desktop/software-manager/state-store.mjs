@@ -3,6 +3,9 @@ import path from "node:path";
 import { isValidOwnershipState } from "./path-policy.mjs";
 
 const STATE_LOCKS = new Map();
+const LEGACY_OWNERSHIP_KEYS = Object.freeze([
+  "schemaVersion", "installRoot", "components", "skills", "shortcuts", "rollback", "activeTask", "lastTask",
+]);
 
 function stateError(code) {
   const error = new Error(code);
@@ -47,22 +50,41 @@ async function openExisting(directory, name) {
 
 async function readValidated(directory, name, skillsRoot) {
   const handle = await openExisting(directory, name);
-  if (!handle) return { entry: null, value: null };
+  if (!handle) return { entry: null, status: "missing", value: null };
   try {
-    const parsed = JSON.parse(await handle.readFile("utf8"));
-    return { entry: handle.entry, value: isValidOwnershipState(parsed, { skillsRoot }) ? parsed : null };
+    let parsed;
+    try { parsed = JSON.parse(await handle.readFile("utf8")); } catch {
+      return { entry: handle.entry, status: "corrupt", value: null };
+    }
+    if (isValidOwnershipState(parsed, { skillsRoot })) {
+      return { entry: handle.entry, status: "current", value: parsed };
+    }
+    const plain = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+      && Object.getPrototypeOf(parsed) === Object.prototype;
+    if (plain && Object.keys(parsed).length === LEGACY_OWNERSHIP_KEYS.length
+      && LEGACY_OWNERSHIP_KEYS.every((key) => Object.hasOwn(parsed, key))) {
+      const migrated = { ...structuredClone(parsed), generation: 0 };
+      if (isValidOwnershipState(migrated, { skillsRoot })) {
+        return { entry: handle.entry, status: "legacy", value: migrated };
+      }
+    }
+    return { entry: handle.entry, status: "invalid", value: null };
   } catch {
-    return { entry: handle.entry, value: null };
+    return { entry: handle.entry, status: "corrupt", value: null };
   } finally {
     await handle.close();
   }
+}
+
+function usable(record) {
+  return record.status === "current" || record.status === "legacy";
 }
 
 async function openStateDirectory(fsApi, stateDir) {
   return requireDirectoryHandle(await fsApi.openStateDirectoryNoFollow(stateDir));
 }
 
-async function withStateLock(stateDir, action) {
+async function withStateLock(stateDir, fsApi, action) {
   const key = stateDir.toLowerCase();
   const previous = STATE_LOCKS.get(key) ?? Promise.resolve();
   let release;
@@ -70,7 +92,15 @@ async function withStateLock(stateDir, action) {
   const tail = previous.then(() => gate, () => gate);
   STATE_LOCKS.set(key, tail);
   await previous.catch(() => {});
-  try { return await action(); } finally {
+  let processLock;
+  try {
+    processLock = await fsApi.acquireStateLockNoFollow(stateDir);
+    if (!processLock || typeof processLock.release !== "function") {
+      throw stateError("ownership_state_lock_capability_invalid");
+    }
+    return await action();
+  } finally {
+    if (processLock) await processLock.release();
     release();
     if (STATE_LOCKS.get(key) === tail) STATE_LOCKS.delete(key);
   }
@@ -83,20 +113,36 @@ export function createOwnershipStore({ stateDir, fsApi, skillsRoot }) {
   if (typeof fsApi.openStateDirectoryNoFollow !== "function") {
     throw stateError("ownership_no_follow_capability_required");
   }
+  if (typeof fsApi.acquireStateLockNoFollow !== "function") {
+    throw stateError("ownership_state_lock_capability_required");
+  }
   const mainName = "ownership.json";
   const tempName = "ownership.json.tmp";
   const backupName = "ownership.json.bak";
 
   async function loadUnlocked() {
     const directory = await openStateDirectory(fsApi, stateDir);
+    let selected;
+    let main;
+    let backup;
     try {
-      const main = await readValidated(directory, mainName, skillsRoot);
-      if (main.value) return main.value;
-      const backup = await readValidated(directory, backupName, skillsRoot);
-      return backup.value ?? emptyState();
+      main = await readValidated(directory, mainName, skillsRoot);
+      if (usable(main)) selected = main;
+      else {
+        backup = await readValidated(directory, backupName, skillsRoot);
+        if (usable(backup)) selected = backup;
+      }
     } finally {
       await directory.close();
     }
+    if (selected) {
+      if (selected.status === "legacy") await writeUnlocked(selected.value);
+      return selected.value;
+    }
+    if (main?.status === "invalid" || backup?.status === "invalid") {
+      throw stateError("ownership_state_invalid");
+    }
+    return emptyState();
   }
 
   async function writeUnlocked(value) {
@@ -124,13 +170,13 @@ export function createOwnershipStore({ stateDir, fsApi, skillsRoot }) {
       const main = await readValidated(directory, mainName, skillsRoot);
       const backup = await readValidated(directory, backupName, skillsRoot);
       if (main.entry) {
-        if (main.value) {
+        if (usable(main)) {
           if (backup.entry) await directory.unlinkEntryNoFollow(backup.entry);
           await directory.renameEntryNoFollow(main.entry, backupName);
         } else {
           await directory.unlinkEntryNoFollow(main.entry);
         }
-      } else if (backup.entry && !backup.value) {
+      } else if (backup.entry && !usable(backup)) {
         await directory.unlinkEntryNoFollow(backup.entry);
       }
       await directory.renameEntryNoFollow(tempEntry, mainName);
@@ -140,13 +186,13 @@ export function createOwnershipStore({ stateDir, fsApi, skillsRoot }) {
   }
 
   return Object.freeze({
-    async load() { return withStateLock(stateDir, loadUnlocked); },
+    async load() { return withStateLock(stateDir, fsApi, loadUnlocked); },
     async compareAndSwap(expectedGeneration, value) {
       if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0) {
         throw stateError("ownership_generation_invalid");
       }
       if (!isValidOwnershipState(value, { skillsRoot })) throw stateError("ownership_state_invalid");
-      return withStateLock(stateDir, async () => {
+      return withStateLock(stateDir, fsApi, async () => {
         const current = await loadUnlocked();
         if (current.generation !== expectedGeneration) throw stateError("ownership_generation_conflict");
         const next = { ...structuredClone(value), generation: expectedGeneration + 1 };
@@ -156,7 +202,7 @@ export function createOwnershipStore({ stateDir, fsApi, skillsRoot }) {
     },
     async save(value) {
       if (!isValidOwnershipState(value, { skillsRoot })) throw stateError("ownership_state_invalid");
-      return withStateLock(stateDir, async () => {
+      return withStateLock(stateDir, fsApi, async () => {
         const current = await loadUnlocked();
         const next = { ...structuredClone(value), generation: current.generation + 1 };
         await writeUnlocked(next);

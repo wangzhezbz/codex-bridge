@@ -1,4 +1,5 @@
 import path from "node:path";
+import { isValidActiveTask } from "./ownership-task-schema.mjs";
 
 const SKILL_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const WINDOWS_MAX_PATH_WITHOUT_TERMINATOR = 259;
@@ -151,10 +152,6 @@ function isSkillRecordMap(value, skillsRoot) {
   });
 }
 
-function isTaskRecord(value) {
-  return value === null || (isPlainObject(value) && isJsonValue(value));
-}
-
 export function isValidOwnershipState(value, { skillsRoot } = {}) {
   if (!isPlainObject(value) || Object.keys(value).length !== OWNERSHIP_KEYS.length
     || !OWNERSHIP_KEYS.every((key) => Object.hasOwn(value, key))) return false;
@@ -168,8 +165,8 @@ export function isValidOwnershipState(value, { skillsRoot } = {}) {
     && isSkillRecordMap(value.skills, skillsRoot)
     && Array.isArray(value.shortcuts) && value.shortcuts.every((record) => isPathRecord(record, "path"))
     && validRollback
-    && isTaskRecord(value.activeTask)
-    && isTaskRecord(value.lastTask);
+    && isValidActiveTask(value.activeTask, { ownership: value, skillsRoot })
+    && (value.lastTask === null || (isPlainObject(value.lastTask) && isJsonValue(value.lastTask)));
 }
 
 export async function validateInstallRoot({ candidate, env = {}, maxRelativePath, access }) {

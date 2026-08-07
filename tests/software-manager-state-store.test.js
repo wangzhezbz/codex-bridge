@@ -5,6 +5,7 @@ import test from "node:test";
 import { createOwnershipStore } from "../desktop/software-manager/state-store.mjs";
 
 const CANONICAL_SKILLS_ROOT = "C:\\Users\\me\\.codex\\skills";
+const testStateLock = async () => ({ async release() {} });
 
 function state(installRoot = "C:\\Tools\\CodexBridge") {
   return {
@@ -22,6 +23,12 @@ function state(installRoot = "C:\\Tools\\CodexBridge") {
 
 function committed(value, generation) {
   return { ...structuredClone(value), generation };
+}
+
+function legacyState(value = state()) {
+  const legacy = structuredClone(value);
+  delete legacy.generation;
+  return legacy;
 }
 
 function createMemoryStateFs(initial = {}) {
@@ -52,6 +59,11 @@ function createMemoryStateFs(initial = {}) {
   }
 
   const fsApi = {
+    async acquireStateLockNoFollow() {
+      calls.push(["acquire-state-lock"]);
+      let released = false;
+      return { async release() { assert.equal(released, false); released = true; calls.push(["release-state-lock"]); } };
+    },
     async openStateDirectoryNoFollow(stateDir) {
       calls.push(["open-directory-no-follow", stateDir]);
       return {
@@ -104,6 +116,52 @@ test("missing or corrupt ownership state falls back to an empty schema", async (
   assert.deepEqual(await store.load(), state(null));
 });
 
+test("a strict legacy eight-field main ownership file migrates to generation zero and is atomically published", async () => {
+  const legacy = legacyState(state("C:\\Legacy"));
+  const memory = createMemoryStateFs({ "ownership.json": JSON.stringify(legacy) });
+  const store = createOwnershipStore({ stateDir: path.resolve("legacy-main"), fsApi: memory.fsApi });
+  const loaded = await store.load();
+  assert.deepEqual(loaded, { ...legacy, generation: 0 });
+  assert.deepEqual(JSON.parse(memory.get("ownership.json")), loaded);
+  assert.equal(memory.calls.some((call) => call[0] === "rename-entry-no-follow"
+    && call[1] === "ownership.json.tmp" && call[2] === "ownership.json"), true);
+});
+
+test("legacy backup fallback migrates atomically without treating the old schema as empty", async () => {
+  const legacy = legacyState(state("C:\\LegacyBackup"));
+  const memory = createMemoryStateFs({
+    "ownership.json": "{broken",
+    "ownership.json.bak": JSON.stringify(legacy),
+  });
+  const store = createOwnershipStore({ stateDir: path.resolve("legacy-backup"), fsApi: memory.fsApi });
+  assert.deepEqual(await store.load(), { ...legacy, generation: 0 });
+  assert.deepEqual(JSON.parse(memory.get("ownership.json")), { ...legacy, generation: 0 });
+});
+
+test("legacy ownership preserves a known active transaction during migration", async () => {
+  const current = state("D:\\CBApps");
+  current.components.chatgpt = { managed: true, installPath: "D:\\CBApps\\c", version: "1.0.0" };
+  current.activeTask = {
+    kind: "component-uninstall", taskId: "legacy-uninstall", componentId: "chatgpt", rootPath: "D:\\CBApps",
+  };
+  const legacy = legacyState(current);
+  const memory = createMemoryStateFs({ "ownership.json": JSON.stringify(legacy) });
+  const store = createOwnershipStore({ stateDir: path.resolve("legacy-active"), fsApi: memory.fsApi });
+  const loaded = await store.load();
+  assert.deepEqual(loaded.activeTask, current.activeTask);
+  assert.equal(loaded.generation, 0);
+});
+
+test("unknown or extra legacy fields fail closed and are never replaced with an empty ownership file", async () => {
+  const unknown = { ...legacyState(state("C:\\Legacy")), surprise: true };
+  const serialized = JSON.stringify(unknown);
+  const memory = createMemoryStateFs({ "ownership.json": serialized });
+  const store = createOwnershipStore({ stateDir: path.resolve("legacy-invalid"), fsApi: memory.fsApi });
+  await assert.rejects(store.load(), /ownership_state_invalid/u);
+  assert.equal(memory.get("ownership.json"), serialized);
+  assert.equal(memory.calls.some(([operation]) => ["write", "unlink-entry-no-follow", "rename-entry-no-follow"].includes(operation)), false);
+});
+
 test("save flushes ownership.json.tmp and atomically renames it", async () => {
   const memory = createMemoryStateFs();
   const calls = memory.calls;
@@ -152,6 +210,7 @@ test("load falls back to a validated backup after interrupted atomic rename", as
 
 test("state files that are links or reparse points are never followed", async () => {
   const fsApi = {
+    acquireStateLockNoFollow: testStateLock,
     async openStateDirectoryNoFollow() {
       throw Object.assign(new Error("state_reparse_point"), { code: "state_reparse_point" });
     },
@@ -164,7 +223,7 @@ test("save rejects malformed state before writing", async () => {
   let touched = false;
   const store = createOwnershipStore({
     stateDir: path.resolve("state"),
-    fsApi: { async openStateDirectoryNoFollow() { touched = true; } },
+    fsApi: { acquireStateLockNoFollow: testStateLock, async openStateDirectoryNoFollow() { touched = true; } },
   });
   await assert.rejects(store.save({ schemaVersion: 1 }), { code: "ownership_state_invalid" });
   assert.equal(touched, false);
@@ -175,6 +234,13 @@ test("fails closed when state fsApi has no stable no-follow capability", () => {
     stateDir: path.resolve("state"),
     fsApi: {},
   }), /no.follow|capability/i);
+});
+
+test("state store fails closed when only a process-local queue exists without an OS lock capability", () => {
+  assert.throws(() => createOwnershipStore({
+    stateDir: path.resolve("state"),
+    fsApi: { async openStateDirectoryNoFollow() {} },
+  }), /state_lock_capability_required/u);
 });
 
 test("reads through a stable handle when the state path is replaced after open", async () => {
@@ -201,6 +267,7 @@ for (const code of ["state_directory_reparse_point", "ancestor_reparse_point"]) 
     const store = createOwnershipStore({
       stateDir: path.resolve("state", "nested"),
       fsApi: {
+        acquireStateLockNoFollow: testStateLock,
         async openStateDirectoryNoFollow() { throw Object.assign(new Error(code), { code }); },
       },
     });
@@ -255,11 +322,11 @@ for (const [label, buildState] of malformedNestedStateCases) {
   });
 }
 
-test("malformed persisted nested state safely degrades without mutation", async () => {
+test("malformed persisted nested state fails closed without mutation", async () => {
   const malformed = { ...state(), components: { app: "C:\\Windows" } };
   const memory = createMemoryStateFs({ "ownership.json": JSON.stringify(malformed) });
   const store = createOwnershipStore({ stateDir: path.resolve("state"), fsApi: memory.fsApi });
-  assert.deepEqual(await store.load(), state(null));
+  await assert.rejects(store.load(), { code: "ownership_state_invalid" });
   assert.equal(memory.calls.some(([operation]) => ["write", "unlink-entry-no-follow", "rename-entry-no-follow"].includes(operation)), false);
 });
 
@@ -270,7 +337,8 @@ test("retains JSON metadata while only fixed path fields define ownership record
     skills: { documents: { sha256: "C:\\Windows", target: "C:\\Owned\\skills\\documents" } },
     shortcuts: [{ message: "C:\\Windows", path: "C:\\Owned\\shortcut.lnk" }],
     rollback: [{ path: "C:\\Owned\\rollback", reason: "update" }],
-    activeTask: { message: "C:\\Windows", progress: 50 },
+    activeTask: null,
+    lastTask: { message: "C:\\Windows", progress: 50 },
   };
   const memory = createMemoryStateFs();
   const store = createOwnershipStore({
@@ -307,7 +375,7 @@ test("store fails closed for Skill ownership without an injected canonical Skill
   const store = createOwnershipStore({ stateDir: path.resolve("state"), fsApi: memory.fsApi });
 
   await assert.rejects(store.save(withSkill), { code: "ownership_state_invalid" });
-  assert.deepEqual(await store.load(), state(null));
+  await assert.rejects(store.load(), { code: "ownership_state_invalid" });
   assert.equal(memory.calls.some(([operation]) => ["write", "unlink-entry-no-follow", "rename-entry-no-follow"].includes(operation)), false);
 });
 
@@ -330,7 +398,7 @@ for (const [label, target] of [
     });
 
     await assert.rejects(store.save(invalid), { code: "ownership_state_invalid" });
-    assert.deepEqual(await store.load(), state(null));
+    await assert.rejects(store.load(), { code: "ownership_state_invalid" });
     assert.equal(memory.calls.some(([operation]) => ["write", "unlink-entry-no-follow", "rename-entry-no-follow"].includes(operation)), false);
   });
 }
@@ -355,7 +423,7 @@ for (const [label, unsafePath] of unsafeOwnershipStatePaths) {
     assert.deepEqual(memory.calls, []);
 
     memory.replace("ownership.json", JSON.stringify(invalid));
-    assert.deepEqual(await store.load(), state(null));
+    await assert.rejects(store.load(), { code: "ownership_state_invalid" });
     assert.equal(memory.calls.some(([operation]) => ["write", "unlink-entry-no-follow", "rename-entry-no-follow"].includes(operation)), false);
   });
 }

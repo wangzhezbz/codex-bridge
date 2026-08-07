@@ -218,6 +218,26 @@ function capabilities(fake, randomUUID = () => "00000000-0000-4000-8000-00000000
   });
 }
 
+test("Windows ownership lock uses an exclusive no-follow handle and becomes available after release", async () => {
+  const fake = createFakeNative([{ path: "C:\\state", kind: "directory" }]);
+  const fileCapabilities = capabilities(fake);
+  const first = await fileCapabilities.acquireStateLockNoFollow("C:\\state");
+  let secondAcquired = false;
+  const secondPromise = fileCapabilities.acquireStateLockNoFollow("C:\\state").then((lock) => {
+    secondAcquired = true;
+    return lock;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(secondAcquired, false);
+  await first.release();
+  const second = await secondPromise;
+  assert.equal(secondAcquired, true);
+  await second.release();
+  const lockOpens = fake.calls.filter((call) => call[0] === "open"
+    && call[1] === "C:\\state\\.codexbridge-ownership.lock");
+  assert.equal(lockOpens.some((call) => call[2].share.length === 0), true);
+});
+
 test("native Windows file adapters reject non-Windows construction before loading native code", () => {
   let nativeTouched = false;
   assert.throws(

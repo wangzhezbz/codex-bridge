@@ -8,6 +8,7 @@ const MAX_STATE_BYTES = 16 * 1_024 * 1_024;
 const MAX_ARCHIVE_BYTES = 16 * 1_024 * 1_024 * 1_024;
 const MAX_PATH_CHARS = 32_760;
 const VERSION_MARKER_NAME = ".codexbridge-version.json";
+const STATE_LOCK_NAME = ".codexbridge-ownership.lock";
 const COMPONENT_IDS = new Set(["chatgpt", "v2rayn", "git"]);
 const VERSION = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
@@ -44,6 +45,10 @@ function isMissing(error) {
 function isOccupied(error) {
   return error?.code === "entry_exists" || error?.code === "EEXIST"
     || error?.nativeCode === 80 || error?.nativeCode === 183;
+}
+
+function isSharingViolation(error) {
+  return error?.code === "sharing_violation" || error?.nativeCode === 32 || error?.nativeCode === 33;
 }
 
 function validateSegment(segment, code = "windows_path_segment_rejected") {
@@ -463,6 +468,40 @@ export function createWindowsFileCapabilities({
 
   async function openStateDirectoryNoFollow(stateDir) {
     return openRecordDirectoryNoFollow(stateDir);
+  }
+
+  async function acquireStateLockNoFollow(stateDir) {
+    const lockPath = ensureDirectChild(validateAbsolute(stateDir), STATE_LOCK_NAME);
+    const deadline = Date.now() + 30_000;
+    for (;;) {
+      let pin;
+      try {
+        try {
+          pin = await openPinnedPath(nativeApi, lockPath, {
+            kind: "file", access: ["read", "write", "attributes"], share: [], disposition: "createNew",
+          });
+        } catch (error) {
+          if (!isOccupied(error)) throw error;
+          pin = await openPinnedPath(nativeApi, lockPath, {
+            kind: "file", access: ["read", "write", "attributes"], share: [], disposition: "openExisting",
+          });
+        }
+        if (pin.leaf.info.nlink !== 1) throw capabilityError("windows_hard_link_rejected");
+        let released = false;
+        return Object.freeze({
+          async release() {
+            if (released) throw capabilityError("state_lock_already_released");
+            released = true;
+            await closeOwner(nativeApi, pin.owner);
+          },
+        });
+      } catch (error) {
+        if (pin) await closeOwner(nativeApi, pin.owner).catch(() => {});
+        if (!isSharingViolation(error)) throw error;
+        if (Date.now() >= deadline) throw capabilityError("state_lock_timeout", error);
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
   }
 
   async function openJournalDirectoryNoFollow(journalDir) {
@@ -1442,6 +1481,7 @@ export function createWindowsFileCapabilities({
   }
 
   return Object.freeze({
+    acquireStateLockNoFollow,
     openStateDirectoryNoFollow,
     openJournalDirectoryNoFollow,
     openDirectoryNoFollow,

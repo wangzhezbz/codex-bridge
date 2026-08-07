@@ -74,3 +74,62 @@ test("a persisted claim is visible to a newly acquired coordinator transaction a
   assert.deepEqual(recovered.activeTask, { kind: "git-install", taskId: "persisted" });
   assert.equal(recovered.generation, 1);
 });
+
+test("a detached promise cannot use the expired transaction store after the outer callback returns", async () => {
+  const store = storeFixture();
+  const coordinator = getOwnershipCoordinator(store);
+  let detached;
+  await coordinator.runExclusive(async (transactionStore) => {
+    detached = Promise.resolve().then(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return transactionStore.load();
+    });
+  });
+  await assert.rejects(detached, /ownership_transaction_required/u);
+});
+
+test("a detached timer reentry queues behind the next live transaction instead of inheriting the old lease", async () => {
+  const store = storeFixture();
+  const coordinator = getOwnershipCoordinator(store);
+  let triggerTimer;
+  let detached;
+  await coordinator.runExclusive(async () => {
+    detached = new Promise((resolve) => { triggerTimer = () => setTimeout(resolve, 0); })
+      .then(() => coordinator.runExclusive(async () => "detached-entered"));
+  });
+  let releaseSecond;
+  const second = coordinator.runExclusive(async () => {
+    await new Promise((resolve) => { releaseSecond = resolve; });
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  triggerTimer();
+  let detachedEntered = false;
+  detached.then(() => { detachedEntered = true; });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(detachedEntered, false);
+  releaseSecond();
+  await second;
+  assert.equal(await detached, "detached-entered");
+});
+
+test("a captured progress callback invoked after release also queues behind the current transaction", async () => {
+  const store = storeFixture();
+  const coordinator = getOwnershipCoordinator(store);
+  let progress;
+  await coordinator.runExclusive(async () => {
+    progress = () => coordinator.runExclusive(async () => "progress-entered");
+  });
+  let releaseSecond;
+  const second = coordinator.runExclusive(async () => {
+    await new Promise((resolve) => { releaseSecond = resolve; });
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const progressResult = progress();
+  let entered = false;
+  progressResult.then(() => { entered = true; });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(entered, false);
+  releaseSecond();
+  await second;
+  assert.equal(await progressResult, "progress-entered");
+});

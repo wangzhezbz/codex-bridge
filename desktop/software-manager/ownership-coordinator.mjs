@@ -26,12 +26,16 @@ export function getOwnershipCoordinator(ownershipStore) {
   const transactionStore = Object.freeze({
     async load() {
       const context = TRANSACTION_CONTEXT.getStore();
-      if (context?.coordinator !== coordinator) throw coordinatorError("ownership_transaction_required");
+      if (context?.coordinator !== coordinator || context.lease?.active !== true) {
+        throw coordinatorError("ownership_transaction_required");
+      }
       return structuredClone(context.state);
     },
     async save(next) {
       const context = TRANSACTION_CONTEXT.getStore();
-      if (context?.coordinator !== coordinator) throw coordinatorError("ownership_transaction_required");
+      if (context?.coordinator !== coordinator || context.lease?.active !== true) {
+        throw coordinatorError("ownership_transaction_required");
+      }
       if (!next || typeof next !== "object" || Array.isArray(next)) {
         throw coordinatorError("ownership_transaction_state_invalid");
       }
@@ -49,20 +53,22 @@ export function getOwnershipCoordinator(ownershipStore) {
   async function runExclusive(action) {
     if (typeof action !== "function") throw coordinatorError("ownership_transaction_action_invalid");
     const inherited = TRANSACTION_CONTEXT.getStore();
-    if (inherited?.coordinator === coordinator) return action(transactionStore);
+    if (inherited?.coordinator === coordinator && inherited.lease?.active === true) return action(transactionStore);
     const previous = queue;
     let release;
     const gate = new Promise((resolve) => { release = resolve; });
     queue = previous.then(() => gate, () => gate);
     await previous.catch(() => {});
+    const lease = { active: true };
     try {
       const loaded = await ownershipStore.load();
       if (!validGeneration(loaded?.generation)) throw coordinatorError("ownership_generation_invalid");
       return await TRANSACTION_CONTEXT.run(
-        { coordinator, state: structuredClone(loaded) },
+        { coordinator, state: structuredClone(loaded), lease },
         () => action(transactionStore),
       );
     } finally {
+      lease.active = false;
       release();
     }
   }
