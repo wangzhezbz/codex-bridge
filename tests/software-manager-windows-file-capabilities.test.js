@@ -1813,15 +1813,17 @@ test("shortcut removeExact failure closes both held handles and aggregates close
 test("thin Win32 layer binds fixed Kernel32 and Ntdll APIs with a relative held-parent rename", async () => {
   const bindings = [];
   const createCalls = [];
+  const createDirectoryCalls = [];
   const setInfoCalls = [];
   const ntSetInfoCalls = [];
   let ntStatus = 0;
   const finalPaths = new Map([
-    [42n, "C:\\safe\\source.part"],
-    [99n, "C:\\safe"],
+    [42n, "\\\\?\\C:\\safe\\source.part"],
+    [99n, "\\\\?\\C:\\safe"],
   ]);
   const stubs = new Map([
     ["CreateFileW", (...args) => { createCalls.push(args); return 42n; }],
+    ["CreateDirectoryW", (...args) => { createDirectoryCalls.push(args); return 1; }],
     ["CloseHandle", () => 1],
     ["GetLastError", () => 0],
     ["SetFileInformationByHandle", (...args) => { setInfoCalls.push(args); return 1; }],
@@ -1858,6 +1860,7 @@ test("thin Win32 layer binds fixed Kernel32 and Ntdll APIs with a relative held-
   });
   assert.equal(handle, 42n);
   assert.equal(createCalls[0][0], "\\\\?\\C:\\safe");
+  assert.equal(api.finalPath(handle), "C:\\safe\\source.part");
   assert.equal(createCalls[0][5] & 0x00200000, 0x00200000);
   assert.equal(createCalls[0][5] & 0x02000000, 0x02000000);
   assert.equal(createCalls[0][1] & 0x20, 0x20);
@@ -1868,6 +1871,8 @@ test("thin Win32 layer binds fixed Kernel32 and Ntdll APIs with a relative held-
   });
   assert.equal(createCalls[1][5] & 0x04000000, 0x04000000);
   assert.equal(createCalls[1][2], 0);
+  api.createDirectory("C:\\safe\\child");
+  assert.deepEqual(createDirectoryCalls, [["\\\\?\\C:\\safe\\child", null]]);
   await api.renameByHandle(42n, 99n, "target.lnk", { replace: false });
   ntStatus = -1073741771;
   assert.throws(
@@ -1900,6 +1905,89 @@ test("thin Win32 layer binds fixed Kernel32 and Ntdll APIs with a relative held-
     "FlushFileBuffers", "CreateDirectoryW", "SetFileInformationByHandle",
     "NtSetInformationFile", "RtlNtStatusToDosError",
   ]);
+});
+
+test("thin Win32 path prefixing accepts only canonical drive paths and counts UTF-16 units", () => {
+  const created = [];
+  const koffi = {
+    load() {
+      return {
+        func(...definition) {
+          const name = definition[1];
+          if (name === "CreateDirectoryW") {
+            return (exactPath) => { created.push(exactPath); return 1; };
+          }
+          return () => 1;
+        },
+      };
+    },
+    sizeof(type) { return type === "intptr_t" ? 8 : 4; },
+  };
+  const api = createWin32FileApi({ platform: "win32", koffi });
+
+  for (const candidate of [
+    "C:\\safe\\..\\escape",
+    "C:\\safe\\.\\child",
+    "C:\\safe\\\\child",
+    "C:\\safe\\",
+    "C:\\safe\\trailing.",
+    "C:\\safe\\trailing ",
+    "C:\\safe\\CON",
+    "C:\\safe\\nul.txt",
+    "C:\\safe\\COM1",
+    "C:\\safe\\LPT9.log",
+    "C:\\safe\\wild*card",
+    "C:\\safe\\wild?card",
+    "C:\\safe\\alternate:data",
+    "C:\\safe\\control\u0001name",
+    `C:\\safe\\${"x".repeat(256)}`,
+    "C:/safe/child",
+    "C:safe\\child",
+    "\\\\server\\share\\child",
+    "\\\\?\\C:\\safe\\child",
+    "\\\\.\\C:\\safe\\child",
+  ]) {
+    assert.throws(() => api.createDirectory(candidate), /windows_path_(?:absolute_required|not_canonical)/u);
+  }
+
+  const maximumPath = `C:\\${[
+    ...Array.from({ length: 127 }, () => "a".repeat(255)),
+    "\ud83d\ude00".repeat(124),
+  ].join("\\")}`;
+  assert.equal(maximumPath.length, 32_763);
+  api.createDirectory(maximumPath);
+  assert.equal(created.at(-1).startsWith("\\\\?\\C:\\"), true);
+  assert.equal(created.at(-1).length + 1, 32_768);
+
+  assert.throws(
+    () => api.createDirectory(`${maximumPath}a`),
+    (error) => error?.code === "native_path_buffer_exceeded",
+  );
+});
+
+test("native error 206 is reported as path-too-long rather than missing", () => {
+  const koffi = {
+    load() {
+      return {
+        func(...definition) {
+          const name = definition[1];
+          if (name === "CreateFileW") return () => -1n;
+          if (name === "GetLastError") return () => 206;
+          return () => 1;
+        },
+      };
+    },
+    sizeof(type) { return type === "intptr_t" ? 8 : 4; },
+  };
+  const api = createWin32FileApi({ platform: "win32", koffi });
+  assert.throws(
+    () => api.openPath("C:\\safe\\child", {
+      access: ["read"], share: ["read"], disposition: "openExisting", directory: false,
+    }),
+    (error) => error?.code === "windows_path_too_long"
+      && error?.nativeCode === 206
+      && error?.operation === "CreateFileW",
+  );
 });
 
 test("thin Win32 layer gets a strict system directory through GetSystemDirectoryW", () => {

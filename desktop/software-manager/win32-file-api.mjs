@@ -24,6 +24,7 @@ const FILE_DISPOSITION_INFO = 4;
 const MAX_NATIVE_PATH_CHARS = 32_768;
 const NATIVE_ENUM_BUFFER_BYTES = 64 * 1_024;
 const MAX_NATIVE_READ_CHUNK_BYTES = 1_024 * 1_024;
+const RESERVED_DOS_NAME = /^(?:con|prn|aux|nul|com[1-9\u00b9\u00b2\u00b3]|lpt[1-9\u00b9\u00b2\u00b3])(?:\.|$)/iu;
 
 function win32Error(code, operation, nativeCode) {
   const error = new Error(code);
@@ -45,10 +46,25 @@ function mapNativeCode(nativeCode) {
 
 function toExtendedPath(exactPath) {
   if (typeof exactPath !== "string" || !/^[A-Za-z]:\\/u.test(exactPath)
-    || exactPath.startsWith("\\\\?\\") || exactPath.length >= MAX_NATIVE_PATH_CHARS - 4) {
+    || exactPath.startsWith("\\\\?\\") || exactPath.startsWith("\\\\.\\")
+    || exactPath.includes("/") || exactPath.includes("\0")) {
     throw win32Error("windows_path_absolute_required");
   }
-  return `\\\\?\\${exactPath}`;
+  if (path.win32.normalize(exactPath) !== exactPath || exactPath.normalize("NFC") !== exactPath) {
+    throw win32Error("windows_path_not_canonical");
+  }
+  const tail = exactPath.slice(path.win32.parse(exactPath).root.length);
+  const segments = tail.length === 0 ? [] : tail.split("\\");
+  if (segments.some((segment) => segment.length === 0 || segment.length > 255
+    || /[<>:"|?*\u0000-\u001f]/u.test(segment) || /[ .]$/u.test(segment)
+    || RESERVED_DOS_NAME.test(segment))) {
+    throw win32Error("windows_path_not_canonical");
+  }
+  const nativePath = `\\\\?\\${exactPath}`;
+  if (nativePath.length + 1 > MAX_NATIVE_PATH_CHARS) {
+    throw win32Error("native_path_buffer_exceeded");
+  }
+  return nativePath;
 }
 
 function maskFrom(values, table, code) {
