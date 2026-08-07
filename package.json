@@ -33,8 +33,9 @@
     "check:history-worker": "node --check src/history-sqlite-worker.js",
     "check:model-selection": "node --check src/codex-model-selection.js && node --check tests/codex-model-selection.test.js",
     "check:software-manager-catalog": "node --check shared/software-manager/catalog-schema.mjs && node --check desktop/software-manager/catalog-public-key.mjs && node --check desktop/software-manager/catalog-trust.mjs && node --check tests/software-manager-catalog.test.js && node --test tests/software-manager-catalog.test.js",
+    "check:software-manager-win32": "node --test tests/software-manager-win32-long-path-smoke.test.js",
     "check:anthropic": "node --check src/anthropic-messages.js && node --check tests/anthropic-messages.test.js",
-    "check": "npm run check:history-worker && npm run check:model-selection && npm run check:software-manager-catalog && npm run check:syntax && npm run check:chrome-extension-manager && npm run check:anthropic && npm run test:router && npm run test:desktop && npm run test:recovery",
+    "check": "npm run check:history-worker && npm run check:model-selection && npm run check:software-manager-catalog && npm run check:software-manager-win32 && npm run check:syntax && npm run check:chrome-extension-manager && npm run check:anthropic && npm run test:router && npm run test:desktop && npm run test:recovery",
     "check:chrome-extension-manager": "node --check desktop/chrome-extension-manager.cjs && node --check tests/desktop-chrome-extension-manager.test.js"
   },
   "devDependencies": {

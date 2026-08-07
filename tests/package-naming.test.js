@@ -139,6 +139,34 @@ test("project and Windows CI gates include the complete desktop refresh flow", (
   );
 });
 
+test("Windows release gate transitively runs the real Electron long-path smoke", () => {
+  const packageJson = JSON.parse(
+    fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8"),
+  );
+  const workflow = fs.readFileSync(
+    path.join(process.cwd(), ".github", "workflows", "desktop-portable.yml"),
+    "utf8",
+  );
+  const smokeGate = packageJson.scripts["check:software-manager-win32"];
+
+  assert.equal(typeof smokeGate, "string", "the Win32 smoke must have a fixed npm gate");
+  assert.match(
+    smokeGate,
+    /node --test tests\/software-manager-win32-long-path-smoke\.test\.js/u,
+    "the fixed gate must execute the real Electron >260 path lifecycle test",
+  );
+  assert.match(
+    packageJson.scripts.check,
+    /npm run check:software-manager-win32/u,
+    "the full project check must retain the Win32 smoke gate",
+  );
+  assert.match(
+    workflow,
+    /jobs:\s+windows:[\s\S]*?- name: Run full project check[\s\S]*?run: npm run check[\s\S]*?\n  macos:/u,
+    "the Windows release workflow must retain the full project check before packaging",
+  );
+});
+
 test("embedded Bridge model selector omits GPT from labels without changing model values", () => {
   const html = fs.readFileSync(
     path.join(process.cwd(), "vendor", "chatgpt-codex-bridge", "public", "index.html"),
