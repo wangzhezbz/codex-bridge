@@ -58,8 +58,8 @@ test("V2RayN fixed URL publishes only when inspected content changes", async () 
       assert.match(packagePath, /\.part$/u);
       return {
         version: "7.20.4",
-        entrypoint: "v2rayN.exe",
-        requiredFiles: ["v2rayN.exe", "bin/xray.exe"],
+        entrypoint: "v2rayn/v2rayN.exe",
+        requiredFiles: ["v2rayn/v2rayN.exe", "v2rayn/bin/xray.exe"],
         maxRelativePathLength: 12,
       };
     },
@@ -67,6 +67,7 @@ test("V2RayN fixed URL publishes only when inspected content changes", async () 
   assert.equal(result.action, "noop");
   assert.equal(result.reason, "content_unchanged");
   assert.equal(result.version, "7.20.4");
+  assert.equal(result.entrypoint, "v2rayn/v2rayN.exe");
   assert.equal(calls[0][0], V2RAYN_PACKAGE_URL);
   assert.equal(calls[0][1].redirect, "follow");
 });
@@ -98,6 +99,41 @@ test("cross-platform PE inspection reads the fixed file version without PowerShe
   bytes.writeUInt32LE((4 << 16) | 9, 44);
   assert.equal(readPeFileVersion(bytes), "7.20.4.9");
   assert.throws(() => readPeFileVersion(Buffer.alloc(32)), /software_sync_pe_version_missing/);
+});
+
+test("PE inspection reads the outer executable version resource instead of an embedded runtime decoy", () => {
+  const bytes = Buffer.alloc(1024);
+  bytes.writeUInt32LE(0xfeef04bd, 32);
+  bytes.writeUInt32LE(0x00010000, 36);
+  bytes.writeUInt32LE((10 << 16) | 0, 40);
+  bytes.writeUInt32LE((1026 << 16) | 32716, 44);
+  bytes.writeUInt32LE(0x80, 0x3c);
+  bytes.write("PE\0\0", 0x80, "binary");
+  bytes.writeUInt16LE(1, 0x86);
+  bytes.writeUInt16LE(0xf0, 0x94);
+  bytes.writeUInt16LE(0x20b, 0x98);
+  bytes.writeUInt32LE(0x1000, 0x118);
+  bytes.writeUInt32LE(0x200, 0x11c);
+  bytes.writeUInt32LE(0x200, 0x190);
+  bytes.writeUInt32LE(0x1000, 0x194);
+  bytes.writeUInt32LE(0x200, 0x198);
+  bytes.writeUInt32LE(0x200, 0x19c);
+  bytes.writeUInt16LE(1, 0x20e);
+  bytes.writeUInt32LE(16, 0x210);
+  bytes.writeUInt32LE(0x80000020, 0x214);
+  bytes.writeUInt16LE(1, 0x22e);
+  bytes.writeUInt32LE(1, 0x230);
+  bytes.writeUInt32LE(0x80000040, 0x234);
+  bytes.writeUInt16LE(1, 0x24e);
+  bytes.writeUInt32LE(0x409, 0x250);
+  bytes.writeUInt32LE(0x60, 0x254);
+  bytes.writeUInt32LE(0x1080, 0x260);
+  bytes.writeUInt32LE(64, 0x264);
+  bytes.writeUInt32LE(0xfeef04bd, 0x290);
+  bytes.writeUInt32LE(0x00010000, 0x294);
+  bytes.writeUInt32LE((7 << 16) | 24, 0x298);
+  bytes.writeUInt32LE((5 << 16) | 0, 0x29c);
+  assert.equal(readPeFileVersion(bytes), "7.24.5.0");
 });
 
 test("Git sync selects only the official x64 installer and requires Valid Authenticode", async () => {

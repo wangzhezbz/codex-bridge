@@ -72,19 +72,24 @@ export async function downloadToPart({ url, fetchImpl = globalThis.fetch, workRo
   return Object.freeze({ packagePath, size, sha256: hash.digest("hex"), sourceUrl: url });
 }
 
+function safeArchiveRelative(value) {
+  return typeof value === "string" && value.length > 0 && !value.includes("\\") && !value.startsWith("/")
+    && value.split("/").every((part) => part && part !== "." && part !== "..");
+}
+
 function validateInspection(value) {
-  if (!value || !VERSION.test(value.version ?? "") || value.entrypoint !== "v2rayN.exe"
-    || !Array.isArray(value.requiredFiles) || !value.requiredFiles.includes("v2rayN.exe")
-    || value.requiredFiles.some((item) => typeof item !== "string" || !item || item.includes("\\") || item.includes(".."))
+  if (!value || !VERSION.test(value.version ?? "") || !safeArchiveRelative(value.entrypoint)
+    || !/(?:^|\/)v2rayN\.exe$/u.test(value.entrypoint)
+    || !Array.isArray(value.requiredFiles) || !value.requiredFiles.includes(value.entrypoint)
+    || value.requiredFiles.some((item) => !safeArchiveRelative(item))
     || !Number.isSafeInteger(value.maxRelativePathLength) || value.maxRelativePathLength < 1) {
     throw syncError("software_sync_v2rayn_inspection_invalid");
   }
   return value;
 }
 
-export function readPeFileVersion(bytes) {
-  const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes ?? []);
-  for (let offset = 0; offset + 16 <= buffer.length; offset += 1) {
+function scanFixedFileVersion(buffer, start = 0, end = buffer.length) {
+  for (let offset = start; offset + 16 <= end; offset += 1) {
     if (buffer.readUInt32LE(offset) !== 0xfeef04bd || buffer.readUInt32LE(offset + 4) !== 0x00010000) continue;
     const versionMs = buffer.readUInt32LE(offset + 8);
     const versionLs = buffer.readUInt32LE(offset + 12);
@@ -92,6 +97,86 @@ export function readPeFileVersion(bytes) {
     if (parts.every((value) => value === 0)) continue;
     return parts.join(".");
   }
+  return null;
+}
+
+function rangeFits(buffer, offset, size) {
+  return Number.isSafeInteger(offset) && Number.isSafeInteger(size) && offset >= 0 && size >= 0
+    && offset <= buffer.length && size <= buffer.length - offset;
+}
+
+function readPeResourceFileVersion(buffer) {
+  if (!rangeFits(buffer, 0x3c, 4)) return null;
+  const peOffset = buffer.readUInt32LE(0x3c);
+  if (!rangeFits(buffer, peOffset, 24) || buffer.toString("binary", peOffset, peOffset + 4) !== "PE\0\0") return null;
+  const sectionCount = buffer.readUInt16LE(peOffset + 6);
+  const optionalSize = buffer.readUInt16LE(peOffset + 20);
+  if (sectionCount < 1 || sectionCount > 96) return null;
+  const optionalOffset = peOffset + 24;
+  if (!rangeFits(buffer, optionalOffset, optionalSize)) return null;
+  const magic = buffer.readUInt16LE(optionalOffset);
+  const dataDirectoryOffset = magic === 0x20b ? optionalOffset + 112 : magic === 0x10b ? optionalOffset + 96 : -1;
+  const resourceDirectoryEntry = dataDirectoryOffset + (2 * 8);
+  if (!rangeFits(buffer, resourceDirectoryEntry, 8)) return null;
+  const resourceRva = buffer.readUInt32LE(resourceDirectoryEntry);
+  if (!resourceRva) return null;
+  const sectionOffset = optionalOffset + optionalSize;
+  if (!rangeFits(buffer, sectionOffset, sectionCount * 40)) return null;
+
+  const rvaToOffset = (rva) => {
+    for (let index = 0; index < sectionCount; index += 1) {
+      const current = sectionOffset + (index * 40);
+      const virtualSize = buffer.readUInt32LE(current + 8);
+      const virtualAddress = buffer.readUInt32LE(current + 12);
+      const rawSize = buffer.readUInt32LE(current + 16);
+      const rawOffset = buffer.readUInt32LE(current + 20);
+      const span = Math.max(virtualSize, rawSize);
+      if (rva < virtualAddress || rva >= virtualAddress + span) continue;
+      const relative = rva - virtualAddress;
+      if (relative >= rawSize || !rangeFits(buffer, rawOffset + relative, 1)) return null;
+      return rawOffset + relative;
+    }
+    return null;
+  };
+
+  const resourceRoot = rvaToOffset(resourceRva);
+  if (resourceRoot === null) return null;
+  const entriesAt = (relativeOffset) => {
+    const directory = resourceRoot + relativeOffset;
+    if (!rangeFits(buffer, directory, 16)) return [];
+    const count = buffer.readUInt16LE(directory + 12) + buffer.readUInt16LE(directory + 14);
+    if (count < 1 || count > 4096 || !rangeFits(buffer, directory + 16, count * 8)) return [];
+    return Array.from({ length: count }, (_, index) => {
+      const entry = directory + 16 + (index * 8);
+      return { name: buffer.readUInt32LE(entry), target: buffer.readUInt32LE(entry + 4) };
+    });
+  };
+  const versionType = entriesAt(0).find((entry) => !(entry.name & 0x80000000) && (entry.name & 0xffff) === 16);
+  if (!versionType) return null;
+
+  const resolveData = (target, depth = 0) => {
+    if (depth > 4) return null;
+    if (target & 0x80000000) {
+      for (const entry of entriesAt(target & 0x7fffffff)) {
+        const resolved = resolveData(entry.target, depth + 1);
+        if (resolved) return resolved;
+      }
+      return null;
+    }
+    const dataEntry = resourceRoot + (target & 0x7fffffff);
+    if (!rangeFits(buffer, dataEntry, 16)) return null;
+    const dataOffset = rvaToOffset(buffer.readUInt32LE(dataEntry));
+    const dataSize = buffer.readUInt32LE(dataEntry + 4);
+    return dataOffset !== null && rangeFits(buffer, dataOffset, dataSize) ? [dataOffset, dataOffset + dataSize] : null;
+  };
+  const range = resolveData(versionType.target);
+  return range ? scanFixedFileVersion(buffer, range[0], range[1]) : null;
+}
+
+export function readPeFileVersion(bytes) {
+  const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes ?? []);
+  const version = readPeResourceFileVersion(buffer) ?? scanFixedFileVersion(buffer);
+  if (version) return version;
   throw syncError("software_sync_pe_version_missing");
 }
 
@@ -162,7 +247,7 @@ async function defaultArchiveInspector(packagePath) {
     });
     return {
       version: readPeFileVersion(fs.readFileSync(executable)),
-      entrypoint: "v2rayN.exe",
+      entrypoint: executableEntry[0],
       requiredFiles: paths,
       maxRelativePathLength: Math.max(...paths.map((value) => value.length)),
     };
