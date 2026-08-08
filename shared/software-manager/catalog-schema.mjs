@@ -4,6 +4,8 @@ export const MAX_SOFTWARE_PACKAGE_ENTRIES = 16_384;
 export const TEST_CATALOG_ORIGIN = "https://shanhaiyouling.com";
 export const TEST_CATALOG_PATH = "/codexbridge-install-test/component-catalog.json";
 export const TEST_PACKAGE_PATH = "/codexbridge-test/packages/";
+export const TEST_COS_PACKAGE_ORIGIN = "https://codex-1431412335.cos.ap-guangzhou.myqcloud.com";
+export const TEST_COS_PACKAGE_PATH = "/codexbridge-test/packages/";
 
 const COMPONENT_KEYS = new Set([
   "id", "name", "version", "architecture", "format", "assetUrl", "size", "sha256",
@@ -44,8 +46,11 @@ export function resolveCatalogAssetUrl(catalogUrl, assetUrl) {
   } catch {
     throw catalogError("catalog_asset_url_invalid");
   }
-  if (resolved.protocol !== "https:" || resolved.origin !== TEST_CATALOG_ORIGIN
-    || !resolved.pathname.startsWith(TEST_PACKAGE_PATH) || resolved.pathname === TEST_PACKAGE_PATH
+  const authorizedPackagePath = resolved.origin === TEST_CATALOG_ORIGIN
+    ? TEST_PACKAGE_PATH
+    : resolved.origin === TEST_COS_PACKAGE_ORIGIN ? TEST_COS_PACKAGE_PATH : null;
+  if (resolved.protocol !== "https:" || authorizedPackagePath === null
+    || !resolved.pathname.startsWith(authorizedPackagePath) || resolved.pathname === authorizedPackagePath
     || resolved.search || resolved.hash) {
     throw catalogError("catalog_asset_url_rejected");
   }

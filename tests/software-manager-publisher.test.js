@@ -13,6 +13,7 @@ import { publishImportedAssets } from "../scripts/software-manager/publish-impor
 import { publishSkills } from "../scripts/software-manager/publish-skills.mjs";
 
 const PACKAGE_BASE_URL = "https://shanhaiyouling.com/codexbridge-test/packages/";
+const COS_PACKAGE_BASE_URL = "https://codex-1431412335.cos.ap-guangzhou.myqcloud.com/codexbridge-test/packages/";
 const CATALOG_URL = "https://shanhaiyouling.com/codexbridge-install-test/component-catalog.json";
 
 function fixture() {
@@ -240,6 +241,29 @@ test("imported asset publisher verifies local immutable objects before signing",
   await assert.rejects(publishImportedAssets({
     config: loadPublisherConfig(value.env), metadataPath,
   }), /publisher_import_asset_verification_failed/);
+});
+
+test("imported asset publisher signs COS URLs only when matching local bytes exist", async () => {
+  const value = fixture();
+  const packageRoot = path.join(value.publicRoot, "packages");
+  fs.mkdirSync(packageRoot, { recursive: true });
+  const packageName = "chatgpt-1.2.3-x64-deadbeefcafe.zip";
+  const packagePath = path.join(packageRoot, packageName);
+  fs.writeFileSync(packagePath, "chatgpt-cos-package");
+  const bytes = fs.readFileSync(packagePath);
+  const metadataPath = path.join(value.root, "cos-import.json");
+  fs.writeFileSync(metadataPath, JSON.stringify({
+    component: {
+      id: "chatgpt", name: "ChatGPT", version: "1.2.3", architecture: "x64", format: "zip",
+      assetUrl: `${COS_PACKAGE_BASE_URL}${packageName}`, size: bytes.length,
+      sha256: crypto.createHash("sha256").update(bytes).digest("hex"), entrypoint: "ChatGPT.exe",
+      requiredFiles: ["ChatGPT.exe"], maxRelativePathLength: 11,
+      publishedAt: "2026-08-08T00:00:00.000Z", supportsRollback: true,
+    },
+    skills: [],
+  }));
+  const result = await publishImportedAssets({ config: loadPublisherConfig(value.env), metadataPath });
+  assert.equal(catalogEnvelope(result, value).components[0].assetUrl, `${COS_PACKAGE_BASE_URL}${packageName}`);
 });
 
 test("package.json exposes explicit manual ChatGPT and Skills publisher commands", () => {

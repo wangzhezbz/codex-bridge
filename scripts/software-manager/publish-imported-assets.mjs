@@ -8,6 +8,9 @@ import {
   resolveCatalogAssetUrl,
   TEST_CATALOG_ORIGIN,
   TEST_CATALOG_PATH,
+  TEST_COS_PACKAGE_ORIGIN,
+  TEST_COS_PACKAGE_PATH,
+  TEST_PACKAGE_PATH,
 } from "../../shared/software-manager/catalog-schema.mjs";
 import { readCurrentCatalog, replaceCatalogEntry, replaceSignedCatalog } from "./catalog-builder.mjs";
 import { loadPublisherConfig } from "./publisher-config.mjs";
@@ -44,11 +47,13 @@ function exactMetadata(value) {
 
 function localAssetPath(config, assetUrl) {
   const resolved = new URL(resolveCatalogAssetUrl(`${TEST_CATALOG_ORIGIN}${TEST_CATALOG_PATH}`, assetUrl));
-  const packageBase = new URL(config.packageBaseUrl);
-  if (resolved.origin !== packageBase.origin || !resolved.pathname.startsWith(packageBase.pathname)) {
+  const packagePath = resolved.origin === TEST_CATALOG_ORIGIN
+    ? TEST_PACKAGE_PATH
+    : resolved.origin === TEST_COS_PACKAGE_ORIGIN ? TEST_COS_PACKAGE_PATH : null;
+  if (packagePath === null || !resolved.pathname.startsWith(packagePath)) {
     throw importError("publisher_import_asset_url_invalid");
   }
-  const relative = decodeURIComponent(resolved.pathname.slice(packageBase.pathname.length));
+  const relative = decodeURIComponent(resolved.pathname.slice(packagePath.length));
   if (!relative || relative.includes("\\") || relative.split("/").some((part) => !part || part === "." || part === "..")) {
     throw importError("publisher_import_asset_url_invalid");
   }

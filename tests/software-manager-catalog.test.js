@@ -137,6 +137,15 @@ test("catalog rejects an external HTTPS asset URL", () => {
   assert.throws(() => parseCatalog({ schemaVersion: 1, components: [componentFixture({ assetUrl: "https://example.test/chatgpt.zip" })], skills: [] }), /asset_url/i);
 });
 
+test("catalog accepts only the isolated immutable COS package prefix", () => {
+  assert.equal(resolveCatalogAssetUrl(TEST_CATALOG_URL,
+    "https://codex-1431412335.cos.ap-guangzhou.myqcloud.com/codexbridge-test/packages/chatgpt-1.2.3.zip"),
+  "https://codex-1431412335.cos.ap-guangzhou.myqcloud.com/codexbridge-test/packages/chatgpt-1.2.3.zip");
+  assert.throws(() => resolveCatalogAssetUrl(TEST_CATALOG_URL,
+    "https://codex-1431412335.cos.ap-guangzhou.myqcloud.com/packages/chatgpt-1.2.3.zip"),
+  /catalog_asset_url_rejected/);
+});
+
 test("catalog rejects an asset in the old production path", () => {
   assert.throws(() => parseCatalog({ schemaVersion: 1, components: [componentFixture({ assetUrl: "https://shanhaiyouling.com/codexbridge-install/packages/chatgpt.zip" })], skills: [] }), /asset_url/i);
 });

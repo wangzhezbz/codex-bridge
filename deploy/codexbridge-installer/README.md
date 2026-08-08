@@ -5,6 +5,7 @@
 - 程序根目录：`/opt/shanhai/codexbridge-installer/`
 - 测试目录：`https://shanhaiyouling.com/codexbridge-install-test/`
 - 不可变包前缀：`https://shanhaiyouling.com/codexbridge-test/packages/`
+- 旧资源迁移的隔离 COS 前缀：`https://codex-1431412335.cos.ap-guangzhou.myqcloud.com/codexbridge-test/packages/`
 
 公开读取对象存储不需要访问令牌。RSA 私钥不是对象存储凭据；它只用于给目录字节签名，必须始终留在发布机的 root-only 目录。公开写入会允许第三方覆盖或删除对象，签名虽能阻止客户端安装被篡改的内容，却不能阻止拒绝服务，因此推荐公开读、发布机独占写。
 
@@ -34,6 +35,7 @@ cd /path/to/repository/deploy/codexbridge-installer
 
 - 手工发布 ChatGPT：设置 `CBI_SIGNING_KEY_FILE`、`CBI_PUBLIC_ROOT`、`CBI_PACKAGE_BASE_URL` 后运行 `npm run software:publish:chatgpt -- --input /absolute/package/tree --version X.Y.Z.W`。
 - 手工发布 Skills：运行 `npm run software:publish:skills -- --input /absolute/skills/root --version X.Y.Z`。
+- 迁移已有 ChatGPT/Skills：先运行 `import-legacy-assets.py` 规范化并校验旧包；大文件可用 `upload-cos-multipart.py --file ... --url ... --state ...` 断点续传，完成对象哈希复核后再运行 `npm run software:publish:imported -- --metadata ...` 签目录。
 - 定时同步：`codexbridge-installer-sync.timer` 调用 `npm run software:sync`，同步 V2RayN 固定包和 Git for Windows 官方 x64 安装包。
 - GitHub API 令牌是可选的，仅用于提高 API 限额；对象下载和客户端读取不需要它。
 
