@@ -886,7 +886,7 @@ test("release preflight JSON explains strict warning blockers", async () => {
   assert.match(codexConfigBlocker.action, /Router|CodexBridge 配置/);
 });
 
-test("release code-ready exits zero when only real-environment evidence is missing", async () => {
+test("release code-ready blocks until software-manager catalog trust is provisioned", async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-code-ready-data-"));
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-code-ready-home-"));
   const configDir = path.join(dataDir, "config");
@@ -918,30 +918,36 @@ test("release code-ready exits zero when only real-environment evidence is missi
     "utf8",
   );
 
-  const { stdout } = await execFileAsync(process.execPath, [
-    "scripts/release-preflight.mjs",
-    "--data-dir",
-    dataDir,
-    "--home-dir",
-    homeDir,
-    "--code-ready",
-    "--json",
-    "--platform",
-    "win32",
-    "--arch",
-    "x64",
-  ], {
-    cwd: process.cwd(),
-    windowsHide: true,
-    maxBuffer: 1024 * 1024,
-  });
+  let failed;
+  try {
+    await execFileAsync(process.execPath, [
+      "scripts/release-preflight.mjs",
+      "--data-dir",
+      dataDir,
+      "--home-dir",
+      homeDir,
+      "--code-ready",
+      "--json",
+      "--platform",
+      "win32",
+      "--arch",
+      "x64",
+    ], {
+      cwd: process.cwd(),
+      windowsHide: true,
+      maxBuffer: 1024 * 1024,
+    });
+  } catch (error) {
+    failed = error;
+  }
 
-  const report = JSON.parse(stdout);
-  assert.equal(report.ok, true);
-  assert.equal(report.codeReady.ok, true);
+  assert.ok(failed, "unprovisioned catalog trust must block code-ready");
+  const report = JSON.parse(failed.stdout);
+  assert.equal(report.ok, false);
+  assert.equal(report.codeReady.ok, false);
   assert.equal(report.codeReady.strictWarnings, true);
-  assert.equal(report.codeReady.codeOrConfigOk, true);
-  assert.deepEqual(report.codeReady.codeOrConfigBlockingItemIds, []);
+  assert.equal(report.codeReady.codeOrConfigOk, false);
+  assert.ok(report.codeReady.codeOrConfigBlockingItemIds.includes("catalog_trust_not_provisioned"));
   assert.ok(report.codeReady.ignoredRealEvidenceItemIds.includes("router"));
   assert.ok(report.codeReady.ignoredRealEvidenceItemIds.includes("image_generation_proxy"));
   assert.ok(report.codeReady.ignoredRealEvidenceItemIds.includes("update_flow"));

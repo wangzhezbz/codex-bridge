@@ -10,7 +10,10 @@ import {
   createHistoryRecoveryE2EFixture,
   historyRecoveryFixtureCounts,
 } from "./history-recovery-e2e-fixture.mjs";
-import { assertWindowsPackageFilePaths } from "./package-content-policy.mjs";
+import {
+  assertWindowsPackageFilePaths,
+  assertWindowsSoftwareManagerPackagePaths,
+} from "./package-content-policy.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const appDir = newestPackagedAppDir();
@@ -24,7 +27,11 @@ assert.ok(fs.existsSync(exePath), `missing packaged exe: ${exePath}`);
 assert.ok(fs.existsSync(path.join(appRoot, "src", "server.js")), "missing packaged router script");
 
 try {
-  const packageContent = assertWindowsPackageFilePaths(listRegularFilePaths(appRoot));
+  const packagePaths = listRegularFilePaths(appRoot);
+  const packageContent = {
+    ...assertWindowsPackageFilePaths(packagePaths),
+    softwareManager: assertWindowsSoftwareManagerPackagePaths(packagePaths),
+  };
   const embeddedBridgeSmoke = await smokeEmbeddedBridge(exePath, appRoot);
   const desktopSmoke = await smokeDesktop(exePath);
   const routerSmoke = await smokeRouter(exePath, appRoot);

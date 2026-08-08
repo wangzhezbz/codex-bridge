@@ -45,6 +45,12 @@ jobs:
           CODEXBRIDGE_SKIP_WINDOWS_HOSTED_RUNNER_INTEGRATION: "1"
         run: npm run check
 
+      - name: Run isolated software-manager transaction
+        env:
+          CODEXBRIDGE_SOFTWARE_MANAGER_FAKE_HOST: "1"
+          CODEXBRIDGE_SOFTWARE_MANAGER_TEST_ROOT: "${{ runner.temp }}\\codexbridge-software-manager"
+        run: npm run test:software-manager
+
       - name: Run Windows release preflight
         run: node scripts/release-preflight.mjs --platform win32 --arch x64
 
@@ -54,6 +60,9 @@ jobs:
         run: npm run package:win
 
       - name: Smoke test packaged Windows app
+        env:
+          CODEXBRIDGE_SOFTWARE_MANAGER_FAKE_HOST: "1"
+          CODEXBRIDGE_SOFTWARE_MANAGER_TEST_ROOT: "${{ runner.temp }}\\codexbridge-software-manager-package"
         run: npm run package:win:smoke
 
       - name: Install NSIS

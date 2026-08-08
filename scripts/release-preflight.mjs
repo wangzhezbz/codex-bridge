@@ -14,6 +14,7 @@ import {
   releasePreflightGateSummary,
 } from "../desktop/settings.mjs";
 import { probeRouterHealth } from "../desktop/router-health.mjs";
+import { buildSoftwareManagerReleaseReadiness } from "./package-content-policy.mjs";
 
 const require = createRequire(import.meta.url);
 const { resolveDataRootDir } = require("../desktop/data-dir.cjs");
@@ -78,7 +79,11 @@ const check = buildStartupCheck(rootDir, {
 const failCount = Number(check.summary?.fail || 0);
 const warnCount = Number(check.summary?.warn || 0);
 const releaseGate = releasePreflightGateSummary(check, { strictWarnings: args.strictWarnings });
-const codeReady = releasePreflightCodeReadySummary(check);
+const softwareManagerReadiness = buildSoftwareManagerReleaseReadiness({ repoRoot, env: process.env });
+const codeReady = mergeSoftwareManagerCodeReady(
+  releasePreflightCodeReadySummary(check),
+  softwareManagerReadiness,
+);
 const releaseOk = args.codeReady
   ? codeReady.ok
   : Boolean(check.summary?.ok) && (!args.strictWarnings || !warnCount);
@@ -90,6 +95,7 @@ const releaseReport = {
   ok: releaseOk,
   releaseGate,
   codeReady,
+  softwareManagerReadiness,
   ...(acceptanceReport ? { acceptanceReport } : {}),
   ...(gateReport ? { gateReport } : {}),
   dataRoot: rootDir,
@@ -99,6 +105,20 @@ const releaseReport = {
 
 if (args.writeGateReport) {
   writeJsonReport(args.writeGateReport, releaseReport);
+}
+
+function mergeSoftwareManagerCodeReady(base, readiness) {
+  const blockingItems = readiness.items.filter((item) => item.status !== "pass");
+  const blockingIds = blockingItems.map((item) => item.id);
+  return {
+    ...base,
+    ok: base.ok && readiness.ok,
+    codeOrConfigOk: base.codeOrConfigOk && readiness.ok,
+    failureItemIds: [...new Set([...base.failureItemIds, ...blockingIds])],
+    codeOrConfigBlockingItemIds: [...new Set([...base.codeOrConfigBlockingItemIds, ...blockingIds])],
+    codeOrConfigBlockingItems: [...base.codeOrConfigBlockingItems, ...blockingItems],
+    softwareManager: readiness,
+  };
 }
 
 if (args.json) {

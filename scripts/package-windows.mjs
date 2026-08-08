@@ -2,7 +2,10 @@ import { packager } from "@electron/packager";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { WINDOWS_PACKAGE_HARDENING_RULES } from "./package-content-policy.mjs";
+import {
+  WINDOWS_PACKAGE_HARDENING_RULES,
+  assertWindowsSoftwareManagerPackagePaths,
+} from "./package-content-policy.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const packageJson = JSON.parse(
@@ -82,5 +85,22 @@ const appPaths = await packager({
 
 console.log("Packaged Windows app:");
 for (const appPath of appPaths) {
+  const appRoot = path.join(appPath, "resources", "app");
+  const packageFiles = listRegularFilePaths(appRoot);
+  assertWindowsSoftwareManagerPackagePaths(packageFiles);
   console.log(appPath);
+}
+
+function listRegularFilePaths(rootDir) {
+  const pending = [rootDir];
+  const files = [];
+  while (pending.length) {
+    const currentDir = pending.pop();
+    for (const entry of fs.readdirSync(currentDir, { withFileTypes: true })) {
+      const fullPath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) pending.push(fullPath);
+      else if (entry.isFile()) files.push(path.relative(rootDir, fullPath).split(path.sep).join("/"));
+    }
+  }
+  return files.sort();
 }

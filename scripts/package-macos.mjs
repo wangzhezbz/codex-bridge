@@ -76,6 +76,7 @@ const appPaths = await packager({
     /^\/config\/router\.config\.json$/,
     /^\/config\/secrets\.local\.json$/,
     /^\/model-catalog\.json$/,
+    /^\/node_modules\/7zip-bin\/win(?:\/|$)/,
   ],
 });
 
