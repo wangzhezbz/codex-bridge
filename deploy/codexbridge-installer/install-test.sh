@@ -6,11 +6,15 @@ APP_ROOT="$ROOT/app"
 PRIVATE_ROOT="$ROOT/private"
 PUBLIC_ROOT="$ROOT/public"
 WORK_ROOT="$ROOT/work"
+TRUST_ROOT="$ROOT/trust"
 RUNTIME_BIN="$ROOT/runtime/node/bin"
+TRUST_CERT="$TRUST_ROOT/microsoft-identity-verification-root-ca-2020.pem"
 PRIVATE_KEY="$PRIVATE_ROOT/catalog-signing-private.pem"
 PUBLIC_KEY="$PRIVATE_ROOT/catalog-signing-public.pem"
 ENV_FILE="$PRIVATE_ROOT/publisher.env"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+TRUST_CERT_SOURCE="$SCRIPT_DIR/microsoft-identity-verification-root-ca-2020.pem"
+TRUST_CERT_SHA1="F40042E2E5F7E8EF8189FED15519AECE42C3BFA2"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "install-test.sh must run as root" >&2
@@ -25,11 +29,11 @@ assert_new_root_path() {
   esac
 }
 
-for target in "$ROOT" "$APP_ROOT" "$PRIVATE_ROOT" "$PUBLIC_ROOT" "$WORK_ROOT" "$RUNTIME_BIN" "$PRIVATE_KEY" "$PUBLIC_KEY" "$ENV_FILE"; do
+for target in "$ROOT" "$APP_ROOT" "$PRIVATE_ROOT" "$PUBLIC_ROOT" "$WORK_ROOT" "$TRUST_ROOT" "$RUNTIME_BIN" "$TRUST_CERT" "$PRIVATE_KEY" "$PUBLIC_KEY" "$ENV_FILE"; do
   assert_new_root_path "$target"
 done
 
-for command in realpath openssl nginx systemctl install osslsigncode; do
+for command in realpath openssl nginx systemctl install osslsigncode cut tr; do
   command -v "$command" >/dev/null 2>&1 || { echo "missing required command: $command" >&2; exit 1; }
 done
 
@@ -44,7 +48,11 @@ chmod 0755 "$SEVEN_ZIP"
 [ -x "$SEVEN_ZIP" ] || { echo "Linux x64 7zip helper is not executable" >&2; exit 1; }
 
 install -d -m 0755 "$ROOT" "$APP_ROOT" "$PUBLIC_ROOT" "$PUBLIC_ROOT/packages"
+install -d -m 0755 "$TRUST_ROOT"
 install -d -m 0700 "$PRIVATE_ROOT" "$WORK_ROOT"
+install -m 0644 "$TRUST_CERT_SOURCE" "$TRUST_CERT"
+trust_fingerprint="$(openssl x509 -in "$TRUST_CERT" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')"
+[ "$trust_fingerprint" = "$TRUST_CERT_SHA1" ] || { echo "Microsoft code-signing root fingerprint mismatch" >&2; exit 1; }
 
 umask 077
 if [ ! -f "$PRIVATE_KEY" ]; then
@@ -54,16 +62,15 @@ fi
 openssl pkey -in "$PRIVATE_KEY" -pubout -out "$PUBLIC_KEY"
 chmod 0644 "$PUBLIC_KEY"
 
-if [ ! -f "$ENV_FILE" ]; then
-  {
-    printf '%s\n' "CBI_SIGNING_KEY_FILE=$PRIVATE_KEY"
-    printf '%s\n' "CBI_PUBLIC_ROOT=$PUBLIC_ROOT"
-    printf '%s\n' "CBI_PACKAGE_BASE_URL=https://shanhaiyouling.com/codexbridge-test/packages/"
-    printf '%s\n' "CBI_SYNC_WORK_ROOT=$WORK_ROOT"
-    printf '%s\n' "CBI_OSSLSIGNCODE_PATH=/usr/bin/osslsigncode"
-  } > "$ENV_FILE"
-  chmod 0600 "$ENV_FILE"
-fi
+{
+  printf '%s\n' "CBI_SIGNING_KEY_FILE=$PRIVATE_KEY"
+  printf '%s\n' "CBI_PUBLIC_ROOT=$PUBLIC_ROOT"
+  printf '%s\n' "CBI_PACKAGE_BASE_URL=https://shanhaiyouling.com/codexbridge-test/packages/"
+  printf '%s\n' "CBI_SYNC_WORK_ROOT=$WORK_ROOT"
+  printf '%s\n' "CBI_OSSLSIGNCODE_PATH=/usr/bin/osslsigncode"
+  printf '%s\n' "CBI_OSSLSIGNCODE_CA_FILE=$TRUST_CERT"
+} > "$ENV_FILE"
+chmod 0600 "$ENV_FILE"
 
 install -m 0644 "$SCRIPT_DIR/codexbridge-installer-sync.service" /etc/systemd/system/codexbridge-installer-sync.service
 install -m 0644 "$SCRIPT_DIR/codexbridge-installer-sync.timer" /etc/systemd/system/codexbridge-installer-sync.timer

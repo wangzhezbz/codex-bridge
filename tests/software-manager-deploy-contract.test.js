@@ -14,6 +14,7 @@ const names = [
   "codexbridge-installer-sync.timer",
   "install-test.sh",
   "verify-test.mjs",
+  "microsoft-identity-verification-root-ca-2020.pem",
 ];
 
 function deployFiles() {
@@ -109,6 +110,15 @@ test("publisher uses the isolated Node runtime instead of changing the server No
   assert.match(readme, /runtime\/node/u);
   assert.match(readme, /PATH=\.\.\/runtime\/node\/bin:\$PATH/u);
   assert.match(readme, /不安装或修改系统全局 Node/u);
+});
+
+test("Git verification pins the Microsoft code-signing root inside the isolated environment", () => {
+  const installer = fs.readFileSync(path.join(deployRoot, "install-test.sh"), "utf8");
+  const certificate = fs.readFileSync(path.join(deployRoot, "microsoft-identity-verification-root-ca-2020.pem"), "utf8");
+  assert.match(certificate, /^-----BEGIN CERTIFICATE-----/u);
+  assert.match(installer, /F40042E2E5F7E8EF8189FED15519AECE42C3BFA2/u);
+  assert.match(installer, /CBI_OSSLSIGNCODE_CA_FILE=\$TRUST_CERT/u);
+  assert.match(installer, /openssl x509/u);
 });
 
 test("remote verifier validates a signed catalog and streams every immutable asset read-only", async () => {

@@ -17,6 +17,8 @@
 5. 将 `nginx-test-location.conf` 作为一次新的 include 加入 `shanhaiyouling.com` 的 server 块；安装脚本只安装独立 snippet，不会自行编辑其他 server 配置。
 6. 对象存储若以挂载目录提供，把 `/opt/shanhai/codexbridge-installer/public/` 指向该隔离挂载点；不要与任何现有目录共用。
 
+部署包内固定了 Microsoft 官方的 `Microsoft Identity Verification Root Certificate Authority 2020` 公共根证书（SHA-1：`F40042E2E5F7E8EF8189FED15519AECE42C3BFA2`）。安装脚本只复制到新环境的 `trust/`，不会写入系统全局 CA；Linux 发布机使用签名中受信任的时间戳验证已过期但签名时有效的代码签名证书。
+
 ## 安装
 
 在审核完文件、并记录现有环境的只读哈希后，以 root 执行：

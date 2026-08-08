@@ -8,7 +8,7 @@ import test from "node:test";
 import { verifyCatalogEnvelope } from "../desktop/software-manager/catalog-trust.mjs";
 import { loadPublisherConfig } from "../scripts/software-manager/publisher-config.mjs";
 import { inspectV2RayNRelease, readPeFileVersion, V2RAYN_PACKAGE_URL } from "../scripts/software-manager/sync-v2rayn.mjs";
-import { GIT_RELEASE_API_URL, inspectGitRelease } from "../scripts/software-manager/sync-git.mjs";
+import { GIT_RELEASE_API_URL, inspectGitRelease, parseAuthenticodeTimestamp } from "../scripts/software-manager/sync-git.mjs";
 import { publishComponentReleases, syncComponents } from "../scripts/software-manager/sync-components.mjs";
 
 function tempRoot(name) {
@@ -197,6 +197,12 @@ test("Git sync rejects unofficial assets and failed Authenticode before publicat
       : responseBytes(Buffer.from("x"), url),
     authenticodeInspector: async () => "NotSigned",
   }), /software_sync_git_authenticode_invalid/);
+});
+
+test("Linux Authenticode validation derives one bounded verification time from the signed timestamp", () => {
+  assert.equal(parseAuthenticodeTimestamp("Timestamp time: Jul 10 15:28:37 2026 GMT\n"), 1783697317);
+  assert.throws(() => parseAuthenticodeTimestamp(""), /software_sync_git_timestamp_invalid/);
+  assert.throws(() => parseAuthenticodeTimestamp("Timestamp time: Jul 10 15:28:37 2026 GMT\nTimestamp time: Jul 10 15:28:37 2026 GMT\n"), /software_sync_git_timestamp_invalid/);
 });
 
 test("combined sync inspects every source before one publisher call and leaves catalog unchanged on download failure", async () => {

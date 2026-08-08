@@ -36,17 +36,52 @@ function selectAsset(metadata) {
   return { ...candidates[0], url: url.href };
 }
 
+export function parseAuthenticodeTimestamp(output) {
+  const matches = [...String(output ?? "").matchAll(/^Timestamp time:\s*(.+ GMT)\s*$/gmu)];
+  if (matches.length !== 1) throw gitError("software_sync_git_timestamp_invalid");
+  const milliseconds = Date.parse(matches[0][1]);
+  const minimum = Date.parse("2020-01-01T00:00:00.000Z");
+  if (!Number.isFinite(milliseconds) || milliseconds < minimum || milliseconds > Date.now() + 86_400_000) {
+    throw gitError("software_sync_git_timestamp_invalid");
+  }
+  return Math.floor(milliseconds / 1_000);
+}
+
+function verificationOutput(result) {
+  return `${String(result?.stdout ?? "")}\n${String(result?.stderr ?? "")}`;
+}
+
+function assertVerifiedOutput(output) {
+  if (!/Timestamp Server Signature verification: ok/u.test(output)
+    || !/^Signature verification: ok$/mu.test(output)
+    || !/Number of verified signatures:\s*1/u.test(output)
+    || !/^Succeeded$/mu.test(output)) {
+    throw gitError("software_sync_git_authenticode_invalid");
+  }
+}
+
 async function defaultAuthenticodeInspector(packagePath) {
   if (process.platform !== "win32") {
     const executable = String(process.env.CBI_OSSLSIGNCODE_PATH || "/usr/bin/osslsigncode");
-    if (!path.isAbsolute(executable) || path.normalize(executable) !== executable) {
+    const caFile = String(process.env.CBI_OSSLSIGNCODE_CA_FILE || "");
+    if (!path.isAbsolute(executable) || path.normalize(executable) !== executable
+      || !path.isAbsolute(caFile) || path.normalize(caFile) !== caFile) {
       throw gitError("software_sync_git_authenticode_tool_invalid");
     }
-    await execFileAsync(executable, ["verify", "-in", packagePath], {
-      windowsHide: true,
-      timeout: 30_000,
-      maxBuffer: 1024 * 1024,
-    });
+    const options = { windowsHide: true, timeout: 60_000, maxBuffer: 4 * 1024 * 1024, encoding: "utf8" };
+    const baseArgs = ["verify", "-CAfile", caFile, "-TSA-CAfile", caFile];
+    let initial;
+    try {
+      initial = await execFileAsync(executable, [...baseArgs, "-in", packagePath], options);
+      assertVerifiedOutput(verificationOutput(initial));
+      return "Valid";
+    } catch (error) {
+      const verificationTime = parseAuthenticodeTimestamp(verificationOutput(error));
+      const verified = await execFileAsync(executable, [
+        ...baseArgs, "-time", String(verificationTime), "-in", packagePath,
+      ], options);
+      assertVerifiedOutput(verificationOutput(verified));
+    }
     return "Valid";
   }
   const command = "$s=Get-AuthenticodeSignature -LiteralPath $env:CBI_GIT_INSTALLER;[Console]::Out.Write($s.Status)";
