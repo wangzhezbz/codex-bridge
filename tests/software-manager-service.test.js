@@ -187,7 +187,7 @@ test("Git inspection exposes only its ownership label and display path to the re
         versionBefore: "2.50.0",
         versionAfter: "2.50.0",
         message: "git_external_installed",
-        details: { ownership: "external", installPath: "C:\\Program Files\\Git" },
+        details: { ownership: "external", installPath: "C:\\Program Files\\Git", previousVersion: null },
       }),
     },
   });
@@ -207,11 +207,36 @@ test("rollback tab is present only for a recent eligible adapter record", async 
   const { service } = fixtureService({
     chatgpt: { inspect: async () => operationResult("chatgpt", "inspect", "succeeded", {
       versionBefore: "2.0.0", versionAfter: "2.0.0", rollbackAvailable: true,
+      details: { installPath: "D:\\CBApps\\c", previousVersion: "1.0.0" },
     }) },
   });
   const snapshot = await service.getSnapshot();
   assert.deepEqual(snapshot.tabs, ["install", "update", "uninstall", "rollback"]);
-  assert.deepEqual(snapshot.rollback.map(({ id }) => id), ["chatgpt"]);
+  assert.deepEqual(snapshot.rollback.map((entry) => ({ ...entry })), [
+    { id: "chatgpt", name: "ChatGPT", version: "2.0.0", previousVersion: "1.0.0" },
+  ]);
+});
+
+test("progress events preserve bounded transfer details for the renderer", async () => {
+  const events = [];
+  const { service } = fixtureService({
+    chatgpt: {
+      prepare: async (context) => {
+        await context.onProgress({
+          phase: "download", percent: 25, receivedBytes: 25, totalBytes: 100, bytesPerSecond: 10,
+        });
+        return operationResult("chatgpt", "prepare");
+      },
+    },
+  });
+  service.subscribe((event) => events.push(event));
+  await service.startTask({ kind: "install", componentIds: ["chatgpt"], skillIds: [] });
+  const progress = events.find((event) => event.type === "progress" && event.phase === "download");
+  assert.deepEqual({
+    downloadedBytes: progress.downloadedBytes,
+    totalBytes: progress.totalBytes,
+    bytesPerSecond: progress.bytesPerSecond,
+  }, { downloadedBytes: 25, totalBytes: 100, bytesPerSecond: 10 });
 });
 
 test("chooseInstallRoot returns only an opaque token and adapters receive only resolved authority", async () => {

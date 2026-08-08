@@ -24,7 +24,8 @@ const RESULT_KEYS = Object.freeze([
   "componentId", "action", "status", "versionBefore", "versionAfter", "message", "rollbackAvailable",
 ]);
 const RESULT_KEY_SET = new Set(RESULT_KEYS);
-const RESULT_DETAIL_KEYS = Object.freeze(["ownership", "installPath"]);
+const NATIVE_RESULT_DETAIL_KEYS = Object.freeze(["installPath", "previousVersion"]);
+const GIT_RESULT_DETAIL_KEYS = Object.freeze(["ownership", "installPath", "previousVersion"]);
 const RESULT_STATUSES = new Set(["succeeded", "failed", "skipped"]);
 const PUBLIC_EXTERNAL_KINDS = new Set([
   "component-prepare", "component-shortcut", "component-uninstall",
@@ -185,14 +186,16 @@ function validAdapterResult(value, fallback) {
   if (!structurallyValid) return false;
   if (Object.hasOwn(value, "details")) {
     const details = value.details;
-    if (fallback.componentId !== "git" || fallback.action !== "inspect" || value.status !== "succeeded"
-      || !isPlainRecord(details) || Object.keys(details).length !== RESULT_DETAIL_KEYS.length
-      || !RESULT_DETAIL_KEYS.every((key) => Object.hasOwn(details, key))
-      || !["managed", "external"].includes(details.ownership)
+    const expectedKeys = fallback.componentId === "git" ? GIT_RESULT_DETAIL_KEYS : NATIVE_RESULT_DETAIL_KEYS;
+    if (fallback.action !== "inspect" || value.status !== "succeeded"
+      || !isPlainRecord(details) || Object.keys(details).length !== expectedKeys.length
+      || !expectedKeys.every((key) => Object.hasOwn(details, key))
+      || (fallback.componentId === "git" && !["managed", "external"].includes(details.ownership))
       || typeof details.installPath !== "string" || details.installPath.length === 0
       || details.installPath.length > 32_760 || details.installPath.includes("\0")
       || !path.win32.isAbsolute(details.installPath)
-      || path.win32.normalize(details.installPath) !== details.installPath) return false;
+      || path.win32.normalize(details.installPath) !== details.installPath
+      || (details.previousVersion !== null && !validVersion(details.previousVersion))) return false;
   }
   if (value.versionAfter === null && value.rollbackAvailable) return false;
   if (value.status !== "succeeded") return true;
@@ -207,9 +210,10 @@ function safeAdapterResult(value, fallback) {
   const safe = redactValue(value);
   if (value.details) {
     safe.details = {
-      ownership: value.details.ownership,
       installPath: value.details.installPath,
+      previousVersion: value.details.previousVersion,
     };
+    if (value.componentId === "git") safe.details.ownership = value.details.ownership;
   }
   return deepFreeze(safe);
 }
@@ -584,6 +588,14 @@ export function createSoftwareManagerService({
       cancellable: task.cancellable,
       message: typeof message === "string" ? message : phase,
     };
+    if (isPlainRecord(details)) {
+      const downloadedBytes = Number(details.downloadedBytes ?? details.receivedBytes);
+      const totalBytes = Number(details.totalBytes);
+      const bytesPerSecond = Number(details.bytesPerSecond);
+      if (Number.isSafeInteger(downloadedBytes) && downloadedBytes >= 0) event.downloadedBytes = downloadedBytes;
+      if (Number.isSafeInteger(totalBytes) && totalBytes >= 0) event.totalBytes = totalBytes;
+      if (Number.isFinite(bytesPerSecond) && bytesPerSecond >= 0) event.bytesPerSecond = bytesPerSecond;
+    }
     const logged = writeLog({ taskId: task.taskId, componentId, phase, message: event.message, details });
     emit(event);
     return logged;
@@ -1078,11 +1090,14 @@ export function createSoftwareManagerService({
         ...(installed?.details ? {
           ownership: installed.details.ownership,
           installPath: installed.details.installPath,
+          previousVersion: installed.details.previousVersion,
         } : {}),
       });
     });
     const rollback = components.filter(({ rollbackAvailable }) => rollbackAvailable)
-      .map(({ id, name, installedVersion }) => Object.freeze({ id, name, version: installedVersion }));
+      .map(({ id, name, installedVersion, previousVersion }) => Object.freeze({
+        id, name, version: installedVersion, previousVersion,
+      }));
     const tabs = ["install", "update", "uninstall"];
     if (rollback.length > 0) tabs.push("rollback");
     const task = currentTask

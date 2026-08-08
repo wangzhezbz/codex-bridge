@@ -114,6 +114,16 @@ function stateRollbackAvailable(state, componentId) {
   return rollbackRecords(state).some((record) => record?.componentId === componentId);
 }
 
+function stateRollbackVersion(state, componentId) {
+  if (componentId === "git") {
+    return typeof state?.components?.git?.previousInstaller?.version === "string"
+      ? state.components.git.previousInstaller.version
+      : null;
+  }
+  const record = rollbackRecords(state).find((candidate) => candidate?.componentId === componentId);
+  return typeof record?.version === "string" ? record.version : null;
+}
+
 function stateVersion(state, componentId) {
   return typeof state?.components?.[componentId]?.version === "string"
     ? state.components[componentId].version
@@ -1035,6 +1045,10 @@ export function createComponentAdapters({
       return result(componentId, "inspect", "succeeded", {
         versionBefore: record.version, versionAfter: record.version, message: "component_installed",
         rollbackAvailable: stateRollbackAvailable(state, componentId),
+        details: {
+          installPath: record.installPath,
+          previousVersion: stateRollbackVersion(state, componentId),
+        },
       });
     } catch (error) { return failed(componentId, "inspect", error); }
   }
@@ -1363,14 +1377,18 @@ export function createComponentAdapters({
       if (managed) return result("git", "inspect", "succeeded", {
         versionBefore: managed.version, versionAfter: managed.version, message: "git_managed_installed",
         rollbackAvailable: Boolean(managed.previousInstaller),
-        details: { ownership: "managed", installPath: managed.installPath },
+        details: {
+          ownership: "managed",
+          installPath: managed.installPath,
+          previousVersion: stateRollbackVersion(state, "git"),
+        },
       });
       const discovered = await windowsHost.discoverGit();
       if (discovered?.kind === "none") return result("git", "inspect", "skipped", { message: "git_not_installed" });
       const external = validateExternalGit(discovered);
       return result("git", "inspect", "succeeded", {
         versionBefore: external.version, versionAfter: external.version, message: "git_external_installed",
-        details: { ownership: "external", installPath: external.installDir },
+        details: { ownership: "external", installPath: external.installDir, previousVersion: null },
       });
     } catch (error) { return failed("git", "inspect", error); }
   }

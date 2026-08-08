@@ -384,7 +384,8 @@ async function startConfirmedSoftwareManagerTask() {
   updateSoftwareManager({ type: "confirm-close" });
   try {
     const result = await api.startSoftwareManagerTask(request);
-    showToast("软件管理任务已完成。");
+    const feedback = softwareManagerUi.taskResultFeedback(result);
+    showToast(feedback.message, feedback.tone);
     await refreshSoftwareManager();
     return result;
   } catch (error) {
@@ -415,6 +416,17 @@ softwareManagerRoot?.addEventListener("click", (event) => {
   }
   if (control.matches("[data-software-register]")) {
     void api.openExternal("https://w1.soxo.top/auth/register?code=2aEq");
+    return;
+  }
+  if (control.matches("[data-software-open-folder]")) {
+    void api.openFolder(control.dataset.softwareOpenFolder)
+      .catch((error) => showToast(error?.message || String(error), "error"));
+    return;
+  }
+  if (control.matches("[data-software-copy-report]")) {
+    void api.copyText(softwareManagerUi.buildTaskReport(softwareManagerState))
+      .then(() => showToast("任务报告已复制。"))
+      .catch((error) => showToast(error?.message || String(error), "error"));
     return;
   }
   if (control.matches("[data-software-start]")) {

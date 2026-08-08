@@ -9,6 +9,22 @@
     rollback: "回滚",
   });
   const REGISTER_URL = "https://w1.soxo.top/auth/register?code=2aEq";
+  const STATUS_LABELS = Object.freeze({ succeeded: "成功", partial: "部分失败", failed: "失败", cancelled: "已取消", skipped: "已跳过" });
+  const PHASE_LABELS = Object.freeze({
+    prepare: "准备文件", download: "下载安装包", inspect: "检查本机状态", commit: "应用更改",
+    verify: "验证安装结果", uninstall: "卸载软件", rollback: "恢复上一版本", cancelling: "正在取消", finishing: "正在完成",
+  });
+  const LOG_LABELS = Object.freeze({
+    software_manager_preparing: "正在准备安装文件",
+    software_manager_preparing_skills: "正在准备 Skills",
+    software_manager_inspecting: "正在检查本机安装状态",
+    software_manager_critical_operation: "正在应用更改，此时不能取消",
+    software_manager_cancelled: "软件管理任务已取消",
+    software_manager_task_succeeded: "软件管理任务已完成",
+    software_manager_task_partial: "软件管理任务部分失败",
+    software_manager_task_failed: "软件管理任务失败",
+    software_manager_task_cancelled: "软件管理任务已取消",
+  });
 
   function escapeHtml(value) {
     return String(value ?? "")
@@ -33,10 +49,52 @@
     return `${amount.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
   }
 
+  function taskResultFeedback(result) {
+    if (result?.status === "partial") return Object.freeze({ message: "部分项目处理失败，请查看任务报告。", tone: "error" });
+    if (result?.status === "failed") return Object.freeze({ message: "软件管理任务失败，请查看任务报告。", tone: "error" });
+    if (result?.status === "cancelled") return Object.freeze({ message: "软件管理任务已取消。", tone: "info" });
+    return Object.freeze({ message: "软件管理任务已完成。", tone: "success" });
+  }
+
+  function localizedLogLine(line) {
+    const message = typeof line === "string" ? line : line?.message ?? JSON.stringify(line);
+    return LOG_LABELS[message] ?? message;
+  }
+
+  function transferText(task) {
+    const downloaded = Number(task?.downloadedBytes);
+    const total = Number(task?.totalBytes);
+    const speed = Number(task?.bytesPerSecond);
+    if (!Number.isFinite(downloaded) || !Number.isFinite(total) || total <= 0) return "";
+    return `${formatBytes(downloaded)} / ${formatBytes(total)}${Number.isFinite(speed) && speed > 0 ? ` · ${formatBytes(speed)}/s` : ""}`;
+  }
+
   function componentName(id, snapshot) {
     return snapshot?.components?.find((entry) => entry.id === id)?.name
       || snapshot?.catalog?.components?.find((entry) => entry.id === id)?.name
       || ({ chatgpt: "ChatGPT", v2rayn: "V2RayN", git: "Git" }[id] ?? id);
+  }
+
+  function buildTaskReport(state) {
+    const result = state?.lastResult;
+    const snapshot = state?.snapshot;
+    const lines = [
+      "软件管理任务报告",
+      `状态：${STATUS_LABELS[result?.status] ?? result?.status ?? (snapshot?.task ? "执行中" : "未知")}`,
+    ];
+    if (result?.taskId) lines.push(`任务编号：${result.taskId}`);
+    if (result?.kind) lines.push(`操作：${TAB_LABELS[result.kind] ?? result.kind}`);
+    const entries = [...(result?.components ?? []), ...(result?.skills ?? [])];
+    if (entries.length > 0) {
+      lines.push("", "处理结果：");
+      for (const entry of entries) {
+        const label = componentName(entry.componentId, snapshot);
+        lines.push(`- ${label}：${STATUS_LABELS[entry.status] ?? entry.status ?? "未知"}${entry.message ? `（${entry.message}）` : ""}`);
+      }
+    }
+    const logs = (snapshot?.logs ?? []).slice(-500);
+    if (logs.length > 0) lines.push("", "任务日志：", ...logs.map((line) => `- ${localizedLogLine(line)}`));
+    return lines.join("\n");
   }
 
   function defaultSelection(snapshot, tab) {
@@ -134,6 +192,9 @@
           percent: Number.isFinite(Number(event.percent)) ? Number(event.percent) : null,
           critical: event.cancellable === false,
           cancellable: event.cancellable === true,
+          downloadedBytes: Number.isFinite(Number(event.downloadedBytes)) ? Number(event.downloadedBytes) : null,
+          totalBytes: Number.isFinite(Number(event.totalBytes)) ? Number(event.totalBytes) : null,
+          bytesPerSecond: Number.isFinite(Number(event.bytesPerSecond)) ? Number(event.bytesPerSecond) : null,
         };
         const logs = [...(snapshot.logs ?? []), event.message].filter(Boolean).slice(-500);
         return { ...current, snapshot: { ...snapshot, task, logs }, confirmationPending: false };
@@ -202,19 +263,25 @@
   }
 
   function componentNote(entry, tab) {
+    let note;
     if (entry.id === "chatgpt") {
-      if (tab === "uninstall") return "删除程序和 ChatGPT 快捷方式，保留登录、配置和历史";
-      if (tab === "update") return entry.updateState === "update-available" ? "更新后保留当前版本用于一次回滚" : "ChatGPT 登录与历史不会改变";
-      return "创建 ChatGPT 桌面图标；登录、配置和历史保存在官方 .codex 目录";
+      if (tab === "uninstall") note = "删除程序和 ChatGPT 快捷方式，保留登录、配置和历史";
+      else if (tab === "update") note = entry.updateState === "update-available" ? "更新后保留当前版本用于一次回滚" : "ChatGPT 登录与历史不会改变";
+      else note = "创建 ChatGPT 桌面图标；登录、配置和历史保存在官方 .codex 目录";
+    } else if (entry.id === "v2rayn") {
+      if (tab === "uninstall") note = "删除程序和 V2RayN 快捷方式，保留订阅和节点配置";
+      else note = `创建 V2RayN 桌面图标 · <button type="button" class="software-link-button" data-software-register data-url="${REGISTER_URL}">没有账号？打开注册地址</button>`;
+    } else {
+      const owner = entry.ownership === "external" || entry.message === "git_external_installed" ? "外部安装" : entry.installedVersion ? "CodexBridge 管理" : "尚未安装";
+      const installPath = entry.installPath ? ` · <code>${escapeHtml(entry.installPath)}</code>` : "";
+      note = tab === "uninstall"
+        ? `卸载 Git 程序，保留配置、SSH 密钥和仓库 · ${owner}${installPath}`
+        : `已有 Git 会在原位置更新；不创建桌面图标 · ${owner}${installPath}`;
     }
-    if (entry.id === "v2rayn") {
-      if (tab === "uninstall") return "删除程序和 V2RayN 快捷方式，保留订阅和节点配置";
-      return `创建 V2RayN 桌面图标 · <button type="button" class="software-link-button" data-software-register data-url="${REGISTER_URL}">没有账号？打开注册地址</button>`;
+    if (entry.installedVersion && entry.installPath) {
+      note += ` · <button type="button" class="software-link-button" data-software-open-folder="${escapeHtml(entry.installPath)}">打开安装目录</button>`;
     }
-    const owner = entry.ownership === "external" || entry.message === "git_external_installed" ? "外部安装" : entry.installedVersion ? "CodexBridge 管理" : "尚未安装";
-    const installPath = entry.installPath ? ` · <code>${escapeHtml(entry.installPath)}</code>` : "";
-    if (tab === "uninstall") return `卸载 Git 程序，保留配置、SSH 密钥和仓库 · ${owner}${installPath}`;
-    return `已有 Git 会在原位置更新；不创建桌面图标 · ${owner}${installPath}`;
+    return note;
   }
 
   function renderComponentCards(state) {
@@ -285,14 +352,16 @@
     const logs = (state.snapshot?.logs ?? []).slice(-500);
     if (!task && logs.length === 0 && !state.lastResult) return "";
     const percent = Number.isFinite(task?.percent) ? Math.max(0, Math.min(100, task.percent)) : 0;
+    const transfer = transferText(task);
     return `
       <section class="software-task-panel" aria-live="polite">
         <div class="software-task-head">
-          <div><strong>${task ? "任务正在执行" : "最近一次任务"}</strong><span>${escapeHtml(task?.phase || state.lastResult?.status || "已完成")}</span></div>
-          ${task ? `<button type="button" class="plain-button" data-software-cancel${task.cancellable && !task.critical ? "" : " disabled"}>取消任务</button>` : ""}
+          <div><strong>${task ? "任务正在执行" : "最近一次任务"}</strong><span>${escapeHtml(task ? PHASE_LABELS[task.phase] ?? task.phase : STATUS_LABELS[state.lastResult?.status] ?? "已完成")}</span></div>
+          <div>${task ? `<button type="button" class="plain-button" data-software-cancel${task.cancellable && !task.critical ? "" : " disabled"}>取消任务</button>` : ""}<button type="button" class="plain-button" data-software-copy-report>复制任务报告</button></div>
         </div>
         ${task ? `<div class="software-progress"><progress max="100" value="${percent}" aria-label="任务进度 ${percent}%"></progress></div>` : ""}
-        <div class="software-log">${logs.map((line) => `<div class="software-log-line">${escapeHtml(typeof line === "string" ? line : line?.message ?? JSON.stringify(line))}</div>`).join("")}</div>
+        ${transfer ? `<div class="software-transfer-status">${escapeHtml(transfer)}</div>` : ""}
+        <div class="software-log">${logs.map((line) => `<div class="software-log-line">${escapeHtml(localizedLogLine(line))}</div>`).join("")}</div>
       </section>`;
   }
 
@@ -320,9 +389,9 @@
       </div>
       <div class="software-tabs" role="tablist">${tabs}</div>
       ${readOnlyMessage ? `<div class="software-unavailable"><strong>当前仅可查看</strong><p>${readOnlyMessage}</p></div>` : ""}
-      ${state.activeTab === "install" ? `
+      ${state.activeTab === "install" || state.activeTab === "update" ? `
         <section class="software-install-root">
-          <div><strong>安装位置</strong><p>${state.customInstallRootSelected ? "已选择自定义位置" : "使用默认安全位置；ChatGPT 自动使用短目录层级"}</p></div>
+          <div><strong>安装位置</strong><p>${state.customInstallRootSelected ? "已选择自定义位置；路径由系统安全保存" : state.activeTab === "update" ? "未安装的软件会安装到这里；默认使用安全短路径" : "使用默认安全位置；ChatGPT 自动使用短目录层级"}</p></div>
           <button type="button" class="plain-button" data-software-choose-root${snapshot.readOnly || snapshot.task ? " disabled" : ""}>选择位置</button>
         </section>` : ""}
       ${state.activeTab === "uninstall" ? '<div class="software-warning-banner">卸载只删除所选程序本体和已记录快捷方式；ChatGPT 登录与历史、V2RayN 订阅、Git 配置、SSH 密钥和项目文件都会保留。</div>' : ""}
@@ -354,11 +423,13 @@
   }
 
   global.CodexBridgeSoftwareManagerUI = Object.freeze({
+    buildTaskReport,
     createInitialState,
     defaultSelection,
     readSelection,
     reduce,
     render,
     renderSkillPicker,
+    taskResultFeedback,
   });
 }(window));

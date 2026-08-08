@@ -68,8 +68,27 @@ test("renderer module exposes the fixed state, rendering, and selection surface"
   const ui = loadUi();
   assert.deepEqual(
     Object.keys(ui).sort(),
-    ["createInitialState", "defaultSelection", "readSelection", "reduce", "render", "renderSkillPicker"].sort(),
+    [
+      "buildTaskReport", "createInitialState", "defaultSelection", "readSelection", "reduce", "render",
+      "renderSkillPicker", "taskResultFeedback",
+    ].sort(),
   );
+});
+
+test("task completion feedback never reports failed or partial work as completed", () => {
+  const ui = loadUi();
+  assert.deepEqual({ ...ui.taskResultFeedback({ status: "succeeded" }) }, {
+    message: "软件管理任务已完成。", tone: "success",
+  });
+  assert.deepEqual({ ...ui.taskResultFeedback({ status: "partial" }) }, {
+    message: "部分项目处理失败，请查看任务报告。", tone: "error",
+  });
+  assert.deepEqual({ ...ui.taskResultFeedback({ status: "failed" }) }, {
+    message: "软件管理任务失败，请查看任务报告。", tone: "error",
+  });
+  assert.deepEqual({ ...ui.taskResultFeedback({ status: "cancelled" }) }, {
+    message: "软件管理任务已取消。", tone: "info",
+  });
 });
 
 test("install defaults select only ChatGPT and both install and uninstall share the fixed-height Skills picker", () => {
@@ -114,6 +133,58 @@ test("update view distinguishes update, current, and missing components without 
   assert.match(html, /已是最新版/u);
   assert.match(html, /尚未安装/u);
   assert.match(html, /data-software-component="v2rayn"[^>]*disabled/u);
+  assert.match(html, /data-software-choose-root/u);
+  assert.match(html, /未安装的软件会安装到这里/u);
+});
+
+test("progress events render localized transfer details and task reports remain copyable", () => {
+  const ui = loadUi();
+  let state = ui.reduce(ui.createInitialState(), { type: "snapshot", snapshot: snapshot() });
+  state = ui.reduce(state, {
+    type: "task-event",
+    event: {
+      type: "progress", taskId: "task-1", componentId: "chatgpt", phase: "download", percent: 50,
+      cancellable: true, message: "software_manager_preparing", downloadedBytes: 50, totalBytes: 100,
+      bytesPerSecond: 10,
+    },
+  });
+  const root = { innerHTML: "" };
+  ui.render(root, state);
+  assert.match(root.innerHTML, /正在准备安装文件/u);
+  assert.match(root.innerHTML, /50 B \/ 100 B/u);
+  assert.match(root.innerHTML, /10 B\/s/u);
+  assert.doesNotMatch(root.innerHTML, /software_manager_preparing/u);
+  assert.match(root.innerHTML, /data-software-copy-report/u);
+
+  state = ui.reduce(state, {
+    type: "task-event",
+    event: {
+      type: "finished",
+      result: {
+        taskId: "task-1", kind: "install", status: "failed",
+        components: [{ componentId: "chatgpt", status: "failed", message: "network_failed" }],
+        skills: [],
+      },
+    },
+  });
+  const report = ui.buildTaskReport(state);
+  assert.match(report, /软件管理任务报告/u);
+  assert.match(report, /状态：失败/u);
+  assert.match(report, /ChatGPT：失败/u);
+  assert.match(report, /network_failed/u);
+});
+
+test("installed components expose a trusted open-folder action", () => {
+  const ui = loadUi();
+  const input = snapshot({
+    components: [
+      component("chatgpt", { installedVersion: "26.721.11231.0", installPath: "D:\\CBApps\\c" }),
+      component("v2rayn"), component("git"),
+    ],
+  });
+  const html = rendered(ui, input).html;
+  assert.match(html, /data-software-open-folder="D:\\CBApps\\c"/u);
+  assert.match(html, /打开安装目录/u);
 });
 
 test("Git ownership, public registration link, replacement warning, and critical cancellation are explicit", () => {

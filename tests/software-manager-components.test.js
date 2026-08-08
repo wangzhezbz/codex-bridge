@@ -88,6 +88,26 @@ function emptyState(installRoot = null) {
   };
 }
 
+test("component inspection exposes only the owned install path and exact rollback target version", async () => {
+  const state = emptyState(INSTALL_ROOT);
+  state.components.chatgpt = {
+    managed: true,
+    installPath: "D:\\CBApps\\c",
+    version: "2.0.0",
+    entrypointPath: "D:\\CBApps\\c\\ChatGPT.exe",
+    requiredFiles: ["D:\\CBApps\\c\\ChatGPT.exe"],
+    health: "healthy",
+  };
+  state.rollback = [{ componentId: "chatgpt", path: "D:\\CBApps\\cp", version: "1.0.0" }];
+  const { adapters } = fixture({ state });
+  const inspected = await adapters.chatgpt.inspectInstalled({});
+  assert.equal(inspected.status, "succeeded");
+  assert.deepEqual(inspected.details, {
+    installPath: "D:\\CBApps\\c",
+    previousVersion: "1.0.0",
+  });
+});
+
 function fixture({
   state = emptyState(), gitDiscovery = { kind: "none" }, gitDiscoveries = null, running = false,
   slotFailure = null, rollbackFailure = null, finalVerifyFailure = null, shortcutFailure = null, restartFailure = null,
@@ -1347,7 +1367,7 @@ test("external Git inspect works with null ownership and ambiguous discovery fai
   const found = await adapters.git.inspectInstalled({});
   assert.equal(found.status, "succeeded");
   assert.equal(found.versionAfter, "2.50.0");
-  assert.deepEqual(found.details, { ownership: "external", installPath: externalGit.installDir });
+  assert.deepEqual(found.details, { ownership: "external", installPath: externalGit.installDir, previousVersion: null });
   const blocked = fixture({ gitDiscovery: Object.assign(new Error("git_multiple_installations"), { code: "git_multiple_installations" }) });
   assert.equal((await blocked.adapters.git.inspectInstalled({})).status, "failed");
 });

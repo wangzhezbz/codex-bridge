@@ -1886,6 +1886,12 @@ h3 {
   color: var(--danger);
 }
 
+.toast.info {
+  border-color: var(--line);
+  background: var(--surface);
+  color: var(--text);
+}
+
 .toast.hidden {
   display: none;
 }
@@ -6203,6 +6209,13 @@ body.resizing-usage-column {
   align-items: center;
 }
 
+.software-task-head > div:last-child {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .software-task-head strong,
 .software-task-head span {
   display: block;
@@ -6238,6 +6251,13 @@ body.resizing-usage-column {
 .software-progress progress::-webkit-progress-value {
   border-radius: inherit;
   background: var(--accent);
+}
+
+.software-transfer-status {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
 }
 
 .software-log {
