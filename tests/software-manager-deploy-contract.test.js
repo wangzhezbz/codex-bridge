@@ -101,9 +101,11 @@ test("publisher uses the isolated Node runtime instead of changing the server No
   assert.match(installer, /RUNTIME_BIN="\$ROOT\/runtime\/node\/bin"/u);
   assert.match(installer, /"\$RUNTIME_BIN\/node"/u);
   assert.match(installer, /"\$RUNTIME_BIN\/npm"/u);
+  assert.match(installer, /PATH="\$RUNTIME_BIN:\$PATH" "\$RUNTIME_BIN\/npm" --version/u);
   assert.doesNotMatch(installer, /for command in [^\n]*\bnode\b/u);
   assert.match(service, /Environment=PATH=\/opt\/shanhai\/codexbridge-installer\/runtime\/node\/bin:/u);
   assert.match(readme, /runtime\/node/u);
+  assert.match(readme, /PATH=\.\.\/runtime\/node\/bin:\$PATH/u);
   assert.match(readme, /不安装或修改系统全局 Node/u);
 });
 

@@ -37,6 +37,7 @@ done
 [ -x "$RUNTIME_BIN/npm" ] || { echo "missing isolated npm runtime: $RUNTIME_BIN/npm" >&2; exit 1; }
 node_major="$($RUNTIME_BIN/node -p 'process.versions.node.split(".")[0]')"
 [ "$node_major" -eq 24 ] || { echo "isolated Node runtime must be Node.js 24" >&2; exit 1; }
+PATH="$RUNTIME_BIN:$PATH" "$RUNTIME_BIN/npm" --version >/dev/null
 
 install -d -m 0755 "$ROOT" "$APP_ROOT" "$PUBLIC_ROOT" "$PUBLIC_ROOT/packages"
 install -d -m 0700 "$PRIVATE_ROOT" "$WORK_ROOT"

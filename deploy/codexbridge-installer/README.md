@@ -12,7 +12,7 @@
 
 1. 把官方 Node.js 24 Linux x64 运行时解压到 `/opt/shanhai/codexbridge-installer/runtime/node/`；新服务只使用该目录内的 `node` 和 `npm`，不安装或修改系统全局 Node。
 2. Linux 发布机具备 OpenSSL、nginx 和 `osslsigncode`。
-3. 将本仓库的已审核版本放到 `/opt/shanhai/codexbridge-installer/app/`，使用隔离运行时执行 `../runtime/node/bin/npm ci --omit=dev`。
+3. 将本仓库的已审核版本放到 `/opt/shanhai/codexbridge-installer/app/`，使用隔离运行时执行 `PATH=../runtime/node/bin:$PATH ../runtime/node/bin/npm ci --omit=dev`。
 4. 确认 `node_modules/7zip-bin/linux/<arch>/7za` 可执行。
 5. 将 `nginx-test-location.conf` 作为一次新的 include 加入 `shanhaiyouling.com` 的 server 块；安装脚本只安装独立 snippet，不会自行编辑其他 server 配置。
 6. 对象存储若以挂载目录提供，把 `/opt/shanhai/codexbridge-installer/public/` 指向该隔离挂载点；不要与任何现有目录共用。
