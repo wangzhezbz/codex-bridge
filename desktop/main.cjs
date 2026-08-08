@@ -1026,6 +1026,9 @@ function registerWindowLoadHooks() {
   mainWindow.webContents.once("did-finish-load", () => {
     markStartupOnce("window-ready");
     scheduleDeferredStartupWork();
+    cleanupMacAppBackupsAfterRendererReady().catch((error) => {
+      appendRuntimeLog(formatError("cleanupMacAppBackups", error));
+    });
   });
 
   if (launchedAfterUpdate && process.env.CODEXBRIDGE_DESKTOP_SMOKE !== "1" && !launchedUpdateLoadHookRegistered) {
@@ -4182,12 +4185,43 @@ async function cleanupUpdateArtifactsOnStartup() {
     const updater = await loadUpdater();
     fs.mkdirSync(portableUpdatesDir(), { recursive: true });
     await updater.cleanupManagedUpdateArtifacts?.(portableUpdatesDir(), { keepPackages: launchedAfterUpdate ? 0 : 1 });
+    const updateDirectoryTargets = await updater.managedUpdateDirectoryCleanupTargets?.(portableUpdatesDir()) || [];
+    for (const targetDir of updateDirectoryTargets) {
+      try {
+        removeDirectoryTreeSafeSync(targetDir, portableUpdatesDir());
+        appendRuntimeLog(`Removed managed update extraction directory: ${targetDir}`);
+      } catch (error) {
+        appendRuntimeLog(formatError("cleanupUpdateExtractionDirectory", error));
+      }
+    }
     if (launchedAfterUpdate) {
       cleanupInstallerPackageAfterUpdate(0);
       await cleanupInstalledAppVersionsAfterUpdate(updater);
     }
   } catch (error) {
     appendRuntimeLog(formatError("cleanupUpdates", error));
+  }
+}
+
+async function cleanupMacAppBackupsAfterRendererReady() {
+  if (process.platform !== "darwin" || !app.isPackaged || process.env.CODEXBRIDGE_DESKTOP_SMOKE === "1") {
+    return;
+  }
+  const updater = await loadUpdater();
+  const currentAppBundle = currentMacAppBundle();
+  const appParent = path.dirname(currentAppBundle);
+  const targets = await updater.managedMacAppBackupCleanupTargets?.({ currentAppBundle }) || [];
+  for (const targetDir of targets) {
+    if (path.dirname(normalizeFsPath(targetDir)) !== normalizeFsPath(appParent)) {
+      appendRuntimeLog(`Skipped macOS app backup cleanup outside current app parent: ${targetDir}`);
+      continue;
+    }
+    try {
+      removeDirectoryTreeSafeSync(targetDir, appParent);
+      appendRuntimeLog(`Removed previous managed macOS app bundle: ${targetDir}`);
+    } catch (error) {
+      appendRuntimeLog(formatError("cleanupMacAppBackup", error));
+    }
   }
 }
 

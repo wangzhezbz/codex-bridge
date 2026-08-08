@@ -412,6 +412,9 @@ test("desktop cleans old managed update artifacts and previous installed apps af
   assert.match(main, /cleanupInstallerPackageAfterUpdate\(0\)/);
   assert.match(main, /setTimeout\(\(\) => cleanupInstallerPackageAfterUpdate\(attempt \+ 1\), 3000\)/);
   assert.match(main, /installedLegacyAppCleanupTargets\?\.\(/);
+  assert.match(main, /managedUpdateDirectoryCleanupTargets\?\.\(portableUpdatesDir\(\)\)/);
+  assert.match(main, /cleanupMacAppBackupsAfterRendererReady/);
+  assert.match(main, /managedMacAppBackupCleanupTargets\?\.\(\{ currentAppBundle \}\)/);
   assert.match(main, /removeInstalledCleanupTargetSafeSync/);
   assert.match(main, /removeDirectoryTreeSafeSync/);
   assert.match(main, /prepareInstallerUpdate/);

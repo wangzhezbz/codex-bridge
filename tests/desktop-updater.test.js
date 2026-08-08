@@ -14,6 +14,8 @@ import {
   inferUpdateInstallKind,
   installedLegacyAppCleanupTargets,
   installedAppVersionCleanupTargets,
+  managedMacAppBackupCleanupTargets,
+  managedUpdateDirectoryCleanupTargets,
   isNewerVersion,
   planReleaseUpdate,
   updateDownloadProxyLabel,
@@ -732,7 +734,54 @@ test("macOS portable updater script replaces the app bundle without recursive de
   assert.match(script, /ditto -x -k/);
   assert.match(script, /mv "\$CURRENT_APP_BUNDLE"/);
   assert.match(script, /open "\$CURRENT_APP_BUNDLE"/);
+  assert.match(script, /--args --updated/);
   assert.doesNotMatch(script, /rm\s+-rf|Remove-Item\s+-Recurse|rmdir\s+\/s|rd\s+\/s|del\s+\/s/i);
+});
+
+test("macOS updater selects only its timestamped app backups for cleanup", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-mac-backups-"));
+  const current = path.join(root, "CodexBridge.app");
+  const managed = [
+    path.join(root, "CodexBridge.app.previous-20260808-010203"),
+    path.join(root, "CodexBridge.app.previous-20260809-111213"),
+  ];
+  const keep = [
+    path.join(root, "CodexBridge Backup.app"),
+    path.join(root, "CodexBridge.app.previous-manual"),
+    path.join(root, "Another.app.previous-20260809-111213"),
+  ];
+  for (const dir of [current, ...managed, ...keep]) {
+    fs.mkdirSync(dir);
+  }
+
+  const targets = await managedMacAppBackupCleanupTargets({ currentAppBundle: current });
+
+  assert.deepEqual(targets.sort(), managed.sort());
+  for (const dir of [...managed, ...keep, current, root]) {
+    fs.rmdirSync(dir);
+  }
+});
+
+test("updater selects only timestamped managed extraction directories for cleanup", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-update-directories-"));
+  const managed = [
+    path.join(root, "extract-20260808-010203"),
+    path.join(root, "extract-20260809-111213"),
+  ];
+  const keep = [
+    path.join(root, "extract-manual"),
+    path.join(root, "other-20260809-111213"),
+  ];
+  for (const dir of [...managed, ...keep]) {
+    fs.mkdirSync(dir);
+  }
+
+  const targets = await managedUpdateDirectoryCleanupTargets(root);
+
+  assert.deepEqual(targets.sort(), managed.sort());
+  for (const dir of [...managed, ...keep, root]) {
+    fs.rmdirSync(dir);
+  }
 });
 
 function snapshotProxyEnv() {

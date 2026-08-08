@@ -390,6 +390,51 @@ export async function installedAppVersionCleanupTargets({
   return uniqueFsPaths(targets);
 }
 
+export async function managedMacAppBackupCleanupTargets({
+  currentAppBundle = "",
+} = {}) {
+  const current = normalizeFsPath(currentAppBundle);
+  if (!current || path.extname(current).toLowerCase() !== ".app") {
+    return [];
+  }
+  const appParent = path.dirname(current);
+  const appLeaf = path.basename(current);
+  const managedName = new RegExp(`^${escapeRegExp(appLeaf)}\\.previous-\\d{8}-\\d{6}$`);
+  let entries = [];
+  try {
+    entries = await fs.readdir(appParent, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+  return uniqueFsPaths(entries
+    .filter((entry) => entry.isDirectory() && managedName.test(entry.name))
+    .map((entry) => path.resolve(appParent, entry.name))
+    .filter((target) => path.dirname(target) === appParent && !sameFsPath(target, current)));
+}
+
+export async function managedUpdateDirectoryCleanupTargets(updateDir = "") {
+  const root = normalizeFsPath(updateDir);
+  if (!root) {
+    return [];
+  }
+  let entries = [];
+  try {
+    entries = await fs.readdir(root, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+  return uniqueFsPaths(entries
+    .filter((entry) => entry.isDirectory() && /^extract-\d{8}-\d{6}$/.test(entry.name))
+    .map((entry) => path.resolve(root, entry.name))
+    .filter((target) => path.dirname(target) === root));
+}
+
 const LEGACY_INSTALLED_APP_FILES = [
   "CodexBridge.exe",
   "chrome_100_percent.pak",
@@ -1093,13 +1138,17 @@ mv "$CURRENT_APP_BUNDLE" "$backup_bundle"
 log "Moving new app bundle into place."
 mv "$new_app" "$CURRENT_APP_BUNDLE"
 log "Starting updated CodexBridge."
-open "$CURRENT_APP_BUNDLE"
-log "更新完成，旧版本保留在 $backup_bundle。"
+open "$CURRENT_APP_BUNDLE" --args --updated
+log "更新完成；旧版本会在新版界面正常加载后自动清理：$backup_bundle"
 `;
 }
 
 function normalizeVersion(value) {
   return String(value || "").trim().replace(/^v/i, "");
+}
+
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function normalizeFsPath(value) {
