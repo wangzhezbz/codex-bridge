@@ -38,6 +38,10 @@ done
 node_major="$($RUNTIME_BIN/node -p 'process.versions.node.split(".")[0]')"
 [ "$node_major" -eq 24 ] || { echo "isolated Node runtime must be Node.js 24" >&2; exit 1; }
 PATH="$RUNTIME_BIN:$PATH" "$RUNTIME_BIN/npm" --version >/dev/null
+SEVEN_ZIP="$APP_ROOT/node_modules/7zip-bin/linux/x64/7za"
+[ -f "$SEVEN_ZIP" ] || { echo "missing Linux x64 7zip helper: $SEVEN_ZIP" >&2; exit 1; }
+chmod 0755 "$SEVEN_ZIP"
+[ -x "$SEVEN_ZIP" ] || { echo "Linux x64 7zip helper is not executable" >&2; exit 1; }
 
 install -d -m 0755 "$ROOT" "$APP_ROOT" "$PUBLIC_ROOT" "$PUBLIC_ROOT/packages"
 install -d -m 0700 "$PRIVATE_ROOT" "$WORK_ROOT"

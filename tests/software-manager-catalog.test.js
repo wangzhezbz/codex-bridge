@@ -170,10 +170,10 @@ test("catalog resolves an authorized test package asset URL", () => {
   assert.equal(resolveCatalogAssetUrl(TEST_CATALOG_URL, "https://shanhaiyouling.com/codexbridge-test/packages/chatgpt.zip"), "https://shanhaiyouling.com/codexbridge-test/packages/chatgpt.zip");
 });
 
-test("catalog trust rejects the default unprovisioned public key", () => {
+test("catalog trust rejects a catalog signed by a key other than the pinned publisher", () => {
   const signed = signedFixture({ components: [componentFixture()] });
   const { publicKeyPem, ...unsignedRuntime } = signed;
-  assert.throws(() => verifyCatalogEnvelope({ ...unsignedRuntime, catalogUrl: TEST_CATALOG_URL }), /catalog_trust_not_provisioned/);
+  assert.throws(() => verifyCatalogEnvelope({ ...unsignedRuntime, catalogUrl: TEST_CATALOG_URL }), /catalog_signature_invalid/);
 });
 
 test("catalog compares numeric version segments", () => {

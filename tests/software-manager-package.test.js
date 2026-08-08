@@ -78,11 +78,10 @@ test("macOS packaging removes the Windows helper and renderer exposes no usable 
   assert.match(rendererSource, /softwareManagerPlatform\s*!==\s*["']win32["']/);
 });
 
-test("release readiness blocks an untrusted catalog and validates the pinned helper", () => {
+test("release readiness validates the provisioned catalog trust and pinned helper", () => {
   const readiness = buildSoftwareManagerReleaseReadiness({ repoRoot, env: {} });
-  assert.equal(readiness.ok, false);
   assert.equal(readiness.items.find((item) => item.id === "software_manager_catalog_url")?.status, "pass");
   assert.equal(readiness.items.find((item) => item.id === "software_manager_7zip")?.status, "pass");
   assert.equal(readiness.items.find((item) => item.id === "software_manager_7zip_license")?.status, "pass");
-  assert.equal(readiness.items.find((item) => item.id === "catalog_trust_not_provisioned")?.status, "fail");
+  assert.equal(readiness.items.find((item) => item.id === "software_manager_catalog_trust")?.status, "pass");
 });

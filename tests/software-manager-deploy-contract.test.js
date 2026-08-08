@@ -102,6 +102,8 @@ test("publisher uses the isolated Node runtime instead of changing the server No
   assert.match(installer, /"\$RUNTIME_BIN\/node"/u);
   assert.match(installer, /"\$RUNTIME_BIN\/npm"/u);
   assert.match(installer, /PATH="\$RUNTIME_BIN:\$PATH" "\$RUNTIME_BIN\/npm" --version/u);
+  assert.match(installer, /SEVEN_ZIP="\$APP_ROOT\/node_modules\/7zip-bin\/linux\/x64\/7za"/u);
+  assert.match(installer, /chmod 0755 "\$SEVEN_ZIP"/u);
   assert.doesNotMatch(installer, /for command in [^\n]*\bnode\b/u);
   assert.match(service, /Environment=PATH=\/opt\/shanhai\/codexbridge-installer\/runtime\/node\/bin:/u);
   assert.match(readme, /runtime\/node/u);
