@@ -7,7 +7,7 @@ import test from "node:test";
 
 import { verifyCatalogEnvelope } from "../desktop/software-manager/catalog-trust.mjs";
 import { loadPublisherConfig } from "../scripts/software-manager/publisher-config.mjs";
-import { inspectV2RayNRelease, V2RAYN_PACKAGE_URL } from "../scripts/software-manager/sync-v2rayn.mjs";
+import { inspectV2RayNRelease, readPeFileVersion, V2RAYN_PACKAGE_URL } from "../scripts/software-manager/sync-v2rayn.mjs";
 import { GIT_RELEASE_API_URL, inspectGitRelease } from "../scripts/software-manager/sync-git.mjs";
 import { publishComponentReleases, syncComponents } from "../scripts/software-manager/sync-components.mjs";
 
@@ -88,6 +88,16 @@ test("V2RayN release identity comes from internal version plus hash, never the f
   assert.equal(result.version, "7.20.4");
   assert.match(result.sha256, /^[a-f0-9]{64}$/u);
   assert.doesNotMatch(result.identity, /v1\.v2ai\.top/u);
+});
+
+test("cross-platform PE inspection reads the fixed file version without PowerShell", () => {
+  const bytes = Buffer.alloc(96);
+  bytes.writeUInt32LE(0xfeef04bd, 32);
+  bytes.writeUInt32LE(0x00010000, 36);
+  bytes.writeUInt32LE((7 << 16) | 20, 40);
+  bytes.writeUInt32LE((4 << 16) | 9, 44);
+  assert.equal(readPeFileVersion(bytes), "7.20.4.9");
+  assert.throws(() => readPeFileVersion(Buffer.alloc(32)), /software_sync_pe_version_missing/);
 });
 
 test("Git sync selects only the official x64 installer and requires Valid Authenticode", async () => {

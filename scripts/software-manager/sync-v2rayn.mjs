@@ -82,6 +82,19 @@ function validateInspection(value) {
   return value;
 }
 
+export function readPeFileVersion(bytes) {
+  const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes ?? []);
+  for (let offset = 0; offset + 16 <= buffer.length; offset += 1) {
+    if (buffer.readUInt32LE(offset) !== 0xfeef04bd || buffer.readUInt32LE(offset + 4) !== 0x00010000) continue;
+    const versionMs = buffer.readUInt32LE(offset + 8);
+    const versionLs = buffer.readUInt32LE(offset + 12);
+    const parts = [versionMs >>> 16, versionMs & 0xffff, versionLs >>> 16, versionLs & 0xffff];
+    if (parts.every((value) => value === 0)) continue;
+    return parts.join(".");
+  }
+  throw syncError("software_sync_pe_version_missing");
+}
+
 export async function inspectV2RayNRelease({
   currentCatalog = { components: [] },
   fetchImpl = globalThis.fetch,
@@ -118,7 +131,8 @@ export async function inspectV2RayNRelease({
 
 async function defaultArchiveInspector(packagePath) {
   const sevenZipRoot = path.dirname(require.resolve("7zip-bin"));
-  const sevenZip = path.join(sevenZipRoot, "win", process.arch, "7za.exe");
+  const platformDirectory = process.platform === "win32" ? "win" : process.platform === "darwin" ? "mac" : "linux";
+  const sevenZip = path.join(sevenZipRoot, platformDirectory, process.arch, process.platform === "win32" ? "7za.exe" : "7za");
   const { stdout } = await execFileAsync(sevenZip, ["l", "-slt", "-ba", "--", packagePath], {
     windowsHide: true,
     timeout: 30_000,
@@ -146,12 +160,8 @@ async function defaultArchiveInspector(packagePath) {
       timeout: 30_000,
       maxBuffer: 1024 * 1024,
     });
-    const command = "$p=Get-Item -LiteralPath $env:CBI_V2RAYN_EXE;[Console]::Out.Write($p.VersionInfo.FileVersion)";
-    const { stdout: version } = await execFileAsync("powershell.exe", [
-      "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command,
-    ], { env: { ...process.env, CBI_V2RAYN_EXE: executable }, windowsHide: true, timeout: 15_000 });
     return {
-      version: String(version).trim(),
+      version: readPeFileVersion(fs.readFileSync(executable)),
       entrypoint: "v2rayN.exe",
       requiredFiles: paths,
       maxRelativePathLength: Math.max(...paths.map((value) => value.length)),

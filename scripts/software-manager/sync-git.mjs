@@ -37,6 +37,18 @@ function selectAsset(metadata) {
 }
 
 async function defaultAuthenticodeInspector(packagePath) {
+  if (process.platform !== "win32") {
+    const executable = String(process.env.CBI_OSSLSIGNCODE_PATH || "/usr/bin/osslsigncode");
+    if (!path.isAbsolute(executable) || path.normalize(executable) !== executable) {
+      throw gitError("software_sync_git_authenticode_tool_invalid");
+    }
+    await execFileAsync(executable, ["verify", "-in", packagePath], {
+      windowsHide: true,
+      timeout: 30_000,
+      maxBuffer: 1024 * 1024,
+    });
+    return "Valid";
+  }
   const command = "$s=Get-AuthenticodeSignature -LiteralPath $env:CBI_GIT_INSTALLER;[Console]::Out.Write($s.Status)";
   const { stdout } = await execFileAsync("powershell.exe", [
     "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command,
@@ -54,10 +66,16 @@ export async function inspectGitRelease({
   fetchImpl = globalThis.fetch,
   authenticodeInspector = defaultAuthenticodeInspector,
   workRoot,
+  githubToken = process.env.GITHUB_TOKEN,
 } = {}) {
+  const metadataHeaders = {
+    accept: "application/vnd.github+json",
+    "user-agent": "CodexBridge-software-sync/1",
+    ...(githubToken ? { authorization: `Bearer ${githubToken}` } : {}),
+  };
   const response = await fetchImpl(GIT_RELEASE_API_URL, {
     redirect: "error",
-    headers: { accept: "application/vnd.github+json", "user-agent": "CodexBridge-software-sync/1" },
+    headers: metadataHeaders,
   });
   if (!response?.ok) throw gitError("software_sync_git_metadata_failed");
   const selected = selectAsset(await response.json());

@@ -1,0 +1,31 @@
+[Unit]
+Description=CodexBridge isolated software catalog synchronization
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/shanhai/codexbridge-installer/app/package.json
+ConditionPathExists=/opt/shanhai/codexbridge-installer/private/publisher.env
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/shanhai/codexbridge-installer/app
+EnvironmentFile=/opt/shanhai/codexbridge-installer/private/publisher.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env npm run software:sync
+TimeoutStartSec=30min
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/opt/shanhai/codexbridge-installer/
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily CodexBridge isolated software catalog synchronization
+
+[Timer]
+OnCalendar=*-*-* 03:17:00 Asia/Shanghai
+RandomizedDelaySec=30min
+Persistent=true
+Unit=codexbridge-installer-sync.service
+
+[Install]
+WantedBy=timers.target
