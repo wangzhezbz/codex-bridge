@@ -172,6 +172,33 @@ test("Git sync selects only the official x64 installer and requires Valid Authen
   assert.equal(result.authenticode, "Valid");
 });
 
+test("Git sync skips the installer download when official metadata matches the signed catalog version", async () => {
+  const current = component("git", "a".repeat(64));
+  current.version = "2.55.0.3";
+  const calls = [];
+  const result = await inspectGitRelease({
+    currentCatalog: { schemaVersion: 1, components: [current], skills: [] },
+    workRoot: tempRoot("git-current"),
+    fetchImpl: async (url) => {
+      calls.push(url);
+      assert.equal(url, GIT_RELEASE_API_URL);
+      return {
+        ok: true,
+        json: async () => ({ assets: [{
+          name: "Git-2.55.0.3-64-bit.exe",
+          browser_download_url: "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.3/Git-2.55.0.3-64-bit.exe",
+        }] }),
+      };
+    },
+    authenticodeInspector: async () => { throw new Error("installer must not be downloaded"); },
+  });
+  assert.equal(result.action, "noop");
+  assert.equal(result.reason, "version_unchanged");
+  assert.equal(result.version, "2.55.0.3");
+  assert.equal(result.sha256, current.sha256);
+  assert.deepEqual(calls, [GIT_RELEASE_API_URL]);
+});
+
 test("Git sync rejects unofficial assets and failed Authenticode before publication", async () => {
   const metadata = (url) => ({
     ok: true,

@@ -114,6 +114,17 @@ export async function inspectGitRelease({
   });
   if (!response?.ok) throw gitError("software_sync_git_metadata_failed");
   const selected = selectAsset(await response.json());
+  const current = currentCatalog.components?.find((item) => item.id === "git");
+  if (current?.version === selected.version) {
+    return Object.freeze({
+      id: "git",
+      action: "noop",
+      reason: "version_unchanged",
+      version: selected.version,
+      sha256: current.sha256,
+      identity: `${selected.version}:${current.sha256}`,
+    });
+  }
   const downloaded = await downloadToPart({
     url: selected.url,
     fetchImpl,
@@ -123,7 +134,6 @@ export async function inspectGitRelease({
   try {
     const authenticode = String(await authenticodeInspector(downloaded.packagePath));
     if (authenticode !== "Valid") throw gitError("software_sync_git_authenticode_invalid");
-    const current = currentCatalog.components?.find((item) => item.id === "git");
     const unchanged = current?.sha256 === downloaded.sha256;
     return Object.freeze({
       ...downloaded,
