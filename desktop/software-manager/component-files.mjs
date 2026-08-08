@@ -8,6 +8,8 @@ const VERSION = /^\d+(?:\.\d+){1,3}$/u;
 const GIT_VERSION = /^(\d+(?:\.\d+){1,3})(?:\.windows\.([1-9]\d*))?$/u;
 const GIT_VERSION_OUTPUT = /^git version (\d+(?:\.\d+){1,3})\.windows\.([1-9]\d*)\r?\n?$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
+const CHATGPT_VERSION_MARKER = ".codexbridge-chatgpt-version.json";
+const CHATGPT_VERSION_MARKER_MAX_BYTES = 1_024;
 const PREPARE_NAME = /^\.codexbridge-prepare-[a-f0-9]{32}$/u;
 const MISSING_CODES = new Set(["ENOENT", "ERROR_FILE_NOT_FOUND", "ERROR_PATH_NOT_FOUND", "windows_path_missing"]);
 const COMPONENT_SLOTS = Object.freeze({
@@ -108,6 +110,21 @@ function isMissing(error) {
   return MISSING_CODES.has(error?.code) || MISSING_CODES.has(error?.cause?.code);
 }
 
+function parseChatGPTVersionMarker(bytes) {
+  if (!Buffer.isBuffer(bytes) || bytes.length === 0 || bytes.length > CHATGPT_VERSION_MARKER_MAX_BYTES) {
+    throw componentError("component_version_marker_invalid");
+  }
+  let value;
+  try { value = JSON.parse(bytes.toString("utf8")); } catch (error) {
+    throw componentError("component_version_marker_invalid", error);
+  }
+  if (!exactKeys(value, ["schemaVersion", "componentId", "version"])
+    || value.schemaVersion !== 1 || value.componentId !== "chatgpt" || !VERSION.test(value.version ?? "")) {
+    throw componentError("component_version_marker_invalid");
+  }
+  return value.version;
+}
+
 export function createComponentFileService({
   fileCapabilities,
   installRootCapability,
@@ -181,6 +198,7 @@ export function createComponentFileService({
     }
 
     const pins = [];
+    const pinsByPath = new Map();
     let primaryError = null;
     try {
       const uniquePaths = [...new Map(requiredFiles.map((item) => [item.toLowerCase(), item])).values()];
@@ -193,9 +211,23 @@ export function createComponentFileService({
           throw componentError("component_file_pin_invalid");
         }
         pins.push(pin);
+        pinsByPath.set(filePath.toLowerCase(), pin);
         await pin.assertStableNoFollow();
       }
-      const actualVersion = await versions.readFileVersion(entrypointPath);
+      let actualVersion;
+      const markerPath = relativeFile(expectedRoot, CHATGPT_VERSION_MARKER);
+      if (plan.componentId === "chatgpt"
+        && uniquePaths.some((item) => samePath(item, markerPath))) {
+        const markerPin = pinsByPath.get(markerPath.toLowerCase());
+        if (typeof markerPin?.readFileNoFollow !== "function") {
+          throw componentError("component_version_marker_capability_required");
+        }
+        actualVersion = parseChatGPTVersionMarker(
+          await markerPin.readFileNoFollow(CHATGPT_VERSION_MARKER_MAX_BYTES),
+        );
+      } else {
+        actualVersion = await versions.readFileVersion(entrypointPath);
+      }
       if (!VERSION.test(actualVersion ?? "") || compareVersions(actualVersion, plan.expectedVersion) !== 0) {
         throw componentError("component_version_mismatch");
       }

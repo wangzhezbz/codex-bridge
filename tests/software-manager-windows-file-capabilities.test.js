@@ -876,14 +876,14 @@ test("safe-delete lists bounded names and deletes files and directories by descr
 
 test("safe-delete directory enumeration enforces one owner-wide entry budget", async () => {
   const entries = [{ path: "C:\\work\\owned" }, { path: "C:\\work\\owned\\nested" }];
-  for (let index = 0; index < 4_095; index += 1) {
+  for (let index = 0; index < 16_383; index += 1) {
     entries.push({ path: `C:\\work\\owned\\file-${index}.txt`, kind: "file", data: "" });
   }
   entries.push({ path: "C:\\work\\owned\\nested\\overflow.txt", kind: "file", data: "" });
   const fake = createFakeNative(entries);
   const root = await capabilities(fake).openDirectoryNoFollow("C:\\work\\owned");
   const names = await root.listChildren();
-  assert.equal(names.length, 4_096);
+  assert.equal(names.length, 16_384);
   const nested = await root.openChildNoFollow("nested");
   await assert.rejects(nested.handle.listChildren(), /entry_limit/u);
   await nested.handle.close();

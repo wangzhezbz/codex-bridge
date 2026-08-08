@@ -6,6 +6,7 @@ import { verifyCatalogEnvelope } from "../../desktop/software-manager/catalog-tr
 
 const CATALOG_URL = "https://shanhaiyouling.com/codexbridge-install-test/component-catalog.json";
 const SIGNATURE_URL = `${CATALOG_URL}.sig`;
+const MAX_ASSET_CONCURRENCY = 4;
 
 function verifyError(code) {
   const error = new Error(code);
@@ -46,6 +47,21 @@ async function verifyAsset(fetchImpl, item) {
   return Object.freeze({ id: item.id, version: item.version, url: item.assetUrl, size, sha256 });
 }
 
+async function verifyAssets(fetchImpl, items) {
+  const results = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(MAX_ASSET_CONCURRENCY, items.length) }, async () => {
+    for (;;) {
+      const index = next;
+      next += 1;
+      if (index >= items.length) return;
+      results[index] = await verifyAsset(fetchImpl, items[index]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 export async function verifyTestEndpoint({
   fetchImpl = globalThis.fetch,
   publicKeyPem = CATALOG_PUBLIC_KEY_SPKI,
@@ -59,8 +75,7 @@ export async function verifyTestEndpoint({
   const jsonBytes = Buffer.from(await catalogResponse.arrayBuffer());
   const signatureText = await signatureResponse.text();
   const catalog = verifyCatalogEnvelope({ jsonBytes, signatureText, publicKeyPem, catalogUrl: CATALOG_URL });
-  const assets = [];
-  for (const item of [...catalog.components, ...catalog.skills]) assets.push(await verifyAsset(fetchImpl, item));
+  const assets = await verifyAssets(fetchImpl, [...catalog.components, ...catalog.skills]);
   return Object.freeze({
     ok: true,
     endpoint: CATALOG_URL,

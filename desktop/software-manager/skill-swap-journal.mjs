@@ -1,5 +1,7 @@
 import path from "node:path";
 
+import { MAX_SOFTWARE_PACKAGE_ENTRIES } from "../../shared/software-manager/catalog-schema.mjs";
+
 const SCHEMA_VERSION = 1;
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
 const SWAP_ID = /^[a-f0-9]{32}$/u;
@@ -82,7 +84,7 @@ function expectedEvidence(value) {
   if (!exact(value, ["treeDigest", "manifestDigest", "skillMdSha256", "requiredFiles"])
     || !SHA256.test(value.treeDigest ?? "") || !SHA256.test(value.manifestDigest ?? "")
     || !SHA256.test(value.skillMdSha256 ?? "") || !Array.isArray(value.requiredFiles)
-    || value.requiredFiles.length === 0 || value.requiredFiles.length > 4_096) {
+    || value.requiredFiles.length === 0 || value.requiredFiles.length > MAX_SOFTWARE_PACKAGE_ENTRIES) {
     throw journalError("skill_swap_record_invalid");
   }
   const requiredFiles = value.requiredFiles.map(requiredFile);

@@ -2,7 +2,9 @@ import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import path from "node:path";
 
-const MAX_FILES = 100_000;
+import { MAX_SOFTWARE_PACKAGE_ENTRIES } from "../../shared/software-manager/catalog-schema.mjs";
+
+const MAX_FILES = MAX_SOFTWARE_PACKAGE_ENTRIES;
 const MAX_ZIP32_SIZE = 0xffff_ffff;
 const CRC_TABLE = buildCrcTable();
 

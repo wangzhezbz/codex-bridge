@@ -1,5 +1,6 @@
 export const COMPONENT_IDS = Object.freeze(["chatgpt", "v2rayn", "git"]);
 export const MAX_SOFTWARE_PACKAGE_BYTES = 16 * 1_024 * 1_024 * 1_024;
+export const MAX_SOFTWARE_PACKAGE_ENTRIES = 16_384;
 export const TEST_CATALOG_ORIGIN = "https://shanhaiyouling.com";
 export const TEST_CATALOG_PATH = "/codexbridge-install-test/component-catalog.json";
 export const TEST_PACKAGE_PATH = "/codexbridge-test/packages/";

@@ -1,4 +1,5 @@
 import path from "node:path";
+import { MAX_SOFTWARE_PACKAGE_ENTRIES } from "../../shared/software-manager/catalog-schema.mjs";
 import { isTrustedCatalogService } from "./catalog-trust.mjs";
 import { readInstallRootCapability } from "./path-policy.mjs";
 
@@ -86,7 +87,7 @@ function evidenceMatches(value, expected) {
 }
 
 function normalizeRequiredFiles(value) {
-  if (!Array.isArray(value) || value.length === 0 || value.length > 4_096) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_SOFTWARE_PACKAGE_ENTRIES) {
     throw skillError("skill_required_files_invalid");
   }
   const result = value.map((item) => {

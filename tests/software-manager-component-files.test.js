@@ -44,11 +44,11 @@ function component(id, version, format, entrypoint, requiredFiles = [entrypoint]
   };
 }
 
-function trustedCatalog() {
+function trustedCatalog(chatgptRequiredFiles = ["ChatGPT.exe", "resources/app.asar"]) {
   const catalog = {
     schemaVersion: 1,
     components: [
-      component("chatgpt", "2.0.0", "zip", "ChatGPT.exe", ["ChatGPT.exe", "resources/app.asar"]),
+      component("chatgpt", "2.0.0", "zip", "ChatGPT.exe", chatgptRequiredFiles),
       component("v2rayn", "7.0.4", "7z", "v2rayN.exe"),
       component("git", "2.50.0", "exe", "cmd/git.exe"),
     ],
@@ -130,6 +130,10 @@ function fakeFiles(initial = {}) {
             throw Object.assign(new Error("windows_identity_changed"), { code: "windows_identity_changed" });
           }
         },
+        async readFileNoFollow(maxBytes) {
+          if (closed || node.data.length > maxBytes) throw new Error("read_limit");
+          return Buffer.from(node.data);
+        },
         async close() { closed = true; },
       };
     },
@@ -198,13 +202,17 @@ function fakeFiles(initial = {}) {
   return { calls, nodes, add, fileCapabilities };
 }
 
-function componentFixture({ files = fakeFiles(), version = "2.0.0", execFile } = {}) {
+function componentFixture({
+  files = fakeFiles(), version = "2.0.0", execFile,
+  catalogService = CATALOG,
+  versionReader = { async readFileVersion(filePath) { return filePath.endsWith("v2rayN.exe") ? "7.0.4" : version; } },
+} = {}) {
   const consumed = [];
   const deleted = [];
   const service = createComponentFileService({
     fileCapabilities: files.fileCapabilities,
     installRootCapability,
-    catalogService: CATALOG,
+    catalogService,
     workspace: {
       async consumePromotedPackageProof(proof, expected) {
         assert.equal(proof, PACKAGE_PROOF);
@@ -212,7 +220,7 @@ function componentFixture({ files = fakeFiles(), version = "2.0.0", execFile } =
         return expected;
       },
     },
-    versionReader: { async readFileVersion(filePath) { return filePath.endsWith("v2rayN.exe") ? "7.0.4" : version; } },
+    versionReader,
     execFile: execFile ?? (async () => ({ stdout: "git version 2.50.0.windows.1\n", stderr: "", exitCode: 0 })),
     async deleteAuthorizedTree(plan) { deleted.push(plan.target); },
   });
@@ -246,6 +254,31 @@ test("staging verification consumes the sealed package proof and derives every p
     `${stagingRoot}\\ChatGPT.exe`,
     `${stagingRoot}\\resources\\app.asar`,
   ]);
+});
+
+test("ChatGPT verifies its signed package version marker instead of Chromium PE version", async () => {
+  const marker = ".codexbridge-chatgpt-version.json";
+  const stagingName = `.codexbridge-prepare-${"c".repeat(32)}`;
+  const stagingRoot = `D:\\CBApps\\${stagingName}`;
+  const files = fakeFiles({
+    [`${stagingRoot}\\ChatGPT.exe`]: {},
+    [`${stagingRoot}\\${marker}`]: {
+      data: JSON.stringify({ schemaVersion: 1, componentId: "chatgpt", version: "2.0.0" }),
+    },
+  });
+  let peReads = 0;
+  const fixture = componentFixture({
+    files,
+    catalogService: trustedCatalog([marker, "ChatGPT.exe"]),
+    versionReader: { async readFileVersion() { peReads += 1; return "150.0.7871.128"; } },
+  });
+  await fixture.service.verifyComponent({
+    componentId: "chatgpt", phase: "staging", stagingName,
+    rootPath: stagingRoot, entrypointPath: `${stagingRoot}\\ChatGPT.exe`,
+    requiredFiles: [`${stagingRoot}\\${marker}`, `${stagingRoot}\\ChatGPT.exe`],
+    expectedVersion: "2.0.0", expectedPackageSha256: HASH, packageProof: PACKAGE_PROOF,
+  });
+  assert.equal(peReads, 0);
 });
 
 test("component verification rejects caller-substituted catalog files before consuming package authority", async () => {

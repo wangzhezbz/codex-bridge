@@ -9,6 +9,7 @@ import { verifyCatalogEnvelope } from "../desktop/software-manager/catalog-trust
 import { buildCatalogBytes } from "../scripts/software-manager/catalog-builder.mjs";
 import { loadPublisherConfig } from "../scripts/software-manager/publisher-config.mjs";
 import { publishChatGPT } from "../scripts/software-manager/publish-chatgpt.mjs";
+import { publishImportedAssets } from "../scripts/software-manager/publish-imported-assets.mjs";
 import { publishSkills } from "../scripts/software-manager/publish-skills.mjs";
 
 const PACKAGE_BASE_URL = "https://shanhaiyouling.com/codexbridge-test/packages/";
@@ -201,8 +202,49 @@ test("publisher refuses to re-sign a catalog whose existing detached signature n
   }), /publisher_existing_catalog_signature_invalid/);
 });
 
+test("imported asset publisher verifies local immutable objects before signing", async () => {
+  const value = fixture();
+  const packageRoot = path.join(value.publicRoot, "packages");
+  const skillRoot = path.join(packageRoot, "skills");
+  fs.mkdirSync(skillRoot, { recursive: true });
+  const chatgptPath = path.join(packageRoot, "chatgpt-1.2.3-x64.zip");
+  const skillPath = path.join(skillRoot, "documents-1.0.0.zip");
+  fs.writeFileSync(chatgptPath, "chatgpt-package");
+  fs.writeFileSync(skillPath, "skill-package");
+  const asset = (filePath) => ({
+    size: fs.statSync(filePath).size,
+    sha256: crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex"),
+  });
+  const metadataPath = path.join(value.root, "import.json");
+  fs.writeFileSync(metadataPath, JSON.stringify({
+    component: {
+      id: "chatgpt", name: "ChatGPT", version: "1.2.3", architecture: "x64", format: "zip",
+      assetUrl: `${PACKAGE_BASE_URL}chatgpt-1.2.3-x64.zip`, ...asset(chatgptPath),
+      entrypoint: "ChatGPT.exe", requiredFiles: ["ChatGPT.exe"], maxRelativePathLength: 11,
+      publishedAt: "2026-08-08T00:00:00.000Z", supportsRollback: true,
+    },
+    skills: [{
+      id: "documents", name: "Documents", description: "Document processing.", version: "1.0.0",
+      assetUrl: `${PACKAGE_BASE_URL}skills/documents-1.0.0.zip`, ...asset(skillPath), files: ["SKILL.md"],
+    }],
+  }));
+  const result = await publishImportedAssets({
+    config: loadPublisherConfig(value.env), metadataPath,
+  });
+  assert.deepEqual(result.events, ["imported_assets_verified", "signature_written", "catalog_replaced"]);
+  const catalog = catalogEnvelope(result, value);
+  assert.equal(catalog.components[0].version, "1.2.3");
+  assert.deepEqual(catalog.skills.map((skill) => skill.id), ["documents"]);
+
+  fs.writeFileSync(skillPath, "tampered");
+  await assert.rejects(publishImportedAssets({
+    config: loadPublisherConfig(value.env), metadataPath,
+  }), /publisher_import_asset_verification_failed/);
+});
+
 test("package.json exposes explicit manual ChatGPT and Skills publisher commands", () => {
   const packageJson = JSON.parse(fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8"));
   assert.equal(packageJson.scripts["software:publish:chatgpt"], "node scripts/software-manager/publish-chatgpt.mjs");
   assert.equal(packageJson.scripts["software:publish:skills"], "node scripts/software-manager/publish-skills.mjs");
+  assert.equal(packageJson.scripts["software:publish:imported"], "node scripts/software-manager/publish-imported-assets.mjs");
 });

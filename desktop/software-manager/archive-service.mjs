@@ -2,7 +2,9 @@ import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import yauzl from "yauzl";
 
-const MAX_ARCHIVE_ENTRIES = 4_096;
+import { MAX_SOFTWARE_PACKAGE_ENTRIES } from "../../shared/software-manager/catalog-schema.mjs";
+
+const MAX_ARCHIVE_ENTRIES = MAX_SOFTWARE_PACKAGE_ENTRIES;
 const MAX_TOTAL_UNPACKED_BYTES = 16n * 1_024n * 1_024n * 1_024n;
 const MAX_SEVEN_ZIP_LISTING_BYTES = 16 * 1_024 * 1_024;
 const MAX_SEVEN_ZIP_STDERR_BYTES = 1 * 1_024 * 1_024;

@@ -207,16 +207,16 @@ test("rejects ZIP reparse-point metadata", async () => {
 });
 
 test("rejects a ZIP entry-count bomb", async () => {
-  const entries = Array.from({ length: 4_097 }, (_, index) => ({ name: `files/${index}.txt`, body: "" }));
+  const entries = Array.from({ length: 16_385 }, (_, index) => ({ name: `files/${index}.txt`, body: "" }));
   const archivePath = await writeZipFixture(entries);
   await assert.rejects(zipService().inspectArchive({ format: "zip", archivePath }), /archive_entry_count_exceeded/);
 });
 
 test("rejects a ZIP declared unpacked-size bomb", async () => {
-  const archivePath = await writeZipFixture(Array.from({ length: 5 }, (_, index) => ({
+  const archivePath = await writeZipFixture(Array.from({ length: 6 }, (_, index) => ({
     name: `huge/${index}.bin`,
     body: "",
-    declaredSize: 0xffff_ffff,
+    declaredSize: 0xc000_0000,
   })));
   await assert.rejects(zipService().inspectArchive({ format: "zip", archivePath }), /archive_unpacked_size_exceeded/);
 });
@@ -567,7 +567,7 @@ test("parses 7z security fields without overwrite or empty-value ambiguity", asy
 
 test("rejects 7z entry-count and declared-size bombs", async (t) => {
   await t.test("entry count", async () => {
-    const listing = sevenZipListing(Array.from({ length: 4_097 }, (_, index) => ({
+    const listing = sevenZipListing(Array.from({ length: 16_385 }, (_, index) => ({
       path: `files/${index}.txt`, size: 0, attributes: "A",
     })));
     const fake = fakeSevenZip({ listing });

@@ -2,7 +2,10 @@ import crypto from "node:crypto";
 import path from "node:path";
 import { Writable } from "node:stream";
 
-import { MAX_SOFTWARE_PACKAGE_BYTES } from "../../shared/software-manager/catalog-schema.mjs";
+import {
+  MAX_SOFTWARE_PACKAGE_BYTES,
+  MAX_SOFTWARE_PACKAGE_ENTRIES,
+} from "../../shared/software-manager/catalog-schema.mjs";
 import {
   readFixedDirectoryCapability,
   revalidateFixedDirectoryCapability,
@@ -10,7 +13,7 @@ import {
 } from "./path-policy.mjs";
 
 const MAX_DEPTH = 64;
-const MAX_ENTRIES = 4_096;
+const MAX_ENTRIES = MAX_SOFTWARE_PACKAGE_ENTRIES;
 const MAX_STATE_BYTES = 16 * 1_024 * 1_024;
 const WORKSPACE_HASH_CHUNK_BYTES = 1_024 * 1_024;
 const MAX_PATH_CHARS = 32_760;
@@ -2012,6 +2015,17 @@ export function createWindowsFileCapabilities({
         verifyIdentity(pin.leaf.info.identity, current);
         const finalPath = validateAbsolute(await nativeApi.finalPath(pin.leaf.handle));
         if (!samePath(finalPath, pin.path)) throw capabilityError("windows_final_path_mismatch");
+      },
+      async readFileNoFollow(maxBytes) {
+        if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 64 * 1_024) {
+          throw capabilityError("windows_pinned_file_read_limit_invalid");
+        }
+        requireOpen(pin.owner);
+        const current = validateInfo(await nativeApi.queryHandle(pin.leaf.handle), "file");
+        verifyIdentity(pin.leaf.info.identity, current);
+        const finalPath = validateAbsolute(await nativeApi.finalPath(pin.leaf.handle));
+        if (!samePath(finalPath, pin.path)) throw capabilityError("windows_final_path_mismatch");
+        return nativeApi.readFile(pin.leaf.handle, maxBytes);
       },
       async close() { await closeOwner(nativeApi, pin.owner); },
     });
