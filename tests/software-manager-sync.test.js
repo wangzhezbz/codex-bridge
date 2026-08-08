@@ -200,7 +200,7 @@ test("Git sync rejects unofficial assets and failed Authenticode before publicat
 });
 
 test("Linux Authenticode validation derives one bounded verification time from the signed timestamp", () => {
-  assert.equal(parseAuthenticodeTimestamp("Timestamp time: Jul 10 15:28:37 2026 GMT\n"), 1783697317);
+  assert.equal(parseAuthenticodeTimestamp("\tTimestamp time: Jul 10 15:28:37 2026 GMT\n"), 1783697317);
   assert.throws(() => parseAuthenticodeTimestamp(""), /software_sync_git_timestamp_invalid/);
   assert.throws(() => parseAuthenticodeTimestamp("Timestamp time: Jul 10 15:28:37 2026 GMT\nTimestamp time: Jul 10 15:28:37 2026 GMT\n"), /software_sync_git_timestamp_invalid/);
 });

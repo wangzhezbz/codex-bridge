@@ -37,7 +37,7 @@ function selectAsset(metadata) {
 }
 
 export function parseAuthenticodeTimestamp(output) {
-  const matches = [...String(output ?? "").matchAll(/^Timestamp time:\s*(.+ GMT)\s*$/gmu)];
+  const matches = [...String(output ?? "").matchAll(/^[ \t]*Timestamp time:[ \t]*(.+ GMT)[ \t]*$/gmu)];
   if (matches.length !== 1) throw gitError("software_sync_git_timestamp_invalid");
   const milliseconds = Date.parse(matches[0][1]);
   const minimum = Date.parse("2020-01-01T00:00:00.000Z");
