@@ -6,6 +6,9 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { createOwnershipStore } from "../desktop/software-manager/state-store.mjs";
+import { createTestStateFs } from "./helpers/software-manager-test-state-fs.mjs";
+
 const childPath = fileURLToPath(new URL("./fixtures/software-manager-state-child.mjs", import.meta.url));
 
 function child(mode, stateDir, label, nonce) {
@@ -47,6 +50,58 @@ test("two real Node processes crossing one CAS barrier allow exactly one generat
     assert.equal(results.filter((item) => item.status === "saved").length, 1, JSON.stringify(results));
     assert.equal(results.filter((item) => item.code === "ownership_generation_conflict").length, 1, JSON.stringify(results));
   } finally { await cleanupStateDir(stateDir); }
+});
+
+test("one transient Windows rename denial does not turn a committed CAS into an EPERM failure", async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "cb-state-rename-retry-"));
+  let attempts = 0;
+  const flakyFs = {
+    ...fs,
+    async rename(source, destination) {
+      attempts += 1;
+      if (attempts === 1) throw Object.assign(new Error("transient rename denial"), { code: "EPERM", syscall: "rename" });
+      return fs.rename(source, destination);
+    },
+  };
+  try {
+    const store = createOwnershipStore({ stateDir, fsApi: createTestStateFs({ fsImpl: flakyFs }) });
+    const saved = await store.compareAndSwap(0, {
+      schemaVersion: 1, generation: 0, installRoot: "D:\\Retry", components: {}, skills: {}, shortcuts: [],
+      rollback: null, activeTask: null, lastTask: null,
+    });
+    assert.equal(saved.generation, 1);
+    assert.equal(attempts, 2);
+  } finally {
+    await cleanupStateDir(stateDir);
+  }
+});
+
+test("one transient Windows lock-file denial is retried before releasing a completed CAS", async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "cb-state-release-retry-"));
+  let ownerUnlinkAttempts = 0;
+  const flakyFs = {
+    ...fs,
+    async unlink(target) {
+      if (path.basename(target) === "owner.json") {
+        ownerUnlinkAttempts += 1;
+        if (ownerUnlinkAttempts === 1) {
+          throw Object.assign(new Error("transient owner denial"), { code: "EPERM", syscall: "unlink" });
+        }
+      }
+      return fs.unlink(target);
+    },
+  };
+  try {
+    const store = createOwnershipStore({ stateDir, fsApi: createTestStateFs({ fsImpl: flakyFs }) });
+    const saved = await store.compareAndSwap(0, {
+      schemaVersion: 1, generation: 0, installRoot: "D:\\ReleaseRetry", components: {}, skills: {}, shortcuts: [],
+      rollback: null, activeTask: null, lastTask: null,
+    });
+    assert.equal(saved.generation, 1);
+    assert.equal(ownerUnlinkAttempts, 2);
+  } finally {
+    await cleanupStateDir(stateDir);
+  }
 });
 
 test("a crashed lock owner is recovered by the next real Node process", async () => {

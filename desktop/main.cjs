@@ -121,6 +121,8 @@ const ipcMain = createTrustedIpcRegistrar(electronIpcMain, () => ({
 let routerProcess = null;
 let softwareManagerIpcPromise = null;
 let softwareManagerRuntimePromise = null;
+let softwareManagerUnavailableServicePromise = null;
+let softwareManagerStartupFailure = null;
 let chatgptBridgeService = null;
 let routerLifecyclePromise = null;
 let codexHistoryRecoveryFlowPromise = null;
@@ -924,6 +926,16 @@ function getSoftwareManagerRuntime() {
 }
 
 async function getSoftwareManagerService() {
+  if (softwareManagerStartupFailure) {
+    if (!softwareManagerUnavailableServicePromise) {
+      softwareManagerUnavailableServicePromise = import("./software-manager/unavailable-service.mjs")
+        .then(({ createUnavailableSoftwareManagerService }) => createUnavailableSoftwareManagerService({
+          platform: process.platform,
+          reason: "software_manager_startup_failed",
+        }));
+    }
+    return softwareManagerUnavailableServicePromise;
+  }
   return (await getSoftwareManagerRuntime()).service;
 }
 
@@ -934,7 +946,8 @@ function initializeSoftwareManagerIpc() {
         ipcMain,
         platform: process.platform,
         getService: getSoftwareManagerService,
-        selectInstallRoot: async () => {
+        selectInstallRoot: async (service) => {
+          if (softwareManagerStartupFailure) return service.chooseInstallRoot();
           const selection = await dialog.showOpenDialog(mainWindow, {
             title: "选择软件安装位置",
             properties: ["openDirectory", "createDirectory"],
@@ -1060,24 +1073,22 @@ app.whenReady().then(async () => {
     app.quit();
     return;
   }
-  try {
-    if (process.platform === "win32") {
-      // Recovery is local-only and deliberately precedes renderer access.  It
+  if (process.platform === "win32") {
+    try {
+      // Recovery is local-only and deliberately precedes renderer access. It
       // neither refreshes the signed catalog nor launches external software.
       const runtime = await getSoftwareManagerRuntime();
       await runtime.recoverOffline();
+    } catch (error) {
+      appendRuntimeLog(formatError("softwareManagerStartup", error));
+      softwareManagerStartupFailure = error;
     }
+  }
+  try {
     await initializeSoftwareManagerIpc();
   } catch (error) {
-    appendRuntimeLog(formatError("softwareManagerStartup", error));
-    dialog.showErrorBox(
-      "CodexBridge 软件管理恢复未完成",
-      "软件管理的本地事务恢复失败。为避免暴露未恢复状态，CodexBridge 已停止启动；请查看日志后重试。",
-    );
-    managedQuitReady = true;
-    isQuitting = true;
-    app.quit();
-    return;
+    appendRuntimeLog(formatError("softwareManagerIpcStartup", error));
+    softwareManagerStartupFailure ??= error;
   }
   configRecoveryComplete = true;
   if (process.env.CODEXBRIDGE_DESKTOP_SMOKE !== "1") {

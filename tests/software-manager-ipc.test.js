@@ -306,7 +306,7 @@ test("main delegates Windows runtime construction and recovers offline before re
   assert.equal(startupRecovery > 0 && createWindow > startupRecovery, true);
 });
 
-test("software-manager startup recovery is fail-closed and performs no catalog or network work", () => {
+test("software-manager startup recovery failure degrades only that feature and performs no catalog or network work", () => {
   const mainSource = require("node:fs").readFileSync(new URL("../desktop/main.cjs", import.meta.url), "utf8");
   const startup = mainSource.match(/app\.whenReady\(\)\.then\(async \(\) => \{[\s\S]*?\n\}\);\n\napp\.on\("before-quit"/u)?.[0] ?? "";
   const recovery = startup.indexOf("runtime.recoverOffline()");
@@ -320,7 +320,8 @@ test("software-manager startup recovery is fail-closed and performs no catalog o
   const recoveryCatchEnd = startup.indexOf("\n  }\n  configRecoveryComplete = true;", recoveryCatch);
   const catchBody = startup.slice(recoveryCatch, recoveryCatchEnd);
   assert.match(catchBody, /appendRuntimeLog\(formatError\("softwareManagerStartup", error\)\)/u);
-  assert.match(catchBody, /app\.quit\(\);[\s\S]*?return;/u);
+  assert.match(catchBody, /softwareManagerStartupFailure\s*=\s*error/u);
+  assert.doesNotMatch(catchBody, /app\.quit\(\)|return;/u);
   assert.doesNotMatch(catchBody, /configRecoveryComplete = true/u);
   assert.equal((startup.match(/configRecoveryComplete = true;/gu) ?? []).length, 1);
   assert.doesNotMatch(startup.slice(recovery, createWindow), /\.refresh\(|\bfetch\s*\(/u);

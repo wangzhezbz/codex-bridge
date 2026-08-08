@@ -53,7 +53,16 @@ if (mode === "hold") {
       const saved = await store.compareAndSwap(0, state(`D:\\${label}`));
       process.send?.({ type: "result", status: "saved", generation: saved.generation });
     } catch (error) {
-      process.send?.({ type: "result", status: "failed", code: error?.code ?? error?.message });
+      process.send?.({
+        type: "result",
+        status: "failed",
+        code: error?.code ?? error?.message,
+        message: error?.message,
+        syscall: error?.syscall,
+        path: error?.path,
+        dest: error?.dest,
+        stack: error?.stack,
+      });
     } finally {
       process.exit(0);
     }
