@@ -1,6 +1,7 @@
 import { compareVersions, COMPONENT_IDS } from "../../shared/software-manager/catalog-schema.mjs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
+import path from "node:path";
 
 const KINDS = new Set(["install", "update", "uninstall", "rollback"]);
 const COMPONENT_SET = new Set(COMPONENT_IDS);
@@ -23,6 +24,7 @@ const RESULT_KEYS = Object.freeze([
   "componentId", "action", "status", "versionBefore", "versionAfter", "message", "rollbackAvailable",
 ]);
 const RESULT_KEY_SET = new Set(RESULT_KEYS);
+const RESULT_DETAIL_KEYS = Object.freeze(["ownership", "installPath"]);
 const RESULT_STATUSES = new Set(["succeeded", "failed", "skipped"]);
 const PUBLIC_EXTERNAL_KINDS = new Set([
   "component-prepare", "component-shortcut", "component-uninstall",
@@ -172,13 +174,26 @@ function validVersion(value) {
 function validAdapterResult(value, fallback) {
   const keys = isPlainRecord(value) ? Object.keys(value) : [];
   const structurallyValid = isPlainRecord(value)
-    && keys.length === RESULT_KEYS.length && keys.every((key) => RESULT_KEY_SET.has(key))
+    && (keys.length === RESULT_KEYS.length || keys.length === RESULT_KEYS.length + 1)
+    && RESULT_KEYS.every((key) => Object.hasOwn(value, key))
+    && keys.every((key) => RESULT_KEY_SET.has(key) || key === "details")
     && value.componentId === fallback.componentId && value.action === fallback.action
     && RESULT_STATUSES.has(value.status)
     && (value.versionBefore === null || validVersion(value.versionBefore))
     && (value.versionAfter === null || validVersion(value.versionAfter))
     && typeof value.message === "string" && typeof value.rollbackAvailable === "boolean";
   if (!structurallyValid) return false;
+  if (Object.hasOwn(value, "details")) {
+    const details = value.details;
+    if (fallback.componentId !== "git" || fallback.action !== "inspect" || value.status !== "succeeded"
+      || !isPlainRecord(details) || Object.keys(details).length !== RESULT_DETAIL_KEYS.length
+      || !RESULT_DETAIL_KEYS.every((key) => Object.hasOwn(details, key))
+      || !["managed", "external"].includes(details.ownership)
+      || typeof details.installPath !== "string" || details.installPath.length === 0
+      || details.installPath.length > 32_760 || details.installPath.includes("\0")
+      || !path.win32.isAbsolute(details.installPath)
+      || path.win32.normalize(details.installPath) !== details.installPath) return false;
+  }
   if (value.versionAfter === null && value.rollbackAvailable) return false;
   if (value.status !== "succeeded") return true;
   if (fallback.action === "uninstall") return value.versionAfter === null;
@@ -189,7 +204,14 @@ function safeAdapterResult(value, fallback) {
   if (!validAdapterResult(value, fallback)) {
     return failedResult(fallback.componentId, fallback.action, serviceError("software_manager_adapter_result_invalid"));
   }
-  return deepFreeze(redactValue(value));
+  const safe = redactValue(value);
+  if (value.details) {
+    safe.details = {
+      ownership: value.details.ownership,
+      installPath: value.details.installPath,
+    };
+  }
+  return deepFreeze(safe);
 }
 
 function failedResult(componentId, action, error) {
@@ -340,6 +362,12 @@ export function createSoftwareManagerService({
   function snapshotValue(raw) {
     const { logs: _ignored, ...withoutLogs } = raw;
     const safe = redactValue(withoutLogs);
+    if (Array.isArray(raw.components) && Array.isArray(safe.components)) {
+      safe.components = safe.components.map((entry, index) => {
+        const displayPath = raw.components[index]?.installPath;
+        return typeof displayPath === "string" ? { ...entry, installPath: displayPath } : entry;
+      });
+    }
     safe.logs = Object.freeze([...uiLogs]);
     return deepFreeze(safe);
   }
@@ -1047,6 +1075,10 @@ export function createSoftwareManagerService({
         installedVersion: installed?.status === "succeeded" ? installed.versionAfter : null,
         updateState,
         rollbackAvailable: Boolean(installed?.rollbackAvailable),
+        ...(installed?.details ? {
+          ownership: installed.details.ownership,
+          installPath: installed.details.installPath,
+        } : {}),
       });
     });
     const rollback = components.filter(({ rollbackAvailable }) => rollbackAvailable)

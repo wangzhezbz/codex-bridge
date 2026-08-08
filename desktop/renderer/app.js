@@ -279,6 +279,13 @@ function stateUnavailableControlEventGuard(event, currentState = state) {
 }
 
 const api = createStateUnavailableGuardedApi(window.codexBridge, () => state);
+const softwareManagerUi = window.CodexBridgeSoftwareManagerUI;
+const softwareManagerRoot = document.querySelector("#softwareManagerRoot");
+const softwareManagerNav = document.querySelector('[data-section="softwareManager"]');
+let softwareManagerState = softwareManagerUi?.createInitialState?.() ?? null;
+let softwareManagerLoaded = false;
+let softwareManagerLoading = false;
+let softwareManagerEventUnsubscribe = null;
 let draftSelection = [];
 let dragSlotIndex = null;
 let editingCustomPresetId = null;
@@ -312,6 +319,145 @@ const DETAIL_STATE_SECTIONS = new Set(["preflight", "capabilities", "resources",
 const SETTINGS_DETAIL_SECTIONS = new Set(["settings"]);
 const LOCAL_CAPABILITY_ADAPTERS = new Set(["local_browser", "local_computer_use", "local_file"]);
 const LOCAL_CAPABILITY_HINT = "本地能力不需要 Base URL、Endpoint、模型名或 API Key；保存后由 CodexBridge 桌面端受控执行。";
+
+if (softwareManagerNav && api.softwareManagerPlatform === "win32" && softwareManagerUi) {
+  softwareManagerNav.hidden = false;
+} else {
+  softwareManagerNav?.setAttribute("hidden", "");
+}
+
+function renderSoftwareManager() {
+  if (softwareManagerUi && softwareManagerRoot && softwareManagerState) {
+    softwareManagerUi.render(softwareManagerRoot, softwareManagerState);
+  }
+}
+
+function updateSoftwareManager(action) {
+  if (!softwareManagerUi || !softwareManagerState) return;
+  softwareManagerState = softwareManagerUi.reduce(softwareManagerState, action);
+  renderSoftwareManager();
+}
+
+async function refreshSoftwareManager() {
+  if (!softwareManagerLoaded || softwareManagerLoading) return;
+  softwareManagerLoading = true;
+  try {
+    const snapshot = await api.refreshSoftwareManager();
+    updateSoftwareManager({ type: "snapshot", snapshot });
+  } catch (error) {
+    updateSoftwareManager({ type: "error", error: error?.message || String(error) });
+  } finally {
+    softwareManagerLoading = false;
+  }
+}
+
+async function ensureSoftwareManagerLoaded() {
+  if (api.softwareManagerPlatform !== "win32" || !softwareManagerUi || softwareManagerLoaded || softwareManagerLoading) return;
+  softwareManagerLoading = true;
+  updateSoftwareManager({ type: "loading", loading: true });
+  try {
+    const snapshot = await api.getSoftwareManagerSnapshot();
+    softwareManagerLoaded = true;
+    updateSoftwareManager({ type: "snapshot", snapshot });
+    if (!softwareManagerEventUnsubscribe) {
+      softwareManagerEventUnsubscribe = api.onSoftwareManagerEvent((event) => {
+        updateSoftwareManager({ type: "task-event", event });
+        if (event?.type === "finished") void refreshSoftwareManager();
+      });
+    }
+  } catch (error) {
+    updateSoftwareManager({ type: "error", error: error?.message || String(error) });
+  } finally {
+    softwareManagerLoading = false;
+  }
+}
+
+async function startConfirmedSoftwareManagerTask() {
+  const snapshot = softwareManagerState?.snapshot;
+  if (!snapshot || snapshot.readOnly || snapshot.task) return;
+  const request = {
+    kind: softwareManagerState.activeTab,
+    componentIds: [...softwareManagerState.selectedComponentIds],
+    skillIds: [...softwareManagerState.selectedSkillIds],
+  };
+  if (softwareManagerState.installRootToken) request.installRootToken = softwareManagerState.installRootToken;
+  updateSoftwareManager({ type: "confirm-close" });
+  try {
+    const result = await api.startSoftwareManagerTask(request);
+    showToast("软件管理任务已完成。");
+    await refreshSoftwareManager();
+    return result;
+  } catch (error) {
+    updateSoftwareManager({ type: "error", error: error?.message || String(error) });
+    showToast(error?.message || String(error), "error");
+  }
+}
+
+softwareManagerRoot?.addEventListener("click", (event) => {
+  const control = event.target.closest("button");
+  if (!control) return;
+  if (control.matches("[data-software-tab]")) {
+    updateSoftwareManager({ type: "tab", tab: control.dataset.softwareTab });
+    return;
+  }
+  if (control.matches("[data-software-refresh]")) {
+    void refreshSoftwareManager();
+    return;
+  }
+  if (control.matches("[data-software-choose-root]")) {
+    void (async () => {
+      try {
+        const selected = await api.selectSoftwareManagerInstallRoot();
+        if (selected?.installRootToken) updateSoftwareManager({ type: "install-root", token: selected.installRootToken });
+      } catch (error) { showToast(error?.message || String(error), "error"); }
+    })();
+    return;
+  }
+  if (control.matches("[data-software-register]")) {
+    void api.openExternal("https://w1.soxo.top/auth/register?code=2aEq");
+    return;
+  }
+  if (control.matches("[data-software-start]")) {
+    const selection = softwareManagerUi.readSelection(softwareManagerRoot);
+    softwareManagerState = {
+      ...softwareManagerState,
+      selectedComponentIds: [...selection.componentIds],
+      selectedSkillIds: [...selection.skillIds],
+    };
+    updateSoftwareManager({ type: "confirm-open" });
+    return;
+  }
+  if (control.matches("[data-software-confirm-cancel]")) {
+    updateSoftwareManager({ type: "confirm-close" });
+    return;
+  }
+  if (control.matches("[data-software-confirm]")) {
+    void startConfirmedSoftwareManagerTask();
+    return;
+  }
+  if (control.matches("[data-software-cancel]")) {
+    void api.cancelSoftwareManagerTask().catch((error) => showToast(error?.message || String(error), "error"));
+  }
+});
+
+softwareManagerRoot?.addEventListener("change", (event) => {
+  const component = event.target.closest("[data-software-component]");
+  if (component) {
+    updateSoftwareManager({ type: "toggle-component", componentId: component.dataset.softwareComponent, checked: component.checked });
+    return;
+  }
+  const skill = event.target.closest("[data-software-skill]");
+  if (skill) updateSoftwareManager({ type: "toggle-skill", skillId: skill.dataset.softwareSkill, checked: skill.checked });
+});
+
+softwareManagerRoot?.addEventListener("input", (event) => {
+  if (!event.target.matches("[data-software-skill-query]")) return;
+  const position = event.target.selectionStart;
+  updateSoftwareManager({ type: "skill-query", query: event.target.value });
+  const next = softwareManagerRoot.querySelector("[data-software-skill-query]");
+  next?.focus();
+  next?.setSelectionRange?.(position, position);
+});
 const usageColumnWidths = [168, 190, 128, 84, 112, 112, 112, 112, 176, 168];
 const SMART_ROUTING_RULE_CONTROLS = [
   { key: "code", mode: "smartCodeMode", route: "smartCodeRoute" },
@@ -921,6 +1067,9 @@ function activateSection(sectionId) {
   }
   if (sectionId === "doubleQuota") {
     void refreshDoubleQuotaState();
+  }
+  if (sectionId === "softwareManager") {
+    void ensureSoftwareManagerLoaded();
   }
 }
 
@@ -2049,6 +2198,10 @@ function renderActiveSection(sectionId = currentSectionId()) {
   }
   if (sectionId === "logs") {
     renderLogs(state.logs || []);
+    return;
+  }
+  if (sectionId === "softwareManager") {
+    renderSoftwareManager();
     return;
   }
   if (sectionId === "doubleQuota") {

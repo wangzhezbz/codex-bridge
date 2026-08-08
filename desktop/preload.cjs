@@ -80,6 +80,7 @@ contextBridge.exposeInMainWorld("codexBridge", {
   revealFile: (target) => ipcRenderer.invoke("file:reveal", target),
   openExternal: (url) => ipcRenderer.invoke("external:open", url),
   openGitHub: () => ipcRenderer.invoke("github:open"),
+  softwareManagerPlatform: process.platform,
   getSoftwareManagerSnapshot: () => ipcRenderer.invoke("softwareManager:getSnapshot"),
   selectSoftwareManagerInstallRoot: () => ipcRenderer.invoke("softwareManager:selectInstallRoot"),
   refreshSoftwareManager: () => ipcRenderer.invoke("softwareManager:refresh"),

@@ -94,12 +94,14 @@ function componentEntrypoint(installRoot, componentId, entry, slot = "current") 
 
 function result(componentId, action, status, {
   versionBefore = null, versionAfter = null, message = `${componentId}_${action}_${status}`,
-  rollbackAvailable = false,
+  rollbackAvailable = false, details,
 } = {}) {
-  return Object.freeze({
+  const value = {
     componentId, action, status, versionBefore, versionAfter, message,
     rollbackAvailable: Boolean(rollbackAvailable),
-  });
+  };
+  if (details !== undefined) value.details = Object.freeze({ ...details });
+  return Object.freeze(value);
 }
 
 function rollbackRecords(state) {
@@ -1361,12 +1363,14 @@ export function createComponentAdapters({
       if (managed) return result("git", "inspect", "succeeded", {
         versionBefore: managed.version, versionAfter: managed.version, message: "git_managed_installed",
         rollbackAvailable: Boolean(managed.previousInstaller),
+        details: { ownership: "managed", installPath: managed.installPath },
       });
       const discovered = await windowsHost.discoverGit();
       if (discovered?.kind === "none") return result("git", "inspect", "skipped", { message: "git_not_installed" });
       const external = validateExternalGit(discovered);
       return result("git", "inspect", "succeeded", {
         versionBefore: external.version, versionAfter: external.version, message: "git_external_installed",
+        details: { ownership: "external", installPath: external.installDir },
       });
     } catch (error) { return failed("git", "inspect", error); }
   }

@@ -1347,6 +1347,7 @@ test("external Git inspect works with null ownership and ambiguous discovery fai
   const found = await adapters.git.inspectInstalled({});
   assert.equal(found.status, "succeeded");
   assert.equal(found.versionAfter, "2.50.0");
+  assert.deepEqual(found.details, { ownership: "external", installPath: externalGit.installDir });
   const blocked = fixture({ gitDiscovery: Object.assign(new Error("git_multiple_installations"), { code: "git_multiple_installations" }) });
   assert.equal((await blocked.adapters.git.inspectInstalled({})).status, "failed");
 });

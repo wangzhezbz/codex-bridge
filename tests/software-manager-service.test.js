@@ -180,6 +180,24 @@ test("install defaults select only ChatGPT and update defaults follow adapter in
   assert.equal(snapshot.components.find(({ id }) => id === "git").updateState, "not-installed");
 });
 
+test("Git inspection exposes only its ownership label and display path to the renderer snapshot", async () => {
+  const { service } = fixtureService({
+    git: {
+      inspect: async () => operationResult("git", "inspect", "succeeded", {
+        versionBefore: "2.50.0",
+        versionAfter: "2.50.0",
+        message: "git_external_installed",
+        details: { ownership: "external", installPath: "C:\\Program Files\\Git" },
+      }),
+    },
+  });
+  const git = (await service.getSnapshot()).components.find(({ id }) => id === "git");
+  assert.equal(git.ownership, "external");
+  assert.equal(git.installPath, "C:\\Program Files\\Git");
+  assert.equal(JSON.stringify(git).includes("registryKey"), false);
+  assert.equal(JSON.stringify(git).includes("uninstallerPath"), false);
+});
+
 test("rollback tab is absent when no eligible record exists", async () => {
   const { service } = fixtureService();
   assert.equal((await service.getSnapshot()).tabs.includes("rollback"), false);

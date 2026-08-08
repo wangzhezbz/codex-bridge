@@ -5863,6 +5863,421 @@ body.resizing-usage-column {
   }
 }
 
+.software-manager-section {
+  max-width: 1220px;
+  margin: 0 auto;
+}
+
+.software-manager-heading,
+.software-install-root,
+.software-action-bar,
+.software-confirmation,
+.software-task-head,
+.software-skills-title {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.software-manager-heading {
+  align-items: center;
+}
+
+.software-manager-heading h2 {
+  font-size: 25px;
+}
+
+.software-manager-heading p,
+.software-install-root p,
+.software-action-bar p,
+.software-skills-title p,
+.software-confirmation p {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.software-tabs {
+  display: flex;
+  gap: 5px;
+  margin: 18px 0;
+  padding: 5px;
+  border-radius: 10px;
+  background: #e4ebef;
+}
+
+.software-tab {
+  flex: 1 1 0;
+  min-height: 40px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #536773;
+  font-weight: 650;
+}
+
+.software-tab.active {
+  background: #fff;
+  color: var(--accent);
+  box-shadow: 0 1px 4px rgba(31, 52, 64, 0.16);
+}
+
+.software-tab:focus-visible,
+.software-component-card:focus-within,
+.software-skill-row:focus-within,
+.software-link-button:focus-visible {
+  outline: 3px solid rgba(15, 125, 115, 0.28);
+  outline-offset: 2px;
+}
+
+.software-loading,
+.software-unavailable,
+.software-install-root,
+.software-warning-banner,
+.software-skills-panel,
+.software-action-bar,
+.software-confirmation,
+.software-task-panel {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+}
+
+.software-loading {
+  padding: 24px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.software-unavailable,
+.software-warning-banner {
+  margin-bottom: 14px;
+  padding: 12px 14px;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.software-unavailable {
+  border-color: #edcf95;
+  background: #fff8e8;
+  color: #76531e;
+}
+
+.software-unavailable p {
+  margin-top: 3px;
+}
+
+.software-warning-banner {
+  border-color: #e7c47f;
+  background: #fff6e6;
+  color: #76531e;
+}
+
+.software-install-root {
+  align-items: center;
+  margin-bottom: 14px;
+  padding: 14px 16px;
+}
+
+.software-manager-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.software-component-card {
+  display: block;
+  min-width: 0;
+  min-height: 132px;
+  padding: 15px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  cursor: pointer;
+  transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
+}
+
+.software-component-card.selected {
+  border: 2px solid #39a998;
+  padding: 14px;
+  background: #fbfffe;
+  box-shadow: 0 10px 24px rgba(15, 125, 115, 0.07);
+}
+
+.software-component-card.disabled {
+  background: #f7f9fa;
+  color: #6f818c;
+  cursor: default;
+}
+
+.software-component-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.software-component-head strong {
+  font-size: 17px;
+}
+
+.software-component-head input,
+.software-skill-row input {
+  accent-color: var(--accent);
+}
+
+.software-state {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: #eef2f4;
+  color: #657985;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.software-state.available,
+.software-state.installed {
+  background: #e5f6f1;
+  color: var(--accent);
+}
+
+.software-state.rollback {
+  background: #fff0d5;
+  color: #996319;
+}
+
+.software-state.failed {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.software-component-version {
+  margin: 12px 0 8px;
+  color: #536a76;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.software-component-version b {
+  color: var(--accent);
+}
+
+.software-component-note {
+  color: #7b8c95;
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.software-component-note code {
+  color: #475c68;
+}
+
+.software-link-button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #167eac;
+  font-size: 12px;
+  text-decoration: underline;
+}
+
+.software-skills-panel {
+  margin-top: 14px;
+  padding: 14px 16px 16px;
+}
+
+.software-skills-title {
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.software-skills-title > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.software-skill-picker {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  overflow: hidden;
+}
+
+.software-skill-search {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px;
+  border-bottom: 1px solid var(--line);
+  background: #f8fafb;
+}
+
+.software-skill-search input {
+  min-width: 0;
+  height: 36px;
+  flex: 1 1 auto;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: #fff;
+}
+
+.software-skill-search span {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.software-skill-list {
+  max-height: 348px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.software-skill-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  min-height: 58px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #e8eef1;
+}
+
+.software-skill-row:last-child {
+  border-bottom: 0;
+}
+
+.software-skill-row strong,
+.software-skill-row small {
+  display: block;
+}
+
+.software-skill-row small,
+.software-skill-row code {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.software-empty-row {
+  padding: 22px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.software-action-bar,
+.software-confirmation,
+.software-task-panel {
+  margin-top: 14px;
+  padding: 14px 16px;
+}
+
+.software-action-bar {
+  align-items: center;
+}
+
+.software-confirmation {
+  border-color: #9fd6cd;
+  background: #f6fcfb;
+}
+
+.software-warning {
+  color: #8b5318 !important;
+  font-weight: 650;
+}
+
+.software-confirm-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+}
+
+.software-task-head {
+  align-items: center;
+}
+
+.software-task-head strong,
+.software-task-head span {
+  display: block;
+}
+
+.software-task-head span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.software-progress {
+  height: 8px;
+  margin-top: 12px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e6edef;
+}
+
+.software-progress progress {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  appearance: none;
+  background: transparent;
+}
+
+.software-progress progress::-webkit-progress-bar {
+  background: transparent;
+}
+
+.software-progress progress::-webkit-progress-value {
+  border-radius: inherit;
+  background: var(--accent);
+}
+
+.software-log {
+  max-height: 220px;
+  margin-top: 12px;
+  overflow-y: auto;
+  border-radius: 8px;
+  background: #101921;
+  color: #cfe0df;
+  font: 12px/1.55 Consolas, "SFMono-Regular", monospace;
+}
+
+.software-log:empty {
+  display: none;
+}
+
+.software-log-line {
+  padding: 4px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 980px) {
+  .software-manager-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .software-manager-heading,
+  .software-install-root,
+  .software-action-bar,
+  .software-confirmation {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .software-confirm-actions {
+    justify-content: flex-end;
+  }
+}
+
 @media (max-height: 820px) {
   .sidebar {
     gap: 8px;
