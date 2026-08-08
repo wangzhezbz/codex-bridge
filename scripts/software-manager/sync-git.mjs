@@ -19,7 +19,7 @@ function selectAsset(metadata) {
     throw gitError("software_sync_git_metadata_invalid");
   }
   const candidates = metadata.assets.map((asset) => {
-    const match = /^Git-(\d+\.\d+\.\d+)-64-bit\.exe$/u.exec(asset?.name ?? "");
+    const match = /^Git-(\d+\.\d+\.\d+(?:\.\d+)?)-64-bit\.exe$/u.exec(asset?.name ?? "");
     return match ? { asset, version: match[1] } : null;
   }).filter(Boolean);
   if (candidates.length !== 1) throw gitError("software_sync_git_asset_invalid");

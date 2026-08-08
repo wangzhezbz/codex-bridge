@@ -149,11 +149,11 @@ test("Git sync selects only the official x64 installer and requires Valid Authen
           ok: true,
           status: 200,
           json: async () => ({
-            tag_name: "v2.51.0.windows.1",
+            tag_name: "v2.55.0.windows.3",
             assets: [
-              { name: "PortableGit-2.51.0-64-bit.7z.exe", browser_download_url: "https://github.com/git-for-windows/git/releases/download/v2.51.0.windows.1/PortableGit-2.51.0-64-bit.7z.exe" },
-              { name: "Git-2.51.0-arm64.exe", browser_download_url: "https://github.com/git-for-windows/git/releases/download/v2.51.0.windows.1/Git-2.51.0-arm64.exe" },
-              { name: "Git-2.51.0-64-bit.exe", browser_download_url: "https://github.com/git-for-windows/git/releases/download/v2.51.0.windows.1/Git-2.51.0-64-bit.exe" },
+              { name: "PortableGit-2.55.0.3-64-bit.7z.exe", browser_download_url: "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.3/PortableGit-2.55.0.3-64-bit.7z.exe" },
+              { name: "Git-2.55.0.3-arm64.exe", browser_download_url: "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.3/Git-2.55.0.3-arm64.exe" },
+              { name: "Git-2.55.0.3-64-bit.exe", browser_download_url: "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.3/Git-2.55.0.3-64-bit.exe" },
             ],
           }),
         };
@@ -167,7 +167,7 @@ test("Git sync selects only the official x64 installer and requires Valid Authen
   });
   assert.equal(calls[0], GIT_RELEASE_API_URL);
   assert.match(calls[1], /^https:\/\/github\.com\/git-for-windows\/git\/releases\/download\//u);
-  assert.equal(result.version, "2.51.0");
+  assert.equal(result.version, "2.55.0.3");
   assert.equal(result.action, "publish");
   assert.equal(result.authenticode, "Valid");
 });
