@@ -6,6 +6,7 @@ APP_ROOT="$ROOT/app"
 PRIVATE_ROOT="$ROOT/private"
 PUBLIC_ROOT="$ROOT/public"
 WORK_ROOT="$ROOT/work"
+RUNTIME_BIN="$ROOT/runtime/node/bin"
 PRIVATE_KEY="$PRIVATE_ROOT/catalog-signing-private.pem"
 PUBLIC_KEY="$PRIVATE_ROOT/catalog-signing-public.pem"
 ENV_FILE="$PRIVATE_ROOT/publisher.env"
@@ -24,13 +25,18 @@ assert_new_root_path() {
   esac
 }
 
-for target in "$ROOT" "$APP_ROOT" "$PRIVATE_ROOT" "$PUBLIC_ROOT" "$WORK_ROOT" "$PRIVATE_KEY" "$PUBLIC_KEY" "$ENV_FILE"; do
+for target in "$ROOT" "$APP_ROOT" "$PRIVATE_ROOT" "$PUBLIC_ROOT" "$WORK_ROOT" "$RUNTIME_BIN" "$PRIVATE_KEY" "$PUBLIC_KEY" "$ENV_FILE"; do
   assert_new_root_path "$target"
 done
 
-for command in realpath openssl nginx systemctl install node npm osslsigncode; do
+for command in realpath openssl nginx systemctl install osslsigncode; do
   command -v "$command" >/dev/null 2>&1 || { echo "missing required command: $command" >&2; exit 1; }
 done
+
+[ -x "$RUNTIME_BIN/node" ] || { echo "missing isolated Node runtime: $RUNTIME_BIN/node" >&2; exit 1; }
+[ -x "$RUNTIME_BIN/npm" ] || { echo "missing isolated npm runtime: $RUNTIME_BIN/npm" >&2; exit 1; }
+node_major="$($RUNTIME_BIN/node -p 'process.versions.node.split(".")[0]')"
+[ "$node_major" -eq 24 ] || { echo "isolated Node runtime must be Node.js 24" >&2; exit 1; }
 
 install -d -m 0755 "$ROOT" "$APP_ROOT" "$PUBLIC_ROOT" "$PUBLIC_ROOT/packages"
 install -d -m 0700 "$PRIVATE_ROOT" "$WORK_ROOT"

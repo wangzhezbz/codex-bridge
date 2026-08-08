@@ -94,6 +94,19 @@ test("systemd timer is bounded and uses the isolated root-owned environment", ()
   assert.match(timer, /Persistent=true/u);
 });
 
+test("publisher uses the isolated Node runtime instead of changing the server Node installation", () => {
+  const installer = fs.readFileSync(path.join(deployRoot, "install-test.sh"), "utf8");
+  const service = fs.readFileSync(path.join(deployRoot, "codexbridge-installer-sync.service"), "utf8");
+  const readme = fs.readFileSync(path.join(deployRoot, "README.md"), "utf8");
+  assert.match(installer, /RUNTIME_BIN="\$ROOT\/runtime\/node\/bin"/u);
+  assert.match(installer, /"\$RUNTIME_BIN\/node"/u);
+  assert.match(installer, /"\$RUNTIME_BIN\/npm"/u);
+  assert.doesNotMatch(installer, /for command in [^\n]*\bnode\b/u);
+  assert.match(service, /Environment=PATH=\/opt\/shanhai\/codexbridge-installer\/runtime\/node\/bin:/u);
+  assert.match(readme, /runtime\/node/u);
+  assert.match(readme, /不安装或修改系统全局 Node/u);
+});
+
 test("remote verifier validates a signed catalog and streams every immutable asset read-only", async () => {
   const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
   const asset = Buffer.from("verified-asset");
