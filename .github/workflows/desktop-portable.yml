@@ -88,10 +88,10 @@ jobs:
           $version = (Get-Content -LiteralPath "package.json" -Raw | ConvertFrom-Json).version
           $smokeRoot = Join-Path $env:RUNNER_TEMP "codexbridge-setup-smoke"
           $installRoot = Join-Path $smokeRoot "installed"
-          $smokeHome = Join-Path $smokeRoot "home"
-          $smokeCodex = Join-Path $smokeHome ".codex"
           $smokeData = Join-Path $smokeRoot "data"
-          $smokeLocalAppData = Join-Path $smokeRoot "local-app-data"
+          $smokeHome = Join-Path $smokeData "home"
+          $smokeCodex = Join-Path $smokeHome ".codex"
+          $smokeLocalAppData = Join-Path $smokeData "local-app-data"
           $setupCopy = Join-Path $smokeRoot "CodexBridge-Windows-x64-Setup.exe"
           New-Item -ItemType Directory -Force -Path $smokeRoot, $smokeHome, $smokeCodex, $smokeData, $smokeLocalAppData | Out-Null
           Set-Content -LiteralPath (Join-Path $smokeCodex "config.toml") -Encoding utf8 -Value @(

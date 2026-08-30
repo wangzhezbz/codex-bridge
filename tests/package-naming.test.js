@@ -777,6 +777,8 @@ test("Windows release archive uses formal portable package naming", () => {
   assert.match(workflow, /Smoke test Windows release archive/);
   assert.match(workflow, /Smoke install Windows Setup/);
   assert.match(workflow, /Start-Process -FilePath \$setupCopy[\s\S]*?-WindowStyle Hidden/);
+  assert.match(workflow, /\$smokeData = Join-Path \$smokeRoot "data"\s+\$smokeHome = Join-Path \$smokeData "home"/);
+  assert.doesNotMatch(workflow, /\$smokeHome = Join-Path \$smokeRoot "home"/);
   assert.match(workflow, /\$installedProcess\.WaitForExit\(180000\)/);
   assert.match(workflow, /desktop smoke exited with code \$\(\$installedProcess\.ExitCode\)/);
   assert.doesNotMatch(workflow, /\$smokeScreenshot/);
