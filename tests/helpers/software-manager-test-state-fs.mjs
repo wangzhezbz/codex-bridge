@@ -7,7 +7,9 @@ const OWNER_FILE = "owner.json";
 function missing(error) { return error?.code === "ENOENT"; }
 function occupied(error) { return error?.code === "EEXIST"; }
 function delay(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
-function transientWindowsMutation(error) { return error?.code === "EPERM" || error?.code === "EBUSY"; }
+function transientWindowsMutation(error) {
+  return error?.code === "EPERM" || error?.code === "EACCES" || error?.code === "EBUSY";
+}
 
 async function retryTransientWindowsMutation(operation) {
   for (let attempt = 0; ; attempt += 1) {
@@ -26,12 +28,15 @@ function processAlive(pid) {
 async function removeStaleLock(lockDir, fileSystem = fs) {
   const ownerPath = path.join(lockDir, OWNER_FILE);
   let owner = null;
-  try { owner = JSON.parse(await fileSystem.readFile(ownerPath, "utf8")); } catch (error) {
+  try {
+    owner = JSON.parse(await retryTransientWindowsMutation(() => fileSystem.readFile(ownerPath, "utf8")));
+  } catch (error) {
     if (!missing(error) && !(error instanceof SyntaxError)) throw error;
   }
   if (owner && processAlive(owner.pid)) return false;
   if (!owner) {
-    const stat = await fileSystem.stat(lockDir).catch((error) => { if (missing(error)) return null; throw error; });
+    const stat = await retryTransientWindowsMutation(() => fileSystem.stat(lockDir))
+      .catch((error) => { if (missing(error)) return null; throw error; });
     if (stat && Date.now() - stat.mtimeMs < 1_000) return false;
   }
   await retryTransientWindowsMutation(() => fileSystem.unlink(ownerPath)).catch((error) => { if (!missing(error)) throw error; });
@@ -46,8 +51,16 @@ async function acquireTestLockDirectory(stateDir, lockDirectoryName, wait = true
   const deadline = Date.now() + 10_000;
   for (;;) {
     try {
-      await fileSystem.mkdir(lockDir);
-      await fileSystem.writeFile(ownerPath, JSON.stringify({ pid: process.pid }), { flag: "wx" });
+      await retryTransientWindowsMutation(() => fileSystem.mkdir(lockDir));
+      try {
+        await retryTransientWindowsMutation(
+          () => fileSystem.writeFile(ownerPath, JSON.stringify({ pid: process.pid }), { flag: "wx" }),
+        );
+      } catch (error) {
+        await retryTransientWindowsMutation(() => fileSystem.rmdir(lockDir))
+          .catch((cleanupError) => { if (!missing(cleanupError) && cleanupError?.code !== "ENOTEMPTY") throw cleanupError; });
+        throw error;
+      }
       let released = false;
       return {
         async release() {

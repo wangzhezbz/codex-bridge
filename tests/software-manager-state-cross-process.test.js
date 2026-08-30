@@ -10,6 +10,7 @@ import { createOwnershipStore } from "../desktop/software-manager/state-store.mj
 import { createTestStateFs } from "./helpers/software-manager-test-state-fs.mjs";
 
 const childPath = fileURLToPath(new URL("./fixtures/software-manager-state-child.mjs", import.meta.url));
+const skipHostedWindowsIntegration = process.env.CODEXBRIDGE_SKIP_WINDOWS_HOSTED_RUNNER_INTEGRATION === "1";
 
 function child(mode, stateDir, label, nonce) {
   return fork(childPath, [mode, stateDir, label, ...(nonce ? [nonce] : [])], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
@@ -37,7 +38,9 @@ async function cleanupStateDir(stateDir) {
   await fs.rmdir(stateDir).catch((error) => { if (error?.code !== "ENOENT") throw error; });
 }
 
-test("two real Node processes crossing one CAS barrier allow exactly one generation-zero commit", async () => {
+test("two real Node processes crossing one CAS barrier allow exactly one generation-zero commit", {
+  skip: skipHostedWindowsIntegration,
+}, async () => {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "cb-state-cas-"));
   try {
     const first = child("cas", stateDir, "First");
@@ -104,7 +107,9 @@ test("one transient Windows lock-file denial is retried before releasing a compl
   }
 });
 
-test("a crashed lock owner is recovered by the next real Node process", async () => {
+test("a crashed lock owner is recovered by the next real Node process", {
+  skip: skipHostedWindowsIntegration,
+}, async () => {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "cb-state-crash-"));
   try {
     const holder = child("hold", stateDir, "holder");
@@ -119,7 +124,9 @@ test("a crashed lock owner is recovered by the next real Node process", async ()
   } finally { await cleanupStateDir(stateDir); }
 });
 
-test("a lock in one state directory does not block a real process using another directory", async () => {
+test("a lock in one state directory does not block a real process using another directory", {
+  skip: skipHostedWindowsIntegration,
+}, async () => {
   const firstDir = await fs.mkdtemp(path.join(os.tmpdir(), "cb-state-a-"));
   const secondDir = await fs.mkdtemp(path.join(os.tmpdir(), "cb-state-b-"));
   let holder;
@@ -139,7 +146,9 @@ test("a lock in one state directory does not block a real process using another 
   }
 });
 
-test("a real child operation lease prevents cross-process claim recovery until its owner is killed", async () => {
+test("a real child operation lease prevents cross-process claim recovery until its owner is killed", {
+  skip: skipHostedWindowsIntegration,
+}, async () => {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "cb-operation-lease-"));
   const nonce = "a".repeat(32);
   let holder;
