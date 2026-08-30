@@ -181,10 +181,19 @@ jobs:
             }
           }
           $env:CODEXBRIDGE_DESKTOP_SMOKE = "1"
-          $env:CODEXBRIDGE_DATA_DIR = Join-Path $env:RUNNER_TEMP "codexbridge-release-archive-data"
-          & $exe.FullName
-          if ($LASTEXITCODE -ne 0) {
-            throw "Release archive desktop smoke exited with code $LASTEXITCODE."
+          $archiveSmokeData = Join-Path $env:RUNNER_TEMP "codexbridge-release-archive-data"
+          $archiveSmokeHome = Join-Path $archiveSmokeData "home"
+          $archiveSmokeLocalAppData = Join-Path $archiveSmokeData "local-app-data"
+          New-Item -ItemType Directory -Force -Path $archiveSmokeData, $archiveSmokeHome, $archiveSmokeLocalAppData | Out-Null
+          $env:CODEXBRIDGE_DATA_DIR = $archiveSmokeData
+          $env:CODEXBRIDGE_DESKTOP_SMOKE_HOME = $archiveSmokeHome
+          $env:CODEXBRIDGE_DESKTOP_SMOKE_LOCAL_APP_DATA = $archiveSmokeLocalAppData
+          $archiveSmokeProcess = Start-Process -FilePath $exe.FullName -PassThru -WindowStyle Hidden
+          if (-not $archiveSmokeProcess.WaitForExit(180000)) {
+            throw "Release archive desktop smoke did not exit."
+          }
+          if ($archiveSmokeProcess.ExitCode -ne 0) {
+            throw "Release archive desktop smoke exited with code $($archiveSmokeProcess.ExitCode)."
           }
 
       - name: Upload Windows release artifacts

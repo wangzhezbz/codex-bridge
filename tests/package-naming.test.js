@@ -797,7 +797,10 @@ test("Windows release archive uses formal portable package naming", () => {
   assert.match(workflow, /Join-Path \$extractPath "\.codexbridge-portable"/);
   assert.match(workflow, /Release archive source fingerprint does not match packaged smoke/);
   assert.match(workflow, /Release archive contains forbidden package content/);
-  assert.match(workflow, /Release archive desktop smoke exited with code/);
+  assert.match(workflow, /\$archiveSmokeProcess = Start-Process -FilePath \$exe\.FullName -PassThru -WindowStyle Hidden/);
+  assert.match(workflow, /\$archiveSmokeProcess\.WaitForExit\(180000\)/);
+  assert.match(workflow, /Release archive desktop smoke exited with code \$\(\$archiveSmokeProcess\.ExitCode\)/);
+  assert.doesNotMatch(workflow, /& \$exe\.FullName\s+if \(\$LASTEXITCODE/);
   assert.doesNotMatch(workflow, /Compress-Archive -Path "release\/\*"/);
   assert.match(workflow, /prerelease: false/);
   assert.doesNotMatch(workflow, /CodexBridge-windows-portable/);
