@@ -418,7 +418,8 @@ test("default process discovery keeps owned paths out of its fixed PowerShell co
 });
 
 test("real default process discovery filters idle PID zero and performs zero stops for an unmatched path", {
-  skip: process.platform !== "win32",
+  skip: process.platform !== "win32"
+    || process.env.CODEXBRIDGE_SKIP_WINDOWS_HOSTED_RUNNER_INTEGRATION === "1",
   timeout: 20_000,
 }, async () => {
   const nativeApi = createWin32FileApi({ platform: "win32" });
