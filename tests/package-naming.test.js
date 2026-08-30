@@ -777,7 +777,9 @@ test("Windows release archive uses formal portable package naming", () => {
   assert.match(workflow, /Smoke test Windows release archive/);
   assert.match(workflow, /Smoke install Windows Setup/);
   assert.match(workflow, /Start-Process -FilePath \$setupCopy[\s\S]*?-WindowStyle Hidden/);
-  assert.match(workflow, /CODEXBRIDGE_DESKTOP_SMOKE_SCREENSHOT/);
+  assert.match(workflow, /\$installedProcess\.WaitForExit\(180000\)/);
+  assert.match(workflow, /desktop smoke exited with code \$\(\$installedProcess\.ExitCode\)/);
+  assert.doesNotMatch(workflow, /\$smokeScreenshot/);
   assert.match(workflow, /Setup smoke copy SHA-256 does not match the release artifact/);
   assert.match(workflow, /resources\\app\\\.codexbridge-build\.json/);
   assert.match(workflow, /different source fingerprint than packaged smoke proved/);

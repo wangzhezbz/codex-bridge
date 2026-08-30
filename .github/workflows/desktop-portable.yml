@@ -92,7 +92,6 @@ jobs:
           $smokeCodex = Join-Path $smokeHome ".codex"
           $smokeData = Join-Path $smokeRoot "data"
           $smokeLocalAppData = Join-Path $smokeRoot "local-app-data"
-          $smokeScreenshot = Join-Path $smokeRoot "installed-desktop-smoke.png"
           $setupCopy = Join-Path $smokeRoot "CodexBridge-Windows-x64-Setup.exe"
           New-Item -ItemType Directory -Force -Path $smokeRoot, $smokeHome, $smokeCodex, $smokeData, $smokeLocalAppData | Out-Null
           Set-Content -LiteralPath (Join-Path $smokeCodex "config.toml") -Encoding utf8 -Value @(
@@ -112,7 +111,6 @@ jobs:
           $env:CODEXBRIDGE_DESKTOP_SMOKE_HOME = $smokeHome
           $env:CODEXBRIDGE_DESKTOP_SMOKE_LOCAL_APP_DATA = $smokeLocalAppData
           $env:CODEXBRIDGE_DATA_DIR = $smokeData
-          $env:CODEXBRIDGE_DESKTOP_SMOKE_SCREENSHOT = $smokeScreenshot
           $env:CODEXBRIDGE_INSTALLER_NO_LAUNCH = "1"
           $installer = Start-Process -FilePath $setupCopy -ArgumentList @("/S", "/D=$installRoot") -Wait -PassThru -WindowStyle Hidden
           if ($installer.ExitCode -ne 0) {
@@ -143,15 +141,11 @@ jobs:
           }
           Remove-Item Env:CODEXBRIDGE_INSTALLER_NO_LAUNCH -ErrorAction SilentlyContinue
           $installedProcess = Start-Process -FilePath $installedExe -PassThru -WindowStyle Hidden
-          $deadline = (Get-Date).AddSeconds(120)
-          while (-not (Test-Path -LiteralPath $smokeScreenshot -PathType Leaf) -and (Get-Date) -lt $deadline) {
-            Start-Sleep -Milliseconds 500
-          }
-          if (-not (Test-Path -LiteralPath $smokeScreenshot -PathType Leaf)) {
-            throw "Installed CodexBridge desktop smoke did not complete."
-          }
-          if (-not $installedProcess.WaitForExit(30000)) {
+          if (-not $installedProcess.WaitForExit(180000)) {
             throw "Installed CodexBridge did not exit after desktop smoke."
+          }
+          if ($installedProcess.ExitCode -ne 0) {
+            throw "Installed CodexBridge desktop smoke exited with code $($installedProcess.ExitCode)."
           }
 
       - name: Smoke test Windows release archive
