@@ -6,7 +6,11 @@ import {
 } from "./ownership-task-schema.mjs";
 
 const SKILL_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
-const WINDOWS_MAX_PATH_WITHOUT_TERMINATOR = 259;
+// Every managed filesystem mutation uses the native Win32 capability layer
+// with extended-length paths. Keep a small margin below its 32,768 UTF-16
+// buffer instead of applying the legacy MAX_PATH limit to otherwise valid
+// package trees.
+const WINDOWS_MAX_MANAGED_PATH = 32_760;
 const OWNERSHIP_KEYS = Object.freeze([
   "schemaVersion",
   "generation",
@@ -58,7 +62,7 @@ function normalizeCanonicalWindowsPath(candidate, {
   const finalIndex = rawSegments.length - 1;
   for (const [index, segment] of rawSegments.entries()) {
     if (segment.length === 0 && index === finalIndex) continue;
-    if (segment.length === 0 || segment === "." || segment === ".." || /[ .]$/u.test(segment)
+    if (segment.length === 0 || segment.length > 255 || segment === "." || segment === ".." || /[ .]$/u.test(segment)
       || /[<>:"|?*\u0000-\u001f]/u.test(segment)
       || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu.test(segment)) {
       throw policyError("path_noncanonical");
@@ -211,7 +215,7 @@ export async function validateInstallRoot({ candidate, env = {}, maxRelativePath
   if (protectedRoots.some((root) => isEqualOrWithinWindows(normalized, root))) {
     return failed("install_root_protected");
   }
-  if (normalized.length + 1 + maxRelativePath > WINDOWS_MAX_PATH_WITHOUT_TERMINATOR) {
+  if (normalized.length + 1 + maxRelativePath > WINDOWS_MAX_MANAGED_PATH) {
     return failed("install_peak_path_too_long");
   }
 

@@ -6,7 +6,11 @@ import { Worker } from "node:worker_threads";
 
 const SCHEMA_VERSION = 1;
 const DEFAULT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const DEFAULT_MAX_RECORD_BYTES = 100 * 1024 * 1024;
+// A Responses request may legally approach the Router's 100 MiB request limit,
+// and one durable turn also contains the provider response plus its replayable
+// assistant history. Keep enough headroom so a successful upstream response is
+// not rejected only because the local durable representation is larger.
+const DEFAULT_MAX_RECORD_BYTES = 256 * 1024 * 1024;
 const DEFAULT_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 const DEFAULT_PROTECT_RECENT_MS = 60 * 60 * 1000;
 const DEFAULT_TOMBSTONE_TTL_MS = 7 * 24 * 60 * 60 * 1000;

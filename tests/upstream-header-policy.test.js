@@ -58,6 +58,81 @@ test("Codex headers forward runtime metadata without forwarding client authentic
   assert.equal(headers["openai-sentinel-chat-requirements-token"], "requirements-123");
 });
 
+test("Codex subscription headers recover the active ChatGPT account from the bearer claims", async () => {
+  const { upstreamHeaders } = await import("../src/upstream-header-policy.js");
+  const bearerToken = jwtWithPayload({
+    "https://api.openai.com/auth": {
+      chatgpt_account_id: "acct_active_123",
+    },
+  });
+
+  const headers = upstreamHeaders(
+    {
+      id: "gpt-codex",
+      authMode: "codex_openai",
+    },
+    {
+      clientAuth: {
+        kind: "codex_openai",
+        bearerToken,
+      },
+      clientHeaders: {},
+    },
+  );
+
+  assert.equal(headers.authorization, `Bearer ${bearerToken}`);
+  assert.equal(headers["chatgpt-account-id"], "acct_active_123");
+});
+
+test("an explicit Codex account header wins over the bearer claim", async () => {
+  const { upstreamHeaders } = await import("../src/upstream-header-policy.js");
+  const headers = upstreamHeaders(
+    {
+      id: "gpt-codex",
+      authMode: "codex_openai",
+    },
+    {
+      clientAuth: {
+        kind: "codex_openai",
+        bearerToken: jwtWithPayload({
+          "https://api.openai.com/auth": {
+            chatgpt_account_id: "acct_claim_123",
+          },
+        }),
+      },
+      clientHeaders: {
+        "chatgpt-account-id": "acct_explicit_456",
+      },
+    },
+  );
+
+  assert.equal(headers["chatgpt-account-id"], "acct_explicit_456");
+});
+
+test("malformed or unsafe bearer claims never create an account header", async () => {
+  const { upstreamHeaders } = await import("../src/upstream-header-policy.js");
+  for (const bearerToken of [
+    "not-a-jwt",
+    jwtWithPayload({
+      "https://api.openai.com/auth": {
+        chatgpt_account_id: "unsafe\r\nheader",
+      },
+    }),
+  ]) {
+    const headers = upstreamHeaders(
+      {
+        id: "gpt-codex",
+        authMode: "codex_openai",
+      },
+      {
+        clientAuth: { kind: "codex_openai", bearerToken },
+        clientHeaders: {},
+      },
+    );
+    assert.equal(headers["chatgpt-account-id"], undefined);
+  }
+});
+
 test("response headers omit transport-specific encoding and length metadata", async () => {
   const { filteredHeaders } = await import("../src/upstream-header-policy.js");
 
@@ -116,3 +191,11 @@ test("native Responses streams keep their existing transport path unchanged", as
   assert.equal(headers.accept, "text/event-stream");
   assert.equal(headers["accept-encoding"], undefined);
 });
+
+function jwtWithPayload(payload) {
+  return [
+    Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url"),
+    Buffer.from(JSON.stringify(payload)).toString("base64url"),
+    "test-signature",
+  ].join(".");
+}

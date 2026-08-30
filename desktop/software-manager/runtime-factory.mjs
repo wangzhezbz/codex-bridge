@@ -8,6 +8,7 @@ import { createArchiveService } from "./archive-service.mjs";
 import { createCatalogCache } from "./catalog-cache.mjs";
 import { createCapabilityRecordStore } from "./capability-record-store.mjs";
 import { createCachedCatalogProvider } from "./catalog-provider.mjs";
+import { readBundledCatalogEnvelope } from "./bundled-catalog.mjs";
 import { createComponentAdapters } from "./component-adapters.mjs";
 import { createComponentFileService } from "./component-files.mjs";
 import { createDownloadManager } from "./download-manager.mjs";
@@ -43,7 +44,7 @@ import { createWindowsFileCapabilities } from "./windows-file-capabilities.mjs";
 import { createWindowsHost } from "./windows-host.mjs";
 
 const FIXED_CATALOG_URL = `${TEST_CATALOG_ORIGIN}${TEST_CATALOG_PATH}`;
-const MAX_RELATIVE_PATH = 4_096;
+const MAX_RELATIVE_PATH = 212;
 const MAX_RECORDS = 500;
 const SEVEN_ZIP_SHA256 = Object.freeze({
   arm64: "81f67048b7366870e5d49f00a8c570570c6a0dd11c05df7a09a8c52870cc83bd",
@@ -232,6 +233,21 @@ function createDefaultWindowsInfrastructure({ platform, dataRoot, homeDir, getDe
     skillsRoot,
     dataRoot,
     env,
+    async ensureRuntimeDirectories() {
+      await fileCapabilities.ensureManagedDirectoriesNoFollow(
+        path.win32.dirname(dataRoot),
+        [path.win32.basename(dataRoot)],
+      );
+      return fileCapabilities.ensureManagedDirectoriesNoFollow(dataRoot, [
+        "state", "journal", "catalog", "logs", "skill-swaps", "skill-prepares",
+      ]);
+    },
+    async ensureInstallRootDirectory(rootPath) {
+      return fileCapabilities.ensureManagedDirectoriesNoFollow(
+        path.win32.dirname(rootPath),
+        [path.win32.basename(rootPath)],
+      );
+    },
     async authorizeRoot(rootPath) {
       return authorizeInstallRoot({
         candidate: rootPath, env, maxRelativePath: MAX_RELATIVE_PATH,
@@ -248,6 +264,14 @@ function createDefaultWindowsInfrastructure({ platform, dataRoot, homeDir, getDe
       return authorizeDesktopPath({ getDesktopPath, realpath: fsPromises.realpath, lstat: fsPromises.lstat });
     },
     async getSkillsRootCapability() {
+      // A fresh Windows profile may have .codex but no skills directory yet.
+      // Installing a Skill is the operation that should create this managed
+      // location; requiring users to pre-create it turns first install into a
+      // failed/hanging-looking task. Create each direct child through the
+      // no-follow Win32 capability so reparses and parent swaps are rejected.
+      const codexDir = path.win32.join(homeDir, ".codex");
+      await fileCapabilities.ensureManagedDirectoriesNoFollow(homeDir, [".codex"]);
+      await fileCapabilities.ensureManagedDirectoriesNoFollow(codexDir, ["skills"]);
       return authorizeSkillsRoot({ candidate: skillsRoot, realpath: fsPromises.realpath, lstat: fsPromises.lstat });
     },
     ...skillRecovery,
@@ -326,12 +350,18 @@ async function createDefaultRootAdapters({
     gitIdentityCapabilities,
     resolveSkillTarget,
     skillPathAccess: { realpath: fsPromises.realpath, lstat: fsPromises.lstat },
+    getAvailableDiskBytes: async (rootPath) => {
+      const stats = await fsPromises.statfs(rootPath);
+      const available = BigInt(stats.bavail) * BigInt(stats.bsize);
+      return available > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(available);
+    },
   });
 }
 
 const DEFAULT_FACTORIES = Object.freeze({
   createWindowsInfrastructure: createDefaultWindowsInfrastructure,
   createCatalogProvider: (options) => createCachedCatalogProvider(options),
+  readBundledCatalogEnvelope,
   createInstallRootResolver: (options) => createInstallRootResolver(options),
   createRootAdapters: createDefaultRootAdapters,
   createWindowsHost(options) {
@@ -366,6 +396,7 @@ export async function createProductionSoftwareManagerService({
   catalogUrl = FIXED_CATALOG_URL,
   sevenZipPath,
   koffi,
+  defaultInstallRoot = null,
   runtimeFactories = {},
 } = {}) {
   if (platform !== "win32") {
@@ -378,17 +409,24 @@ export async function createProductionSoftwareManagerService({
   }
   const exactDataRoot = requireWindowsPath(dataRoot, "software_manager_data_root_invalid");
   const exactHomeDir = requireWindowsPath(homeDir, "software_manager_home_root_invalid");
+  const exactDefaultInstallRoot = defaultInstallRoot === null
+    ? null
+    : requireWindowsPath(defaultInstallRoot, "software_manager_default_install_root_invalid");
   if (catalogUrl !== FIXED_CATALOG_URL) throw runtimeError("software_manager_catalog_url_rejected");
   if (publicKeyPem !== null && typeof publicKeyPem !== "string") throw runtimeError("software_manager_catalog_key_invalid");
   requireRecord(env, "software_manager_environment_invalid");
+  const runtimeEnv = Object.freeze({ ...env });
   const injectedFactories = requireRecord(runtimeFactories, "software_manager_factories_invalid");
+  const injectedEnsureDefaultInstallRoot = typeof injectedFactories.ensureDefaultInstallRoot === "function"
+    ? injectedFactories.ensureDefaultInstallRoot
+    : null;
   const sevenZip = fixedSevenZip(sevenZipPath);
   const factories = Object.freeze({ ...DEFAULT_FACTORIES, ...injectedFactories });
   const infrastructure = await factories.createWindowsInfrastructure({
-    platform, dataRoot: exactDataRoot, homeDir: exactHomeDir, getDesktopPath, env, koffi,
+    platform, dataRoot: exactDataRoot, homeDir: exactHomeDir, getDesktopPath, env: runtimeEnv, koffi,
   });
   for (const name of [
-    "authorizeRoot", "createSlots", "getDesktopCapability", "getSkillsRootCapability",
+    "ensureRuntimeDirectories", "ensureInstallRootDirectory", "authorizeRoot", "createSlots", "getDesktopCapability", "getSkillsRootCapability",
     "inferSkillInstallRoot", "recoverActiveSkillTransaction", "cleanupAbandonedPreparedSkills",
   ]) {
     requireMethod(infrastructure, name, "software_manager_infrastructure_invalid");
@@ -401,6 +439,7 @@ export async function createProductionSoftwareManagerService({
     publicKeyPem,
     fetchImpl,
     cache: infrastructure.catalogCache,
+    bundledEnvelope: factories.readBundledCatalogEnvelope({ catalogUrl }),
   });
   const installRootResolver = factories.createInstallRootResolver({
     authorizeRoot: infrastructure.authorizeRoot.bind(infrastructure),
@@ -412,7 +451,7 @@ export async function createProductionSoftwareManagerService({
   const getDesktopCapability = memoizeAsync(() => infrastructure.getDesktopCapability());
   const getSkillsRootCapability = memoizeAsync(() => infrastructure.getSkillsRootCapability());
   const getWindowsHost = memoizeAsync(() => factories.createWindowsHost({
-    platform, infrastructure, getDesktopCapability, env, electronShell, execFile, spawn, koffi,
+    platform, infrastructure, getDesktopCapability, env: runtimeEnv, electronShell, execFile, spawn, koffi,
   }));
   const rootRuntimes = new WeakMap();
 
@@ -462,6 +501,37 @@ export async function createProductionSoftwareManagerService({
   const recoverOffline = () => {
     if (recoveryInFlight !== null) return recoveryInFlight;
     const operation = Promise.resolve().then(async () => {
+      await infrastructure.ensureRuntimeDirectories();
+      // Establish the display and capability for the install root before
+      // recovering interrupted work. A broken recovery record must not leave
+      // the page with a placeholder path or disable choosing another root.
+      const beforeRecovery = await ownershipStore.load();
+      let initialRoot = beforeRecovery.installRoot;
+      if (initialRoot === null) {
+        try {
+          initialRoot = await infrastructure.inferSkillInstallRoot(structuredClone(beforeRecovery));
+        } catch (error) {
+          // A malformed or incomplete abandoned Skill record is still handled
+          // by the strict recovery pass below. It must not prevent the safe
+          // default root from being selected and displayed first.
+          if (exactDefaultInstallRoot === null) throw error;
+          initialRoot = null;
+        }
+      }
+      const selectedBeforeRecovery = typeof installRootResolver.getCurrentPath === "function"
+        ? installRootResolver.getCurrentPath()
+        : null;
+      if (typeof initialRoot === "string" && selectedBeforeRecovery !== initialRoot) {
+        await installRootResolver.restoreOwnedRoot(initialRoot);
+      } else if (initialRoot === null && exactDefaultInstallRoot !== null
+        && selectedBeforeRecovery !== exactDefaultInstallRoot) {
+        if (injectedEnsureDefaultInstallRoot) await injectedEnsureDefaultInstallRoot(exactDefaultInstallRoot);
+        else await infrastructure.ensureInstallRootDirectory(exactDefaultInstallRoot);
+        const chosen = await installRootResolver.choose(exactDefaultInstallRoot);
+        const token = typeof chosen === "string" ? chosen : chosen?.token;
+        if (typeof token !== "string") throw runtimeError("software_manager_install_root_invalid");
+        await installRootResolver.adopt(token);
+      }
       const recovered = await recoverLocalTransactions({
         ownershipStore,
         journal,
@@ -470,7 +540,20 @@ export async function createProductionSoftwareManagerService({
       });
       let current = await ownershipStore.load();
       let installRoot = recovered.installRoot ?? current.installRoot;
-      if (installRoot === null) installRoot = await infrastructure.inferSkillInstallRoot(structuredClone(current));
+      if (installRoot === null) {
+        try {
+          installRoot = await infrastructure.inferSkillInstallRoot(structuredClone(current));
+        } catch (error) {
+          const selected = typeof installRootResolver.getCurrentPath === "function"
+            ? installRootResolver.getCurrentPath()
+            : null;
+          if (typeof selected !== "string") throw error;
+          installRoot = selected;
+        }
+      }
+      if (installRoot === null && typeof installRootResolver.getCurrentPath === "function") {
+        installRoot = installRootResolver.getCurrentPath();
+      }
       let installRootCapability = null;
       if (typeof installRoot === "string") {
         installRootCapability = await infrastructure.authorizeRoot(installRoot);
@@ -489,9 +572,28 @@ export async function createProductionSoftwareManagerService({
         await infrastructure.cleanupAbandonedPreparedSkills({ installRootCapability, heldLease: null });
       }
       current = await ownershipStore.load();
-      const restoredRoot = current.installRoot;
-      if (typeof restoredRoot === "string") await installRootResolver.restoreOwnedRoot(restoredRoot);
-      else await installRootResolver.clearCurrent();
+      let restoredRoot = current.installRoot;
+      const selectedRoot = typeof installRootResolver.getCurrentPath === "function"
+        ? installRootResolver.getCurrentPath()
+        : null;
+      if (restoredRoot === null && exactDefaultInstallRoot !== null
+        && typeof selectedRoot === "string"
+        && selectedRoot.toLowerCase() === exactDefaultInstallRoot.toLowerCase()) {
+        restoredRoot = selectedRoot;
+      }
+      if (typeof restoredRoot === "string") {
+        if (restoredRoot !== selectedRoot) await installRootResolver.restoreOwnedRoot(restoredRoot);
+      } else if (exactDefaultInstallRoot !== null) {
+        if (injectedEnsureDefaultInstallRoot) await injectedEnsureDefaultInstallRoot(exactDefaultInstallRoot);
+        else await infrastructure.ensureInstallRootDirectory(exactDefaultInstallRoot);
+        const chosen = await installRootResolver.choose(exactDefaultInstallRoot);
+        const token = typeof chosen === "string" ? chosen : chosen?.token;
+        if (typeof token !== "string") throw runtimeError("software_manager_install_root_invalid");
+        await installRootResolver.adopt(token);
+        restoredRoot = exactDefaultInstallRoot;
+      } else {
+        await installRootResolver.clearCurrent();
+      }
       if (recovered.installRoot === restoredRoot) return recovered;
       return Object.freeze({ ...recovered, status: "recovered", installRoot: restoredRoot });
     });

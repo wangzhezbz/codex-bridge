@@ -207,7 +207,7 @@ test("bound archive prepare identity round-trips while Git and malformed identit
   bound.activeTask = {
     kind: "component-prepare", taskId: "bound-archive", componentId: "chatgpt", version: "2.0.0",
     leaseScope: "prepare", leaseNonce: "a".repeat(32),
-    stagingName: `.codexbridge-prepare-${"b".repeat(32)}`,
+    stagingName: `.p-${"b".repeat(32)}`,
     stagingIdentity: { volumeSerial: "volume", fileId: "staging" },
   };
   const memory = createMemoryStateFs({ "ownership.json": JSON.stringify(bound) });

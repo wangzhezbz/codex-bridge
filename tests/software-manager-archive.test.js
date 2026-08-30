@@ -252,7 +252,9 @@ test("lists a normal 7z with the fixed bundled executable command", async () => 
     { path: "app", size: 0, directory: true },
     { path: "app/tool.exe", size: 12, directory: false },
   ]);
-  assert.deepEqual(fake.calls[0].args, ["l", "-slt", "-ba", "-t7z", "-sns-", "--", path.resolve("packages", "tool.7z")]);
+  assert.deepEqual(fake.calls[0].args, [
+    "l", "-slt", "-ba", "-t7z", "-sns-", "-sccUTF-8", "--", path.resolve("packages", "tool.7z"),
+  ]);
   assert.equal(fake.calls[0].file, SEVEN_ZIP_PATH);
   assert.equal(fake.calls[0].options.shell, false);
 });
@@ -328,7 +330,7 @@ test("extracts 7z only with fixed arguments and no-follow capability verificatio
 
   assert.equal(result.totalUnpackedBytes, 12);
   assert.deepEqual(fake.calls.map((call) => call.args), [
-    ["l", "-slt", "-ba", "-t7z", "-sns-", "--", archivePath],
+    ["l", "-slt", "-ba", "-t7z", "-sns-", "-sccUTF-8", "--", archivePath],
     ["x", "-so", "-y", "-t7z", "-sns-", "--", archivePath, "app/tool.exe"],
   ]);
   assert.equal(fake.calls.some((call) => call.args.some((arg) => arg.startsWith("-o"))), false);

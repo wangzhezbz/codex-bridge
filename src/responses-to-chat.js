@@ -11,6 +11,12 @@ import {
   namespacedToolName,
   toolDiagnosticsFromContext,
 } from "./tools.js";
+import {
+  attachNativeResponsesHistoryItems,
+  hasNativeResponsesHistoryItems,
+  routeUsesStatelessDeepSeekResponses,
+  withoutNativeResponsesHistoryItems,
+} from "./responses-native-history.js";
 
 const MAX_CHAT_DATA_IMAGE_URL_CHARS = 2_000_000;
 const OVERSIZED_IMAGE_PLACEHOLDER =
@@ -50,6 +56,19 @@ const ATTACHMENT_GUIDANCE =
   "Use only the attachment text, audio parts, or file parts already included here. " +
   "Do not call shell, browser, MCP, or local file tools to retrieve unsupported attachments. " +
   "If needed content is missing, ask the user to switch to a GPT/Responses model or provide text/OCR output.";
+const CHAT_COMPATIBILITY_GUIDANCE_PREFIXES = Object.freeze([
+  "CodexBridge tool guidance:",
+  "CodexBridge interactive-tool guidance:",
+  "CodexBridge command guidance:",
+  "CodexBridge GitHub repository guidance:",
+  "CodexBridge tool continuation guidance:",
+  "CodexBridge controlled capability guidance:",
+  "CodexBridge attachment guidance:",
+]);
+const PROTECTED_HISTORICAL_SYSTEM_PREFIXES = Object.freeze([
+  "CodexBridge tool result context:",
+  "Earlier conversation history was omitted by CodexBridge",
+]);
 const MAX_EXTRACTABLE_FILE_BYTES = 5_000_000;
 const MAX_EXTRACTED_FILE_TEXT_CHARS = 120_000;
 const UNNAMED_FILE_NAME = "未命名文件";
@@ -136,8 +155,13 @@ export function responsesToChatRequest(request, route, history, options = {}) {
 }
 
 export function responseRequestToChatSourceMessages(request, route, history, options = {}) {
+  const preserveNativeHistory = routeUsesStatelessDeepSeekResponses(route);
   const toolContext = buildToolContext(responseToolsForChatRequest(request, options), { route });
-  const priorMessages = history?.get?.(request.previous_response_id) || [];
+  const instructions = systemInstructionsFromRequest(request, {
+    includeInputMessages: !preserveNativeHistory,
+  });
+  const storedPriorMessages = history?.get?.(request.previous_response_id) || [];
+  const priorMessages = normalizeStoredPriorMessages(storedPriorMessages, instructions);
   const currentMessages = stripExactPersistedHistoryPrefix(
     responseInputToChatMessages(
       request.messages ?? request.input,
@@ -148,17 +172,18 @@ export function responseRequestToChatSourceMessages(request, route, history, opt
   );
 
   const headerMessages = [];
-  const instructions = systemInstructionsFromRequest(request);
   if (instructions) {
     headerMessages.push({ role: "system", content: instructions });
   }
-  const toolGuidance = toolGuidanceFromContext(toolContext, request);
-  if (toolGuidance) {
-    headerMessages.push({ role: "system", content: toolGuidance });
-  }
-  const attachmentGuidance = attachmentGuidanceFromRequest(request);
-  if (attachmentGuidance) {
-    headerMessages.push({ role: "system", content: attachmentGuidance });
+  if (!preserveNativeHistory) {
+    const toolGuidance = toolGuidanceFromContext(toolContext, request);
+    if (toolGuidance) {
+      headerMessages.push({ role: "system", content: toolGuidance });
+    }
+    const attachmentGuidance = attachmentGuidanceFromRequest(request);
+    if (attachmentGuidance) {
+      headerMessages.push({ role: "system", content: attachmentGuidance });
+    }
   }
   const historySourceMessages = sanitizeMessagesForRoute(normalizeToolCallPairs([
     ...headerMessages,
@@ -187,6 +212,65 @@ export function responseRequestToChatSourceMessages(request, route, history, opt
     };
   }
   return { messages: historySourceMessages, toolContext };
+}
+
+function isChatCompatibilityGuidanceMessage(message) {
+  if (message?.role !== "system") {
+    return false;
+  }
+  const text = contentToText(message.content).trim();
+  return CHAT_COMPATIBILITY_GUIDANCE_PREFIXES.some((prefix) => text.startsWith(prefix));
+}
+
+function normalizeStoredPriorMessages(messages, currentInstructions) {
+  const filtered = (Array.isArray(messages) ? messages : [])
+    .filter((message) => !isChatCompatibilityGuidanceMessage(message));
+  let leadingInstructionCount = 0;
+  while (leadingInstructionCount < filtered.length) {
+    const message = filtered[leadingInstructionCount];
+    if (
+      message?.role !== "system" ||
+      isProtectedHistoricalSystemMessage(message)
+    ) {
+      break;
+    }
+    leadingInstructionCount += 1;
+  }
+  if (leadingInstructionCount === 0) {
+    return filtered;
+  }
+  const retained = currentInstructions
+    ? []
+    : deduplicateLeadingInstructionMessages(filtered.slice(0, leadingInstructionCount));
+  return [
+    ...retained,
+    ...filtered.slice(leadingInstructionCount),
+  ];
+}
+
+function deduplicateLeadingInstructionMessages(messages) {
+  const retained = [];
+  for (const message of messages) {
+    const duplicate = retained.some((existing) => {
+      if (
+        hasNativeResponsesHistoryItems(existing) ||
+        hasNativeResponsesHistoryItems(message)
+      ) {
+        return isDeepStrictEqual(existing, message);
+      }
+      return contentToText(existing?.content).trim() ===
+        contentToText(message?.content).trim();
+    });
+    if (!duplicate) {
+      retained.push(message);
+    }
+  }
+  return retained;
+}
+
+function isProtectedHistoricalSystemMessage(message) {
+  const text = contentToText(message?.content).trim();
+  return PROTECTED_HISTORICAL_SYSTEM_PREFIXES.some((prefix) => text.startsWith(prefix));
 }
 
 export function stripExactPersistedHistoryPrefix(currentMessages, priorMessages) {
@@ -237,27 +321,71 @@ export function responseInputToChatMessages(input, toolContext, route = {}) {
     return [];
   }
   if (typeof input === "string") {
-    return [{ role: "user", content: input }];
+    const message = { role: "user", content: input };
+    return [routeUsesStatelessDeepSeekResponses(route)
+      ? attachNativeResponsesHistoryItems(message, [{ role: "user", content: input }])
+      : message];
   }
 
   const items = Array.isArray(input) ? input : [input];
+  const preserveNativeHistory = routeUsesStatelessDeepSeekResponses(route);
   const messages = [];
   let pendingToolCalls = [];
+  let pendingReasoningContent = "";
+  let pendingAssistantMessage = null;
+  let pendingNativeItems = [];
 
-  const flushToolCalls = () => {
-    if (pendingToolCalls.length === 0) {
-      return;
+  const flushAssistant = () => {
+    const embeddedToolCalls = Array.isArray(pendingAssistantMessage?.tool_calls)
+      ? pendingAssistantMessage.tool_calls
+      : [];
+    const toolCalls = [...embeddedToolCalls, ...pendingToolCalls];
+    if (
+      !pendingAssistantMessage &&
+      toolCalls.length === 0 &&
+      pendingNativeItems.length === 0
+    ) {
+      pendingReasoningContent = "";
+      return false;
     }
-    messages.push({
-      role: "assistant",
-      content: null,
-      tool_calls: pendingToolCalls,
-    });
+    const assistant = pendingAssistantMessage
+      ? { ...pendingAssistantMessage }
+      : { role: "assistant", content: null };
+    if (toolCalls.length > 0) {
+      assistant.tool_calls = toolCalls;
+      if (!messageHasContent(assistant)) {
+        assistant.content = null;
+      }
+    }
+    if (toolCalls.length > 0 && pendingReasoningContent) {
+      assistant.reasoning_content = pendingReasoningContent;
+    }
+    messages.push(preserveNativeHistory
+      ? attachNativeResponsesHistoryItems(assistant, pendingNativeItems)
+      : assistant);
     pendingToolCalls = [];
+    pendingReasoningContent = "";
+    pendingAssistantMessage = null;
+    pendingNativeItems = [];
+    return true;
   };
 
   for (const item of items) {
+    if (item?.type === "reasoning") {
+      if (preserveNativeHistory) {
+        pendingNativeItems.push(item);
+      }
+      const reasoningContent = responseReasoningContentForToolCall(item, route);
+      if (reasoningContent) {
+        pendingReasoningContent += reasoningContent;
+      }
+      continue;
+    }
+
     if (isResponseToolCallItem(item)) {
+      if (preserveNativeHistory) {
+        pendingNativeItems.push(item);
+      }
       if (shouldOmitResponseToolCallFromChatHistory(item, toolContext)) {
         continue;
       }
@@ -265,18 +393,50 @@ export function responseInputToChatMessages(input, toolContext, route = {}) {
       continue;
     }
 
-    flushToolCalls();
-
     if (
       item &&
       typeof item === "object" &&
       ["system", "developer"].includes(item.role)
     ) {
+      flushAssistant();
+      if (preserveNativeHistory) {
+        const systemMessage = responseMessageToChatMessage(item, route) || {
+          role: "system",
+          content: contentToText(item.content),
+        };
+        messages.push(attachNativeResponsesHistoryItems(systemMessage, [item]));
+      }
       continue;
     }
 
+    if (preserveNativeHistory && item?.type === "web_search_call") {
+      flushAssistant();
+      messages.push(attachNativeResponsesHistoryItems(
+        { role: "assistant", content: null },
+        [item],
+      ));
+      continue;
+    }
+
+    const message = responseMessageToChatMessage(item, route);
+    if (message?.role === "assistant") {
+      if (pendingAssistantMessage) {
+        flushAssistant();
+      }
+      pendingAssistantMessage = message;
+      if (preserveNativeHistory) {
+        pendingNativeItems.push(item);
+      }
+      continue;
+    }
+
+    flushAssistant();
+
     if (isResponseToolOutputItem(item)) {
-      messages.push(chatMessageFromToolOutput(item));
+      const toolMessage = chatMessageFromToolOutput(item);
+      messages.push(preserveNativeHistory
+        ? attachNativeResponsesHistoryItems(toolMessage, [item])
+        : toolMessage);
       continue;
     }
 
@@ -292,14 +452,40 @@ export function responseInputToChatMessages(input, toolContext, route = {}) {
       continue;
     }
 
-    const message = responseMessageToChatMessage(item, route);
     if (message) {
-      messages.push(message);
+      messages.push(preserveNativeHistory
+        ? attachNativeResponsesHistoryItems(message, [item])
+        : message);
     }
   }
 
-  flushToolCalls();
+  flushAssistant();
   return messages;
+}
+
+function responseReasoningContentForToolCall(item, route = {}) {
+  if (item?.type !== "reasoning" || !routeSupportsReasoningContent(route)) {
+    return "";
+  }
+  if (typeof item.reasoning_content === "string" && item.reasoning_content) {
+    return item.reasoning_content;
+  }
+  if (Array.isArray(item.content)) {
+    const content = item.content
+      .map((part) => part?.type === "reasoning_text"
+        ? String(part.text || "")
+        : String(part?.reasoning_text || ""))
+      .join("");
+    if (content) {
+      return content;
+    }
+  }
+  if (!Array.isArray(item.summary)) {
+    return "";
+  }
+  return item.summary
+    .map((part) => typeof part === "string" ? part : String(part?.text || ""))
+    .join("");
 }
 
 function isCompactionItem(item) {
@@ -343,6 +529,11 @@ export function responseMessageToChatMessage(item, route = {}) {
     content: contentToChatContent(item.content ?? item.text ?? item.output ?? "", route),
   };
 
+  const phase = responseAssistantPhase(item);
+  if (role === "assistant" && phase) {
+    message.responses_phase = phase;
+  }
+
   if (Array.isArray(item.tool_calls)) {
     message.tool_calls = item.tool_calls;
     if (!message.content) {
@@ -357,6 +548,11 @@ export function responseMessageToChatMessage(item, route = {}) {
   }
 
   return message;
+}
+
+function responseAssistantPhase(item) {
+  const phase = typeof item?.phase === "string" ? item.phase.trim() : "";
+  return ["commentary", "final_answer"].includes(phase) ? phase : "";
 }
 
 export function contentToChatContent(content, route = {}) {
@@ -902,12 +1098,13 @@ function requestHasAttachmentInput(input) {
   return requestHasAttachmentInput(input.content ?? input.input ?? input.output);
 }
 
-function systemInstructionsFromRequest(request) {
+function systemInstructionsFromRequest(request, options = {}) {
   const parts = [];
   if (typeof request.instructions === "string" && request.instructions.trim()) {
     parts.push(request.instructions.trim());
   }
-  for (const message of asArray(request.input)) {
+  const requestMessages = request.messages ?? request.input;
+  for (const message of options.includeInputMessages === false ? [] : asArray(requestMessages)) {
     if (
       message &&
       typeof message === "object" &&
@@ -1916,16 +2113,42 @@ export function interactivePluginKindForRequest(request = {}) {
 }
 
 function sanitizeMessagesForRoute(messages, route = {}) {
-  if (routeSupportsReasoningContent(route)) {
-    return messages;
-  }
-  return messages.map((message) => {
-    if (!message || typeof message !== "object" || !("reasoning_content" in message)) {
-      return message;
-    }
-    const { reasoning_content, ...rest } = message;
-    return rest;
-  });
+  const preserveNativeHistory = routeUsesStatelessDeepSeekResponses(route);
+  const preserveReasoningContent = routeSupportsReasoningContent(route);
+  const preserveAnthropicThinking = route.api === "anthropic_messages";
+  const preserveResponsesPhase = route.api === "responses";
+  return messages
+    .map((message) => {
+      if (!message || typeof message !== "object") {
+        return message;
+      }
+      let next = preserveNativeHistory
+        ? message
+        : withoutNativeResponsesHistoryItems(message);
+      if (!preserveReasoningContent && "reasoning_content" in next) {
+        const { reasoning_content: _reasoningContent, ...rest } = next;
+        next = rest;
+      }
+      if (!preserveAnthropicThinking && "anthropic_thinking" in next) {
+        const { anthropic_thinking: _anthropicThinking, ...rest } = next;
+        next = rest;
+      }
+      if (!preserveResponsesPhase && "responses_phase" in next) {
+        const { responses_phase: _responsesPhase, ...rest } = next;
+        next = rest;
+      }
+      if (
+        !preserveNativeHistory &&
+        hasNativeResponsesHistoryItems(message) &&
+        next.role === "assistant" &&
+        !messageHasContent(next) &&
+        !hasToolCalls(next)
+      ) {
+        return null;
+      }
+      return next;
+    })
+    .filter(Boolean);
 }
 
 function routeSupportsReasoningContent(route = {}) {

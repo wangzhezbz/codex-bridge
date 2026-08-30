@@ -71,6 +71,7 @@ export const PROVIDERS = [
     keyUrl: "https://platform.deepseek.com/api_keys",
     docsUrl: "https://api-docs.deepseek.com/",
     baseUrl: "https://api.deepseek.com/v1",
+    api: "chat_completions",
     authMode: "api_key",
     description: "DeepSeek 官方 OpenAI-compatible API。",
   },

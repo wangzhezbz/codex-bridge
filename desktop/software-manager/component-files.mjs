@@ -10,8 +10,26 @@ const GIT_VERSION_OUTPUT = /^git version (\d+(?:\.\d+){1,3})\.windows\.([1-9]\d*
 const SHA256 = /^[a-f0-9]{64}$/u;
 const CHATGPT_VERSION_MARKER = ".codexbridge-chatgpt-version.json";
 const CHATGPT_VERSION_MARKER_MAX_BYTES = 1_024;
-const PREPARE_NAME = /^\.codexbridge-prepare-[a-f0-9]{32}$/u;
-const MISSING_CODES = new Set(["ENOENT", "ERROR_FILE_NOT_FOUND", "ERROR_PATH_NOT_FOUND", "windows_path_missing"]);
+const CHATGPT_RUNTIME_REQUIRED_FILES = new Set([
+  CHATGPT_VERSION_MARKER,
+  "ChatGPT.exe",
+  "Codex.exe",
+  "chrome.dll",
+  "resources/app.asar",
+  "resources/codex.exe",
+]);
+const V2RAYN_RUNTIME_REQUIRED_FILES = new Set([
+  "v2rayn/v2rayN.exe",
+  "v2rayn/guiConfigs/guiNConfig.json",
+  "v2rayn/e_sqlite3.dll",
+  "v2rayn/bin/mihomo/mihomo.exe",
+  "v2rayn/bin/sing_box/sing-box.exe",
+  "v2rayn/bin/xray/xray.exe",
+]);
+const PREPARE_NAME = /^\.p-[a-f0-9]{32}$/u;
+const MISSING_CODES = new Set([
+  "entry_missing", "ENOENT", "ERROR_FILE_NOT_FOUND", "ERROR_PATH_NOT_FOUND", "windows_path_missing",
+]);
 const COMPONENT_SLOTS = Object.freeze({
   chatgpt: Object.freeze({ staging: "ct", current: "c" }),
   v2rayn: Object.freeze({ staging: "staging", current: "current" }),
@@ -33,6 +51,27 @@ function isPlainRecord(value) {
 function exactKeys(value, keys) {
   return isPlainRecord(value)
     && Object.keys(value).sort().join("\0") === [...keys].sort().join("\0");
+}
+
+function runtimeRequiredRelativeFiles(entry) {
+  if (entry.id === "git") return entry.requiredFiles;
+  const allowlist = entry.id === "chatgpt"
+    ? CHATGPT_RUNTIME_REQUIRED_FILES
+    : V2RAYN_RUNTIME_REQUIRED_FILES;
+  const critical = entry.requiredFiles.filter((item) => allowlist.has(item));
+  return critical.includes(entry.entrypoint) ? critical : [entry.entrypoint, ...critical];
+}
+
+function relativeBudget(installRoot, paths) {
+  let maximum = 0;
+  for (const filePath of paths) {
+    const relative = path.win32.relative(installRoot, filePath);
+    if (path.win32.isAbsolute(relative) || relative === ".." || relative.startsWith("..\\")) {
+      throw componentError("component_catalog_path_mismatch");
+    }
+    maximum = Math.max(maximum, relative.length);
+  }
+  return maximum;
 }
 
 function canonicalPath(value, code) {
@@ -167,16 +206,14 @@ export function createComponentFileService({
 
   async function verifyComponent(rawPlan) {
     const plan = validateVerificationPlan(rawPlan);
-    await revalidateInstallRootCapability(installRootCapability, {
-      maxRelativePath: Math.max(plan.rootPath.length, plan.entrypointPath.length, ...plan.requiredFiles.map((item) => String(item).length)),
-    });
     const entry = catalogService.getComponent(plan.componentId);
     if (entry.version !== plan.expectedVersion) throw componentError("component_catalog_version_mismatch");
     const expectedRoot = plan.phase === "staging"
       ? path.win32.join(componentRoot(installRoot, plan.componentId), plan.stagingName)
       : slotRoot(installRoot, plan.componentId, plan.phase);
     const expectedEntrypoint = relativeFile(expectedRoot, entry.entrypoint);
-    const expectedRequiredFiles = entry.requiredFiles.map((item) => relativeFile(expectedRoot, item));
+    const expectedRequiredFiles = runtimeRequiredRelativeFiles(entry)
+      .map((item) => relativeFile(expectedRoot, item));
     let rootPath;
     let entrypointPath;
     let requiredFiles;
@@ -193,6 +230,9 @@ export function createComponentFileService({
       || requiredFiles.some((item, index) => !samePath(item, expectedRequiredFiles[index]))) {
       throw componentError("component_catalog_path_mismatch");
     }
+    await revalidateInstallRootCapability(installRootCapability, {
+      maxRelativePath: relativeBudget(installRoot, [rootPath, entrypointPath, ...requiredFiles]),
+    });
     if (plan.phase === "staging" && plan.expectedPackageSha256 !== entry.sha256) {
       throw componentError("component_catalog_package_mismatch");
     }
@@ -318,12 +358,12 @@ export function createComponentFileService({
     try {
       descriptor = await root.openChildNoFollow(childName);
     } catch (error) {
-      await root.close().catch(() => {});
+      try { await root.close(); } catch {}
       if (isMissing(error)) return false;
       throw error;
     }
     if (!descriptor || descriptor.kind !== "directory") {
-      await root.close().catch(() => {});
+      try { await root.close(); } catch {}
       throw componentError("component_delete_target_invalid");
     }
     await deleteAuthorizedTree({

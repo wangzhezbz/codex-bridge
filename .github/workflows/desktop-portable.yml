@@ -34,6 +34,11 @@ jobs:
           node-version: 24
           cache: npm
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install dependencies
         run: npm ci
 
@@ -75,6 +80,79 @@ jobs:
       - name: Run Windows release artifact preflight
         run: node scripts/release-preflight.mjs --platform win32 --arch x64 --release-dir dist-artifacts --write-gate-report windows-release-gate.json
 
+      - name: Smoke install Windows Setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = (Get-Content -LiteralPath "package.json" -Raw | ConvertFrom-Json).version
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "codexbridge-setup-smoke"
+          $installRoot = Join-Path $smokeRoot "installed"
+          $smokeHome = Join-Path $smokeRoot "home"
+          $smokeCodex = Join-Path $smokeHome ".codex"
+          $smokeData = Join-Path $smokeRoot "data"
+          $smokeLocalAppData = Join-Path $smokeRoot "local-app-data"
+          $smokeScreenshot = Join-Path $smokeRoot "installed-desktop-smoke.png"
+          $setupCopy = Join-Path $smokeRoot "CodexBridge-Windows-x64-Setup.exe"
+          New-Item -ItemType Directory -Force -Path $smokeRoot, $smokeHome, $smokeCodex, $smokeData, $smokeLocalAppData | Out-Null
+          Set-Content -LiteralPath (Join-Path $smokeCodex "config.toml") -Encoding utf8 -Value @(
+            'sandbox_mode = "workspace-write"'
+            'model = "gpt-5.5"'
+            'model_reasoning_effort = "high"'
+            'approval_policy = "on-request"'
+          )
+          Copy-Item -LiteralPath "dist-artifacts\CodexBridge-Windows-x64-Setup.exe" -Destination $setupCopy
+          $sourceSetupHash = (Get-FileHash -LiteralPath "dist-artifacts\CodexBridge-Windows-x64-Setup.exe" -Algorithm SHA256).Hash
+          $copiedSetupHash = (Get-FileHash -LiteralPath $setupCopy -Algorithm SHA256).Hash
+          if ($sourceSetupHash -ne $copiedSetupHash) {
+            throw "Setup smoke copy SHA-256 does not match the release artifact."
+          }
+          $env:CODEXBRIDGE_DESKTOP_SMOKE = "1"
+          $env:CODEXBRIDGE_DESKTOP_SMOKE_START_ROUTER = "1"
+          $env:CODEXBRIDGE_DESKTOP_SMOKE_HOME = $smokeHome
+          $env:CODEXBRIDGE_DESKTOP_SMOKE_LOCAL_APP_DATA = $smokeLocalAppData
+          $env:CODEXBRIDGE_DATA_DIR = $smokeData
+          $env:CODEXBRIDGE_DESKTOP_SMOKE_SCREENSHOT = $smokeScreenshot
+          $env:CODEXBRIDGE_INSTALLER_NO_LAUNCH = "1"
+          $installer = Start-Process -FilePath $setupCopy -ArgumentList @("/S", "/D=$installRoot") -Wait -PassThru -WindowStyle Hidden
+          if ($installer.ExitCode -ne 0) {
+            throw "Setup smoke installer exited with code $($installer.ExitCode)."
+          }
+          $installedApp = Join-Path $installRoot "app-$version"
+          $installedExe = Join-Path $installedApp "CodexBridge.exe"
+          $buildMetadata = Join-Path $installedApp "resources\app\.codexbridge-build.json"
+          if (-not (Test-Path -LiteralPath $installedExe -PathType Leaf)) {
+            throw "Setup smoke did not install CodexBridge.exe."
+          }
+          if (-not (Test-Path -LiteralPath $buildMetadata -PathType Leaf)) {
+            throw "Setup smoke did not preserve release build metadata."
+          }
+          $installedMetadata = Get-Content -LiteralPath $buildMetadata -Raw | ConvertFrom-Json
+          $packagedSmoke = Get-Content -LiteralPath "release\packaged-smoke-report.json" -Raw | ConvertFrom-Json
+          if ($installedMetadata.sourceFingerprint -ne $packagedSmoke.buildMetadata.sourceFingerprint) {
+            throw "Setup smoke installed a different source fingerprint than packaged smoke proved."
+          }
+          $installedPackage = Get-Content -LiteralPath (Join-Path $installedApp "resources\app\package.json") -Raw | ConvertFrom-Json
+          if ($installedPackage.version -ne $version) {
+            throw "Setup smoke installed an unexpected application version."
+          }
+          foreach ($relativePath in @("deploy", "state", "docs")) {
+            if (Test-Path -LiteralPath (Join-Path $installedApp "resources\app\$relativePath")) {
+              throw "Setup smoke installed forbidden package content: $relativePath"
+            }
+          }
+          Remove-Item Env:CODEXBRIDGE_INSTALLER_NO_LAUNCH -ErrorAction SilentlyContinue
+          $installedProcess = Start-Process -FilePath $installedExe -PassThru -WindowStyle Hidden
+          $deadline = (Get-Date).AddSeconds(120)
+          while (-not (Test-Path -LiteralPath $smokeScreenshot -PathType Leaf) -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+          }
+          if (-not (Test-Path -LiteralPath $smokeScreenshot -PathType Leaf)) {
+            throw "Installed CodexBridge desktop smoke did not complete."
+          }
+          if (-not $installedProcess.WaitForExit(30000)) {
+            throw "Installed CodexBridge did not exit after desktop smoke."
+          }
+
       - name: Smoke test Windows release archive
         shell: pwsh
         run: |
@@ -84,16 +162,35 @@ jobs:
           if (-not (Test-Path -LiteralPath (Join-Path $extractPath ".codexbridge-portable"))) {
             throw "Release archive does not contain .codexbridge-portable marker."
           }
-          $exe = Get-ChildItem -LiteralPath $extractPath -Filter "CodexBridge.exe" -File -Recurse | Select-Object -First 1
-          if (-not $exe) {
-            throw "Release archive does not contain CodexBridge.exe."
+          $expectedExePath = Join-Path $extractPath "CodexBridge.exe"
+          $executables = @(Get-ChildItem -LiteralPath $extractPath -Filter "CodexBridge.exe" -File -Recurse)
+          if ($executables.Count -ne 1 -or $executables[0].FullName -ne $expectedExePath) {
+            throw "Release archive must contain exactly one root CodexBridge.exe."
           }
+          $exe = $executables[0]
           if (-not (Test-Path -LiteralPath (Join-Path $exe.Directory.FullName "resources\app\package.json"))) {
             throw "Release archive does not contain resources\app\package.json beside CodexBridge.exe."
+          }
+          $archiveMetadataPath = Join-Path $exe.Directory.FullName "resources\app\.codexbridge-build.json"
+          if (-not (Test-Path -LiteralPath $archiveMetadataPath -PathType Leaf)) {
+            throw "Release archive does not contain build metadata."
+          }
+          $archiveMetadata = Get-Content -LiteralPath $archiveMetadataPath -Raw | ConvertFrom-Json
+          $packagedSmoke = Get-Content -LiteralPath "release\packaged-smoke-report.json" -Raw | ConvertFrom-Json
+          if ($archiveMetadata.sourceFingerprint -ne $packagedSmoke.buildMetadata.sourceFingerprint) {
+            throw "Release archive source fingerprint does not match packaged smoke."
+          }
+          foreach ($relativePath in @("deploy", "state", "docs")) {
+            if (Test-Path -LiteralPath (Join-Path $exe.Directory.FullName "resources\app\$relativePath")) {
+              throw "Release archive contains forbidden package content: $relativePath"
+            }
           }
           $env:CODEXBRIDGE_DESKTOP_SMOKE = "1"
           $env:CODEXBRIDGE_DATA_DIR = Join-Path $env:RUNNER_TEMP "codexbridge-release-archive-data"
           & $exe.FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release archive desktop smoke exited with code $LASTEXITCODE."
+          }
 
       - name: Upload Windows release artifacts
         uses: actions/upload-artifact@v4
@@ -139,6 +236,9 @@ jobs:
           node --check scripts/smoke-packaged-macos.mjs
           node --check desktop/data-dir.cjs
 
+      - name: Run catalog publisher POSIX tests
+        run: node --test tests/software-manager-publisher.test.js
+
       - name: Run macOS release preflight
         run: node scripts/release-preflight.mjs --platform darwin --arch ${{ matrix.arch }} --write-gate-report macos-${{ matrix.arch }}-release-gate.json
 
@@ -168,9 +268,13 @@ jobs:
           test -f "$smoke_dir/CodexBridge.app/Contents/MacOS/CodexBridge"
           test -f "$smoke_dir/CodexBridge.app/Contents/Frameworks/Electron Framework.framework/Electron Framework"
           test -f "$smoke_dir/CodexBridge.app/Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework"
+          test -f "$smoke_dir/CodexBridge.app/Contents/Resources/app/.codexbridge-build.json"
           test -x "$smoke_dir/CodexBridge.app/Contents/MacOS/CodexBridge"
           test -x "$smoke_dir/CodexBridge.app/Contents/Frameworks/Electron Framework.framework/Electron Framework"
           test -x "$smoke_dir/CodexBridge.app/Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework"
+          for relative_path in deploy state docs; do
+            test ! -e "$smoke_dir/CodexBridge.app/Contents/Resources/app/$relative_path"
+          done
 
       - name: Upload macOS portable app
         uses: actions/upload-artifact@v4

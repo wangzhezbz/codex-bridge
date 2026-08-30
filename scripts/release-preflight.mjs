@@ -15,6 +15,8 @@ import {
 } from "../desktop/settings.mjs";
 import { probeRouterHealth } from "../desktop/router-health.mjs";
 import { buildSoftwareManagerReleaseReadiness } from "./package-content-policy.mjs";
+import { packagedSmokeSourceEvidence } from "./release-source-fingerprint.mjs";
+import { assertReleaseTagMatchesPackageVersion } from "./release-version-policy.mjs";
 
 const require = createRequire(import.meta.url);
 const { resolveDataRootDir } = require("../desktop/data-dir.cjs");
@@ -27,6 +29,7 @@ if (args.help) {
   printHelp();
   process.exit(0);
 }
+assertReleaseTagMatchesPackageVersion({ env: process.env, packageVersion: packageJson.version });
 
 const rootDir = args.dataDir || resolveDataRootDir({
   appRootDir: repoRoot,
@@ -269,7 +272,24 @@ function readPackagedSmokeReport(reportPath = "") {
     return null;
   }
   try {
-    return JSON.parse(fs.readFileSync(target, "utf8"));
+    const report = JSON.parse(fs.readFileSync(target, "utf8"));
+    try {
+      return {
+        ...report,
+        sourceEvidence: packagedSmokeSourceEvidence(report, repoRoot),
+        reportPath: target,
+      };
+    } catch (error) {
+      return {
+        ...report,
+        sourceEvidence: {
+          ok: false,
+          reason: "source_fingerprint_check_failed",
+          error: error?.message || String(error),
+        },
+        reportPath: target,
+      };
+    }
   } catch (error) {
     return {
       ok: false,

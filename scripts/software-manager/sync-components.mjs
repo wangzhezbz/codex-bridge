@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 
 import { compareVersions } from "../../shared/software-manager/catalog-schema.mjs";
 import { readCurrentCatalog, replaceCatalogEntry, replaceSignedCatalog } from "./catalog-builder.mjs";
+import { createDogeCloudArtifactPublisher } from "./dogecloud-artifact-publisher.mjs";
 import { loadPublisherConfig } from "./publisher-config.mjs";
 import { inspectGitRelease } from "./sync-git.mjs";
 import { inspectV2RayNRelease } from "./sync-v2rayn.mjs";
@@ -16,6 +17,38 @@ function componentError(code) {
   return error;
 }
 
+function safeSyncErrorCode(error) {
+  const value = String(error?.code || error?.message || "");
+  return /^[a-z0-9_]{1,80}$/u.test(value) ? value : "software_sync_failed";
+}
+
+export async function writeSoftwareSyncStatus({ filePath, workRoot, value } = {}) {
+  const root = String(workRoot || "");
+  const target = String(filePath || "");
+  if (!root || !path.isAbsolute(root) || path.normalize(root) !== root
+    || target !== path.join(root, "sync-status.json") || !value || typeof value !== "object") {
+    throw componentError("software_sync_status_path_invalid");
+  }
+  await fsPromises.mkdir(root, { recursive: true, mode: 0o700 });
+  const temporary = `${target}.tmp-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
+  const handle = await fsPromises.open(temporary, "wx", 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(value)}\n`, "utf8");
+    await handle.sync();
+  } catch (error) {
+    await handle.close().catch(() => {});
+    await fsPromises.unlink(temporary).catch(() => {});
+    throw error;
+  }
+  await handle.close();
+  try {
+    await fsPromises.rename(temporary, target);
+  } catch (error) {
+    await fsPromises.unlink(temporary).catch(() => {});
+    throw error;
+  }
+}
+
 function hashFile(filePath) {
   return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
 }
@@ -23,12 +56,19 @@ function hashFile(filePath) {
 function exactRelease(value) {
   if (!value || value.action !== "publish" || !["v2rayn", "git"].includes(value.id)
     || !/^\d+(?:\.\d+){0,3}$/u.test(value.version ?? "")
-    || !["7z", "exe"].includes(value.format) || !path.isAbsolute(value.packagePath)
+    || !["zip", "exe"].includes(value.format) || !path.isAbsolute(value.packagePath)
     || !Number.isSafeInteger(value.size) || value.size < 1
     || !/^[a-f0-9]{64}$/u.test(value.sha256 ?? "")
     || !Array.isArray(value.requiredFiles) || !value.requiredFiles.length
     || !Number.isSafeInteger(value.maxRelativePathLength) || value.maxRelativePathLength < 1) {
     throw componentError("software_sync_release_invalid");
+  }
+  if (value.id === "v2rayn" && (value.format !== "zip" || value.authenticity !== "pgp"
+    || value.signingFingerprint !== "A4A69C432C532A5F21D0B6EE14162A209ADA306B")) {
+    throw componentError("software_sync_release_authenticity_invalid");
+  }
+  if (value.id === "git" && (value.format !== "exe" || value.authenticode !== "Valid")) {
+    throw componentError("software_sync_release_authenticity_invalid");
   }
   const stat = fs.statSync(value.packagePath);
   if (!stat.isFile() || stat.size !== value.size || hashFile(value.packagePath) !== value.sha256) {
@@ -63,6 +103,7 @@ export async function publishComponentReleases({
   currentCatalog,
   releases,
   publishedAt = new Date().toISOString(),
+  artifactPublisher = null,
 } = {}) {
   if (!Array.isArray(releases) || !releases.length || !Number.isFinite(Date.parse(publishedAt))) {
     throw componentError("software_sync_release_batch_invalid");
@@ -71,6 +112,9 @@ export async function publishComponentReleases({
   await fsPromises.mkdir(packageDirectory, { recursive: true });
   const created = [];
   try {
+    const packagePublisher = artifactPublisher ?? createDogeCloudArtifactPublisher({
+      packageBaseUrl: config.packageBaseUrl,
+    });
     for (const raw of releases) {
       const release = exactRelease(raw);
       const name = packageName(release);
@@ -85,7 +129,13 @@ export async function publishComponentReleases({
         await fsPromises.unlink(destination);
         throw componentError("software_sync_published_asset_invalid");
       }
-      created.push({ release, name, destination });
+      const object = await packagePublisher.publish({
+        sourcePath: destination,
+        relativePath: name,
+        expectedSize: release.size,
+        expectedSha256: release.sha256,
+      });
+      created.push({ release, name, destination, object });
     }
     let next = currentCatalog;
     const previous = new Map();
@@ -98,7 +148,7 @@ export async function publishComponentReleases({
         version: item.release.version,
         architecture: "x64",
         format: item.release.format,
-        assetUrl: new URL(item.name, config.packageBaseUrl).href,
+        assetUrl: item.object.url,
         size: item.release.size,
         sha256: item.release.sha256,
         entrypoint: item.release.entrypoint,
@@ -109,6 +159,7 @@ export async function publishComponentReleases({
       } });
     }
     const events = ["package_verified"];
+    if (created.some(({ object }) => object.action !== "local")) events.push("object_verified");
     const result = await replaceSignedCatalog({ config, catalog: next, events });
     for (const item of created) {
       await retainPackages(packageDirectory, item.release, [item.name, previous.get(item.release.id)]);
@@ -134,14 +185,24 @@ export async function syncComponents({
   sources = null,
   publisher = null,
   publishedAt = new Date().toISOString(),
+  onProgress = null,
 } = {}) {
   const resolvedConfig = config ?? (publisher ? null : loadPublisherConfig(process.env));
   const catalog = currentCatalog ?? readCurrentCatalog(resolvedConfig.publicRoot, {
     signingKeyFile: resolvedConfig.signingKeyFile,
   });
+  const progress = onProgress ?? (process.env.CBI_SYNC_PROGRESS === "1" ? (event) => {
+    if (event.downloadedBytes === event.totalBytes || event.downloadedBytes % (8 * 1024 * 1024) === 0) {
+      process.stderr.write(`[software-sync] ${event.componentId} ${event.downloadedBytes}/${event.totalBytes}\n`);
+    }
+  } : null);
   const sourceSet = sources ?? {
-    v2rayn: () => inspectV2RayNRelease({ currentCatalog: catalog, workRoot: path.join(workRoot, "v2rayn") }),
-    git: () => inspectGitRelease({ currentCatalog: catalog, workRoot: path.join(workRoot, "git") }),
+    v2rayn: () => inspectV2RayNRelease({
+      currentCatalog: catalog, workRoot: path.join(workRoot, "v2rayn"), onProgress: progress,
+    }),
+    git: () => inspectGitRelease({
+      currentCatalog: catalog, workRoot: path.join(workRoot, "git"), onProgress: progress,
+    }),
   };
   if (typeof sourceSet.v2rayn !== "function" || typeof sourceSet.git !== "function") {
     throw componentError("software_sync_sources_invalid");
@@ -158,13 +219,45 @@ export async function syncComponents({
   } finally {
     for (const item of inspected) {
       if (typeof item?.packagePath === "string") await fsPromises.unlink(item.packagePath).catch(() => {});
+      if (typeof item?.signaturePath === "string") await fsPromises.unlink(item.signaturePath).catch(() => {});
     }
   }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const result = await syncComponents();
-  console.log(JSON.stringify({ action: result.action, releases: result.releases.map((item) => ({
-    id: item.id, action: item.action, version: item.version, sha256: item.sha256,
-  })) }, null, 2));
+  const startedAt = new Date().toISOString();
+  const statusFile = process.env.CBI_SYNC_STATUS_FILE;
+  const writeStatus = async (value) => {
+    if (!statusFile) return;
+    try {
+      await writeSoftwareSyncStatus({ filePath: statusFile, workRoot: process.env.CBI_SYNC_WORK_ROOT, value });
+    } catch {
+      process.stderr.write("[software-sync] status_file_write_failed\n");
+    }
+  };
+  await writeStatus({ schemaVersion: 1, status: "running", startedAt });
+  try {
+    const result = await syncComponents();
+    const releases = result.releases.map((item) => ({
+      id: item.id, action: item.action, version: item.version, sha256: item.sha256,
+    }));
+    await writeStatus({
+      schemaVersion: 1,
+      status: "succeeded",
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      action: result.action,
+      releases,
+    });
+    console.log(JSON.stringify({ action: result.action, releases }, null, 2));
+  } catch (error) {
+    await writeStatus({
+      schemaVersion: 1,
+      status: "failed",
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      errorCode: safeSyncErrorCode(error),
+    });
+    throw error;
+  }
 }

@@ -75,6 +75,7 @@ function memoryRecoveryFs() {
           return structuredClone(evidence);
         },
         async deleteDirectChildTreeNoFollow({ child }) { skillTrees.delete(skillKey(child)); },
+        async deleteUnverifiedDirectChildTreeNoFollow({ child }) { return skillTrees.delete(skillKey(child)); },
         async close() {},
       };
     },
@@ -248,6 +249,8 @@ function fixture({
         catalogCache: Object.freeze({ readEnvelope: async () => null, replaceEnvelope: async () => {} }),
         logSink: Object.freeze({ async write(entry) { calls.push(["log", entry.phase]); } }),
         rootFactories,
+        async ensureRuntimeDirectories() { calls.push("runtime-directories:ensure"); },
+        async ensureInstallRootDirectory(rootPath) { calls.push(["install-root:ensure", rootPath]); },
         async authorizeRoot(rootPath) {
           calls.push(["authorize-root", rootPath]);
           return Object.freeze({ kind: "root", path: rootPath, nonce: ++tokenSequence });
@@ -316,6 +319,7 @@ function fixture({
   };
   const installRootResolver = {
     getCurrentToken() { return currentToken; },
+    getCurrentPath() { return currentToken === null ? null : tokens.get(currentToken)?.path ?? null; },
     async choose(rootPath) {
       const capability = await runtimeFactories.lastInfrastructure.authorizeRoot(rootPath);
       const token = `root_token_${String(++tokenSequence).padStart(8, "0")}`;
@@ -415,6 +419,46 @@ test("adapter creation waits for both a catalog and one selected root capability
   assert.equal(created.length, 1);
   assert.equal(created[0][1].path, "D:\\CBApps");
   assert.equal(created[0][2], harness.currentCatalog);
+});
+
+test("production snapshots process-style environment objects before Windows host validation", async () => {
+  const harness = fixture();
+  const inheritedEnvironment = Object.create({ INHERITED_ATTACKER_VALUE: "blocked" });
+  inheritedEnvironment.LOCALAPPDATA = "C:\\Users\\Example\\AppData\\Local";
+  harness.options.env = inheritedEnvironment;
+  let hostEnvironment = null;
+  harness.runtimeFactories.createWindowsHost = (options) => {
+    hostEnvironment = options.env;
+    return Object.freeze({ marker: "host" });
+  };
+  const createRootAdapters = harness.runtimeFactories.createRootAdapters;
+  harness.runtimeFactories.createRootAdapters = async (options) => {
+    await options.getWindowsHost();
+    return createRootAdapters(options);
+  };
+
+  const runtime = await createProductionSoftwareManagerService(harness.options);
+  await runtime.selectInstallRoot("D:\\CBApps");
+
+  assert.equal(Object.getPrototypeOf(hostEnvironment), Object.prototype);
+  assert.equal(hostEnvironment.LOCALAPPDATA, "C:\\Users\\Example\\AppData\\Local");
+  assert.equal(Object.hasOwn(hostEnvironment, "INHERITED_ATTACKER_VALUE"), false);
+});
+
+test("production startup adopts one safe default root and exposes it for the install-location field", async () => {
+  const harness = fixture();
+  const ensured = [];
+  harness.options.defaultInstallRoot = "C:\\Users\\Example\\AppData\\Local\\CBApps";
+  harness.runtimeFactories.ensureDefaultInstallRoot = async (rootPath) => { ensured.push(rootPath); };
+  const runtime = await createProductionSoftwareManagerService(harness.options);
+
+  await runtime.recoverOffline();
+  const snapshot = await runtime.service.getSnapshot();
+
+  assert.deepEqual(ensured, ["C:\\Users\\Example\\AppData\\Local\\CBApps"]);
+  assert.equal(harness.installRootResolver.getCurrentPath(), "C:\\Users\\Example\\AppData\\Local\\CBApps");
+  assert.equal(snapshot.installRootPath, "C:\\Users\\Example\\AppData\\Local\\CBApps");
+  assert.equal(snapshot.readOnly, false);
 });
 
 test("each selected root creates only root-bound adapters and slots without persisting tokens", async () => {
@@ -1040,6 +1084,25 @@ test("startup recovery never cleans prepared Skills when task ownership changed 
   assert.deepEqual(harness.getOwnership().activeTask, task);
 });
 
+test("startup selects the full default path even when abandoned Skill root inference fails", async () => {
+  const harness = fixture({ activeTask: { kind: "skill-replace" } });
+  harness.options.defaultInstallRoot = "C:\\Users\\Example\\AppData\\Local\\CBApps";
+  const originalCreate = harness.runtimeFactories.createWindowsInfrastructure;
+  harness.runtimeFactories.createWindowsInfrastructure = (options) => {
+    const infrastructure = originalCreate(options);
+    return Object.freeze({
+      ...infrastructure,
+      async inferSkillInstallRoot() { throw new Error("broken_skill_record"); },
+    });
+  };
+  const runtime = await createProductionSoftwareManagerService(harness.options);
+
+  await runtime.recoverOffline();
+  const snapshot = await runtime.service.getSnapshot();
+
+  assert.equal(snapshot.installRootPath, "C:\\Users\\Example\\AppData\\Local\\CBApps");
+});
+
 test("default Skill recovery infers a skill-only reserved root before swap and cleans its abandoned prepare", async () => {
   const fsApi = memoryRecoveryFs();
   const deletePrepared = fsApi.deletePreparedSkillSourceNoFollow;
@@ -1579,6 +1642,60 @@ test("default Skill recovery leaves a live swap WAL untouched and recovers it on
   await hooks.cleanupAbandonedPreparedSkills({ installRootCapability, heldLease: recovered.heldLease });
   assert.equal(released, 1);
   assert.equal(await swapJournal.load({ taskId, swapId }), null);
+});
+
+test("dead malformed Skill replacement releases only its stale ownership claim", async () => {
+  const fsApi = memoryRecoveryFs();
+  const skillRoot = "C:\\Users\\Example\\.codex\\skills";
+  const installRootCapability = await authorizeInstallRoot({
+    candidate: "D:\\CBApps", env: {}, maxRelativePath: 180,
+    access: async () => {}, realpath: async (value) => value,
+    lstat: async () => ({
+      dev: 1, ino: 2, isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false,
+    }),
+  });
+  const skillsRootCapability = await authorizeSkillsRoot({
+    candidate: skillRoot, realpath: async (value) => value,
+    lstat: async () => ({
+      dev: 1, ino: 3, isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false,
+    }),
+  });
+  const task = {
+    kind: "skill-replace", phase: "reserved", taskId: "broken-swap", swapId: "c".repeat(32),
+    skillId: "documents", installRoot: "D:\\CBApps", skillsRoot: skillRoot,
+    target: `${skillRoot}\\documents`, version: "1.0.0",
+    packageSha256: "1".repeat(64), skillMdSha256: "2".repeat(64),
+    treeDigest: "3".repeat(64), manifestDigest: "4".repeat(64),
+    previousEvidence: { kind: "absent" }, leaseScope: "prepare", leaseNonce: "5".repeat(32),
+  };
+  let ownership = state("D:\\CBApps");
+  ownership.activeTask = task;
+  let released = 0;
+  const ownershipStore = {
+    async load() { return structuredClone(ownership); },
+    async compareAndSwap(expected, next) {
+      assert.equal(expected, ownership.generation);
+      ownership = { ...structuredClone(next), generation: expected + 1 };
+      return structuredClone(ownership);
+    },
+    async acquireOperationLease() { return { async release() { released += 1; } }; },
+  };
+  const hooks = createDefaultSkillRecoveryHooks({
+    fileCapabilities: fsApi, ownershipStore, dataRoot: "C:\\runtime-data", skillsRoot: skillRoot,
+    skillPathAccess: {
+      realpath: async (value) => value,
+      lstat: async () => ({
+        dev: 1, ino: 4, isDirectory: () => true, isSymbolicLink: () => false, isReparsePoint: () => false,
+      }),
+    },
+  });
+
+  const recovered = await hooks.recoverActiveSkillTransaction({ installRootCapability, skillsRootCapability });
+  assert.equal(["recovered", "abandoned"].includes(recovered.status), true);
+  if (recovered.heldLease) await recovered.heldLease.lease.release();
+  assert.equal(ownership.activeTask, null);
+  assert.equal(["skill-replace-aborted", "skill-recovery-abandoned"].includes(ownership.lastTask.action), true);
+  assert.equal(released, 1);
 });
 
 test("service events use the injected bounded structured log sink", async () => {

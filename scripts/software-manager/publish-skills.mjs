@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 
 import { compareVersions } from "../../shared/software-manager/catalog-schema.mjs";
 import { replaceCatalogEntry, readCurrentCatalog, replaceSignedCatalog } from "./catalog-builder.mjs";
+import { createDogeCloudArtifactPublisher } from "./dogecloud-artifact-publisher.mjs";
 import { inspectPackageTree, writeImmutableStoredZip } from "./package-inspector.mjs";
 import { loadPublisherConfig } from "./publisher-config.mjs";
 
@@ -53,7 +54,9 @@ export async function publishSkills({
   version,
   publishedAt = new Date().toISOString(),
   descriptions = {},
+  replaceSkillCatalog = false,
   readDirectory = fs.readdirSync,
+  artifactPublisher = null,
 } = {}) {
   const root = exactRoot(inputRoot);
   if (!VERSION.test(String(version || "")) || !Number.isFinite(Date.parse(publishedAt))) {
@@ -86,20 +89,37 @@ export async function publishSkills({
     }
     const current = readCurrentCatalog(config.publicRoot, { signingKeyFile: config.signingKeyFile });
     const previous = new Map(current.skills.map((item) => [item.id, path.basename(item.assetUrl)]));
-    const skills = created.map((item) => ({
+    const publisher = artifactPublisher ?? createDogeCloudArtifactPublisher({ packageBaseUrl: config.packageBaseUrl });
+    const stored = [];
+    for (const item of created) {
+      const size = fs.statSync(item.packagePath).size;
+      const sha256 = sha256File(item.packagePath);
+      const object = await publisher.publish({
+        sourcePath: item.packagePath,
+        relativePath: `skills/${item.packageName}`,
+        expectedSize: size,
+        expectedSha256: sha256,
+      });
+      stored.push({ item, object, size, sha256 });
+    }
+    const skills = stored.map(({ item, object, size, sha256 }) => ({
       id: item.id,
       name: displayName(item.id),
       description: String(descriptions[item.id] || `${displayName(item.id)} skill.`).trim(),
       version: String(version),
-      assetUrl: new URL(`skills/${item.packageName}`, config.packageBaseUrl).href,
-      size: fs.statSync(item.packagePath).size,
-      sha256: sha256File(item.packagePath),
+      assetUrl: object.url,
+      size,
+      sha256,
       files: ["SKILL.md", ...item.tree.files.filter((value) => value !== "SKILL.md")],
     }));
     const events = ["package_verified"];
+    if (stored.some(({ object }) => object.action !== "local")) events.push("object_verified");
+    const nextCatalog = replaceSkillCatalog
+      ? { schemaVersion: 1, components: [...current.components], skills }
+      : replaceCatalogEntry(current, { skills });
     const result = await replaceSignedCatalog({
       config,
-      catalog: replaceCatalogEntry(current, { skills }),
+      catalog: nextCatalog,
       events,
     });
     for (const item of created) {

@@ -11,9 +11,16 @@ import {
   isResponseToolCallItem,
   responseToolCallFromChat,
 } from "./tools.js";
+import {
+  attachNativeResponsesHistoryItems,
+  isUnsafeIncompleteNativeToolCall,
+  responseOutputItemsForNativeHistory,
+  routeUsesStatelessDeepSeekResponses,
+} from "./responses-native-history.js";
 
 const APPLY_PATCH = "apply_patch";
 const CHAT_TOOL_CALL_INDEX = Symbol("chatToolCallIndex");
+const CHAT_ANTHROPIC_THINKING_INDEX = Symbol("chatAnthropicThinkingIndex");
 const INTERNAL_BRIDGE_DIAGNOSTIC_PREFIXES = [
   "Earlier assistant tool use was summarized for provider compatibility",
   "Do not quote this summary as a new tool call",
@@ -377,21 +384,54 @@ export function assistantHistoryMessageFromChat(chat, toolContext = null) {
   return history;
 }
 
-export function assistantHistoryMessageFromResponse(response, toolContext) {
-  const history = {
+export function assistantHistoryMessageFromResponse(response, toolContext, route = {}) {
+  let history = {
     role: "assistant",
     content: responseHistoryText(response) || null,
   };
+  const assistantOutputItems = (Array.isArray(response?.output) ? response.output : [])
+    .filter((item) => item?.type === "message" && item?.role === "assistant");
+  const outputPhases = assistantOutputItems
+    .map((item) => responseAssistantPhase(item))
+    .filter(Boolean);
+  if (
+    outputPhases.length > 0 &&
+    outputPhases.length === assistantOutputItems.length &&
+    new Set(outputPhases).size === 1
+  ) {
+    history.responses_phase = outputPhases[0];
+  }
+  const reasoningContent = responseReasoningText(response);
+  if (reasoningContent) {
+    history.reasoning_content = reasoningContent;
+  }
   const toolCalls = [];
   for (const item of response?.output || []) {
     if (isResponseToolCallItem(item)) {
+      if (
+        routeUsesStatelessDeepSeekResponses(route) &&
+        isUnsafeIncompleteNativeToolCall(response, item)
+      ) {
+        continue;
+      }
       toolCalls.push(chatToolCallFromResponseItem(item, toolContext));
     }
   }
   if (toolCalls.length > 0) {
     history.tool_calls = toolCalls;
   }
+  if (routeUsesStatelessDeepSeekResponses(route)) {
+    history = attachNativeResponsesHistoryItems(
+      history,
+      responseOutputItemsForNativeHistory(response),
+    );
+  }
   return history;
+}
+
+function responseAssistantPhase(item) {
+  const phase = typeof item?.phase === "string" ? item.phase.trim() : "";
+  return ["commentary", "final_answer"].includes(phase) ? phase : "";
 }
 
 export function responseToSse(response) {
@@ -608,6 +648,10 @@ export function createChatCompletionResponsesStream(
       }
       const data = event.data.trim();
       if (!data) {
+        const keepAlive = chatSseKeepAliveComment(event);
+        if (keepAlive) {
+          output.push(keepAlive);
+        }
         continue;
       }
       if (data === "[DONE]") {
@@ -616,6 +660,12 @@ export function createChatCompletionResponsesStream(
       }
       const payload = tryParseJson(data);
       if (!payload || typeof payload !== "object") {
+        continue;
+      }
+      if (sawFinishReason) {
+        if (payload.usage && typeof payload.usage === "object") {
+          chat.usage = payload.usage;
+        }
         continue;
       }
       if (event.event === "error" || payload.error) {
@@ -724,6 +774,16 @@ export function createChatCompletionResponsesStream(
   }
 }
 
+function chatSseKeepAliveComment(event = {}) {
+  const lines = String(event.raw || "")
+    .split("\n")
+    .filter(Boolean);
+  if (lines.length === 0 || lines.some((line) => !line.startsWith(":"))) {
+    return "";
+  }
+  return `${lines.join("\n")}\n\n`;
+}
+
 function mergeChatCompletionChunk(chat, chunk) {
   if (chunk.id) {
     chat.id = chunk.id;
@@ -752,6 +812,7 @@ function mergeChatCompletionChunk(chat, chunk) {
   if (delta.role) {
     target.message.role = delta.role;
   }
+  mergeAnthropicThinkingBlock(target.message, delta.anthropic_thinking_block);
   const content = chatDeltaText(delta);
   if (content) {
     target.message.content += content;
@@ -759,6 +820,24 @@ function mergeChatCompletionChunk(chat, chunk) {
   if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
     target.message.reasoning_content =
       String(target.message.reasoning_content || "") + delta.reasoning_content;
+    const thinkingIndex = normalizeAnthropicThinkingIndex(delta.anthropic_thinking_index);
+    const thinking = thinkingIndex === null
+      ? lastAnthropicThinkingBlock(target.message)
+      : ensureAnthropicThinkingBlock(target.message, thinkingIndex);
+    if (thinking?.type === "thinking") {
+      thinking.thinking = String(thinking.thinking || "") + delta.reasoning_content;
+    }
+  }
+  if (
+    typeof delta.anthropic_thinking_signature === "string" &&
+    delta.anthropic_thinking_signature
+  ) {
+    const thinkingIndex = normalizeAnthropicThinkingIndex(delta.anthropic_thinking_index);
+    const thinking = thinkingIndex === null
+      ? ensureTrailingAnthropicThinkingBlock(target.message)
+      : ensureAnthropicThinkingBlock(target.message, thinkingIndex);
+    thinking.signature =
+      String(thinking.signature || "") + delta.anthropic_thinking_signature;
   }
   mergeChatToolCallDeltas(target.message, delta.tool_calls);
   if (choice.finish_reason !== undefined && choice.finish_reason !== null) {
@@ -767,6 +846,79 @@ function mergeChatCompletionChunk(chat, chunk) {
   if (choice.logprobs !== undefined) {
     target.logprobs = choice.logprobs;
   }
+}
+
+function mergeAnthropicThinkingBlock(message, source) {
+  if (!source || typeof source !== "object") {
+    return null;
+  }
+  const index = normalizeAnthropicThinkingIndex(source.index);
+  if (index === null) {
+    return null;
+  }
+  message.anthropic_thinking ||= [];
+  const existing = anthropicThinkingBlockByIndex(message, index);
+  if (existing) {
+    return existing;
+  }
+  let block = null;
+  if (source.type === "thinking") {
+    block = { type: "thinking", thinking: "", signature: "" };
+  } else if (source.type === "redacted_thinking" && typeof source.data === "string") {
+    block = { type: "redacted_thinking", data: source.data };
+  }
+  if (!block) {
+    return null;
+  }
+  Object.defineProperty(block, CHAT_ANTHROPIC_THINKING_INDEX, {
+    value: index,
+    enumerable: false,
+  });
+  message.anthropic_thinking.push(block);
+  return block;
+}
+
+function ensureAnthropicThinkingBlock(message, index) {
+  return anthropicThinkingBlockByIndex(message, index) ||
+    mergeAnthropicThinkingBlock(message, { index, type: "thinking" });
+}
+
+function ensureTrailingAnthropicThinkingBlock(message) {
+  const trailing = lastAnthropicThinkingBlock(message);
+  if (trailing?.type === "thinking") {
+    return trailing;
+  }
+  message.anthropic_thinking ||= [];
+  const block = {
+    type: "thinking",
+    thinking: String(message.reasoning_content || ""),
+    signature: "",
+  };
+  message.anthropic_thinking.push(block);
+  return block;
+}
+
+function lastAnthropicThinkingBlock(message) {
+  return Array.isArray(message?.anthropic_thinking)
+    ? message.anthropic_thinking.at(-1)
+    : null;
+}
+
+function anthropicThinkingBlockByIndex(message, index) {
+  if (!Array.isArray(message?.anthropic_thinking)) {
+    return null;
+  }
+  return message.anthropic_thinking.find(
+    (block) => block?.[CHAT_ANTHROPIC_THINKING_INDEX] === index,
+  ) || null;
+}
+
+function normalizeAnthropicThinkingIndex(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+  const index = Number(value);
+  return Number.isInteger(index) && index >= 0 ? index : null;
 }
 
 function mergeChatToolCallDeltas(message, toolCalls) {
@@ -1211,6 +1363,32 @@ function responseHistoryText(response) {
     }
   }
   return parts.join("\n");
+}
+
+function responseReasoningText(response) {
+  const parts = [];
+  for (const item of response?.output || []) {
+    if (item?.type !== "reasoning") {
+      continue;
+    }
+    const content = Array.isArray(item.content) ? item.content : [];
+    for (const part of content) {
+      const text = part?.type === "reasoning_text"
+        ? part.text
+        : part?.reasoning_text;
+      if (typeof text === "string" && text) {
+        parts.push(text);
+      }
+    }
+    if (content.length === 0 && Array.isArray(item.summary)) {
+      for (const summary of item.summary) {
+        if (typeof summary?.text === "string" && summary.text) {
+          parts.push(summary.text);
+        }
+      }
+    }
+  }
+  return parts.join("");
 }
 
 function messageText(message) {

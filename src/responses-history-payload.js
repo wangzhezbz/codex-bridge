@@ -1,36 +1,55 @@
 import { stringifyJson } from "./json.js";
 import { contentToText } from "./responses-to-chat.js";
+import {
+  hasNativeResponsesHistoryItems,
+  nativeResponsesHistoryItems,
+} from "./responses-native-history.js";
 
-export function inlineLocalHistoryForResponsesPayload(payload, sourceMessages) {
-  const systemInstructions = sourceMessages
-    .filter((message) => message?.role === "system")
+export function inlineLocalHistoryForResponsesPayload(payload, sourceMessages, options = {}) {
+  const preferNativeHistory = options.preferNativeResponsesHistoryItems === true;
+  const systemInstructionParts = sourceMessages
+    .filter((message) =>
+      message?.role === "system" &&
+      !(preferNativeHistory && hasNativeResponsesHistoryItems(message)))
     .map((message) => contentToText(message.content))
     .filter(Boolean)
-    .join("\n\n");
+    .filter((value, index, values) => values.indexOf(value) === index);
   const existingInstructions =
     typeof payload.instructions === "string" ? payload.instructions : "";
-  if (systemInstructions && !existingInstructions) {
-    payload.instructions = systemInstructions;
-  } else if (
-    systemInstructions &&
-    !existingInstructions.includes(systemInstructions)
-  ) {
-    payload.instructions = `${systemInstructions}\n\n${payload.instructions}`;
+  const missingInstructions = systemInstructionParts.filter((part) =>
+    !existingInstructions.includes(part)
+  );
+  if (missingInstructions.length > 0) {
+    payload.instructions = [
+      ...missingInstructions,
+      existingInstructions,
+    ].filter(Boolean).join("\n\n");
   }
   payload.input = chatMessagesToResponsesInput(
-    sourceMessages.filter((message) => message?.role !== "system"),
+    sourceMessages.filter((message) =>
+      message?.role !== "system" ||
+      (preferNativeHistory && hasNativeResponsesHistoryItems(message))),
+    options,
   );
   delete payload.messages;
   delete payload.previous_response_id;
 }
 
-export function chatMessagesToResponsesInput(messages) {
-  return messages.flatMap(chatMessageToResponsesInputItems).filter(Boolean);
+export function chatMessagesToResponsesInput(messages, options = {}) {
+  return messages
+    .flatMap((message) => chatMessageToResponsesInputItems(message, options))
+    .filter(Boolean);
 }
 
-function chatMessageToResponsesInputItems(message) {
+function chatMessageToResponsesInputItems(message, options = {}) {
   if (!message || typeof message !== "object") {
     return [];
+  }
+  if (
+    options.preferNativeResponsesHistoryItems === true &&
+    hasNativeResponsesHistoryItems(message)
+  ) {
+    return nativeResponsesHistoryItems(message);
   }
   if (message.role === "tool" && message.tool_call_id) {
     return [{
@@ -39,17 +58,26 @@ function chatMessageToResponsesInputItems(message) {
       output: contentToText(message.content),
     }];
   }
-  if (
-    message.role === "assistant" &&
-    Array.isArray(message.tool_calls) &&
-    message.tool_calls.length > 0
-  ) {
+  if (message.role === "assistant") {
     const items = [];
+    if (options.includePlainReasoningContent === true
+      && typeof message.reasoning_content === "string"
+      && message.reasoning_content) {
+      items.push({
+        type: "reasoning",
+        content: [{ type: "reasoning_text", text: message.reasoning_content }],
+      });
+    }
     const assistantContent = chatContentToResponsesContent(message.content, "assistant");
     if (assistantContent) {
-      items.push({ role: "assistant", content: assistantContent });
+      const assistant = { role: "assistant", content: assistantContent };
+      const phase = responsesAssistantPhase(message);
+      if (phase) {
+        assistant.phase = phase;
+      }
+      items.push(assistant);
     }
-    for (const toolCall of message.tool_calls) {
+    for (const toolCall of Array.isArray(message.tool_calls) ? message.tool_calls : []) {
       const callId = toolCall?.id || toolCall?.call_id || "";
       const name = toolCall?.function?.name || toolCall?.name || "";
       if (!callId || !name) {
@@ -71,6 +99,13 @@ function chatMessageToResponsesInputItems(message) {
     return [];
   }
   return [{ role, content }];
+}
+
+function responsesAssistantPhase(message) {
+  const phase = typeof message?.responses_phase === "string"
+    ? message.responses_phase.trim()
+    : "";
+  return ["commentary", "final_answer"].includes(phase) ? phase : "";
 }
 
 function responsesInputRole(role) {

@@ -79,6 +79,13 @@ export function upstreamHeaders(route, context = {}, options = {}) {
 
   if (authModeForRoute(route) === "codex_openai") {
     addCodexPassthroughHeaders(headers, context.clientHeaders);
+    if (!headerValue(headers, "chatgpt-account-id")) {
+      setCodexPassthroughHeader(
+        headers,
+        "chatgpt-account-id",
+        chatgptAccountIdFromBearerToken(context.clientAuth?.bearerToken),
+      );
+    }
   }
 
   return headers;
@@ -161,6 +168,26 @@ function shouldPassthroughCodexHeader(name) {
 function setCodexPassthroughHeader(target, name, value) {
   if (value && !CODEX_PASSTHROUGH_BLOCKED_HEADERS.has(name)) {
     target[name] = value;
+  }
+}
+
+function chatgptAccountIdFromBearerToken(bearerToken) {
+  const token = String(bearerToken || "").trim();
+  if (!token || token.length > 32 * 1024) {
+    return "";
+  }
+  const parts = token.split(".");
+  if (parts.length !== 3 || !parts[1] || parts[1].length > 24 * 1024) {
+    return "";
+  }
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    const accountId = String(
+      payload?.["https://api.openai.com/auth"]?.chatgpt_account_id || "",
+    ).trim();
+    return /^[A-Za-z0-9._:-]{1,160}$/.test(accountId) ? accountId : "";
+  } catch {
+    return "";
   }
 }
 

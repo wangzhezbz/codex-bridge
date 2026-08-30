@@ -187,7 +187,7 @@ function validAdapterResult(value, fallback) {
   if (Object.hasOwn(value, "details")) {
     const details = value.details;
     const expectedKeys = fallback.componentId === "git" ? GIT_RESULT_DETAIL_KEYS : NATIVE_RESULT_DETAIL_KEYS;
-    if (fallback.action !== "inspect" || value.status !== "succeeded"
+    if (!["inspect", "commit"].includes(fallback.action) || value.status !== "succeeded"
       || !isPlainRecord(details) || Object.keys(details).length !== expectedKeys.length
       || !expectedKeys.every((key) => Object.hasOwn(details, key))
       || (fallback.componentId === "git" && !["managed", "external"].includes(details.ownership))
@@ -347,6 +347,8 @@ export function createSoftwareManagerService({
   let recoveryComplete = false;
   let recoveryFailure = null;
   let catalogFailure = null;
+  let catalogMetadata = null;
+  let catalogRefreshFailure = null;
   let externalTask = null;
   let currentTask = null;
   let startReserved = false;
@@ -356,6 +358,21 @@ export function createSoftwareManagerService({
   let taskNamespace = randomUUID().replaceAll("-", "").slice(0, 24);
   let selectedInstallRootToken = installRootResolver.getCurrentToken() ?? null;
   let lastInspection = null;
+
+  function describeCatalog(service) {
+    const described = typeof catalogProvider?.describe === "function"
+      ? catalogProvider.describe(service)
+      : null;
+    catalogMetadata = described && typeof described === "object"
+      ? {
+          source: String(described.source || "unknown"),
+          publishedAt: typeof described.publishedAt === "string" ? described.publishedAt : null,
+          refreshedAt: typeof described.refreshedAt === "string" ? described.refreshedAt : null,
+        }
+      : { source: "unknown", publishedAt: null, refreshedAt: null };
+    return service;
+  }
+  if (catalogService) describeCatalog(catalogService);
 
   function now() {
     const value = clock.now();
@@ -372,6 +389,7 @@ export function createSoftwareManagerService({
         return typeof displayPath === "string" ? { ...entry, installPath: displayPath } : entry;
       });
     }
+    if (typeof raw.installRootPath === "string") safe.installRootPath = raw.installRootPath;
     safe.logs = Object.freeze([...uiLogs]);
     return deepFreeze(safe);
   }
@@ -564,7 +582,11 @@ export function createSoftwareManagerService({
   }
 
   function emit(rawEvent) {
-    const event = deepFreeze(redactValue(rawEvent));
+    const safeEvent = redactValue(rawEvent);
+    if (rawEvent?.type === "snapshot" && isPlainRecord(rawEvent.snapshot)) {
+      safeEvent.snapshot = snapshotValue(rawEvent.snapshot);
+    }
+    const event = deepFreeze(safeEvent);
     const source = listenerContext.getStore();
     const sourceActive = Boolean(source?.lease?.active && listeners.get(source.token)?.active);
     const causes = sourceActive ? source.causes : new Set();
@@ -596,21 +618,48 @@ export function createSoftwareManagerService({
       if (Number.isSafeInteger(totalBytes) && totalBytes >= 0) event.totalBytes = totalBytes;
       if (Number.isFinite(bytesPerSecond) && bytesPerSecond >= 0) event.bytesPerSecond = bytesPerSecond;
     }
-    const logged = writeLog({ taskId: task.taskId, componentId, phase, message: event.message, details });
+    const progressLogKey = `${componentId ?? "service"}:${phase}:${event.message}`;
+    const logged = task.lastProgressLogKey === progressLogKey
+      ? Promise.resolve()
+      : writeLog({ taskId: task.taskId, componentId, phase, message: event.message, details });
+    task.lastProgressLogKey = progressLogKey;
     emit(event);
     return logged;
   }
 
-  async function currentCatalog() {
+  function progressMessage(raw) {
+    if (typeof raw?.message === "string") return raw.message;
+    if (raw?.phase === "download") return "software_manager_downloading";
+    if (raw?.phase === "verify-download") return "software_manager_verifying_download";
+    if (raw?.phase === "extract") return "software_manager_extracting";
+    if (raw?.phase === "verify") return "software_manager_verifying_installation";
+    return "software_manager_preparing";
+  }
+
+  async function currentCatalog({ refreshIfMissing = true } = {}) {
     if (catalogService) return catalogService;
     if (typeof catalogProvider?.getCurrent === "function") {
       try {
-        catalogService = await catalogProvider.getCurrent();
-        catalogFailure = catalogService ? null : serviceError("software_manager_catalog_unavailable");
+        catalogService = describeCatalog(await catalogProvider.getCurrent());
       } catch (error) {
         catalogService = null;
         catalogFailure = serviceError("software_manager_catalog_unavailable", error);
       }
+    }
+    // A new machine has no verified cache yet. The first renderer snapshot is
+    // allowed to fetch and verify the fixed catalog endpoint, then persist it
+    // for later offline starts. Startup recovery itself remains local-only.
+    if (!catalogService && refreshIfMissing && typeof catalogProvider?.refresh === "function") {
+      try {
+        catalogService = describeCatalog(await catalogProvider.refresh());
+        catalogFailure = catalogService ? null : serviceError("software_manager_catalog_unavailable");
+        catalogRefreshFailure = null;
+      } catch (error) {
+        catalogService = null;
+        catalogFailure = serviceError("software_manager_catalog_unavailable", error);
+      }
+    } else {
+      catalogFailure = catalogService ? null : (catalogFailure ?? serviceError("software_manager_catalog_unavailable"));
     }
     return catalogService ?? null;
   }
@@ -682,16 +731,13 @@ export function createSoftwareManagerService({
       await recoverTransactions();
       selectedInstallRootToken = installRootResolver.getCurrentToken() ?? null;
       const before = await loadOwnership();
-      if (before?.activeTask) {
-        externalTask = publicExternalTask(before.activeTask);
-        recoveryFailure = serviceError("software_manager_pending_recovery");
-        recoveryComplete = true;
-        return { recovered: false, pending: true };
-      }
       externalTask = null;
       recoveryFailure = null;
       const service = await currentCatalog();
       const entries = catalogEntries(service);
+      // Adapter inspection is also the recovery boundary for abandoned
+      // prepare claims. Run it before declaring an inherited claim pending;
+      // otherwise a force-closed download can leave this page read-only.
       if (service && !catalogFailure && (fixedAdapters || selectedInstallRootToken)) {
         const adapters = await resolveAdapters(service);
         lastInspection = await inspectAll(adapters, entries, Object.keys(before?.skills ?? {}));
@@ -739,7 +785,10 @@ export function createSoftwareManagerService({
 
   async function ensureRecoveryInGate() {
     const outcome = await refreshRecoveryStateInGate();
-    if (outcome.pending || recoveryFailure || externalTask) {
+    // A failed environment/installed-version inspection is advisory for install
+    // and update. Only a durable active transaction can conflict with a new
+    // mutation; component adapters still enforce their own journals and locks.
+    if (externalTask) {
       throw serviceError("software_manager_pending_recovery", recoveryFailure ?? undefined);
     }
     return outcome;
@@ -797,13 +846,13 @@ export function createSoftwareManagerService({
     }
   }
 
-  async function callSkills(adapters, action, context, requestedIds) {
+  async function callSkills(adapters, action, context, requestedIds, resultAction = action) {
     try {
       const values = await adapterMethod(adapters, "skills", action)(context);
-      return safeSkillBatch(values, requestedIds, action);
+      return safeSkillBatch(values, requestedIds, resultAction);
     } catch (error) {
-      writeLog({ level: "error", taskId: currentTask?.taskId, componentId: "skills", phase: action, message: stringError(error), details: error });
-      return requestedIds.map((id) => failedResult(id, action, error));
+      writeLog({ level: "error", taskId: currentTask?.taskId, componentId: "skills", phase: resultAction, message: stringError(error), details: error });
+      return requestedIds.map((id) => failedResult(id, resultAction, error));
     }
   }
 
@@ -851,7 +900,7 @@ export function createSoftwareManagerService({
           typeof raw.phase === "string" ? raw.phase : "prepare",
           raw.percent,
           !signal.aborted && !task.acceptedCancel,
-          typeof raw.message === "string" ? raw.message : "software_manager_preparing",
+          progressMessage(raw),
           raw,
           false,
           task,
@@ -864,7 +913,10 @@ export function createSoftwareManagerService({
     const task = currentTask;
     const nonce = beginCancellable(task, "prepare");
     await progress(id, "prepare", 0, true, "software_manager_preparing", undefined, false, task);
-    const prepared = await callOne(adapters, id, "prepare", cancellableContext(id, task, nonce));
+    const prepared = await callOne(adapters, id, "prepare", {
+      ...cancellableContext(id, task, nonce),
+      selected: true,
+    });
     endCancellable(task, nonce);
     await drainLogs();
     if (task.acceptedCancel) return failedResult(id, "prepare", serviceError("software_manager_cancelled"));
@@ -885,14 +937,17 @@ export function createSoftwareManagerService({
     if (task.acceptedCancel) {
       return failedResult(id, "inspect", serviceError("software_manager_cancelled"));
     }
-    if (inspected.status === "failed") return inspected;
+    // Update doubles as install. If the existing installation cannot be
+    // detected, continue through the normal verified install path.
+    if (inspected.status === "failed") return runPreparedComponent(adapters, id);
     if (inspected.status === "succeeded" && inspected.versionAfter) {
       let comparison;
       try { comparison = compareVersions(service.getComponent(id).version, inspected.versionAfter); }
       catch (error) { return failedResult(id, "inspect", error); }
       if (comparison <= 0) {
+        const { details: _inspectionOnlyDetails, ...publicUpdate } = inspected;
         return safeAdapterResult({
-          ...inspected,
+          ...publicUpdate,
           action: "update",
           status: "skipped",
           message: "software_manager_already_current",
@@ -904,10 +959,18 @@ export function createSoftwareManagerService({
 
   async function runPreparedSkills(adapters, ids) {
     if (ids.length === 0) return [];
+    // Each prepared Skill owns open directory handles and an operation lease.
+    // Finish and release one Skill before preparing the next so a large
+    // selection cannot leak authority or filesystem state across items.
+    if (ids.length > 1) {
+      const results = [];
+      for (const id of ids) results.push(...await runPreparedSkills(adapters, [id]));
+      return results;
+    }
     const task = currentTask;
-    const discard = () => adapterMethod(adapters, "skills", "discardPrepared")({
+    const discard = () => Promise.resolve().then(() => adapterMethod(adapters, "skills", "discardPrepared")({
       taskId: task.taskId, skillIds: ids,
-    });
+    }));
     try {
       const nonce = beginCancellable(task, "prepare");
       await progress("skills", "prepare", 0, true, "software_manager_preparing_skills", undefined, false, task);
@@ -955,12 +1018,60 @@ export function createSoftwareManagerService({
     finally { exitCritical(task); }
   }
 
+  function skippedNotInstalled(id, action = "uninstall") {
+    return safeAdapterResult({
+      componentId: id,
+      action,
+      status: "skipped",
+      message: "software_manager_not_installed",
+      rollbackAvailable: false,
+      versionBefore: null,
+      versionAfter: null,
+    }, { componentId: id, action });
+  }
+
+  async function runUninstallComponent(adapters, id) {
+    const task = currentTask;
+    const nonce = beginCancellable(task, "inspect");
+    await progress(id, "inspect", 0, true, "software_manager_inspecting", undefined, false, task);
+    const inspected = await callOne(adapters, id, "inspectInstalled", {
+      signal: task.controller.signal,
+    }, "inspect");
+    endCancellable(task, nonce);
+    if (task.acceptedCancel) return failedResult(id, "inspect", serviceError("software_manager_cancelled"));
+    if (inspected.status !== "succeeded" || !inspected.versionAfter) return skippedNotInstalled(id);
+    return runCriticalComponent(adapters, id, "uninstall");
+  }
+
   async function runCriticalSkills(adapters, ids, action) {
     if (ids.length === 0) return [];
     const task = currentTask;
     await enterCritical(task, "skills", action);
     try { return await callSkills(adapters, action, { taskId: task.taskId, skillIds: ids }, ids); }
     finally { exitCritical(task); }
+  }
+
+  async function runUninstallSkills(adapters, ids) {
+    if (ids.length === 0) return [];
+    const task = currentTask;
+    const nonce = beginCancellable(task, "inspect");
+    await progress("skills", "inspect", 0, true, "software_manager_inspecting", undefined, false, task);
+    const inspected = await callSkills(adapters, "inspectInstalled", {
+      signal: task.controller.signal,
+      skillIds: ids,
+    }, ids, "inspect");
+    endCancellable(task, nonce);
+    if (task.acceptedCancel) {
+      return ids.map((id) => failedResult(id, "inspect", serviceError("software_manager_cancelled")));
+    }
+    const installed = inspected
+      .filter((entry) => entry.status === "succeeded" && entry.versionAfter)
+      .map(({ componentId }) => componentId);
+    const removed = installed.length > 0
+      ? await runCriticalSkills(adapters, installed, "uninstall")
+      : [];
+    const removedById = new Map(removed.map((entry) => [entry.componentId, entry]));
+    return ids.map((id) => removedById.get(id) ?? skippedNotInstalled(id));
   }
 
   async function startTask(rawRequest) {
@@ -998,6 +1109,7 @@ export function createSoftwareManagerService({
           phaseNonce: 0,
           activePhaseNonce: null,
           controller: new AbortController(),
+          lastProgressLogKey: null,
         };
         currentTask = task;
         startReserved = false;
@@ -1011,6 +1123,9 @@ export function createSoftwareManagerService({
               : await runPreparedComponent(adapters, id));
           }
           if (!task.acceptedCancel) skills = await runPreparedSkills(adapters, request.skillIds);
+        } else if (request.kind === "uninstall") {
+          for (const id of request.componentIds) components.push(await runUninstallComponent(adapters, id));
+          skills = await runUninstallSkills(adapters, request.skillIds);
         } else {
           for (const id of request.componentIds) components.push(await runCriticalComponent(adapters, id, request.kind));
           skills = await runCriticalSkills(adapters, request.skillIds, request.kind);
@@ -1039,7 +1154,11 @@ export function createSoftwareManagerService({
     });
   }
 
-  async function buildSnapshot({ inspect = true, inspectionOverride = null } = {}) {
+  async function buildSnapshot({
+    inspect = true,
+    inspectionOverride = null,
+    installRootPathOverride = null,
+  } = {}) {
     if (platform !== "win32") {
       return snapshotValue({
         platform,
@@ -1052,6 +1171,7 @@ export function createSoftwareManagerService({
         skills: [],
         rollback: [],
         defaults: { install: { componentIds: [], skillIds: [] }, update: { componentIds: [], skillIds: [] } },
+        installRootPath: null,
         task: null,
         logging: {
           degraded: loggingDegraded,
@@ -1062,7 +1182,9 @@ export function createSoftwareManagerService({
         logs: [...uiLogs],
       });
     }
-    const service = externalTask || recoveryFailure ? catalogService : await currentCatalog();
+    // Catalog trust and local environment detection are independent. A local
+    // inspection/recovery warning must not hide a valid bundled catalog.
+    const service = await currentCatalog();
     const entries = catalogEntries(service);
     let inspected = inspectionOverride ?? lastInspection ?? { components: [], skills: [] };
     if (service && !catalogFailure && inspect && !currentTask && !externalTask && (fixedAdapters || selectedInstallRootToken)) {
@@ -1100,18 +1222,27 @@ export function createSoftwareManagerService({
       }));
     const tabs = ["install", "update", "uninstall"];
     if (rollback.length > 0) tabs.push("rollback");
+    // Only work accepted by this service instance is an active UI task. A
+    // durable claim loaded after restart is recovery metadata, not proof that
+    // it is still running; exposing it as `task` locked every UI control.
     const task = currentTask
       ? { taskId: currentTask.taskId, kind: currentTask.kind, phase: currentTask.phase, cancellable: currentTask.cancellable, critical: currentTask.critical, external: false }
-      : externalTask
-        ? { ...externalTask, external: true, critical: true, cancellable: false, phase: externalTask.phase ?? externalTask.kind }
-        : null;
+      : null;
     return snapshotValue({
       platform,
       enabled: true,
-      readOnly: !service || Boolean(recoveryFailure) || Boolean(catalogFailure),
+      readOnly: !service || Boolean(catalogFailure),
       pendingRecovery: Boolean(externalTask || recoveryFailure),
       tabs,
-      catalog: { available: Boolean(service && !catalogFailure), components: entries.components, skills: entries.skills },
+      catalog: {
+        available: Boolean(service && !catalogFailure),
+        components: entries.components,
+        skills: entries.skills,
+        source: catalogMetadata?.source || "unknown",
+        publishedAt: catalogMetadata?.publishedAt || null,
+        refreshedAt: catalogMetadata?.refreshedAt || null,
+        refreshError: catalogRefreshFailure,
+      },
       components,
       skills: inspected.skills,
       rollback,
@@ -1119,6 +1250,11 @@ export function createSoftwareManagerService({
         install: { componentIds: service && !catalogFailure ? ["chatgpt"] : [], skillIds: [] },
         update: { componentIds: components.filter(({ updateState }) => updateState === "update-available").map(({ id }) => id), skillIds: [] },
       },
+      installRootPath: typeof installRootPathOverride === "string"
+        ? installRootPathOverride
+        : typeof installRootResolver.getCurrentPath === "function"
+          ? installRootResolver.getCurrentPath()
+          : null,
       task,
       logging: {
         degraded: loggingDegraded,
@@ -1149,14 +1285,21 @@ export function createSoftwareManagerService({
       if (quitReservation) throw serviceError("software_manager_quit_reserved");
       if (currentTask) throw serviceError("software_manager_task_running");
       await ensureRecoveryInGate();
+      const previousCatalog = await currentCatalog({ refreshIfMissing: false });
       try {
-        catalogService = typeof catalogProvider?.refresh === "function"
+        const refreshedCatalog = typeof catalogProvider?.refresh === "function"
           ? await catalogProvider.refresh()
           : await currentCatalog();
-        catalogFailure = catalogService ? null : serviceError("software_manager_catalog_unavailable");
+        if (!refreshedCatalog) throw serviceError("software_manager_catalog_unavailable");
+        catalogService = describeCatalog(refreshedCatalog);
+        catalogFailure = null;
+        catalogRefreshFailure = null;
       } catch (error) {
-        catalogService = null;
-        catalogFailure = serviceError("software_manager_catalog_unavailable", error);
+        catalogService = previousCatalog;
+        catalogFailure = previousCatalog ? null : serviceError("software_manager_catalog_unavailable", error);
+        catalogRefreshFailure = previousCatalog
+          ? String(error?.code || error?.message || "software_manager_catalog_refresh_failed")
+          : null;
       }
       await ensureRecoveryInGate();
       const snapshot = await buildSnapshot();
@@ -1178,6 +1321,7 @@ export function createSoftwareManagerService({
       try {
         const chosen = await installRootResolver.choose(candidate);
         token = typeof chosen === "string" ? chosen : chosen?.token;
+        const chosenPath = typeof chosen?.path === "string" ? chosen.path : candidate;
         if (typeof token !== "string" || !OPAQUE_TOKEN.test(token)) {
           throw serviceError("software_manager_install_root_invalid");
         }
@@ -1193,10 +1337,22 @@ export function createSoftwareManagerService({
           entries,
           Object.keys(ownership?.skills ?? {}),
         );
-        if (candidateInspection.components.some(({ status }) => status === "failed")) {
-          throw serviceError("software_manager_snapshot_failed");
+        const rootOwnershipFailure = candidateInspection.components.find(({ status, message }) => (
+          status === "failed"
+          && typeof message === "string"
+          && /component_install_root_(?:not_owned|changed)/u.test(message)
+        ));
+        if (rootOwnershipFailure) {
+          const failure = serviceError(
+            rootOwnershipFailure.message,
+          );
+          throw serviceError("software_manager_install_root_in_use", failure);
         }
-        const snapshot = await buildSnapshot({ inspect: false, inspectionOverride: candidateInspection });
+        const snapshot = await buildSnapshot({
+          inspect: false,
+          inspectionOverride: candidateInspection,
+          installRootPathOverride: chosenPath,
+        });
         await ensureRecoveryInGate();
         await installRootResolver.adopt(token);
         adopted = true;
@@ -1221,9 +1377,7 @@ export function createSoftwareManagerService({
   }
 
   function cancelTask() {
-    if (!currentTask) return externalTask
-      ? { cancelled: false, reason: "critical" }
-      : { cancelled: false, reason: "idle" };
+    if (!currentTask) return { cancelled: false, reason: "idle" };
     if (currentTask.acceptedCancel) return { cancelled: false, reason: "already_cancelled" };
     if (currentTask.critical) return { cancelled: false, reason: "critical" };
     if (!currentTask.cancellable) return { cancelled: false, reason: "not_cancellable" };
@@ -1236,13 +1390,12 @@ export function createSoftwareManagerService({
   }
 
   function hasCriticalTask() {
-    return Boolean(currentTask?.critical || externalTask || recoveryFailure);
+    return Boolean(currentTask?.critical);
   }
 
   function prepareForQuit() {
     // beginQuit() owns the async recovery/entry gate. This remains synchronous
     // so the caller cannot accidentally await across a state transition.
-    if (externalTask || recoveryFailure) return { allowQuit: false, reason: "critical" };
     if (!currentTask) return { allowQuit: true };
     if (currentTask.acceptedCancel) return { allowQuit: false, reason: "cancelling", canCancel: false };
     if (currentTask.critical) return { allowQuit: false, reason: "critical" };
@@ -1254,19 +1407,12 @@ export function createSoftwareManagerService({
     const reservation = Object.freeze(Object.create(null));
     quitReservation = reservation;
     try {
-      if (currentTask) {
-        // startTask already owns the entry gate for its full execution. The
-        // synchronously published reservation blocks every later acceptance,
-        // while this snapshot lets Main offer cancellation without waiting for
-        // the running task to finish.
-        await Promise.resolve();
-        return Object.freeze({ ...prepareForQuit(), reservation });
-      }
-      const decision = await withEntryGate(async () => {
-        await refreshRecoveryStateInGate();
-        return prepareForQuit();
-      });
-      return Object.freeze({ ...decision, reservation });
+      // The reservation is published synchronously, so a task that has not yet
+      // entered its critical write phase cannot be accepted after this point.
+      // Local inspection/recovery failures and claims from another process are
+      // never reasons to trap the user inside this application.
+      await Promise.resolve();
+      return Object.freeze({ ...prepareForQuit(), reservation });
     } catch (error) {
       if (quitReservation === reservation) quitReservation = null;
       throw error;
@@ -1283,11 +1429,9 @@ export function createSoftwareManagerService({
     if (!reservation || quitReservation !== reservation) {
       throw serviceError("software_manager_quit_reservation_invalid");
     }
-    return withEntryGate(async () => {
-      if (quitReservation !== reservation) throw serviceError("software_manager_quit_reservation_invalid");
-      await refreshRecoveryStateInGate();
-      return prepareForQuit();
-    });
+    if (quitReservation !== reservation) throw serviceError("software_manager_quit_reservation_invalid");
+    await Promise.resolve();
+    return prepareForQuit();
   }
 
   function subscribe(listener) {

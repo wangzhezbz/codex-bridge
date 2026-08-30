@@ -7,6 +7,12 @@ const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
 const SWAP_ID = /^[a-f0-9]{32}$/u;
 const SKILL_ID = /^[a-z0-9][a-z0-9-]{0,63}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
+const MISSING_CODES = new Set([
+  "entry_missing", "ENOENT", "ERROR_FILE_NOT_FOUND", "ERROR_PATH_NOT_FOUND", "windows_path_missing",
+]);
+const PARTIAL_TREE_CODES = new Set([
+  "skill_required_file_missing", "skill_md_missing", "skill_tree_evidence_invalid",
+]);
 
 function skillError(code, cause) {
   const error = new Error(code, cause === undefined ? undefined : { cause });
@@ -46,6 +52,10 @@ function publicIdentity(value, nullable = false) {
 
 function sameIdentity(left, right) {
   return Boolean(left && right && left.volumeSerial === right.volumeSerial && left.fileId === right.fileId);
+}
+
+function isMissing(error) {
+  return MISSING_CODES.has(error?.code) || MISSING_CODES.has(error?.cause?.code);
 }
 
 function directoryEvidence(value, code = "skill_tree_evidence_invalid", allowAbsent = false) {
@@ -139,7 +149,8 @@ function requireWorkspace(value) {
 function requireSession(value) {
   const methods = [
     "inspectDirectChildNoFollow", "stagePreparedTreeNoFollow", "recoverPreparedTreeNoFollow",
-    "renameDirectChildNoReplace", "deleteDirectChildTreeNoFollow", "close",
+    "renameDirectChildNoReplace", "deleteDirectChildTreeNoFollow",
+    "deleteUnverifiedDirectChildTreeNoFollow", "close",
   ];
   if (!value || typeof value.rootPath !== "string" || !value.rootIdentity
     || methods.some((method) => typeof value[method] !== "function")) {
@@ -200,9 +211,9 @@ export function createPreparedSkillRecovery({
         installRootCapability, taskId, skillId,
         expectedIdentity: record.identity, expectedEvidence: record.evidence,
       });
-      if (!plain(validated) || !["absent", "directory"].includes(validated.kind)
+      if (!plain(validated) || !["absent", "directory", "changed"].includes(validated.kind)
         || validated.sourcePath !== record.sourcePath
-        || (validated.kind === "directory" && !sameIdentity(validated.identity, record.identity))) {
+        || (validated.kind !== "absent" && !sameIdentity(validated.identity, record.identity))) {
         throw skillError("skill_prepare_delete_validation_invalid");
       }
       record = await preparedJournal.record({ ...record, phase: "deleting" });
@@ -357,9 +368,9 @@ export function createSkillFileService({
         expectedIdentity: record.identity,
         expectedEvidence: record.evidence,
       });
-      if (!plain(validated) || !["absent", "directory"].includes(validated.kind)
+      if (!plain(validated) || !["absent", "directory", "changed"].includes(validated.kind)
         || validated.sourcePath !== record.sourcePath
-        || (validated.kind === "directory" && !sameIdentity(validated.identity, record.identity))) {
+        || (validated.kind !== "absent" && !sameIdentity(validated.identity, record.identity))) {
         throw skillError("skill_prepare_delete_validation_invalid");
       }
       record = await preparedJournal.record({ ...record, phase: "deleting" });
@@ -404,7 +415,7 @@ export function createSkillFileService({
       installRootCapability, skillsRootCapability,
     }));
     if (session.rootPath !== root) {
-      await session.close().catch(() => {});
+      try { await session.close(); } catch {}
       throw skillError("skill_root_identity_mismatch");
     }
     publicIdentity(session.rootIdentity);
@@ -645,16 +656,41 @@ export function createSkillFileService({
     try {
       if (!sameIdentity(session.rootIdentity, record.identities.root)) throw skillError("skill_swap_root_identity_changed");
       if (record.phase === "reserved") {
-        const prepared = directoryEvidence(await session.inspectDirectChildNoFollow(preparedSpec), "skill_swap_ambiguous", true);
+        let prepared;
+        try {
+          prepared = directoryEvidence(
+            await session.inspectDirectChildNoFollow(preparedSpec), "skill_swap_ambiguous", true,
+          );
+        } catch (error) {
+          if (!PARTIAL_TREE_CODES.has(error?.code) && error?.code !== "skill_swap_ambiguous") throw error;
+          await session.deleteUnverifiedDirectChildTreeNoFollow({ child: preparedSpec });
+          prepared = { kind: "absent" };
+        }
         let staged = prepared;
         if (prepared.kind === "absent") {
-          staged = directoryEvidence(await session.recoverPreparedTreeNoFollow({
-            taskId: record.taskId,
-            sourceIdentity: record.identities.source,
-            skillId: record.skillId,
-            swapId: record.swapId,
-            expected: record.expectedEvidence,
-          }), "skill_prepared_evidence_invalid");
+          try {
+            staged = directoryEvidence(await session.recoverPreparedTreeNoFollow({
+              taskId: record.taskId,
+              sourceIdentity: record.identities.source,
+              skillId: record.skillId,
+              swapId: record.swapId,
+              expected: record.expectedEvidence,
+            }), "skill_prepared_evidence_invalid");
+          } catch (error) {
+            if (!isMissing(error)) throw error;
+            const current = directoryEvidence(
+              await session.inspectDirectChildNoFollow(targetSpec), "skill_swap_ambiguous", true,
+            );
+            const old = directoryEvidence(
+              await session.inspectDirectChildNoFollow(oldSpec), "skill_swap_ambiguous", true,
+            );
+            if (!sameEvidence(current, record.previousEvidence) || old.kind !== "absent") throw error;
+            await journal.record(journalRecord(plan, session, "abort_committed", {
+              prepared: null, new: null,
+            }));
+            await journal.clear({ taskId: record.taskId, swapId: record.swapId });
+            return Object.freeze({ status: "aborted" });
+          }
         }
         if (!evidenceMatches(staged, record.expectedEvidence)) throw skillError("skill_swap_ambiguous");
         identities.prepared = staged.identity;

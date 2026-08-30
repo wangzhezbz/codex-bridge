@@ -144,6 +144,10 @@ export function createAnthropicChatCompletionStreamTranslator(route = {}) {
       throw error;
     }
 
+    if (payload.type === "ping") {
+      return [": keep-alive\n\n"];
+    }
+
     if (payload.type === "message_start") {
       const message = payload.message || {};
       state.id = String(message.id || state.id);
@@ -159,9 +163,10 @@ export function createAnthropicChatCompletionStreamTranslator(route = {}) {
 
     if (payload.type === "content_block_start") {
       const block = payload.content_block || {};
+      const blockIndex = Number(payload.index || 0);
       if (block.type === "tool_use") {
         const toolIndex = state.nextToolIndex++;
-        state.toolIndexes.set(Number(payload.index || 0), toolIndex);
+        state.toolIndexes.set(blockIndex, toolIndex);
         return [chatCompletionStreamChunk(state, {
           tool_calls: [{
             index: toolIndex,
@@ -173,6 +178,48 @@ export function createAnthropicChatCompletionStreamTranslator(route = {}) {
             },
           }],
         })];
+      }
+      if (block.type === "thinking") {
+        const delta = {
+          anthropic_thinking_block: {
+            index: blockIndex,
+            type: "thinking",
+          },
+          anthropic_thinking_index: blockIndex,
+        };
+        if (typeof block.thinking === "string" && block.thinking) {
+          delta.reasoning_content = block.thinking;
+        }
+        if (typeof block.signature === "string" && block.signature) {
+          delta.anthropic_thinking_signature = block.signature;
+        }
+        if (!state.roleSent) {
+          state.roleSent = true;
+          delta.role = "assistant";
+        }
+        return [chatCompletionStreamChunk(state, delta)];
+      }
+      if (block.type === "redacted_thinking" && typeof block.data === "string") {
+        const delta = {
+          anthropic_thinking_block: {
+            index: blockIndex,
+            type: "redacted_thinking",
+            data: block.data,
+          },
+        };
+        if (!state.roleSent) {
+          state.roleSent = true;
+          delta.role = "assistant";
+        }
+        return [chatCompletionStreamChunk(state, delta)];
+      }
+      if (block.type === "text" && typeof block.text === "string" && block.text) {
+        const delta = { content: block.text };
+        if (!state.roleSent) {
+          state.roleSent = true;
+          delta.role = "assistant";
+        }
+        return [chatCompletionStreamChunk(state, delta)];
       }
       if (!state.roleSent) {
         state.roleSent = true;
@@ -187,11 +234,15 @@ export function createAnthropicChatCompletionStreamTranslator(route = {}) {
         return [chatCompletionStreamChunk(state, { content: delta.text })];
       }
       if (delta.type === "thinking_delta" && typeof delta.thinking === "string") {
-        return [chatCompletionStreamChunk(state, { reasoning_content: delta.thinking })];
+        return [chatCompletionStreamChunk(state, {
+          reasoning_content: delta.thinking,
+          anthropic_thinking_index: Number(payload.index || 0),
+        })];
       }
       if (delta.type === "signature_delta" && typeof delta.signature === "string") {
         return [chatCompletionStreamChunk(state, {
           anthropic_thinking_signature: delta.signature,
+          anthropic_thinking_index: Number(payload.index || 0),
         })];
       }
       if (delta.type === "input_json_delta" && typeof delta.partial_json === "string") {
@@ -251,8 +302,13 @@ export function createAnthropicChatCompletionStreamTranslator(route = {}) {
       while (separator !== -1) {
         const rawEvent = state.buffer.slice(0, separator);
         state.buffer = state.buffer.slice(separator + 2);
-        const event = parseSseEvent(rawEvent);
-        if (event) output.push(...translateEvent(event));
+        const keepAlive = anthropicSseKeepAliveComment(rawEvent);
+        if (keepAlive) {
+          output.push(keepAlive);
+        } else {
+          const event = parseSseEvent(rawEvent);
+          if (event) output.push(...translateEvent(event));
+        }
         separator = state.buffer.indexOf("\n\n");
       }
       return output;
@@ -260,9 +316,15 @@ export function createAnthropicChatCompletionStreamTranslator(route = {}) {
     end() {
       const output = [];
       state.buffer = state.buffer.replace(/\r/g, "\n");
-      const event = parseSseEvent(state.buffer);
+      const rawEvent = state.buffer;
       state.buffer = "";
-      if (event) output.push(...translateEvent(event));
+      const keepAlive = anthropicSseKeepAliveComment(rawEvent);
+      if (keepAlive) {
+        output.push(keepAlive);
+      } else {
+        const event = parseSseEvent(rawEvent);
+        if (event) output.push(...translateEvent(event));
+      }
       return output;
     },
     get completed() {
@@ -276,6 +338,16 @@ export function createAnthropicChatCompletionStreamTranslator(route = {}) {
       };
     },
   };
+}
+
+function anthropicSseKeepAliveComment(rawEvent = "") {
+  const lines = String(rawEvent)
+    .split("\n")
+    .filter(Boolean);
+  if (lines.length === 0 || lines.some((line) => !line.startsWith(":"))) {
+    return "";
+  }
+  return `${lines.join("\n")}\n\n`;
 }
 
 export function chatRequestToAnthropicMessages(body = {}, route = {}) {

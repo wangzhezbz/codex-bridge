@@ -77,10 +77,12 @@ test("SSE block accumulation enforces its byte limit without rejecting the exact
   assert.throws(
     () => takeCompleteSseBlocks(oversizedState, Buffer.from("abcdef")),
     (error) => {
-      assert.equal(error.message, "Responses SSE event exceeds 5 bytes.");
-      assert.equal(error.statusCode, 503);
-      assert.equal(error.code, "local_history_storage_unavailable");
-      assert.equal(error.localHistoryError, true);
+      assert.equal(error.name, "UpstreamResponseTooLargeError");
+      assert.equal(error.statusCode, 502);
+      assert.equal(error.code, "upstream_response_too_large");
+      assert.equal(error.limitBytes, 5);
+      assert.equal(error.actualBytes, 6);
+      assert.equal(error.localHistoryError, undefined);
       return true;
     },
   );

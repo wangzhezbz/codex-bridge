@@ -3,7 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 
 const PACKAGE_PATH = "/codexbridge-test/packages/";
-const PACKAGE_ORIGIN = "https://shanhaiyouling.com";
+const PACKAGE_ORIGINS = new Set([
+  "https://shanhaiyouling.com",
+  "https://download.shanhaiyouling.com",
+]);
 
 function publisherError(code) {
   const error = new Error(code);
@@ -35,7 +38,7 @@ function packageBaseUrl(value) {
   } catch {
     throw publisherError("publisher_package_base_url_rejected");
   }
-  if (parsed.origin !== PACKAGE_ORIGIN || parsed.pathname !== PACKAGE_PATH || parsed.search || parsed.hash) {
+  if (!PACKAGE_ORIGINS.has(parsed.origin) || parsed.pathname !== PACKAGE_PATH || parsed.search || parsed.hash) {
     throw publisherError("publisher_package_base_url_rejected");
   }
   return parsed.href;

@@ -350,6 +350,138 @@ test("async persistent history hands a large write off without blocking the call
   }
 });
 
+test("staged history is readable before asynchronous persistence finishes", async () => {
+  let resolveWrite;
+  const storage = {
+    recordTurnAsync() {
+      return new Promise((resolve) => {
+        resolveWrite = resolve;
+      });
+    },
+  };
+  const history = new ResponseHistory({ storage });
+  const turn = historyTurn("resp_staged_pending", [
+    { role: "user", content: "read this while persistence is pending" },
+    { role: "assistant", content: "available immediately" },
+  ]);
+
+  try {
+    const responseId = history.stageTurn(turn);
+    const persistence = history.persistStagedTurnAsync(responseId);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(history.lookup(responseId).pendingPersistence, true);
+    assert.equal(history.get(responseId)[1].content, "available immediately");
+    assert.equal(history.getResponse(responseId).id, responseId);
+
+    resolveWrite({
+      recordBytes: {
+        messages: Buffer.byteLength(JSON.stringify(turn.messages)),
+        response: Buffer.byteLength(JSON.stringify(turn.response)),
+        meta: Buffer.byteLength(JSON.stringify(turn.meta)),
+      },
+    });
+    await persistence;
+    assert.equal(history.lookup(responseId).pendingPersistence, undefined);
+    assert.equal(history.get(responseId)[1].content, "available immediately");
+  } finally {
+    history.close();
+  }
+});
+
+test("failed staged persistence keeps the active in-memory conversation readable", async () => {
+  const storage = {
+    async recordTurnAsync() {
+      const error = new Error("history record is too large");
+      error.code = "history_record_too_large";
+      throw error;
+    },
+  };
+  const history = new ResponseHistory({ storage });
+  const turn = historyTurn("resp_staged_failed", [
+    { role: "user", content: "keep this active chain" },
+    { role: "assistant", content: "do not discard the successful answer" },
+  ]);
+
+  try {
+    const responseId = history.stageTurn(turn);
+    await assert.rejects(
+      history.persistStagedTurnAsync(responseId),
+      /history record is too large/i,
+    );
+    assert.equal(history.lookup(responseId).pendingPersistence, false);
+    assert.equal(
+      history.get(responseId)[1].content,
+      "do not discard the successful answer",
+    );
+  } finally {
+    history.close();
+  }
+});
+
+test("staged history enforces a total byte budget across pending turns", () => {
+  const history = new ResponseHistory({
+    storage: { recordTurnAsync: async () => ({}) },
+    maxStagedEntries: 4,
+    maxStagedBytes: 1_600,
+  });
+  const first = historyTurn("resp_staged_budget_first", [
+    { role: "user", content: "A".repeat(600) },
+  ]);
+  const second = historyTurn("resp_staged_budget_second", [
+    { role: "user", content: "B".repeat(600) },
+  ]);
+
+  try {
+    history.stageTurn(first);
+    assert.throws(
+      () => history.stageTurn(second),
+      (error) =>
+        error?.code === "local_history_storage_unavailable" &&
+        error?.internalCode === "history_stage_budget_exceeded",
+    );
+    assert.equal(history.get(first.responseId)[0].content, "A".repeat(600));
+  } finally {
+    history.close();
+  }
+});
+
+test("staged persistence times out without discarding memory and cleans up after late success", async () => {
+  let resolveWrite;
+  const storage = {
+    recordTurnAsync() {
+      return new Promise((resolve) => {
+        resolveWrite = resolve;
+      });
+    },
+  };
+  const history = new ResponseHistory({
+    storage,
+    stagedWriteTimeoutMs: 10,
+  });
+  const turn = historyTurn("resp_staged_timeout", [
+    { role: "user", content: "keep this while the writer is late" },
+  ]);
+
+  try {
+    const responseId = history.stageTurn(turn);
+    await assert.rejects(
+      history.persistStagedTurnAsync(responseId),
+      (error) =>
+        error?.code === "local_history_storage_unavailable" &&
+        error?.internalCode === "history_write_timeout",
+    );
+    assert.equal(history.lookup(responseId).pendingPersistence, false);
+    assert.equal(history.get(responseId)[0].content, "keep this while the writer is late");
+
+    resolveWrite({ recordBytes: { messages: 1, response: 1, meta: 1 } });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(history.lookup(responseId).pendingPersistence, undefined);
+  } finally {
+    history.close();
+  }
+});
+
 test("async persistent history rejects writes after an unexpected clean worker exit", async () => {
   const fixture = historyFixture();
   let history;
@@ -466,6 +598,85 @@ test("persistent history lets a rebuilt Router continue a chat route", async () 
     assert.match(continuedPayload, /restart marker from the first turn/);
     assert.match(continuedPayload, /answer 1/);
     assert.match(continuedPayload, /continue after Router restart/);
+  } finally {
+    await closeIfListening(firstRouter);
+    await closeIfListening(secondRouter);
+    await closeIfListening(upstream);
+    cleanupHistoryFixture(fixture);
+  }
+});
+
+test("persistent DeepSeek Responses history keeps native item order after Router restart", async () => {
+  const fixture = historyFixture();
+  const upstreamBodies = [];
+  const firstResponse = {
+    ...nativeResponse("resp_deepseek_native_restart", "native answer before restart"),
+    model: "deepseek-v4-flash",
+    output: [
+      {
+        id: "rs_native_restart",
+        type: "reasoning",
+        status: "completed",
+        content: [{ type: "reasoning_text", text: "search before restart" }],
+      },
+      {
+        id: "ws_native_restart",
+        type: "web_search_call",
+        status: "completed",
+        action: { type: "search", query: "persistent native history" },
+      },
+      {
+        id: "msg_native_restart",
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: "native answer before restart" }],
+      },
+    ],
+    output_text: "native answer before restart",
+  };
+  const upstream = http.createServer(async (req, res) => {
+    upstreamBodies.push(await readJson(req));
+    const response = upstreamBodies.length === 1
+      ? firstResponse
+      : {
+          ...nativeResponse("resp_deepseek_native_restarted", "native answer after restart"),
+          model: "deepseek-v4-flash",
+        };
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(response));
+  });
+  let firstRouter;
+  let secondRouter;
+  try {
+    await listen(upstream);
+    const config = deepseekNativeRouterConfig(serverUrl(upstream));
+    firstRouter = createRouterServer(config, { historyPath: fixture.historyPath });
+    await listen(firstRouter);
+    const first = await postResponses(firstRouter, {
+      model: "cb-deepseek-native-history",
+      stream: false,
+      input: "first native request",
+    });
+    assert.equal(first.status, 200, JSON.stringify(first.body));
+    await close(firstRouter);
+    firstRouter = null;
+
+    secondRouter = createRouterServer(config, { historyPath: fixture.historyPath });
+    await listen(secondRouter);
+    const second = await postResponses(secondRouter, {
+      model: "cb-deepseek-native-history",
+      stream: false,
+      previous_response_id: firstResponse.id,
+      input: "continue after native restart",
+    });
+
+    assert.equal(second.status, 200, JSON.stringify(second.body));
+    assert.deepEqual(
+      upstreamBodies[1].input.map((item) => item.type || item.role),
+      ["user", "reasoning", "web_search_call", "message", "user"],
+    );
+    assert.equal(upstreamBodies[1].input[2].id, "ws_native_restart");
   } finally {
     await closeIfListening(firstRouter);
     await closeIfListening(secondRouter);
@@ -1347,7 +1558,7 @@ test("native non-stream success requires a completed response before sending 200
   }
 });
 
-test("native streaming history write failure withholds completed and emits failed", async () => {
+test("native streaming history write failure does not replace provider completion", async () => {
   const upstreamBodies = [];
   const upstream = http.createServer(async (req, res) => {
     upstreamBodies.push(await readJson(req));
@@ -1388,10 +1599,9 @@ test("native streaming history write failure withholds completed and emits faile
     const text = await response.text();
 
     assert.equal(response.status, 200);
-    assert.doesNotMatch(text, /event: response\.completed/);
-    assert.match(text, /event: response\.failed/);
-    assert.match(text, /本地模型历史保存失败/);
-    assert.match(text, /local_history_storage_unavailable/);
+    assert.match(text, /event: response\.completed/);
+    assert.doesNotMatch(text, /event: response\.failed/);
+    assert.doesNotMatch(text, /本地模型历史保存失败/);
     assert.equal(upstreamBodies.length, 1);
   } finally {
     await closeIfListening(router);
@@ -1789,6 +1999,27 @@ function chatRouterConfig(upstreamUrl) {
         contextWindow: 128000,
       },
     ],
+  };
+}
+
+function deepseekNativeRouterConfig(upstreamUrl) {
+  return {
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "fake-router-token",
+    defaultModel: "cb-deepseek-native-history",
+    models: [{
+      id: "cb-deepseek-native-history",
+      displayName: "DeepSeek Native History Test",
+      provider: "deepseek",
+      api: "responses",
+      model: "deepseek-v4-flash",
+      baseUrl: `${upstreamUrl}/v1`,
+      apiKey: "fake-upstream-key",
+      apiKeyEnv: "FAKE_DEEPSEEK_KEY",
+      supportsResponsePreviousId: false,
+      contextWindow: 1_048_576,
+    }],
   };
 }
 

@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { UpstreamResponseTooLargeError } from "../src/upstream-response-guard.js";
+import {
+  UpstreamResponseTooLargeError,
+  UpstreamTimeoutError,
+} from "../src/upstream-response-guard.js";
+import { parseSseEvents } from "../src/sse.js";
 
 test("standalone upstream error presentation preserves the diagnostic code without leaking URL secrets", async () => {
   const {
@@ -30,6 +34,76 @@ test("standalone upstream error presentation preserves the diagnostic code witho
   assert.equal(res.statusCode, 502);
   assert.equal(body.error.code, "upstream_response_too_large");
   assert.equal(body.error.message.includes("secret-value"), false);
+});
+
+test("Responses stream failures preserve their classified machine error codes", async () => {
+  const {
+    createUpstreamErrorPresentation,
+  } = await import("../src/upstream-error-presentation.js");
+  class TestUpstreamHttpError extends Error {
+    constructor(statusCode, bodyText, route = {}) {
+      super(`Upstream returned HTTP ${statusCode}`);
+      this.statusCode = statusCode;
+      this.bodyText = bodyText;
+      this.route = route;
+    }
+  }
+  class TestUpstreamNetworkError extends Error {}
+  class TestUpstreamStreamError extends Error {}
+  const presentation = createUpstreamErrorPresentation({
+    UpstreamHttpError: TestUpstreamHttpError,
+    UpstreamNetworkError: TestUpstreamNetworkError,
+    UpstreamStreamError: TestUpstreamStreamError,
+    UpstreamTimeoutError,
+  });
+  const cases = [
+    {
+      error: new TestUpstreamHttpError(
+        400,
+        JSON.stringify({ error: { message: "invalid parameter" } }),
+        { id: "parameter-route" },
+      ),
+      code: "upstream_parameter_error",
+    },
+    {
+      error: new TestUpstreamHttpError(
+        429,
+        JSON.stringify({ error: { message: "rate limit" } }),
+        { id: "rate-route" },
+      ),
+      code: "upstream_rate_limit",
+    },
+    {
+      error: new UpstreamTimeoutError(
+        1000,
+        "https://provider.example/v1",
+        { id: "timeout-route" },
+      ),
+      code: "upstream_timeout",
+    },
+    {
+      error: new UpstreamResponseTooLargeError(
+        64,
+        128,
+        "https://provider.example/v1",
+        { id: "large-route" },
+      ),
+      code: "upstream_response_too_large",
+    },
+  ];
+
+  for (const item of cases) {
+    const res = collectResponse();
+    presentation.sendUpstreamError(res, item.error, {
+      asResponsesStream: true,
+      model: "test-model",
+    });
+    const failed = parseSseEvents(res.body()).find(
+      (event) => event.event === "response.failed",
+    );
+    const payload = JSON.parse(failed.data);
+    assert.equal(payload.response.error.code, item.code);
+  }
 });
 
 test("responses stream failure message prefers the display name and sanitizes diagnostic detail", async () => {

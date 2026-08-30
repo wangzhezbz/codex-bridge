@@ -113,6 +113,21 @@ function commandEnvironment(environment) {
   return { ...inherited, ...environment };
 }
 
+function windowsPowerShellEnvironment(environment, executable) {
+  if (!/\\WindowsPowerShell\\v1\.0\\powershell\.exe$/iu.test(executable)) {
+    return environment;
+  }
+  const inherited = Object.fromEntries(
+    Object.entries(environment || process.env).filter(
+      ([key]) => key.toUpperCase() !== "PSMODULEPATH",
+    ),
+  );
+  return {
+    ...inherited,
+    PSModulePath: path.win32.join(path.win32.dirname(executable), "Modules"),
+  };
+}
+
 export function runBoundedWindowsCommand(
   executable,
   args,
@@ -139,6 +154,7 @@ export function runBoundedWindowsCommand(
     let childEnvironment;
     try {
       childEnvironment = commandEnvironment(environment);
+      childEnvironment = windowsPowerShellEnvironment(childEnvironment, executable);
     } catch (error) {
       reject(error);
       return;

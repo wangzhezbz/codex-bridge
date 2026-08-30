@@ -6,6 +6,8 @@ export const TEST_CATALOG_PATH = "/codexbridge-install-test/component-catalog.js
 export const TEST_PACKAGE_PATH = "/codexbridge-test/packages/";
 export const TEST_COS_PACKAGE_ORIGIN = "https://codex-1431412335.cos.ap-guangzhou.myqcloud.com";
 export const TEST_COS_PACKAGE_PATH = "/codexbridge-test/packages/";
+export const TEST_DOGECLOUD_PACKAGE_ORIGIN = "https://download.shanhaiyouling.com";
+export const TEST_DOGECLOUD_PACKAGE_PATH = "/codexbridge-test/packages/";
 
 const COMPONENT_KEYS = new Set([
   "id", "name", "version", "architecture", "format", "assetUrl", "size", "sha256",
@@ -48,7 +50,8 @@ export function resolveCatalogAssetUrl(catalogUrl, assetUrl) {
   }
   const authorizedPackagePath = resolved.origin === TEST_CATALOG_ORIGIN
     ? TEST_PACKAGE_PATH
-    : resolved.origin === TEST_COS_PACKAGE_ORIGIN ? TEST_COS_PACKAGE_PATH : null;
+    : resolved.origin === TEST_COS_PACKAGE_ORIGIN ? TEST_COS_PACKAGE_PATH
+      : resolved.origin === TEST_DOGECLOUD_PACKAGE_ORIGIN ? TEST_DOGECLOUD_PACKAGE_PATH : null;
   if (resolved.protocol !== "https:" || authorizedPackagePath === null
     || !resolved.pathname.startsWith(authorizedPackagePath) || resolved.pathname === authorizedPackagePath
     || resolved.search || resolved.hash) {

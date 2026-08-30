@@ -51,5 +51,8 @@ Section "Install"
   WriteRegStr HKCU "Software\CodexBridge" "InstallRoot" "$INSTDIR"
   WriteRegStr HKCU "Software\CodexBridge" "InstallLocation" "$INSTDIR\app-${VERSION}"
 
+  ReadEnvStr $0 "CODEXBRIDGE_INSTALLER_NO_LAUNCH"
+  StrCmp $0 "1" skip_launch
   ExecShell "" "$INSTDIR\app-${VERSION}\CodexBridge.exe" "--updated --previous-install-dir $\"$PREVIOUS_INSTALL_DIR$\" --cleanup-installer $\"$EXEDIR\$EXEFILE$\""
+skip_launch:
 SectionEnd

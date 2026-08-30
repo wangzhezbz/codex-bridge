@@ -4,7 +4,7 @@
 
 - 程序根目录：`/opt/shanhai/codexbridge-installer/`
 - 测试目录：`https://shanhaiyouling.com/codexbridge-install-test/`
-- 不可变包前缀：`https://shanhaiyouling.com/codexbridge-test/packages/`
+- 不可变包前缀：`https://download.shanhaiyouling.com/codexbridge-test/packages/`
 - 旧资源迁移的隔离 COS 前缀：`https://codex-1431412335.cos.ap-guangzhou.myqcloud.com/codexbridge-test/packages/`
 
 公开读取对象存储不需要访问令牌。RSA 私钥不是对象存储凭据；它只用于给目录字节签名，必须始终留在发布机的 root-only 目录。公开写入会允许第三方覆盖或删除对象，签名虽能阻止客户端安装被篡改的内容，却不能阻止拒绝服务，因此推荐公开读、发布机独占写。
@@ -16,7 +16,8 @@
 3. 将本仓库的已审核版本放到 `/opt/shanhai/codexbridge-installer/app/`，使用隔离运行时执行 `PATH=../runtime/node/bin:$PATH ../runtime/node/bin/npm ci --omit=dev`。
 4. 确认 `node_modules/7zip-bin/linux/<arch>/7za` 可执行。
 5. 将 `nginx-test-location.conf` 作为一次新的 include 加入 `shanhaiyouling.com` 的 server 块；安装脚本只安装独立 snippet，不会自行编辑其他 server 配置。
-6. 对象存储若以挂载目录提供，把 `/opt/shanhai/codexbridge-installer/public/` 指向该隔离挂载点；不要与任何现有目录共用。
+6. 服务器需要 Python 3、`boto3` 和 `botocore`。大文件通过多吉云临时 S3 凭证分片上传，不挂载对象存储目录。
+7. 在 `/opt/shanhai/codexbridge-installer/private/dogecloud.env` 写入 `CBI_DOGECLOUD_ACCESS_KEY` 和 `CBI_DOGECLOUD_SECRET_KEY`，文件属主必须为 root、权限必须为 `0600`；永久密钥不得进入仓库、桌面包或日志。
 
 部署包内固定了 Microsoft 官方的 `Microsoft Identity Verification Root Certificate Authority 2020` 公共根证书（SHA-1：`F40042E2E5F7E8EF8189FED15519AECE42C3BFA2`）。安装脚本只复制到新环境的 `trust/`，不会写入系统全局 CA；Linux 发布机使用签名中受信任的时间戳验证已过期但签名时有效的代码签名证书。
 
@@ -36,7 +37,8 @@ cd /path/to/repository/deploy/codexbridge-installer
 - 手工发布 ChatGPT：设置 `CBI_SIGNING_KEY_FILE`、`CBI_PUBLIC_ROOT`、`CBI_PACKAGE_BASE_URL` 后运行 `npm run software:publish:chatgpt -- --input /absolute/package/tree --version X.Y.Z.W`。
 - 手工发布 Skills：运行 `npm run software:publish:skills -- --input /absolute/skills/root --version X.Y.Z`。
 - 迁移已有 ChatGPT/Skills：先运行 `import-legacy-assets.py` 规范化并校验旧包；大文件可用 `upload-cos-multipart.py --file ... --url ... --state ...` 断点续传，完成对象哈希复核后再运行 `npm run software:publish:imported -- --metadata ...` 签目录。
-- 定时同步：`codexbridge-installer-sync.timer` 调用 `npm run software:sync`，同步 V2RayN 固定包和 Git for Windows 官方 x64 安装包。
+- 定时同步：`codexbridge-installer-sync.timer` 调用 `npm run software:sync`。V2RayN 使用官方 `v2rayN-windows-64-desktop.zip`，并在解包前用仓库固定公钥校验发布者签名（指纹 `A4A69C432C532A5F21D0B6EE14162A209ADA306B`）；Git 使用官方 x64 安装包并校验 Authenticode。
+- 迁移当前目录：`npm run software:migrate:dogecloud` 会逐个校验本地大小和 SHA256、上传到 `codexbridge-test/packages/`、验证 S3 元数据及公开 CDN HEAD，全部成功后才原子替换并重新签名目录。
 - GitHub API 令牌是可选的，仅用于提高 API 限额；对象下载和客户端读取不需要它。
 
 ## 验证

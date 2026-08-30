@@ -1,7 +1,9 @@
 import {
+  COMPONENT_IDS,
   TEST_CATALOG_ORIGIN,
   TEST_CATALOG_PATH,
   catalogError,
+  compareVersions,
 } from "../../shared/software-manager/catalog-schema.mjs";
 import { createTrustedCatalogService, verifyCatalogEnvelope } from "./catalog-trust.mjs";
 
@@ -86,6 +88,23 @@ function normalizeCachedEnvelope(value, catalogUrl, maxCatalogBytes, maxSignatur
     throw catalogError("catalog_cache_envelope_invalid");
   }
   return { catalogUrl, jsonBytes, signatureText };
+}
+
+function isBehindBundledBaseline(candidate, bundled) {
+  if (!candidate || !bundled) return false;
+  for (const componentId of COMPONENT_IDS) {
+    let bundledEntry;
+    try { bundledEntry = bundled.getComponent(componentId); } catch { continue; }
+    let candidateEntry;
+    try { candidateEntry = candidate.getComponent(componentId); } catch { return true; }
+    if (compareVersions(candidateEntry.version, bundledEntry.version) < 0) return true;
+  }
+  for (const bundledSkill of bundled.listSkills()) {
+    let candidateSkill;
+    try { candidateSkill = candidate.getSkill(bundledSkill.id); } catch { return true; }
+    if (compareVersions(candidateSkill.version, bundledSkill.version) < 0) return true;
+  }
+  return false;
 }
 
 async function raceWithSignal(promise, signal) {
@@ -178,6 +197,7 @@ export function createCachedCatalogProvider({
   publicKeyPem,
   fetchImpl,
   cache,
+  bundledEnvelope = null,
   timeoutMs = 15_000,
   maxCatalogBytes = 2_000_000,
   maxSignatureBytes = 16_384,
@@ -195,16 +215,46 @@ export function createCachedCatalogProvider({
   positiveSafeInteger(timeoutMs, "catalog_provider_timeout_invalid");
   positiveSafeInteger(maxCatalogBytes, "catalog_provider_limit_invalid");
   positiveSafeInteger(maxSignatureBytes, "catalog_provider_limit_invalid");
+  const metadata = new WeakMap();
+  const catalogPublishedAt = (service) => {
+    const dates = [];
+    for (const id of COMPONENT_IDS) {
+      try { dates.push(service.getComponent(id).publishedAt); } catch {}
+    }
+    try { dates.push(...service.listSkills().map((entry) => entry.publishedAt)); } catch {}
+    return dates.filter((value) => Number.isFinite(Date.parse(value)))
+      .sort((left, right) => Date.parse(right) - Date.parse(left))[0] || null;
+  };
+  const mark = (service, source, refreshedAt = null) => {
+    if (service) metadata.set(service, Object.freeze({
+      source,
+      publishedAt: catalogPublishedAt(service),
+      refreshedAt,
+    }));
+    return service;
+  };
+  const bundledService = bundledEnvelope === null || publicKeyPem === null
+    ? null
+    : mark(createTrustedCatalogService(verifyCatalogEnvelope({
+      ...normalizeCachedEnvelope(bundledEnvelope, catalogUrl, maxCatalogBytes, maxSignatureBytes),
+      publicKeyPem,
+    })), "bundled");
   const offlineRefresh = Promise.resolve(null);
   let refreshInFlight = null;
 
   async function getCurrent() {
     if (publicKeyPem === null) return null;
-    const cached = await cache.readEnvelope();
-    if (cached === null) return null;
-    const envelope = normalizeCachedEnvelope(cached, catalogUrl, maxCatalogBytes, maxSignatureBytes);
-    const catalog = verifyCatalogEnvelope({ ...envelope, publicKeyPem });
-    return createTrustedCatalogService(catalog);
+    try {
+      const cached = await cache.readEnvelope();
+      if (cached === null) return bundledService;
+      const envelope = normalizeCachedEnvelope(cached, catalogUrl, maxCatalogBytes, maxSignatureBytes);
+      const catalog = verifyCatalogEnvelope({ ...envelope, publicKeyPem });
+      const cachedService = mark(createTrustedCatalogService(catalog), "cache");
+      return isBehindBundledBaseline(cachedService, bundledService) ? bundledService : cachedService;
+    } catch (error) {
+      if (bundledService) return bundledService;
+      throw error;
+    }
   }
 
   async function performRefresh() {
@@ -217,7 +267,7 @@ export function createCachedCatalogProvider({
       const signatureText = decodeSignatureText(signatureBytes);
       const envelope = { catalogUrl, jsonBytes, signatureText };
       const catalog = verifyCatalogEnvelope({ ...envelope, publicKeyPem });
-      const service = createTrustedCatalogService(catalog);
+      const service = mark(createTrustedCatalogService(catalog), "remote", new Date().toISOString());
       await cache.replaceEnvelope(envelope);
       return service;
     } finally {
@@ -237,5 +287,9 @@ export function createCachedCatalogProvider({
     return operation;
   }
 
-  return Object.freeze({ getCurrent, refresh });
+  function describe(service) {
+    return metadata.get(service) ?? Object.freeze({ source: "unknown", publishedAt: null, refreshedAt: null });
+  }
+
+  return Object.freeze({ getCurrent, refresh, describe });
 }

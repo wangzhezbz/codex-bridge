@@ -9,7 +9,7 @@ async function withRecordDirectory(fileCapabilities, directoryPath, operation) {
   if (!directory || typeof directory.openFileNoFollow !== "function"
     || typeof directory.unlinkEntryNoFollow !== "function"
     || typeof directory.renameEntryNoFollow !== "function" || typeof directory.close !== "function") {
-    await directory?.close?.().catch(() => {});
+    try { await directory?.close?.(); } catch {}
     throw recordError("software_manager_record_store_invalid");
   }
   let result;

@@ -60,8 +60,8 @@ function validateRecord(record, installRoot, requireAll) {
 }
 
 function requireCapabilities(value) {
-  if (!value || typeof value.pinArchiveFileNoFollow !== "function"
-    || typeof value.openInstallerWorkspaceRootNoFollow !== "function") {
+  if (!value || typeof value.pinExecutableFileNoFollow !== "function"
+    || typeof value.deleteVerifiedExecutableFileNoFollow !== "function") {
     throw retainedError("git_retained_file_capabilities_required");
   }
   return value;
@@ -79,7 +79,7 @@ export function createRetainedInstallerStore({
   async function hashFile(rawPath) {
     const { path: filePath } = validateRecord({ path: rawPath }, installRoot, false);
     await revalidateInstallRootCapability(installRootCapability, { maxRelativePath: filePath.length - installRoot.length });
-    const pin = await files.pinArchiveFileNoFollow(filePath);
+    const pin = await files.pinExecutableFileNoFollow(filePath);
     if (!pin || typeof pin.assertStableNoFollow !== "function" || typeof pin.close !== "function") {
       throw retainedError("git_retained_file_pin_invalid");
     }
@@ -122,51 +122,7 @@ export function createRetainedInstallerStore({
     await revalidateInstallRootCapability(installRootCapability, {
       maxRelativePath: validated.path.length - installRoot.length,
     });
-    const session = await files.openInstallerWorkspaceRootNoFollow(
-      installRootCapability,
-      { maxRelativePath: validated.path.length - installRoot.length },
-    );
-    const methods = [
-      "openDirectoryChildNoFollow",
-      "openFileChildNoFollow",
-      "inspectIssuedChildNoFollow",
-      "sealIssuedFileNoFollow",
-      "deleteIssuedChildNoFollow",
-      "close",
-    ];
-    if (!session || !session.root || methods.some((name) => typeof session[name] !== "function")) {
-      if (typeof session?.close === "function") await session.close().catch(() => {});
-      throw retainedError("git_retained_workspace_capability_invalid");
-    }
-    let primaryError = null;
-    try {
-      const downloads = await session.openDirectoryChildNoFollow(
-        session.root, "downloads", { role: "rename-parent" },
-      );
-      if (!downloads) throw Object.assign(new Error("git_retained_installer_missing"), { code: "ENOENT" });
-      const file = await session.openFileChildNoFollow(downloads, path.win32.basename(validated.path));
-      if (!file) throw Object.assign(new Error("git_retained_installer_missing"), { code: "ENOENT" });
-      const inspected = await session.inspectIssuedChildNoFollow(file);
-      if (!inspected || inspected.path !== validated.path || inspected.kind !== "file"
-        || !Number.isSafeInteger(inspected.size) || inspected.size < 0
-        || inspected.size > MAX_SOFTWARE_PACKAGE_BYTES) {
-        throw retainedError("git_retained_installer_identity_mismatch");
-      }
-      const sealed = await session.sealIssuedFileNoFollow(file, {
-        size: inspected.size,
-        sha256: record.sha256,
-      });
-      await session.deleteIssuedChildNoFollow(sealed);
-    } catch (error) {
-      primaryError = error;
-    }
-    try {
-      await session.close();
-    } catch (error) {
-      if (primaryError) throw new AggregateError([primaryError, error], primaryError.message, { cause: primaryError });
-      throw error;
-    }
-    if (primaryError) throw primaryError;
+    await files.deleteVerifiedExecutableFileNoFollow(validated.path, record.sha256);
     return Object.freeze({ deleted: true });
   }
 

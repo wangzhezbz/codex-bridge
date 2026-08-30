@@ -6,7 +6,10 @@ export class ResponseHistory {
     maxEntries = 200,
     maxEntryBytes = 1_000_000,
     maxTotalBytes = 20_000_000,
-    maxPendingPersistentBytes = 100 * 1024 * 1024,
+    maxPendingPersistentBytes = 256 * 1024 * 1024,
+    maxStagedEntries = 8,
+    maxStagedBytes = maxPendingPersistentBytes,
+    stagedWriteTimeoutMs = 30_000,
     historyPath = "",
     storage = null,
     ...historyOptions
@@ -15,6 +18,9 @@ export class ResponseHistory {
     this.maxEntryBytes = maxEntryBytes;
     this.maxTotalBytes = maxTotalBytes;
     this.maxPendingPersistentBytes = maxPendingPersistentBytes;
+    this.maxStagedEntries = positiveInteger(maxStagedEntries, 8);
+    this.maxStagedBytes = positiveNumber(maxStagedBytes, maxPendingPersistentBytes);
+    this.stagedWriteTimeoutMs = positiveNumber(stagedWriteTimeoutMs, 30_000);
     this.entries = new Map();
     this.responses = new Map();
     this.responseMeta = new Map();
@@ -23,6 +29,8 @@ export class ResponseHistory {
     this.pendingPersistentEntries = new Map();
     this.pendingPersistentEntrySizes = new Map();
     this.totalPendingPersistentBytes = 0;
+    this.stagedTurns = new Map();
+    this.totalStagedBytes = 0;
     this.storage = storage;
     this.storageError = null;
     if (!this.storage && historyPath) {
@@ -35,6 +43,10 @@ export class ResponseHistory {
   }
 
   get(responseId) {
+    const staged = this.stagedTurns.get(responseId);
+    if (staged?.turn) {
+      return cloneJson(Array.isArray(staged.turn.messages) ? staged.turn.messages : []);
+    }
     if (!responseId || !this.entries.has(responseId)) {
       const result = this.lookup(responseId);
       return result.state === "available" ? cloneJson(result.messages) : [];
@@ -61,6 +73,10 @@ export class ResponseHistory {
   }
 
   getResponse(responseId) {
+    const staged = this.stagedTurns.get(responseId);
+    if (staged?.turn?.response) {
+      return cloneJson(staged.turn.response);
+    }
     if (!responseId || !this.responses.has(responseId)) {
       const result = this.lookup(responseId);
       return result.state === "available" ? cloneJson(result.response) : null;
@@ -69,6 +85,10 @@ export class ResponseHistory {
   }
 
   getResponseMeta(responseId) {
+    const staged = this.stagedTurns.get(responseId);
+    if (staged?.turn) {
+      return cloneJson(staged.turn.meta || {});
+    }
     if (!responseId || !this.responseMeta.has(responseId)) {
       const result = this.lookup(responseId);
       return result.state === "available" ? cloneJson(result.meta) : null;
@@ -164,9 +184,92 @@ export class ResponseHistory {
     this.applyPruneResult(pruneResult);
   }
 
+  stageTurn(turn = {}) {
+    const responseId = String(turn.responseId || turn.response?.id || "").trim();
+    if (!responseId) {
+      return "";
+    }
+    const existing = this.stagedTurns.get(responseId);
+    if (existing) {
+      return responseId;
+    }
+    const estimatedBytes = boundedValueBytes(turn, this.maxStagedBytes + 1);
+    if (
+      this.stagedTurns.size >= this.maxStagedEntries ||
+      this.totalStagedBytes + estimatedBytes > this.maxStagedBytes
+    ) {
+      throw stagedHistoryError(
+        "history_stage_budget_exceeded",
+        "Pending response history exceeds its bounded staging budget.",
+      );
+    }
+    this.stagedTurns.set(responseId, {
+      turn,
+      promise: null,
+      writePromise: null,
+      error: null,
+      estimatedBytes,
+    });
+    this.totalStagedBytes += estimatedBytes;
+    return responseId;
+  }
+
+  persistStagedTurnAsync(responseId) {
+    const staged = this.stagedTurns.get(responseId);
+    if (!staged) {
+      return Promise.resolve();
+    }
+    if (staged.promise) {
+      return staged.promise;
+    }
+    // Defer only to the microtask boundary: the HTTP terminal is written by the
+    // caller in the current stack, while persistence is handed to the worker
+    // before a later shutdown signal or I/O turn can overtake it.
+    const writePromise = Promise.resolve()
+      .then(() => this.recordTurnAsync(staged.turn));
+    staged.writePromise = writePromise;
+    let timeoutId;
+    const monitoredWrite = new Promise((resolve, reject) => {
+      timeoutId = setTimeout(() => reject(stagedHistoryError(
+        "history_write_timeout",
+        "Response history persistence exceeded its bounded time budget.",
+      )), this.stagedWriteTimeoutMs);
+      writePromise.then(resolve, reject);
+    }).finally(() => clearTimeout(timeoutId));
+    staged.promise = monitoredWrite
+      .then((result) => {
+        this.deleteStagedTurn(responseId);
+        return result;
+      })
+      .catch((error) => {
+        staged.error = error;
+        throw error;
+      });
+    writePromise.then(
+      () => {
+        if (staged.error?.internalCode === "history_write_timeout") {
+          this.deleteStagedTurn(responseId);
+        }
+      },
+      () => {},
+    );
+    return staged.promise;
+  }
+
   lookup(responseId) {
     if (!responseId) {
       return unavailableResult("missing", "memory");
+    }
+    const staged = this.stagedTurns.get(responseId);
+    if (staged?.turn) {
+      return {
+        state: "available",
+        messages: cloneJson(Array.isArray(staged.turn.messages) ? staged.turn.messages : []),
+        response: cloneJson(staged.turn.response || null),
+        meta: cloneJson(staged.turn.meta || {}),
+        source: "memory",
+        pendingPersistence: !staged.error,
+      };
     }
     if (
       this.entries.has(responseId) ||
@@ -239,6 +342,8 @@ export class ResponseHistory {
     this.pendingPersistentEntries.clear();
     this.pendingPersistentEntrySizes.clear();
     this.totalPendingPersistentBytes = 0;
+    this.stagedTurns.clear();
+    this.totalStagedBytes = 0;
   }
 
   storageUnavailableError(cause = this.storageError) {
@@ -316,6 +421,7 @@ export class ResponseHistory {
     this.responseMeta.delete(responseId);
     this.totalEntryBytes -= this.entrySizes.get(responseId) || 0;
     this.entrySizes.delete(responseId);
+    this.deleteStagedTurn(responseId);
   }
 
   deleteResponse(responseId) {
@@ -326,6 +432,20 @@ export class ResponseHistory {
       this.totalEntryBytes -= this.entrySizes.get(responseId) || 0;
       this.entrySizes.delete(responseId);
     }
+    this.deleteStagedTurn(responseId);
+  }
+
+  deleteStagedTurn(responseId) {
+    const staged = this.stagedTurns.get(responseId);
+    if (!staged) {
+      return false;
+    }
+    this.stagedTurns.delete(responseId);
+    this.totalStagedBytes = Math.max(
+      0,
+      this.totalStagedBytes - Number(staged.estimatedBytes || 0),
+    );
+    return true;
   }
 
   trim() {
@@ -406,6 +526,77 @@ function trimContentFields(value, maxChars) {
       trimContentFields(raw, maxChars);
     }
   }
+}
+
+function positiveNumber(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+function positiveInteger(value, fallback) {
+  return Math.max(1, Math.floor(positiveNumber(value, fallback)));
+}
+
+function stagedHistoryError(internalCode, message) {
+  const error = new Error(message);
+  error.code = "local_history_storage_unavailable";
+  error.internalCode = internalCode;
+  error.statusCode = 503;
+  error.localHistoryError = true;
+  return error;
+}
+
+function boundedValueBytes(value, limit, seen = new WeakSet()) {
+  let total = 0;
+  const add = (bytes) => {
+    total = Math.min(limit, total + Math.max(0, Number(bytes) || 0));
+  };
+  const visit = (item) => {
+    if (total >= limit) {
+      return;
+    }
+    if (item === null || item === undefined) {
+      add(4);
+      return;
+    }
+    if (typeof item === "string") {
+      add(Buffer.byteLength(item, "utf8") + 2);
+      return;
+    }
+    if (typeof item === "number" || typeof item === "bigint") {
+      add(24);
+      return;
+    }
+    if (typeof item === "boolean") {
+      add(5);
+      return;
+    }
+    if (typeof item !== "object") {
+      add(8);
+      return;
+    }
+    if (seen.has(item)) {
+      return;
+    }
+    seen.add(item);
+    add(2);
+    if (Array.isArray(item)) {
+      for (const entry of item) {
+        visit(entry);
+        add(1);
+        if (total >= limit) break;
+      }
+      return;
+    }
+    for (const [key, entry] of Object.entries(item)) {
+      add(Buffer.byteLength(key, "utf8") + 3);
+      visit(entry);
+      add(1);
+      if (total >= limit) break;
+    }
+  };
+  visit(value);
+  return total;
 }
 
 function byteSize(value) {

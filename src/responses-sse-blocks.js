@@ -1,3 +1,5 @@
+import { UpstreamResponseTooLargeError } from "./upstream-response-guard.js";
+
 const DEFAULT_MAX_SSE_EVENT_BYTES = 48 * 1024 * 1024;
 
 export function createSseBlockAccumulator(options = {}) {
@@ -57,11 +59,11 @@ function addSseAccumulatorPart(state, part) {
 
 function assertSseEventBufferSize(state, byteLength) {
   if (byteLength > state.maxBytes) {
-    const error = new Error(`Responses SSE event exceeds ${state.maxBytes} bytes.`);
-    error.statusCode = 503;
-    error.code = "local_history_storage_unavailable";
-    error.localHistoryError = true;
-    throw error;
+    throw new UpstreamResponseTooLargeError(
+      state.maxBytes,
+      byteLength,
+      "",
+    );
   }
 }
 

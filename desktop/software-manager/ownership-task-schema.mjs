@@ -208,7 +208,7 @@ export function isValidActiveTask(task, { ownership, skillsRoot } = {}) {
   if (task.kind === "component-prepare") {
     const common = ["kind", "taskId", "componentId", "version", "leaseScope", "leaseNonce"];
     const archiveCommon = [...common, "stagingName"];
-    const archiveNameValid = /^\.codexbridge-prepare-[a-f0-9]{32}$/u.test(task.stagingName ?? "");
+    const archiveNameValid = /^\.p-[a-f0-9]{32}$/u.test(task.stagingName ?? "");
     const boundArchive = ["chatgpt", "v2rayn"].includes(task.componentId)
       && exact(task, [...archiveCommon, "stagingIdentity"])
       && archiveNameValid

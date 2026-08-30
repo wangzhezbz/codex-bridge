@@ -2504,6 +2504,47 @@ test("Windows ACL command runner binds literal arguments and rejects a hard time
   assert.equal(error.message.includes("sensitive"), false);
 });
 
+test("Windows ACL PowerShell runner uses only the matching system module directory", async () => {
+  const { runBoundedWindowsCommand } = await import(
+    "../desktop/windows-private-acl.mjs"
+  );
+  const executable = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+  let invocation;
+
+  await runBoundedWindowsCommand(
+    executable,
+    ["-NoProfile", "-Command", "Get-Acl -LiteralPath $env:CODEXBRIDGE_PRIVATE_ACL_LITERAL_PATH"],
+    {
+      environment: {
+        CODEXBRIDGE_PRIVATE_ACL_KIND: "file",
+        CODEXBRIDGE_PRIVATE_ACL_LITERAL_PATH: "C:\\fixture\\candidate.tmp",
+        CODEXBRIDGE_PRIVATE_ACL_USER_SID: "S-1-5-21-111-222-333-1001",
+      },
+      execFileImpl(file, args, options, callback) {
+        invocation = { file, args, options };
+        callback(null, Buffer.alloc(0), Buffer.alloc(0));
+        return { kill() {} };
+      },
+    },
+  );
+
+  assert.equal(invocation.file, executable);
+  assert.equal(
+    invocation.options.env.PSModulePath,
+    "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules",
+  );
+  assert.equal(
+    Object.keys(invocation.options.env)
+      .filter((key) => key.toUpperCase() === "PSMODULEPATH")
+      .length,
+    1,
+  );
+  assert.equal(
+    invocation.options.env.CODEXBRIDGE_PRIVATE_ACL_LITERAL_PATH,
+    "C:\\fixture\\candidate.tmp",
+  );
+});
+
 test("Windows ACL command runner owns a watchdog when execFile never completes", async () => {
   const { runBoundedWindowsCommand } = await import(
     "../desktop/windows-private-acl.mjs"

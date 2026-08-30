@@ -5,7 +5,9 @@ import { readInstallRootCapability } from "./path-policy.mjs";
 const SHA256 = /^[a-f0-9]{64}$/u;
 const VERSION = /^\d+(?:\.\d+){0,3}$/u;
 const PINS = new WeakMap();
-const MISSING_CODES = new Set(["ENOENT", "ERROR_FILE_NOT_FOUND", "ERROR_PATH_NOT_FOUND", "windows_path_missing"]);
+const MISSING_CODES = new Set([
+  "entry_missing", "ENOENT", "ERROR_FILE_NOT_FOUND", "ERROR_PATH_NOT_FOUND", "windows_path_missing",
+]);
 
 function identityError(code, cause) {
   const error = new Error(code, cause === undefined ? undefined : { cause });
@@ -100,6 +102,7 @@ export function createGitIdentityCapabilities({
   retainedInstallerStore,
 } = {}) {
   if (typeof fileCapabilities?.pinArchiveFileNoFollow !== "function"
+    || typeof fileCapabilities?.pinExecutableFileNoFollow !== "function"
     || typeof fileCapabilities?.openDirectoryNoFollow !== "function") {
     throw identityError("git_file_capabilities_required");
   }
@@ -110,8 +113,11 @@ export function createGitIdentityCapabilities({
   const installRoot = readInstallRootCapability(installRootCapability);
   const downloadsRoot = path.win32.join(installRoot, "downloads");
 
-  async function pinFile(filePath) {
-    const pin = validateFilePin(await fileCapabilities.pinArchiveFileNoFollow(filePath));
+  async function pinFile(filePath, { trustedInstaller = false } = {}) {
+    const operation = trustedInstaller
+      ? fileCapabilities.pinExecutableFileNoFollow
+      : fileCapabilities.pinArchiveFileNoFollow;
+    const pin = validateFilePin(await operation.call(fileCapabilities, filePath));
     await pin.assertStableNoFollow();
     return pin;
   }
@@ -133,7 +139,7 @@ export function createGitIdentityCapabilities({
         record.installerPath = canonicalPath(rawPlan.installerPath, "git_identity_installer_invalid");
         if (!SHA256.test(rawPlan.installerSha256 ?? "")) throw identityError("git_identity_installer_hash_invalid");
         record.installerSha256 = rawPlan.installerSha256;
-        const installerPin = await pinFile(record.installerPath);
+        const installerPin = await pinFile(record.installerPath, { trustedInstaller: true });
         handles.push(installerPin);
         installerHandles.push(installerPin);
         if (await hashFile(record.installerPath) !== record.installerSha256) {

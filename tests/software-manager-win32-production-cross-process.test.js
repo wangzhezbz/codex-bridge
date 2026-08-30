@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { fork } from "node:child_process";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -10,6 +11,46 @@ import { createWindowsFileCapabilities } from "../desktop/software-manager/windo
 
 const childPath = fileURLToPath(new URL("./fixtures/software-manager-win32-state-child.mjs", import.meta.url));
 const windowsOnly = process.platform !== "win32" ? "requires production Win32 handles" : false;
+
+test("production Win32 handles accept a real 8.3 parent alias without disabling local recovery", { skip: windowsOnly }, async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codexbridge-short-alias-"));
+  const stateDir = path.join(root, "state");
+  await fs.mkdir(stateDir);
+  try {
+    const longRoot = await fs.realpath(root);
+    if (longRoot.toLowerCase() === root.toLowerCase()) {
+      t.skip("host temp path does not expose an 8.3 alias");
+      return;
+    }
+    const fileCapabilities = createWindowsFileCapabilities({ nativeApi: createWin32FileApi() });
+    const lock = await fileCapabilities.acquireStateLockNoFollow(stateDir);
+    await lock.release();
+  } finally {
+    await fs.unlink(path.join(stateDir, ".codexbridge-ownership.lock")).catch((error) => {
+      if (error?.code !== "ENOENT") throw error;
+    });
+    await fs.rmdir(stateDir);
+    await fs.rmdir(root);
+  }
+});
+
+test("production Win32 bootstrap creates fixed runtime directories and can enumerate an empty journal", { skip: windowsOnly }, async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codexbridge-runtime-dirs-"));
+  const capabilities = createWindowsFileCapabilities({ nativeApi: createWin32FileApi() });
+  try {
+    await capabilities.ensureManagedDirectoriesNoFollow(root, ["state", "journal"]);
+    const journal = await capabilities.openJournalDirectoryNoFollow(path.join(root, "journal"));
+    try {
+      assert.deepEqual(await journal.listFileNamesNoFollow(), []);
+    } finally {
+      await journal.close();
+    }
+  } finally {
+    await fs.rmdir(path.join(root, "journal"));
+    await fs.rmdir(path.join(root, "state"));
+    await fs.rmdir(root);
+  }
+});
 
 function child(mode, stateDir, label, nonce) {
   return fork(childPath, [mode, stateDir, label, ...(nonce ? [nonce] : [])], {

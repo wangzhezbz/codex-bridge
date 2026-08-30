@@ -4,6 +4,7 @@ After=network-online.target
 Wants=network-online.target
 ConditionPathExists=/opt/shanhai/codexbridge-installer/app/package.json
 ConditionPathExists=/opt/shanhai/codexbridge-installer/private/publisher.env
+ConditionPathExists=/opt/shanhai/codexbridge-installer/private/dogecloud.env
 
 [Service]
 Type=oneshot
@@ -11,6 +12,7 @@ User=root
 Group=root
 WorkingDirectory=/opt/shanhai/codexbridge-installer/app
 EnvironmentFile=/opt/shanhai/codexbridge-installer/private/publisher.env
+EnvironmentFile=/opt/shanhai/codexbridge-installer/private/dogecloud.env
 Environment=PATH=/opt/shanhai/codexbridge-installer/runtime/node/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/opt/shanhai/codexbridge-installer/runtime/node/bin/npm run software:sync
 TimeoutStartSec=30min

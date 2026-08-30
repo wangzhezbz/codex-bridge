@@ -22,6 +22,15 @@ sudo xattr -cr /Applications/CodexBridge.app
 
 [GitHub Releases](https://github.com/wangzhezbz/codex-bridge/releases)
 
+## v0.3.42
+
+- 修复 DeepSeek、GPT 兼容路由和自动故障转移场景首段输出被本地缓冲的问题，普通文本会按上游到达顺序立即流式转发。
+- 加固 Responses 历史、模型切换、压缩恢复与错误呈现，避免跨供应商引用和推理内容造成后续请求失败。
+- 重做软件管理任务边界：主进程跟踪完整插件批次，支持安全取消和退出保护，并在界面持续展示下载速度、阶段活动与最终结果。
+- 完整插件按固定提交安装和卸载其专属 Marketplace；Skills 继续独立安装、检测和卸载，不进入更新流程。
+- V2RayN 改用官方签名桌面 ZIP，发布前固定校验 PGP 指纹、ZIP 路径和实际文件版本；目录离线或刷新失败时会明确提示来源状态。
+- 升级到 Electron 44，消除构建依赖中的已知高危解压路径穿越问题。
+
 ## v0.3.3
 
 - 修复 Windows 用户目录、中文用户名及目录联接场景下的配置写入与恢复失败。
@@ -86,9 +95,12 @@ npm run release:code-ready
 npm run check
 npm run package:win
 npm run package:win:smoke
+npm run package:win:artifacts
 npm run package:mac
 npm run package:mac:smoke
 ```
+
+`package:win:artifacts` only accepts the exact Windows app proven by the current `packaged-smoke-report.json`; an old package or a report from another app path cannot be turned into release artifacts.
 
 `npm run release:code-ready` is the local code readiness gate. It still reports missing real Router, provider, or installer evidence, but only exits non-zero when repository code/config work remains. In JSON output, use `codeReady.ignoredRealEvidenceItemIds` and `codeReady.ignoredLocalSetupItemIds` to hand those non-code checks to the real test machine.
 

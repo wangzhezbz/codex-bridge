@@ -93,7 +93,7 @@ async function installRootCapability({ identity = 10, getIdentity = () => identi
 
 function fakeWorkspaceCapabilities({ expectedInstallRootCapability = null, skillSealFailure = null } = {}) {
   const calls = [];
-  const nodes = new Map([[ROOT.toLowerCase(), { kind: "directory", empty: true, identity: 1 }]]);
+  const nodes = new Map([[ROOT.toLowerCase(), { path: ROOT, kind: "directory", empty: true, identity: 1 }]]);
   const sessions = new Set();
   const skillSourceProofs = new WeakSet();
   let identity = 2;
@@ -101,6 +101,7 @@ function fakeWorkspaceCapabilities({ expectedInstallRootCapability = null, skill
   function key(value) { return value.toLowerCase(); }
   function add(pathValue, kind, options = {}) {
     nodes.set(key(pathValue), {
+      path: pathValue,
       kind,
       empty: options.empty ?? kind === "file",
       identity: options.identity ?? identity++,
@@ -183,6 +184,13 @@ function fakeWorkspaceCapabilities({ expectedInstallRootCapability = null, skill
             if (!existing) return null;
             if (existing.kind !== "file") throw Object.assign(new Error("windows_regular_file_required"), { code: "windows_regular_file_required" });
             return this.issue(childPath, "file");
+          },
+          async listDirectChildNamesNoFollow(parentReceipt, { limit = 128 } = {}) {
+            const parent = this.require(parentReceipt);
+            return [...nodes.values()]
+              .filter((node) => node.path && path.win32.dirname(node.path).toLowerCase() === parent.path.toLowerCase())
+              .map((node) => path.win32.basename(node.path))
+              .slice(0, limit);
           },
           async inspectIssuedChildNoFollow(receipt) {
             const record = this.require(receipt);
@@ -377,6 +385,25 @@ test("workspace derives deterministic children and rejects renderer-controlled i
     "releaseComponentPackage",
     "sealSkillStaging",
   ].sort().join(","));
+});
+
+test("workspace removes only stale managed partials from older catalog versions", async () => {
+  const fake = fakeWorkspaceCapabilities();
+  const downloadsRoot = path.win32.join(ROOT, "downloads");
+  const stale = path.win32.join(downloadsRoot, "chatgpt-0.9.0.zip.part");
+  const foreign = path.win32.join(downloadsRoot, "user-notes.part");
+  const retainedCurrent = path.win32.join(downloadsRoot, "v2rayn-7.0.4.7z.part");
+  fake.add(downloadsRoot, "directory", { empty: false });
+  fake.add(stale, "file", { data: "old" });
+  fake.add(foreign, "file", { data: "foreign" });
+  fake.add(retainedCurrent, "file", { data: "resume" });
+  const { workspace } = await createWorkspace(fake);
+
+  const record = await workspace.prepareDownloadFile(downloadRequest("chatgpt", "1.0.0", ".zip"));
+  assert.equal(fake.nodes.has(stale.toLowerCase()), false);
+  assert.equal(fake.nodes.has(foreign.toLowerCase()), true);
+  assert.equal(fake.nodes.has(retainedCurrent.toLowerCase()), true);
+  await workspace.cleanupAbandonedPrepare(record);
 });
 
 test("workspace seals one issued Skill staging tree into an opaque source proof", async () => {

@@ -438,26 +438,204 @@ function applyCodexOpenAiResponsesContract(payload, profile) {
     include.push("reasoning.encrypted_content");
   }
   payload.include = include;
-  sanitizeCodexOpenAiReasoningInput(payload);
+  sanitizeCodexOpenAiInput(payload);
 }
 
-function sanitizeCodexOpenAiReasoningInput(payload) {
+function sanitizeCodexOpenAiInput(payload) {
   if (!Array.isArray(payload.input)) {
     return;
   }
-  payload.input = payload.input.flatMap((item) => {
-    if (!item || typeof item !== "object" || item.type !== "reasoning") {
-      return [item];
+  payload.input = portableCodexOpenAiInputItems(payload.input, {
+    store: payload.store,
+  });
+}
+
+export function codexOpenAiPortableHistoryRetryPayload(payload = {}) {
+  const retryPayload = { ...payload };
+  delete retryPayload.previous_response_id;
+  if (Array.isArray(retryPayload.input)) {
+    retryPayload.input = portableCodexOpenAiInputItems(retryPayload.input, {
+      store: retryPayload.store,
+      forcePortable: true,
+    });
+  }
+  return retryPayload;
+}
+
+function portableCodexOpenAiInputItems(input, options = {}) {
+  const portableItems = input.flatMap((item) =>
+    portableCodexOpenAiInputItem(item, options)
+  );
+  if (options.forcePortable !== true) {
+    return portableItems;
+  }
+  const availableCallIds = new Set(
+    portableItems
+      .filter((item) => ["function_call", "custom_tool_call"].includes(item?.type))
+      .map((item) => String(item.call_id || "").trim())
+      .filter(Boolean),
+  );
+  return portableItems.filter((item) => {
+    if (!["function_call_output", "custom_tool_call_output"].includes(item?.type)) {
+      return true;
     }
+    return availableCallIds.has(String(item.call_id || "").trim());
+  });
+}
+
+function portableCodexOpenAiInputItem(item, options = {}) {
+  if (!item || typeof item !== "object") {
+    return [item];
+  }
+
+  if (item.type === "reasoning") {
     if (typeof item.encrypted_content === "string" && item.encrypted_content) {
       return [item];
     }
-    if (payload.store === false) {
+    if (options.forcePortable === true || options.store === false) {
       return [];
     }
     const id = String(item.id || "").trim();
     return id ? [{ id, type: "reasoning" }] : [];
-  });
+  }
+
+  if (isAssistantOutputMessage(item)) {
+    const text = portableAssistantMessageText(item.content);
+    if (text !== null) {
+      return text ? [portableAssistantMessage(item, text)] : [];
+    }
+  }
+
+  if (options.forcePortable !== true) {
+    return [item];
+  }
+
+  if (item.role === "assistant") {
+    if (Array.isArray(item.content)) {
+      const text = portableAssistantMessageText(item.content, { ignoreUnknown: true });
+      return text ? [portableAssistantMessage(item, text)] : [];
+    }
+    if (typeof item.content === "string") {
+      return item.content ? [portableAssistantMessage(item, item.content)] : [];
+    }
+    if (typeof item.encrypted_content === "string" && item.encrypted_content) {
+      return [item];
+    }
+    return [];
+  }
+  if (item.type === "function_call") {
+    return portableFunctionCallItem(item);
+  }
+  if (item.type === "custom_tool_call") {
+    return portableCustomToolCallItem(item);
+  }
+  if (item.type === "custom_tool_call_output") {
+    return portableToolOutputItem(item, "custom_tool_call_output");
+  }
+  if (item.type === "function_call_output") {
+    return portableToolOutputItem(item, "function_call_output");
+  }
+  const itemType = String(item.type || "");
+  if (itemType.endsWith("_call")) {
+    return portableFunctionCallItem(item);
+  }
+  if (itemType.endsWith("_call_output") || itemType === "tool_result") {
+    return portableToolOutputItem(item, "function_call_output");
+  }
+  if (item.type === "item_reference") {
+    return [];
+  }
+  return [item];
+}
+
+function portableAssistantMessage(item, content) {
+  const message = { role: "assistant", content };
+  const phase = typeof item.phase === "string" ? item.phase.trim() : "";
+  if (["commentary", "final_answer"].includes(phase)) {
+    message.phase = phase;
+  }
+  return message;
+}
+
+function isAssistantOutputMessage(item) {
+  if (item.role !== "assistant" || !Array.isArray(item.content) || item.content.length === 0) {
+    return false;
+  }
+  return item.content.some((part) =>
+    part &&
+    typeof part === "object" &&
+    ["output_text", "refusal"].includes(String(part.type || "")),
+  );
+}
+
+function portableAssistantMessageText(content, options = {}) {
+  const parts = [];
+  for (const part of content) {
+    if (typeof part === "string") {
+      parts.push(part);
+      continue;
+    }
+    if (!part || typeof part !== "object") {
+      return null;
+    }
+    if (part.type === "output_text" || part.type === "input_text") {
+      parts.push(String(part.text || ""));
+      continue;
+    }
+    if (part.type === "refusal") {
+      parts.push(String(part.refusal || part.text || ""));
+      continue;
+    }
+    if (options.ignoreUnknown === true) {
+      continue;
+    }
+    return null;
+  }
+  return parts.filter(Boolean).join("\n");
+}
+
+function portableFunctionCallItem(item) {
+  const callId = String(item.call_id || item.id || "").trim();
+  const name = String(item.name || item.function?.name || item.tool_name || "").trim();
+  if (!callId || !name) {
+    return [];
+  }
+  const args = item.arguments ?? item.function?.arguments ?? item.action ?? item.input ?? {};
+  return [{
+    type: "function_call",
+    call_id: callId,
+    name,
+    arguments:
+      typeof args === "string"
+        ? args
+        : JSON.stringify(args || {}),
+  }];
+}
+
+function portableCustomToolCallItem(item) {
+  const callId = String(item.call_id || "").trim();
+  const name = String(item.name || "").trim();
+  if (!callId || !name) {
+    return [];
+  }
+  return [{
+    type: "custom_tool_call",
+    call_id: callId,
+    name,
+    input: typeof item.input === "string" ? item.input : String(item.input || ""),
+  }];
+}
+
+function portableToolOutputItem(item, type) {
+  const callId = String(item.call_id || item.tool_call_id || "").trim();
+  if (!callId) {
+    return [];
+  }
+  return [{
+    type,
+    call_id: callId,
+    output: item.output ?? item.result ?? "",
+  }];
 }
 
 export function reasoningParamsForAdapter(request = {}, route = {}, options = {}) {

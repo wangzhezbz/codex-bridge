@@ -44,12 +44,15 @@ function component(id, version, format, entrypoint, requiredFiles = [entrypoint]
   };
 }
 
-function trustedCatalog(chatgptRequiredFiles = ["ChatGPT.exe", "resources/app.asar"]) {
+function trustedCatalog(
+  chatgptRequiredFiles = ["ChatGPT.exe", "resources/app.asar"],
+  v2raynRequiredFiles = ["v2rayN.exe"],
+) {
   const catalog = {
     schemaVersion: 1,
     components: [
       component("chatgpt", "2.0.0", "zip", "ChatGPT.exe", chatgptRequiredFiles),
-      component("v2rayn", "7.0.4", "7z", "v2rayN.exe"),
+      component("v2rayn", "7.0.4", "7z", "v2rayN.exe", v2raynRequiredFiles),
       component("git", "2.50.0", "exe", "cmd/git.exe"),
     ],
     skills: [],
@@ -136,6 +139,17 @@ function fakeFiles(initial = {}) {
         },
         async close() { closed = true; },
       };
+    },
+    async pinExecutableFileNoFollow(filePath) {
+      return fileCapabilities.pinArchiveFileNoFollow(filePath);
+    },
+    async deleteVerifiedExecutableFileNoFollow(filePath, expectedSha256) {
+      const node = nodes.get(key(filePath));
+      if (!node || node.kind !== "file") throw Object.assign(new Error("missing"), { code: "ENOENT" });
+      const actual = createHash("sha256").update(node.data).digest("hex");
+      if (actual !== expectedSha256) throw new Error("windows_executable_hash_mismatch");
+      calls.push(["delete-executable", filePath, actual]);
+      nodes.delete(key(filePath));
     },
     async openDirectoryNoFollow(rootPath) {
       calls.push(["open-directory", rootPath]);
@@ -228,7 +242,7 @@ function componentFixture({
 }
 
 test("staging verification consumes the sealed package proof and derives every path from the trusted catalog", async () => {
-  const stagingName = `.codexbridge-prepare-${"a".repeat(32)}`;
+  const stagingName = `.p-${"a".repeat(32)}`;
   const stagingRoot = `D:\\CBApps\\${stagingName}`;
   const files = fakeFiles({
     [`${stagingRoot}\\ChatGPT.exe`]: {},
@@ -256,9 +270,38 @@ test("staging verification consumes the sealed package proof and derives every p
   ]);
 });
 
+test("V2RayN runtime verification never opens catalog directories as ordinary files", async () => {
+  const stagingName = `.p-${"d".repeat(32)}`;
+  const stagingRoot = `D:\\CBApps\\V2RayN\\${stagingName}`;
+  const files = fakeFiles({
+    [stagingRoot]: { kind: "directory" },
+    [`${stagingRoot}\\v2rayn`]: { kind: "directory" },
+    [`${stagingRoot}\\v2rayN.exe`]: {},
+  });
+  const catalogService = trustedCatalog(undefined, ["v2rayn", "v2rayN.exe"]);
+  const fixture = componentFixture({ files, catalogService });
+
+  const result = await fixture.service.verifyComponent({
+    componentId: "v2rayn",
+    phase: "staging",
+    stagingName,
+    rootPath: stagingRoot,
+    entrypointPath: `${stagingRoot}\\v2rayN.exe`,
+    requiredFiles: [`${stagingRoot}\\v2rayN.exe`],
+    expectedVersion: "7.0.4",
+    expectedPackageSha256: HASH,
+    packageProof: PACKAGE_PROOF,
+  });
+
+  assert.equal(result.version, "7.0.4");
+  assert.deepEqual(files.calls.filter(([kind]) => kind === "pin"), [
+    ["pin", `${stagingRoot}\\v2rayN.exe`],
+  ]);
+});
+
 test("ChatGPT verifies its signed package version marker instead of Chromium PE version", async () => {
   const marker = ".codexbridge-chatgpt-version.json";
-  const stagingName = `.codexbridge-prepare-${"c".repeat(32)}`;
+  const stagingName = `.p-${"c".repeat(32)}`;
   const stagingRoot = `D:\\CBApps\\${stagingName}`;
   const files = fakeFiles({
     [`${stagingRoot}\\ChatGPT.exe`]: {},
@@ -285,7 +328,7 @@ test("component verification rejects caller-substituted catalog files before con
   const files = fakeFiles({ "D:\\CBApps\\ct\\evil.exe": {} });
   const fixture = componentFixture({ files });
   await assert.rejects(fixture.service.verifyComponent({
-    componentId: "chatgpt", phase: "staging", stagingName: `.codexbridge-prepare-${"b".repeat(32)}`,
+    componentId: "chatgpt", phase: "staging", stagingName: `.p-${"b".repeat(32)}`,
     rootPath: "D:\\CBApps\\ct",
     entrypointPath: "D:\\CBApps\\ct\\evil.exe", requiredFiles: ["D:\\CBApps\\ct\\evil.exe"],
     expectedVersion: "2.0.0", expectedPackageSha256: HASH, packageProof: PACKAGE_PROOF,
@@ -408,6 +451,24 @@ test("component deletion plans never include install root, V2RayN-Data, or unrel
   assert.deepEqual(fixture.deleted, [`${ROOT}\\V2RayN`]);
 });
 
+test("component deletion treats the real Win32 entry_missing code as an idempotent absence", async () => {
+  const files = fakeFiles();
+  let closes = 0;
+  files.fileCapabilities.openDirectoryNoFollow = async () => ({
+    async openChildNoFollow() {
+      throw Object.assign(new Error("missing"), { code: "entry_missing" });
+    },
+    async close() { closes += 1; },
+  });
+  const fixture = componentFixture({ files });
+
+  assert.equal(await fixture.service.deleteComponent({
+    componentId: "v2rayn", rootPath: `${ROOT}\\V2RayN`, authorizedRoot: ROOT,
+  }), true);
+  assert.equal(closes, 1);
+  assert.deepEqual(fixture.deleted, []);
+});
+
 test("persistent V2RayN data evidence is serializable and rejects a replaced directory identity", async () => {
   const files = fakeFiles();
   const fixture = componentFixture({ files });
@@ -442,8 +503,7 @@ test("retained installer hashes under a pin and deletes only a sealed exact down
     installRoot: ROOT, path: installerPath, version: "2.50.0", sha256,
   }), { deleted: true });
   assert.equal(files.nodes.has(installerPath.toLowerCase()), false);
-  assert.equal(files.calls.some(([kind, filePath]) => kind === "seal" && filePath === installerPath), true);
-  assert.equal(files.calls.some(([kind, filePath]) => kind === "delete" && filePath === installerPath), true);
+  assert.equal(files.calls.some(([kind, filePath]) => kind === "delete-executable" && filePath === installerPath), true);
 });
 
 test("retained installer store rejects paths, versions, and hashes outside the fixed record", async () => {

@@ -15,6 +15,7 @@ const names = [
   "install-test.sh",
   "verify-test.mjs",
   "microsoft-identity-verification-root-ca-2020.pem",
+  "v2rayn-fqfqgo-public-key.asc",
 ];
 
 function deployFiles() {
@@ -119,6 +120,18 @@ test("Git verification pins the Microsoft code-signing root inside the isolated 
   assert.match(installer, /F40042E2E5F7E8EF8189FED15519AECE42C3BFA2/u);
   assert.match(installer, /CBI_OSSLSIGNCODE_CA_FILE=\$TRUST_CERT/u);
   assert.match(installer, /openssl x509/u);
+});
+
+test("V2RayN synchronization pins the official PGP key inside the isolated environment", () => {
+  const installer = fs.readFileSync(path.join(deployRoot, "install-test.sh"), "utf8");
+  const publicKey = fs.readFileSync(path.join(deployRoot, "v2rayn-fqfqgo-public-key.asc"), "utf8");
+  assert.match(publicKey, /^-----BEGIN PGP PUBLIC KEY BLOCK-----/u);
+  assert.match(installer, /A4A69C432C532A5F21D0B6EE14162A209ADA306B/u);
+  assert.match(installer, /CBI_GPGV_PATH=\/usr\/bin\/gpgv/u);
+  assert.match(installer, /CBI_V2RAYN_KEYRING=\$V2RAYN_KEYRING/u);
+  assert.match(installer, /CBI_SYNC_STATUS_FILE=\$WORK_ROOT\/sync-status\.json/u);
+  assert.match(installer, /CBI_SYNC_PROGRESS=1/u);
+  assert.match(installer, /gpg --batch --no-options/u);
 });
 
 test("remote verifier validates a signed catalog and streams every immutable asset read-only", async () => {

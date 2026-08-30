@@ -94,15 +94,41 @@ test("resumes a partial package and verifies final SHA256", async () => {
       assert.deepEqual(await readFile(destination), body);
       await assert.rejects(stat(`${destination}.part`));
       assert.deepEqual(seenRanges, ["bytes=7-"]);
-      assert.equal(progress.at(-1).receivedBytes, body.length);
-      assert.equal(progress.at(-1).totalBytes, body.length);
-      assert.equal(progress.at(-1).percent, 100);
-      assert.equal(progress.at(-1).phase, "download");
-      assert.equal(typeof progress.at(-1).bytesPerSecond, "number");
+      const transfer = progress.filter((event) => event.phase === "download").at(-1);
+      assert.equal(transfer.receivedBytes, body.length);
+      assert.equal(transfer.totalBytes, body.length);
+      assert.equal(transfer.percent, 100);
+      assert.equal(typeof transfer.bytesPerSecond, "number");
+      assert.deepEqual(progress.at(-1), {
+        phase: "verify-download",
+        receivedBytes: body.length,
+        totalBytes: body.length,
+        percent: 100,
+      });
     });
   } finally {
     await origin.close();
   }
+});
+
+test("high-frequency chunks are throttled before reaching IPC-facing progress listeners", async () => {
+  const chunks = Array.from({ length: 2_000 }, () => Buffer.alloc(4_096, 7));
+  const content = Buffer.concat(chunks);
+  const fetchImpl = async () => new Response(Readable.toWeb(Readable.from(chunks)), { status: 200 });
+  await withTempDirectory(async ({ destination: fixtureDestination }) => {
+    const progress = [];
+    const manager = createDownloadManager({ fetchImpl });
+    await manager.download({
+      asset: assetFor("https://download.example/component.zip", content),
+      destination: fixtureDestination("throttled.zip"),
+      onProgress: (event) => progress.push(event),
+    });
+
+    const transfer = progress.filter((event) => event.phase === "download");
+    assert.equal(transfer.at(-1).percent, 100);
+    assert.ok(transfer.length < 20, `expected throttled progress, received ${transfer.length} events`);
+    assert.equal(progress.at(-1).phase, "verify-download");
+  });
 });
 
 test("prepared mode verifies one exact part without publishing and issues an opaque instance-bound receipt", async () => {

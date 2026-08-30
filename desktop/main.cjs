@@ -83,12 +83,30 @@ if (shouldDisableChromiumSandbox({ env: process.env, platform: process.platform 
 }
 
 const hasSingleInstanceLock = process.env.CODEXBRIDGE_DESKTOP_SMOKE === "1" ||
-  app.requestSingleInstanceLock();
+  app.requestSingleInstanceLock({ version: app.getVersion() });
 if (!hasSingleInstanceLock) {
   app.quit();
 } else {
-  app.on("second-instance", () => {
+  app.on("second-instance", (_event, _commandLine, _workingDirectory, additionalData) => {
     showMainWindow();
+    const attemptedVersion = typeof additionalData?.version === "string" ? additionalData.version : "";
+    const currentVersion = app.getVersion();
+    const differentVersion = Boolean(attemptedVersion && attemptedVersion !== currentVersion);
+    const notice = {
+      type: differentVersion ? "warning" : "info",
+      title: "CodexBridge 已在运行",
+      message: differentVersion
+        ? `当前运行的是 v${currentVersion}，刚启动的是 v${attemptedVersion}。`
+        : `CodexBridge v${currentVersion} 已经在运行。`,
+      detail: "当前显示的是原先已运行的窗口。测试新版前，请先从托盘退出旧版；如果旧版任务已长时间卡住，可在任务管理器结束 CodexBridge.exe，再启动新版。",
+      buttons: ["知道了"],
+      defaultId: 0,
+      noLink: true,
+    };
+    const noticePromise = mainWindow && !mainWindow.isDestroyed()
+      ? dialog.showMessageBox(mainWindow, notice)
+      : dialog.showMessageBox(notice);
+    void noticePromise.catch((error) => appendRuntimeLog(formatError("secondInstanceNotice", error)));
   });
 }
 
@@ -123,6 +141,8 @@ let softwareManagerIpcPromise = null;
 let softwareManagerRuntimePromise = null;
 let softwareManagerUnavailableServicePromise = null;
 let softwareManagerStartupFailure = null;
+let curatedPluginTask = null;
+let curatedPluginTaskSequence = 0;
 let chatgptBridgeService = null;
 let routerLifecyclePromise = null;
 let codexHistoryRecoveryFlowPromise = null;
@@ -160,6 +180,7 @@ const ROUTER_RESTART_MAX_ATTEMPTS = 12;
 const ROUTER_RESTART_BASE_DELAY_MS = 1500;
 const ROUTER_RESTART_MAX_DELAY_MS = 30000;
 const ROUTER_RESTART_STABLE_WINDOW_MS = 60000;
+const CURATED_PLUGIN_TASK_TIMEOUT_MS = 5 * 60 * 1000;
 const ROUTER_CONFIG_RECOVERY_RETRY_MS = 5000;
 const ROUTER_SPAWN_TIMEOUT_MS = 5000;
 const ROUTER_GRACEFUL_STOP_TIMEOUT_MS = 2000;
@@ -895,14 +916,26 @@ async function createSoftwareManagerRuntimeService() {
     import("./software-manager/runtime-factory.mjs"),
     import("./software-manager/catalog-public-key.mjs"),
   ]);
+  const softwareHomeDir = desktopHomeDir();
+  const smokeLocalAppData = process.env.CODEXBRIDGE_DESKTOP_SMOKE === "1"
+    ? String(process.env.CODEXBRIDGE_DESKTOP_SMOKE_LOCAL_APP_DATA || "").trim()
+    : "";
+  const smokeDefaultInstallRoot = process.env.CODEXBRIDGE_DESKTOP_SMOKE === "1"
+    ? String(process.env.CODEXBRIDGE_DESKTOP_SMOKE_DEFAULT_INSTALL_ROOT || "").trim()
+    : "";
+  const localAppData = smokeLocalAppData || process.env.LOCALAPPDATA || path.join(softwareHomeDir, "AppData", "Local");
+  const softwareManagerFetch = process.env.CODEXBRIDGE_DESKTOP_SMOKE_SOFTWARE_MANAGER_OFFLINE === "1"
+    ? async () => { throw new Error("software_manager_smoke_offline"); }
+    : globalThis.fetch;
   return createProductionSoftwareManagerService({
     platform: process.platform,
     dataRoot: path.join(dataRootDir, "software-manager"),
-    homeDir: desktopHomeDir(),
+    homeDir: softwareHomeDir,
+    defaultInstallRoot: smokeDefaultInstallRoot || path.join(localAppData, "CBApps"),
     getDesktopPath: () => app.getPath("desktop"),
     env: process.env,
     electronShell: shell,
-    fetchImpl: globalThis.fetch,
+    fetchImpl: softwareManagerFetch,
     execFile: execSoftwareManagerFile,
     spawn: spawnSoftwareManagerProcess,
     publicKeyPem: CATALOG_PUBLIC_KEY_SPKI,
@@ -948,6 +981,12 @@ function initializeSoftwareManagerIpc() {
         getService: getSoftwareManagerService,
         selectInstallRoot: async (service) => {
           if (softwareManagerStartupFailure) return service.chooseInstallRoot();
+          const smokeSelectedRoot = process.env.CODEXBRIDGE_DESKTOP_SMOKE === "1"
+            ? String(process.env.CODEXBRIDGE_DESKTOP_SMOKE_SELECTED_INSTALL_ROOT || "").trim()
+            : "";
+          if (smokeSelectedRoot) {
+            return (await getSoftwareManagerRuntime()).selectInstallRoot(smokeSelectedRoot);
+          }
           const selection = await dialog.showOpenDialog(mainWindow, {
             title: "选择软件安装位置",
             properties: ["openDirectory", "createDirectory"],
@@ -956,6 +995,7 @@ function initializeSoftwareManagerIpc() {
           return (await getSoftwareManagerRuntime()).selectInstallRoot(selection.filePaths[0]);
         },
         sendEvent: (event) => sendToRenderer("softwareManager:event", event),
+        cancelExternalTask: () => cancelCuratedPluginTask(),
       });
     }).catch((error) => {
       softwareManagerIpcPromise = null;
@@ -1077,14 +1117,22 @@ app.whenReady().then(async () => {
     return;
   }
   if (process.platform === "win32") {
+    let runtime = null;
     try {
       // Recovery is local-only and deliberately precedes renderer access. It
       // neither refreshes the signed catalog nor launches external software.
-      const runtime = await getSoftwareManagerRuntime();
-      await runtime.recoverOffline();
+      runtime = await getSoftwareManagerRuntime();
     } catch (error) {
       appendRuntimeLog(formatError("softwareManagerStartup", error));
       softwareManagerStartupFailure = error;
+    }
+    try {
+      // Interrupted installs can fail the first recovery attempt transiently
+      // while Windows releases child-process handles. Keep the real service
+      // available so opening the page or clicking refresh can retry safely.
+      if (runtime) await runtime.recoverOffline();
+    } catch (error) {
+      appendRuntimeLog(formatError("softwareManagerRecovery", error));
     }
   }
   try {
@@ -2146,6 +2194,157 @@ ipcMain.handle("resource:refreshMarketplaces", async () => {
   };
 });
 
+async function managedCuratedPluginCliOptions() {
+  try {
+    const runtime = await getSoftwareManagerRuntime();
+    const snapshot = await runtime.service.getSnapshot();
+    const chatgpt = snapshot?.components?.find((entry) => entry?.id === "chatgpt");
+    // ChatGPT has no external-install mode in the software manager, so its
+    // successful installed-version inspection is the ownership signal. The
+    // public snapshot intentionally exposes `ownership` only for Git.
+    if (typeof chatgpt?.installedVersion !== "string" || typeof chatgpt.installPath !== "string") return {};
+    const executable = path.join(chatgpt.installPath, "resources", "codex.exe");
+    return fs.existsSync(executable) ? { executable } : {};
+  } catch {
+    return {};
+  }
+}
+
+ipcMain.handle("curatedPlugin:list", async () => {
+  const settings = await loadSettings();
+  const cliOptions = await managedCuratedPluginCliOptions();
+  return settings.listCuratedCodexPluginResources(cliOptions);
+});
+
+function curatedPluginTaskError(code, cause = undefined) {
+  const error = new Error(code, cause === undefined ? undefined : { cause });
+  error.code = code;
+  return error;
+}
+
+async function validateCuratedPluginTaskRequest(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)
+    || Object.getPrototypeOf(payload) !== Object.prototype
+    || Object.keys(payload).sort().join("\0") !== ["kind", "pluginIds"].sort().join("\0")
+    || !["install", "uninstall"].includes(payload.kind)
+    || !Array.isArray(payload.pluginIds) || payload.pluginIds.length < 1 || payload.pluginIds.length > 2
+    || new Set(payload.pluginIds).size !== payload.pluginIds.length) {
+    throw curatedPluginTaskError("curated_plugin_task_request_invalid");
+  }
+  const { CURATED_CODEX_PLUGINS } = await import("../shared/software-manager/curated-plugins.mjs");
+  const allowed = new Set(CURATED_CODEX_PLUGINS.map(({ id }) => id));
+  if (payload.pluginIds.some((id) => typeof id !== "string" || !allowed.has(id))) {
+    throw curatedPluginTaskError("curated_plugin_task_request_invalid");
+  }
+  return Object.freeze({ kind: payload.kind, pluginIds: Object.freeze([...payload.pluginIds]) });
+}
+
+function curatedPluginTaskStatus(entries) {
+  const succeeded = entries.filter(({ status }) => ["succeeded", "skipped"].includes(status)).length;
+  const failed = entries.filter(({ status }) => status === "failed").length;
+  const cancelled = entries.filter(({ status }) => status === "cancelled").length;
+  if (failed > 0) return succeeded > 0 ? "partial" : "failed";
+  if (cancelled > 0) return succeeded > 0 ? "partial" : "cancelled";
+  return "succeeded";
+}
+
+function cancelCuratedPluginTask() {
+  const task = curatedPluginTask;
+  if (!task) return null;
+  if (task.controller.signal.aborted) return { cancelled: false, reason: "cancelling" };
+  task.controller.abort(curatedPluginTaskError("curated_plugin_cancelled"));
+  sendToRenderer("softwareManager:event", {
+    type: "progress", taskId: task.taskId, componentId: task.currentPluginId,
+    phase: "cancelling", percent: null, cancellable: false,
+    message: "正在安全取消完整插件任务",
+  });
+  return { cancelled: true };
+}
+
+async function runCuratedPluginTask(payload) {
+  const request = await validateCuratedPluginTaskRequest(payload);
+  if (curatedPluginTask) throw curatedPluginTaskError("curated_plugin_task_running");
+  const taskId = `plugins-${Date.now().toString(36)}-${(++curatedPluginTaskSequence).toString(36)}`;
+  const startedAt = Date.now();
+  const deadlineAt = startedAt + CURATED_PLUGIN_TASK_TIMEOUT_MS;
+  const controller = new AbortController();
+  let resolveDone;
+  const done = new Promise((resolve) => { resolveDone = resolve; });
+  const task = {
+    taskId, kind: request.kind, pluginIds: [...request.pluginIds], currentPluginId: null,
+    controller, deadlineAt, done,
+  };
+  curatedPluginTask = task;
+  appendRuntimeLog(`curated-plugin-task start id=${taskId} kind=${request.kind} count=${request.pluginIds.length}`);
+  const entries = [];
+  try {
+    const settings = await loadSettings();
+    const cliOptions = await managedCuratedPluginCliOptions();
+    for (let index = 0; index < request.pluginIds.length; index += 1) {
+      const id = request.pluginIds[index];
+      task.currentPluginId = id;
+      if (controller.signal.aborted) {
+        entries.push({
+          componentId: id, action: request.kind, status: "cancelled",
+          versionBefore: null, versionAfter: null, message: "curated_plugin_cancelled", rollbackAvailable: false,
+        });
+        continue;
+      }
+      const remainingMs = deadlineAt - Date.now();
+      if (remainingMs <= 0) {
+        entries.push({
+          componentId: id, action: request.kind, status: "failed",
+          versionBefore: null, versionAfter: null, message: "curated_plugin_timeout", rollbackAvailable: false,
+        });
+        continue;
+      }
+      sendToRenderer("softwareManager:event", {
+        type: "progress", taskId, componentId: id, phase: "plugin",
+        percent: (index / request.pluginIds.length) * 100, cancellable: true,
+        message: request.kind === "install" ? "正在安装完整插件" : "正在卸载完整插件",
+      });
+      try {
+        const pluginResult = await settings.runSharedConfigExclusive(() => (
+          request.kind === "install"
+            ? settings.installCuratedCodexPluginResource({
+                id, ...cliOptions, timeoutMs: remainingMs, signal: controller.signal,
+              })
+            : settings.removeCuratedCodexPluginResource({
+                id, ...cliOptions, timeoutMs: remainingMs, signal: controller.signal,
+              })
+        ));
+        entries.push({
+          componentId: id, action: request.kind, status: "succeeded",
+          versionBefore: null, versionAfter: pluginResult?.version || null,
+          message: request.kind === "install" ? "curated_plugin_installed" : "curated_plugin_removed",
+          rollbackAvailable: false,
+        });
+      } catch (error) {
+        const cancelled = controller.signal.aborted || error?.code === "curated_plugin_cancelled";
+        entries.push({
+          componentId: id, action: request.kind, status: cancelled ? "cancelled" : "failed",
+          versionBefore: null, versionAfter: null,
+          message: cancelled ? "curated_plugin_cancelled" : error?.message || String(error),
+          rollbackAvailable: false,
+        });
+      }
+    }
+    const result = Object.freeze({
+      taskId, kind: request.kind, status: curatedPluginTaskStatus(entries),
+      plugins: Object.freeze(entries.map((entry) => Object.freeze({ ...entry }))),
+      startedAt, finishedAt: Date.now(),
+    });
+    appendRuntimeLog(`curated-plugin-task finish id=${taskId} status=${result.status}`);
+    await broadcastState();
+    return result;
+  } finally {
+    if (curatedPluginTask === task) curatedPluginTask = null;
+    resolveDone();
+  }
+}
+
+ipcMain.handle("curatedPlugin:runTask", async (_event, payload) => runCuratedPluginTask(payload));
+
 ipcMain.handle("backups:restore", async (_event, backupPath) => {
   const settings = await loadSettings();
   const result = await settings.restoreCodexConfigFromBackup(
@@ -3091,11 +3290,49 @@ function requestManagedAppQuit(reason = "application") {
   return tracked;
 }
 
+async function prepareCuratedPluginAppQuit() {
+  const task = curatedPluginTask;
+  if (!task) return { allowQuit: true };
+  const result = await dialog.showMessageBox(mainWindow, {
+    type: "question",
+    title: "完整插件任务正在进行",
+    message: "完整插件正在写入 Codex 配置。你可以让 CodexBridge 继续在后台运行，或安全取消任务后退出。",
+    buttons: ["继续后台运行", "取消任务并退出"],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+  });
+  if (result.response !== 1) return { allowQuit: false, reason: "background" };
+  cancelCuratedPluginTask();
+  let completed = false;
+  await Promise.race([
+    task.done.then(() => { completed = true; }),
+    new Promise((resolve) => setTimeout(resolve, 30_000)),
+  ]);
+  if (!completed || curatedPluginTask === task) {
+    await dialog.showMessageBox(mainWindow, {
+      type: "warning",
+      title: "完整插件任务正在取消",
+      message: "任务尚未完成安全清理，CodexBridge 暂不退出。请稍后再次尝试。",
+      buttons: ["知道了"],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true,
+    });
+    return { allowQuit: false, reason: "cancelling" };
+  }
+  return { allowQuit: true };
+}
+
 async function runManagedAppQuit(reason = "application") {
   if (managedQuitReady) {
     cancelRouterRestartTimer();
     app.quit();
     return { ok: true, alreadyReady: true };
+  }
+  const pluginDecision = await prepareCuratedPluginAppQuit();
+  if (!pluginDecision.allowQuit) {
+    return { ok: false, cancelled: true, reason: pluginDecision.reason };
   }
   const { prepareSoftwareManagerQuit } = await import("./software-manager/ipc.mjs");
   const softwareDecision = await prepareSoftwareManagerQuit({
@@ -5662,6 +5899,122 @@ async function runDesktopSmokeChecks() {
         };
       })()
     `);
+    let softwareManagerSmoke = null;
+    if (process.env.CODEXBRIDGE_DESKTOP_SMOKE_SOFTWARE_MANAGER === "1") {
+      const expectedSoftwareHealthLabel = process.env.CODEXBRIDGE_DESKTOP_SMOKE_SOFTWARE_MANAGER_OFFLINE === "1"
+        ? "使用内置清单"
+        : "安装服务可用";
+      softwareManagerSmoke = await mainWindow.webContents.executeJavaScript(`
+        (async () => {
+          const waitFor = (fn, timeoutMs = 60000, label = "software manager") => new Promise((resolve, reject) => {
+            const started = Date.now();
+            const timer = setInterval(async () => {
+              try {
+                const value = await fn();
+                if (value) {
+                  clearInterval(timer);
+                  resolve(value);
+                  return;
+                }
+              } catch {}
+              if (Date.now() - started > timeoutMs) {
+                clearInterval(timer);
+                reject(new Error("Timed out waiting for " + label));
+              }
+            }, 100);
+          });
+          const nav = document.querySelector('[data-section="softwareManager"]');
+          if (!nav || nav.hidden) throw new Error("Software Manager navigation is unavailable");
+          nav.click();
+          await waitFor(
+            () => document.querySelectorAll("#softwareManagerRoot .software-component-card").length === 4,
+            60000,
+            "four software cards",
+          );
+          await waitFor(
+            () => document.querySelector("#softwareManagerRoot .software-health-badge")?.textContent?.includes(${JSON.stringify(expectedSoftwareHealthLabel)}),
+            60000,
+            "trusted software manager UI",
+          );
+          let snapshot = await window.codexBridge.getSoftwareManagerSnapshot();
+          if (snapshot?.readOnly === true) {
+            throw new Error("Software Manager is read-only: " + String(snapshot.unavailableReason || "unknown"));
+          }
+          if (snapshot?.catalog?.available !== true) throw new Error("Software Manager catalog is unavailable");
+          if (snapshot?.components?.length !== 3) {
+            throw new Error("Software Manager component count mismatch: " + String(snapshot?.components?.length));
+          }
+          if (snapshot?.catalog?.skills?.length !== 7) {
+            throw new Error("Software Manager Skill count mismatch: " + String(snapshot?.catalog?.skills?.length));
+          }
+          if (String(snapshot?.installRootPath || "").length < 4) {
+            throw new Error("Software Manager default install root is missing");
+          }
+          const initialInstallRootPath = snapshot.installRootPath;
+          const selectedInstallRootPath = ${JSON.stringify(String(process.env.CODEXBRIDGE_DESKTOP_SMOKE_SELECTED_INSTALL_ROOT || "").trim())};
+          if (selectedInstallRootPath) {
+            const chooseRoot = document.querySelector("#softwareManagerRoot [data-software-choose-root]");
+            if (!chooseRoot || chooseRoot.disabled) throw new Error("Software Manager install-root control is unavailable");
+            chooseRoot.click();
+            snapshot = await waitFor(async () => {
+              const current = await window.codexBridge.getSoftwareManagerSnapshot();
+              return current?.installRootPath === selectedInstallRootPath ? current : null;
+            }, 30000, "selected install root snapshot");
+            await waitFor(
+              () => document.querySelector("#softwareManagerRoot .software-install-root-value")?.textContent?.trim() === selectedInstallRootPath,
+              15000,
+              "selected install root UI",
+            );
+          }
+          document.querySelector("#softwareManagerRoot [data-software-toggle-skills]")?.click();
+          await waitFor(
+            () => document.querySelectorAll("#softwareManagerRoot [data-software-skill]").length === 7
+              && document.querySelectorAll("#softwareManagerRoot [data-software-plugin]").length === 2,
+            15000,
+            "unified Skill list",
+          );
+          const cardNames = Array.from(document.querySelectorAll("#softwareManagerRoot .software-component-head strong"))
+            .map((node) => String(node.textContent || "").trim());
+          const expandedSkillRows = document.querySelectorAll("#softwareManagerRoot [data-software-skill]").length;
+          const expandedPluginRows = document.querySelectorAll("#softwareManagerRoot [data-software-plugin]").length;
+          const selectablePluginRows = Array.from(document.querySelectorAll("#softwareManagerRoot [data-software-plugin]"))
+            .filter((input) => !input.disabled).length;
+          document.querySelector('#softwareManagerRoot [data-software-tab="update"]')?.click();
+          await waitFor(
+            () => document.querySelectorAll("#softwareManagerRoot .software-component-card").length === 3
+              && !document.querySelector("#softwareManagerRoot [data-software-toggle-skills]"),
+            15000,
+            "update view without Skills",
+          );
+          return {
+            readOnly: snapshot.readOnly,
+            catalogAvailable: snapshot.catalog.available,
+            components: snapshot.components.length,
+            skills: snapshot.catalog.skills.length,
+            initialInstallRootPath,
+            installRootPath: snapshot.installRootPath,
+            installRootChanged: selectedInstallRootPath
+              ? initialInstallRootPath !== snapshot.installRootPath && snapshot.installRootPath === selectedInstallRootPath
+              : false,
+            cards: cardNames,
+            expandedSkillRows,
+            expandedPluginRows,
+            selectablePluginRows,
+            updateCards: document.querySelectorAll("#softwareManagerRoot .software-component-card").length,
+            updateHasSkills: Boolean(document.querySelector("#softwareManagerRoot [data-software-toggle-skills]")),
+            mainScrollTop: document.querySelector(".main")?.scrollTop ?? -1,
+          };
+        })()
+      `);
+      const softwareScreenshotPath = String(process.env.CODEXBRIDGE_DESKTOP_SMOKE_SOFTWARE_MANAGER_SCREENSHOT || "").trim();
+      if (softwareScreenshotPath) {
+        fs.mkdirSync(path.dirname(softwareScreenshotPath), { recursive: true });
+        const image = await mainWindow.webContents.capturePage();
+        fs.writeFileSync(softwareScreenshotPath, image.toPNG());
+        softwareManagerSmoke.screenshotPath = softwareScreenshotPath;
+      }
+      console.log(`Software manager smoke passed: ${JSON.stringify(softwareManagerSmoke)}`);
+    }
     const resourceScreenshotPath = String(process.env.CODEXBRIDGE_DESKTOP_SMOKE_RESOURCE_SCREENSHOT || "").trim();
     if (resourceScreenshotPath) {
       await mainWindow.webContents.executeJavaScript(`

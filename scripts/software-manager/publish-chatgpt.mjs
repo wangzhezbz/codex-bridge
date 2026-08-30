@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 
 import { compareVersions } from "../../shared/software-manager/catalog-schema.mjs";
 import { replaceCatalogEntry, readCurrentCatalog, replaceSignedCatalog } from "./catalog-builder.mjs";
+import { createDogeCloudArtifactPublisher } from "./dogecloud-artifact-publisher.mjs";
 import { inspectPackageTree, writeImmutableStoredZip } from "./package-inspector.mjs";
 import { loadPublisherConfig } from "./publisher-config.mjs";
 
@@ -76,6 +77,7 @@ export async function publishChatGPT({
   version = "",
   publishedAt = new Date().toISOString(),
   versionInspector = defaultVersionInspector,
+  artifactPublisher = null,
 } = {}) {
   const source = exactInput(inputPath);
   const tree = inspectPackageTree(source);
@@ -93,6 +95,15 @@ export async function publishChatGPT({
   const size = fs.statSync(packagePath).size;
   const sha256 = sha256File(packagePath);
   const events = ["package_verified"];
+  const stored = await (artifactPublisher ?? createDogeCloudArtifactPublisher({
+    packageBaseUrl: config.packageBaseUrl,
+  })).publish({
+    sourcePath: packagePath,
+    relativePath: packageName,
+    expectedSize: size,
+    expectedSha256: sha256,
+  });
+  if (stored.action !== "local") events.push("object_verified");
   const current = readCurrentCatalog(config.publicRoot, { signingKeyFile: config.signingKeyFile });
   const previousName = path.basename(current.components.find((item) => item.id === "chatgpt")?.assetUrl || "");
   const component = {
@@ -101,7 +112,7 @@ export async function publishChatGPT({
     version: selectedVersion,
     architecture: "x64",
     format: "zip",
-    assetUrl: new URL(packageName, config.packageBaseUrl).href,
+    assetUrl: stored.url,
     size,
     sha256,
     entrypoint: "ChatGPT.exe",

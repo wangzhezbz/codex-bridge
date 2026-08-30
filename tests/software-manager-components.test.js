@@ -120,6 +120,7 @@ function fixture({
   onDiscardPreparedSkill = null,
   onAuthenticode = null, onGitPin = null, gitExecutionTimeoutMs = undefined,
   onGitUninstall = null,
+  availableDiskBytes = Number.MAX_SAFE_INTEGER,
   packageCleanupFailure = null, packageReleaseFailure = null,
   preparedSkillReconcileOverride = null,
   windowsHostOverride = null,
@@ -582,6 +583,7 @@ function fixture({
     downloader, archiveService, versionSlots, ownershipStore, windowsHost, componentFiles, skillFiles,
     installerWorkspace,
     gitIdentityCapabilities,
+    getAvailableDiskBytes: async () => availableDiskBytes,
     ...(gitExecutionTimeoutMs === undefined ? {} : { gitExecutionTimeoutMs }),
     resolveSkillTarget: async ({ skillsRoot, skillId }) => path.win32.join(skillsRoot, skillId),
   };
@@ -861,11 +863,29 @@ test("raw context catalog and path injection fails before ownership or download"
   assert.deepEqual(calls.downloads, []);
 });
 
+test("disk space preflight blocks components and Skills before any download", async () => {
+  const componentFixture = fixture({ availableDiskBytes: 0 });
+  const componentResult = await componentFixture.adapters.chatgpt.prepare({ taskId: "disk-low-component" });
+  assert.equal(componentResult.status, "failed");
+  assert.match(componentResult.message, /component_disk_space_insufficient/u);
+  assert.deepEqual(componentFixture.calls.downloads, []);
+
+  const skillFixture = fixture({ availableDiskBytes: 0 });
+  const [skillResult] = await skillFixture.adapters.skills.prepare({
+    taskId: "disk-low-skill",
+    skillIds: ["documents"],
+  });
+  assert.equal(skillResult.componentId, "documents");
+  assert.equal(skillResult.status, "failed");
+  assert.match(skillResult.message, /component_disk_space_insufficient/u);
+  assert.deepEqual(skillFixture.calls.downloads, []);
+});
+
 test("ChatGPT prepares in a task-unique directory and still commits to fixed c/cp slots", async () => {
   const { adapters, calls, getState } = fixture();
   assert.equal((await adapters.chatgpt.prepare({ taskId: "chat" })).status, "succeeded");
   const stagingRoot = calls.extracts[0].destination;
-  assert.match(stagingRoot, /^D:\\CBApps\\\.codexbridge-prepare-[a-f0-9]{32}$/u);
+  assert.match(stagingRoot, /^D:\\CBApps\\\.p-[a-f0-9]{32}$/u);
   assert.deepEqual(calls.extracts[0].destinationIdentity, getState().activeTask.stagingIdentity);
   assert.deepEqual(calls.verified[0], {
     kind: "component",
@@ -892,6 +912,32 @@ test("ChatGPT prepares in a task-unique directory and still commits to fixed c/c
     expectedVersion: "2.0.0",
   });
   assert.equal(getState().components.chatgpt.installPath, "D:\\CBApps\\c");
+});
+
+test("ChatGPT rollback verifies the restored entrypoint, files, and version before reporting success", async () => {
+  const state = emptyState(INSTALL_ROOT);
+  state.components.chatgpt = {
+    managed: true,
+    installPath: "D:\\CBApps\\c",
+    version: "1.0.0",
+    entrypointPath: "D:\\CBApps\\c\\ChatGPT.exe",
+    requiredFiles: ["D:\\CBApps\\c\\ChatGPT.exe"],
+    health: "healthy",
+  };
+  const current = fixture({ state });
+  assert.equal((await current.adapters.chatgpt.prepare({ taskId: "rollback-verify" })).status, "succeeded");
+  assert.equal((await current.adapters.chatgpt.commit({ taskId: "rollback-verify" })).status, "succeeded");
+  const rolledBack = await current.adapters.chatgpt.rollback({});
+  assert.equal(rolledBack.status, "succeeded");
+  assert.deepEqual(current.calls.verified.at(-1), {
+    kind: "component",
+    componentId: "chatgpt",
+    phase: "current",
+    rootPath: "D:\\CBApps\\c",
+    entrypointPath: "D:\\CBApps\\c\\ChatGPT.exe",
+    requiredFiles: ["D:\\CBApps\\c\\ChatGPT.exe"],
+    expectedVersion: "1.0.0",
+  });
 });
 
 test("archive prepare closes and deletes each exact package on success or verification failure", async () => {
@@ -928,6 +974,42 @@ test("a live archive prepare cannot be discarded by another process and its owne
   const committed = await owner.chatgpt.commit({ taskId: "archive-live-owner" });
   assert.equal(committed.status, "succeeded", committed.message);
   assert.equal(harness.getState().components.chatgpt.version, "2.0.0");
+});
+
+test("a Skills-only ownership state can inspect and safely rebind a newly selected install root", async () => {
+  const state = emptyState(INSTALL_ROOT);
+  state.skills.documents = {
+    target: `${SKILLS_ROOT}\\documents`, version: "1.0.0", packageSha256: DIGEST_A,
+    skillMdSha256: OLD_SKILL_HASH, identity: { volumeSerial: "skills", fileId: "documents" },
+    treeDigest: DIGEST_A, manifestDigest: DIGEST_B,
+  };
+  const harness = fixture({ state });
+  const selectedRoot = harness.createAdaptersForInstallRoot(SECOND_INSTALL_CAPABILITY);
+
+  const inspected = await selectedRoot.chatgpt.inspectInstalled({});
+  assert.equal(inspected.status, "skipped", inspected.message);
+  assert.equal(harness.getState().installRoot, INSTALL_ROOT);
+
+  const prepared = await selectedRoot.chatgpt.prepare({ taskId: "rebind-after-skills" });
+  assert.equal(prepared.status, "succeeded", prepared.message);
+  assert.equal(harness.getState().installRoot, SECOND_INSTALL_ROOT);
+  assert.equal(harness.getState().skills.documents.version, "1.0.0");
+});
+
+test("a selected root cannot replace the ownership root of an installed managed component", async () => {
+  const state = emptyState(INSTALL_ROOT);
+  state.components.chatgpt = {
+    managed: true, installPath: `${INSTALL_ROOT}\\c`, version: "2.0.0",
+    entrypointPath: `${INSTALL_ROOT}\\c\\ChatGPT.exe`,
+    requiredFiles: [`${INSTALL_ROOT}\\c\\ChatGPT.exe`], health: "healthy",
+  };
+  const harness = fixture({ state });
+  const selectedRoot = harness.createAdaptersForInstallRoot(SECOND_INSTALL_CAPABILITY);
+
+  const inspected = await selectedRoot.chatgpt.inspectInstalled({});
+  assert.equal(inspected.status, "failed");
+  assert.match(inspected.message, /component_install_root_not_owned/u);
+  assert.equal(harness.getState().installRoot, INSTALL_ROOT);
 });
 
 test("a dead archive prepare is discarded under its old claim before a new prepare retries", async () => {
@@ -2159,6 +2241,7 @@ test("Skill prepared-source reconciliation failure is reported and retains trans
   assert.equal(inspected[0].status, "failed");
   assert.match(inspected[0].message, /prepared_recovery_failed/u);
   const prepared = await adapters.skills.prepare({ taskId: "reconcile-failed", skillIds: ["documents"] });
+  assert.equal(prepared[0].componentId, "documents");
   assert.equal(prepared[0].status, "failed");
   assert.match(prepared[0].message, /prepared_recovery_failed/u);
   assert.equal(getState().installRoot, INSTALL_ROOT);
@@ -2381,7 +2464,7 @@ test("skills commit revalidates both roots before replacement", async () => {
 });
 
 test("skills reject a catalog whose staging peak exceeds the authorized Windows path budget", async () => {
-  const excessive = `${"nested/".repeat(36)}SKILL.md`;
+  const excessive = `${`${"a".repeat(250)}/`.repeat(132)}SKILL.md`;
   const catalogService = trustedCatalog({ skills: [{ ...skill("documents"), files: ["SKILL.md", excessive] }] });
   const { adapters, calls } = fixture({ catalogService });
   const [prepared] = await adapters.skills.prepare({ taskId: "skills-long-path", skillIds: ["documents"] });

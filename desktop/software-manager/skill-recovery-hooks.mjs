@@ -213,8 +213,37 @@ export function createDefaultSkillRecoveryHooks({
         }
         return Object.freeze({ status: "recovered", state: recovery.state, heldLease });
       } catch (error) {
-        await lease.release().catch(() => {});
-        throw error;
+        // The exact lease is ours, so no process is still applying this swap.
+        // If strict reconciliation cannot prove either old or new content, keep
+        // the files untouched but release the stale ownership claim. This
+        // prevents one interrupted Skill from disabling unrelated software
+        // installs forever; reinstalling that Skill remains an explicit action.
+        let abandoned;
+        try {
+          const coordinator = getOwnershipCoordinator(ownershipStore);
+          abandoned = await coordinator.runExclusive(async (store) => {
+            const latest = await store.load();
+            if (JSON.stringify(latest.activeTask ?? null) !== JSON.stringify(task)) {
+              return Object.freeze({ status: "changed", state: latest });
+            }
+            const next = structuredClone(latest);
+            next.activeTask = null;
+            next.lastTask = {
+              taskId: task.taskId,
+              componentId: task.skillId,
+              action: "skill-recovery-abandoned",
+              error: String(error?.code || error?.message || "skill_recovery_failed"),
+            };
+            return Object.freeze({ status: "abandoned", state: await store.save(next) });
+          });
+        } catch (abandonError) {
+          try { await lease.release(); } catch {}
+          throw new AggregateError([error, abandonError], "software_manager_skill_recovery_abandon_failed", {
+            cause: error,
+          });
+        }
+        await lease.release();
+        return Object.freeze({ ...abandoned, heldLease: null });
       }
     },
     cleanupAbandonedPreparedSkills,

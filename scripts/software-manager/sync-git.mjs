@@ -23,17 +23,25 @@ function selectAsset(metadata) {
     return match ? { asset, version: match[1] } : null;
   }).filter(Boolean);
   if (candidates.length !== 1) throw gitError("software_sync_git_asset_invalid");
-  let url;
+  let browserUrl;
+  let apiUrl;
   try {
-    url = new URL(candidates[0].asset.browser_download_url);
+    browserUrl = new URL(candidates[0].asset.browser_download_url);
+    apiUrl = new URL(candidates[0].asset.url);
   } catch {
     throw gitError("software_sync_git_asset_rejected");
   }
-  if (url.protocol !== "https:" || url.hostname !== "github.com"
-    || !url.pathname.startsWith("/git-for-windows/git/releases/download/") || url.search || url.hash) {
+  if (browserUrl.protocol !== "https:" || browserUrl.hostname !== "github.com"
+    || !browserUrl.pathname.startsWith("/git-for-windows/git/releases/download/")
+    || browserUrl.search || browserUrl.hash || apiUrl.protocol !== "https:"
+    || apiUrl.hostname !== "api.github.com" || !Number.isSafeInteger(candidates[0].asset.id)
+    || candidates[0].asset.id < 1
+    || apiUrl.pathname !== `/repos/git-for-windows/git/releases/assets/${candidates[0].asset.id}`
+    || apiUrl.search || apiUrl.hash || !Number.isSafeInteger(candidates[0].asset.size)
+    || candidates[0].asset.size < 1) {
     throw gitError("software_sync_git_asset_rejected");
   }
-  return { ...candidates[0], url: url.href };
+  return { ...candidates[0], url: apiUrl.href };
 }
 
 export function parseAuthenticodeTimestamp(output) {
@@ -102,6 +110,7 @@ export async function inspectGitRelease({
   authenticodeInspector = defaultAuthenticodeInspector,
   workRoot,
   githubToken = process.env.GITHUB_TOKEN,
+  onProgress = null,
 } = {}) {
   const metadataHeaders = {
     accept: "application/vnd.github+json",
@@ -130,8 +139,17 @@ export async function inspectGitRelease({
     fetchImpl,
     workRoot,
     prefix: "git",
+    expectedSize: selected.asset.size,
+    headers: {
+      accept: "application/octet-stream",
+      ...(githubToken ? { authorization: `Bearer ${githubToken}` } : {}),
+    },
+    onProgress: typeof onProgress === "function"
+      ? (event) => onProgress(Object.freeze({ componentId: "git", ...event }))
+      : null,
   });
   try {
+    if (downloaded.size !== selected.asset.size) throw gitError("software_sync_git_asset_size_mismatch");
     const authenticode = String(await authenticodeInspector(downloaded.packagePath));
     if (authenticode !== "Valid") throw gitError("software_sync_git_authenticode_invalid");
     const unchanged = current?.sha256 === downloaded.sha256;

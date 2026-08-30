@@ -285,7 +285,11 @@ const softwareManagerNav = document.querySelector('[data-section="softwareManage
 let softwareManagerState = softwareManagerUi?.createInitialState?.() ?? null;
 let softwareManagerLoaded = false;
 let softwareManagerLoading = false;
+let softwareManagerRefreshPromise = null;
 let softwareManagerEventUnsubscribe = null;
+let softwareManagerPendingPluginIds = [];
+let softwareManagerCombinedResultPending = false;
+const softwareManagerCombinedTaskIds = new Set();
 let draftSelection = [];
 let dragSlotIndex = null;
 let editingCustomPresetId = null;
@@ -334,21 +338,49 @@ function renderSoftwareManager() {
 
 function updateSoftwareManager(action) {
   if (!softwareManagerUi || !softwareManagerState) return;
+  const priorSkillList = softwareManagerRoot?.querySelector?.(".software-skill-list");
+  const priorSkillScrollTop = Number(priorSkillList?.scrollTop || 0);
+  const active = document.activeElement;
+  const focusSelector = active?.matches?.("[data-software-skill]")
+    ? `[data-software-skill="${CSS.escape(active.dataset.softwareSkill)}"]`
+    : active?.matches?.("[data-software-plugin]")
+      ? `[data-software-plugin="${CSS.escape(active.dataset.softwarePlugin)}"]`
+      : "";
   softwareManagerState = softwareManagerUi.reduce(softwareManagerState, action);
   renderSoftwareManager();
+  const nextSkillList = softwareManagerRoot?.querySelector?.(".software-skill-list");
+  if (nextSkillList) nextSkillList.scrollTop = priorSkillScrollTop;
+  if (focusSelector) softwareManagerRoot?.querySelector?.(focusSelector)?.focus?.({ preventScroll: true });
 }
 
-async function refreshSoftwareManager() {
-  if (!softwareManagerLoaded || softwareManagerLoading) return;
-  softwareManagerLoading = true;
+async function refreshSoftwareManagerCuratedPlugins() {
   try {
-    const snapshot = await api.refreshSoftwareManager();
-    updateSoftwareManager({ type: "snapshot", snapshot });
-  } catch (error) {
-    updateSoftwareManager({ type: "error", error: error?.message || String(error) });
-  } finally {
-    softwareManagerLoading = false;
+    const plugins = await api.listCuratedCodexPlugins();
+    updateSoftwareManager({ type: "curated-plugins", plugins });
+    return plugins;
+  } catch {
+    return [];
   }
+}
+
+function refreshSoftwareManager() {
+  if (!softwareManagerLoaded) return Promise.resolve();
+  if (softwareManagerRefreshPromise) return softwareManagerRefreshPromise;
+  softwareManagerLoading = true;
+  softwareManagerRefreshPromise = (async () => {
+    try {
+      const snapshot = await api.refreshSoftwareManager();
+      const curatedPlugins = softwareManagerState?.snapshot?.curatedPlugins ?? [];
+      updateSoftwareManager({ type: "snapshot", snapshot: { ...snapshot, curatedPlugins } });
+      await refreshSoftwareManagerCuratedPlugins();
+    } catch (error) {
+      updateSoftwareManager({ type: "error", error: error?.message || String(error) });
+    } finally {
+      softwareManagerLoading = false;
+      softwareManagerRefreshPromise = null;
+    }
+  })();
+  return softwareManagerRefreshPromise;
 }
 
 async function ensureSoftwareManagerLoaded() {
@@ -356,15 +388,48 @@ async function ensureSoftwareManagerLoaded() {
   softwareManagerLoading = true;
   updateSoftwareManager({ type: "loading", loading: true });
   try {
-    const snapshot = await api.getSoftwareManagerSnapshot();
+    let snapshot = await api.getSoftwareManagerSnapshot();
     softwareManagerLoaded = true;
-    updateSoftwareManager({ type: "snapshot", snapshot });
+    updateSoftwareManager({ type: "snapshot", snapshot: { ...snapshot, curatedPlugins: [] } });
     if (!softwareManagerEventUnsubscribe) {
       softwareManagerEventUnsubscribe = api.onSoftwareManagerEvent((event) => {
+        const taskId = String(event?.taskId || event?.result?.taskId || "").trim();
+        if (event?.type === "finished" && taskId && softwareManagerCombinedTaskIds.has(taskId)) {
+          softwareManagerCombinedTaskIds.delete(taskId);
+          return;
+        }
+        if (event?.type === "finished" && softwareManagerCombinedResultPending) {
+          // The managed software service finishes before the separately routed
+          // curated plugins. Do not briefly publish the base result as the
+          // final result and then make it disappear again while plugins run.
+          updateSoftwareManager({
+            type: "task-event",
+            event: {
+              type: "progress",
+              taskId: taskId || `plugins-${Date.now()}`,
+              componentId: softwareManagerPendingPluginIds[0] || null,
+              phase: softwareManagerPendingPluginIds.length > 0 ? "plugin" : "finishing",
+              percent: null,
+              cancellable: false,
+              critical: true,
+              message: softwareManagerPendingPluginIds.length > 0 ? "正在准备完整插件" : "正在汇总任务结果",
+            },
+          });
+          return;
+        }
         updateSoftwareManager({ type: "task-event", event });
         if (event?.type === "finished") void refreshSoftwareManager();
       });
     }
+    const curatedPluginsPromise = refreshSoftwareManagerCuratedPlugins();
+    try {
+      snapshot = await api.refreshSoftwareManager();
+      const curatedPlugins = softwareManagerState?.snapshot?.curatedPlugins ?? [];
+      updateSoftwareManager({ type: "snapshot", snapshot: { ...snapshot, curatedPlugins } });
+    } catch (error) {
+      if (!snapshot?.catalog?.available) throw error;
+    }
+    await curatedPluginsPromise;
   } catch (error) {
     updateSoftwareManager({ type: "error", error: error?.message || String(error) });
   } finally {
@@ -380,15 +445,82 @@ async function startConfirmedSoftwareManagerTask() {
     componentIds: [...softwareManagerState.selectedComponentIds],
     skillIds: [...softwareManagerState.selectedSkillIds],
   };
+  const pluginIds = [...softwareManagerState.selectedPluginIds];
+  softwareManagerPendingPluginIds = [...pluginIds];
+  softwareManagerCombinedResultPending = pluginIds.length > 0;
   if (softwareManagerState.installRootToken) request.installRootToken = softwareManagerState.installRootToken;
   updateSoftwareManager({ type: "confirm-close" });
   try {
-    const result = await api.startSoftwareManagerTask(request);
-    const feedback = softwareManagerUi.taskResultFeedback(result);
+    let result = null;
+    const pluginResults = [];
+    let managedChatGptFailed = false;
+    let pluginTaskBlockedCore = false;
+    const runSelectedPlugins = async () => {
+      if (pluginIds.length === 0) return;
+      if (managedChatGptFailed) {
+        pluginResults.push(...pluginIds.map((id) => ({
+          componentId: id, action: request.kind, status: "failed",
+          versionBefore: null, versionAfter: null,
+          message: "curated_plugin_requires_chatgpt_install", rollbackAvailable: false,
+        })));
+      } else {
+        const pluginTask = await api.runCuratedCodexPluginTask({
+          kind: request.kind,
+          pluginIds,
+        });
+        pluginResults.push(...(pluginTask?.plugins ?? []));
+      }
+      softwareManagerPendingPluginIds = [];
+      pluginTaskBlockedCore = request.kind === "uninstall"
+        && pluginResults.some(({ status }) => !["succeeded", "skipped"].includes(status));
+    };
+    if (request.kind === "uninstall") await runSelectedPlugins();
+    if (!pluginTaskBlockedCore && (request.componentIds.length > 0 || request.skillIds.length > 0)) {
+      result = await api.startSoftwareManagerTask(request);
+    } else if (pluginTaskBlockedCore) {
+      const blocked = (id) => ({
+        componentId: id, action: request.kind, status: "failed",
+        versionBefore: null, versionAfter: null,
+        message: "software_manager_blocked_by_plugin_failure", rollbackAvailable: false,
+      });
+      result = {
+        taskId: `plugins-blocked-${Date.now()}`,
+        kind: request.kind,
+        status: "failed",
+        components: request.componentIds.map(blocked),
+        skills: request.skillIds.map(blocked),
+      };
+    }
+    managedChatGptFailed = request.kind === "install"
+      && request.componentIds.includes("chatgpt")
+      && result?.components?.some((entry) => entry?.componentId === "chatgpt" && entry?.status === "failed");
+    const managedTaskCancelled = result?.status === "cancelled"
+      || [...(result?.components ?? []), ...(result?.skills ?? [])].some(({ status }) => status === "cancelled");
+    if (request.kind !== "uninstall" && !managedTaskCancelled) await runSelectedPlugins();
+    if (request.kind !== "uninstall" && managedTaskCancelled) {
+      pluginResults.push(...pluginIds.map((id) => ({
+        componentId: id, action: request.kind, status: "cancelled",
+        versionBefore: null, versionAfter: null,
+        message: "software_manager_cancelled", rollbackAvailable: false,
+      })));
+    }
+    const combined = softwareManagerUi.combineTaskResults(result, pluginResults, request.kind);
+    if (pluginIds.length > 0 && combined?.taskId) {
+      softwareManagerCombinedTaskIds.add(combined.taskId);
+      while (softwareManagerCombinedTaskIds.size > 32) {
+        softwareManagerCombinedTaskIds.delete(softwareManagerCombinedTaskIds.values().next().value);
+      }
+    }
+    softwareManagerPendingPluginIds = [];
+    softwareManagerCombinedResultPending = false;
+    updateSoftwareManager({ type: "task-result", result: combined });
+    const feedback = softwareManagerUi.taskResultFeedback(combined);
     showToast(feedback.message, feedback.tone);
     await refreshSoftwareManager();
-    return result;
+    return combined;
   } catch (error) {
+    softwareManagerPendingPluginIds = [];
+    softwareManagerCombinedResultPending = false;
     updateSoftwareManager({ type: "error", error: error?.message || String(error) });
     showToast(error?.message || String(error), "error");
   }
@@ -403,6 +535,10 @@ softwareManagerRoot?.addEventListener("click", (event) => {
   }
   if (control.matches("[data-software-refresh]")) {
     void refreshSoftwareManager();
+    return;
+  }
+  if (control.matches("[data-software-toggle-skills]")) {
+    updateSoftwareManager({ type: "toggle-skills" });
     return;
   }
   if (control.matches("[data-software-choose-root]")) {
@@ -435,6 +571,7 @@ softwareManagerRoot?.addEventListener("click", (event) => {
       ...softwareManagerState,
       selectedComponentIds: [...selection.componentIds],
       selectedSkillIds: [...selection.skillIds],
+      selectedPluginIds: [...selection.pluginIds],
     };
     updateSoftwareManager({ type: "confirm-open" });
     return;
@@ -459,7 +596,12 @@ softwareManagerRoot?.addEventListener("change", (event) => {
     return;
   }
   const skill = event.target.closest("[data-software-skill]");
-  if (skill) updateSoftwareManager({ type: "toggle-skill", skillId: skill.dataset.softwareSkill, checked: skill.checked });
+  if (skill) {
+    updateSoftwareManager({ type: "toggle-skill", skillId: skill.dataset.softwareSkill, checked: skill.checked });
+    return;
+  }
+  const plugin = event.target.closest("[data-software-plugin]");
+  if (plugin) updateSoftwareManager({ type: "toggle-plugin", pluginId: plugin.dataset.softwarePlugin, checked: plugin.checked });
 });
 
 softwareManagerRoot?.addEventListener("input", (event) => {
@@ -1071,6 +1213,8 @@ function activateSection(sectionId) {
   document.querySelectorAll(".section-panel").forEach((item) => item.classList.add("hidden"));
   button.classList.add("active");
   section.classList.remove("hidden");
+  const mainScroller = document.querySelector(".main");
+  if (mainScroller) mainScroller.scrollTop = 0;
   renderActiveSection(sectionId);
   void ensureSettingsDetailForSection(sectionId);
   void ensureDetailedStateForSection(sectionId);
@@ -2213,7 +2357,15 @@ function renderActiveSection(sectionId = currentSectionId()) {
     return;
   }
   if (sectionId === "softwareManager") {
-    renderSoftwareManager();
+    // Software Manager owns a separate state machine and re-renders from its
+    // own IPC events. Global Router/usage/resource broadcasts can arrive while
+    // the user is clicking a checkbox; rebuilding this subtree for unrelated
+    // state detached the active control and made selections appear unclickable.
+    // The first activation is rendered here, then its dedicated reducer is the
+    // only writer until the page is opened again in a fresh renderer.
+    if (!softwareManagerLoaded && !softwareManagerLoading) {
+      renderSoftwareManager();
+    }
     return;
   }
   if (sectionId === "doubleQuota") {

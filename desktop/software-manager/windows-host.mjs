@@ -212,7 +212,10 @@ function validateRegistryRecord(value, registryKey) {
   let installDir;
   let uninstallerPath;
   try {
-    installDir = requireDirectoryPath(value.InstallLocation, "git_install_location_absolute_required");
+    const registryInstallLocation = value.InstallLocation.endsWith("\\")
+      ? value.InstallLocation.slice(0, -1)
+      : value.InstallLocation;
+    installDir = requireDirectoryPath(registryInstallLocation, "git_install_location_absolute_required");
     const uninstallValue = strictUninstallExecutable(value.UninstallString);
     uninstallerPath = requireExecutablePath(uninstallValue);
   } catch (error) {
@@ -545,13 +548,12 @@ export function createWindowsHost({
       if (records.length > 1) throw hostError("git_multiple_installations");
 
       const pathExecutables = await discoverWhereGit(execFile, env);
-      if (pathExecutables.length > 1) throw hostError("git_multiple_installations");
       if (records.length === 0 && pathExecutables.length === 0) return { kind: "none" };
       if (records.length === 0) throw hostError("git_portable_or_unregistered");
       if (pathExecutables.length === 0) throw hostError("git_registry_incomplete");
 
       const record = records[0];
-      if (pathKey(record.executablePath) !== pathKey(pathExecutables[0])) {
+      if (!pathExecutables.some((candidate) => pathKey(record.executablePath) === pathKey(candidate))) {
         throw hostError("git_executable_mismatch");
       }
       return {

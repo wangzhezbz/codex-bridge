@@ -103,7 +103,9 @@ def immutable_zip(destination: Path, source: zipfile.ZipFile, entries: list[tupl
                 if any(relative.casefold() == name.casefold() for name, _ in entries):
                     raise fail("legacy_archive_duplicate_path")
                 output.writestr(normalized_info(relative), data)
-        with temporary.open("rb") as handle:
+        # Windows rejects fsync on a read-only descriptor even though Linux accepts it.
+        # Open the completed archive read/write solely for the durability barrier.
+        with temporary.open("rb+") as handle:
             os.fsync(handle.fileno())
         try:
             os.link(temporary, destination)

@@ -33,10 +33,12 @@ test("terminal text buffering enforces UTF-8 bytes at the exact boundary", async
   assert.throws(
     () => appendTerminalText(state, "b"),
     (error) => {
-      assert.equal(error.message, "Responses terminal event exceeds 4 bytes.");
-      assert.equal(error.statusCode, 503);
-      assert.equal(error.code, "local_history_storage_unavailable");
-      assert.equal(error.localHistoryError, true);
+      assert.equal(error.name, "UpstreamResponseTooLargeError");
+      assert.equal(error.statusCode, 502);
+      assert.equal(error.code, "upstream_response_too_large");
+      assert.equal(error.limitBytes, 4);
+      assert.equal(error.actualBytes, 5);
+      assert.equal(error.localHistoryError, undefined);
       return true;
     },
   );

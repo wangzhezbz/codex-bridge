@@ -167,6 +167,22 @@ test("catalog-unavailable snapshot is read-only without exposing package authori
   );
 });
 
+test("a first-run machine fetches and verifies the catalog when no cache exists", async () => {
+  const catalog = catalogFixture();
+  const calls = [];
+  const { service } = fixtureService({
+    catalogProvider: {
+      getCurrent: async () => { calls.push("cache"); return null; },
+      refresh: async () => { calls.push("network"); return catalog; },
+    },
+  });
+  const snapshot = await service.getSnapshot();
+  assert.deepEqual(calls, ["cache", "network"]);
+  assert.equal(snapshot.catalog.available, true);
+  assert.equal(snapshot.readOnly, false);
+  assert.equal(snapshot.catalog.components.length, 3);
+});
+
 test("install defaults select only ChatGPT and update defaults follow adapter inspection", async () => {
   const { service } = fixtureService({
     chatgpt: { inspect: async () => operationResult("chatgpt", "inspect", "succeeded", { versionBefore: "1.0.0", versionAfter: "1.0.0" }) },
@@ -262,7 +278,8 @@ test("chooseInstallRoot returns only an opaque token and adapters receive only r
   });
   service.subscribe((event) => events.push(event));
   assert.deepEqual(await service.chooseInstallRoot("C:\\Chosen"), { installRootToken: "opaque_root_123456" });
-  assert.equal(events.some(({ type }) => type === "snapshot"), true);
+  const selectedSnapshot = events.find(({ type }) => type === "snapshot")?.snapshot;
+  assert.equal(selectedSnapshot?.installRootPath, "C:\\Chosen");
   const result = await service.startTask({
     kind: "install", componentIds: ["chatgpt"], skillIds: [], installRootToken: "opaque_root_123456",
   });
@@ -339,6 +356,25 @@ test("a denied Skills inspection remains visible but does not block install-root
   assert.equal(snapshot.components.every(({ updateState }) => updateState !== "error"), true);
 });
 
+test("an unrelated Git inspection failure stays visible but does not block install-root adoption", async () => {
+  const events = [];
+  const { service } = fixtureService({
+    git: {
+      inspect: async () => operationResult("git", "inspect", "failed", {
+        message: "git_registry_incomplete",
+      }),
+    },
+  });
+  service.subscribe((event) => events.push(event));
+
+  assert.deepEqual(await service.chooseInstallRoot("D:\\CBApps"), {
+    installRootToken: "root_token_00000001",
+  });
+  const snapshot = events.find(({ type }) => type === "snapshot")?.snapshot;
+  assert.equal(snapshot.installRootPath, "D:\\CBApps");
+  assert.equal(snapshot.components.find(({ id }) => id === "git").updateState, "error");
+});
+
 test("request schema is exact, ordered, duplicate-free, and authority-safe", async () => {
   const { service } = fixtureService();
   const invalid = [
@@ -408,7 +444,11 @@ test("update re-inspects selected components and skips an already-current versio
   let prepares = 0;
   const { service } = fixtureService({
     chatgpt: {
-      inspect: async () => operationResult("chatgpt", "inspect", "succeeded", { versionBefore: "2.0.0", versionAfter: "2.0.0" }),
+      inspect: async () => operationResult("chatgpt", "inspect", "succeeded", {
+        versionBefore: "2.0.0",
+        versionAfter: "2.0.0",
+        details: { installPath: "D:\\CBApps\\c", previousVersion: null },
+      }),
       prepare: async () => { prepares += 1; return operationResult("chatgpt", "prepare"); },
     },
   });
@@ -416,6 +456,41 @@ test("update re-inspects selected components and skips an already-current versio
   assert.equal(prepares, 0);
   assert.deepEqual(result.components.map(({ status }) => status), ["skipped"]);
   assert.match(result.components[0].message, /already_current/);
+  assert.equal(Object.hasOwn(result.components[0], "details"), false);
+});
+
+test("update treats an undetectable installation as a new verified install", async () => {
+  let prepares = 0;
+  const { service } = fixtureService({
+    chatgpt: {
+      inspect: async () => { throw new Error("version detection unavailable"); },
+      prepare: async () => { prepares += 1; return operationResult("chatgpt", "prepare"); },
+    },
+  });
+
+  const result = await service.startTask({ kind: "update", componentIds: ["chatgpt"], skillIds: [] });
+
+  assert.equal(prepares, 1);
+  assert.equal(result.status, "succeeded");
+});
+
+test("selected component prepare receives explicit selection authority", async () => {
+  let receivedContext = null;
+  const { service } = fixtureService({
+    git: {
+      prepare: async (context) => {
+        receivedContext = context;
+        return context.selected === true
+          ? operationResult("git", "prepare")
+          : operationResult("git", "prepare", "failed", { message: "git_explicit_selection_required" });
+      },
+    },
+  });
+
+  const result = await service.startTask({ kind: "install", componentIds: ["git"], skillIds: [] });
+
+  assert.equal(result.status, "succeeded");
+  assert.equal(receivedContext?.selected, true);
 });
 
 test("components execute serially in request order", async () => {
@@ -471,12 +546,35 @@ test("recovery runs before new work and fails closed on a persistent Task 7 clai
   });
   const snapshot = await service.getSnapshot();
   assert.equal(snapshot.pendingRecovery, true);
-  assert.equal(snapshot.task.external, true);
+  assert.equal(snapshot.task, null);
   await assert.rejects(
     service.startTask({ kind: "install", componentIds: ["v2rayn"], skillIds: [] }),
     /software_manager_pending_recovery/,
   );
-  assert.deepEqual(order, ["recover", "recover"]);
+  assert.deepEqual(order, ["recover", "inspect", "recover", "inspect"]);
+});
+
+test("snapshot inspection recovers an abandoned prepare claim before declaring the page read-only", async () => {
+  const state = {
+    activeTask: {
+      kind: "component-prepare", taskId: "interrupted", componentId: "chatgpt", version: "2.0.0",
+      leaseScope: "prepare", leaseNonce: "1".repeat(32),
+    },
+    components: {}, skills: {}, rollback: null,
+  };
+  const { service } = fixtureService({
+    state,
+    chatgpt: {
+      inspect: async () => {
+        state.activeTask = null;
+        return operationResult("chatgpt", "inspect", "skipped", { message: "chatgpt_not_installed" });
+      },
+    },
+  });
+  const snapshot = await service.getSnapshot();
+  assert.equal(snapshot.pendingRecovery, false);
+  assert.equal(snapshot.readOnly, false);
+  assert.equal(snapshot.task, null);
 });
 
 test("a later start retries failed recovery and proceeds only after the durable claim clears", async () => {
@@ -526,6 +624,22 @@ test("catalog provider exceptions produce a read-only snapshot instead of escapi
   assert.equal(snapshot.readOnly, true);
   assert.equal(snapshot.catalog.available, false);
   assert.equal(JSON.stringify(snapshot).includes("secret"), false);
+});
+
+test("catalog refresh keeps the last verified cache when the network refresh fails", async () => {
+  const cached = catalogFixture();
+  const { service } = fixtureService({
+    catalogProvider: {
+      getCurrent: async () => cached,
+      refresh: async () => { throw new Error("offline"); },
+    },
+  });
+  const before = await service.getSnapshot();
+  const after = await service.refresh();
+  assert.equal(before.catalog.available, true);
+  assert.equal(after.catalog.available, true);
+  assert.deepEqual(after.catalog.skills.map(({ id }) => id), before.catalog.skills.map(({ id }) => id));
+  assert.equal(after.readOnly, false);
 });
 
 test("cancel aborts a cancellable download and never enters commit", async () => {
@@ -743,7 +857,7 @@ test("cancel is disabled before critical commit and no AbortSignal reaches criti
   assert.equal(service.hasCriticalTask(), false);
 });
 
-test("uninstall and rollback are critical from entry and never receive AbortSignal", async () => {
+test("confirmed uninstall and rollback enter critical mutation without an AbortSignal", async () => {
   for (const kind of ["uninstall", "rollback"]) {
     const entered = deferred();
     const release = deferred();
@@ -751,11 +865,37 @@ test("uninstall and rollback are critical from entry and never receive AbortSign
       assert.equal(Object.hasOwn(context, "signal"), false);
       entered.resolve(); await release.promise; return operationResult("chatgpt", kind);
     };
-    const { service } = fixtureService({ chatgpt: { [kind]: operation } });
+    const { service } = fixtureService({
+      chatgpt: {
+        inspect: async () => operationResult("chatgpt", "inspect", "succeeded", {
+          versionBefore: "1.0.0", versionAfter: "1.0.0",
+        }),
+        [kind]: operation,
+      },
+    });
     const running = service.startTask({ kind, componentIds: ["chatgpt"], skillIds: [] });
     await entered.promise;
     assert.deepEqual(service.cancelTask(), { cancelled: false, reason: "critical" });
     release.resolve(); await running;
+  }
+});
+
+test("uninstall skips components that are missing or cannot be detected", async () => {
+  for (const inspect of [
+    async () => operationResult("chatgpt", "inspect", "skipped"),
+    async () => { throw new Error("detection unavailable"); },
+  ]) {
+    let uninstalls = 0;
+    const { service } = fixtureService({
+      chatgpt: {
+        inspect,
+        uninstall: async () => { uninstalls += 1; return operationResult("chatgpt", "uninstall"); },
+      },
+    });
+    const result = await service.startTask({ kind: "uninstall", componentIds: ["chatgpt"], skillIds: [] });
+    assert.equal(uninstalls, 0);
+    assert.equal(result.status, "succeeded");
+    assert.equal(result.components[0].status, "skipped");
   }
 });
 
@@ -823,16 +963,28 @@ test("quit reservation observes an accepted running task without waiting for tha
   assert.equal(service.releaseQuit(decision.reservation), true);
 });
 
-test("recovery failure makes synchronous and reserved quit decisions fail closed", async () => {
+test("recovery or environment detection failure never traps an idle user inside CodexBridge", async () => {
   const { service } = fixtureService({
     recoverTransactions: async () => { throw new Error("recovery failed"); },
   });
   assert.equal((await service.recoverPending()).pending, true);
-  assert.deepEqual(service.prepareForQuit(), { allowQuit: false, reason: "critical" });
+  assert.deepEqual(service.prepareForQuit(), { allowQuit: true });
   const decision = await service.beginQuit();
-  assert.equal(decision.allowQuit, false);
-  assert.equal(decision.reason, "critical");
+  assert.equal(decision.allowQuit, true);
   assert.equal(service.releaseQuit(decision.reservation), true);
+});
+
+test("recovery inspection failure keeps a trusted catalog usable for install", async () => {
+  const { service } = fixtureService({
+    recoverTransactions: async () => { throw new Error("recovery failed"); },
+  });
+
+  const snapshot = await service.getSnapshot();
+  assert.equal(snapshot.catalog.available, true);
+  assert.equal(snapshot.readOnly, false);
+  assert.equal(snapshot.pendingRecovery, true);
+  const result = await service.startTask({ kind: "install", componentIds: ["chatgpt"], skillIds: [] });
+  assert.equal(result.status, "succeeded");
 });
 
 test("finishing log drain is non-critical and non-cancellable across cancel, quit, and snapshot", async () => {
@@ -866,7 +1018,7 @@ test("critical state is reset even when an adapter throws", async () => {
   assert.deepEqual(service.prepareForQuit(), { allowQuit: true });
 });
 
-test("an external durable claim is one consistent effective critical task", async () => {
+test("an external durable claim remains recovery metadata rather than a running UI task", async () => {
   const state = {
     activeTask: {
       kind: "component-prepare", taskId: "other", componentId: "chatgpt", version: "2.0.0",
@@ -886,21 +1038,17 @@ test("an external durable claim is one consistent effective critical task", asyn
     },
   });
   const snapshot = await service.getSnapshot();
-  assert.deepEqual(Object.keys(snapshot.task).sort(), [
-    "cancellable", "componentId", "critical", "external", "kind", "phase", "taskId",
-  ]);
-  assert.equal(snapshot.task.external, true);
-  assert.equal(snapshot.task.critical, true);
+  assert.equal(snapshot.task, null);
   assert.equal(JSON.stringify(snapshot).includes("N".repeat(32)), false);
-  assert.equal(service.hasCriticalTask(), true);
-  assert.deepEqual(service.prepareForQuit(), { allowQuit: false, reason: "critical" });
-  assert.deepEqual(service.cancelTask(), { cancelled: false, reason: "critical" });
+  assert.equal(service.hasCriticalTask(), false);
+  assert.deepEqual(service.prepareForQuit(), { allowQuit: true });
+  assert.deepEqual(service.cancelTask(), { cancelled: false, reason: "idle" });
   await assert.rejects(service.chooseInstallRoot("C:\\New"), /software_manager_pending_recovery/);
   await assert.rejects(service.refresh(), /software_manager_pending_recovery/);
   assert.equal(chooseCalls, 0);
 });
 
-test("external skill claims expose only the public kind and normalized component id", async () => {
+test("external skill claims stay internal and do not impersonate a running task", async () => {
   const state = {
     activeTask: {
       kind: "skill-prepare", taskId: "other", skillId: "documents", target: "C:\\secret\\documents",
@@ -909,21 +1057,14 @@ test("external skill claims expose only the public kind and normalized component
     components: {}, skills: {}, rollback: null,
   };
   const { service } = fixtureService({ state });
-  const task = (await service.getSnapshot()).task;
-  assert.deepEqual({ ...task }, {
-    external: true,
-    critical: true,
-    cancellable: false,
-    taskId: "other",
-    kind: "skill-prepare",
-    phase: "skill-prepare",
-    componentId: "documents",
-  });
-  assert.equal(JSON.stringify(task).includes("secret"), false);
-  assert.equal(JSON.stringify(task).includes("N".repeat(32)), false);
+  const snapshot = await service.getSnapshot();
+  assert.equal(snapshot.task, null);
+  assert.equal(snapshot.pendingRecovery, true);
+  assert.equal(JSON.stringify(snapshot).includes("secret"), false);
+  assert.equal(JSON.stringify(snapshot).includes("N".repeat(32)), false);
 });
 
-test("external task component identity is derived from kind-specific fixed fields", async () => {
+test("external task component identity is not exposed as current UI work", async () => {
   const state = {
     activeTask: {
       kind: "git-uninstall", taskId: "other", componentId: "chatgpt", skillId: "documents",
@@ -932,11 +1073,10 @@ test("external task component identity is derived from kind-specific fixed field
     components: {}, skills: {}, rollback: null,
   };
   const { service } = fixtureService({ state });
-  const task = (await service.getSnapshot()).task;
-  assert.equal(task.kind, "git-uninstall");
-  assert.equal(task.componentId, "git");
-  assert.equal(JSON.stringify(task).includes("chatgpt"), false);
-  assert.equal(JSON.stringify(task).includes("documents"), false);
+  const snapshot = await service.getSnapshot();
+  assert.equal(snapshot.task, null);
+  assert.equal(snapshot.pendingRecovery, true);
+  assert.equal(JSON.stringify(snapshot).includes("secret"), false);
 });
 
 test("snapshot retries stale recovery through the entry gate after an external claim clears", async () => {
@@ -1015,8 +1155,8 @@ test("every asynchronous entry gate fresh-loads a durable claim created after a 
     if (entry === "snapshot") {
       const snapshot = await service.getSnapshot();
       assert.equal(snapshot.pendingRecovery, true);
-      assert.equal(snapshot.task.external, true);
-      assert.deepEqual(service.prepareForQuit(), { allowQuit: false, reason: "critical" });
+      assert.equal(snapshot.task, null);
+      assert.deepEqual(service.prepareForQuit(), { allowQuit: true });
     } else if (entry === "refresh") {
       await assert.rejects(service.refresh(), /software_manager_pending_recovery/);
     } else if (entry === "choose") {
@@ -1095,7 +1235,7 @@ test("fresh ownership recheck catches claims created during refresh, root choice
       /software_manager_pending_recovery/,
     );
     assert.equal(prepareCalls, 0);
-    assert.equal((await service.getSnapshot()).task.external, true);
+    assert.equal((await service.getSnapshot()).task, null);
   }
 });
 
@@ -1186,29 +1326,74 @@ test("adapter versions and action-specific null semantics are strict", async () 
     assert.match(result.components[0].message, /adapter_result_invalid/);
   }
   const { service } = fixtureService({
-    chatgpt: { uninstall: async () => operationResult("chatgpt", "uninstall", "succeeded", { versionAfter: "2.0.0" }) },
+    chatgpt: {
+      inspect: async () => operationResult("chatgpt", "inspect", "succeeded", {
+        versionBefore: "1.0.0", versionAfter: "1.0.0",
+      }),
+      uninstall: async () => operationResult("chatgpt", "uninstall", "succeeded", { versionAfter: "2.0.0" }),
+    },
   });
   const uninstall = await service.startTask({ kind: "uninstall", componentIds: ["chatgpt"], skillIds: [] });
   assert.equal(uninstall.components[0].status, "failed");
   assert.match(uninstall.components[0].message, /adapter_result_invalid/);
 });
 
-test("Skill adapter output rejects duplicate, missing, unknown, or extra IDs as one malformed batch", async () => {
-  const catalogService = catalogFixture({ skills: [skillEntry("documents"), skillEntry("spreadsheets")] });
+test("Skill adapter output rejects duplicate, missing, unknown, or extra IDs for each isolated Skill", async () => {
+  const catalogService = catalogFixture({ skills: [skillEntry("documents")] });
   const badOutputs = [
-    [operationResult("documents", "prepare")],
+    [],
     [operationResult("documents", "prepare"), operationResult("documents", "prepare")],
-    [operationResult("documents", "prepare"), operationResult("unknown", "prepare")],
-    [operationResult("documents", "prepare"), operationResult("spreadsheets", "prepare"), operationResult("extra", "prepare")],
+    [operationResult("unknown", "prepare")],
+    [operationResult("documents", "prepare"), operationResult("extra", "prepare")],
   ];
   for (const output of badOutputs) {
     const calls = [];
     const { service } = fixtureService({ calls, catalogService, skills: { prepare: async () => output } });
-    const result = await service.startTask({ kind: "install", componentIds: [], skillIds: ["documents", "spreadsheets"] });
+    const result = await service.startTask({ kind: "install", componentIds: [], skillIds: ["documents"] });
     assert.equal(result.status, "failed");
-    assert.deepEqual(result.skills.map(({ status }) => status), ["failed", "failed"]);
+    assert.deepEqual(result.skills.map(({ status }) => status), ["failed"]);
     assert.equal(calls.some(({ id, action }) => id === "skills" && action === "discardPrepared"), true);
   }
+});
+
+test("multiple Skills complete prepare, commit, and release one item at a time", async () => {
+  const calls = [];
+  const catalogService = catalogFixture({ skills: [skillEntry("documents"), skillEntry("spreadsheets")] });
+  const { service } = fixtureService({ calls, catalogService });
+  const result = await service.startTask({
+    kind: "install", componentIds: [], skillIds: ["documents", "spreadsheets"],
+  });
+  assert.equal(result.status, "succeeded");
+  assert.deepEqual(result.skills.map(({ componentId, status }) => [componentId, status]), [
+    ["documents", "succeeded"],
+    ["spreadsheets", "succeeded"],
+  ]);
+  assert.deepEqual(calls.filter(({ id, action }) => id === "skills" && action !== "inspect")
+    .map(({ action, context }) => [action, context.skillIds]), [
+    ["prepare", ["documents"]],
+    ["commit", ["documents"]],
+    ["discardPrepared", ["documents"]],
+    ["prepare", ["spreadsheets"]],
+    ["commit", ["spreadsheets"]],
+    ["discardPrepared", ["spreadsheets"]],
+  ]);
+});
+
+test("a synchronous Skill discard result is awaited without calling catch on undefined", async () => {
+  const calls = [];
+  const skills = skillsAdapterFixture({ calls });
+  skills.discardPrepared = (context) => {
+    calls.push({ id: "skills", action: "discardPrepared", context });
+    return undefined;
+  };
+  const { service } = fixtureService({ calls, adapters: { skills } });
+
+  const result = await service.startTask({ kind: "install", componentIds: [], skillIds: ["documents"] });
+
+  assert.equal(result.status, "succeeded");
+  assert.deepEqual(result.skills.map(({ componentId, status }) => [componentId, status]), [
+    ["documents", "succeeded"],
+  ]);
 });
 
 test("overall status needs a real success; skipped plus failed is failed", async () => {

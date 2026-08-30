@@ -12,6 +12,7 @@ import {
 import {
   adapterIdForRoute,
   adapterContractForRoute,
+  codexOpenAiPortableHistoryRetryPayload,
   filterPayloadForAdapter,
   normalizeAdapterProfile,
   reasoningParamsForAdapter,
@@ -230,6 +231,200 @@ test("codex_openai strips foreign reasoning content from stored item references"
   );
 
   assert.deepEqual(filtered.input, [{ id: "rs_foreign_reasoning", type: "reasoning" }]);
+});
+
+test("codex_openai converts foreign assistant output messages into portable history", () => {
+  const filtered = filterPayloadForAdapter(
+    {
+      model: "gpt-5.6-terra",
+      previous_response_id: "resp_deepseek_flash_failed",
+      input: [
+        {
+          id: "msg_foreign_deepseek_answer",
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          phase: "commentary",
+          content: [
+            {
+              type: "output_text",
+              text: "DeepSeek already showed this answer.",
+              annotations: [],
+            },
+          ],
+        },
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "Continue with Terra." }],
+        },
+      ],
+    },
+    {
+      id: "cb-gpt-5-6-terra",
+      provider: "codex",
+      api: "responses",
+      model: "gpt-5.6-terra",
+      authMode: "codex_openai",
+    },
+  );
+
+  assert.equal(filtered.previous_response_id, "resp_deepseek_flash_failed");
+  assert.deepEqual(filtered.input, [
+    {
+      role: "assistant",
+      content: "DeepSeek already showed this answer.",
+      phase: "commentary",
+    },
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "Continue with Terra." }],
+    },
+  ]);
+  assert.equal(JSON.stringify(filtered.input).includes("msg_foreign_deepseek_answer"), false);
+  assert.equal(JSON.stringify(filtered.input).includes("output_text"), false);
+});
+
+test("codex_openai portable retry removes unresolved output references and keeps tool pairs", () => {
+  const retry = codexOpenAiPortableHistoryRetryPayload({
+    model: "gpt-5.6-terra",
+    previous_response_id: "resp_foreign_provider",
+    store: true,
+    input: [
+      {
+        id: "msg_foreign_empty",
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        content: [],
+      },
+      {
+        id: "msg_foreign_mixed",
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        phase: "commentary",
+        content: [
+          { type: "output_text", text: "visible text survives" },
+          { type: "custom_part", provider_private: true },
+        ],
+      },
+      {
+        id: "computer_foreign_call",
+        type: "computer_call",
+        status: "completed",
+        call_id: "call_screen",
+        name: "computer_screenshot",
+        arguments: { display_id: "main" },
+      },
+      {
+        id: "computer_foreign_output",
+        type: "computer_call_output",
+        status: "completed",
+        call_id: "call_screen",
+        output: { text: "screen captured" },
+      },
+      {
+        id: "image_foreign_output",
+        type: "image_generation_call",
+        status: "completed",
+        result: "provider-private-image",
+      },
+      {
+        role: "user",
+        content: [{ type: "input_text", text: "continue" }],
+      },
+    ],
+  });
+
+  assert.equal(retry.previous_response_id, undefined);
+  assert.deepEqual(retry.input, [
+    {
+      role: "assistant",
+      content: "visible text survives",
+      phase: "commentary",
+    },
+    {
+      type: "function_call",
+      call_id: "call_screen",
+      name: "computer_screenshot",
+      arguments: '{"display_id":"main"}',
+    },
+    {
+      type: "function_call_output",
+      call_id: "call_screen",
+      output: { text: "screen captured" },
+    },
+    {
+      role: "user",
+      content: [{ type: "input_text", text: "continue" }],
+    },
+  ]);
+  assert.equal(JSON.stringify(retry).includes("msg_foreign_empty"), false);
+  assert.equal(JSON.stringify(retry).includes("provider-private-image"), false);
+});
+
+test("codex_openai keeps encrypted reasoning while portableizing visible assistant history", () => {
+  const encryptedReasoning = {
+    id: "rs_codex_encrypted",
+    type: "reasoning",
+    encrypted_content: "encrypted-reasoning-payload",
+  };
+  const filtered = filterPayloadForAdapter(
+    {
+      model: "gpt-5.6-terra",
+      store: false,
+      input: [
+        encryptedReasoning,
+        {
+          id: "msg_visible_history",
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: "visible answer" }],
+        },
+      ],
+    },
+    {
+      id: "cb-gpt-5-6-terra",
+      provider: "codex",
+      api: "responses",
+      model: "gpt-5.6-terra",
+      authMode: "codex_openai",
+    },
+  );
+
+  assert.deepEqual(filtered.input, [
+    encryptedReasoning,
+    { role: "assistant", content: "visible answer" },
+  ]);
+});
+
+test("API-key Responses routes retain standard output-message history items", () => {
+  const outputMessage = {
+    id: "msg_api_history",
+    type: "message",
+    role: "assistant",
+    status: "completed",
+    content: [{ type: "output_text", text: "standard API history" }],
+  };
+  const filtered = filterPayloadForAdapter(
+    {
+      model: "custom-responses-model",
+      input: [outputMessage],
+    },
+    {
+      id: "custom-responses-route",
+      provider: "custom",
+      custom: true,
+      api: "responses",
+      model: "custom-responses-model",
+      authMode: "api_key",
+    },
+  );
+
+  assert.deepEqual(filtered.input, [outputMessage]);
 });
 
 test("adapter profiles classify DeepSeek chat routes", () => {

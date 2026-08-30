@@ -10,6 +10,7 @@ import {
 } from "../src/responses-to-chat.js";
 import {
   assistantHistoryMessageFromChat,
+  assistantHistoryMessageFromResponse,
   chatResponseToResponse,
   returnedToolDiagnosticsFromChat,
   returnedToolDiagnosticsLogFields,
@@ -30,6 +31,69 @@ const imageRoute = {
   ...route,
   inputModalities: ["text", "image"],
 };
+
+test("assistant phase survives Responses history conversion but never leaks to chat providers", () => {
+  const input = [{
+    type: "message",
+    role: "assistant",
+    phase: "commentary",
+    content: [{ type: "output_text", text: "I will inspect first." }],
+  }];
+  const messages = responseInputToChatMessages(input, undefined, route);
+  assert.deepEqual(messages, [{
+    role: "assistant",
+    content: "I will inspect first.",
+    responses_phase: "commentary",
+  }]);
+
+  const converted = responsesToChatRequest({ input }, route, new ResponseHistory());
+  assert.equal(converted.body.messages[0].responses_phase, undefined);
+  assert.equal(converted.body.messages[0].phase, undefined);
+});
+
+test("a single Responses assistant phase survives local history persistence metadata", () => {
+  const historyMessage = assistantHistoryMessageFromResponse({
+    id: "resp_phase_history",
+    object: "response",
+    status: "completed",
+    output: [{
+      id: "msg_phase_history",
+      type: "message",
+      role: "assistant",
+      status: "completed",
+      phase: "final_answer",
+      content: [{ type: "output_text", text: "finished" }],
+    }],
+  });
+
+  assert.equal(historyMessage.content, "finished");
+  assert.equal(historyMessage.responses_phase, "final_answer");
+});
+
+test("collapsed mixed-phase Responses history does not invent one phase for all text", () => {
+  const historyMessage = assistantHistoryMessageFromResponse({
+    id: "resp_mixed_phase_history",
+    object: "response",
+    status: "completed",
+    output: [
+      {
+        id: "msg_commentary_history",
+        type: "message",
+        role: "assistant",
+        phase: "commentary",
+        content: [{ type: "output_text", text: "working" }],
+      },
+      {
+        id: "msg_unphased_history",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "done" }],
+      },
+    ],
+  });
+
+  assert.equal(historyMessage.responses_phase, undefined);
+});
 
 test("previous_response_id removes only an exact full persisted-history input prefix", () => {
   const priorMessages = [
@@ -1657,6 +1721,136 @@ test("reasoning_content is replayed only for chat providers that support it", ()
     (message) => message.role === "assistant",
   );
   assert.equal("reasoning_content" in genericAssistant, false);
+});
+
+test("DeepSeek V4 replays inline reasoning on the assistant tool-call message", () => {
+  const tools = [{
+    type: "function",
+    name: "shell_command",
+    description: "Run one command.",
+    parameters: {
+      type: "object",
+      properties: { command: { type: "string" } },
+      required: ["command"],
+    },
+  }];
+  const input = [
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "inspect the directory" }],
+    },
+    {
+      id: "rs_inline_deepseek",
+      type: "reasoning",
+      content: [{ type: "reasoning_text", text: "inspect before editing" }],
+    },
+    {
+      id: "msg_inline_deepseek",
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "I will inspect first." }],
+    },
+    {
+      id: "fc_inline_deepseek",
+      type: "function_call",
+      call_id: "call_inline_deepseek",
+      name: "shell_command",
+      arguments: '{"command":"ls"}',
+      status: "completed",
+    },
+    {
+      type: "function_call_output",
+      call_id: "call_inline_deepseek",
+      output: "file.txt",
+    },
+  ];
+
+  const deepseek = responsesToChatRequest(
+    {
+      model: "deepseek-v4-pro",
+      model_reasoning_effort: "high",
+      input,
+      tools,
+    },
+    { ...route, provider: "deepseek", model: "deepseek-v4-pro" },
+    null,
+  );
+  const deepseekAssistants = deepseek.body.messages.filter((message) =>
+    Array.isArray(message.tool_calls),
+  );
+  assert.equal(deepseekAssistants.length, 1);
+  const [assistant] = deepseekAssistants;
+  assert.equal(assistant.reasoning_content, "inspect before editing");
+  assert.equal(assistant.content, "I will inspect first.");
+  assert.equal(assistant.tool_calls[0].id, "call_inline_deepseek");
+  assert.deepEqual(deepseek.body.thinking, { type: "enabled" });
+
+  const generic = responsesToChatRequest(
+    { model: "generic", input, tools },
+    { ...route, provider: "openrouter", model: "generic" },
+    null,
+  );
+  const genericAssistant = generic.body.messages.find((message) =>
+    Array.isArray(message.tool_calls),
+  );
+  assert.equal("reasoning_content" in genericAssistant, false);
+});
+
+test("DeepSeek V4 keeps separate reasoning state for consecutive inline tool turns", () => {
+  const tool = {
+    type: "function",
+    name: "shell_command",
+    description: "Run one command.",
+    parameters: {
+      type: "object",
+      properties: { command: { type: "string" } },
+      required: ["command"],
+    },
+  };
+  const converted = responsesToChatRequest(
+    {
+      model: "deepseek-v4-pro",
+      input: [
+        { type: "reasoning", summary: [{ type: "summary_text", text: "first reasoning" }] },
+        { type: "message", role: "assistant", content: "first preamble" },
+        {
+          type: "function_call",
+          call_id: "call_first",
+          name: "shell_command",
+          arguments: '{"command":"ls"}',
+        },
+        { type: "function_call_output", call_id: "call_first", output: "one.txt" },
+        { type: "reasoning", summary: [{ type: "summary_text", text: "second reasoning" }] },
+        { type: "message", role: "assistant", content: "second preamble" },
+        {
+          type: "function_call",
+          call_id: "call_second",
+          name: "shell_command",
+          arguments: '{"command":"pwd"}',
+        },
+        { type: "function_call_output", call_id: "call_second", output: "F:\\repo" },
+      ],
+      tools: [tool],
+    },
+    { ...route, provider: "deepseek", model: "deepseek-v4-pro" },
+    null,
+  );
+
+  const assistants = converted.body.messages.filter((message) =>
+    Array.isArray(message.tool_calls),
+  );
+  assert.deepEqual(
+    assistants.map((message) => [
+      message.tool_calls[0].id,
+      message.reasoning_content,
+      message.content,
+    ]),
+    [
+      ["call_first", "first reasoning", "first preamble"],
+      ["call_second", "second reasoning", "second preamble"],
+    ],
+  );
 });
 
 test("DeepSeek preserves prior tool results as native chat tool messages", () => {

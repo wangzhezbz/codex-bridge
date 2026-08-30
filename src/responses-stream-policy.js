@@ -21,5 +21,6 @@ export function looksLikeSseResponse(text = "") {
   const trimmed = String(text || "").trimStart();
   return trimmed.startsWith("data:") ||
     trimmed.startsWith("event:") ||
-    /\n(?:data|event):/.test(trimmed);
+    trimmed.startsWith(":") ||
+    /\n(?:(?:data|event):|:)/.test(trimmed);
 }

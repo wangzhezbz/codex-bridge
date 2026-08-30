@@ -11,9 +11,15 @@ import {
   historyRecoveryFixtureCounts,
 } from "./history-recovery-e2e-fixture.mjs";
 import {
+  assertWindowsPackageTree,
   assertWindowsPackageFilePaths,
   assertWindowsSoftwareManagerPackagePaths,
 } from "./package-content-policy.mjs";
+import {
+  WINDOWS_RELEASE_BUILD_METADATA_FILE,
+  packagedSmokeSourceEvidence,
+} from "./release-source-fingerprint.mjs";
+import { removeOwnedTemporaryDirectory } from "./smoke-temp-cleanup.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const appDir = newestPackagedAppDir();
@@ -21,16 +27,32 @@ const exePath = path.join(appDir, "CodexBridge.exe");
 const appRoot = path.join(appDir, "resources", "app");
 const smokeReportPath = process.env.CODEXBRIDGE_PACKAGED_SMOKE_REPORT ||
   path.join(repoRoot, "release", "packaged-smoke-report.json");
+const smokeArtifactDir = path.resolve(
+  process.env.CODEXBRIDGE_PACKAGED_SMOKE_ARTIFACT_DIR || path.dirname(smokeReportPath),
+);
 const smokeStartedAt = Date.now();
+let buildMetadata = null;
+let sourceEvidence = null;
 
 assert.ok(fs.existsSync(exePath), `missing packaged exe: ${exePath}`);
 assert.ok(fs.existsSync(path.join(appRoot, "src", "server.js")), "missing packaged router script");
 
 try {
+  buildMetadata = readPackagedBuildMetadata(appRoot);
+  sourceEvidence = packagedSmokeSourceEvidence({ buildMetadata }, repoRoot);
+  assert.equal(
+    sourceEvidence.ok,
+    true,
+    sourceEvidence.reason === "source_fingerprint_missing"
+      ? "packaged app is missing a valid release source fingerprint; run package:win again"
+      : "packaged app was built from older source; run package:win again before smoke testing",
+  );
+  const packageTree = assertWindowsPackageTree(appRoot, { requireSoftwareManager: true });
   const packagePaths = listRegularFilePaths(appRoot);
   const packageContent = {
     ...assertWindowsPackageFilePaths(packagePaths),
     softwareManager: assertWindowsSoftwareManagerPackagePaths(packagePaths),
+    tree: packageTree,
   };
   const embeddedBridgeSmoke = await smokeEmbeddedBridge(exePath, appRoot);
   const desktopSmoke = await smokeDesktop(exePath);
@@ -41,6 +63,8 @@ try {
     durationMs: Date.now() - smokeStartedAt,
     appPath: appDir,
     exePath,
+    buildMetadata,
+    sourceEvidence,
     packageContent,
     embeddedBridgeSmoke,
     desktopSmoke,
@@ -53,6 +77,8 @@ try {
     durationMs: Date.now() - smokeStartedAt,
     appPath: appDir,
     exePath,
+    ...(buildMetadata ? { buildMetadata } : {}),
+    ...(sourceEvidence ? { sourceEvidence } : {}),
     error: error?.message || String(error),
   });
   throw error;
@@ -85,6 +111,10 @@ async function smokeEmbeddedBridge(exePath, appRoot) {
   assertDependencyVersionAtLeast(dependencyVersions.fastUri, "3.1.4", "fast-uri");
 
   const port = await findFreePort();
+  const bridgeDataDir = path.join(
+    os.tmpdir(),
+    `codexbridge-embedded-smoke-${process.pid}-${Date.now()}`,
+  );
   const child = spawn(exePath, [entryPath], {
     cwd: bridgeRoot,
     env: {
@@ -93,7 +123,7 @@ async function smokeEmbeddedBridge(exePath, appRoot) {
       BRIDGE_HOST: "127.0.0.1",
       BRIDGE_PORT: String(port),
       BRIDGE_API_TOKEN: "a".repeat(64),
-      BRIDGE_DATA_DIR: path.join(os.tmpdir(), `codexbridge-embedded-smoke-${process.pid}-${Date.now()}`),
+      BRIDGE_DATA_DIR: bridgeDataDir,
       BRIDGE_ROUTER_V2: "1",
       BRIDGE_GPT_TRANSPORT: "web-sync",
     },
@@ -122,7 +152,11 @@ async function smokeEmbeddedBridge(exePath, appRoot) {
       `packaged Embedded Bridge smoke failed: ${error.message}\nstdout:\n${stdout}\nstderr:\n${stderr}`,
     );
   } finally {
-    child.kill("SIGTERM");
+    await terminateChild(child, "SIGTERM");
+    removeOwnedTemporaryDirectory(bridgeDataDir, {
+      parentDirectory: os.tmpdir(),
+      requiredPrefix: "codexbridge-embedded-smoke-",
+    });
   }
 }
 
@@ -164,6 +198,19 @@ function listRegularFilePaths(rootDir) {
   }
   files.sort();
   return files;
+}
+
+function readPackagedBuildMetadata(appRoot) {
+  const metadataPath = path.join(appRoot, WINDOWS_RELEASE_BUILD_METADATA_FILE);
+  assert.ok(fs.existsSync(metadataPath), `missing packaged build metadata: ${metadataPath}`);
+  const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
+  assert.equal(metadata.schemaVersion, 1, "unsupported packaged build metadata schema");
+  assert.equal(metadata.algorithm, "sha256", "unsupported packaged source fingerprint algorithm");
+  assert.match(String(metadata.sourceFingerprint || ""), /^[a-f0-9]{64}$/u);
+  assert.ok(Number.isInteger(metadata.sourceFileCount) && metadata.sourceFileCount > 0);
+  const packagedApp = JSON.parse(fs.readFileSync(path.join(appRoot, "package.json"), "utf8"));
+  assert.equal(metadata.appVersion, packagedApp.version, "packaged build metadata version mismatch");
+  return metadata;
 }
 
 function newestPackagedAppDir() {
@@ -212,12 +259,19 @@ async function smokeDesktop(exePath) {
   const dataDir = fs.mkdtempSync(path.join(dataRoot, "codexbridge-desktop-data-"));
   const smokeHomeDir = path.join(dataDir, "home");
   const configDir = path.join(dataDir, "config");
+  const smokeLocalAppData = path.join(dataDir, "local-app-data");
+  const smokeInstallRoot = path.join(os.homedir(), `CBP${process.pid.toString(36)}${Date.now().toString(36).slice(-4)}`);
+  const smokeSelectedInstallRoot = path.join(os.homedir(), `CBS${process.pid.toString(36)}${Date.now().toString(36).slice(-4)}`);
   fs.mkdirSync(path.join(smokeHomeDir, ".codex"), { recursive: true });
   fs.mkdirSync(configDir, { recursive: true });
+  fs.mkdirSync(smokeLocalAppData, { recursive: true });
+  fs.mkdirSync(smokeSelectedInstallRoot);
+  try {
   createHistoryRecoveryE2EFixture(smokeHomeDir);
   const resourceFixture = createResourceE2EFixture(smokeHomeDir, dataDir);
-  const recoveryScreenshotPath = path.join(repoRoot, "release", "history-recovery-packaged-e2e.png");
-  const resourceScreenshotPath = path.join(repoRoot, "release", "resources-packaged-e2e.png");
+  const recoveryScreenshotPath = path.join(smokeArtifactDir, "history-recovery-packaged-e2e.png");
+  const resourceScreenshotPath = path.join(smokeArtifactDir, "resources-packaged-e2e.png");
+  const softwareManagerScreenshotPath = path.join(smokeArtifactDir, "software-manager-packaged-e2e.png");
   const routerPort = await findFreePort();
   fs.writeFileSync(
     path.join(configDir, "desktop-options.json"),
@@ -250,6 +304,12 @@ async function smokeDesktop(exePath) {
     CODEXBRIDGE_DESKTOP_SMOKE_SCREENSHOT: recoveryScreenshotPath,
     CODEXBRIDGE_DESKTOP_SMOKE_RESOURCE_SCREENSHOT: resourceScreenshotPath,
     CODEXBRIDGE_DESKTOP_SMOKE_RESOURCE_SNAPSHOT: resourceFixture.snapshotPath,
+    CODEXBRIDGE_DESKTOP_SMOKE_LOCAL_APP_DATA: smokeLocalAppData,
+    CODEXBRIDGE_DESKTOP_SMOKE_DEFAULT_INSTALL_ROOT: smokeInstallRoot,
+    CODEXBRIDGE_DESKTOP_SMOKE_SELECTED_INSTALL_ROOT: smokeSelectedInstallRoot,
+    CODEXBRIDGE_DESKTOP_SMOKE_SOFTWARE_MANAGER: "1",
+    CODEXBRIDGE_DESKTOP_SMOKE_SOFTWARE_MANAGER_OFFLINE: "1",
+    CODEXBRIDGE_DESKTOP_SMOKE_SOFTWARE_MANAGER_SCREENSHOT: softwareManagerScreenshotPath,
     CODEXBRIDGE_DATA_DIR: dataDir,
   }, 120000);
   assert.equal(
@@ -277,6 +337,24 @@ async function smokeDesktop(exePath) {
     6,
   );
   assert.ok(fs.existsSync(resourceScreenshotPath));
+  const softwareManagerMatch = (result.stdout + result.stderr).match(/Software manager smoke passed: (\{.+\})/);
+  assert.ok(softwareManagerMatch, "missing packaged Software Manager report");
+  const softwareManager = JSON.parse(softwareManagerMatch[1]);
+  assert.equal(softwareManager.readOnly, false);
+  assert.equal(softwareManager.catalogAvailable, true);
+  assert.equal(softwareManager.components, 3);
+  assert.equal(softwareManager.skills, 7);
+  assert.deepEqual(softwareManager.cards, ["ChatGPT", "V2RayN", "Git", "Skills"]);
+  assert.equal(softwareManager.expandedSkillRows, 7);
+  assert.equal(softwareManager.expandedPluginRows, 2);
+  assert.equal(softwareManager.selectablePluginRows, 2);
+  assert.equal(softwareManager.updateCards, 3);
+  assert.equal(softwareManager.updateHasSkills, false);
+  assert.equal(softwareManager.mainScrollTop, 0);
+  assert.equal(softwareManager.initialInstallRootPath, smokeInstallRoot);
+  assert.equal(softwareManager.installRootPath, smokeSelectedInstallRoot);
+  assert.equal(softwareManager.installRootChanged, true);
+  assert.ok(fs.existsSync(softwareManagerScreenshotPath));
   const historyRecoveryMatch = (result.stdout + result.stderr).match(/History recovery smoke passed: (\{.+\})/);
   assert.ok(historyRecoveryMatch, "missing packaged history recovery IPC report");
   const historyRecovery = JSON.parse(historyRecoveryMatch[1]);
@@ -306,7 +384,15 @@ async function smokeDesktop(exePath) {
       screenshotPath: recoveryScreenshotPath,
     },
     resourceMerge: { ...resourceMerge, screenshotPath: resourceScreenshotPath },
+    softwareManager: { ...softwareManager, screenshotPath: softwareManagerScreenshotPath },
   };
+  } finally {
+    cleanupSmokeDirectories([
+      { targetPath: smokeInstallRoot, parentDirectory: os.homedir(), requiredPrefix: "CBP" },
+      { targetPath: smokeSelectedInstallRoot, parentDirectory: os.homedir(), requiredPrefix: "CBS" },
+      { targetPath: dataDir, parentDirectory: dataRoot, requiredPrefix: "codexbridge-desktop-data-" },
+    ]);
+  }
 }
 
 function createResourceE2EFixture(homeDir, dataDir) {
@@ -499,13 +585,31 @@ async function smokeRouter(exePath, appRoot) {
       `packaged router smoke failed: ${error.message}\nstdout:\n${stdout}\nstderr:\n${stderr}`,
     );
   } finally {
-    child.kill();
+    await terminateChild(child);
+    removeOwnedTemporaryDirectory(tempDir, {
+      parentDirectory: os.tmpdir(),
+      requiredPrefix: "codexbridge-packaged-",
+    });
   }
 }
 
 function writeSmokeReport(report) {
   fs.mkdirSync(path.dirname(smokeReportPath), { recursive: true });
   fs.writeFileSync(smokeReportPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+}
+
+function cleanupSmokeDirectories(specs) {
+  const errors = [];
+  for (const spec of specs) {
+    try {
+      removeOwnedTemporaryDirectory(spec.targetPath, spec);
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length) {
+    throw new AggregateError(errors, "packaged smoke temporary cleanup failed");
+  }
 }
 
 function runProcess(command, args, extraEnv, timeoutMs) {
@@ -534,6 +638,36 @@ function runProcess(command, args, extraEnv, timeoutMs) {
       clearTimeout(timer);
       resolve({ code, stdout, stderr });
     });
+  });
+}
+
+async function terminateChild(child, signal = "SIGTERM") {
+  if (!child || child.exitCode !== null || child.signalCode) {
+    return;
+  }
+  child.kill(signal);
+  await waitForChildExit(child, 5000);
+  if (child.exitCode === null && !child.signalCode) {
+    child.kill("SIGKILL");
+    await waitForChildExit(child, 2000);
+  }
+  if (child.exitCode === null && !child.signalCode) {
+    throw new Error(`packaged smoke child process did not exit: ${child.pid || "unknown"}`);
+  }
+}
+
+function waitForChildExit(child, timeoutMs) {
+  if (!child || child.exitCode !== null || child.signalCode) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      child.removeListener("exit", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    child.once("exit", finish);
   });
 }
 

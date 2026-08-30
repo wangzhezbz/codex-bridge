@@ -27,6 +27,7 @@ import {
 import { parseSseEvents } from "../src/sse.js";
 import { buildToolContext } from "../src/tools.js";
 import { ResponseHistory } from "../src/history.js";
+import { chatRequestToAnthropicMessages } from "../src/anthropic-messages.js";
 
 test("default upstream response guards use 64 MiB and 600-second time boundaries", () => {
   assert.equal(typeof upstreamModule.upstreamTimeoutMs, "function");
@@ -119,6 +120,588 @@ test("stateless native Responses routes replace previous_response_id with local 
   }
 });
 
+test("DeepSeek stateless Responses replays reasoning, assistant text, and tool calls together", async () => {
+  const originalFetch = globalThis.fetch;
+  const seenBodies = [];
+  let call = 0;
+  const firstResponse = {
+    id: "resp_deepseek_reasoning_tool",
+    object: "response",
+    created_at: 1,
+    status: "completed",
+    model: "deepseek-v4-flash",
+    output: [
+      {
+        id: "rs_deepseek_reasoning_tool",
+        type: "reasoning",
+        status: "completed",
+        content: [{ type: "reasoning_text", text: "inspect before editing" }],
+        summary: [],
+      },
+      {
+        id: "msg_deepseek_reasoning_tool",
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: "I will inspect first.", annotations: [] }],
+      },
+      {
+        id: "fc_deepseek_reasoning_tool",
+        type: "function_call",
+        status: "completed",
+        call_id: "call_deepseek_reasoning_tool",
+        name: "shell_command",
+        arguments: '{"command":"ls"}',
+      },
+    ],
+    output_text: "I will inspect first.",
+    error: null,
+    incomplete_details: null,
+    usage: null,
+  };
+  globalThis.fetch = async (_url, init) => {
+    seenBodies.push(JSON.parse(init.body));
+    call += 1;
+    const response = call === 1
+      ? firstResponse
+      : {
+          id: "resp_deepseek_reasoning_final",
+          object: "response",
+          created_at: 2,
+          status: "completed",
+          model: "deepseek-v4-flash",
+          output: [{
+            id: "msg_deepseek_reasoning_final",
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "output_text", text: "done", annotations: [] }],
+          }],
+          output_text: "done",
+          error: null,
+          incomplete_details: null,
+          usage: null,
+        };
+    return new Response(JSON.stringify(response), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  const route = {
+    id: "deepseek-v4-flash",
+    displayName: "DeepSeek V4 Flash",
+    provider: "deepseek",
+    api: "responses",
+    baseUrl: "https://api.deepseek.com",
+    model: "deepseek-v4-flash",
+    apiKey: "test-key",
+    supportsResponsePreviousId: false,
+  };
+  const tools = [{
+    type: "function",
+    name: "shell_command",
+    description: "Run one command.",
+    parameters: {
+      type: "object",
+      properties: { command: { type: "string" } },
+      required: ["command"],
+    },
+  }];
+
+  try {
+    const history = new ResponseHistory();
+    await proxyResponsesApi(
+      { model: "deepseek-v4-flash", input: "inspect the directory", tools },
+      route,
+      history,
+      collectResponse(),
+      {},
+    );
+    await proxyResponsesApi(
+      {
+        model: "deepseek-v4-flash",
+        previous_response_id: firstResponse.id,
+        input: [{
+          type: "function_call_output",
+          call_id: "call_deepseek_reasoning_tool",
+          output: "file.txt",
+        }],
+        tools,
+      },
+      route,
+      history,
+      collectResponse(),
+      {},
+    );
+
+    assert.equal(seenBodies.length, 2);
+    assert.equal(seenBodies[1].previous_response_id, undefined);
+    assert.deepEqual(
+      seenBodies[1].input.map((item) => item.type || item.role),
+      ["user", "reasoning", "message", "function_call", "function_call_output"],
+    );
+    assert.equal(seenBodies[1].input[1].id, "rs_deepseek_reasoning_tool");
+    assert.equal(seenBodies[1].input[1].content[0].text, "inspect before editing");
+    assert.equal(seenBodies[1].input[2].content[0].text, "I will inspect first.");
+    assert.equal(seenBodies[1].input[3].call_id, "call_deepseek_reasoning_tool");
+    assert.equal(seenBodies[1].input[4].output, "file.txt");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("DeepSeek stateless Responses preserves ordered web search and custom tool history", async () => {
+  const originalFetch = globalThis.fetch;
+  const seenBodies = [];
+  let call = 0;
+  const webSearchCall = {
+    id: "ws_deepseek_history",
+    type: "web_search_call",
+    status: "completed",
+    action: { type: "search", query: "CodexBridge streaming" },
+  };
+  const firstResponse = {
+    id: "resp_deepseek_hosted_and_custom",
+    object: "response",
+    created_at: 1,
+    status: "completed",
+    model: "deepseek-v4-flash",
+    output: [
+      {
+        id: "rs_before_search",
+        type: "reasoning",
+        status: "completed",
+        content: [{ type: "reasoning_text", text: "search first" }],
+      },
+      webSearchCall,
+      {
+        id: "rs_after_search",
+        type: "reasoning",
+        status: "completed",
+        content: [{ type: "reasoning_text", text: "then patch" }],
+      },
+      {
+        id: "msg_before_patch",
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: "I found the issue.", annotations: [] }],
+      },
+      {
+        id: "ctc_deepseek_patch",
+        type: "custom_tool_call",
+        status: "completed",
+        call_id: "call_deepseek_patch",
+        name: "apply_patch",
+        input: "*** Begin Patch\n*** End Patch",
+      },
+    ],
+    output_text: "I found the issue.",
+    error: null,
+    incomplete_details: null,
+    usage: null,
+  };
+  globalThis.fetch = async (_url, init) => {
+    seenBodies.push(JSON.parse(init.body));
+    call += 1;
+    const response = call === 1
+      ? firstResponse
+      : {
+          id: "resp_deepseek_after_custom_output",
+          object: "response",
+          created_at: 2,
+          status: "completed",
+          model: "deepseek-v4-flash",
+          output: [{
+            id: "msg_deepseek_after_custom_output",
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "output_text", text: "done", annotations: [] }],
+          }],
+          output_text: "done",
+          error: null,
+          incomplete_details: null,
+          usage: null,
+        };
+    return new Response(JSON.stringify(response), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  const route = {
+    id: "deepseek-v4-flash",
+    displayName: "DeepSeek V4 Flash",
+    provider: "deepseek",
+    api: "responses",
+    baseUrl: "https://api.deepseek.com",
+    model: "deepseek-v4-flash",
+    apiKey: "test-key",
+    supportsResponsePreviousId: false,
+  };
+
+  try {
+    const history = new ResponseHistory();
+    await proxyResponsesApi(
+      { model: route.id, input: "research and patch" },
+      route,
+      history,
+      collectResponse(),
+      {},
+    );
+    await proxyResponsesApi(
+      {
+        model: route.id,
+        previous_response_id: firstResponse.id,
+        input: [{
+          type: "custom_tool_call_output",
+          call_id: "call_deepseek_patch",
+          output: "patch applied",
+        }],
+      },
+      route,
+      history,
+      collectResponse(),
+      {},
+    );
+
+    assert.deepEqual(
+      seenBodies[1].input.map((item) => item.type || item.role),
+      [
+        "user",
+        "reasoning",
+        "web_search_call",
+        "reasoning",
+        "message",
+        "custom_tool_call",
+        "custom_tool_call_output",
+      ],
+    );
+    assert.deepEqual(seenBodies[1].input[2], webSearchCall);
+    assert.equal(seenBodies[1].input[5].call_id, "call_deepseek_patch");
+    assert.equal(seenBodies[1].input[6].type, "custom_tool_call_output");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("DeepSeek stateless Responses persists an incomplete response for continuation", async () => {
+  const originalFetch = globalThis.fetch;
+  const seenBodies = [];
+  let call = 0;
+  const incompleteResponse = {
+    id: "resp_deepseek_incomplete",
+    object: "response",
+    created_at: 1,
+    status: "incomplete",
+    model: "deepseek-v4-flash",
+    output: [
+      {
+        id: "msg_deepseek_incomplete",
+        type: "message",
+        role: "assistant",
+        status: "incomplete",
+        content: [{ type: "output_text", text: "partial answer", annotations: [] }],
+      },
+      {
+        id: "fc_deepseek_incomplete",
+        type: "function_call",
+        status: "incomplete",
+        call_id: "call_deepseek_incomplete",
+        name: "shell_command",
+        arguments: '{"command":"git st',
+      },
+      {
+        id: "ctc_deepseek_incomplete",
+        type: "custom_tool_call",
+        status: "incomplete",
+        call_id: "call_deepseek_custom_incomplete",
+        name: "apply_patch",
+        input: "*** Begin Pat",
+      },
+    ],
+    output_text: "partial answer",
+    error: null,
+    incomplete_details: { reason: "max_output_tokens" },
+    usage: null,
+  };
+  globalThis.fetch = async (_url, init) => {
+    seenBodies.push(JSON.parse(init.body));
+    call += 1;
+    const response = call === 1
+      ? incompleteResponse
+      : {
+          id: "resp_deepseek_incomplete_continued",
+          object: "response",
+          created_at: 2,
+          status: "completed",
+          model: "deepseek-v4-flash",
+          output: [{
+            id: "msg_deepseek_incomplete_continued",
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "output_text", text: "finished", annotations: [] }],
+          }],
+          output_text: "finished",
+          error: null,
+          incomplete_details: null,
+          usage: null,
+        };
+    return new Response(JSON.stringify(response), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  const route = {
+    id: "deepseek-v4-flash",
+    displayName: "DeepSeek V4 Flash",
+    provider: "deepseek",
+    api: "responses",
+    baseUrl: "https://api.deepseek.com",
+    model: "deepseek-v4-flash",
+    apiKey: "test-key",
+    supportsResponsePreviousId: false,
+  };
+
+  try {
+    const history = new ResponseHistory();
+    const firstRes = collectResponse();
+    await proxyResponsesApi(
+      {
+        model: route.id,
+        input: "write a long answer",
+        stream: false,
+        tools: [
+          {
+            type: "function",
+            name: "shell_command",
+            parameters: { type: "object", properties: { command: { type: "string" } } },
+          },
+          { type: "custom", name: "apply_patch", description: "Apply a patch." },
+        ],
+      },
+      route,
+      history,
+      firstRes,
+      {},
+    );
+    assert.equal(firstRes.statusCode, 200);
+    assert.equal(JSON.parse(firstRes.body()).status, "incomplete");
+
+    await proxyResponsesApi(
+      {
+        model: route.id,
+        previous_response_id: incompleteResponse.id,
+        input: "continue",
+      },
+      route,
+      history,
+      collectResponse(),
+      {},
+    );
+
+    assert.equal(seenBodies[1].previous_response_id, undefined);
+    assert.deepEqual(
+      seenBodies[1].input.map((item) => item.type || item.role),
+      ["user", "message", "user"],
+    );
+    assert.equal(seenBodies[1].input[1].content[0].text, "partial answer");
+    assert.equal(
+      seenBodies[1].input.some((item) =>
+        ["function_call", "custom_tool_call"].includes(item.type)),
+      false,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("DeepSeek streaming incomplete response remains replayable on the next request", async () => {
+  const originalFetch = globalThis.fetch;
+  const seenBodies = [];
+  let call = 0;
+  const incompleteResponse = {
+    id: "resp_deepseek_stream_incomplete",
+    object: "response",
+    created_at: 1,
+    status: "incomplete",
+    model: "deepseek-v4-pro",
+    output: [{
+      id: "msg_deepseek_stream_incomplete",
+      type: "message",
+      role: "assistant",
+      status: "incomplete",
+      content: [{ type: "output_text", text: "streamed partial answer", annotations: [] }],
+    }],
+    output_text: "streamed partial answer",
+    error: null,
+    incomplete_details: { reason: "max_output_tokens" },
+    usage: null,
+  };
+  globalThis.fetch = async (_url, init) => {
+    seenBodies.push(JSON.parse(init.body));
+    call += 1;
+    if (call === 1) {
+      return new Response(
+        `event: response.output_text.delta\ndata: ${JSON.stringify({
+          type: "response.output_text.delta",
+          delta: "streamed partial answer",
+        })}\n\nevent: response.incomplete\ndata: ${JSON.stringify({
+          type: "response.incomplete",
+          response: incompleteResponse,
+        })}\n\n`,
+        { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8" } },
+      );
+    }
+    return new Response(JSON.stringify({
+      id: "resp_deepseek_stream_continued",
+      object: "response",
+      created_at: 2,
+      status: "completed",
+      model: "deepseek-v4-pro",
+      output: [],
+      output_text: "finished",
+      error: null,
+      incomplete_details: null,
+      usage: null,
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  const route = {
+    id: "deepseek-v4-pro",
+    displayName: "DeepSeek V4 Pro",
+    provider: "deepseek",
+    api: "responses",
+    baseUrl: "https://api.deepseek.com",
+    model: "deepseek-v4-pro",
+    apiKey: "test-key",
+    supportsResponsePreviousId: false,
+  };
+
+  try {
+    const history = new ResponseHistory();
+    const firstRes = collectResponse();
+    await proxyResponsesApi(
+      { model: route.id, input: "long streamed answer", stream: true },
+      route,
+      history,
+      firstRes,
+      {},
+    );
+    assert.match(firstRes.body(), /response\.incomplete/);
+
+    await proxyResponsesApi(
+      {
+        model: route.id,
+        previous_response_id: incompleteResponse.id,
+        input: "continue",
+      },
+      route,
+      history,
+      collectResponse(),
+      {},
+    );
+    assert.equal(seenBodies[1].previous_response_id, undefined);
+    assert.equal(seenBodies[1].input[1].content[0].text, "streamed partial answer");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("DeepSeek native history metadata never leaks into a chat provider payload", async () => {
+  const originalFetch = globalThis.fetch;
+  const seenBodies = [];
+  let call = 0;
+  globalThis.fetch = async (_url, init) => {
+    seenBodies.push(JSON.parse(init.body));
+    call += 1;
+    if (call === 1) {
+      return new Response(JSON.stringify({
+        id: "resp_deepseek_before_chat_switch",
+        object: "response",
+        created_at: 1,
+        status: "completed",
+        model: "deepseek-v4-flash",
+        output: [
+          {
+            id: "ws_before_chat_switch",
+            type: "web_search_call",
+            status: "completed",
+            action: { type: "search", query: "private native history marker" },
+          },
+          {
+            id: "msg_before_chat_switch",
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "output_text", text: "DeepSeek visible answer", annotations: [] }],
+          },
+        ],
+        output_text: "DeepSeek visible answer",
+        error: null,
+        incomplete_details: null,
+        usage: null,
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return new Response(JSON.stringify({
+      id: "chatcmpl_after_deepseek",
+      object: "chat.completion",
+      created: 2,
+      model: "kimi-k2.7-code",
+      choices: [{
+        index: 0,
+        message: { role: "assistant", content: "chat answer" },
+        finish_reason: "stop",
+      }],
+      usage: null,
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+
+  try {
+    const history = new ResponseHistory();
+    await proxyResponsesApi(
+      { model: "deepseek-v4-flash", input: "search" },
+      {
+        id: "deepseek-v4-flash",
+        provider: "deepseek",
+        api: "responses",
+        baseUrl: "https://api.deepseek.com",
+        model: "deepseek-v4-flash",
+        apiKey: "test-key",
+        supportsResponsePreviousId: false,
+      },
+      history,
+      collectResponse(),
+      {},
+    );
+    await proxyChatCompletions(
+      {
+        model: "kimi-k2.7-code",
+        previous_response_id: "resp_deepseek_before_chat_switch",
+        input: "continue on chat",
+      },
+      {
+        id: "kimi-k2-7-code",
+        provider: "kimi",
+        api: "chat_completions",
+        baseUrl: "https://api.moonshot.cn/v1",
+        model: "kimi-k2.7-code",
+        apiKey: "test-key",
+      },
+      history,
+      collectResponse(),
+      {},
+    );
+
+    const chatPayload = JSON.stringify(seenBodies[1]);
+    assert.match(chatPayload, /DeepSeek visible answer/);
+    assert.doesNotMatch(chatPayload, /__codexbridge_native_responses_input_items/);
+    assert.doesNotMatch(chatPayload, /web_search_call/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("cross-route Responses history reaches codex_openai without foreign reasoning ids", async () => {
   const originalFetch = globalThis.fetch;
   const seenBodies = [];
@@ -199,6 +782,383 @@ test("cross-route Responses history reaches codex_openai without foreign reasoni
     assert.match(JSON.stringify(seenBodies[0].input), /first question/);
     assert.match(JSON.stringify(seenBodies[0].input), /DeepSeek answer/);
     assert.match(JSON.stringify(seenBodies[0].input), /now answer with Terra/);
+    assert.equal(JSON.stringify(seenBodies[0].input).includes("output_text"), false);
+    assert.ok(
+      seenBodies[0].input.some((item) =>
+        item?.role === "assistant" && item?.content === "DeepSeek answer"),
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Terra retries an exact assistant content-array rejection with portable history", async () => {
+  const originalFetch = globalThis.fetch;
+  const seenBodies = [];
+  globalThis.fetch = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    seenBodies.push(body);
+    if (seenBodies.length === 1) {
+      return new Response(JSON.stringify({
+        error: {
+          message:
+            "[ArrayParam] [input[5].content] [array_above_max_length] " +
+            "Invalid 'input[5].content': array too long. " +
+            "Expected an array with maximum length 0, but got an array with length 1 instead.",
+        },
+      }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({
+      id: "resp_terra_after_portable_retry",
+      object: "response",
+      status: "completed",
+      model: "gpt-5.6-terra",
+      output: [],
+      output_text: "terra recovered",
+      error: null,
+      incomplete_details: null,
+      usage: null,
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  try {
+    await proxyResponsesApi(
+      {
+        model: "gpt-5.6-terra",
+        previous_response_id: "resp_after_flash_502",
+        input: [
+          {
+            id: "rs_unknown_foreign_reasoning",
+            type: "reasoning",
+          },
+          {
+            id: "msg_foreign_flash_answer",
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "output_text", text: "visible Flash answer" }],
+          },
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "continue with Terra" }],
+          },
+        ],
+      },
+      {
+        id: "cb-gpt-5-6-terra",
+        displayName: "5.6-Terra",
+        provider: "codex",
+        api: "responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        model: "gpt-5.6-terra",
+        authMode: "codex_openai",
+        supportsResponsePreviousId: true,
+      },
+      new ResponseHistory(),
+      collectResponse(),
+      {
+        requestId: "req_flash_502_to_terra",
+        clientAuth: {
+          kind: "codex_openai",
+          bearerToken: "codex-openai-token",
+        },
+      },
+    );
+
+    assert.equal(seenBodies.length, 2);
+    assert.equal(seenBodies[0].model, "gpt-5.6-terra");
+    assert.equal(seenBodies[1].model, "gpt-5.6-terra");
+    assert.deepEqual(seenBodies[0].input[1], {
+      role: "assistant",
+      content: "visible Flash answer",
+    });
+    assert.equal(seenBodies[1].previous_response_id, undefined);
+    assert.equal(
+      seenBodies[1].input.some((item) => item?.type === "reasoning"),
+      false,
+    );
+    assert.deepEqual(seenBodies[1].input[0], {
+      role: "assistant",
+      content: "visible Flash answer",
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Terra also retries untagged assistant content-array validation wording", async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return new Response(JSON.stringify({
+        error: {
+          message:
+            "Invalid 'input[3].content': array too long. " +
+            "Expected an array with maximum length 0, but got an array with length 1 instead.",
+        },
+      }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({
+      id: "resp_terra_after_untagged_retry",
+      object: "response",
+      status: "completed",
+      model: "gpt-5.6-terra",
+      output: [],
+      output_text: "recovered",
+      error: null,
+      incomplete_details: null,
+      usage: null,
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  try {
+    await proxyResponsesApi(
+      {
+        model: "gpt-5.6-terra",
+        previous_response_id: "resp_foreign_untagged",
+        input: [
+          { role: "assistant", content: "portable prior answer" },
+          { role: "user", content: "continue" },
+        ],
+      },
+      {
+        id: "cb-gpt-5-6-terra",
+        provider: "codex",
+        api: "responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        model: "gpt-5.6-terra",
+        authMode: "codex_openai",
+      },
+      new ResponseHistory(),
+      collectResponse(),
+      { clientAuth: { kind: "codex_openai", bearerToken: "token" } },
+    );
+    assert.equal(calls, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Terra retries a foreign stored reasoning reference without losing visible history", async () => {
+  const originalFetch = globalThis.fetch;
+  const seenBodies = [];
+  globalThis.fetch = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    seenBodies.push(body);
+    if (seenBodies.length === 1) {
+      return new Response(JSON.stringify({
+        detail:
+          "Item with id 'rs_foreign_after_flash_failure' not found. " +
+          "Items are not persisted when `store` is set to false. " +
+          "Try again with `store` set to true, or remove this item from your input.",
+      }), {
+        status: 404,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({
+      id: "resp_terra_after_reference_retry",
+      object: "response",
+      status: "completed",
+      model: "gpt-5.6-terra",
+      output: [],
+      output_text: "terra recovered from foreign reference",
+      error: null,
+      incomplete_details: null,
+      usage: null,
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  try {
+    await proxyResponsesApi(
+      {
+        model: "gpt-5.6-terra",
+        previous_response_id: "resp_flash_failed_before_reference",
+        input: [
+          {
+            id: "rs_foreign_after_flash_failure",
+            type: "reasoning",
+            summary: [{ type: "summary_text", text: "foreign reasoning" }],
+          },
+          {
+            id: "msg_flash_visible_before_reference",
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "output_text", text: "visible answer before failure" }],
+          },
+          {
+            role: "user",
+            content: [{ type: "input_text", text: "continue" }],
+          },
+        ],
+      },
+      {
+        id: "cb-gpt-5-6-terra",
+        displayName: "5.6-Terra",
+        provider: "codex",
+        api: "responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        model: "gpt-5.6-terra",
+        authMode: "codex_openai",
+        supportsResponsePreviousId: true,
+      },
+      new ResponseHistory(),
+      collectResponse(),
+      {
+        requestId: "req_foreign_reference_to_terra",
+        clientAuth: {
+          kind: "codex_openai",
+          bearerToken: "codex-openai-token",
+        },
+      },
+    );
+
+    assert.equal(seenBodies.length, 2);
+    assert.equal(seenBodies[1].model, "gpt-5.6-terra");
+    assert.equal(seenBodies[1].previous_response_id, undefined);
+    assert.equal(JSON.stringify(seenBodies[1]).includes("rs_foreign_after_flash_failure"), false);
+    assert.ok(
+      seenBodies[1].input.some((item) =>
+        item?.role === "assistant" && item?.content === "visible answer before failure"),
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("codex_openai normalizes messages-shaped Responses history before forwarding", async () => {
+  const originalFetch = globalThis.fetch;
+  const seenBodies = [];
+  globalThis.fetch = async (_url, init) => {
+    seenBodies.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({
+      id: "resp_terra_messages_normalized",
+      object: "response",
+      status: "completed",
+      model: "gpt-5.6-terra",
+      output: [],
+      output_text: "normalized",
+      error: null,
+      incomplete_details: null,
+      usage: null,
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  try {
+    await proxyResponsesApi(
+      {
+        model: "gpt-5.6-terra",
+        previous_response_id: "resp_from_another_provider",
+        messages: [
+          { role: "system", content: "Keep the project rules." },
+          { role: "user", content: "first question" },
+          { role: "assistant", phase: "commentary", content: "foreign visible answer" },
+          { role: "user", content: "continue with Terra" },
+        ],
+      },
+      {
+        id: "cb-gpt-5-6-terra",
+        displayName: "5.6-Terra",
+        provider: "codex",
+        api: "responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        model: "gpt-5.6-terra",
+        authMode: "codex_openai",
+        supportsResponsePreviousId: true,
+      },
+      new ResponseHistory(),
+      collectResponse(),
+      {
+        requestId: "req_messages_to_terra",
+        clientAuth: {
+          kind: "codex_openai",
+          bearerToken: "codex-openai-token",
+        },
+      },
+    );
+
+    assert.equal(seenBodies.length, 1);
+    assert.equal(seenBodies[0].messages, undefined);
+    assert.equal(seenBodies[0].previous_response_id, undefined);
+    assert.match(seenBodies[0].instructions, /Keep the project rules/);
+    assert.deepEqual(seenBodies[0].input, [
+      { role: "user", content: "first question" },
+      { role: "assistant", phase: "commentary", content: "foreign visible answer" },
+      { role: "user", content: "continue with Terra" },
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("API-key Responses routes keep provider-specific messages payloads unchanged", async () => {
+  const originalFetch = globalThis.fetch;
+  const seenBodies = [];
+  globalThis.fetch = async (_url, init) => {
+    seenBodies.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({
+      id: "resp_custom_messages_extension",
+      object: "response",
+      status: "completed",
+      model: "custom-responses-model",
+      output: [],
+      output_text: "custom response",
+      error: null,
+      incomplete_details: null,
+      usage: null,
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  const messages = [
+    { role: "system", content: "provider extension" },
+    { role: "user", content: "hello" },
+  ];
+
+  try {
+    await proxyResponsesApi(
+      { model: "custom-responses-model", messages },
+      {
+        id: "custom-responses-route",
+        provider: "custom",
+        custom: true,
+        api: "responses",
+        baseUrl: "https://provider.example/v1",
+        model: "custom-responses-model",
+        authMode: "api_key",
+        apiKey: "test-key",
+      },
+      new ResponseHistory(),
+      collectResponse(),
+      {},
+    );
+
+    assert.equal(seenBodies.length, 1);
+    assert.deepEqual(seenBodies[0].messages, messages);
+    assert.equal(seenBodies[0].input, undefined);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -521,6 +1481,91 @@ test("Anthropic streaming chat requests use native Messages endpoint and return 
   }
 });
 
+test("Anthropic streaming persists redacted thinking for the next tool turn without exposing it", async () => {
+  const originalFetch = globalThis.fetch;
+  let recordedTurn = null;
+  globalThis.fetch = async () => new Response([
+    'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_redacted_history","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[],"usage":{"input_tokens":10,"output_tokens":0}}}',
+    "",
+    'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}',
+    "",
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"inspect safely"}}',
+    "",
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-safe"}}',
+    "",
+    'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"encrypted-history-block"}}',
+    "",
+    'event: content_block_start\ndata: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_history","name":"read_file","input":{}}}',
+    "",
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"README.md\\"}"}}',
+    "",
+    'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}',
+    "",
+    'event: message_stop\ndata: {"type":"message_stop"}',
+    "",
+  ].join("\n"), {
+    status: 200,
+    headers: { "content-type": "text/event-stream; charset=utf-8" },
+  });
+
+  try {
+    const res = collectResponse();
+    await proxyChatCompletions(
+      {
+        model: "cb-claude-sonnet-4-6",
+        input: "Inspect README.",
+        stream: true,
+        tools: [{
+          type: "function",
+          name: "read_file",
+          description: "Read one file.",
+          parameters: {
+            type: "object",
+            properties: { path: { type: "string" } },
+            required: ["path"],
+          },
+        }],
+      },
+      {
+        id: "cb-claude-sonnet-4-6",
+        displayName: "Claude Sonnet 4.6",
+        provider: "anthropic",
+        api: "anthropic_messages",
+        baseUrl: "https://api.anthropic.com/v1",
+        model: "claude-sonnet-4-6",
+        apiKey: "anthropic-test-key",
+        authMode: "anthropic_api_key",
+      },
+      {
+        recordTurnAsync: async (turn) => {
+          recordedTurn = turn;
+        },
+      },
+      res,
+      {},
+    );
+
+    assert.ok(recordedTurn);
+    const assistant = recordedTurn.messages.at(-1);
+    assert.deepEqual(assistant.anthropic_thinking, [
+      { type: "thinking", thinking: "inspect safely", signature: "sig-safe" },
+      { type: "redacted_thinking", data: "encrypted-history-block" },
+    ]);
+    assert.doesNotMatch(res.body(), /encrypted-history-block/);
+    const nextTurn = chatRequestToAnthropicMessages({
+      model: "claude-sonnet-4-6",
+      messages: [
+        assistant,
+        { role: "tool", tool_call_id: "toolu_history", content: "README contents" },
+      ],
+    });
+    assert.deepEqual(nextTurn.messages[0].content.slice(0, 2), assistant.anthropic_thinking);
+    assert.equal(nextTurn.messages[0].content[2].type, "tool_use");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("custom route headers cannot override provider authentication or Anthropic protocol version", async () => {
   let seenHeaders = null;
   const upstream = httpServer(async (req, res) => {
@@ -731,12 +1776,123 @@ test("Codex Responses chat routes forward real upstream text chunks before compl
     assert.match(res.body(), /first answer/);
     assert.doesNotMatch(res.body(), /private reasoning/);
     assert.equal(recordedTurn.messages.at(-1).reasoning_content, "private reasoning");
+    assert.equal(recordedTurn.response.usage.input_tokens, 3);
+    assert.equal(recordedTurn.response.usage.output_tokens, 2);
+    assert.equal(recordedTurn.response.usage.total_tokens, 5);
   } finally {
     try {
       streamController?.close();
     } catch {
       // The success path already closes the controlled stream.
     }
+    await proxyPromise?.catch(() => {});
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("an offered Bridge capability never buffers ordinary chat text that does not call it", async () => {
+  const originalFetch = globalThis.fetch;
+  const encoder = new TextEncoder();
+  let streamController;
+  let seenBody = null;
+  let proxyPromise;
+  globalThis.fetch = async (_url, init) => {
+    seenBody = JSON.parse(String(init?.body || "{}"));
+    return new Response(new ReadableStream({
+      start(controller) { streamController = controller; },
+    }), {
+      status: 200,
+      headers: { "content-type": "text/event-stream; charset=utf-8" },
+    });
+  };
+
+  try {
+    const res = collectResponse();
+    proxyPromise = proxyChatCompletions(
+      { model: "deepseek-test", input: "Read https://example.com and explain it", stream: true },
+      {
+        id: "deepseek-test", displayName: "DeepSeek Test", api: "chat_completions",
+        baseUrl: "https://provider.example/v1", model: "deepseek-chat", apiKey: "test-key",
+      },
+      null,
+      res,
+      {
+        capabilityProviders: [{
+          id: "local-browser", capability: "browser", adapter: "local_browser", enabled: true,
+        }],
+        executeCapabilityRequest: async () => ({ text: "unused" }),
+      },
+    );
+
+    await waitFor(() => seenBody !== null && streamController);
+    assert.equal(
+      seenBody.tools.some((tool) => tool?.function?.name === "codexbridge_capability"),
+      true,
+    );
+    streamController.enqueue(encoder.encode(
+      'data: {"id":"chatcmpl-capability-text","object":"chat.completion.chunk","model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"first visible words"},"finish_reason":null}]}\n\n',
+    ));
+    await waitFor(() => res.body().includes('"delta":"first visible words"'));
+    assert.doesNotMatch(res.body(), /response\.completed/u);
+
+    streamController.enqueue(encoder.encode(
+      'data: {"id":"chatcmpl-capability-text","object":"chat.completion.chunk","model":"deepseek-chat","choices":[{"index":0,"delta":{"content":" and the rest"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+    ));
+    streamController.close();
+    await proxyPromise;
+    assert.match(res.body(), /first visible words/u);
+    assert.match(res.body(), /response\.completed/u);
+  } finally {
+    try { streamController?.close(); } catch {}
+    await proxyPromise?.catch(() => {});
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a smart-failover route streams its first ordinary text delta immediately", async () => {
+  const originalFetch = globalThis.fetch;
+  const encoder = new TextEncoder();
+  let streamController;
+  let fetchStarted = false;
+  let proxyPromise;
+  globalThis.fetch = async () => {
+    fetchStarted = true;
+    return new Response(new ReadableStream({
+      start(controller) { streamController = controller; },
+    }), {
+      status: 200,
+      headers: { "content-type": "text/event-stream; charset=utf-8" },
+    });
+  };
+
+  try {
+    const res = collectResponse();
+    proxyPromise = proxyChatCompletions(
+      { model: "fallback-test", input: "hello", stream: true },
+      {
+        id: "fallback-test", displayName: "Fallback Test", api: "chat_completions",
+        baseUrl: "https://provider.example/v1", model: "fallback-model", apiKey: "test-key",
+      },
+      null,
+      res,
+      { failoverFromRoute: "primary-route" },
+    );
+
+    await waitFor(() => fetchStarted && streamController);
+    streamController.enqueue(encoder.encode(
+      'data: {"id":"chatcmpl-failover-live","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"early fallback"},"finish_reason":null}]}\n\n',
+    ));
+    await waitFor(() => res.body().includes('"delta":"early fallback"'));
+    assert.doesNotMatch(res.body(), /response\.completed/u);
+
+    streamController.enqueue(encoder.encode(
+      'data: {"id":"chatcmpl-failover-live","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" done"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+    ));
+    streamController.close();
+    await proxyPromise;
+    assert.match(res.body(), /response\.completed/u);
+  } finally {
+    try { streamController?.close(); } catch {}
     await proxyPromise?.catch(() => {});
     globalThis.fetch = originalFetch;
   }
@@ -1392,6 +2548,100 @@ test("DeepSeek Pro streams reasoning events before answer text arrives", async (
   }
 });
 
+test("DeepSeek V4 inline tool continuation forwards reasoning_content upstream", async () => {
+  const originalFetch = globalThis.fetch;
+  let seenBody = null;
+  globalThis.fetch = async (_url, init) => {
+    seenBody = JSON.parse(init.body);
+    return new Response(
+      [
+        'data: {"id":"chatcmpl-inline-replay","object":"chat.completion.chunk","model":"deepseek-v4-pro","choices":[{"index":0,"delta":{"content":"continued"},"finish_reason":"stop"}]}',
+        "",
+        "data: [DONE]",
+        "",
+      ].join("\n"),
+      {
+        status: 200,
+        headers: { "content-type": "text/event-stream; charset=utf-8" },
+      },
+    );
+  };
+
+  try {
+    const res = collectResponse();
+    await proxyChatCompletions(
+      {
+        model: "deepseek-v4-pro",
+        stream: true,
+        model_reasoning_effort: "high",
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "inspect the directory" }],
+          },
+          {
+            id: "rs_inline_replay",
+            type: "reasoning",
+            summary: [{ type: "summary_text", text: "must be replayed exactly" }],
+          },
+          {
+            id: "msg_inline_replay",
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "I will inspect first." }],
+          },
+          {
+            id: "fc_inline_replay",
+            type: "function_call",
+            call_id: "call_inline_replay",
+            name: "shell_command",
+            arguments: '{"command":"ls"}',
+            status: "completed",
+          },
+          {
+            type: "function_call_output",
+            call_id: "call_inline_replay",
+            output: "file.txt",
+          },
+        ],
+        tools: [{
+          type: "function",
+          name: "shell_command",
+          description: "Run one command.",
+          parameters: {
+            type: "object",
+            properties: { command: { type: "string" } },
+            required: ["command"],
+          },
+        }],
+      },
+      {
+        id: "deepseek-v4-pro",
+        displayName: "DeepSeek V4 Pro",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: "https://api.deepseek.com/v1",
+        model: "deepseek-v4-pro",
+        apiKey: "test-key",
+        dropParams: ["response_format", "parallel_tool_calls"],
+      },
+      null,
+      res,
+      {},
+    );
+
+    const assistant = seenBody.messages.find((message) => Array.isArray(message.tool_calls));
+    assert.equal(assistant.reasoning_content, "must be replayed exactly");
+    assert.equal(assistant.content, "I will inspect first.");
+    assert.equal(assistant.tool_calls[0].id, "call_inline_replay");
+    assert.deepEqual(seenBody.thinking, { type: "enabled" });
+    assert.match(res.body(), /continued/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("DeepSeek chat stream completes on DONE without waiting for the upstream socket to close", async () => {
   const originalFetch = globalThis.fetch;
   const encoder = new TextEncoder();
@@ -1445,6 +2695,389 @@ test("DeepSeek chat stream completes on DONE without waiting for the upstream so
   } finally {
     if (!upstreamCancelled && streamController) {
       streamController.close();
+    }
+    await proxyPromise?.catch(() => {});
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("DeepSeek Chat forwards keep-alive comments before the first model delta", async () => {
+  const originalFetch = globalThis.fetch;
+  const encoder = new TextEncoder();
+  let streamController = null;
+  let streamClosed = false;
+  let proxyPromise = null;
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    start(controller) {
+      streamController = controller;
+    },
+  }), {
+    status: 200,
+    headers: { "content-type": "text/event-stream; charset=utf-8" },
+  });
+
+  try {
+    const res = collectResponse();
+    proxyPromise = proxyChatCompletions(
+      { model: "deepseek-v4-flash", input: "hello", stream: true },
+      {
+        id: "deepseek-v4-flash",
+        displayName: "DeepSeek V4 Flash",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: "https://api.deepseek.com/v1",
+        model: "deepseek-v4-flash",
+        apiKey: "test-key",
+      },
+      null,
+      res,
+      {},
+    );
+
+    await waitFor(() => streamController !== null, 500);
+    streamController.enqueue(encoder.encode(": keep-alive\n\n"));
+    await waitFor(() => res.body().includes(": keep-alive"), 500);
+    assert.equal(res.statusCode, 200);
+    assert.match(String(res.headers?.["content-type"] || ""), /text\/event-stream/);
+    assert.doesNotMatch(res.body(), /response\.completed/);
+
+    streamController.enqueue(encoder.encode(
+      'data: {"id":"chatcmpl-keepalive","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}]}\n\n' +
+      "data: [DONE]\n\n",
+    ));
+    streamController.close();
+    streamClosed = true;
+    await proxyPromise;
+    assert.match(res.body(), /response\.completed/);
+  } finally {
+    if (!streamClosed && streamController) {
+      try {
+        streamController.enqueue(encoder.encode("data: [DONE]\n\n"));
+        streamController.close();
+      } catch {
+        // The fixed path may already have cancelled the upstream stream.
+      }
+    }
+    await proxyPromise?.catch(() => {});
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("DeepSeek Chat completes on finish_reason without waiting for DONE or socket close", async () => {
+  const originalFetch = globalThis.fetch;
+  const encoder = new TextEncoder();
+  let streamController = null;
+  let upstreamCancelled = false;
+  let proxyPromise = null;
+  let proxySettled = false;
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    start(controller) {
+      streamController = controller;
+    },
+    cancel() {
+      upstreamCancelled = true;
+    },
+  }), {
+    status: 200,
+    headers: { "content-type": "text/event-stream; charset=utf-8" },
+  });
+
+  try {
+    const res = collectResponse();
+    proxyPromise = proxyChatCompletions(
+      { model: "deepseek-v4-flash", input: "hello", stream: true },
+      {
+        id: "deepseek-v4-flash",
+        displayName: "DeepSeek V4 Flash",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: "https://api.deepseek.com/v1",
+        model: "deepseek-v4-flash",
+        apiKey: "test-key",
+      },
+      null,
+      res,
+      {},
+    ).finally(() => {
+      proxySettled = true;
+    });
+
+    await waitFor(() => streamController !== null, 500);
+    streamController.enqueue(encoder.encode(
+      'data: {"id":"chatcmpl-finish-held","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"answer ready"},"finish_reason":"stop"}]}\n\n',
+    ));
+
+    await waitFor(() => proxySettled, 500);
+    assert.equal(upstreamCancelled, true);
+    assert.match(res.body(), /answer ready/);
+    assert.match(res.body(), /response\.completed/);
+  } finally {
+    if (!upstreamCancelled && streamController) {
+      try {
+        streamController.enqueue(encoder.encode("data: [DONE]\n\n"));
+        streamController.close();
+      } catch {
+        // The fixed path may already have cancelled the upstream stream.
+      }
+    }
+    await proxyPromise?.catch(() => {});
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("keep-alive followed by a tool-only response writes downstream headers once", async () => {
+  const originalFetch = globalThis.fetch;
+  const encoder = new TextEncoder();
+  let streamController = null;
+  let writeHeadCalls = 0;
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    start(controller) {
+      streamController = controller;
+    },
+  }), {
+    status: 200,
+    headers: { "content-type": "text/event-stream; charset=utf-8" },
+  });
+
+  const chunks = [];
+  const res = {
+    headersSent: false,
+    destroyed: false,
+    writableEnded: false,
+    writeHead() {
+      writeHeadCalls += 1;
+      if (this.headersSent) {
+        const error = new Error("duplicate writeHead");
+        error.code = "ERR_HTTP_HEADERS_SENT";
+        throw error;
+      }
+      this.headersSent = true;
+    },
+    write(chunk) {
+      chunks.push(Buffer.from(chunk));
+      return true;
+    },
+    end(chunk = "") {
+      if (chunk) chunks.push(Buffer.from(String(chunk)));
+      this.writableEnded = true;
+    },
+    body() {
+      return Buffer.concat(chunks).toString("utf8");
+    },
+  };
+
+  try {
+    const proxyPromise = proxyChatCompletions(
+      {
+        model: "deepseek-v4-flash",
+        input: "run the tool",
+        stream: true,
+        tools: [{
+          type: "function",
+          name: "shell_command",
+          parameters: { type: "object" },
+        }],
+      },
+      {
+        id: "deepseek-v4-flash",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: "https://api.deepseek.com/v1",
+        model: "deepseek-v4-flash",
+        apiKey: "test-key",
+      },
+      null,
+      res,
+      {},
+    );
+    await waitFor(() => streamController !== null, 500);
+    streamController.enqueue(encoder.encode(
+      ": keep-alive\n\n" +
+      'data: {"id":"chatcmpl-tool-only","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_tool","type":"function","function":{"name":"shell_command","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}\n\n' +
+      'data: {"id":"chatcmpl-tool-only","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}\n\n' +
+      "data: [DONE]\n\n",
+    ));
+    streamController.close();
+    await proxyPromise;
+
+    assert.equal(writeHeadCalls, 1);
+    assert.equal(res.writableEnded, true);
+    assert.match(res.body(), /: keep-alive/);
+    assert.match(res.body(), /response\.function_call_arguments\.done/);
+    assert.match(res.body(), /response\.completed/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("transport errors after finish_reason do not overturn a completed Chat response", async () => {
+  const originalFetch = globalThis.fetch;
+  const encoder = new TextEncoder();
+  let streamController = null;
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    start(controller) {
+      streamController = controller;
+    },
+  }), {
+    status: 200,
+    headers: { "content-type": "text/event-stream; charset=utf-8" },
+  });
+
+  try {
+    const res = collectResponse();
+    const proxyPromise = proxyChatCompletions(
+      { model: "deepseek-v4-flash", input: "hello", stream: true },
+      {
+        id: "deepseek-v4-flash",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: "https://api.deepseek.com/v1",
+        model: "deepseek-v4-flash",
+        apiKey: "test-key",
+      },
+      null,
+      res,
+      {},
+    );
+    await waitFor(() => streamController !== null, 500);
+    streamController.enqueue(encoder.encode(
+      'data: {"id":"chatcmpl-finish-error","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"complete answer"},"finish_reason":"stop"}]}\n\n',
+    ));
+    await waitFor(() => res.body().includes("complete answer"), 500);
+    streamController.error(new Error("socket failed after finish"));
+    await proxyPromise;
+
+    assert.match(res.body(), /response\.completed/);
+    assert.doesNotMatch(res.body(), /response\.failed/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("SSE errors after finish_reason are ignored while trailing usage is retained", async () => {
+  const originalFetch = globalThis.fetch;
+  const encoder = new TextEncoder();
+  let streamController = null;
+  let recordedTurn = null;
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    start(controller) {
+      streamController = controller;
+    },
+  }), {
+    status: 200,
+    headers: { "content-type": "text/event-stream; charset=utf-8" },
+  });
+
+  try {
+    const res = collectResponse();
+    const proxyPromise = proxyChatCompletions(
+      { model: "deepseek-v4-flash", input: "hello", stream: true },
+      {
+        id: "deepseek-v4-flash",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: "https://api.deepseek.com/v1",
+        model: "deepseek-v4-flash",
+        apiKey: "test-key",
+      },
+      {
+        recordTurn(turn) {
+          recordedTurn = turn;
+        },
+      },
+      res,
+      {},
+    );
+    await waitFor(() => streamController !== null, 500);
+    streamController.enqueue(encoder.encode(
+      'data: {"id":"chatcmpl-late-sse-error","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"complete answer"},"finish_reason":"stop"}]}\n\n',
+    ));
+    streamController.enqueue(encoder.encode(
+      'data: {"error":{"message":"late gateway error"}}\n\n' +
+      'data: {"id":"chatcmpl-late-sse-error","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[],"usage":{"prompt_tokens":4,"completion_tokens":3,"total_tokens":7}}\n\n',
+    ));
+    streamController.close();
+    await proxyPromise;
+
+    assert.match(res.body(), /response\.completed/);
+    assert.doesNotMatch(res.body(), /response\.failed/);
+    assert.equal(recordedTurn.response.usage.input_tokens, 4);
+    assert.equal(recordedTurn.response.usage.output_tokens, 3);
+    assert.equal(recordedTurn.response.usage.total_tokens, 7);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Codex Responses routed to Anthropic forwards native text before message_stop", async () => {
+  const originalFetch = globalThis.fetch;
+  const encoder = new TextEncoder();
+  let streamController = null;
+  let seenBody = null;
+  let proxyPromise = null;
+  globalThis.fetch = async (_url, init) => {
+    seenBody = JSON.parse(String(init?.body || "{}"));
+    return new Response(new ReadableStream({
+      start(controller) {
+        streamController = controller;
+      },
+    }), {
+      status: 200,
+      headers: { "content-type": "text/event-stream; charset=utf-8" },
+    });
+  };
+
+  try {
+    const res = collectResponse();
+    proxyPromise = proxyChatCompletions(
+      {
+        model: "cb-claude-sonnet-4-6",
+        input: "hello from Codex",
+        stream: true,
+        max_output_tokens: 321,
+      },
+      {
+        id: "cb-claude-sonnet-4-6",
+        displayName: "Claude Sonnet 4.6",
+        provider: "anthropic",
+        api: "anthropic_messages",
+        baseUrl: "https://api.anthropic.com/v1",
+        model: "claude-sonnet-4-6",
+        apiKey: "anthropic-test-key",
+        authMode: "anthropic_api_key",
+      },
+      null,
+      res,
+      {},
+    );
+
+    await waitFor(() => streamController !== null && seenBody !== null, 500);
+    assert.equal(seenBody.stream, true);
+    streamController.enqueue(encoder.encode(
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_live","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[],"stop_reason":null,"usage":{"input_tokens":7,"output_tokens":0}}}\n\n' +
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n' +
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"live anthropic "}}\n\n',
+    ));
+    await waitFor(() => res.body().includes("live anthropic "), 500);
+    assert.doesNotMatch(res.body(), /response\.completed/);
+
+    streamController.enqueue(encoder.encode(
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"reply"}}\n\n' +
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":5}}\n\n' +
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ));
+    streamController.close();
+    await proxyPromise;
+    assert.match(res.body(), /live anthropic reply/);
+    assert.match(res.body(), /response\.completed/);
+    assert.match(res.body(), /data: \[DONE\]/);
+  } finally {
+    if (streamController) {
+      try {
+        streamController.close();
+      } catch {
+        // The success path already closed or cancelled the controlled stream.
+      }
     }
     await proxyPromise?.catch(() => {});
     globalThis.fetch = originalFetch;
@@ -1517,20 +3150,305 @@ test("DeepSeek Responses stream completes on response.completed without waiting 
       `event: response.completed\ndata: ${JSON.stringify({
         type: "response.completed",
         response: completedResponse,
-      })}\n\ndata: [DONE]\n\n`,
+      })}\n\n`,
     ));
 
     await waitFor(() => proxySettled, 500);
     assert.equal(upstreamCancelled, true);
     assert.match(res.body(), /answer ready/);
     assert.match(res.body(), /response\.completed/);
-    assert.match(res.body(), /data: \[DONE\]/);
+    assert.doesNotMatch(res.body(), /data: \[DONE\]/);
     assert.equal(history.getResponse("resp_held_open")?.status, "completed");
   } finally {
     if (!upstreamCancelled && streamController) {
       streamController.close();
     }
     await proxyPromise?.catch(() => {});
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("DeepSeek Responses preserves visible text across delta, done snapshots, and completion", async () => {
+  const originalFetch = globalThis.fetch;
+  const encoder = new TextEncoder();
+  let streamController = null;
+  let upstreamCancelled = false;
+  const messageItem = {
+    id: "msg_stable_visible_text",
+    type: "message",
+    role: "assistant",
+    status: "completed",
+    content: [{ type: "output_text", text: "first answer", annotations: [] }],
+  };
+  const completedResponse = {
+    id: "resp_stable_visible_text",
+    object: "response",
+    created_at: 1,
+    status: "completed",
+    model: "deepseek-v4-flash",
+    output: [messageItem],
+    output_text: "first answer",
+    error: null,
+    incomplete_details: null,
+    usage: { input_tokens: 3, output_tokens: 2, total_tokens: 5 },
+  };
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    start(controller) {
+      streamController = controller;
+    },
+    cancel() {
+      upstreamCancelled = true;
+    },
+  }), {
+    status: 200,
+    headers: { "content-type": "text/event-stream; charset=utf-8" },
+  });
+
+  let proxyPromise;
+  try {
+    const res = collectResponse();
+    proxyPromise = proxyResponsesApi(
+      { model: "deepseek-v4-flash", input: "hello", stream: true },
+      {
+        id: "deepseek-v4-flash",
+        displayName: "DeepSeek V4 Flash",
+        provider: "deepseek",
+        api: "responses",
+        baseUrl: "https://api.deepseek.com",
+        model: "deepseek-v4-flash",
+        apiKey: "test-key",
+        supportsResponsePreviousId: false,
+      },
+      new ResponseHistory(),
+      res,
+      {},
+    );
+    await waitFor(() => streamController !== null, 500);
+    const event = (type, payload) => `event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`;
+    streamController.enqueue(encoder.encode(
+      event("response.created", {
+        type: "response.created",
+        response: { ...completedResponse, status: "in_progress", output: [], output_text: "", usage: null },
+      }) +
+      event("response.output_item.added", {
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { ...messageItem, status: "in_progress", content: [] },
+      }) +
+      event("response.content_part.added", {
+        type: "response.content_part.added",
+        item_id: messageItem.id,
+        output_index: 0,
+        content_index: 0,
+        part: { type: "output_text", text: "", annotations: [] },
+      }) +
+      event("response.output_text.delta", {
+        type: "response.output_text.delta",
+        item_id: messageItem.id,
+        output_index: 0,
+        content_index: 0,
+        delta: "first ",
+      }) +
+      event("response.output_text.delta", {
+        type: "response.output_text.delta",
+        item_id: messageItem.id,
+        output_index: 0,
+        content_index: 0,
+        delta: "answer",
+      }) +
+      event("response.output_text.done", {
+        type: "response.output_text.done",
+        item_id: messageItem.id,
+        output_index: 0,
+        content_index: 0,
+        text: "first answer",
+      }) +
+      event("response.content_part.done", {
+        type: "response.content_part.done",
+        item_id: messageItem.id,
+        output_index: 0,
+        content_index: 0,
+        part: messageItem.content[0],
+      }) +
+      event("response.output_item.done", {
+        type: "response.output_item.done",
+        output_index: 0,
+        item: messageItem,
+      }),
+    ));
+
+    await waitFor(() => res.body().includes('"type":"response.output_item.done"'), 500);
+    assert.match(res.body(), /"delta":"first "/u);
+    assert.match(res.body(), /"delta":"answer"/u);
+    assert.match(res.body(), /"text":"first answer"/u);
+    assert.doesNotMatch(res.body(), /response\.completed/u);
+
+    streamController.enqueue(encoder.encode(event("response.completed", {
+      type: "response.completed",
+      response: completedResponse,
+    })));
+    await proxyPromise;
+
+    const payloads = parseSseEvents(res.body())
+      .map((item) => JSON.parse(item.data))
+      .filter(Boolean);
+    assert.deepEqual(
+      payloads.map((payload) => payload.type),
+      [
+        "response.created",
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
+        "response.output_item.done",
+        "response.completed",
+      ],
+    );
+    assert.equal(
+      payloads.filter((payload) => payload.type === "response.output_text.delta")
+        .map((payload) => payload.delta)
+        .join(""),
+      "first answer",
+    );
+    assert.equal(payloads.at(-1).response.output_text, "first answer");
+    assert.equal(upstreamCancelled, true);
+  } finally {
+    if (!upstreamCancelled && streamController) {
+      try {
+        streamController.close();
+      } catch {
+        // The terminal event may already have cancelled the upstream stream.
+      }
+    }
+    await proxyPromise?.catch(() => {});
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("native Responses sends completion before slow history persistence finishes", async () => {
+  const originalFetch = globalThis.fetch;
+  let resolveWrite;
+  let proxySettled = false;
+  const completedResponse = {
+    id: "resp_before_slow_history",
+    object: "response",
+    created_at: 1,
+    status: "completed",
+    model: "deepseek-v4-flash",
+    output: [{
+      id: "msg_before_slow_history",
+      type: "message",
+      role: "assistant",
+      status: "completed",
+      content: [{ type: "output_text", text: "visible before disk", annotations: [] }],
+    }],
+    output_text: "visible before disk",
+    error: null,
+    incomplete_details: null,
+    usage: null,
+  };
+  globalThis.fetch = async () => new Response(
+    `event: response.output_text.delta\ndata: ${JSON.stringify({
+      type: "response.output_text.delta",
+      delta: "visible before disk",
+    })}\n\nevent: response.completed\ndata: ${JSON.stringify({
+      type: "response.completed",
+      response: completedResponse,
+    })}\n\n`,
+    { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8" } },
+  );
+  const history = new ResponseHistory({
+    storage: {
+      recordTurnAsync() {
+        return new Promise((resolve) => {
+          resolveWrite = resolve;
+        });
+      },
+    },
+  });
+
+  try {
+    const res = collectResponse();
+    const proxyPromise = proxyResponsesApi(
+      { model: "deepseek-v4-flash", input: "hello", stream: true },
+      {
+        id: "deepseek-v4-flash",
+        displayName: "DeepSeek V4 Flash",
+        provider: "deepseek",
+        api: "responses",
+        baseUrl: "https://api.deepseek.com",
+        model: "deepseek-v4-flash",
+        apiKey: "test-key",
+        supportsResponsePreviousId: false,
+      },
+      history,
+      res,
+      {},
+    ).finally(() => {
+      proxySettled = true;
+    });
+
+    await waitFor(() => res.body().includes("response.completed"), 500);
+    assert.equal(proxySettled, false);
+    assert.equal(history.getResponse(completedResponse.id)?.status, "completed");
+
+    resolveWrite({ recordBytes: { messages: 1, response: 1, meta: 1 } });
+    await proxyPromise;
+    assert.equal(proxySettled, true);
+  } finally {
+    history.close();
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("chat-compatible streaming sends completion before slow history persistence finishes", async () => {
+  const originalFetch = globalThis.fetch;
+  let resolveWrite;
+  let proxySettled = false;
+  globalThis.fetch = async () => new Response(
+    'data: {"id":"chatcmpl-slow-history","object":"chat.completion.chunk","model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"visible chat answer"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+    { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8" } },
+  );
+  const history = new ResponseHistory({
+    storage: {
+      recordTurnAsync() {
+        return new Promise((resolve) => {
+          resolveWrite = resolve;
+        });
+      },
+    },
+  });
+
+  try {
+    const res = collectResponse();
+    const proxyPromise = proxyChatCompletions(
+      { model: "deepseek-chat", input: "hello", stream: true },
+      {
+        id: "deepseek-chat",
+        displayName: "DeepSeek Chat",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: "https://api.deepseek.com/v1",
+        model: "deepseek-chat",
+        apiKey: "test-key",
+      },
+      history,
+      res,
+      {},
+    ).finally(() => {
+      proxySettled = true;
+    });
+
+    await waitFor(() => res.body().includes("response.completed"), 500);
+    assert.equal(proxySettled, false);
+
+    resolveWrite({ recordBytes: { messages: 1, response: 1, meta: 1 } });
+    await proxyPromise;
+    assert.equal(proxySettled, true);
+  } finally {
+    history.close();
     globalThis.fetch = originalFetch;
   }
 });
@@ -3347,6 +5265,116 @@ test("mislabeled completed Responses SSE is passed through as a successful strea
     assert.match(res.body(), /response\.completed/);
     assert.doesNotMatch(res.body(), /response\.failed/);
   } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("mislabeled Responses SSE forwards keep-alives and deltas before upstream closes", async () => {
+  const originalFetch = globalThis.fetch;
+  const encoder = new TextEncoder();
+  let streamController = null;
+  let streamClosed = false;
+  let proxyPromise = null;
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    start(controller) {
+      streamController = controller;
+      controller.enqueue(encoder.encode(": keep-alive\n\n"));
+    },
+  }), {
+    status: 200,
+    headers: {},
+  });
+
+  const completedResponse = {
+    id: "resp_mislabeled_live",
+    object: "response",
+    status: "completed",
+    model: "gpt-5.6-sol",
+    output: [{
+      id: "msg_mislabeled_live",
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "first answer" }],
+    }],
+    output_text: "first answer",
+    usage: { input_tokens: 3, output_tokens: 2, total_tokens: 5 },
+  };
+
+  try {
+    const res = collectResponse();
+    proxyPromise = proxyResponsesApi(
+      {
+        model: "gpt-5.6-sol",
+        input: "hello",
+        stream: true,
+      },
+      {
+        id: "cb-gpt-5-6-sol",
+        displayName: "GPT-5.6-Sol",
+        api: "responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        model: "gpt-5.6-sol",
+        authMode: "codex_openai",
+      },
+      res,
+      {
+        clientAuth: {
+          kind: "codex_openai",
+          bearerToken: "codex-openai-token",
+        },
+      },
+    );
+
+    await waitFor(() => res.body().includes(": keep-alive"), 500);
+    assert.equal(res.statusCode, 200);
+    assert.match(String(res.headers?.["content-type"] || ""), /text\/event-stream/);
+    assert.doesNotMatch(res.body(), /response\.completed/);
+
+    streamController.enqueue(encoder.encode(
+      "event: response.created\n" +
+        `data: ${JSON.stringify({
+          type: "response.created",
+          response: { ...completedResponse, status: "in_progress", output: [] },
+        })}\n\n` +
+        "event: response.output_text.delta\n" +
+        `data: ${JSON.stringify({
+          type: "response.output_text.delta",
+          item_id: "msg_mislabeled_live",
+          output_index: 0,
+          content_index: 0,
+          delta: "first ",
+        })}\n\n`,
+    ));
+    await waitFor(() => res.body().includes('"delta":"first "'), 500);
+    assert.doesNotMatch(res.body(), /response\.completed/);
+
+    streamController.enqueue(encoder.encode(
+      "event: response.output_text.delta\n" +
+        `data: ${JSON.stringify({
+          type: "response.output_text.delta",
+          item_id: "msg_mislabeled_live",
+          output_index: 0,
+          content_index: 0,
+          delta: "answer",
+        })}\n\n` +
+        "event: response.completed\n" +
+        `data: ${JSON.stringify({
+          type: "response.completed",
+          response: completedResponse,
+        })}\n\n` +
+        "data: [DONE]\n\n",
+    ));
+    streamController.close();
+    streamClosed = true;
+    await proxyPromise;
+
+    assert.match(res.body(), /response\.completed/);
+    assert.match(res.body(), /data: \[DONE\]/);
+  } finally {
+    if (!streamClosed && streamController) {
+      streamController.close();
+    }
+    await proxyPromise?.catch(() => {});
     globalThis.fetch = originalFetch;
   }
 });

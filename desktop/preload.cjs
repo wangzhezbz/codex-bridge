@@ -40,6 +40,8 @@ contextBridge.exposeInMainWorld("codexBridge", {
   updateCodexResource: (payload) => ipcRenderer.invoke("resource:update", payload),
   removeCodexResource: (payload) => ipcRenderer.invoke("resource:remove", payload),
   refreshCodexPluginMarketplaces: () => ipcRenderer.invoke("resource:refreshMarketplaces"),
+  listCuratedCodexPlugins: () => ipcRenderer.invoke("curatedPlugin:list"),
+  runCuratedCodexPluginTask: (payload) => ipcRenderer.invoke("curatedPlugin:runTask", payload),
   restoreCodexBackup: (backupPath) => ipcRenderer.invoke("backups:restore", backupPath),
   exportSessionMarkdown: (sessionId) => ipcRenderer.invoke("sessions:export", sessionId),
   exportProjectMarkdown: (projectKey) => ipcRenderer.invoke("sessions:exportProject", projectKey),

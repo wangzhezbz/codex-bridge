@@ -148,7 +148,8 @@ function createMemoryJournalFs(initial = {}) {
 
 function createFakeSkillCapabilities({
   existing = null, crashAfterOldDelete = false, crashAfterPreparedChildDelete = false,
-  sourceInitiallyPresent = true, sourceInitiallyNonempty = false,
+  sourceInitiallyPresent = true, sourceInitiallyNonempty = false, sourceValidationKind = "directory",
+  crashAfterStage = false, stageLeavesPartial = false, recoverSourceMissing = false,
 } = {}) {
   const rootIdentity = identity("skills-root");
   const sourceEvidence = evidence("source");
@@ -160,6 +161,7 @@ function createFakeSkillCapabilities({
   let sourcePresent = sourceInitiallyPresent;
   let sourceNonempty = sourceInitiallyNonempty;
   let preparedDeleteCrashPending = crashAfterPreparedChildDelete;
+  let stageCrashPending = crashAfterStage;
   const sourceReceipts = new WeakMap();
   const sourceProof = Object.freeze(Object.create(null));
   sourceReceipts.set(sourceProof, { path: SOURCE, identity: identity("source"), evidence: sourceEvidence });
@@ -195,7 +197,7 @@ function createFakeSkillCapabilities({
       if (!sourcePresent) return { kind: "absent", sourcePath: SOURCE };
       assert.deepEqual(expectedIdentity, identity("source"));
       if (expectedEvidence !== null) assert.deepEqual(expectedEvidence, sourceEvidence);
-      return { kind: "directory", identity: identity("source"), sourcePath: SOURCE };
+      return { kind: sourceValidationKind, identity: identity("source"), sourcePath: SOURCE };
     },
     async deletePreparedSkillSourceNoFollow({
       installRootCapability, taskId, skillId, expectedIdentity, expectedEvidence,
@@ -246,7 +248,11 @@ function createFakeSkillCapabilities({
           if (trees.has(destinationName)) throw new Error("skill_destination_exists");
           const staged = evidence(`prepared-${++preparedSequence}`);
           assert.equal(staged.treeDigest, expected.treeDigest);
-          trees.set(destinationName, staged);
+          trees.set(destinationName, stageCrashPending && stageLeavesPartial ? { kind: "partial" } : staged);
+          if (stageCrashPending) {
+            stageCrashPending = false;
+            throw new Error("test_crash_after_stage_copy");
+          }
           return structuredClone(staged);
         },
         async recoverPreparedTreeNoFollow({ taskId, sourceIdentity, skillId, swapId, expected }) {
@@ -254,6 +260,7 @@ function createFakeSkillCapabilities({
           calls.push(["recover-stage", SOURCE, destinationName]);
           assert.equal(taskId, "skill-task");
           assert.deepEqual(sourceIdentity, identity("source"));
+          if (recoverSourceMissing) throw Object.assign(new Error("missing"), { code: "entry_missing" });
           if (!trees.has(destinationName)) trees.set(destinationName, evidence(`prepared-${++preparedSequence}`));
           const staged = trees.get(destinationName);
           assert.equal(staged.treeDigest, expected.treeDigest);
@@ -282,6 +289,11 @@ function createFakeSkillCapabilities({
             throw new Error("test_crash_after_old_delete");
           }
         },
+        async deleteUnverifiedDirectChildTreeNoFollow({ child }) {
+          const name = specName(child);
+          calls.push(["delete-unverified", name]);
+          return trees.delete(name);
+        },
         async close() {},
       };
     },
@@ -308,7 +320,8 @@ function createFakeSkillCapabilities({
 function createFixture({
   existing = null, crashAfterPhase = null, crashAfterOldDelete = false,
   crashAfterPreparedChildDelete = false,
-  sourceInitiallyPresent = true, sourceInitiallyNonempty = false,
+  sourceInitiallyPresent = true, sourceInitiallyNonempty = false, sourceValidationKind = "directory",
+  crashAfterStage = false, stageLeavesPartial = false, recoverSourceMissing = false,
 } = {}) {
   const memory = createMemoryJournalFs();
   const durableJournal = createSkillSwapJournal({
@@ -335,7 +348,8 @@ function createFixture({
   });
   const capabilities = createFakeSkillCapabilities({
     existing, crashAfterOldDelete, crashAfterPreparedChildDelete,
-    sourceInitiallyPresent, sourceInitiallyNonempty,
+    sourceInitiallyPresent, sourceInitiallyNonempty, sourceValidationKind, crashAfterStage,
+    stageLeavesPartial, recoverSourceMissing,
   });
   const prepareLeaseStore = {
     async acquireOperationLease({ nonce, scope }) {
@@ -785,6 +799,17 @@ test("prepared Skill deletion resumes from deleting after a child was removed be
   assert.equal(fixture.capabilities.calls.filter(([name]) => name === "delete-source-child").length, 1);
 });
 
+test("dead prepared Skill cleanup removes its exact identity after partial content damage", async () => {
+  const fixture = createFixture({ sourceValidationKind: "changed" });
+  await prepare(fixture.service, fixture.capabilities);
+
+  assert.deepEqual(await fixture.service.discardPrepared({
+    taskId: "skill-task", skillIds: ["documents"],
+  }), [true]);
+  assert.equal(fixture.capabilities.sourcePresent(), false);
+  assert.equal(await fixture.prepareJournal.load({ taskId: "skill-task", skillId: "documents" }), null);
+});
+
 test("prepared Skill recovery reports an exact live lease before cleaning that journal after lease death", async () => {
   const fixture = createFixture({ sourceInitiallyPresent: false });
   await fixture.service.beginPreparedSource({
@@ -907,6 +932,73 @@ for (const phase of ["reserved", "prepared", "old_moved", "new_published", "proo
     assert.equal(await fixture.prepareJournal.load({ taskId: "skill-task", skillId: "documents" }), null);
   });
 }
+
+test("reserved Skill recovery adopts a complete prepared tree left by synchronous close failure", async () => {
+  const fixture = createFixture({ crashAfterStage: true });
+  const verified = await prepare(fixture.service, fixture.capabilities);
+  await assert.rejects(
+    fixture.service.replaceExact(replacementPlan(verified)),
+    /test_crash_after_stage_copy/u,
+  );
+  assert.equal(fixture.capabilities.inspect(`.codexbridge-new-documents-${SWAP_ID}`).kind, "directory");
+
+  const restarted = createSkillFileService({
+    fileCapabilities: fixture.capabilities.fileCapabilities,
+    installRootCapability: INSTALL_CAPABILITY,
+    skillsRootCapability: SKILLS_CAPABILITY,
+    catalogService: TRUSTED_CATALOG,
+    workspace: fixture.capabilities.workspace,
+    swapJournal: fixture.journal,
+    prepareJournal: fixture.prepareJournal,
+    prepareLeaseStore: fixture.prepareLeaseStore,
+    hashFile: async () => { throw new Error("raw_path_hash_forbidden"); },
+  });
+  const reconciled = await restarted.reconcileReplacement({
+    taskId: "skill-task",
+    swapId: SWAP_ID,
+    target: TARGET,
+    expected: { treeDigest: TREE, manifestDigest: MANIFEST, skillMdSha256: SKILL_MD },
+  });
+
+  assert.equal(reconciled.status, "completed");
+  assert.equal((await restarted.inspectExact({ target: TARGET, authorizedRoot: SKILLS_ROOT })).treeDigest, TREE);
+  assert.equal(await fixture.prepareJournal.load({ taskId: "skill-task", skillId: "documents" }), null);
+});
+
+test("reserved Skill recovery removes a partial prepared tree and aborts when its source is gone", async () => {
+  const fixture = createFixture({
+    crashAfterStage: true,
+    stageLeavesPartial: true,
+    recoverSourceMissing: true,
+  });
+  const verified = await prepare(fixture.service, fixture.capabilities);
+  await assert.rejects(
+    fixture.service.replaceExact(replacementPlan(verified)),
+    /test_crash_after_stage_copy/u,
+  );
+
+  const restarted = createSkillFileService({
+    fileCapabilities: fixture.capabilities.fileCapabilities,
+    installRootCapability: INSTALL_CAPABILITY,
+    skillsRootCapability: SKILLS_CAPABILITY,
+    catalogService: TRUSTED_CATALOG,
+    workspace: fixture.capabilities.workspace,
+    swapJournal: fixture.journal,
+    prepareJournal: fixture.prepareJournal,
+    prepareLeaseStore: fixture.prepareLeaseStore,
+    hashFile: async () => { throw new Error("raw_path_hash_forbidden"); },
+  });
+  const reconciled = await restarted.reconcileReplacement({
+    taskId: "skill-task",
+    swapId: SWAP_ID,
+    target: TARGET,
+    expected: { treeDigest: TREE, manifestDigest: MANIFEST, skillMdSha256: SKILL_MD },
+  });
+
+  assert.equal(reconciled.status, "aborted");
+  assert.equal(fixture.capabilities.inspect(`.codexbridge-new-documents-${SWAP_ID}`).kind, "absent");
+  assert.equal(await fixture.journal.load({ taskId: "skill-task", swapId: SWAP_ID }), null);
+});
 
 test("ambiguous identity during recovery fails closed and deletes no tree", async () => {
   const old = evidence("old", { treeDigest: OLD_TREE, manifestDigest: OLD_MANIFEST, skillMdSha256: OLD_SKILL_MD });

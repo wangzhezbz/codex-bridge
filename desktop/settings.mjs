@@ -1,10 +1,11 @@
 import fs from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { Worker } from "node:worker_threads";
 import {
   MODEL_PRESETS,
   PROVIDERS,
@@ -21,6 +22,12 @@ import {
 import { buildModelCatalog } from "../src/model-catalog.js";
 import { fetchInitWithProxy, proxySettingsForUrl } from "../src/proxy.js";
 import { routeDecisionSummaryForLog } from "../src/route-trace.js";
+import {
+  CURATED_CODEX_PLUGINS,
+  buildCuratedPluginInstallPlan,
+  buildCuratedPluginRemovePlan,
+  curatedPluginDefinition,
+} from "../shared/software-manager/curated-plugins.mjs";
 import {
   CODEX_BRIDGE_LEGACY_LOCAL_AUTH_TOKEN,
   CODEX_BRIDGE_PROVIDER_ID,
@@ -161,6 +168,12 @@ const DELETE_SAFETY_SCAN_FILES = [
   "scripts/installer/windows/CodexBridge.nsi",
   "scripts/package-windows.mjs",
   "scripts/package-windows-release-artifacts.mjs",
+  "scripts/package-macos.mjs",
+  "scripts/run-node-tests-isolated.mjs",
+  "scripts/run-project-check.mjs",
+  "scripts/smoke-packaged-macos.mjs",
+  "scripts/smoke-packaged-windows.mjs",
+  "scripts/smoke-temp-cleanup.mjs",
 ];
 const FORBIDDEN_BATCH_DELETE_COMMANDS = [
   ["del /s", /\bdel\s+\/s\b/i],
@@ -3433,7 +3446,12 @@ function packagedAppSmokePreflightItem(report = null) {
   if (!report || typeof report !== "object") {
     return null;
   }
-  const ok = report.ok === true && report.desktopSmoke?.ok === true && report.routerSmoke?.ok === true;
+  const smokeOk = report.ok === true && report.desktopSmoke?.ok === true && report.routerSmoke?.ok === true;
+  const sourceEvidence = report.sourceEvidence && typeof report.sourceEvidence === "object"
+    ? report.sourceEvidence
+    : null;
+  const sourceOk = sourceEvidence?.ok === true;
+  const status = smokeOk ? (sourceOk ? "pass" : "warn") : "fail";
   const exePath = String(report.exePath || "").trim();
   const checkedAt = String(report.checkedAt || "").trim();
   const desktopMs = Number(report.desktopSmoke?.durationMs || 0);
@@ -3444,24 +3462,51 @@ function packagedAppSmokePreflightItem(report = null) {
   return checkItem({
     id: "packaged_app_smoke",
     label: "打包应用 smoke",
-    status: ok ? "pass" : "fail",
-    detail: ok
+    status,
+    detail: status === "pass"
       ? [
           `${exePath || "CodexBridge.exe"} 已通过桌面 smoke 和 Router health smoke`,
           checkedAt ? `时间 ${checkedAt}` : "",
           desktopMs > 0 ? `桌面 smoke ${Math.round(desktopMs)}ms` : "",
           routerMs > 0 ? `Router health smoke ${Math.round(routerMs)}ms` : "",
           models.length ? `模型 ${models.join("、")}` : "",
+          sourceEvidence.currentFingerprint
+            ? `源码指纹 ${String(sourceEvidence.currentFingerprint).slice(0, 12)}`
+            : "",
         ].filter(Boolean).join("；")
-      : [
-          `${exePath || "CodexBridge.exe"} 打包 smoke 未通过`,
-          report.error ? redactSecretText(report.error) : "",
-        ].filter(Boolean).join("；"),
-    count: ok ? 2 : 1,
-    action: ok
+      : status === "warn"
+        ? [
+            `${exePath || "CodexBridge.exe"} 的历史打包 smoke 已通过，但不能作为当前源码的发包证据`,
+            packagedSmokeSourceEvidenceDetail(sourceEvidence),
+            checkedAt ? `报告时间 ${checkedAt}` : "",
+          ].filter(Boolean).join("；")
+        : [
+            `${exePath || "CodexBridge.exe"} 打包 smoke 未通过`,
+            report.error ? redactSecretText(report.error) : "",
+          ].filter(Boolean).join("；"),
+    count: status === "pass" ? 2 : 1,
+    action: status === "pass"
       ? "这只能证明打包后的 exe 能启动桌面和本地 Router health；真实安装器和供应商仍需单独检查。"
       : "请重新运行 npm run package:win 和 npm run package:win:smoke，确认打包后的 CodexBridge.exe 可以启动。",
   });
+}
+
+function packagedSmokeSourceEvidenceDetail(sourceEvidence = null) {
+  if (!sourceEvidence || typeof sourceEvidence !== "object") {
+    return "报告缺少源码指纹";
+  }
+  if (sourceEvidence.reason === "source_fingerprint_missing") {
+    return "报告缺少源码指纹";
+  }
+  if (sourceEvidence.reason === "source_fingerprint_mismatch") {
+    return "报告对应的源码与当前源码不一致";
+  }
+  if (sourceEvidence.reason === "source_fingerprint_check_failed") {
+    return sourceEvidence.error
+      ? `源码指纹校验失败：${redactSecretText(sourceEvidence.error)}`
+      : "源码指纹校验失败";
+  }
+  return "报告未通过当前源码指纹校验";
 }
 
 function preflightOptionalItem(item) {
@@ -4864,6 +4909,7 @@ const REAL_EVIDENCE_RELEASE_ITEM_IDS = new Set([
   "image_generation_proxy",
   "capability_providers",
   "real_environment_acceptance",
+  "packaged_app_smoke",
   "update_flow",
 ]);
 
@@ -6300,12 +6346,52 @@ function runCodexCliJsonCommand(executable, args, { homeDir = os.homedir(), time
   } catch (error) {
     const stderr = String(error?.stderr || "").trim();
     const stdout = String(error?.stdout || "").trim();
-    const detail = stderr || stdout || error?.message || String(error);
+    const timedOut = error?.killed === true || error?.code === "ETIMEDOUT" || /timed?\s*out/iu.test(String(error?.message || ""));
+    const detail = stderr || stdout || (timedOut
+      ? `命令超时（${Math.ceil(timeoutMs / 1000)} 秒）`
+      : error?.message || String(error));
     throw new Error(`Codex CLI 执行失败：${detail}`);
   }
 }
 
-function codexCliExecOptions({ homeDir = os.homedir(), timeoutMs = 2500, env = {} } = {}) {
+async function runCodexCliJsonCommandAsync(executable, args, {
+  homeDir = os.homedir(), timeoutMs = 30000, env = {}, signal = undefined,
+} = {}) {
+  let output;
+  try {
+    output = await new Promise((resolve, reject) => {
+      execFile(executable, args, codexCliExecOptions({ homeDir, timeoutMs, env, signal }), (error, stdout, stderr) => {
+        if (error) {
+          error.stdout = stdout;
+          error.stderr = stderr;
+          reject(error);
+          return;
+        }
+        resolve(stdout);
+      });
+    });
+  } catch (error) {
+    if (signal?.aborted) {
+      const cancelled = new Error("curated_plugin_cancelled");
+      cancelled.code = "curated_plugin_cancelled";
+      throw cancelled;
+    }
+    const stderr = String(error?.stderr || "").trim();
+    const stdout = String(error?.stdout || "").trim();
+    const timedOut = error?.killed === true || error?.code === "ETIMEDOUT" || /timed?\s*out/iu.test(String(error?.message || ""));
+    const detail = stderr || stdout || (timedOut
+      ? `命令超时（${Math.ceil(timeoutMs / 1000)} 秒）`
+      : error?.message || String(error));
+    throw new Error(`Codex CLI 执行失败：${detail}`);
+  }
+  try {
+    return output ? JSON.parse(output) : null;
+  } catch {
+    return { rawOutput: output };
+  }
+}
+
+function codexCliExecOptions({ homeDir = os.homedir(), timeoutMs = 2500, env = {}, signal = undefined } = {}) {
   return {
     cwd: homeDir,
     encoding: "utf8",
@@ -6317,6 +6403,7 @@ function codexCliExecOptions({ homeDir = os.homedir(), timeoutMs = 2500, env = {
       CODEX_HOME: path.join(homeDir, ".codex"),
     },
     maxBuffer: 8 * 1024 * 1024,
+    ...(signal ? { signal } : {}),
   };
 }
 
@@ -6346,6 +6433,29 @@ function codexCliExecutableForSnapshot(homeDir) {
   } catch {
     return "";
   }
+}
+
+function codexCliExecutableForSnapshotAsync(homeDir, env = {}, timeoutMs = 15_000) {
+  const locatorEnv = Object.fromEntries(Object.entries({ ...process.env, ...env })
+    .filter(([key, value]) => typeof key === "string" && typeof value === "string"));
+  return new Promise((resolve) => {
+    const worker = new Worker(new URL("./codex-cli-locator-worker.cjs", import.meta.url), {
+      workerData: { homeDir, env: locatorEnv },
+    });
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      worker.terminate().catch(() => {});
+      resolve(String(value || ""));
+    };
+    const timer = setTimeout(() => finish(""), Math.max(1000, Math.min(30_000, Number(timeoutMs) || 15_000)));
+    timer.unref?.();
+    worker.once("message", (message) => finish(message?.ok === true ? message.cliTarget : ""));
+    worker.once("error", () => finish(""));
+    worker.once("exit", (code) => { if (code !== 0) finish(""); });
+  });
 }
 
 function normalizeCodexCliPlugins(items = []) {
@@ -7573,6 +7683,338 @@ export function refreshCodexPluginMarketplaces({
       : "已刷新插件市场快照。",
     refresh,
   };
+}
+
+function codexJsonArray(value, keys = []) {
+  if (Array.isArray(value)) return value;
+  for (const key of keys) if (Array.isArray(value?.[key])) return value[key];
+  return [];
+}
+
+function curatedPluginRuntimeError(code, cause = undefined) {
+  const error = new Error(code, cause === undefined ? undefined : { cause });
+  error.code = code;
+  return error;
+}
+
+async function curatedCodexCli({ homeDir, executable, codexCliArgsPrefix, deadlineAt, env, signal }) {
+  const cli = executable || await codexCliExecutableForSnapshotAsync(
+    homeDir,
+    env,
+    Math.max(1000, Math.min(15_000, Number(deadlineAt) - Date.now())),
+  );
+  const prefix = Array.isArray(codexCliArgsPrefix) ? codexCliArgsPrefix.map(String) : [];
+  if (!cli) throw new Error("curated_plugin_codex_cli_not_found");
+  return {
+    async run(args) {
+      if (signal?.aborted) throw curatedPluginRuntimeError("curated_plugin_cancelled");
+      const remainingMs = Math.floor(Number(deadlineAt) - Date.now());
+      if (!Number.isSafeInteger(remainingMs) || remainingMs <= 0) {
+        throw curatedPluginRuntimeError("curated_plugin_timeout");
+      }
+      const result = await runCodexCliJsonCommandAsync(cli, [...prefix, ...args], {
+        homeDir, timeoutMs: remainingMs, env, signal,
+      });
+      if (!result || typeof result !== "object" || result.ok === false || Object.hasOwn(result, "rawOutput")) {
+        throw new Error("curated_plugin_codex_cli_invalid_json");
+      }
+      return result;
+    },
+  };
+}
+
+function ensureCuratedCodexHome(homeDir) {
+  const root = path.resolve(String(homeDir || ""));
+  if (!path.isAbsolute(root) || root !== homeDir) throw new Error("curated_plugin_home_invalid");
+  const rootStat = fs.lstatSync(root);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("curated_plugin_home_invalid");
+  const codexHome = path.join(root, ".codex");
+  if (!fs.existsSync(codexHome)) fs.mkdirSync(codexHome);
+  const codexStat = fs.lstatSync(codexHome);
+  if (!codexStat.isDirectory() || codexStat.isSymbolicLink()) throw new Error("curated_plugin_codex_home_invalid");
+  return codexHome;
+}
+
+function listedPluginId(item = {}) {
+  if (!item || typeof item !== "object") return "";
+  return String(item.pluginId || item.id || item.selector || "").trim();
+}
+
+function pluginNameFromSelector(value = "") {
+  return String(value || "").trim().split("@")[0];
+}
+
+function marketplaceName(item = {}) {
+  return String(item?.name || item?.id || "").trim();
+}
+
+function normalizedGitHubRepo(value = "") {
+  const raw = String(value || "").trim();
+  const short = /^([a-z0-9_.-]+)\/([a-z0-9_.-]+)$/iu.exec(raw);
+  if (short) return `${short[1]}/${short[2].replace(/\.git$/iu, "")}`.toLowerCase();
+  const ssh = /^git@github\.com:([^/]+)\/(.+)$/iu.exec(raw);
+  if (ssh) return `${ssh[1]}/${ssh[2].replace(/\.git$/iu, "")}`.toLowerCase();
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "https:" || url.hostname.toLowerCase() !== "github.com" || url.search || url.hash) return "";
+    const parts = url.pathname.replace(/^\/+|\/+$/gu, "").split("/");
+    if (parts.length !== 2 || parts.some((part) => !part)) return "";
+    return `${parts[0]}/${parts[1].replace(/\.git$/iu, "")}`.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function trustedCuratedMarketplace(plugin, item) {
+  if (!item) return null;
+  const source = item?.marketplaceSource?.source;
+  if (String(item?.marketplaceSource?.sourceType || "").toLowerCase() !== "git"
+    || normalizedGitHubRepo(source) !== plugin.repo.toLowerCase()) {
+    throw curatedPluginRuntimeError("curated_plugin_marketplace_source_mismatch");
+  }
+  return item;
+}
+
+function marketplaceByName(items, name) {
+  return (Array.isArray(items) ? items : []).find((item) => marketplaceName(item) === name) || null;
+}
+
+function marketplaceUsedByOtherPlugin(items, plugin) {
+  const suffix = `@${plugin.marketplace}`;
+  return (Array.isArray(items) ? items : []).some((item) => {
+    const selector = listedPluginId(item);
+    return selector.endsWith(suffix) && pluginNameFromSelector(selector) !== plugin.id;
+  });
+}
+
+function readBoundedUtf8(filePath, limit = 1024 * 1024) {
+  const stat = fs.lstatSync(filePath);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 1 || stat.size > limit) {
+    throw curatedPluginRuntimeError("curated_plugin_marketplace_git_state_invalid");
+  }
+  return fs.readFileSync(filePath, "utf8");
+}
+
+function resolveGitCheckoutHead(rootPath) {
+  const gitRoot = path.join(rootPath, ".git");
+  const gitStat = fs.lstatSync(gitRoot);
+  if (!gitStat.isDirectory() || gitStat.isSymbolicLink()) {
+    throw curatedPluginRuntimeError("curated_plugin_marketplace_git_state_invalid");
+  }
+  const head = readBoundedUtf8(path.join(gitRoot, "HEAD"), 4096).trim();
+  if (/^[a-f0-9]{40}$/u.test(head)) return head;
+  const match = /^ref: (refs\/[A-Za-z0-9._/-]+)$/u.exec(head);
+  if (!match || match[1].split("/").some((part) => !part || part === "." || part === "..")) {
+    throw curatedPluginRuntimeError("curated_plugin_marketplace_git_state_invalid");
+  }
+  const loosePath = path.join(gitRoot, ...match[1].split("/"));
+  if (fs.existsSync(loosePath)) {
+    const loose = readBoundedUtf8(loosePath, 4096).trim();
+    if (/^[a-f0-9]{40}$/u.test(loose)) return loose;
+  }
+  const packedPath = path.join(gitRoot, "packed-refs");
+  if (fs.existsSync(packedPath)) {
+    const line = readBoundedUtf8(packedPath)
+      .split(/\r?\n/u)
+      .find((entry) => entry.endsWith(` ${match[1]}`));
+    const packed = line?.split(" ")[0] || "";
+    if (/^[a-f0-9]{40}$/u.test(packed)) return packed;
+  }
+  throw curatedPluginRuntimeError("curated_plugin_marketplace_git_state_invalid");
+}
+
+function verifyPinnedMarketplaceCheckout({ plugin, marketplace, codexHome }) {
+  const root = path.resolve(String(marketplace?.root || ""));
+  const expected = path.resolve(codexHome, ".tmp", "marketplaces", plugin.marketplace);
+  if (!root || root !== expected) throw curatedPluginRuntimeError("curated_plugin_marketplace_root_invalid");
+  const rootStat = fs.lstatSync(root);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    throw curatedPluginRuntimeError("curated_plugin_marketplace_root_invalid");
+  }
+  if (resolveGitCheckoutHead(root) !== plugin.commit) {
+    throw curatedPluginRuntimeError("curated_plugin_marketplace_commit_mismatch");
+  }
+  return root;
+}
+
+function trustedInstalledPluginSelector(plugin, item) {
+  const selector = listedPluginId(item);
+  if (!/^[a-z0-9][a-z0-9-]{0,63}@[a-z0-9][a-z0-9-]{0,63}$/u.test(selector)
+    || pluginNameFromSelector(selector) !== plugin.id) {
+    throw new Error("curated_plugin_installed_selector_invalid");
+  }
+  return selector;
+}
+
+function installedCuratedPlugin(plugin, items) {
+  return items.find((item) => listedPluginId(item) === plugin.selector)
+    || items.find((item) => pluginNameFromSelector(listedPluginId(item)) === plugin.id)
+    || null;
+}
+
+export async function listCuratedCodexPluginResources({
+  homeDir = os.homedir(),
+  executable = "",
+  codexCliArgsPrefix = [],
+  timeoutMs = 30000,
+  env = {},
+} = {}) {
+  let listed = [];
+  let detectionError = "";
+  try {
+    const cli = await curatedCodexCli({
+      homeDir, executable, codexCliArgsPrefix, deadlineAt: Date.now() + timeoutMs, env,
+    });
+    listed = codexJsonArray(await cli.run(["plugin", "list", "--json"]), ["plugins", "installed", "items"]);
+  } catch (error) {
+    detectionError = String(error?.code || error?.message || "curated_plugin_detection_failed");
+  }
+  return CURATED_CODEX_PLUGINS.map((plugin) => {
+    const installed = installedCuratedPlugin(plugin, listed);
+    const installedSelector = listedPluginId(installed);
+    return Object.freeze({
+      ...plugin,
+      installed: Boolean(installed),
+      managed: installedSelector === plugin.selector,
+      installedSelector,
+      enabled: installed?.enabled === true,
+      version: String(installed?.version || ""),
+      detectionAvailable: detectionError === "",
+      detectionError,
+    });
+  });
+}
+
+export async function installCuratedCodexPluginResource({
+  homeDir = os.homedir(),
+  id = "",
+  executable = "",
+  codexCliArgsPrefix = [],
+  timeoutMs = 300000,
+  env = {},
+  signal = undefined,
+} = {}) {
+  const plugin = curatedPluginDefinition(id);
+  const deadlineAt = Date.now() + timeoutMs;
+  const codexHome = ensureCuratedCodexHome(homeDir);
+  const cli = await curatedCodexCli({
+    homeDir, executable, codexCliArgsPrefix, deadlineAt, env, signal,
+  });
+  const before = codexJsonArray(await cli.run(["plugin", "list", "--json"]), ["plugins", "installed", "items"]);
+  const installedBefore = installedCuratedPlugin(plugin, before);
+  const installedSelector = installedBefore ? trustedInstalledPluginSelector(plugin, installedBefore) : "";
+  const marketplaceItems = codexJsonArray(
+    await cli.run(["plugin", "marketplace", "list", "--json"]),
+    ["marketplaces", "items"],
+  );
+  const existingMarketplace = marketplaceByName(marketplaceItems, plugin.marketplace);
+  if (existingMarketplace) trustedCuratedMarketplace(plugin, existingMarketplace);
+  if (existingMarketplace && marketplaceUsedByOtherPlugin(before, plugin)) {
+    throw curatedPluginRuntimeError("curated_plugin_marketplace_in_use");
+  }
+  const operations = buildCuratedPluginInstallPlan({
+    id: plugin.id,
+    installedMarketplaces: existingMarketplace ? [plugin.marketplace] : [],
+  });
+  const results = [];
+  if (installedSelector) {
+    results.push(await cli.run(["plugin", "remove", installedSelector, "--json"]));
+  }
+  for (const args of operations) results.push(await cli.run(args));
+  const refreshedMarketplaces = codexJsonArray(
+    await cli.run(["plugin", "marketplace", "list", "--json"]),
+    ["marketplaces", "items"],
+  );
+  const installedMarketplace = trustedCuratedMarketplace(
+    plugin,
+    marketplaceByName(refreshedMarketplaces, plugin.marketplace),
+  );
+  if (!installedMarketplace) throw curatedPluginRuntimeError("curated_plugin_marketplace_verification_failed");
+  verifyPinnedMarketplaceCheckout({ plugin, marketplace: installedMarketplace, codexHome });
+  const installedPlugins = codexJsonArray(await cli.run(["plugin", "list", "--json"]), ["plugins", "installed", "items"]);
+  const installed = installedPlugins.find((item) => listedPluginId(item) === plugin.selector);
+  if (!installed) throw new Error("curated_plugin_verification_failed");
+  invalidateCodexResourceSnapshotCaches();
+  return Object.freeze({
+    ok: true,
+    kind: "curated_plugin",
+    id: plugin.id,
+    selector: plugin.selector,
+    marketplace: plugin.marketplace,
+    installed: true,
+    enabled: installed.enabled === true,
+    version: String(installed.version || ""),
+    results: Object.freeze(results),
+  });
+}
+
+export async function removeCuratedCodexPluginResource({
+  homeDir = os.homedir(),
+  id = "",
+  executable = "",
+  codexCliArgsPrefix = [],
+  timeoutMs = 120000,
+  env = {},
+  signal = undefined,
+} = {}) {
+  const plugin = curatedPluginDefinition(id);
+  ensureCuratedCodexHome(homeDir);
+  const cli = await curatedCodexCli({
+    homeDir, executable, codexCliArgsPrefix, deadlineAt: Date.now() + timeoutMs, env, signal,
+  });
+  const before = codexJsonArray(await cli.run(["plugin", "list", "--json"]), ["plugins", "installed", "items"]);
+  const installed = installedCuratedPlugin(plugin, before);
+  const marketplaces = codexJsonArray(
+    await cli.run(["plugin", "marketplace", "list", "--json"]),
+    ["marketplaces", "items"],
+  );
+  const existingMarketplace = marketplaceByName(marketplaces, plugin.marketplace);
+  if (existingMarketplace) trustedCuratedMarketplace(plugin, existingMarketplace);
+  if (existingMarketplace && marketplaceUsedByOtherPlugin(before, plugin)) {
+    throw curatedPluginRuntimeError("curated_plugin_marketplace_in_use");
+  }
+  if (!installed && !existingMarketplace) {
+    return Object.freeze({
+      ok: true,
+      kind: "curated_plugin",
+      id: plugin.id,
+      selector: plugin.selector,
+      marketplace: plugin.marketplace,
+      removed: false,
+      remove: null,
+      marketplaceRemoved: false,
+      marketplaceRemove: null,
+    });
+  }
+  const plan = buildCuratedPluginRemovePlan({ id: plugin.id });
+  const installedSelector = installed ? trustedInstalledPluginSelector(plugin, installed) : "";
+  const remove = installed
+    ? await cli.run(installedSelector === plugin.selector
+      ? plan[0]
+      : ["plugin", "remove", installedSelector, "--json"])
+    : null;
+  const marketplaceRemove = existingMarketplace ? await cli.run(plan[1]) : null;
+  const after = codexJsonArray(await cli.run(["plugin", "list", "--json"]), ["plugins", "installed", "items"]);
+  if (installedCuratedPlugin(plugin, after)) throw new Error("curated_plugin_remove_verification_failed");
+  const marketplacesAfter = codexJsonArray(
+    await cli.run(["plugin", "marketplace", "list", "--json"]),
+    ["marketplaces", "items"],
+  );
+  if (marketplaceByName(marketplacesAfter, plugin.marketplace)) {
+    throw curatedPluginRuntimeError("curated_plugin_marketplace_remove_verification_failed");
+  }
+  invalidateCodexResourceSnapshotCaches();
+  return Object.freeze({
+    ok: true,
+    kind: "curated_plugin",
+    id: plugin.id,
+    selector: installedSelector,
+    marketplace: plugin.marketplace,
+    removed: Boolean(installed),
+    remove,
+    marketplaceRemoved: Boolean(existingMarketplace),
+    marketplaceRemove,
+  });
 }
 
 export function setCodexResourceEnabled({ homeDir = os.homedir(), kind = "", id = "", enabled = true } = {}) {

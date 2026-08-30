@@ -9,7 +9,12 @@ import {
 } from "../desktop/software-manager/catalog-public-key.mjs";
 
 const PINNED_SEVEN_ZIP_X64_SHA256 = "b0cfdeaf429f5cc53f85123dd8f5a5feb92c19d31aa34df257edf9a26be05f95";
+const MAX_WINDOWS_PACKAGE_TREE_ENTRIES = 250_000;
 const REQUIRED_SOFTWARE_MANAGER_PATHS = Object.freeze([
+  "desktop/software-manager/bundled-catalog.mjs",
+  "desktop/software-manager/bundled-catalog/component-catalog.json",
+  "desktop/software-manager/bundled-catalog/component-catalog.json.sig",
+  "desktop/software-manager/catalog-public-key.mjs",
   "desktop/software-manager/catalog-trust.mjs",
   "desktop/software-manager/runtime-factory.mjs",
   "node_modules/7zip-bin/win/x64/7za.exe",
@@ -18,8 +23,20 @@ const REQUIRED_SOFTWARE_MANAGER_PATHS = Object.freeze([
 
 export const WINDOWS_PACKAGE_HARDENING_RULES = Object.freeze([
   Object.freeze({
-    id: "remediation_record",
-    pattern: /^\/docs\/router-remediation-record-\d+\.md$/i,
+    id: "deployment_infrastructure",
+    pattern: /^\/deploy(?:\/|$)/i,
+  }),
+  Object.freeze({
+    id: "runtime_state_tree",
+    pattern: /^\/state(?:\/|$)/i,
+  }),
+  Object.freeze({
+    id: "internal_documentation",
+    pattern: /^\/docs(?:\/|$)/i,
+  }),
+  Object.freeze({
+    id: "development_worktree",
+    pattern: /(?:^|\/)\.worktrees(?:\/|$)/i,
   }),
   Object.freeze({ id: "source_map", pattern: /\.map$/i }),
   Object.freeze({
@@ -116,6 +133,74 @@ export function assertWindowsSoftwareManagerPackagePaths(filePaths = []) {
     throw error;
   }
   return { checkedFiles: filePaths.length, requiredFiles: REQUIRED_SOFTWARE_MANAGER_PATHS.length };
+}
+
+export function assertWindowsPackageTree(rootDir, { requireSoftwareManager = false } = {}) {
+  const root = path.resolve(String(rootDir || ""));
+  if (!rootDir || !fs.existsSync(root) || !fs.lstatSync(root).isDirectory() || fs.lstatSync(root).isSymbolicLink()) {
+    const error = new Error(`Windows package root must be a real directory: ${root}`);
+    error.code = "windows_package_root_invalid";
+    throw error;
+  }
+  const pending = [root];
+  const filePaths = [];
+  const treeViolations = [];
+  let checkedEntries = 0;
+  let checkedDirectories = 0;
+  while (pending.length) {
+    const directoryPath = pending.pop();
+    checkedDirectories += 1;
+    for (const entry of fs.readdirSync(directoryPath, { withFileTypes: true })) {
+      checkedEntries += 1;
+      if (checkedEntries > MAX_WINDOWS_PACKAGE_TREE_ENTRIES) {
+        const error = new Error("Windows package tree exceeds the bounded entry limit.");
+        error.code = "windows_package_tree_too_large";
+        throw error;
+      }
+      const entryPath = path.join(directoryPath, entry.name);
+      const relativePath = path.relative(root, entryPath).split(path.sep).join("/");
+      const stat = fs.lstatSync(entryPath);
+      if (stat.isSymbolicLink()) {
+        treeViolations.push({ path: relativePath, rule: "package_tree_link" });
+      } else if (stat.isDirectory()) {
+        pending.push(entryPath);
+      } else if (stat.isFile()) {
+        if (Number(stat.nlink) !== 1) {
+          treeViolations.push({ path: relativePath, rule: "package_tree_hardlink" });
+        }
+        filePaths.push(relativePath);
+      } else {
+        treeViolations.push({ path: relativePath, rule: "package_tree_special_file" });
+      }
+    }
+  }
+  if (treeViolations.length) {
+    const preview = treeViolations.slice(0, 10)
+      .map((violation) => `${violation.rule}: ${violation.path}`)
+      .join("; ");
+    const error = new Error(
+      `Windows package tree contains ${treeViolations.length} unsafe filesystem entr${treeViolations.length === 1 ? "y" : "ies"}: ${preview}`,
+    );
+    error.code = "forbidden_package_tree_entry";
+    Object.defineProperty(error, "violations", {
+      configurable: false,
+      enumerable: false,
+      value: treeViolations,
+      writable: false,
+    });
+    throw error;
+  }
+  const pathSummary = requireSoftwareManager
+    ? assertWindowsSoftwareManagerPackagePaths(filePaths)
+    : assertWindowsPackageFilePaths(filePaths);
+  return Object.freeze({
+    ...pathSummary,
+    checkedEntries,
+    checkedDirectories,
+    links: 0,
+    hardlinks: 0,
+    specialFiles: 0,
+  });
 }
 
 export function buildSoftwareManagerReleaseReadiness({ repoRoot = process.cwd(), env = process.env } = {}) {

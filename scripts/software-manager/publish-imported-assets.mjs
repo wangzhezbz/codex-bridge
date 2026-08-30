@@ -10,6 +10,8 @@ import {
   TEST_CATALOG_PATH,
   TEST_COS_PACKAGE_ORIGIN,
   TEST_COS_PACKAGE_PATH,
+  TEST_DOGECLOUD_PACKAGE_ORIGIN,
+  TEST_DOGECLOUD_PACKAGE_PATH,
   TEST_PACKAGE_PATH,
 } from "../../shared/software-manager/catalog-schema.mjs";
 import { readCurrentCatalog, replaceCatalogEntry, replaceSignedCatalog } from "./catalog-builder.mjs";
@@ -49,7 +51,8 @@ function localAssetPath(config, assetUrl) {
   const resolved = new URL(resolveCatalogAssetUrl(`${TEST_CATALOG_ORIGIN}${TEST_CATALOG_PATH}`, assetUrl));
   const packagePath = resolved.origin === TEST_CATALOG_ORIGIN
     ? TEST_PACKAGE_PATH
-    : resolved.origin === TEST_COS_PACKAGE_ORIGIN ? TEST_COS_PACKAGE_PATH : null;
+    : resolved.origin === TEST_COS_PACKAGE_ORIGIN ? TEST_COS_PACKAGE_PATH
+      : resolved.origin === TEST_DOGECLOUD_PACKAGE_ORIGIN ? TEST_DOGECLOUD_PACKAGE_PATH : null;
   if (packagePath === null || !resolved.pathname.startsWith(packagePath)) {
     throw importError("publisher_import_asset_url_invalid");
   }

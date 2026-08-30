@@ -1,5 +1,7 @@
 import path from "node:path";
 
+import { MAX_SOFTWARE_PACKAGE_ENTRIES } from "../../shared/software-manager/catalog-schema.mjs";
+
 const SCHEMA_VERSION = 2;
 const COMPONENT_IDS = new Set(["chatgpt", "v2rayn", "git"]);
 const PHASES = [
@@ -22,8 +24,9 @@ const VERSION_KEYS = ["incoming", "current", "previous"];
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
 const VERSION = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
-const PREPARE_NAME = /^\.codexbridge-prepare-[a-f0-9]{32}$/u;
+const PREPARE_NAME = /^\.p-[a-f0-9]{32}$/u;
 const RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/iu;
+const MAX_JSON_NODES = MAX_SOFTWARE_PACKAGE_ENTRIES * 2 + 4_096;
 
 function journalError(code, cause) {
   const error = new Error(code, cause === undefined ? undefined : { cause });
@@ -93,7 +96,7 @@ function normalizeIntegrity(value) {
 
 function normalizeJson(value, state = { count: 0 }, depth = 0) {
   state.count += 1;
-  if (state.count > 2_048 || depth > 16) throw journalError("transaction_record_invalid");
+  if (state.count > MAX_JSON_NODES || depth > 16) throw journalError("transaction_record_invalid");
   if (value === null || typeof value === "boolean") return value;
   if (typeof value === "string") {
     if (value.length > 32_760 || value.includes("\0")) throw journalError("transaction_record_invalid");

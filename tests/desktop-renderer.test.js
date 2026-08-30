@@ -14,6 +14,12 @@ const mainSource = readFileSync(resolve(__dirname, "../desktop/main.cjs"), "utf8
 const kimiLogoSource = readFileSync(resolve(__dirname, "../desktop/renderer/assets/providers/kimi.svg"), "utf8");
 const defaultLogoSource = readFileSync(resolve(__dirname, "../desktop/renderer/assets/providers/default.svg"), "utf8");
 
+test("sidebar navigation keeps the existing order while separating workbench, management, and service groups", () => {
+  assert.match(htmlSource, /id="navGroupWorkbench">工作台<\/div>[\s\S]*?data-section="dashboard"[\s\S]*?data-section="stats"/u);
+  assert.match(htmlSource, /id="navGroupManagement">管理<\/div>[\s\S]*?data-section="softwareManager"[\s\S]*?data-section="resources"/u);
+  assert.match(htmlSource, /id="navGroupTools">工具与服务<\/div>[\s\S]*?data-section="sessions"[\s\S]*?data-section="vvip"/u);
+});
+
 test("model cards show a dedicated user description when a preset provides one", () => {
   assert.match(rendererSource, /function modelFriendlySummary\(model\)[\s\S]*?model\.userDescription/);
   assert.match(rendererSource, /function modelCatalogSummary\(model\)[\s\S]*?model\.userDescription/);
@@ -458,7 +464,11 @@ test("desktop renderer exposes update from sidebar without a dedicated page", ()
   assert.match(rendererSource, /els\.appVersion\.textContent = `v\$\{state\.appVersion \|\| "-"\}`;/);
   assert.match(rendererSource, /showUpdateDialog/);
   assert.match(rendererSource, /phase === "restarting"/);
-  assert.doesNotMatch(rendererSource, /window\.confirm/);
+  const updateFlowSource = rendererSource.slice(
+    rendererSource.indexOf("function runUpdateCheck"),
+    rendererSource.indexOf("function resetUpdateProgress"),
+  );
+  assert.doesNotMatch(updateFlowSource, /window\.confirm/);
   assert.doesNotMatch(rendererSource, /Windows Setup installer will be saved|updates folder|manual fallback/);
   assert.doesNotMatch(htmlSource, /Windows Setup installer will be saved|updates folder|manual fallback/);
 });

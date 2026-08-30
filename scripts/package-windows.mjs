@@ -4,8 +4,16 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   WINDOWS_PACKAGE_HARDENING_RULES,
+  assertWindowsPackageTree,
   assertWindowsSoftwareManagerPackagePaths,
 } from "./package-content-policy.mjs";
+import {
+  WINDOWS_RELEASE_BUILD_METADATA_FILE,
+  buildWindowsReleaseBuildMetadata,
+  createWindowsReleaseSourceFingerprint,
+} from "./release-source-fingerprint.mjs";
+import { removeOwnedTemporaryDirectory } from "./smoke-temp-cleanup.mjs";
+import { assertReleaseTagMatchesPackageVersion } from "./release-version-policy.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const packageJson = JSON.parse(
@@ -14,6 +22,7 @@ const packageJson = JSON.parse(
 const electronPackageJson = JSON.parse(
   fs.readFileSync(path.join(repoRoot, "node_modules", "electron", "package.json"), "utf8"),
 );
+assertReleaseTagMatchesPackageVersion({ env: process.env, packageVersion: packageJson.version });
 const localStamp = new Date()
   .toISOString()
   .replaceAll(":", "")
@@ -30,10 +39,23 @@ const releaseRoot = process.env.CODEXBRIDGE_RELEASE_ROOT
   : path.join(repoRoot, "release");
 const outDir = path.join(releaseRoot, `CodexBridge-Windows-x64-Portable-${safeReleaseVersion}`);
 const iconPath = path.join(repoRoot, "desktop", "assets", "codexbridge-icon.ico");
+const buildMetadata = buildWindowsReleaseBuildMetadata(repoRoot, {
+  appVersion: packageJson.version,
+});
 
-fs.mkdirSync(outDir, { recursive: true });
+fs.mkdirSync(releaseRoot, { recursive: true });
+let ownsOutDir = false;
+try {
+  fs.mkdirSync(outDir);
+  ownsOutDir = true;
+} catch (error) {
+  if (error?.code !== "EEXIST") throw error;
+  throw new Error(`Windows package output already exists; choose a new release version: ${outDir}`);
+}
 
-const appPaths = await packager({
+let appPaths;
+try {
+appPaths = await packager({
   dir: repoRoot,
   name: "CodexBridge",
   executableName: "CodexBridge",
@@ -58,7 +80,7 @@ const appPaths = await packager({
     /^\/\.agents(?:\/|$)/,
     /^\/\.codex(?:\/|$)/,
     /^\/\.superpowers(?:\/|$)/,
-    /^\/\.tmp(?:\/|$)/,
+    /^\/\.tmp(?:-|\/|$)/,
     /^\/\.tmp-release-/,
     /^\/\.tmp-updates-/,
     /^\/\.tmp-electron-packager(?:\/|$)/,
@@ -86,9 +108,32 @@ const appPaths = await packager({
 console.log("Packaged Windows app:");
 for (const appPath of appPaths) {
   const appRoot = path.join(appPath, "resources", "app");
+  const currentSource = createWindowsReleaseSourceFingerprint(repoRoot);
+  if (currentSource.sourceFingerprint !== buildMetadata.sourceFingerprint) {
+    throw new Error("Windows release source changed while the package was being created. Run package:win again.");
+  }
+  fs.writeFileSync(
+    path.join(appRoot, WINDOWS_RELEASE_BUILD_METADATA_FILE),
+    `${JSON.stringify(buildMetadata, null, 2)}\n`,
+    "utf8",
+  );
+  assertWindowsPackageTree(appRoot, { requireSoftwareManager: true });
   const packageFiles = listRegularFilePaths(appRoot);
   assertWindowsSoftwareManagerPackagePaths(packageFiles);
   console.log(appPath);
+}
+} catch (error) {
+  if (ownsOutDir && fs.existsSync(outDir)) {
+    try {
+      removeOwnedTemporaryDirectory(outDir, {
+        parentDirectory: releaseRoot,
+        requiredPrefix: "CodexBridge-Windows-x64-Portable-",
+      });
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], "Windows packaging and partial-output cleanup both failed.");
+    }
+  }
+  throw error;
 }
 
 function listRegularFilePaths(rootDir) {

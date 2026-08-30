@@ -198,9 +198,11 @@ test("install-root resolver restores persisted authority with a new process-loca
   });
 
   assert.equal(resolver.getCurrentToken(), null);
+  assert.equal(resolver.getCurrentPath(), null);
   const restored = await resolver.restoreOwnedRoot();
   assert.match(restored, /^root_[a-f0-9]{32}$/u);
   assert.equal(resolver.getCurrentToken(), restored);
+  assert.equal(resolver.getCurrentPath(), "D:\\CBApps");
   assert.deepEqual(await resolver.resolve(restored), { authorizedPath: "D:\\CBApps" });
   assert.deepEqual(calls, ["D:\\CBApps"]);
   assert.deepEqual(persisted, { installRoot: "D:\\CBApps" });
@@ -222,6 +224,7 @@ test("install-root candidates are isolated until adopt and discard never revokes
   const adopted = await resolver.choose("F:\\Adopted");
   await resolver.adopt(adopted.token);
   assert.equal(resolver.getCurrentToken(), adopted.token);
+  assert.equal(resolver.getCurrentPath(), "F:\\Adopted");
   assert.deepEqual(await resolver.resolve(adopted.token), { authorizedPath: "F:\\Adopted" });
   await assert.rejects(resolver.resolve(original), /install_root_token_invalid/u);
   await resolver.discard(adopted.token);
@@ -237,6 +240,7 @@ test("install-root resolver can revoke the current process-local authority witho
   assert.equal(resolver.getCurrentToken(), original);
   await resolver.clearCurrent();
   assert.equal(resolver.getCurrentToken(), null);
+  assert.equal(resolver.getCurrentPath(), null);
   await assert.rejects(resolver.resolve(original), /install_root_token_invalid/u);
 });
 

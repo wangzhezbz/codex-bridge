@@ -192,6 +192,19 @@ test("journal rejects non-fixed component slots, paths, unknown fields, and unsa
   assert.equal(fake.calls.length, 0);
 });
 
+test("journal keeps the expanded legacy inventory allowance bounded", async () => {
+  const fake = createJournalFs();
+  const journal = createTransactionJournal({ journalDir: "D:\\State\\transactions", fsApi: fake.fsApi });
+  const base = record();
+  await assert.rejects(journal.record(record({
+    ownershipBefore: {
+      ...base.ownershipBefore,
+      lastTask: { values: Array.from({ length: 40_000 }, (_, index) => index) },
+    },
+  })), /transaction_record_invalid/u);
+  assert.equal(fake.calls.length, 0);
+});
+
 test("journal rejects canonical-looking ADS, reserved-name, and trailing-dot roots before opening storage", async () => {
   const fake = createJournalFs();
   const journal = createTransactionJournal({ journalDir: "D:\\State\\transactions", fsApi: fake.fsApi });

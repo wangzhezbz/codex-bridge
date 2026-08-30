@@ -1,3 +1,5 @@
+import { UpstreamResponseTooLargeError } from "./upstream-response-guard.js";
+
 const DEFAULT_MAX_TERMINAL_BYTES = 48 * 1024 * 1024;
 const DEFAULT_MAX_DIAGNOSTIC_CHARS = 2_000_000;
 
@@ -15,11 +17,11 @@ export function createTextBuffer(options = {}) {
 export function appendTerminalText(state, value) {
   const byteLength = Buffer.byteLength(value, "utf8");
   if (state.byteLength + byteLength > state.maxBytes) {
-    const error = new Error(`Responses terminal event exceeds ${state.maxBytes} bytes.`);
-    error.statusCode = 503;
-    error.code = "local_history_storage_unavailable";
-    error.localHistoryError = true;
-    throw error;
+    throw new UpstreamResponseTooLargeError(
+      state.maxBytes,
+      state.byteLength + byteLength,
+      "",
+    );
   }
   state.parts.push(value);
   state.byteLength += byteLength;

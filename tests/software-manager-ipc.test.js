@@ -23,6 +23,7 @@ function fixture({
   platform = "win32",
   decision = { allowQuit: true },
   selectResult = { installRootToken: "opaque_root_123456" },
+  externalCancelResult = null,
 } = {}) {
   const handlers = new Map();
   const trustedWebContents = { sendCalls: [], send(...args) { this.sendCalls.push(args); } };
@@ -63,6 +64,10 @@ function fixture({
       return selectResult;
     },
     sendEvent: (event) => trustedWebContents.send("softwareManager:event", event),
+    cancelExternalTask: () => {
+      calls.push(["cancelExternalTask"]);
+      return externalCancelResult;
+    },
   });
   const trustedEvent = {
     sender: trustedWebContents,
@@ -93,6 +98,12 @@ test("registers only the fixed software-manager IPC surface and forwards events"
   assert.deepEqual(value.trustedWebContents.sendCalls, [[
     "softwareManager:event", { type: "progress", percent: 30 },
   ]]);
+});
+
+test("software-manager cancel reaches a tracked external plugin task before the component service", async () => {
+  const value = fixture({ externalCancelResult: { cancelled: true } });
+  assert.deepEqual(await value.invoke("softwareManager:cancelTask"), { cancelled: true });
+  assert.deepEqual(value.calls, [["cancelExternalTask"]]);
 });
 
 test("non-Windows rejects every software-manager IPC before creating the service", async () => {
@@ -296,31 +307,41 @@ test("main delegates Windows runtime construction and recovers offline before re
   assert.match(runtime, /process\.platform !== "win32"[\s\S]*?import\("\.\/software-manager\/runtime-factory\.mjs"\)/u);
   assert.match(runtime, /createProductionSoftwareManagerService\(\{/u);
   for (const dependency of [
-    "platform", "dataRoot", "homeDir", "getDesktopPath", "env", "electronShell",
+    "platform", "dataRoot", "homeDir", "defaultInstallRoot", "getDesktopPath", "env", "electronShell",
     "fetchImpl", "execFile", "spawn", "publicKeyPem", "koffi",
   ]) assert.match(runtime, new RegExp(`\\b${dependency}\\s*:`, "u"));
-  assert.match(runtime, /homeDir:\s*desktopHomeDir\(\)/u);
+  assert.match(runtime, /const softwareHomeDir = desktopHomeDir\(\)/u);
+  assert.match(runtime, /homeDir:\s*softwareHomeDir/u);
+  assert.match(runtime, /defaultInstallRoot:\s*smokeDefaultInstallRoot\s*\|\|\s*path\.join\(localAppData, "CBApps"\)/u);
+  assert.match(runtime, /CODEXBRIDGE_DESKTOP_SMOKE_SOFTWARE_MANAGER_OFFLINE/u);
   assert.doesNotMatch(mainSource, /softwareManagerUnavailableAdapter|software_manager_runtime_not_provisioned/u);
   const startupRecovery = mainSource.indexOf("runtime.recoverOffline()");
   const createWindow = mainSource.indexOf("createWindow();", startupRecovery);
   assert.equal(startupRecovery > 0 && createWindow > startupRecovery, true);
 });
 
-test("software-manager startup recovery failure degrades only that feature and performs no catalog or network work", () => {
+test("software-manager runtime failure degrades only that feature and recovery remains retryable", () => {
   const mainSource = require("node:fs").readFileSync(new URL("../desktop/main.cjs", import.meta.url), "utf8");
   const startup = mainSource.match(/app\.whenReady\(\)\.then\(async \(\) => \{[\s\S]*?\n\}\);\n\napp\.on\("before-quit"/u)?.[0] ?? "";
   const recovery = startup.indexOf("runtime.recoverOffline()");
+  const construction = startup.lastIndexOf("runtime = await getSoftwareManagerRuntime()", recovery);
+  const constructionCatch = startup.indexOf("catch (error)", construction);
+  const constructionCatchEnd = startup.indexOf("\n    }", constructionCatch);
   const recoveryCatch = startup.indexOf("catch (error)", recovery);
   const recoveryComplete = startup.indexOf("configRecoveryComplete = true;", recovery);
   const createWindow = startup.indexOf("createWindow();", recovery);
   assert.equal(
-    recovery >= 0 && recoveryCatch > recovery && recoveryComplete > recoveryCatch && createWindow > recoveryComplete,
+    construction >= 0 && constructionCatch > construction && recovery >= 0
+      && recoveryCatch > recovery && recoveryComplete > recoveryCatch && createWindow > recoveryComplete,
     true,
   );
-  const recoveryCatchEnd = startup.indexOf("\n  }\n  configRecoveryComplete = true;", recoveryCatch);
+  const recoveryCatchEnd = startup.indexOf("\n    }", recoveryCatch);
+  const constructionCatchBody = startup.slice(constructionCatch, constructionCatchEnd);
   const catchBody = startup.slice(recoveryCatch, recoveryCatchEnd);
-  assert.match(catchBody, /appendRuntimeLog\(formatError\("softwareManagerStartup", error\)\)/u);
-  assert.match(catchBody, /softwareManagerStartupFailure\s*=\s*error/u);
+  assert.match(constructionCatchBody, /appendRuntimeLog\(formatError\("softwareManagerStartup", error\)\)/u);
+  assert.match(constructionCatchBody, /softwareManagerStartupFailure\s*=\s*error/u);
+  assert.match(catchBody, /appendRuntimeLog\(formatError\("softwareManagerRecovery", error\)\)/u);
+  assert.doesNotMatch(catchBody, /softwareManagerStartupFailure\s*=\s*error/u);
   assert.doesNotMatch(catchBody, /app\.quit\(\)|return;/u);
   assert.doesNotMatch(catchBody, /configRecoveryComplete = true/u);
   assert.equal((startup.match(/configRecoveryComplete = true;/gu) ?? []).length, 1);

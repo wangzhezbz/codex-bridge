@@ -73,6 +73,7 @@ import {
   readCustomModels,
   readProviderOverrides,
   releaseAssetsFromDirectory,
+  releasePreflightCodeReadySummary,
   resetProviderOverride,
   saveReleaseGateReport,
   refreshProviderModelDirectory,
@@ -2266,6 +2267,12 @@ test("release preflight surfaces packaged app smoke evidence", () => {
     exePath: "F:\\game_code\\router\\release\\CodexBridge-Windows-x64-Portable-v0.2.3-local\\CodexBridge-win32-x64\\CodexBridge.exe",
     desktopSmoke: { ok: true, durationMs: 1200 },
     routerSmoke: { ok: true, durationMs: 900, models: ["gpt-5.5"] },
+    sourceEvidence: {
+      ok: true,
+      currentFingerprint: "a".repeat(64),
+      reportFingerprint: "a".repeat(64),
+      reason: "current_source_match",
+    },
   };
 
   const check = buildStartupCheck(rootDir, {
@@ -2281,6 +2288,50 @@ test("release preflight surfaces packaged app smoke evidence", () => {
   assert.match(item.detail, /桌面 smoke/);
   assert.match(item.detail, /Router health smoke/);
   assert.equal(item.count, 2);
+});
+
+test("release preflight never treats a legacy packaged smoke report as current source evidence", () => {
+  const rootDir = makeTempProject();
+  const check = buildStartupCheck(rootDir, {
+    packagedSmokeReport: {
+      ok: true,
+      checkedAt: "2026-07-05T07:10:00.000Z",
+      exePath: "C:\\old\\CodexBridge.exe",
+      desktopSmoke: { ok: true },
+      routerSmoke: { ok: true },
+    },
+  });
+  const item = check.items.find((entry) => entry.id === "packaged_app_smoke");
+
+  assert.equal(item.status, "warn");
+  assert.match(item.detail, /缺少源码指纹/);
+  assert.match(item.detail, /不能作为当前源码/);
+});
+
+test("release preflight marks a mismatched packaged smoke source fingerprint as stale evidence", () => {
+  const rootDir = makeTempProject();
+  const check = buildStartupCheck(rootDir, {
+    packagedSmokeReport: {
+      ok: true,
+      checkedAt: "2026-07-05T07:10:00.000Z",
+      exePath: "C:\\old\\CodexBridge.exe",
+      desktopSmoke: { ok: true },
+      routerSmoke: { ok: true },
+      sourceEvidence: {
+        ok: false,
+        reportFingerprint: "a".repeat(64),
+        currentFingerprint: "b".repeat(64),
+        reason: "source_fingerprint_mismatch",
+      },
+    },
+  });
+  const item = check.items.find((entry) => entry.id === "packaged_app_smoke");
+
+  assert.equal(item.status, "warn");
+  assert.match(item.detail, /源码与当前源码不一致/);
+  const codeReady = releasePreflightCodeReadySummary(check);
+  assert.equal(codeReady.ok, true);
+  assert.ok(codeReady.ignoredRealEvidenceItemIds.includes("packaged_app_smoke"));
 });
 
 test("release preflight checks config package portability without secrets", () => {
@@ -2776,6 +2827,7 @@ test("release preflight checks forbidden batch-delete commands", () => {
   assert.match(item.label, /删除安全|清理安全/);
   assert.match(item.detail, /未发现|没有发现/);
   assert.match(item.detail, /批量删除命令/);
+  assert.match(item.detail, /12 个发布\/更新文件/);
 });
 
 test("release preflight fails stale OpenAI bundled plugin runtime", () => {
@@ -9507,6 +9559,11 @@ test("buildRouterConfigFromSelection exposes selected models with independent Co
   ]);
   assert.equal(config.defaultModel, "cb-gpt-5-5");
   assert.equal(config.models[2].displayName, "DeepSeek V4 Pro");
+  assert.equal(config.models[2].api, "chat_completions");
+  assert.equal(config.models[2].supportsResponsePreviousId, undefined);
+  assert.equal(config.models[3].api, "responses");
+  assert.equal(config.models[3].supportsResponsePreviousId, false);
+  assert.equal(config.models[3].supportsFiles, "text-placeholder");
   assert.equal(config.models[4].displayName, "Kimi K2.7 Code");
   assert.equal(config.models[5].displayName, "Qwen Plus");
 });
@@ -13269,7 +13326,7 @@ test("provider overrides cannot replace built-in per-model API contracts", () =>
   assert.equal(provider.name, "DeepSeek Proxy");
   assert.equal(provider.shortName, "DS Proxy");
   assert.equal(provider.baseUrl, "https://proxy.example.com/v1");
-  assert.equal(provider.api, undefined);
+  assert.equal(provider.api, "chat_completions");
   assert.equal(pro.baseUrl, "https://proxy.example.com/v1");
   assert.equal(flash.baseUrl, "https://proxy.example.com/v1");
   assert.equal(pro.api, "chat_completions");
@@ -14595,12 +14652,47 @@ test("prepareRouterStartConfig refreshes stale Codex local endpoint before route
     ].join("\n"),
     "utf8",
   );
-  saveSelection(rootDir, ["codex-gpt-5-5", "deepseek-v4-pro"], MODE_HYBRID);
+  saveSelection(
+    rootDir,
+    ["codex-gpt-5-5", "deepseek-v4-pro", "deepseek-v4-flash"],
+    MODE_HYBRID,
+  );
+  fs.mkdirSync(path.dirname(routerConfigPath(rootDir)), { recursive: true });
+  fs.writeFileSync(
+    routerConfigPath(rootDir),
+    JSON.stringify({
+      mode: MODE_HYBRID,
+      models: [
+        {
+          id: "cb-deepseek-v4-pro",
+          api: "responses",
+          baseUrl: "https://api.deepseek.com",
+          model: "deepseek-v4-pro",
+          supportsResponsePreviousId: false,
+        },
+        {
+          id: "cb-deepseek-v4-flash",
+          api: "chat_completions",
+          baseUrl: "https://api.deepseek.com/v1",
+          model: "deepseek-v4-flash",
+        },
+      ],
+    }, null, 2),
+    "utf8",
+  );
 
   const result = prepareRouterStartConfig({ rootDir, mode: MODE_HYBRID, homeDir });
 
   const written = fs.readFileSync(target, "utf8");
   assert.equal(result.config.defaultModel, "cb-gpt-5-5");
+  const deepseek = result.config.models.find((model) => model.id === "cb-deepseek-v4-pro");
+  assert.equal(deepseek.api, "chat_completions");
+  assert.equal(deepseek.baseUrl, "https://api.deepseek.com/v1");
+  assert.equal(deepseek.supportsResponsePreviousId, undefined);
+  const flash = result.config.models.find((model) => model.id === "cb-deepseek-v4-flash");
+  assert.equal(flash.api, "responses");
+  assert.equal(flash.baseUrl, "https://api.deepseek.com/v1");
+  assert.equal(flash.supportsResponsePreviousId, false);
   assert.match(written, /model_provider = "openai"/);
   assert.match(written, /openai_base_url = "http:\/\/127\.0\.0\.1:15722\/v1"/);
   assert.doesNotMatch(written, /\[model_providers\.codex-bridge]/);

@@ -22,6 +22,7 @@ function snapshotValue(platform, reason) {
       install: Object.freeze({ componentIds: Object.freeze([]), skillIds: Object.freeze([]) }),
       update: Object.freeze({ componentIds: Object.freeze([]), skillIds: Object.freeze([]) }),
     }),
+    installRootPath: null,
     task: null,
     logging: Object.freeze({ degraded: false, pendingWrites: 0, error: null, recovery: null }),
     logs: Object.freeze([]),

@@ -16,6 +16,8 @@ const PHASES = Object.freeze([
   "proof_written",
   "cleanup_committed",
 ]);
+const ABORT_PHASE = "abort_committed";
+const STORED_PHASES = Object.freeze([...PHASES, ABORT_PHASE]);
 const RECORD_KEYS = Object.freeze([
   "schemaVersion", "phase", "taskId", "swapId", "skillId", "leaseScope", "leaseNonce", "skillsRoot", "target",
   "sourcePath", "preparedPath", "oldPath", "identities", "previousEvidence", "expectedEvidence",
@@ -101,7 +103,7 @@ function expectedEvidence(value) {
 
 function normalizeRecord(value, skillsRoot) {
   if (!exact(value, RECORD_KEYS) || value.schemaVersion !== SCHEMA_VERSION
-    || !PHASES.includes(value.phase) || !TASK_ID.test(value.taskId ?? "")
+    || !STORED_PHASES.includes(value.phase) || !TASK_ID.test(value.taskId ?? "")
     || !SWAP_ID.test(value.swapId ?? "") || !SKILL_ID.test(value.skillId ?? "")
     || value.leaseScope !== "prepare" || !LEASE_NONCE.test(value.leaseNonce ?? "")) {
     throw journalError("skill_swap_record_invalid");
@@ -129,8 +131,9 @@ function normalizeRecord(value, skillsRoot) {
     new: identity(value.identities.new, true),
   };
   const expected = expectedEvidence(value.expectedEvidence);
-  const preparedRequired = value.phase === "reserved" ? null : identities.prepared;
-  const newRequired = value.phase === "reserved" ? null : identities.new;
+  const noPreparedIdentity = value.phase === "reserved" || value.phase === ABORT_PHASE;
+  const preparedRequired = noPreparedIdentity ? null : identities.prepared;
+  const newRequired = noPreparedIdentity ? null : identities.new;
   if (identities.prepared !== preparedRequired || identities.new !== newRequired
     || (previousEvidence.kind === "absent") !== (identities.old === null)
     || (previousEvidence.kind === "directory"
@@ -218,7 +221,7 @@ export function createSkillSwapJournal({ journalDir, fsApi, skillsRoot } = {}) {
     const directory = await openDirectory();
     try {
       const records = [];
-      for (const phase of PHASES) {
+      for (const phase of STORED_PHASES) {
         const value = await readNamed(directory, fileName(taskId, swapId, phase), root);
         if (value) records.push(value.record);
       }
@@ -226,6 +229,12 @@ export function createSkillSwapJournal({ journalDir, fsApi, skillsRoot } = {}) {
       if (records.some((record) => record.taskId !== taskId || record.swapId !== swapId
         || !immutableEqual(record, records[0]))) {
         throw journalError("skill_swap_journal_conflict");
+      }
+      const abortSequence = records.length === 2
+        && records[0].phase === "reserved" && records[1].phase === ABORT_PHASE;
+      if (abortSequence) return { snapshot: records.at(-1), records };
+      if (records.some((record) => record.phase === ABORT_PHASE)) {
+        throw journalError("skill_swap_phase_order_invalid");
       }
       const phaseIndexes = records.map((record) => PHASES.indexOf(record.phase));
       const clearingSuffix = records.at(-1).phase === "cleanup_committed";
@@ -253,6 +262,39 @@ export function createSkillSwapJournal({ journalDir, fsApi, skillsRoot } = {}) {
   async function record(raw) {
     const normalized = normalizeRecord(raw, root);
     const existing = await load({ taskId: normalized.taskId, swapId: normalized.swapId });
+    if (normalized.phase === ABORT_PHASE) {
+      if (existing?.snapshot.phase === ABORT_PHASE) {
+        if (JSON.stringify(existing.snapshot) !== JSON.stringify(normalized)) {
+          throw journalError("skill_swap_journal_conflict");
+        }
+        return existing.snapshot;
+      }
+      if (!existing || existing.records.length !== 1 || existing.snapshot.phase !== "reserved"
+        || !immutableEqual(existing.snapshot, normalized)) {
+        throw journalError("skill_swap_phase_order_invalid");
+      }
+      const directory = await openDirectory();
+      const destination = fileName(normalized.taskId, normalized.swapId, normalized.phase);
+      const tempName = fileName(normalized.taskId, normalized.swapId, normalized.phase, true);
+      try {
+        const tempExisting = await readNamed(directory, tempName, root);
+        if (tempExisting) {
+          if (JSON.stringify(tempExisting.record) !== JSON.stringify(normalized)) {
+            throw journalError("skill_swap_journal_conflict");
+          }
+          await directory.renameEntryNoFollow(tempExisting.entry, destination);
+          return normalized;
+        }
+        const temp = requireFile(await directory.openFileNoFollow(tempName, "wx"), true);
+        const entry = temp.entry;
+        try {
+          await temp.writeFile(`${JSON.stringify(normalized)}\n`, "utf8");
+          await temp.sync();
+        } finally { await temp.close(); }
+        await directory.renameEntryNoFollow(entry, destination);
+        return normalized;
+      } finally { await directory.close(); }
+    }
     const expectedIndex = existing ? existing.records.length : 0;
     const phaseIndex = PHASES.indexOf(normalized.phase);
     if (phaseIndex < expectedIndex) {
@@ -297,7 +339,7 @@ export function createSkillSwapJournal({ journalDir, fsApi, skillsRoot } = {}) {
   async function clear({ taskId, swapId } = {}) {
     const transaction = await load({ taskId, swapId });
     if (!transaction) return false;
-    if (transaction.snapshot.phase !== "cleanup_committed") {
+    if (!["cleanup_committed", ABORT_PHASE].includes(transaction.snapshot.phase)) {
       throw journalError("skill_swap_cleanup_not_committed");
     }
     const directory = await openDirectory();

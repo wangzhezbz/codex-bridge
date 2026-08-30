@@ -92,6 +92,42 @@ function componentEntrypoint(installRoot, componentId, entry, slot = "current") 
   return relativeFile(slotRoot(installRoot, componentId, slot), entry.entrypoint);
 }
 
+const V2RAYN_RUNTIME_REQUIRED_FILES = new Set([
+  "v2rayn/v2rayN.exe",
+  "v2rayn/guiConfigs/guiNConfig.json",
+  "v2rayn/e_sqlite3.dll",
+  "v2rayn/bin/mihomo/mihomo.exe",
+  "v2rayn/bin/sing_box/sing-box.exe",
+  "v2rayn/bin/xray/xray.exe",
+]);
+
+function runtimeRequiredRelativeFiles(componentId, entry) {
+  const relativeFiles = componentId === "chatgpt"
+    ? entry.requiredFiles.filter((file) => [
+      ".codexbridge-chatgpt-version.json",
+      "ChatGPT.exe",
+      "Codex.exe",
+      "chrome.dll",
+      "resources/app.asar",
+      "resources/codex.exe",
+    ].includes(file))
+    : componentId === "v2rayn"
+      ? entry.requiredFiles.filter((file) => V2RAYN_RUNTIME_REQUIRED_FILES.has(file))
+      : entry.requiredFiles;
+  const selected = relativeFiles.includes(entry.entrypoint)
+    ? relativeFiles
+    : [entry.entrypoint, ...relativeFiles];
+  return selected;
+}
+
+function runtimeRequiredFilesAt(root, componentId, entry) {
+  return runtimeRequiredRelativeFiles(componentId, entry).map((file) => relativeFile(root, file));
+}
+
+function runtimeRequiredFiles(installRoot, componentId, entry) {
+  return runtimeRequiredFilesAt(slotRoot(installRoot, componentId, "current"), componentId, entry);
+}
+
 function result(componentId, action, status, {
   versionBefore = null, versionAfter = null, message = `${componentId}_${action}_${status}`,
   rollbackAvailable = false, details,
@@ -138,6 +174,11 @@ function errorMessage(error) {
   if (typeof error?.code === "string") return error.code;
   if (typeof error?.message === "string" && error.message.length > 0) return error.message;
   return "component_operation_failed";
+}
+
+function reportPreparePhase(context, phase, percent, message) {
+  if (typeof context?.onProgress !== "function") return;
+  context.onProgress({ phase, percent, message });
 }
 
 function combineOperationErrors(primaryError, cleanupErrors, fallbackCode) {
@@ -336,6 +377,7 @@ export function createComponentAdapters({
   gitIdentityCapabilities,
   resolveSkillTarget,
   skillPathAccess = {},
+  getAvailableDiskBytes,
   gitExecutionTimeoutMs = 15 * 60_000,
 } = {}) {
   if (!isTrustedCatalogService(catalogService)) throw adapterError("trusted_catalog_service_required");
@@ -394,10 +436,29 @@ export function createComponentAdapters({
   }
   const download = requireMethod(downloader, "download", "component_downloader_required");
   const extractArchive = requireMethod(archiveService, "extractArchive", "component_archive_required");
+  const availableDiskBytes = requireMethod(
+    { getAvailableDiskBytes }, "getAvailableDiskBytes", "component_disk_space_probe_required",
+  );
   const promotePreparedVersion = requireMethod(versionSlots, "promotePreparedVersion", "component_slots_required");
   const discardPreparedVersion = requireMethod(versionSlots, "discardPreparedVersion", "component_slots_required");
   const bindPreparedVersion = requireMethod(versionSlots, "bindPreparedVersion", "component_slots_required");
   const rollbackVersion = requireMethod(versionSlots, "rollbackVersion", "component_slots_required");
+
+  async function assertSufficientDiskSpace(requiredBytes) {
+    const available = await availableDiskBytes(installRoot);
+    if (!Number.isSafeInteger(available) || available < 0) {
+      throw adapterError("component_disk_space_probe_invalid");
+    }
+    if (available < requiredBytes) throw adapterError("component_disk_space_insufficient");
+  }
+
+  function archiveDiskRequirement(size) {
+    return Math.min(Number.MAX_SAFE_INTEGER, Math.ceil(size * 3 + 512 * 1024 * 1024));
+  }
+
+  function installerDiskRequirement(size) {
+    return Math.min(Number.MAX_SAFE_INTEGER, Math.ceil(size + 512 * 1024 * 1024));
+  }
   let ownershipCoordinator;
   try { ownershipCoordinator = getOwnershipCoordinator(ownershipStore); } catch (error) {
     throw adapterError("component_ownership_store_required", error);
@@ -459,7 +520,8 @@ export function createComponentAdapters({
         const current = await recover();
         if (current.activeTask !== null) throw adapterError("component_pending_transaction");
         const reserved = structuredClone(current);
-        if (reserved.installRoot !== null && reserved.installRoot !== installRoot) {
+        if (reserved.installRoot !== null && reserved.installRoot !== installRoot
+          && !canRebindInstallRoot(reserved)) {
           throw adapterError("component_install_root_changed");
         }
         reserved.installRoot = installRoot;
@@ -468,7 +530,7 @@ export function createComponentAdapters({
       });
       return { claim, lease, state };
     } catch (error) {
-      await lease.release().catch(() => {});
+      try { await lease.release(); } catch {}
       throw error;
     }
   }
@@ -560,7 +622,7 @@ export function createComponentAdapters({
       });
       return { claim, lease, state };
     } catch (error) {
-      await lease.release().catch(() => {});
+      try { await lease.release(); } catch {}
       throw error;
     }
   }
@@ -584,7 +646,7 @@ export function createComponentAdapters({
       });
       return { claim, lease, state };
     } catch (error) {
-      await lease.release().catch(() => {});
+      try { await lease.release(); } catch {}
       throw error;
     }
   }
@@ -618,10 +680,27 @@ export function createComponentAdapters({
     });
   }
 
+  async function failedSkills(context, action, error) {
+    const rawIds = Array.isArray(context?.skillIds) ? context.skillIds : [];
+    const ids = rawIds.every((id) => typeof id === "string" && SKILL_ID.test(id))
+      && new Set(rawIds).size === rawIds.length
+      ? rawIds
+      : [];
+    const targets = ids.length > 0 ? ids : ["skills"];
+    return Promise.all(targets.map((id) => failed(id, action, error)));
+  }
+
+  function canRebindInstallRoot(state) {
+    return state.activeTask === null
+      && Object.keys(state.components).length === 0
+      && state.shortcuts.length === 0
+      && (state.rollback === null || (Array.isArray(state.rollback) && state.rollback.length === 0));
+  }
+
   function assertStateForManaged(state) {
     if (!isRecord(state) || !isRecord(state.components) || !isRecord(state.skills)
       || !Array.isArray(state.shortcuts)) throw adapterError("component_ownership_state_invalid");
-    if (state.installRoot !== null && state.installRoot !== installRoot) {
+    if (state.installRoot !== null && state.installRoot !== installRoot && !canRebindInstallRoot(state)) {
       throw adapterError("component_install_root_not_owned");
     }
     return state;
@@ -642,8 +721,9 @@ export function createComponentAdapters({
   function trustedComponent(componentId) {
     const entry = catalogService.getComponent(componentId);
     requireVersionSegment(entry.version);
-    const expectedFormat = { chatgpt: "zip", v2rayn: "7z", git: "exe" }[componentId];
-    if (entry.format !== expectedFormat || !Array.isArray(entry.requiredFiles)
+    const expectedFormats = componentId === "v2rayn" ? new Set(["7z", "zip"])
+      : new Set([{ chatgpt: "zip", git: "exe" }[componentId]]);
+    if (!expectedFormats.has(entry.format) || !Array.isArray(entry.requiredFiles)
       || !entry.requiredFiles.includes(entry.entrypoint)) throw adapterError("component_catalog_entry_invalid");
     for (const file of entry.requiredFiles) relativeFile("D:\\proof", file);
     return entry;
@@ -780,9 +860,10 @@ export function createComponentAdapters({
       const context = rejectForbiddenContext(rawContext);
       const taskId = requireTaskId(context.taskId);
       const entry = trustedComponent(componentId);
+      await assertSufficientDiskSpace(archiveDiskRequirement(entry.size));
       claim = {
         kind: "component-prepare", taskId, componentId, version: entry.version,
-        stagingName: `.codexbridge-prepare-${randomBytes(16).toString("hex")}`,
+        stagingName: `.p-${randomBytes(16).toString("hex")}`,
       };
       const reservation = await reservePrepareClaim(recoverComponentUninstall, claim);
       ({ claim, lease: operationLease } = reservation);
@@ -812,19 +893,21 @@ export function createComponentAdapters({
       }
       downloadRecord = downloaded.downloadRecord;
       await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
+      reportPreparePhase(context, "extract", null, "software_manager_extracting");
       const receipt = validateReceipt(await extractArchive({
         format: entry.format, archivePath, destination: staging, signal: context.signal,
         destinationIdentity: claim.stagingIdentity,
         verification: { componentId, version: entry.version },
       }), "component_verification_receipt_invalid");
       await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
+      reportPreparePhase(context, "verify", null, "software_manager_verifying_installation");
       await verifyComponent({
         componentId,
         phase: "staging",
         stagingName: claim.stagingName,
         rootPath: staging,
         entrypointPath: relativeFile(staging, entry.entrypoint),
-        requiredFiles: entry.requiredFiles.map((file) => relativeFile(staging, file)),
+        requiredFiles: runtimeRequiredFilesAt(staging, componentId, entry),
         expectedVersion: entry.version,
         expectedPackageSha256: entry.sha256,
         packageProof: downloaded.packageProof,
@@ -900,9 +983,7 @@ export function createComponentAdapters({
       }
       let promoted;
       const finalEntrypoint = componentEntrypoint(installRoot, componentId, prepared.entry);
-      const finalRequiredFiles = prepared.entry.requiredFiles.map((file) => relativeFile(
-        slotRoot(installRoot, componentId, "current"), file,
-      ));
+      const finalRequiredFiles = runtimeRequiredFiles(installRoot, componentId, prepared.entry);
       try {
         promoted = await promotePreparedVersion({
           taskId, componentId, rootPath: prepared.rootPath, version: prepared.entry.version,
@@ -914,7 +995,7 @@ export function createComponentAdapters({
           },
         });
       } catch (error) {
-        if (wasRunning) await windowsHost.launchOwned(oldEntrypoint).catch(() => {});
+        if (wasRunning) try { await windowsHost.launchOwned(oldEntrypoint); } catch {}
         throw error;
       }
 
@@ -937,7 +1018,7 @@ export function createComponentAdapters({
         if (owned) {
           try {
             await rollbackVersion(componentId);
-            if (wasRunning) await windowsHost.launchOwned(oldEntrypoint).catch(() => {});
+            if (wasRunning) try { await windowsHost.launchOwned(oldEntrypoint); } catch {}
           } catch (rollbackError) {
             return failed(componentId, action, rollbackError, before);
           }
@@ -950,7 +1031,7 @@ export function createComponentAdapters({
               ...current, entrypointPath: finalEntrypoint, requiredFiles: finalRequiredFiles,
               health: "failed-unhealthy", verifyError: errorMessage(coreVerifyError),
             };
-            await saveState(marked).catch(() => {});
+            try { await saveState(marked); } catch {}
           }
         }
         return failed(componentId, action, coreVerifyError, before);
@@ -1009,13 +1090,17 @@ export function createComponentAdapters({
         }
       }
       if (wasRunning) {
-        await windowsHost.launchOwned(finalEntrypoint)
-          .catch((error) => { warnings.push(`restart:${errorMessage(error)}`); });
+        try { await windowsHost.launchOwned(finalEntrypoint); }
+        catch (error) { warnings.push(`restart:${errorMessage(error)}`); }
       }
       return result(componentId, action, "succeeded", {
         versionBefore: before, versionAfter: prepared.entry.version,
         message: warnings.length === 0 ? "component_committed" : `component_committed_with_warning:${warnings.join(",")}`,
         rollbackAvailable: Boolean(promoted?.rollbackAvailable),
+        details: {
+          installPath: slotRoot(installRoot, componentId, "current"),
+          previousVersion: before,
+        },
       });
     } catch (error) {
       const before = prepared?.before ?? null;
@@ -1042,6 +1127,16 @@ export function createComponentAdapters({
       if (["pending-verify", "failed-unhealthy"].includes(record.health)) {
         throw adapterError(record.health === "pending-verify" ? "component_verification_pending" : "component_failed_unhealthy");
       }
+      if (typeof record.entrypointPath !== "string" || !Array.isArray(record.requiredFiles)) {
+        throw adapterError("component_runtime_metadata_missing");
+      }
+      await verifyComponent({
+        componentId, phase: "current",
+        rootPath: slotRoot(installRoot, componentId, "current"),
+        entrypointPath: record.entrypointPath,
+        requiredFiles: record.requiredFiles,
+        expectedVersion: record.version,
+      });
       return result(componentId, "inspect", "succeeded", {
         versionBefore: record.version, versionAfter: record.version, message: "component_installed",
         rollbackAvailable: stateRollbackAvailable(state, componentId),
@@ -1117,7 +1212,7 @@ export function createComponentAdapters({
       next.rollback = rollbackRecords(next).filter((item) => item?.componentId !== componentId);
       if (next.rollback.length === 0) next.rollback = null;
       next.activeTask = null;
-      await saveState(next).catch(() => {});
+      try { await saveState(next); } catch {}
       return result(componentId, "uninstall", "succeeded", {
         versionBefore: before, versionAfter: null,
         message: deleted ? "component_uninstalled" : "component_uninstall_warning",
@@ -1145,15 +1240,24 @@ export function createComponentAdapters({
       const warnings = [];
       const restoredState = assertStateForManaged(await loadState());
       const restored = managedRecord(restoredState, componentId);
-      if (!restored || typeof restored.entrypointPath !== "string") throw adapterError("component_runtime_metadata_missing");
-      if (wasRunning) await windowsHost.launchOwned(restored.entrypointPath)
-        .catch((error) => warnings.push(`restart:${errorMessage(error)}`));
+      if (!restored || typeof restored.entrypointPath !== "string" || !Array.isArray(restored.requiredFiles)) {
+        throw adapterError("component_runtime_metadata_missing");
+      }
+      await verifyComponent({
+        componentId, phase: "current",
+        rootPath: slotRoot(installRoot, componentId, "current"),
+        entrypointPath: restored.entrypointPath,
+        requiredFiles: restored.requiredFiles,
+        expectedVersion: restored.version,
+      });
+      if (wasRunning) try { await windowsHost.launchOwned(restored.entrypointPath); }
+      catch (error) { warnings.push(`restart:${errorMessage(error)}`); }
       return result(componentId, "rollback", "succeeded", {
         versionBefore: before, versionAfter: rolled.version,
         message: warnings.length ? `component_rolled_back_with_warning:${warnings.join(",")}` : "component_rolled_back",
       });
     } catch (error) {
-      if (wasRunning && oldEntrypoint) await windowsHost.launchOwned(oldEntrypoint).catch(() => {});
+      if (wasRunning && oldEntrypoint) try { await windowsHost.launchOwned(oldEntrypoint); } catch {}
       return failed(componentId, "rollback", error, before);
     }
   }
@@ -1311,8 +1415,8 @@ export function createComponentAdapters({
           onStarted: () => releaseMutableGitPlan(targetAbsencePin),
         });
       } finally {
-        if (targetAbsencePin) await releaseGitPlan(targetAbsencePin).catch(() => {});
-        await releaseGitPlan(installerPin).catch(() => {});
+        if (targetAbsencePin) try { await releaseGitPlan(targetAbsencePin); } catch {}
+        try { await releaseGitPlan(installerPin); } catch {}
       }
       discoveredRaw = await windowsHost.discoverGit();
     }
@@ -1403,6 +1507,7 @@ export function createComponentAdapters({
       if (context.selected !== true) throw adapterError("git_explicit_selection_required");
       const taskId = requireTaskId(context.taskId);
       const entry = trustedComponent("git");
+      await assertSufficientDiskSpace(installerDiskRequirement(entry.size));
       claim = { kind: "component-prepare", taskId, componentId: "git", version: entry.version };
       const reservation = await reservePrepareClaim(recoverGitTransaction, claim);
       ({ claim, lease: operationLease } = reservation);
@@ -1432,6 +1537,7 @@ export function createComponentAdapters({
       }
       downloadRecord = downloaded.downloadRecord;
       await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
+      reportPreparePhase(context, "verify", null, "software_manager_verifying_installer");
       const signature = await windowsHost.verifyAuthenticode(installerPath);
       if (signature?.status !== "Valid") throw adapterError("git_authenticode_invalid");
       await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
@@ -1542,6 +1648,7 @@ export function createComponentAdapters({
         return result("git", "commit", "succeeded", {
           versionBefore: prepared.before, versionAfter: prepared.entry.version,
           message: "git_external_updated", rollbackAvailable: false,
+          details: { ownership: "external", installPath: fresh.installDir, previousVersion: null },
         });
       }
 
@@ -1626,6 +1733,11 @@ export function createComponentAdapters({
       return result("git", "commit", "succeeded", {
         versionBefore: prepared.before, versionAfter: prepared.entry.version,
         message: "git_managed_committed", rollbackAvailable: Boolean(next.components.git.previousInstaller),
+        details: {
+          ownership: "managed",
+          installPath: componentRoot(installRoot, "git"),
+          previousVersion: prepared.previousRecord?.version ?? null,
+        },
       });
     } catch (error) {
       const before = prepared?.before ?? null;
@@ -1741,8 +1853,8 @@ export function createComponentAdapters({
       });
     } catch (error) { return failed("git", "uninstall", error, before); }
     finally {
-      if (executionLease) await executionLease.release().catch(() => {});
-      if (pin) await releaseGitPlan(pin).catch(() => {});
+      if (executionLease) try { await executionLease.release(); } catch {}
+      if (pin) try { await releaseGitPlan(pin); } catch {}
     }
   }
 
@@ -1843,9 +1955,9 @@ export function createComponentAdapters({
       });
     } catch (error) { return failed("git", "rollback", error, before); }
     finally {
-      if (executionLease) await executionLease.release().catch(() => {});
-      if (targetPin) await releaseGitPlan(targetPin).catch(() => {});
-      if (pin) await releaseGitPlan(pin).catch(() => {});
+      if (executionLease) try { await executionLease.release(); } catch {}
+      if (targetPin) try { await releaseGitPlan(targetPin); } catch {}
+      if (pin) try { await releaseGitPlan(pin); } catch {}
     }
   }
 
@@ -1889,8 +2001,17 @@ export function createComponentAdapters({
       await runOwnership(() => recoverSkillTransaction());
       await reconcilePreparedSkillsAndReleaseTransientRoot();
     }
-    catch (error) { return [await failed("skills", "prepare", error)]; }
+    catch (error) { return failedSkills(context, "prepare", error); }
     const ids = Array.isArray(context.skillIds) ? context.skillIds : [];
+    try {
+      let totalSize = 0;
+      for (const id of ids) {
+        try { totalSize += trustedSkill(id).size; } catch {}
+      }
+      await assertSufficientDiskSpace(archiveDiskRequirement(totalSize));
+    } catch (error) {
+      return failedSkills(context, "prepare", error);
+    }
     const pending = new Map();
     preparedSkills.set(taskId, pending);
     const results = [];
@@ -1937,6 +2058,7 @@ export function createComponentAdapters({
         downloadRecord = downloaded.downloadRecord;
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
         await revalidateFixedDirectoryCapability(activeSkillsRootCapability);
+        reportPreparePhase(context, "extract", null, "software_manager_extracting_skill");
         await extractArchive({
           format: "zip", archivePath, destination,
           destinationIdentity: boundSource.identity,
@@ -1944,6 +2066,7 @@ export function createComponentAdapters({
         });
         await revalidateInstallRootCapability(installRootCapability, { maxRelativePath });
         await revalidateFixedDirectoryCapability(activeSkillsRootCapability);
+        reportPreparePhase(context, "verify", null, "software_manager_verifying_skill");
         const verified = await verifyPreparedSkill({
           taskId,
           skillId: entry.id,
@@ -2010,7 +2133,7 @@ export function createComponentAdapters({
     try { context = rejectForbiddenContext(rawContext); requireTaskId(context.taskId); }
     catch (error) { return [await failed("skills", "commit", error)]; }
     const pending = preparedSkills.get(context.taskId);
-    if (!pending) return [await failed("skills", "commit", adapterError("component_not_prepared"))];
+    if (!pending) return failedSkills(context, "commit", adapterError("component_not_prepared"));
     preparedSkills.delete(context.taskId);
     const results = [];
     for (const id of Array.isArray(context.skillIds) ? context.skillIds : []) {
@@ -2107,18 +2230,19 @@ export function createComponentAdapters({
           versionBefore: before, versionAfter: prepared.entry.version, message: "skill_replaced",
         }));
       } catch (error) {
-        await discardPreparedSkillSources({ taskId: context.taskId, skillIds: [id] }).catch(() => {});
+        try { await discardPreparedSkillSources({ taskId: context.taskId, skillIds: [id] }); } catch {}
         results.push(await failed(id, "commit", error));
       } finally {
-        await prepared?.operationLease?.release().catch(() => {});
+        try { await prepared?.operationLease?.release?.(); } catch {}
       }
     }
     return results;
   }
 
   async function inspectSkills(rawContext) {
+    let context;
     try {
-      const context = rejectForbiddenContext(rawContext);
+      context = rejectForbiddenContext(rawContext);
       await ensureSkillsAuthority();
       await revalidateInstallRootCapability(installRootCapability);
       await revalidateFixedDirectoryCapability(activeSkillsRootCapability);
@@ -2126,15 +2250,31 @@ export function createComponentAdapters({
       await reconcilePreparedSkillsAndReleaseTransientRoot();
       if (state.activeTask !== null) throw adapterError("component_pending_transaction");
       const ids = Array.isArray(context.skillIds) ? context.skillIds : Object.keys(state.skills);
-      return ids.map((id) => {
+      const results = [];
+      for (const id of ids) {
         const version = stateSkillVersion(state, id);
-        return version === null
-          ? result(id, "inspect", "skipped", { message: "skill_not_installed" })
-          : result(id, "inspect", "succeeded", {
+        if (version === null) {
+          results.push(result(id, "inspect", "skipped", { message: "skill_not_installed" }));
+          continue;
+        }
+        try {
+          const record = state.skills[id];
+          const target = await resolveSkillTarget({ skillsRoot, skillId: id, ...skillPathAccess });
+          if (!record || target !== record.target
+            || await hashSkillFile(path.win32.join(target, "SKILL.md")) !== record.skillMdSha256) {
+            throw adapterError("skill_md_hash_mismatch");
+          }
+          results.push(result(id, "inspect", "succeeded", {
             versionBefore: version, versionAfter: version, message: "skill_installed",
-          });
-      });
-    } catch (error) { return [await failed("skills", "inspect", error)]; }
+          }));
+        } catch (error) {
+          results.push(await failed(id, "inspect", error));
+        }
+      }
+      return results;
+    } catch (error) {
+      return context ? failedSkills(context, "inspect", error) : [await failed("skills", "inspect", error)];
+    }
   }
 
   async function discardPreparedSkills(rawContext) {
@@ -2249,7 +2389,7 @@ export function createComponentAdapters({
         await deleteSkillExact({ target, authorizedRoot: skillsRoot, expectedEvidence });
         const next = structuredClone(reserved);
         delete next.skills[id]; next.activeTask = null;
-        await saveState(next).catch(() => {});
+        try { await saveState(next); } catch {}
         results.push(result(id, "uninstall", "succeeded", {
           versionBefore: record.version, versionAfter: null, message: "skill_uninstalled",
         }));

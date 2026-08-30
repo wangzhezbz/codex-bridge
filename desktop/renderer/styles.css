@@ -68,7 +68,7 @@ button:disabled {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   height: 100vh;
-  gap: 22px;
+  gap: 18px;
   padding: 22px 16px;
   border-right: 1px solid #20313b;
   overflow: hidden;
@@ -110,7 +110,26 @@ button:disabled {
   display: grid;
   min-height: 0;
   align-content: start;
-  gap: 6px;
+  gap: 14px;
+  padding: 2px 0 4px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-color: rgba(159, 178, 176, 0.4) transparent;
+  scrollbar-width: thin;
+}
+
+.nav-group {
+  display: grid;
+  gap: 4px;
+}
+
+.nav-group-label {
+  padding: 0 12px 2px;
+  color: #718785;
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.12em;
+  line-height: 1.4;
 }
 
 .sidebar-actions {
@@ -138,12 +157,14 @@ button:disabled {
 
 .nav-item {
   width: 100%;
-  min-height: 42px;
+  min-height: 38px;
   padding: 0 12px;
   border: 0;
-  border-radius: 8px;
+  border-radius: 10px;
   background: transparent;
   color: #b8c7c5;
+  font-size: 15px;
+  font-weight: 520;
   text-align: left;
 }
 
@@ -1734,6 +1755,15 @@ h3 {
 
 .primary-button:hover {
   background: var(--accent-strong);
+}
+
+[data-software-start],
+[data-software-confirm] {
+  width: 148px;
+  min-width: 148px;
+  flex: 0 0 148px;
+  word-break: keep-all;
+  white-space: nowrap !important;
 }
 
 .plain-button {
@@ -5890,6 +5920,28 @@ body.resizing-usage-column {
   align-items: center;
 }
 
+.software-heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.software-health-badge {
+  padding: 6px 10px;
+  border: 1px solid #b9d3d0;
+  border-radius: 999px;
+  background: #f7fffd;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.software-health-badge.warning {
+  border-color: #edcf95;
+  background: #fff8e8;
+  color: #76531e;
+}
+
 .software-manager-heading h2 {
   font-size: 25px;
 }
@@ -5943,6 +5995,7 @@ body.resizing-usage-column {
 .software-install-root,
 .software-warning-banner,
 .software-skills-panel,
+.software-plugins-panel,
 .software-action-bar,
 .software-confirmation,
 .software-task-panel {
@@ -5963,6 +6016,16 @@ body.resizing-usage-column {
   padding: 12px 14px;
   font-size: 13px;
   line-height: 1.55;
+}
+
+.software-catalog-notice {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid #e6ca8b;
+  border-radius: 8px;
+  background: #fff8e6;
+  color: #76531d;
+  font-size: 12px;
 }
 
 .software-unavailable {
@@ -5987,6 +6050,24 @@ body.resizing-usage-column {
   padding: 14px 16px;
 }
 
+.software-install-root-copy {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.software-install-root-value {
+  margin-top: 9px;
+  padding: 8px 10px;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: #fbfcfd;
+  color: #435966;
+  font: 12px/1.35 Consolas, "SFMono-Regular", monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .software-manager-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -5996,13 +6077,33 @@ body.resizing-usage-column {
 .software-component-card {
   display: block;
   min-width: 0;
-  min-height: 132px;
+  min-height: 114px;
   padding: 15px;
   border: 1px solid var(--line);
   border-radius: 10px;
   background: #fff;
   cursor: pointer;
   transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
+}
+
+.software-skills-card {
+  cursor: default;
+}
+
+.software-skills-toggle {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #167eac;
+  font-size: 12px;
+  font-weight: 650;
+  text-decoration: underline;
+}
+
+.software-skills-toggle:disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+  text-decoration: none;
 }
 
 .software-component-card.selected {
@@ -6029,8 +6130,21 @@ body.resizing-usage-column {
   font-size: 17px;
 }
 
+.software-component-head > span:first-child {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+}
+
 .software-component-head input,
 .software-skill-row input {
+  width: 16px;
+  min-width: 16px;
+  height: 16px;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
   accent-color: var(--accent);
 }
 
@@ -6094,6 +6208,88 @@ body.resizing-usage-column {
 .software-skills-panel {
   margin-top: 14px;
   padding: 14px 16px 16px;
+}
+
+.software-skills-drawer {
+  border-color: #b9d9d4;
+  box-shadow: 0 10px 24px rgba(15, 125, 115, 0.06);
+}
+
+.software-plugins-panel {
+  margin-top: 14px;
+  padding: 14px 16px 16px;
+}
+
+.software-plugin-list {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+
+.software-plugin-group {
+  margin-top: 14px;
+}
+
+.software-skill-group-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.software-skill-group-title strong,
+.software-skill-group-title small {
+  display: block;
+}
+
+.software-skill-group-title small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.software-skill-group-title > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.software-skill-update-note {
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f8fafb;
+  color: #536a76;
+  font-size: 13px;
+}
+
+.software-plugin-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  align-items: center;
+  min-height: 72px;
+  padding: 10px 12px;
+  border-bottom: 1px solid #e8eef1;
+}
+
+.software-plugin-row:last-child {
+  border-bottom: 0;
+}
+
+.software-plugin-row strong {
+  margin-right: 10px;
+}
+
+.software-plugin-row p {
+  margin: 6px 0 4px;
+  color: #536a76;
+  font-size: 13px;
+}
+
+.software-plugin-row small {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .software-skills-title {
@@ -6228,11 +6424,27 @@ body.resizing-usage-column {
 }
 
 .software-progress {
+  position: relative;
   height: 8px;
   margin-top: 12px;
   overflow: hidden;
   border-radius: 999px;
   background: #e6edef;
+}
+
+.software-progress.indeterminate::after {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 34%;
+  border-radius: inherit;
+  background: var(--accent);
+  content: "";
+  animation: software-progress-indeterminate 1.25s ease-in-out infinite;
+}
+
+@keyframes software-progress-indeterminate {
+  0% { transform: translateX(-105%); }
+  100% { transform: translateX(395%); }
 }
 
 .software-progress progress {
@@ -6258,6 +6470,64 @@ body.resizing-usage-column {
   color: var(--muted);
   font-size: 12px;
   text-align: right;
+}
+
+.software-phase-activity {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.software-result-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid #9fd8ca;
+  border-radius: 10px;
+  background: #effbf7;
+  color: #087765;
+}
+
+.software-result-summary.partial,
+.software-result-summary.failed {
+  border-color: #efb0aa;
+  background: #fff4f2;
+  color: #b3261e;
+}
+
+.software-result-summary.cancelled {
+  border-color: #d5dde5;
+  background: #f5f7f9;
+  color: var(--muted);
+}
+
+.software-result-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.software-result-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.3fr) minmax(180px, 1fr);
+  gap: 4px 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--panel);
+}
+
+.software-result-row.failed span {
+  color: #b3261e;
+}
+
+.software-result-row code {
+  grid-column: 1 / -1;
+  overflow-wrap: anywhere;
+  color: var(--muted);
 }
 
 .software-log {
@@ -6293,6 +6563,11 @@ body.resizing-usage-column {
     flex-direction: column;
   }
 
+  .software-heading-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
   .software-confirm-actions {
     justify-content: flex-end;
   }
@@ -6300,8 +6575,8 @@ body.resizing-usage-column {
 
 @media (max-height: 820px) {
   .sidebar {
-    gap: 8px;
-    padding: 10px 12px;
+    gap: 10px;
+    padding: 12px;
   }
 
   .brand {
@@ -6315,13 +6590,21 @@ body.resizing-usage-column {
   }
 
   .nav-list {
+    gap: 10px;
+    padding-top: 0;
+  }
+
+  .nav-group {
     gap: 2px;
-    overflow-y: auto;
-    overscroll-behavior: contain;
+  }
+
+  .nav-group-label {
+    padding-bottom: 1px;
+    font-size: 9px;
   }
 
   .nav-item {
-    min-height: 32px;
+    min-height: 34px;
     padding: 0 10px;
   }
 

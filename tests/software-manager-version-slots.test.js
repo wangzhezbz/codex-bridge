@@ -702,7 +702,7 @@ test("legacy schema-v2 transaction records without prepare metadata still recove
 });
 
 test("archive prepare WAL moves only its bound task source into the fixed staging slot", async () => {
-  const stagingName = `.codexbridge-prepare-${"c".repeat(32)}`;
+  const stagingName = `.p-${"c".repeat(32)}`;
   const taskId = "archive-source-promote";
   const fixture = createFixture({ slots: { [stagingName]: null } });
   const claimed = fixture.state();
@@ -721,7 +721,7 @@ test("archive prepare WAL moves only its bound task source into the fixed stagin
 });
 
 test("archive prepare WAL recovers when the source moved before the prepare claim transitioned", async () => {
-  const stagingName = `.codexbridge-prepare-${"d".repeat(32)}`;
+  const stagingName = `.p-${"d".repeat(32)}`;
   const taskId = "archive-source-crash";
   const fixture = createFixture({ slots: { [stagingName]: null } });
   const claimed = fixture.state();
@@ -746,7 +746,7 @@ test("prepared staging is bound to the durable claim and only that exact identit
   const claimed = fixture.state();
   claimed.activeTask = {
     kind: "component-prepare", taskId: "bound-staging", componentId: "chatgpt", version: "1.0.0",
-    stagingName: `.codexbridge-prepare-${"a".repeat(32)}`,
+    stagingName: `.p-${"a".repeat(32)}`,
     leaseScope: "prepare", leaseNonce: "bound-lease",
   };
   fixture.setState(claimed);
@@ -769,8 +769,8 @@ test("failed prepared-directory inspection removes every exact unbound directory
     await t.test(scenario.label, async () => {
       const fixture = createFixture({ componentId: scenario.componentId });
       const taskId = `bind-fault-${scenario.label.replaceAll(" ", "-").toLowerCase()}`;
-      const stagingName = `.codexbridge-prepare-${scenario.componentId === "v2rayn" ? "a" : scenario.failKind.endsWith("inspect") ? "b" : "c"}`
-        .padEnd(53, scenario.componentId === "v2rayn" ? "a" : scenario.failKind.endsWith("inspect") ? "b" : "c");
+      const stagingName = `.p-${scenario.componentId === "v2rayn" ? "a" : scenario.failKind.endsWith("inspect") ? "b" : "c"}`
+        .padEnd(35, scenario.componentId === "v2rayn" ? "a" : scenario.failKind.endsWith("inspect") ? "b" : "c");
       const claimed = fixture.state();
       claimed.activeTask = {
         kind: "component-prepare", taskId, componentId: scenario.componentId, version: "1.0.0",
@@ -797,7 +797,7 @@ test("prepared staging discard fails closed after a same-name identity replaceme
   const claimed = fixture.state();
   claimed.activeTask = {
     kind: "component-prepare", taskId: "foreign-staging", componentId: "chatgpt", version: "1.0.0",
-    stagingName: `.codexbridge-prepare-${"b".repeat(32)}`,
+    stagingName: `.p-${"b".repeat(32)}`,
     leaseScope: "prepare", leaseNonce: "foreign-lease",
   };
   fixture.setState(claimed);
@@ -812,7 +812,7 @@ test("prepared staging discard fails closed after a same-name identity replaceme
 });
 
 test("unbound prepared staging is never adopted or deleted even when it is empty", async () => {
-  const stagingName = `.codexbridge-prepare-${"7".repeat(32)}`;
+  const stagingName = `.p-${"7".repeat(32)}`;
   const fixture = createFixture({ slots: { [stagingName]: null } });
   const claimed = fixture.state();
   claimed.activeTask = {
@@ -832,7 +832,7 @@ test("first V2RayN prepare atomically owns and discards its exact new component 
   const claimed = fixture.state();
   claimed.activeTask = {
     kind: "component-prepare", taskId: "first-v2-root", componentId: "v2rayn", version: "1.0.0",
-    stagingName: `.codexbridge-prepare-${"8".repeat(32)}`,
+    stagingName: `.p-${"8".repeat(32)}`,
     leaseScope: "prepare", leaseNonce: "first-v2-lease",
   };
   fixture.setState(claimed);
@@ -850,7 +850,7 @@ test("first V2RayN prepare atomically owns and discards its exact new component 
 test("first V2RayN promotion rejects a same-path replacement of its owned component root", async () => {
   const fixture = createFixture({ componentId: "v2rayn" });
   const taskId = "first-v2-root-replaced";
-  const stagingName = `.codexbridge-prepare-${"3".repeat(32)}`;
+  const stagingName = `.p-${"3".repeat(32)}`;
   const claimed = fixture.state();
   claimed.activeTask = {
     kind: "component-prepare", taskId, componentId: "v2rayn", version: "1.0.0",
@@ -876,7 +876,7 @@ test("foreign pre-existing V2RayN root is never adopted by first prepare", async
   const claimed = fixture.state();
   claimed.activeTask = {
     kind: "component-prepare", taskId: "foreign-v2-root", componentId: "v2rayn", version: "1.0.0",
-    stagingName: `.codexbridge-prepare-${"9".repeat(32)}`,
+    stagingName: `.p-${"9".repeat(32)}`,
     leaseScope: "prepare", leaseNonce: "foreign-v2-lease",
   };
   fixture.setState(claimed);
@@ -892,7 +892,7 @@ test("first V2RayN bind save ambiguity recovers a durable bound claim after exac
   const claimed = fixture.state();
   claimed.activeTask = {
     kind: "component-prepare", taskId: "v2-save-ambiguous", componentId: "v2rayn", version: "1.0.0",
-    stagingName: `.codexbridge-prepare-${"6".repeat(32)}`,
+    stagingName: `.p-${"6".repeat(32)}`,
     leaseScope: "prepare", leaseNonce: "v2-save-lease",
   };
   fixture.setState(claimed);
@@ -927,7 +927,7 @@ test("first V2RayN abort recovery is idempotent after its exact component root i
     await t.test(label, async () => {
       const fixture = createFixture({ componentId: "v2rayn" });
       const taskId = `v2-abort-${label.startsWith("before") ? "before" : "after"}`;
-      const stagingName = `.codexbridge-prepare-${label.startsWith("before") ? "4" : "5"}`.padEnd(53, label.startsWith("before") ? "4" : "5");
+      const stagingName = `.p-${label.startsWith("before") ? "4" : "5"}`.padEnd(35, label.startsWith("before") ? "4" : "5");
       const claimed = fixture.state();
       claimed.activeTask = {
         kind: "component-prepare", taskId, componentId: "v2rayn", version: "1.0.0",
@@ -958,7 +958,7 @@ test("first V2RayN abort recovery is idempotent after its exact component root i
 test("first V2RayN abort finish rejects a foreign root that reappears after cleanup WAL", async () => {
   const fixture = createFixture({ componentId: "v2rayn" });
   const taskId = "v2-abort-foreign-reappeared";
-  const stagingName = `.codexbridge-prepare-${"2".repeat(32)}`;
+  const stagingName = `.p-${"2".repeat(32)}`;
   const claimed = fixture.state();
   claimed.activeTask = {
     kind: "component-prepare", taskId, componentId: "v2rayn", version: "1.0.0",
@@ -1026,6 +1026,31 @@ test("first update keeps the old current as previous and records one rollback", 
   await fixture.manager.promotePreparedVersion(promotionPlan(fixture, "2.0.0"));
   assert.deepEqual(fixture.versions(), { current: "2.0.0", previous: "1.0.0", staging: null, retiring: null });
   assert.equal(fixture.state().rollback[0].version, "1.0.0");
+});
+
+test("an update journals two legacy ChatGPT versions with full package file inventories", async () => {
+  const fixture = fixtureWithInstalled({
+    currentVersion: "1.0.0", previousVersion: "0.9.0", incomingVersion: "2.0.0",
+  });
+  const state = fixture.state();
+  state.components.chatgpt.entrypointPath = "D:\\CodexBridge\\c\\ChatGPT.exe";
+  state.components.chatgpt.requiredFiles = Array.from(
+    { length: 9_000 },
+    (_, index) => `D:\\CodexBridge\\c\\resources\\legacy-${index}.bin`,
+  );
+  state.components.chatgpt.health = "healthy";
+  state.rollback[0].entrypointPath = "D:\\CodexBridge\\cp\\ChatGPT.exe";
+  state.rollback[0].requiredFiles = Array.from(
+    { length: 9_000 },
+    (_, index) => `D:\\CodexBridge\\cp\\resources\\legacy-${index}.bin`,
+  );
+  state.rollback[0].health = "healthy";
+  fixture.setState(state);
+
+  await fixture.manager.promotePreparedVersion(promotionPlan(fixture, "2.0.0"));
+
+  assert.equal(fixture.state().components.chatgpt.version, "2.0.0");
+  assert.equal(fixture.state().rollback[0].requiredFiles.length, 9_000);
 });
 
 test("second update moves oldest to retiring, commits ownership, then deletes retiring", async () => {

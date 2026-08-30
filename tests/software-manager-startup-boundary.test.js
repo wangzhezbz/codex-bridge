@@ -22,6 +22,7 @@ test("an unavailable optional software manager remains read-only while normal de
     components: [],
     skills: [],
     rollback: [],
+    installRootPath: null,
     task: null,
     logs: [],
     defaults: {
@@ -45,19 +46,26 @@ test("an unavailable optional software manager remains read-only while normal de
   }
 });
 
-test("software-manager startup failure is isolated from Router and renderer startup", () => {
+test("software-manager startup failure is isolated and recovery warnings remain retryable", () => {
   const mainSource = fs.readFileSync(new URL("../desktop/main.cjs", import.meta.url), "utf8");
   const startup = mainSource.match(/app\.whenReady\(\)\.then\(async \(\) => \{[\s\S]*?\n\}\);\n\napp\.on\("before-quit"/u)?.[0] ?? "";
+  const construction = startup.indexOf("runtime = await getSoftwareManagerRuntime()");
+  const constructionCatch = startup.indexOf("catch (error)", construction);
+  const constructionCatchEnd = startup.indexOf("\n    }", constructionCatch);
   const recovery = startup.indexOf("runtime.recoverOffline()");
   const recoveryCatch = startup.indexOf("catch (error)", recovery);
-  const recoveryCatchEnd = startup.indexOf("\n  }", recoveryCatch);
+  const recoveryCatchEnd = startup.indexOf("\n    }", recoveryCatch);
+  const constructionCatchBody = startup.slice(constructionCatch, constructionCatchEnd);
   const catchBody = startup.slice(recoveryCatch, recoveryCatchEnd);
   const recoveryComplete = startup.indexOf("configRecoveryComplete = true;", recoveryCatch);
   const createWindow = startup.indexOf("createWindow();", recoveryComplete);
 
-  assert.equal(recovery >= 0 && recoveryCatch > recovery && recoveryComplete > recoveryCatch && createWindow > recoveryComplete, true);
-  assert.match(catchBody, /appendRuntimeLog\(formatError\("softwareManagerStartup", error\)\)/u);
-  assert.match(catchBody, /softwareManagerStartupFailure\s*=\s*error/u);
+  assert.equal(construction >= 0 && constructionCatch > construction && recovery >= 0
+    && recoveryCatch > recovery && recoveryComplete > recoveryCatch && createWindow > recoveryComplete, true);
+  assert.match(constructionCatchBody, /appendRuntimeLog\(formatError\("softwareManagerStartup", error\)\)/u);
+  assert.match(constructionCatchBody, /softwareManagerStartupFailure\s*=\s*error/u);
+  assert.match(catchBody, /appendRuntimeLog\(formatError\("softwareManagerRecovery", error\)\)/u);
+  assert.doesNotMatch(catchBody, /softwareManagerStartupFailure\s*=\s*error/u);
   assert.doesNotMatch(catchBody, /app\.quit\(\)|return;/u);
   assert.match(startup.slice(recoveryCatchEnd, recoveryComplete), /initializeSoftwareManagerIpc\(\)/u);
 });

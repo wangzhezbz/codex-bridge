@@ -17,18 +17,23 @@ export function createUpstreamErrorPresentation({
         error?.localHistoryError || error?.code === "local_history_storage_unavailable",
       );
       const contextSwitchError = error?.code === "context_switch_compaction_failed";
+      const classification = classifyUpstreamError(error);
+      const code = localHistoryError
+        ? "local_history_storage_unavailable"
+        : contextSwitchError
+          ? "context_switch_compaction_failed"
+          : classification.code || error?.code || "upstream_stream_error";
       sendResponsesStreamFailure(res, streamErrorMessage(error), {
         model: options.model || error?.route?.model || null,
+        code,
         ...(localHistoryError
           ? {
               statusCode: error.statusCode || 503,
-              code: "local_history_storage_unavailable",
             }
           : {}),
         ...(contextSwitchError
           ? {
               statusCode: error.statusCode || 409,
-              code: "context_switch_compaction_failed",
             }
           : {}),
       });

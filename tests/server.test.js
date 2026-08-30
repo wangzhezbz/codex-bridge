@@ -6838,7 +6838,7 @@ test("native responses stream transport errors end with a bridge failure event",
     const text = await response.text();
     assert.equal(response.ok, true, text);
     assert.match(text, /response\.failed/);
-    assert.match(text, /upstream_stream_truncated/);
+    assert.match(text, /upstream_network_error/);
     assert.match(text, /data: \[DONE\]/);
 
     const health = await fetchJson(`${serverUrl(router)}/health`);

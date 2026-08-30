@@ -4,6 +4,8 @@ import test from "node:test";
 
 import { createCatalogCache } from "../desktop/software-manager/catalog-cache.mjs";
 import { createCachedCatalogProvider } from "../desktop/software-manager/catalog-provider.mjs";
+import { readBundledCatalogEnvelope } from "../desktop/software-manager/bundled-catalog.mjs";
+import { CATALOG_PUBLIC_KEY_SPKI } from "../desktop/software-manager/catalog-public-key.mjs";
 
 const TEST_CATALOG_URL = "https://shanhaiyouling.com/codexbridge-install-test/component-catalog.json";
 const TEST_SIGNATURE_URL = `${TEST_CATALOG_URL}.sig`;
@@ -277,6 +279,87 @@ test("getCurrent re-verifies a valid cached envelope before returning a trusted 
   const service = await provider.getCurrent();
 
   assert.equal(service.getComponent("chatgpt").version, "1.2.3");
+});
+
+test("getCurrent uses the signed bundled catalog when a new machine has no cache", async () => {
+  const bundledEnvelope = signedFixture("4.5.6");
+  const provider = createCachedCatalogProvider(providerOptions({ bundledEnvelope }));
+
+  const service = await provider.getCurrent();
+
+  assert.equal(service.getComponent("chatgpt").version, "4.5.6");
+});
+
+test("getCurrent never lets a valid but stale cache downgrade the signed bundled baseline", async () => {
+  const cached = signedFixture("1.0.0");
+  const bundledEnvelope = signedFixture("4.5.6");
+  const provider = createCachedCatalogProvider(providerOptions({
+    bundledEnvelope,
+    cache: { readEnvelope: async () => cached, replaceEnvelope: async () => {} },
+  }));
+
+  const service = await provider.getCurrent();
+
+  assert.equal(service.getComponent("chatgpt").version, "4.5.6");
+});
+
+test("getCurrent keeps a cache that is newer than the signed bundled baseline", async () => {
+  const cached = signedFixture("5.0.0");
+  const bundledEnvelope = signedFixture("4.5.6");
+  const provider = createCachedCatalogProvider(providerOptions({
+    bundledEnvelope,
+    cache: { readEnvelope: async () => cached, replaceEnvelope: async () => {} },
+  }));
+
+  const service = await provider.getCurrent();
+
+  assert.equal(service.getComponent("chatgpt").version, "5.0.0");
+});
+
+test("the production bundled catalog works offline on a first-run machine", async () => {
+  const provider = createCachedCatalogProvider({
+    catalogUrl: TEST_CATALOG_URL,
+    signatureUrl: TEST_SIGNATURE_URL,
+    publicKeyPem: CATALOG_PUBLIC_KEY_SPKI,
+    fetchImpl: async () => { throw new Error("offline"); },
+    cache: { readEnvelope: async () => null, replaceEnvelope: async () => {} },
+    bundledEnvelope: readBundledCatalogEnvelope({ catalogUrl: TEST_CATALOG_URL }),
+  });
+
+  const service = await provider.getCurrent();
+
+  assert.equal(service.getComponent("chatgpt").version, "26.814.5517.0");
+  assert.equal(service.getComponent("v2rayn").version, "7.24.7.0");
+  assert.equal(service.getComponent("git").version, "2.55.0.5");
+  assert.equal(service.listSkills().length, 7);
+});
+
+test("getCurrent uses the signed bundled catalog when the local cache is corrupt", async () => {
+  const cached = signedFixture("1.0.0");
+  const bundledEnvelope = signedFixture("4.5.6");
+  const provider = createCachedCatalogProvider(providerOptions({
+    bundledEnvelope,
+    cache: {
+      readEnvelope: async () => ({ ...cached, signatureText: Buffer.alloc(256).toString("base64") }),
+      replaceEnvelope: async () => {},
+    },
+  }));
+
+  const service = await provider.getCurrent();
+
+  assert.equal(service.getComponent("chatgpt").version, "4.5.6");
+});
+
+test("provider rejects a bundled catalog whose signature is invalid", () => {
+  const bundledEnvelope = {
+    ...signedFixture("4.5.6"),
+    signatureText: Buffer.alloc(256).toString("base64"),
+  };
+
+  assert.throws(
+    () => createCachedCatalogProvider(providerOptions({ bundledEnvelope })),
+    /catalog_signature_invalid/u,
+  );
 });
 
 test("getCurrent fails closed when the cached envelope signature is corrupt", async () => {

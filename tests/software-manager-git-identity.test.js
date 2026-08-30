@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rmdir, unlink, writeFile, lstat } from "node:fs/promises";
+import { link, mkdir, readFile, rename, rmdir, unlink, writeFile, lstat } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 
@@ -49,9 +49,13 @@ function fixture({ missingAfterDelete = false, failMutableCloseOnce = null } = {
   }
   const fileCapabilities = {
     async pinArchiveFileNoFollow(filePath) {
+      calls.push(["pin-archive", filePath]);
+      return filePin(filePath);
+    },
+    async pinExecutableFileNoFollow(filePath) {
       calls.push(["pin-file", filePath]);
       if (missingAfterDelete && deleted.some((record) => record.path === filePath)) {
-        throw Object.assign(new Error("missing"), { code: "ENOENT" });
+        throw Object.assign(new Error("missing"), { code: "entry_missing" });
       }
       return filePin(filePath);
     },
@@ -99,6 +103,8 @@ test("pins the installer, registered Git root, git.exe and uninstaller and reval
   await capabilities.revalidate(pin, { installerSha256: HASH, discovery: external });
   assert.deepEqual(calls.filter(([kind]) => kind === "pin-file").map(([, value]) => value), [
     "D:\\CBApps\\downloads\\git-2.51.0.exe",
+  ]);
+  assert.deepEqual(calls.filter(([kind]) => kind === "pin-archive").map(([, value]) => value), [
     external.executablePath,
     external.uninstallerPath,
   ]);
@@ -269,5 +275,35 @@ test("real Win32 pins block Git target mutation until the process-start release"
     await rmdir(gitRoot).catch(() => {});
     await rmdir(downloadsRoot).catch(() => {});
     await rmdir(installRoot).catch(() => {});
+  }
+});
+
+test("real Win32 accepts and deletes only the verified Git-installer link when link count exceeds one", {
+  skip: process.platform !== "win32" ? "requires production Win32 handles" : false,
+}, async () => {
+  const root = path.win32.join(process.cwd(), `.tmp-cb-git-hardlink-${randomUUID()}`);
+  const installerPath = path.win32.join(root, "git-2.51.0.exe");
+  const siblingLink = path.win32.join(root, "git-cache-link.exe");
+  const data = Buffer.from("signed git installer hardlink fixture");
+  const sha256 = createHash("sha256").update(data).digest("hex");
+  await mkdir(root);
+  await writeFile(installerPath, data);
+  await link(installerPath, siblingLink);
+  const files = createWindowsFileCapabilities({ nativeApi: createWin32FileApi() });
+  let pin = null;
+  try {
+    await assert.rejects(files.pinArchiveFileNoFollow(installerPath), /hard_link/u);
+    pin = await files.pinExecutableFileNoFollow(installerPath);
+    await pin.assertStableNoFollow();
+    await pin.close();
+    pin = null;
+    await files.deleteVerifiedExecutableFileNoFollow(installerPath, sha256);
+    await assert.rejects(readFile(installerPath), { code: "ENOENT" });
+    assert.deepEqual(await readFile(siblingLink), data);
+  } finally {
+    if (pin) await pin.close().catch(() => {});
+    await unlink(installerPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+    await unlink(siblingLink).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+    await rmdir(root).catch((error) => { if (error?.code !== "ENOENT") throw error; });
   }
 });

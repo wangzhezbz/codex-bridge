@@ -77,6 +77,24 @@ test("discovers one registered Git only when the registry and PATH executable un
   assertCommand(fixture.calls.execFile.at(-1), "where.exe", ["git.exe"]);
 });
 
+test("ignores bundled or portable PATH Git entries when one registered installation matches exactly", async () => {
+  const fixture = fakeHost({
+    registryRecords: new Map([[REGISTRY_KEYS[0], gitRegistryRecord({
+      installLocation: "D:\\Apps\\Git\\",
+      uninstallString: '"D:\\Apps\\Git\\unins001.exe"',
+    })]]),
+    wherePaths: [
+      "D:\\Apps\\Git\\cmd\\git.exe",
+      "C:\\Users\\tester\\.cache\\codex-runtimes\\dependencies\\native\\git\\cmd\\git.exe",
+    ],
+  });
+
+  const result = await fixture.host.discoverGit();
+
+  assert.equal(result.installDir, "D:\\Apps\\Git");
+  assert.equal(result.executablePath, "D:\\Apps\\Git\\cmd\\git.exe");
+});
+
 test("default Git registry discovery invokes only fixed reg.exe keys and arguments", async () => {
   const fixture = fakeHost({
     registryRecords: null,

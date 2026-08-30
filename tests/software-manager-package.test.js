@@ -20,11 +20,15 @@ test("Windows package requires the pinned 7zip executable and its license", () =
     path.relative(repoRoot, path.join(sevenZipRoot, "LICENSE.txt")).replaceAll("\\", "/"),
     "desktop/software-manager/catalog-trust.mjs",
     "desktop/software-manager/runtime-factory.mjs",
+    "desktop/software-manager/bundled-catalog.mjs",
+    "desktop/software-manager/bundled-catalog/component-catalog.json",
+    "desktop/software-manager/bundled-catalog/component-catalog.json.sig",
+    "desktop/software-manager/catalog-public-key.mjs",
   ];
 
   assert.deepEqual(assertWindowsSoftwareManagerPackagePaths(paths), {
-    checkedFiles: 4,
-    requiredFiles: 4,
+    checkedFiles: 8,
+    requiredFiles: 8,
   });
   assert.throws(
     () => assertWindowsSoftwareManagerPackagePaths(paths.filter((value) => !value.endsWith("LICENSE.txt"))),
@@ -51,6 +55,9 @@ test("package policy rejects software-manager state, journals, partial downloads
 
 test("packaged runtime contains public trust code but no private key material", () => {
   const paths = [
+    "desktop/software-manager/bundled-catalog.mjs",
+    "desktop/software-manager/bundled-catalog/component-catalog.json",
+    "desktop/software-manager/bundled-catalog/component-catalog.json.sig",
     "desktop/software-manager/catalog-trust.mjs",
     "desktop/software-manager/catalog-public-key.mjs",
     "desktop/software-manager/runtime-factory.mjs",
@@ -67,6 +74,12 @@ test("Windows packaging and smoke both execute the software-manager package gate
   const smokeSource = fs.readFileSync(path.join(repoRoot, "scripts", "smoke-packaged-windows.mjs"), "utf8");
   assert.match(packageSource, /assertWindowsSoftwareManagerPackagePaths/);
   assert.match(smokeSource, /assertWindowsSoftwareManagerPackagePaths/);
+  assert.match(smokeSource, /CODEXBRIDGE_DESKTOP_SMOKE_SOFTWARE_MANAGER:\s*"1"/u);
+  assert.match(smokeSource, /Software manager smoke passed/u);
+  assert.match(smokeSource, /softwareManager\.skills,\s*7/u);
+  assert.match(smokeSource, /softwareManager\.expandedPluginRows,\s*2/u);
+  assert.match(smokeSource, /softwareManager\.selectablePluginRows,\s*2/u);
+  assert.match(smokeSource, /softwareManager\.updateHasSkills,\s*false/u);
 });
 
 test("macOS packaging removes the Windows helper and renderer exposes no usable entrypoint", () => {

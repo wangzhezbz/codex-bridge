@@ -6,6 +6,15 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import {
+  WINDOWS_RELEASE_BUILD_METADATA_FILE,
+  buildWindowsReleaseBuildMetadata,
+  collectWindowsReleaseSourceFiles,
+  createWindowsReleaseSourceFingerprint,
+  packagedSmokeSourceEvidence,
+} from "../scripts/release-source-fingerprint.mjs";
+import { removeOwnedTemporaryDirectory } from "../scripts/smoke-temp-cleanup.mjs";
+import { assertReleaseTagMatchesPackageVersion } from "../scripts/release-version-policy.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -63,6 +72,30 @@ test("bundled router examples keep experimental smart routing explicitly disable
   }
 });
 
+test("release tags must exactly match the packaged desktop version", () => {
+  assert.deepEqual(
+    assertReleaseTagMatchesPackageVersion({
+      env: { GITHUB_REF_TYPE: "branch", GITHUB_REF_NAME: "codex/test" },
+      packageVersion: "0.3.35",
+    }),
+    { tagged: false, packageVersion: "0.3.35", expectedTag: "v0.3.35" },
+  );
+  assert.deepEqual(
+    assertReleaseTagMatchesPackageVersion({
+      env: { GITHUB_REF_TYPE: "tag", GITHUB_REF: "refs/tags/v0.3.35", GITHUB_REF_NAME: "v0.3.35" },
+      packageVersion: "0.3.35",
+    }),
+    { tagged: true, packageVersion: "0.3.35", expectedTag: "v0.3.35", actualTag: "v0.3.35" },
+  );
+  assert.throws(
+    () => assertReleaseTagMatchesPackageVersion({
+      env: { GITHUB_REF_TYPE: "tag", GITHUB_REF_NAME: "v0.3.36" },
+      packageVersion: "0.3.35",
+    }),
+    /does not match package version v0\.3\.35/u,
+  );
+});
+
 test("duplicate request protection is disabled by default in both bundled router examples", () => {
   for (const fileName of ["router.config.example.json", "router.config.hybrid.example.json"]) {
     const configPath = path.join(process.cwd(), "config", fileName);
@@ -93,18 +126,23 @@ test("bundled router examples require an external local token instead of publish
   assert.equal(allApiConfig.clientAuth.allowOpenAiBearer, false);
 });
 
-test("bundled router examples use stateless native Responses for DeepSeek V4 Flash", () => {
+test("bundled router examples keep Pro on Chat Completions and Flash on Responses", () => {
   for (const fileName of ["router.config.example.json", "router.config.hybrid.example.json"]) {
     const configPath = path.join(process.cwd(), "config", fileName);
     const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
-    const flash = config.models.find((model) => model.model === "deepseek-v4-flash");
-
-    assert.ok(flash, `${fileName} must include DeepSeek V4 Flash`);
+    const pro = config.models.find((entry) => entry.model === "deepseek-v4-pro");
+    const flash = config.models.find((entry) => entry.model === "deepseek-v4-flash");
+    assert.ok(pro, `${fileName} must include deepseek-v4-pro`);
+    assert.ok(flash, `${fileName} must include deepseek-v4-flash`);
+    assert.equal(pro.api, "chat_completions");
+    assert.equal(pro.baseUrl, "https://api.deepseek.com/v1");
+    assert.deepEqual(pro.dropParams, ["response_format", "parallel_tool_calls"]);
+    assert.equal(pro.supportsResponsePreviousId, undefined);
     assert.equal(flash.api, "responses");
     assert.equal(flash.baseUrl, "https://api.deepseek.com");
-    assert.equal(flash.contextWindow, 1048576);
     assert.equal(flash.supportsResponsePreviousId, false);
     assert.equal(flash.supportsFiles, "text-placeholder");
+    assert.equal(flash.dropParams, undefined);
   }
 });
 
@@ -116,6 +154,39 @@ test("project and Windows CI gates include the complete desktop refresh flow", (
     path.join(process.cwd(), ".github", "workflows", "desktop-portable.yml"),
     "utf8",
   );
+  const syntaxRunner = fs.readFileSync(
+    path.join(process.cwd(), "scripts", "run-syntax-checks.mjs"),
+    "utf8",
+  );
+  const projectCheck = fs.readFileSync(
+    path.join(process.cwd(), "scripts", "run-project-check.mjs"),
+    "utf8",
+  );
+  const isolatedTests = fs.readFileSync(
+    path.join(process.cwd(), "scripts", "run-node-tests-isolated.mjs"),
+    "utf8",
+  );
+
+  assert.match(packageJson.scripts["check:syntax"], /^node scripts\/run-syntax-checks\.mjs\b/u);
+  assert.doesNotMatch(packageJson.scripts["check:syntax"], /&&/u);
+  assert.equal(packageJson.scripts.check, "node scripts/run-project-check.mjs");
+  assert.match(projectCheck, /cbcheck-/u);
+  assert.match(projectCheck, /removeOwnedTemporaryDirectory/u);
+  assert.match(projectCheck, /TEMP:\s*checkTemp/u);
+  assert.match(projectCheck, /TMP:\s*checkTemp/u);
+  assert.match(projectCheck, /TMPDIR:\s*checkTemp/u);
+  assert.match(projectCheck, /process\.env\.npm_execpath/u);
+  assert.match(projectCheck, /spawnSync\(process\.execPath/u);
+  for (const scriptName of ["test", "test:software-manager", "test:router", "test:desktop"]) {
+    assert.match(packageJson.scripts[scriptName], /^node scripts\/run-node-tests-isolated\.mjs\b/u);
+  }
+  assert.match(isolatedTests, /CODEXBRIDGE_PROJECT_CHECK_TEMP/u);
+  assert.match(isolatedTests, /requiredPrefix:\s*"cbtest-"/u);
+  assert.match(isolatedTests, /removeOwnedTemporaryDirectory/u);
+  assert.match(syntaxRunner, /const sourceRoots/);
+  assert.match(syntaxRunner, /vendor\/chatgpt-codex-bridge/);
+  assert.match(syntaxRunner, /deploy\/codexbridge-installer/);
+  assert.match(syntaxRunner, /execFileAsync\(process\.execPath, \["--check"/);
 
   assert.match(
     packageJson.scripts["check:syntax"],
@@ -133,10 +204,64 @@ test("project and Windows CI gates include the complete desktop refresh flow", (
     "the new desktop flow test must run in the full project gate",
   );
   assert.match(
+    projectCheck,
+    /"test:software-manager"/u,
+    "the full project gate must include the complete software-manager suite",
+  );
+  assert.match(
+    packageJson.scripts["test:desktop"],
+    /tests\/desktop-smoke-fixture\.test\.js/u,
+    "the desktop smoke fixture contract must run in the full project gate",
+  );
+  assert.match(
+    projectCheck,
+    /"test:installer-python"/u,
+    "the full project gate must include the installer publisher Python tests",
+  );
+  assert.match(
     workflow,
     /- name: Run full project check\s+env:\s+CODEXBRIDGE_SKIP_WINDOWS_HOSTED_RUNNER_INTEGRATION: "1"\s+run: npm run check/,
     "Windows CI must use the same complete check gate as local verification",
   );
+  assert.match(
+    workflow,
+    /jobs:\s+windows:[\s\S]*?uses: actions\/setup-python@v5[\s\S]*?python-version: "3\.12"[\s\S]*?run: npm run check/u,
+    "Windows CI must provision the Python runtime before the complete project check",
+  );
+  assert.match(
+    workflow,
+    /macos:[\s\S]*?- name: Run catalog publisher POSIX tests\s+run: node --test tests\/software-manager-publisher\.test\.js/u,
+    "macOS CI must execute the POSIX public-file permission regression",
+  );
+});
+
+test("every Node test file is assigned to the fixed project check", () => {
+  const packageJson = JSON.parse(
+    fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8"),
+  );
+  const allTests = fs.readdirSync(path.join(process.cwd(), "tests"))
+    .filter((fileName) => fileName.endsWith(".test.js"))
+    .sort();
+  const covered = new Set();
+  for (const scriptName of [
+    "test:router",
+    "test:desktop",
+    "test:recovery",
+    "check:software-manager-catalog",
+    "check:software-manager-win32",
+    "check:model-selection",
+    "check:chrome-extension-manager",
+    "check:anthropic",
+  ]) {
+    for (const match of String(packageJson.scripts[scriptName] || "")
+      .matchAll(/tests\/([A-Za-z0-9_.-]+\.test\.js)/gu)) {
+      covered.add(match[1]);
+    }
+  }
+  for (const fileName of allTests) {
+    if (/^software-manager-.*\.test\.js$/u.test(fileName)) covered.add(fileName);
+  }
+  assert.deepEqual(allTests.filter((fileName) => !covered.has(fileName)), []);
 });
 
 test("Windows release gate transitively runs the real Electron long-path smoke", () => {
@@ -148,16 +273,20 @@ test("Windows release gate transitively runs the real Electron long-path smoke",
     "utf8",
   );
   const smokeGate = packageJson.scripts["check:software-manager-win32"];
+  const projectCheck = fs.readFileSync(
+    path.join(process.cwd(), "scripts", "run-project-check.mjs"),
+    "utf8",
+  );
 
   assert.equal(typeof smokeGate, "string", "the Win32 smoke must have a fixed npm gate");
   assert.match(
     smokeGate,
-    /node --test tests\/software-manager-win32-long-path-smoke\.test\.js/u,
+    /run-node-tests-isolated\.mjs tests\/software-manager-win32-long-path-smoke\.test\.js/u,
     "the fixed gate must execute the real Electron >260 path lifecycle test",
   );
   assert.match(
-    packageJson.scripts.check,
-    /npm run check:software-manager-win32/u,
+    projectCheck,
+    /"check:software-manager-win32"/u,
     "the full project check must retain the Win32 smoke gate",
   );
   assert.match(
@@ -194,6 +323,34 @@ test("Windows CI runs OS integration tests in the user profile temp directory", 
   assert.match(workflow, /"TMP=\$userTemp"/);
   assert.doesNotMatch(workflow, /"TEMP=\$env:RUNNER_TEMP"/);
   assert.doesNotMatch(workflow, /"TMP=\$env:RUNNER_TEMP"/);
+});
+
+test("Windows Setup smoke workflow block parses as PowerShell", {
+  skip: process.platform !== "win32",
+}, async () => {
+  const workflow = fs.readFileSync(
+    path.join(process.cwd(), ".github", "workflows", "desktop-portable.yml"),
+    "utf8",
+  );
+  const lines = workflow.replaceAll("\r\n", "\n").split("\n");
+  const nameIndex = lines.findIndex((line) => line === "      - name: Smoke install Windows Setup");
+  const runIndex = lines.findIndex((line, index) => index > nameIndex && line === "        run: |");
+  assert.ok(nameIndex >= 0 && runIndex > nameIndex);
+  const body = [];
+  for (let index = runIndex + 1; index < lines.length; index += 1) {
+    if (lines[index].startsWith("      - name: ")) break;
+    body.push(lines[index].startsWith("          ") ? lines[index].slice(10) : "");
+  }
+  await execFileAsync("powershell.exe", [
+    "-NoProfile",
+    "-Command",
+    "[void][scriptblock]::Create($env:CODEXBRIDGE_SETUP_SMOKE_SCRIPT)",
+  ], {
+    cwd: process.cwd(),
+    env: { ...process.env, CODEXBRIDGE_SETUP_SMOKE_SCRIPT: body.join("\r\n") },
+    windowsHide: true,
+    maxBuffer: 1024 * 1024,
+  });
 });
 
 test("desktop security policy runs in the fixed syntax and desktop gates", () => {
@@ -235,8 +392,10 @@ test("desktop enforces a single running instance", () => {
   assert.notEqual(lockIndex, -1);
   assert.notEqual(readyIndex, -1);
   assert.ok(lockIndex < readyIndex, "single instance lock must be acquired before app.whenReady()");
+  assert.match(main, /requestSingleInstanceLock\(\{ version: app\.getVersion\(\) \}\)/);
   assert.match(main, /app\.on\("second-instance"/);
   assert.match(main, /showMainWindow\(\)/);
+  assert.match(main, /当前显示的是原先已运行的窗口/);
 });
 
 test("desktop updater waits for router child process before replacing portable files", () => {
@@ -367,14 +526,23 @@ test("desktop smoke checks cover capability diagnostics and project recovery", (
 
 test("Windows packaged smoke writes a machine-readable report for release preflight", () => {
   const smoke = fs.readFileSync(path.join(process.cwd(), "scripts", "smoke-packaged-windows.mjs"), "utf8");
+  const packager = fs.readFileSync(path.join(process.cwd(), "scripts", "package-windows.mjs"), "utf8");
   const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
 
   assert.match(smoke, /packaged-smoke-report\.json/);
   assert.match(smoke, /CODEXBRIDGE_PACKAGED_SMOKE_REPORT/);
+  assert.match(smoke, /CODEXBRIDGE_PACKAGED_SMOKE_ARTIFACT_DIR/);
+  assert.match(smoke, /smokeArtifactDir/);
   assert.match(smoke, /function writeSmokeReport/);
   assert.match(smoke, /desktopSmoke/);
   assert.match(smoke, /routerSmoke/);
   assert.match(smoke, /checkedAt/);
+  assert.match(smoke, /sourceEvidence/);
+  assert.match(smoke, /readPackagedBuildMetadata/);
+  assert.match(smoke, /assertWindowsPackageTree/);
+  assert.match(packager, /WINDOWS_RELEASE_BUILD_METADATA_FILE/);
+  assert.match(packager, /createWindowsReleaseSourceFingerprint/);
+  assert.match(packager, /assertWindowsPackageTree/);
   assert.match(smoke, /CODEXBRIDGE_DESKTOP_SMOKE_START_ROUTER/);
   assert.match(smoke, /duplicateRequestProtection:\s*true/);
   assert.match(smoke, /model\s*=\s*"gpt-5\.5"/);
@@ -384,6 +552,78 @@ test("Windows packaged smoke writes a machine-readable report for release prefli
   assert.match(main, /window\.codexBridge\.startRouter\(\)/);
   assert.match(main, /window\.codexBridge\.stopRouter\(\)/);
   assert.match(main, /duplicateRequestProtection !== false/);
+});
+
+test("Windows release source fingerprints cover current runtime inputs and reject stale evidence", () => {
+  const files = collectWindowsReleaseSourceFiles(process.cwd());
+  assert.ok(files.includes("package.json"));
+  assert.ok(files.includes("src/server.js"));
+  assert.ok(files.includes("src/responses-native-history.js"));
+  assert.ok(files.includes("desktop/main.cjs"));
+  assert.ok(files.includes("shared/software-manager/catalog-schema.mjs"));
+  assert.ok(files.includes("vendor/chatgpt-codex-bridge/src/http-server.js"));
+  assert.ok(files.includes("scripts/smoke-temp-cleanup.mjs"));
+  assert.ok(!files.some((filePath) => /(?:^|\/)secrets\.local\.json$/u.test(filePath)));
+
+  const first = createWindowsReleaseSourceFingerprint(process.cwd());
+  const second = createWindowsReleaseSourceFingerprint(process.cwd());
+  assert.equal(first.sourceFingerprint, second.sourceFingerprint);
+  assert.match(first.sourceFingerprint, /^[a-f0-9]{64}$/u);
+  assert.equal(first.sourceFileCount, files.length);
+  assert.equal(
+    packagedSmokeSourceEvidence({ sourceFingerprint: first.sourceFingerprint }, process.cwd()).ok,
+    true,
+  );
+  assert.equal(
+    packagedSmokeSourceEvidence({ sourceFingerprint: "0".repeat(64) }, process.cwd()).reason,
+    "source_fingerprint_mismatch",
+  );
+  assert.equal(
+    packagedSmokeSourceEvidence({}, process.cwd()).reason,
+    "source_fingerprint_missing",
+  );
+  assert.equal(WINDOWS_RELEASE_BUILD_METADATA_FILE, ".codexbridge-build.json");
+});
+
+test("packaged smoke cleanup is confined to one prefixed temporary directory", () => {
+  const target = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-cleanup-test-"));
+  fs.mkdirSync(path.join(target, "nested"));
+  fs.writeFileSync(path.join(target, "nested", "fixture.txt"), "fixture", "utf8");
+
+  assert.throws(
+    () => removeOwnedTemporaryDirectory(target, {
+      parentDirectory: path.dirname(os.tmpdir()),
+      requiredPrefix: "codexbridge-cleanup-test-",
+    }),
+    /direct child/u,
+  );
+  assert.throws(
+    () => removeOwnedTemporaryDirectory(target, {
+      parentDirectory: os.tmpdir(),
+      requiredPrefix: "wrong-prefix-",
+    }),
+    /required prefix/u,
+  );
+
+  const result = removeOwnedTemporaryDirectory(target, {
+    parentDirectory: os.tmpdir(),
+    requiredPrefix: "codexbridge-cleanup-test-",
+  });
+  assert.deepEqual(result, { removed: true, files: 1, directories: 2 });
+  assert.equal(fs.existsSync(target), false);
+});
+
+test("packaged smoke scripts terminate children and clean their owned temporary roots", () => {
+  const windowsSmoke = fs.readFileSync(path.join(process.cwd(), "scripts", "smoke-packaged-windows.mjs"), "utf8");
+  const macSmoke = fs.readFileSync(path.join(process.cwd(), "scripts", "smoke-packaged-macos.mjs"), "utf8");
+  for (const source of [windowsSmoke, macSmoke]) {
+    assert.match(source, /removeOwnedTemporaryDirectory/);
+    assert.match(source, /terminateChild/);
+    assert.match(source, /waitForChildExit/);
+  }
+  assert.match(windowsSmoke, /codexbridge-desktop-data-/);
+  assert.match(windowsSmoke, /codexbridge-embedded-smoke-/);
+  assert.match(macSmoke, /codexbridge-packaged-macos-/);
 });
 
 test("Windows packaged smoke rejects stale Embedded Bridge contents", () => {
@@ -511,11 +751,44 @@ test("Windows release archive uses formal portable package naming", () => {
   assert.match(artifactsScript, /makensis/);
   assert.match(artifactsScript, /CodexBridge\.nsi/);
   assert.match(artifactsScript, /--portable-only/);
+  assert.match(artifactsScript, /WINDOWS_RELEASE_BUILD_METADATA_FILE/);
+  assert.match(artifactsScript, /assertReleaseTagMatchesPackageVersion/);
+  assert.match(artifactsScript, /packagedSmokeSourceEvidence/);
+  assert.match(artifactsScript, /assertMatchingPackagedSmoke/);
+  assert.match(artifactsScript, /assertWindowsPackageTree/);
+  assert.match(artifactsScript, /--smoke-report/);
+  assert.match(artifactsScript, /embeddedBridgeSmoke/);
+  assert.match(artifactsScript, /desktopSmoke/);
+  assert.match(artifactsScript, /routerSmoke/);
+  assert.match(artifactsScript, /ZipFile\]::CreateFromDirectory/);
+  assert.doesNotMatch(artifactsScript, /codexbridge-portable-root-|copyDirectoryContents/);
+  assert.match(artifactsScript, /\.part/);
+  assert.match(artifactsScript, /assertReleaseArtifactTargetsAvailable/);
+  assert.match(artifactsScript, /ensureRealOutputDirectory/);
+  assert.match(artifactsScript, /fs\.renameSync/);
+  assert.match(artifactsScript, /removeExactArtifactFile/);
   assert.match(packager, /\\\.tmp-updates-/);
   assert.match(packager, /\\\.tmp-release-/);
   assert.match(workflow, /Smoke test Windows release archive/);
+  assert.match(workflow, /Smoke install Windows Setup/);
+  assert.match(workflow, /Start-Process -FilePath \$setupCopy[\s\S]*?-WindowStyle Hidden/);
+  assert.match(workflow, /CODEXBRIDGE_DESKTOP_SMOKE_SCREENSHOT/);
+  assert.match(workflow, /Setup smoke copy SHA-256 does not match the release artifact/);
+  assert.match(workflow, /resources\\app\\\.codexbridge-build\.json/);
+  assert.match(workflow, /different source fingerprint than packaged smoke proved/);
+  assert.match(workflow, /installed an unexpected application version/);
+  assert.match(workflow, /did not exit after desktop smoke/);
+  assert.match(workflow, /@\("deploy", "state", "docs"\)/);
+  assert.match(
+    workflow,
+    /Run Windows release artifact preflight[\s\S]*?Smoke install Windows Setup[\s\S]*?Smoke test Windows release archive/u,
+  );
   assert.match(workflow, /CodexBridge\.exe/);
+  assert.match(workflow, /exactly one root CodexBridge\.exe/);
   assert.match(workflow, /Join-Path \$extractPath "\.codexbridge-portable"/);
+  assert.match(workflow, /Release archive source fingerprint does not match packaged smoke/);
+  assert.match(workflow, /Release archive contains forbidden package content/);
+  assert.match(workflow, /Release archive desktop smoke exited with code/);
   assert.doesNotMatch(workflow, /Compress-Archive -Path "release\/\*"/);
   assert.match(workflow, /prerelease: false/);
   assert.doesNotMatch(workflow, /CodexBridge-windows-portable/);
@@ -526,11 +799,17 @@ test("Windows release archive uses formal portable package naming", () => {
   assert.match(workflow, /files:\s*\|[\s\S]*release-assets\/CodexBridge-macOS-x64-Portable\.zip/);
   assert.match(packager, /CODEXBRIDGE_RELEASE_VERSION/);
   assert.match(packager, /CodexBridge-Windows-x64-Portable-/);
+  assert.match(packager, /assertReleaseTagMatchesPackageVersion/);
+  assert.match(packager, /ownsOutDir/);
+  assert.match(packager, /package output already exists/);
+  assert.match(packager, /removeOwnedTemporaryDirectory/);
+  assert.match(packager, /partial-output cleanup/);
   assert.match(packager, /codexbridge-icon\.ico/);
   assert.match(packager, /\^\\\/\\\.agents/);
   assert.match(packager, /\^\\\/\\\.codex/);
   assert.match(packager, /\^\\\/\\\.superpowers/);
   assert.match(packager, /\^\\\/\\\.tmp/);
+  assert.ok(packager.includes("/^\\/\\.tmp(?:-|\\/|$)/"));
   assert.match(packager, /\\\.tmp-release-/);
 });
 
@@ -563,21 +842,54 @@ test("GitHub release publishing flattens and verifies every downloadable asset",
 
 test("Windows release artifact script creates portable zip and setup with injected makensis", {
   skip: process.platform !== "win32",
-}, async () => {
+}, async (t) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-artifacts-test-"));
+  t.after(() => removeOwnedTemporaryDirectory(tempDir, {
+    parentDirectory: os.tmpdir(),
+    requiredPrefix: "codexbridge-artifacts-test-",
+  }));
   const appDir = path.join(tempDir, "CodexBridge-win32-x64");
   const outDir = path.join(tempDir, "dist-artifacts");
   const fakeMakensis = path.join(tempDir, "fake-makensis.mjs");
+  const smokeReportPath = path.join(tempDir, "packaged-smoke-report.json");
   fs.mkdirSync(path.join(appDir, "resources", "app", "src"), { recursive: true });
   fs.writeFileSync(path.join(appDir, "CodexBridge.exe"), "fake exe", "utf8");
-  fs.writeFileSync(path.join(appDir, "resources", "app", "package.json"), "{}", "utf8");
+  const packageJson = JSON.parse(fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8"));
+  fs.writeFileSync(
+    path.join(appDir, "resources", "app", "package.json"),
+    JSON.stringify({ version: packageJson.version }),
+    "utf8",
+  );
   fs.writeFileSync(path.join(appDir, "resources", "app", "src", "server.js"), "console.log('router');\n", "utf8");
+  for (const relativePath of [
+    "desktop/software-manager/bundled-catalog.mjs",
+    "desktop/software-manager/bundled-catalog/component-catalog.json",
+    "desktop/software-manager/bundled-catalog/component-catalog.json.sig",
+    "desktop/software-manager/catalog-public-key.mjs",
+    "desktop/software-manager/catalog-trust.mjs",
+    "desktop/software-manager/runtime-factory.mjs",
+    "node_modules/7zip-bin/win/x64/7za.exe",
+    "node_modules/7zip-bin/LICENSE.txt",
+  ]) {
+    const targetPath = path.join(appDir, "resources", "app", ...relativePath.split("/"));
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.writeFileSync(targetPath, "fixture", "utf8");
+  }
+  const buildMetadata = buildWindowsReleaseBuildMetadata(process.cwd(), { appVersion: packageJson.version });
+  fs.writeFileSync(
+    path.join(appDir, "resources", "app", WINDOWS_RELEASE_BUILD_METADATA_FILE),
+    JSON.stringify(buildMetadata),
+    "utf8",
+  );
   fs.writeFileSync(fakeMakensis, `
 import fs from "node:fs";
 const args = process.argv.slice(2);
 if (args.includes("/VERSION")) {
   console.log("fake makensis 3.0");
   process.exit(0);
+}
+if (process.env.FAIL_MAKENSIS === "1") {
+  process.exit(42);
 }
 const outArg = args.find((arg) => arg.startsWith("/DOUT_FILE="));
 if (!outArg) {
@@ -586,13 +898,29 @@ if (!outArg) {
 fs.writeFileSync(outArg.slice("/DOUT_FILE=".length), "fake setup", "utf8");
 `, "utf8");
 
-  const { stdout } = await execFileAsync(process.execPath, [
+  const smokeReport = {
+    ok: true,
+    appPath: `${appDir}-wrong`,
+    exePath: path.join(appDir, "CodexBridge.exe"),
+    buildMetadata,
+    sourceEvidence: packagedSmokeSourceEvidence({ buildMetadata }, process.cwd()),
+    packageContent: { forbiddenFiles: 0, softwareManager: { requiredFiles: 8 } },
+    embeddedBridgeSmoke: { ok: true },
+    desktopSmoke: { ok: true },
+    routerSmoke: { ok: true },
+  };
+  fs.writeFileSync(smokeReportPath, JSON.stringify(smokeReport), "utf8");
+
+  const artifactArgs = [
     "scripts/package-windows-release-artifacts.mjs",
     "--app-dir",
     appDir,
     "--out-dir",
     outDir,
-  ], {
+    "--smoke-report",
+    smokeReportPath,
+  ];
+  const artifactOptions = {
     cwd: process.cwd(),
     env: {
       ...process.env,
@@ -601,12 +929,38 @@ fs.writeFileSync(outArg.slice("/DOUT_FILE=".length), "fake setup", "utf8");
     },
     windowsHide: true,
     maxBuffer: 1024 * 1024,
-  });
+  };
+  await assert.rejects(
+    execFileAsync(process.execPath, artifactArgs, artifactOptions),
+    /does not prove this exact current app/u,
+  );
+  smokeReport.appPath = appDir;
+  fs.writeFileSync(smokeReportPath, JSON.stringify(smokeReport), "utf8");
+
+  await assert.rejects(
+    execFileAsync(process.execPath, artifactArgs, {
+      ...artifactOptions,
+      env: { ...artifactOptions.env, FAIL_MAKENSIS: "1" },
+    }),
+    /makensis failed with exit code 42/u,
+  );
+  assert.equal(fs.existsSync(path.join(outDir, "CodexBridge-Windows-x64-Portable.zip")), false);
+  assert.equal(fs.existsSync(path.join(outDir, "CodexBridge-Windows-x64-Setup.exe")), false);
+  assert.deepEqual(
+    fs.readdirSync(outDir).filter((name) => name.endsWith(".part")),
+    [],
+  );
+
+  const { stdout } = await execFileAsync(process.execPath, artifactArgs, artifactOptions);
   const portableZip = path.join(outDir, "CodexBridge-Windows-x64-Portable.zip");
   const setupExe = path.join(outDir, "CodexBridge-Windows-x64-Setup.exe");
   assert.match(stdout, /Windows release artifacts created/);
   assert.ok(fs.statSync(portableZip).size > 0);
   assert.equal(fs.readFileSync(setupExe, "utf8"), "fake setup");
+  await assert.rejects(
+    execFileAsync(process.execPath, artifactArgs, artifactOptions),
+    /target already exists/u,
+  );
 
   const { stdout: entryOutput } = await execFileAsync("powershell.exe", [
     "-NoProfile",
@@ -654,6 +1008,8 @@ test("Windows installer script installs a versioned app and does not batch-delet
   assert.match(installer, /WriteRegStr HKCU "Software\\CodexBridge" "CurrentVersion"/);
   assert.match(installer, /WriteRegStr HKCU "Software\\CodexBridge" "InstallRoot" "\$INSTDIR"/);
   assert.match(installer, /ExecShell "" "\$INSTDIR\\app-\$\{VERSION\}\\CodexBridge\.exe" "--updated --previous-install-dir/);
+  assert.match(installer, /ReadEnvStr \$0 "CODEXBRIDGE_INSTALLER_NO_LAUNCH"/);
+  assert.match(installer, /StrCmp \$0 "1" skip_launch/);
   assert.match(installer, /--cleanup-installer/);
   assert.doesNotMatch(installer, /RMDir\s+\/r|Delete\s+\/REBOOTOK|Remove-Item\s+-Recurse|rm\s+-rf|rmdir\s+\/s|rd\s+\/s|del\s+\/s/i);
 });
@@ -1106,6 +1462,7 @@ test("release preflight CLI reads packaged smoke report evidence", async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-preflight-data-"));
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-preflight-home-"));
   const reportPath = path.join(os.tmpdir(), `codexbridge-packaged-smoke-${Date.now()}.json`);
+  const sourceFingerprint = createWindowsReleaseSourceFingerprint(process.cwd()).sourceFingerprint;
   fs.writeFileSync(
     reportPath,
     JSON.stringify({
@@ -1115,6 +1472,7 @@ test("release preflight CLI reads packaged smoke report evidence", async () => {
       exePath: "F:\\game_code\\router\\release\\CodexBridge-Windows-x64-Portable-v0.2.3-local\\CodexBridge-win32-x64\\CodexBridge.exe",
       desktopSmoke: { ok: true, durationMs: 1100 },
       routerSmoke: { ok: true, durationMs: 800, models: ["gpt-5.5"] },
+      sourceFingerprint,
     }),
     "utf8",
   );
@@ -1501,6 +1859,10 @@ test("macOS release archives use formal x64 and arm64 package naming", () => {
     path.join(process.cwd(), "scripts", "package-macos.mjs"),
     "utf8",
   );
+  const smoke = fs.readFileSync(
+    path.join(process.cwd(), "scripts", "smoke-packaged-macos.mjs"),
+    "utf8",
+  );
 
   assert.match(workflow, /CodexBridge-macOS-arm64-Portable\.zip/);
   assert.match(workflow, /CodexBridge-macOS-x64-Portable\.zip/);
@@ -1518,6 +1880,19 @@ test("macOS release archives use formal x64 and arm64 package naming", () => {
   assert.match(packager, /\^\\\/\\\.codex/);
   assert.match(packager, /\^\\\/\\\.superpowers/);
   assert.match(packager, /\^\\\/\\\.tmp/);
+  assert.ok(packager.includes("/^\\/\\.tmp(?:-|\\/|$)/"));
+  assert.match(packager, /WINDOWS_PACKAGE_HARDENING_RULES/);
+  assert.match(packager, /assertWindowsPackageFilePaths/);
+  assert.match(packager, /listRegularFilePaths/);
+  assert.match(packager, /buildDesktopReleaseBuildMetadata/);
+  assert.match(packager, /assertReleaseTagMatchesPackageVersion/);
+  assert.match(packager, /DESKTOP_RELEASE_BUILD_METADATA_FILE/);
+  assert.match(packager, /ownsOutDir/);
+  assert.match(packager, /package output already exists/);
+  assert.match(packager, /removeOwnedTemporaryDirectory/);
+  assert.match(packager, /partial-output cleanup/);
+  assert.match(smoke, /packagedSmokeSourceEvidence/);
+  assert.match(smoke, /readPackagedBuildMetadata/);
 });
 
 test("macOS release archives are extracted and checked for Electron Framework", () => {
@@ -1534,6 +1909,8 @@ test("macOS release archives are extracted and checked for Electron Framework", 
   assert.match(workflow, /ditto -x -k "dist-artifacts\/CodexBridge-macOS-\$\{\{ matrix\.arch \}\}-Portable\.zip"/);
   assert.match(workflow, /Electron Framework\.framework\/Electron Framework/);
   assert.match(workflow, /Electron Framework\.framework\/Versions\/A\/Electron Framework/);
+  assert.match(workflow, /Contents\/Resources\/app\/\.codexbridge-build\.json/);
+  assert.match(workflow, /for relative_path in deploy state docs/);
   assert.match(smoke, /Electron Framework\.framework/);
   assert.match(smoke, /Versions",\s*"A",\s*"Electron Framework"/);
   assert.match(smoke, /missing packaged Electron Framework/);

@@ -97,7 +97,10 @@ test("path authorities revalidate directory identity and the current peak-path b
   });
   assert.equal(await revalidateInstallRootCapability(install, { maxRelativePath: 180 }), "D:\\CBApps");
   assert.deepEqual(await revalidateFixedDirectoryCapability(skills), { kind: "skills", path: CANONICAL_SKILLS_ROOT });
-  await assert.rejects(revalidateInstallRootCapability(install, { maxRelativePath: 251 }), /path_too_long/u);
+  await assert.rejects(
+    revalidateInstallRootCapability(install, { maxRelativePath: 32_760 }),
+    /path_too_long/u,
+  );
   identity = 11;
   await assert.rejects(revalidateInstallRootCapability(install, { maxRelativePath: 180 }), /identity_changed/u);
   await assert.rejects(revalidateFixedDirectoryCapability(skills), /identity_changed/u);
@@ -158,11 +161,9 @@ test("rejects an install root that is not writable", async () => {
   assert.deepEqual(result, { ok: false, error: "install_root_unwritable" });
 });
 
-test("accepts a peak path of 259 characters and rejects 260", async () => {
-  const prefix = "D:\\Apps\\";
-  const maxRelativePath = 180;
-  const accepted = `${prefix}${"a".repeat(259 - maxRelativePath - 1 - prefix.length)}`;
-  const rejected = `${accepted}b`;
+test("accepts extended-length managed paths and rejects the native capability ceiling", async () => {
+  const accepted = "D:\\Apps";
+  const maxRelativePath = 32_760 - accepted.length - 1;
 
   assert.equal((await validateInstallRoot({
     candidate: accepted,
@@ -171,11 +172,33 @@ test("accepts a peak path of 259 characters and rejects 260", async () => {
     access: allowAccess,
   })).ok, true);
   assert.deepEqual(await validateInstallRoot({
-    candidate: rejected,
+    candidate: accepted,
     env: fixtureEnv(),
-    maxRelativePath,
+    maxRelativePath: maxRelativePath + 1,
     access: allowAccess,
   }), { ok: false, error: "install_peak_path_too_long" });
+});
+
+test("the default per-user root accepts a ChatGPT package tree beyond legacy MAX_PATH", async () => {
+  const result = await validateInstallRoot({
+    candidate: "C:\\Users\\me\\AppData\\Local\\CBApps",
+    env: fixtureEnv(),
+    maxRelativePath: 320,
+    access: allowAccess,
+  });
+
+  assert.deepEqual(result, { ok: true, path: "C:\\Users\\me\\AppData\\Local\\CBApps" });
+});
+
+test("install-root policy rejects an individual Windows path segment longer than 255 characters", async () => {
+  const result = await validateInstallRoot({
+    candidate: `D:\\${"a".repeat(256)}`,
+    env: fixtureEnv(),
+    maxRelativePath: 1,
+    access: allowAccess,
+  });
+
+  assert.equal(result.ok, false);
 });
 
 test("Skill target is derived as a direct child of the canonical Skills root", async () => {

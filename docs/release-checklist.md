@@ -10,7 +10,7 @@ Before tagging a CodexBridge release:
 5. Run `npm run desktop:smoke`.
 6. Run `npm run package:win`.
 7. Run `npm run package:win:smoke`.
-8. Run `npm run package:win:artifacts` on a Windows machine with NSIS installed, or let the GitHub Actions Windows job run the same command.
+8. Run `npm run package:win:artifacts` in an empty output directory on a Windows machine with NSIS installed, or let the GitHub Actions Windows job run the same command. Artifact creation must read the successful `release/packaged-smoke-report.json` for that exact app path and current source fingerprint; it must refuse a missing, stale, failed, different-package report, or an output directory that already contains final artifact names.
 9. Run `node scripts/release-preflight.mjs --platform win32 --arch x64 --release-dir dist-artifacts` after Windows artifacts are created; this checks expected names, non-empty files, and EXE/ZIP file headers.
 10. In `dist-artifacts`, only keep valid Windows artifacts named `CodexBridge-Windows-x64-Setup.exe` and `CodexBridge-Windows-x64-Portable.zip`; Windows 发布目录只保留 `CodexBridge-Windows-x64-Setup.exe` 和 `CodexBridge-Windows-x64-Portable.zip` 这两个非空且文件头正确的文件，remove old or version-suffixed package names before publishing.
 11. After the real Router, provider keys, image provider, capability providers, and Windows artifacts are ready, run `node scripts/release-preflight.mjs --platform win32 --arch x64 --release-dir dist-artifacts --write-acceptance-report release-acceptance.json --write-gate-report release-gate.json`. This writes a machine-readable acceptance evidence file from the current Router probe, fresh provider test records, and valid Windows artifacts, plus a complete release gate report.
@@ -24,7 +24,7 @@ Before tagging a CodexBridge release:
 19. Confirm all local provider-category smoke tests pass.
 20. Confirm `git status --short --branch` is clean before tagging.
 21. Push `main`.
-22. Create and push the version tag.
+22. Confirm the tag is exactly `v<package.json version>` (for example package `0.3.35` requires tag `v0.3.35`), then create and push it. Windows and macOS packaging must fail closed on a mismatch.
 23. Wait for GitHub Actions release build success.
 24. Confirm `/releases/latest` points to the new version.
 

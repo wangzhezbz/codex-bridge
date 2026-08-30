@@ -27,11 +27,18 @@ test("desktop main column is the only vertical scroll container", () => {
 test("sidebar reserves fixed brand and action rows around a shrinkable navigation row", () => {
   const sidebar = cssBlock(".sidebar");
   const navList = cssBlock(".nav-list");
+  const navGroup = cssBlock(".nav-group");
+  const navGroupLabel = cssBlock(".nav-group-label");
 
   assert.match(sidebar, /display:\s*grid;/);
   assert.match(sidebar, /grid-template-rows:\s*auto minmax\(0,\s*1fr\) auto;/);
   assert.match(navList, /min-height:\s*0;/);
   assert.match(navList, /align-content:\s*start;/);
+  assert.match(navList, /gap:\s*14px;/);
+  assert.match(navList, /overflow-y:\s*auto;/);
+  assert.match(navGroup, /display:\s*grid;/);
+  assert.match(navGroup, /gap:\s*4px;/);
+  assert.match(navGroupLabel, /font-size:\s*10px;/);
 });
 
 test("short desktop heights compact every sidebar row and keep all footer actions visible", () => {
@@ -39,10 +46,12 @@ test("short desktop heights compact every sidebar row and keep all footer action
   assert.notEqual(compactStart, -1);
   const compact = styles.slice(compactStart);
 
-  assert.match(compact, /\.sidebar\s*{[\s\S]*?padding:\s*10px 12px;/);
+  assert.match(compact, /\.sidebar\s*{[\s\S]*?padding:\s*12px;/);
   assert.match(compact, /\.brand-mark\s*{[\s\S]*?width:\s*36px;[\s\S]*?height:\s*36px;/);
-  assert.match(compact, /\.nav-list\s*{[\s\S]*?gap:\s*2px;[\s\S]*?overflow-y:\s*auto;/);
-  assert.match(compact, /\.nav-item\s*{[\s\S]*?min-height:\s*32px;/);
+  assert.match(compact, /\.nav-list\s*{[\s\S]*?gap:\s*10px;/);
+  assert.match(compact, /\.nav-group\s*{[\s\S]*?gap:\s*2px;/);
+  assert.match(compact, /\.nav-group-label\s*{[\s\S]*?font-size:\s*9px;/);
+  assert.match(compact, /\.nav-item\s*{[\s\S]*?min-height:\s*34px;/);
   assert.match(compact, /\.sidebar-actions\s*{[\s\S]*?grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/);
   assert.match(compact, /\.sidebar-actions \.app-version,[\s\S]*?#checkUpdates\s*{[\s\S]*?grid-column:\s*1 \/ -1;/);
   assert.match(compact, /\.sidebar-actions \.ghost-button\s*{[\s\S]*?min-height:\s*32px;/);
@@ -72,4 +81,8 @@ test("double quota panels keep the same vertical gap above and below their grid"
   const doubleQuotaGrid = cssBlock(".double-quota-grid");
 
   assert.match(doubleQuotaGrid, /margin:\s*16px 0;/);
+});
+
+test("software manager start action stays on one line", () => {
+  assert.match(styles, /\[data-software-start\],[\s\S]*?flex:\s*0 0 148px;[\s\S]*?white-space:\s*nowrap !important;/u);
 });

@@ -37,7 +37,7 @@ export function createInstallRootResolver({ authorizeRoot, getPersistedRoot } = 
       throw resolverError("install_root_authority_invalid");
     }
     const token = createToken(entries);
-    entries.set(token, Object.freeze({ capability, state: "candidate" }));
+    entries.set(token, Object.freeze({ capability, path, state: "candidate" }));
     return token;
   }
 
@@ -52,9 +52,13 @@ export function createInstallRootResolver({ authorizeRoot, getPersistedRoot } = 
     return currentToken;
   }
 
+  function getCurrentPath() {
+    return currentToken === null ? null : entries.get(currentToken)?.path ?? null;
+  }
+
   async function choose(candidate) {
     const token = await issue(candidate);
-    return Object.freeze({ token });
+    return Object.freeze({ token, path: entries.get(token).path });
   }
 
   async function resolve(token) {
@@ -65,7 +69,7 @@ export function createInstallRootResolver({ authorizeRoot, getPersistedRoot } = 
     const entry = requireEntry(token);
     const prior = currentToken;
     currentToken = token;
-    entries.set(token, Object.freeze({ capability: entry.capability, state: "current" }));
+    entries.set(token, Object.freeze({ capability: entry.capability, path: entry.path, state: "current" }));
     if (prior !== null && prior !== token) entries.delete(prior);
     return token;
   }
@@ -82,7 +86,7 @@ export function createInstallRootResolver({ authorizeRoot, getPersistedRoot } = 
     const prior = currentToken;
     currentToken = token;
     const entry = entries.get(token);
-    entries.set(token, Object.freeze({ capability: entry.capability, state: "current" }));
+    entries.set(token, Object.freeze({ capability: entry.capability, path: entry.path, state: "current" }));
     if (prior !== null && prior !== token) entries.delete(prior);
     return token;
   }
@@ -95,6 +99,7 @@ export function createInstallRootResolver({ authorizeRoot, getPersistedRoot } = 
 
   return Object.freeze({
     getCurrentToken,
+    getCurrentPath,
     choose,
     resolve,
     adopt,

@@ -132,9 +132,11 @@ function createFakeNative(initial = []) {
       return requireHandle(handle).node.path;
     },
     async readFile(handle, maxBytes) {
-      const { node } = requireHandle(handle);
-      if (node.data.length > maxBytes) throw codedError("native_file_too_large");
-      return Buffer.from(node.data);
+      const current = requireHandle(handle);
+      const remaining = current.node.data.subarray(current.position);
+      if (remaining.length > maxBytes) throw codedError("native_file_too_large");
+      current.position = current.node.data.length;
+      return Buffer.from(remaining);
     },
     async readChunk(handle, maxBytes) {
       const current = requireHandle(handle);
@@ -159,8 +161,9 @@ function createFakeNative(initial = []) {
       calls.push(["truncate", current.node.path, size]);
     },
     async writeFile(handle, value) {
-      const { node } = requireHandle(handle);
-      node.data = Buffer.from(value);
+      const current = requireHandle(handle);
+      current.node.data = Buffer.from(value);
+      current.position = current.node.data.length;
     },
     async appendFile(handle, value) {
       const { node } = requireHandle(handle);
@@ -200,7 +203,7 @@ function createFakeNative(initial = []) {
     },
     async createDirectoryAtNoFollow(parentHandle, name, options) {
       const parent = requireHandle(parentHandle).node;
-      const exactPath = `${parent.path}\\${name}`;
+      const exactPath = `${parent.path.replace(/[\\]+$/u, "")}\\${name}`;
       calls.push(["mkdir-at", parent.path, name, structuredClone(options)]);
       if (nodes.has(key(exactPath))) throw codedError("entry_exists", 183);
       const node = add(exactPath, { kind: "directory" });
@@ -371,6 +374,38 @@ test("capability paths reject traversal, namespaces, UNC, ADS, roots, and reserv
   assert.equal(fake.calls.length, 0);
 });
 
+test("runtime record directories are created as verified direct children and reject reparse substitution", async () => {
+  const fake = createFakeNative([{ path: "C:\\runtime-data", kind: "directory" }]);
+  const api = capabilities(fake);
+  const created = await api.ensureManagedDirectoriesNoFollow("C:\\runtime-data", ["state", "journal", "catalog"]);
+  assert.deepEqual({ ...created, names: [...created.names] }, {
+    rootPath: "C:\\runtime-data",
+    names: ["state", "journal", "catalog"],
+  });
+  assert.equal(fake.get("C:\\runtime-data\\state")?.kind, "directory");
+  assert.equal(fake.get("C:\\runtime-data\\journal")?.kind, "directory");
+  assert.equal(fake.handles.size, 0);
+
+  fake.replace("C:\\runtime-data\\state", { kind: "directory", reparse: true });
+  await assert.rejects(
+    api.ensureManagedDirectoriesNoFollow("C:\\runtime-data", ["state"]),
+    /windows_reparse_point_rejected/u,
+  );
+  assert.equal(fake.handles.size, 0);
+});
+
+test("managed install-root creation can safely anchor one direct child at a drive root", async () => {
+  const fake = createFakeNative([{ path: "X:\\", kind: "directory" }]);
+  const created = await capabilities(fake).ensureManagedDirectoriesNoFollow("X:\\", ["CBApps"]);
+
+  assert.deepEqual({ ...created, names: [...created.names] }, {
+    rootPath: "X:\\",
+    names: ["CBApps"],
+  });
+  assert.equal(fake.get("X:\\CBApps")?.kind, "directory");
+  assert.equal(fake.handles.size, 0);
+});
+
 test("state directory and entries reject reparses and close every pinned handle", async () => {
   const fake = createFakeNative([{ path: "C:\\work\\state", reparse: true }]);
   await assert.rejects(capabilities(fake).openStateDirectoryNoFollow("C:\\work\\state"), /reparse/u);
@@ -381,6 +416,24 @@ test("state directory and entries reject reparses and close every pinned handle"
   const directory = await capabilities(fake).openStateDirectoryNoFollow("C:\\work\\state");
   await assert.rejects(directory.openFileNoFollow("ownership.json", "r"), /reparse/u);
   await directory.close();
+  assert.equal(fake.handles.size, 0);
+});
+
+test("pinned path canonicalization never accepts a handle that escapes its verified parent", async () => {
+  const fake = createFakeNative([
+    { path: "C:\\work\\state", kind: "directory" },
+    { path: "C:\\elsewhere\\state", kind: "directory" },
+  ]);
+  fake.onOpenPath(({ path: requestedPath }) => (
+    requestedPath.toLowerCase() === "c:\\work\\state"
+      ? "C:\\elsewhere\\state"
+      : requestedPath
+  ));
+
+  await assert.rejects(
+    capabilities(fake).openStateDirectoryNoFollow("C:\\work\\state"),
+    /windows_final_path_mismatch/u,
+  );
   assert.equal(fake.handles.size, 0);
 });
 
@@ -900,6 +953,25 @@ test("archive pin detects identity change while holding the exact file", async (
   assert.equal(fake.handles.size, 0);
 });
 
+test("trusted executable pins accept a stable hard-linked file while archive pins stay strict", async () => {
+  const filePath = "C:\\work\\git-installer.exe";
+  const data = Buffer.from("signed");
+  const fake = createFakeNative([{ path: filePath, kind: "file", data, nlink: 2 }]);
+  const api = capabilities(fake);
+
+  await assert.rejects(api.pinArchiveFileNoFollow(filePath), /hard_link/u);
+  const pin = await api.pinExecutableFileNoFollow(filePath);
+  await pin.assertStableNoFollow();
+  await pin.close();
+  await api.deleteVerifiedExecutableFileNoFollow(
+    filePath,
+    createHash("sha256").update(data).digest("hex"),
+  );
+
+  assert.equal(fake.handles.size, 0);
+  assert.equal(fake.get(filePath), undefined);
+});
+
 test("archive destination must be initially empty and closes handles on rejection", async () => {
   const fake = createFakeNative([
     { path: "C:\\work\\staging" },
@@ -1250,6 +1322,35 @@ test("prepared Skill cleanup is identity-bound, fail-closed for intent, and pres
   assert.equal(fake.handles.size, 0);
 });
 
+test("prepared Skill deletion classifies a same-identity partial tree as recoverable damage", async () => {
+  const source = "D:\\CBApps\\staging\\task-skill-task\\skill-documents.prepare";
+  const fake = createFakeNative([
+    { path: "D:\\CBApps" },
+    { path: "D:\\CBApps\\staging" },
+    { path: "D:\\CBApps\\staging\\task-skill-task" },
+    { path: source },
+    { path: `${source}\\partial.txt`, kind: "file", data: Buffer.from("partial") },
+  ]);
+  const sourceIdentity = structuredClone(fake.get(source).identity);
+
+  const validated = await capabilities(fake).validatePreparedSkillSourceForDeletionNoFollow({
+    installRootCapability: await installRootAuthority("D:\\CBApps"),
+    taskId: "skill-task",
+    skillId: "documents",
+    expectedIdentity: sourceIdentity,
+    expectedEvidence: {
+      kind: "directory",
+      identity: sourceIdentity,
+      treeDigest: "a".repeat(64),
+      manifestDigest: "b".repeat(64),
+      skillMdSha256: "c".repeat(64),
+    },
+  });
+
+  assert.deepEqual(validated, { kind: "changed", identity: sourceIdentity, sourcePath: source });
+  assert.equal(fake.handles.size, 0);
+});
+
 test("absent prepared Skill cleanup never adopts or removes an unbound task parent", async () => {
   const task = "D:\\CBApps\\staging\\task-skill-task";
   const fake = createFakeNative([
@@ -1306,6 +1407,10 @@ test("Skill cross-root copy holds every nested parent against an ancestor juncti
     { path: skillsRoot },
     { path: "C:\\outside" },
   ]);
+  const asyncCloseHandle = fake.nativeApi.closeHandle.bind(fake.nativeApi);
+  fake.nativeApi.closeHandle = (handle) => {
+    void asyncCloseHandle(handle);
+  };
   const api = capabilities(fake);
   const installRootCapability = await installRootAuthority("D:\\CBApps");
   const workspace = await api.openInstallerWorkspaceRootNoFollow(installRootCapability, { maxRelativePath: 100 });

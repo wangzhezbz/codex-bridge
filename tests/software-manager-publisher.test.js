@@ -6,14 +6,20 @@ import path from "node:path";
 import test from "node:test";
 
 import { verifyCatalogEnvelope } from "../desktop/software-manager/catalog-trust.mjs";
-import { buildCatalogBytes } from "../scripts/software-manager/catalog-builder.mjs";
+import {
+  atomicReplacePublicFile,
+  buildCatalogBytes,
+  replaceSignedCatalog,
+} from "../scripts/software-manager/catalog-builder.mjs";
 import { loadPublisherConfig } from "../scripts/software-manager/publisher-config.mjs";
+import { migrateCatalogToDogeCloud } from "../scripts/software-manager/migrate-dogecloud-assets.mjs";
 import { publishChatGPT } from "../scripts/software-manager/publish-chatgpt.mjs";
 import { publishImportedAssets } from "../scripts/software-manager/publish-imported-assets.mjs";
 import { publishSkills } from "../scripts/software-manager/publish-skills.mjs";
 
 const PACKAGE_BASE_URL = "https://shanhaiyouling.com/codexbridge-test/packages/";
 const COS_PACKAGE_BASE_URL = "https://codex-1431412335.cos.ap-guangzhou.myqcloud.com/codexbridge-test/packages/";
+const DOGECLOUD_PACKAGE_BASE_URL = "https://download.shanhaiyouling.com/codexbridge-test/packages/";
 const CATALOG_URL = "https://shanhaiyouling.com/codexbridge-install-test/component-catalog.json";
 
 function fixture() {
@@ -76,6 +82,25 @@ test("publisher config needs no object-storage credentials and rejects historica
   }), /publisher_package_base_url_rejected/);
 });
 
+test("publisher config accepts only the exact isolated DogeCloud download prefix", () => {
+  const value = fixture();
+  assert.equal(loadPublisherConfig({
+    ...value.env,
+    CBI_PACKAGE_BASE_URL: DOGECLOUD_PACKAGE_BASE_URL,
+  }).packageBaseUrl, DOGECLOUD_PACKAGE_BASE_URL);
+  for (const rejected of [
+    "https://download.shanhaiyouling.com/",
+    "https://download.shanhaiyouling.com/packages/",
+    "https://download.shanhaiyouling.com/codexbridge-test/packages",
+    "https://download.shanhaiyouling.com/codexbridge-test/packages/?token=unsafe",
+  ]) {
+    assert.throws(() => loadPublisherConfig({
+      ...value.env,
+      CBI_PACKAGE_BASE_URL: rejected,
+    }), /publisher_package_base_url_rejected/);
+  }
+});
+
 test("catalog bytes are deterministic, recursively key-sorted and LF terminated", () => {
   const left = buildCatalogBytes({
     skills: [],
@@ -90,6 +115,53 @@ test("catalog bytes are deterministic, recursively key-sorted and LF terminated"
   assert.deepEqual(left, right);
   assert.equal(left.at(-1), 0x0a);
   assert.equal(left.includes(0x0d), false);
+});
+
+test("public atomic replacement removes its exact temporary file after pre-rename failure", async () => {
+  const value = fixture();
+  const target = path.join(value.publicRoot, "fault-injected.json");
+  await assert.rejects(
+    atomicReplacePublicFile(target, Symbol("invalid-bytes")),
+    /data|buffer|string|typedarray|dataview/i,
+  );
+  assert.deepEqual(fs.readdirSync(value.publicRoot), []);
+});
+
+test("public atomic replacement never deletes another writer's occupied temporary file", async () => {
+  const value = fixture();
+  const target = path.join(value.publicRoot, "occupied.json");
+  const originalNow = Date.now;
+  Date.now = () => 1_234_567;
+  const occupied = `${target}.${process.pid}.1234567.part`;
+  fs.writeFileSync(occupied, "foreign-writer", { flag: "wx" });
+  try {
+    await assert.rejects(
+      atomicReplacePublicFile(target, Buffer.from("replacement")),
+      (error) => error?.code === "EEXIST",
+    );
+  } finally {
+    Date.now = originalNow;
+  }
+  assert.equal(fs.readFileSync(occupied, "utf8"), "foreign-writer");
+  assert.equal(fs.existsSync(target), false);
+});
+
+test("signed catalog publication overrides a restrictive umask for public files", {
+  skip: process.platform === "win32",
+}, async () => {
+  const value = fixture();
+  const previousUmask = process.umask(0o077);
+  let result;
+  try {
+    result = await replaceSignedCatalog({
+      config: loadPublisherConfig(value.env),
+      catalog: { schemaVersion: 1, components: [], skills: [] },
+    });
+  } finally {
+    process.umask(previousUmask);
+  }
+  assert.equal(fs.statSync(result.catalogPath).mode & 0o777, 0o644);
+  assert.equal(fs.statSync(result.signaturePath).mode & 0o777, 0o644);
 });
 
 test("ChatGPT publisher normalizes an explicit local tree and replaces the signed catalog last", async () => {
@@ -115,6 +187,32 @@ test("ChatGPT publisher normalizes an explicit local tree and replaces the signe
   assert.equal(catalog.components[0].maxRelativePathLength, "resources/app.asar".length);
   assert.equal(fs.statSync(result.packagePath).size, catalog.components[0].size);
   assert.equal(crypto.createHash("sha256").update(fs.readFileSync(result.packagePath)).digest("hex"), catalog.components[0].sha256);
+});
+
+test("ChatGPT publisher verifies the DogeCloud object before exposing its CDN URL", async () => {
+  const value = fixture();
+  const inputPath = createChatGPTSource(value.inputRoot, "1.2.4");
+  const config = loadPublisherConfig({ ...value.env, CBI_PACKAGE_BASE_URL: DOGECLOUD_PACKAGE_BASE_URL });
+  const result = await publishChatGPT({
+    config,
+    inputPath,
+    version: "1.2.4",
+    versionInspector: async () => "1.2.4",
+    artifactPublisher: {
+      publish: async ({ relativePath, expectedSize, expectedSha256 }) => {
+        assert.equal(fs.existsSync(path.join(value.publicRoot, "component-catalog.json")), false);
+        return {
+          action: "verified",
+          objectKey: `codexbridge-test/packages/${relativePath}`,
+          size: expectedSize,
+          sha256: expectedSha256,
+          url: `${DOGECLOUD_PACKAGE_BASE_URL}${relativePath}`,
+        };
+      },
+    },
+  });
+  assert.equal(catalogEnvelope(result, value).components[0].assetUrl, `${DOGECLOUD_PACKAGE_BASE_URL}chatgpt-1.2.4-x64.zip`);
+  assert.deepEqual(result.events.slice(-4), ["package_verified", "object_verified", "signature_written", "catalog_replaced"]);
 });
 
 test("publisher refuses immutable-name overwrite and retains only current plus one fallback package", async () => {
@@ -162,6 +260,51 @@ test("Skills publisher accepts only direct safe children with SKILL.md and signs
   await assert.rejects(publishSkills({
     config: loadPublisherConfig(value.env), inputRoot: skillsRoot, version: "1.0.1",
   }), /publisher_skill_id_invalid|publisher_skill_entrypoint_missing/);
+});
+
+test("curated Skills publication can replace the complete Skill catalog without changing components", async () => {
+  const value = fixture();
+  const config = loadPublisherConfig(value.env);
+  const firstRoot = path.join(value.inputRoot, "first-skills");
+  fs.mkdirSync(path.join(firstRoot, "legacy-skill"), { recursive: true });
+  fs.writeFileSync(path.join(firstRoot, "legacy-skill", "SKILL.md"), "# Legacy\n");
+  await publishSkills({ config, inputRoot: firstRoot, version: "1.0.0" });
+
+  const curatedRoot = path.join(value.inputRoot, "curated-skills");
+  fs.mkdirSync(path.join(curatedRoot, "agent-reach"), { recursive: true });
+  fs.writeFileSync(path.join(curatedRoot, "agent-reach", "SKILL.md"), "# Agent Reach\n");
+  const result = await publishSkills({
+    config,
+    inputRoot: curatedRoot,
+    version: "2.0.0",
+    replaceSkillCatalog: true,
+  });
+
+  assert.deepEqual(catalogEnvelope(result, value).skills.map(({ id }) => id), ["agent-reach"]);
+});
+
+test("Skills publisher exposes only DogeCloud objects verified before catalog replacement", async () => {
+  const value = fixture();
+  const skillsRoot = path.join(value.inputRoot, "skills");
+  fs.mkdirSync(path.join(skillsRoot, "documents"), { recursive: true });
+  fs.writeFileSync(path.join(skillsRoot, "documents", "SKILL.md"), "# Documents\n");
+  const config = loadPublisherConfig({ ...value.env, CBI_PACKAGE_BASE_URL: DOGECLOUD_PACKAGE_BASE_URL });
+  const result = await publishSkills({
+    config,
+    inputRoot: skillsRoot,
+    version: "1.0.0",
+    artifactPublisher: {
+      publish: async ({ relativePath, expectedSize, expectedSha256 }) => ({
+        action: "uploaded",
+        objectKey: `codexbridge-test/packages/${relativePath}`,
+        size: expectedSize,
+        sha256: expectedSha256,
+        url: `${DOGECLOUD_PACKAGE_BASE_URL}${relativePath}`,
+      }),
+    },
+  });
+  assert.equal(catalogEnvelope(result, value).skills[0].assetUrl, `${DOGECLOUD_PACKAGE_BASE_URL}skills/documents-1.0.0.zip`);
+  assert.deepEqual(result.events.slice(-4), ["package_verified", "object_verified", "signature_written", "catalog_replaced"]);
 });
 
 test("publisher rejects duplicate case-folded Skill IDs before writing packages", async () => {
@@ -266,9 +409,62 @@ test("imported asset publisher signs COS URLs only when matching local bytes exi
   assert.equal(catalogEnvelope(result, value).components[0].assetUrl, `${COS_PACKAGE_BASE_URL}${packageName}`);
 });
 
+test("imported asset publisher signs verified DogeCloud URLs only when matching local bytes exist", async () => {
+  const value = fixture();
+  const packageRoot = path.join(value.publicRoot, "packages");
+  fs.mkdirSync(packageRoot, { recursive: true });
+  const packageName = "chatgpt-1.2.4-x64.zip";
+  const packagePath = path.join(packageRoot, packageName);
+  fs.writeFileSync(packagePath, "chatgpt-dogecloud-package");
+  const bytes = fs.readFileSync(packagePath);
+  const metadataPath = path.join(value.root, "dogecloud-import.json");
+  fs.writeFileSync(metadataPath, JSON.stringify({
+    component: {
+      id: "chatgpt", name: "ChatGPT", version: "1.2.4", architecture: "x64", format: "zip",
+      assetUrl: `${DOGECLOUD_PACKAGE_BASE_URL}${packageName}`, size: bytes.length,
+      sha256: crypto.createHash("sha256").update(bytes).digest("hex"), entrypoint: "ChatGPT.exe",
+      requiredFiles: ["ChatGPT.exe"], maxRelativePathLength: 11,
+      publishedAt: "2026-08-08T00:00:00.000Z", supportsRollback: true,
+    },
+    skills: [],
+  }));
+  const result = await publishImportedAssets({ config: loadPublisherConfig(value.env), metadataPath });
+  assert.equal(
+    catalogEnvelope(result, value).components[0].assetUrl,
+    `${DOGECLOUD_PACKAGE_BASE_URL}${packageName}`,
+  );
+});
+
+test("catalog migration publishes every local byte before atomically signing DogeCloud URLs", async () => {
+  const value = fixture();
+  const localConfig = loadPublisherConfig(value.env);
+  await publishChatGPT({
+    config: localConfig,
+    inputPath: createChatGPTSource(value.inputRoot, "1.2.3"),
+    version: "1.2.3",
+    versionInspector: async () => "1.2.3",
+  });
+  const dogeConfig = loadPublisherConfig({ ...value.env, CBI_PACKAGE_BASE_URL: DOGECLOUD_PACKAGE_BASE_URL });
+  const result = await migrateCatalogToDogeCloud({
+    config: dogeConfig,
+    artifactPublisher: {
+      publish: async ({ relativePath, expectedSize, expectedSha256 }) => ({
+        action: "verified",
+        objectKey: `codexbridge-test/packages/${relativePath}`,
+        size: expectedSize,
+        sha256: expectedSha256,
+        url: `${DOGECLOUD_PACKAGE_BASE_URL}${relativePath}`,
+      }),
+    },
+  });
+  assert.equal(catalogEnvelope(result, value).components[0].assetUrl, `${DOGECLOUD_PACKAGE_BASE_URL}chatgpt-1.2.3-x64.zip`);
+  assert.deepEqual(result.events, ["package_verified", "object_verified", "signature_written", "catalog_replaced"]);
+});
+
 test("package.json exposes explicit manual ChatGPT and Skills publisher commands", () => {
   const packageJson = JSON.parse(fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8"));
   assert.equal(packageJson.scripts["software:publish:chatgpt"], "node scripts/software-manager/publish-chatgpt.mjs");
   assert.equal(packageJson.scripts["software:publish:skills"], "node scripts/software-manager/publish-skills.mjs");
   assert.equal(packageJson.scripts["software:publish:imported"], "node scripts/software-manager/publish-imported-assets.mjs");
+  assert.equal(packageJson.scripts["software:migrate:dogecloud"], "node scripts/software-manager/migrate-dogecloud-assets.mjs");
 });

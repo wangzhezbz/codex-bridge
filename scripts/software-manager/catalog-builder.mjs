@@ -46,20 +46,24 @@ export function readCurrentCatalog(publicRoot, { signingKeyFile = "" } = {}) {
   }
 }
 
-async function atomicReplace(filePath, bytes) {
+export async function atomicReplacePublicFile(filePath, bytes) {
   await fsPromises.mkdir(path.dirname(filePath), { recursive: true });
   const temporary = `${filePath}.${process.pid}.${Date.now()}.part`;
-  const handle = await fsPromises.open(temporary, "wx", 0o644);
+  let created = false;
   try {
-    await handle.writeFile(bytes);
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  try {
+    const handle = await fsPromises.open(temporary, "wx", 0o644);
+    created = true;
+    try {
+      await handle.writeFile(bytes);
+      await handle.chmod(0o644);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
     await fsPromises.rename(temporary, filePath);
+    created = false;
   } catch (error) {
-    await fsPromises.unlink(temporary).catch(() => {});
+    if (created) await fsPromises.unlink(temporary).catch(() => {});
     throw error;
   }
 }
@@ -76,9 +80,9 @@ export async function replaceSignedCatalog({ config, catalog, events = [] }) {
   const signature = `${crypto.sign("RSA-SHA256", bytes, privateKey).toString("base64")}\n`;
   const signaturePath = path.join(config.publicRoot, "component-catalog.json.sig");
   const catalogPath = path.join(config.publicRoot, "component-catalog.json");
-  await atomicReplace(signaturePath, signature);
+  await atomicReplacePublicFile(signaturePath, signature);
   events.push("signature_written");
-  await atomicReplace(catalogPath, bytes);
+  await atomicReplacePublicFile(catalogPath, bytes);
   events.push("catalog_replaced");
   return Object.freeze({ catalogPath, signaturePath, catalog: parsed, events: Object.freeze([...events]) });
 }

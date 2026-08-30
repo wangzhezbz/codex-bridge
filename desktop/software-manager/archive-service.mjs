@@ -329,7 +329,10 @@ async function extractZip({ archivePath, destination, destinationIdentity, signa
     destinationHandle = await fsApi.openArchiveDestinationNoFollow(destination, { expectedIdentity: destinationIdentity });
     requireZipDestinationHandle(destinationHandle);
     enumerated = await enumerateZip(archivePath, signal);
+    let extractedEntries = 0;
     for (const entry of enumerated.entries) {
+      extractedEntries += 1;
+      if (extractedEntries % 32 === 0) await new Promise((resolve) => setImmediate(resolve));
       throwIfAborted(signal);
       if (entry.directory) {
         await destinationHandle.ensureDirectoryPathNoFollow([...entry.segments]);
@@ -507,7 +510,9 @@ async function inspectSevenZip({ archivePath, signal, sevenZipPath, spawnFile })
   const stdout = await runSevenZip({
     sevenZipPath,
     spawnFile,
-    args: ["l", "-slt", "-ba", "-t7z", "-sns-", "--", archivePath],
+    // Force Unicode console output. Without this switch, 7-Zip uses the
+    // active Windows code page and corrupts non-ASCII entry selectors.
+    args: ["l", "-slt", "-ba", "-t7z", "-sns-", "-sccUTF-8", "--", archivePath],
     signal,
   });
   if (typeof stdout !== "string") throw archiveError("archive_7z_listing_encoding_required");

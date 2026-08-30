@@ -5,6 +5,7 @@ import { pipeline } from "node:stream/promises";
 import { Readable, Transform } from "node:stream";
 
 const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
+const PROGRESS_INTERVAL_MS = 250;
 const DOWNLOAD_MANAGER_AUTHORITIES = new WeakMap();
 const NON_RETRYABLE_SOURCE_FAILURES = new WeakSet();
 
@@ -164,16 +165,26 @@ async function downloadOnce(context) {
   }
 
   const startedAt = Date.now();
+  let lastProgressAt = 0;
+  let progressReported = false;
   const progress = new Transform({
     transform(chunk, encoding, callback) {
       receivedBytes += chunk.length;
-      const elapsedSeconds = Math.max((Date.now() - startedAt) / 1_000, 0.001);
+      const timestamp = Date.now();
+      const completed = receivedBytes === context.asset.size;
+      if (progressReported && !completed && timestamp - lastProgressAt < PROGRESS_INTERVAL_MS) {
+        callback(null, chunk);
+        return;
+      }
+      progressReported = true;
+      lastProgressAt = timestamp;
+      const elapsedSeconds = Math.max((timestamp - startedAt) / 1_000, 0.001);
       onProgressSafely(context.onProgress, {
         phase: "download",
         receivedBytes,
         totalBytes: context.asset.size,
         percent: context.asset.size === 0 ? 100 : Math.min(100, (receivedBytes / context.asset.size) * 100),
-        bytesPerSecond: receivedBytes / elapsedSeconds
+        bytesPerSecond: (receivedBytes - existingSize) / elapsedSeconds
       }, callback, chunk);
     }
   });
@@ -232,6 +243,12 @@ async function verifyDownloaded(context) {
     throw nonRetryableError(`download length mismatch: expected ${context.asset.size}, received ${context.receivedBytes}`);
   }
   throwIfAborted(context.signal);
+  context.onProgress({
+    phase: "verify-download",
+    receivedBytes: context.receivedBytes,
+    totalBytes: context.asset.size,
+    percent: 100,
+  });
   let sha256;
   if (context.target) {
     const verified = await failFastSource(() => context.target.verify({

@@ -8,6 +8,7 @@ import {
   joinUpstreamUrl,
 } from "./config.js";
 import {
+  codexOpenAiPortableHistoryRetryPayload,
   filterPayloadForAdapter,
   normalizeAdapterProfile,
 } from "./adapter-profile.js";
@@ -137,6 +138,7 @@ import {
 import { normalizeBridgePlainCompactionPayload } from "./responses-compaction-payload.js";
 import { responsesCompactRequestOptions } from "./responses-compact-request-policy.js";
 import { responsesBaseUrlForRoute } from "./responses-upstream-url.js";
+import { routeUsesStatelessDeepSeekResponses } from "./responses-native-history.js";
 import { chatToolContinuationTurns } from "./responses-tool-continuation.js";
 import {
   latestToolResultSignaturesFromInput,
@@ -204,6 +206,7 @@ export { responsesBaseUrlForRoute };
 // A completed response is persisted both as the provider response and as an
 // assistant history message. Keep headroom below the store's 100 MiB turn cap;
 // the store remains the final whole-turn limit when source input is also large.
+const CHAT_STREAM_TERMINAL_GRACE_MS = 250;
 const { shouldRetryChatWithoutImages } = createUpstreamImageRetryPolicy({
   UpstreamHttpError,
 });
@@ -1092,15 +1095,22 @@ export async function proxyResponsesApi(
     toolDiagnosticsFromContext(toolContext, requestBody.tool_choice || ""),
     "responses-native",
   );
+  const codexMessagesRequest =
+    authModeForRoute(route) === "codex_openai" &&
+    Array.isArray(requestBody.messages);
   if (
+    codexMessagesRequest ||
     context.contextSwitchCompaction ||
     shouldInlineLocalHistoryForResponses(requestBody, history, route)
   ) {
-    inlineLocalHistoryForResponsesPayload(payload, sourceMessages);
+    inlineLocalHistoryForResponsesPayload(payload, sourceMessages, {
+      includePlainReasoningContent: shouldReplayPlainResponsesReasoning(route),
+      preferNativeResponsesHistoryItems: routeUsesStatelessDeepSeekResponses(route),
+    });
   }
   normalizeBridgePlainCompactionPayload(payload, route, context);
 
-  const upstreamPayload = filterPayloadForUpstream(
+  let upstreamPayload = filterPayloadForUpstream(
     payload,
     route,
     context,
@@ -1111,14 +1121,8 @@ export async function proxyResponsesApi(
   let activeUpstreamUrl = upstreamUrl;
   logRoute(context, route, upstreamUrl);
   let upstream;
+  let upstreamInit = responsesUpstreamRequestInit(upstreamPayload, route, context);
   try {
-    const upstreamInit = {
-      method: "POST",
-      headers: upstreamHeaders(route, context, {
-        acceptEventStream: Boolean(upstreamPayload.stream),
-      }),
-      body: JSON.stringify(upstreamPayload),
-    };
     upstream = await fetchUpstream(activeUpstreamUrl, upstreamInit, context, route, {
       streamingResponse: Boolean(upstreamPayload.stream),
     });
@@ -1143,54 +1147,102 @@ export async function proxyResponsesApi(
   }
 
   if (!upstream.ok) {
-    const bodyText = await readUpstreamText(upstream, context, route, activeUpstreamUrl);
-    const completedResponse = extractResponsesObject(bodyText);
+    let bodyText = await readUpstreamText(upstream, context, route, activeUpstreamUrl);
     if (
-      upstreamPayload.stream &&
-      looksLikeSseResponse(bodyText) &&
-      responsesSseStreamComplete(bodyText) &&
-      isCompletedResponsesObject(completedResponse)
+      shouldRetryCodexOpenAiWithPortableHistory(
+        upstream.status,
+        bodyText,
+        upstreamPayload,
+        route,
+      )
     ) {
+      const originalStatus = upstream.status;
+      upstreamPayload = codexOpenAiPortableHistoryRetryPayload(upstreamPayload);
+      upstreamInit = responsesUpstreamRequestInit(upstreamPayload, route, context);
       console.warn(
         `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
-          `!! upstream route=${route.id} returned HTTP ${upstream.status} with completed Responses SSE; ` +
-          "treating stream as completed for compatibility",
+          `!! upstream route=${route.id || route.model || "-"} rejected stored history ` +
+          `with HTTP ${originalStatus}; retrying the same model with portable history`,
       );
-      await recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
-        requestBody,
-        route,
-      });
-      logUsage(context, route, extractUsageObject(completedResponse) || extractResponsesUsage(bodyText));
-      res.writeHead(200, {
-        ...filteredHeaders(upstream.headers),
-        "content-type": "text/event-stream; charset=utf-8",
-      });
-      res.end(bodyText);
-      return;
-    }
-    if (
-      !upstreamPayload.stream &&
-      looksLikeSseResponse(bodyText) &&
-      responsesSseStreamComplete(bodyText) &&
-      isCompletedResponsesObject(completedResponse)
-    ) {
-      console.warn(
-        `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
-          `!! upstream route=${route.id} returned HTTP ${upstream.status} with completed Responses SSE; ` +
-          "returning completed response JSON for compatibility",
+      recordRouteTraceEvent(
+        ensureRouteTrace(context, route),
+        "payload_compatibility_retry",
+        {
+          reason: "codex_openai_portable_history",
+          status: originalStatus,
+          model: route.model || null,
+        },
       );
-      await recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
-        requestBody,
-        route,
+      upstream = await fetchUpstream(activeUpstreamUrl, upstreamInit, context, route, {
+        streamingResponse: Boolean(upstreamPayload.stream),
       });
-      logUsage(context, route, extractUsageObject(completedResponse) || extractResponsesUsage(bodyText));
-      jsonResponse(res, 200, completedResponse);
-      return;
+      logStatus(context, route, upstream.status);
+      bodyText = upstream.ok
+        ? ""
+        : await readUpstreamText(upstream, context, route, activeUpstreamUrl);
     }
-    const error = new UpstreamHttpError(upstream.status, bodyText, activeUpstreamUrl, route, {
-      headers: upstream.headers,
-    });
-    throw error;
+
+    if (!upstream.ok) {
+      const completedResponse = extractResponsesObject(bodyText);
+      if (
+        upstreamPayload.stream &&
+        looksLikeSseResponse(bodyText) &&
+        responsesSseStreamComplete(bodyText) &&
+        isCompletedResponsesObject(completedResponse)
+      ) {
+        console.warn(
+          `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+            `!! upstream route=${route.id} returned HTTP ${upstream.status} with completed Responses SSE; ` +
+            "treating stream as completed for compatibility",
+        );
+        await recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
+          requestBody,
+          route,
+        });
+        logUsage(
+          context,
+          route,
+          extractUsageObject(completedResponse) || extractResponsesUsage(bodyText),
+        );
+        res.writeHead(200, {
+          ...filteredHeaders(upstream.headers),
+          "content-type": "text/event-stream; charset=utf-8",
+        });
+        res.end(bodyText);
+        return;
+      }
+      if (
+        !upstreamPayload.stream &&
+        looksLikeSseResponse(bodyText) &&
+        responsesSseStreamComplete(bodyText) &&
+        isCompletedResponsesObject(completedResponse)
+      ) {
+        console.warn(
+          `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+            `!! upstream route=${route.id} returned HTTP ${upstream.status} with completed Responses SSE; ` +
+            "returning completed response JSON for compatibility",
+        );
+        await recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
+          requestBody,
+          route,
+        });
+        logUsage(
+          context,
+          route,
+          extractUsageObject(completedResponse) || extractResponsesUsage(bodyText),
+        );
+        jsonResponse(res, 200, completedResponse);
+        return;
+      }
+      const error = new UpstreamHttpError(
+        upstream.status,
+        bodyText,
+        activeUpstreamUrl,
+        route,
+        { headers: upstream.headers },
+      );
+      throw error;
+    }
   }
 
   if (shouldAggregateForcedResponsesStream(requestBody, upstreamPayload, route)) {
@@ -1222,75 +1274,16 @@ export async function proxyResponsesApi(
     return;
   }
 
-  if (!upstreamPayload.stream || !responseUsesEventStream(upstream)) {
+  if (!upstreamPayload.stream) {
     const responseText = upstream.body
       ? await readUpstreamText(upstream, context, route, activeUpstreamUrl)
       : "";
     const completedResponse = extractResponsesObject(responseText);
-    const mislabeledResponsesStream =
-      upstreamPayload.stream === true &&
-      looksLikeSseResponse(responseText);
-    if (mislabeledResponsesStream) {
-      const headers = filteredHeaders(upstream.headers);
-      headers["content-type"] = "text/event-stream; charset=utf-8";
-      headers["cache-control"] = "no-cache";
-      res.writeHead(upstream.status, headers);
-      await writeResponseChunk(res, responseText, context);
-
-      const terminalKind = responsesTerminalKind(responseText);
-      if (isPassThroughNonSuccessTerminal(terminalKind, completedResponse)) {
-        logUsage(
-          context,
-          route,
-          extractUsageObject(completedResponse) || extractResponsesUsage(responseText),
-        );
-        res.end();
-        return;
-      }
-      if (isCompletedResponsesObject(completedResponse)) {
-        await recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
-          requestBody,
-          route,
-        });
-        logUsage(
-          context,
-          route,
-          extractUsageObject(completedResponse) || extractResponsesUsage(responseText),
-        );
-        res.end();
-        return;
-      }
-
-      const message =
-        `CodexBridge upstream stream from ${route.displayName || route.id || route.model || "route"} ` +
-        "ended before response.completed or [DONE].";
-      console.warn(
-        `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
-          `!! upstream route=${route.id} mislabeled truncated responses stream ` +
-          `content_type=${safeText(upstream.headers.get("content-type") || "missing", 80)} ` +
-          `terminal=${terminalKind || "missing"} bytes=${Buffer.byteLength(responseText, "utf8")}`,
-      );
-      if (!/(\r?\n){2}$/.test(responseText)) {
-        await writeResponseChunk(res, "\n\n", context);
-      }
-      await writeResponseChunk(res, buildResponsesStreamErrorSse(message, {
-        code: "upstream_stream_truncated",
-        model: requestBody.model || route.id || route.model || null,
-      }), context);
-      res.end();
-      logUsage(
-        context,
-        route,
-        extractUsageObject(completedResponse) || extractResponsesUsage(responseText),
-      );
-      throw new UpstreamStreamError(
-        message,
-        activeUpstreamUrl,
-        route,
-        "upstream_stream_truncated",
-      );
-    }
-    if (!isCompletedResponsesObject(completedResponse)) {
+    const persistableIncomplete = shouldPersistIncompleteResponsesHistory(
+      completedResponse,
+      route,
+    );
+    if (!isCompletedResponsesObject(completedResponse) && !persistableIncomplete) {
       throw new UpstreamHttpError(
         502,
         `Upstream returned HTTP ${upstream.status} without a completed response: ` +
@@ -1313,8 +1306,12 @@ export async function proxyResponsesApi(
     return;
   }
 
-  res.writeHead(upstream.status, filteredHeaders(upstream.headers));
   if (!upstream.body) {
+    const headers = filteredHeaders(upstream.headers);
+    headers["content-type"] = "text/event-stream; charset=utf-8";
+    headers["cache-control"] = "no-cache";
+    res.writeHead(upstream.status, headers);
+    res.flushHeaders?.();
     const message =
       `CodexBridge upstream stream from ${route.displayName || route.id || route.model || "route"} ` +
       "ended without a response body.";
@@ -1323,6 +1320,79 @@ export async function proxyResponsesApi(
     }));
     throw new UpstreamStreamError(message, activeUpstreamUrl, route, "upstream_stream_truncated");
   }
+
+  let upstreamChunks = readUpstreamBody(
+    upstream,
+    context,
+    route,
+    activeUpstreamUrl,
+    { streamingResponse: true },
+  );
+  const upstreamDeclaredEventStream = responseUsesEventStream(upstream);
+  if (!upstreamDeclaredEventStream) {
+    const iterator = upstreamChunks[Symbol.asyncIterator]();
+    const bufferedChunks = [];
+    const sniffDecoder = new TextDecoder();
+    let sniffText = "";
+    let detectedEventStream = false;
+    while (true) {
+      const result = await iterator.next();
+      if (result.done) {
+        break;
+      }
+      const chunk = Buffer.from(result.value);
+      bufferedChunks.push(chunk);
+      const sniffCandidate = `${sniffText}${sniffDecoder.decode(chunk, { stream: true })}`;
+      if (looksLikeSseResponse(sniffCandidate)) {
+        detectedEventStream = true;
+        break;
+      }
+      sniffText = sniffCandidate.slice(-1024);
+    }
+    if (!detectedEventStream) {
+      const responseText = Buffer.concat(bufferedChunks).toString("utf8");
+      const completedResponse = extractResponsesObject(responseText);
+      const persistableIncomplete = shouldPersistIncompleteResponsesHistory(
+        completedResponse,
+        route,
+      );
+      if (!isCompletedResponsesObject(completedResponse) && !persistableIncomplete) {
+        throw new UpstreamHttpError(
+          502,
+          `Upstream returned HTTP ${upstream.status} without a completed response: ` +
+            responseText.slice(0, 500),
+          activeUpstreamUrl,
+          route,
+        );
+      }
+      await recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
+        requestBody,
+        route,
+      });
+      logUsage(
+        context,
+        route,
+        extractUsageObject(completedResponse) || extractResponsesUsage(responseText),
+      );
+      res.writeHead(upstream.status, filteredHeaders(upstream.headers));
+      res.end(responseText);
+      return;
+    }
+    console.warn(
+      `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+        `!! upstream route=${route.id} responses stream omitted SSE content type; ` +
+        "forwarding detected event stream incrementally",
+    );
+    upstreamChunks = replayBufferedUpstreamChunks(bufferedChunks, iterator);
+  }
+
+  const streamHeaders = filteredHeaders(upstream.headers);
+  if (!upstreamDeclaredEventStream) {
+    streamHeaders["content-type"] = "text/event-stream; charset=utf-8";
+    streamHeaders["cache-control"] = "no-cache";
+  }
+  res.writeHead(upstream.status, streamHeaders);
+  res.flushHeaders?.();
   const pendingEvent = createSseBlockAccumulator();
   let diagnosticTail = "";
   const terminalBuffer = createTextBuffer();
@@ -1331,13 +1401,7 @@ export async function proxyResponsesApi(
   let streamError = null;
   try {
     upstreamRead:
-    for await (const chunk of readUpstreamBody(
-      upstream,
-      context,
-      route,
-      activeUpstreamUrl,
-      { streamingResponse: true },
-    )) {
+    for await (const chunk of upstreamChunks) {
       const blocks = takeCompleteSseBlocks(pendingEvent, Buffer.from(chunk));
       for (const block of blocks) {
         if (terminalStarted || responsesSseStreamComplete(block)) {
@@ -1448,6 +1512,23 @@ export async function proxyResponsesApi(
 
   const terminalKind = responsesTerminalKind(terminalText);
   if (isPassThroughNonSuccessTerminal(terminalKind, completedResponse)) {
+    if (shouldPersistIncompleteResponsesHistory(completedResponse, route)) {
+      const historyWrite = recordResponsesHistory(
+        history,
+        completedResponse,
+        sourceMessages,
+        toolContext,
+        {
+        requestBody,
+        route,
+          deferPersistence: true,
+        },
+      );
+      res.end(terminalText);
+      logUsage(context, route, usage);
+      await historyWrite;
+      return;
+    }
     res.end(terminalText);
     logUsage(context, route, usage);
     return;
@@ -1471,25 +1552,107 @@ export async function proxyResponsesApi(
     );
   }
 
-  try {
-    await recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
+  const historyWrite = recordResponsesHistory(
+    history,
+    completedResponse,
+    sourceMessages,
+    toolContext,
+    {
       requestBody,
       route,
-    });
-  } catch (error) {
-    const localError = asLocalHistoryStorageError(error);
-    const message = "本地模型历史保存失败，请新建会话后重试。";
-    if (!res.destroyed && !res.writableEnded) {
-      res.end(buildResponsesStreamErrorSse(message, {
-        code: "local_history_storage_unavailable",
-        model: requestBody.model || route.id || route.model || null,
-      }));
-    }
-    logUsage(context, route, usage);
-    throw localError;
-  }
+      deferPersistence: true,
+    },
+  );
   logUsage(context, route, usage);
   res.end(terminalText);
+  try {
+    await historyWrite;
+  } catch (error) {
+    throw asLocalHistoryStorageError(error);
+  }
+}
+
+function responsesUpstreamRequestInit(payload, route, context) {
+  return {
+    method: "POST",
+    headers: upstreamHeaders(route, context, {
+      acceptEventStream: Boolean(payload.stream),
+    }),
+    body: JSON.stringify(payload),
+  };
+}
+
+function shouldRetryCodexOpenAiWithPortableHistory(
+  statusCode,
+  bodyText,
+  payload,
+  route,
+) {
+  if (
+    ![400, 404].includes(Number(statusCode)) ||
+    authModeForRoute(route) !== "codex_openai" ||
+    !Array.isArray(payload?.input) ||
+    !payload.input.some(isCodexPortableHistoryCandidate)
+  ) {
+    return false;
+  }
+  const detail = String(bodyText || "");
+  const contentArrayRejected = (
+    /input\[\d+\]\.content/i.test(detail) &&
+    /array_above_max_length|array too long/i.test(detail) &&
+    /maximum length 0|array too long/i.test(detail)
+  );
+  const storedHistoryReferenceRejected =
+    /item with id .+ not found|no item found .+ id|previous response .+ not found/i.test(detail) ||
+    /(?:unknown|invalid) previous_response_id/i.test(detail) ||
+    /items are not persisted when [`'\"]?store[`'\"]? is (?:set to )?false/i.test(detail);
+  return contentArrayRejected || storedHistoryReferenceRejected;
+}
+
+function isCodexPortableHistoryCandidate(item) {
+  if (!item || typeof item !== "object") {
+    return false;
+  }
+  if (item.role === "assistant") {
+    return true;
+  }
+  const itemType = String(item.type || "");
+  return (
+    ["reasoning", "item_reference", "tool_result"].includes(itemType) ||
+    itemType.endsWith("_call") ||
+    itemType.endsWith("_call_output")
+  );
+}
+
+function shouldReplayPlainResponsesReasoning(route = {}) {
+  const profile = normalizeAdapterProfile(route);
+  return profile.api === "responses" && profile.providerFamily === "deepseek";
+}
+
+function shouldPersistIncompleteResponsesHistory(response, route = {}) {
+  return (
+    routeUsesStatelessDeepSeekResponses(route) &&
+    isResponsesObject(response) &&
+    String(response.status || "").toLowerCase() === "incomplete" &&
+    !response.error
+  );
+}
+
+async function* replayBufferedUpstreamChunks(bufferedChunks, iterator) {
+  try {
+    for (const chunk of bufferedChunks) {
+      yield chunk;
+    }
+    while (true) {
+      const result = await iterator.next();
+      if (result.done) {
+        return;
+      }
+      yield result.value;
+    }
+  } finally {
+    await iterator.return?.();
+  }
 }
 
 export async function proxyDirectChatCompletions(
@@ -1750,8 +1913,8 @@ export async function proxyChatCompletions(
   let upstream;
   let chatResponseStream = null;
   try {
-    if (converted.wantsStream && route.api === "chat_completions") {
-      const streamed = await callChatCompletionsResponsesStreamUpstream(
+    if (converted.wantsStream) {
+      const streamed = await callChatCompatibleResponsesStreamUpstream(
         upstreamUrl,
         route,
         converted.body,
@@ -1803,8 +1966,8 @@ export async function proxyChatCompletions(
     const textOnlyBody = chatBodyWithoutImages(converted.body);
     messagesForHistory = chatMessagesWithoutImages(converted.messagesForHistory);
     try {
-      if (converted.wantsStream && route.api === "chat_completions") {
-        const streamed = await callChatCompletionsResponsesStreamUpstream(
+      if (converted.wantsStream) {
+        const streamed = await callChatCompatibleResponsesStreamUpstream(
           upstreamUrl,
           route,
           textOnlyBody,
@@ -1966,7 +2129,7 @@ export async function proxyChatCompletions(
     response = chatResponseStream.alignResponse(response);
   }
 
-  await recordHistoryTurn(
+  const historyWrite = recordHistoryTurn(
     history,
     response,
     [
@@ -1991,13 +2154,16 @@ export async function proxyChatCompletions(
       toolResultSignatures,
       ...(localFallback ? { localFallback } : {}),
     },
-    { requestBody, route },
+    { requestBody, route, deferPersistence: converted.wantsStream },
   );
   if (converted.wantsStream) {
     const payload = chatResponseStream
       ? chatResponseStream.finish(response)
       : responseToSse(response);
-    if (!chatResponseStream || !chatResponseStream.responseStarted) {
+    if (
+      !res.headersSent &&
+      (!chatResponseStream || !chatResponseStream.responseStarted)
+    ) {
       res.writeHead(200, {
         "content-type": "text/event-stream; charset=utf-8",
         "cache-control": "no-cache",
@@ -2005,9 +2171,11 @@ export async function proxyChatCompletions(
       });
     }
     res.end(payload);
+    await historyWrite;
     return;
   }
 
+  await historyWrite;
   jsonResponse(res, 200, response);
 }
 
@@ -2212,6 +2380,188 @@ async function callChatCompletionsUpstream(
   }
 }
 
+async function callChatCompatibleResponsesStreamUpstream(
+  upstreamUrl,
+  route,
+  payload,
+  requestedModel,
+  res,
+  context = {},
+  options = {},
+) {
+  if (route.api === "anthropic_messages") {
+    return callAnthropicMessagesResponsesStreamUpstream(
+      upstreamUrl,
+      route,
+      payload,
+      requestedModel,
+      res,
+      context,
+      options,
+    );
+  }
+  return callChatCompletionsResponsesStreamUpstream(
+    upstreamUrl,
+    route,
+    payload,
+    requestedModel,
+    res,
+    context,
+    options,
+  );
+}
+
+async function callAnthropicMessagesResponsesStreamUpstream(
+  upstreamUrl,
+  route,
+  payload,
+  requestedModel,
+  res,
+  context = {},
+  options = {},
+) {
+  const {
+    emitTextDeltas = true,
+    emitReasoningDeltas = false,
+    ...fetchOptions
+  } = options;
+  const upstreamPayload = chatRequestToAnthropicMessages(
+    { ...payload, stream: true },
+    route,
+  );
+  const upstream = await fetchUpstream(
+    upstreamUrl,
+    {
+      method: "POST",
+      headers: upstreamHeaders(route, context, { acceptEventStream: true }),
+      body: JSON.stringify(upstreamPayload),
+    },
+    context,
+    route,
+    { ...fetchOptions, streamingResponse: true },
+  );
+  logStatus(context, route, upstream.status);
+  if (!upstream.ok) {
+    const bodyText = await readUpstreamText(upstream, context, route, upstreamUrl);
+    throw new UpstreamHttpError(upstream.status, bodyText, upstreamUrl, route, {
+      headers: upstream.headers,
+    });
+  }
+
+  const stream = createChatCompletionResponsesStream(
+    requestedModel || route.id || route.model,
+    null,
+    { emitTextDeltas, emitReasoningDeltas },
+  );
+  const translator = createAnthropicChatCompletionStreamTranslator(route);
+  const decoder = new TextDecoder();
+  let detectedEventStream = responseUsesEventStream(upstream);
+  let bufferedChunks = [];
+  let downstreamHeadersSent = false;
+  const writeStreamEvents = async (events) => {
+    if (events.length > 0 && !downstreamHeadersSent) {
+      res.writeHead(200, {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+      });
+      downstreamHeadersSent = true;
+    }
+    for (const event of events) {
+      await writeResponseChunk(res, event, context);
+    }
+  };
+  const consumeAnthropicEvents = async (events) => {
+    for (const event of events) {
+      await writeStreamEvents(stream.push(event));
+      if (stream.completed) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  if (upstream.body) {
+    anthropicRead:
+    for await (const chunk of readUpstreamBody(
+      upstream,
+      context,
+      route,
+      upstreamUrl,
+      { streamingResponse: true },
+    )) {
+      if (!detectedEventStream) {
+        bufferedChunks.push(chunk);
+        const bufferedText = Buffer.concat(bufferedChunks).toString("utf8");
+        if (!looksLikeSseResponse(bufferedText)) {
+          continue;
+        }
+        detectedEventStream = true;
+        for (const bufferedChunk of bufferedChunks) {
+          const translated = translator.push(
+            decoder.decode(bufferedChunk, { stream: true }),
+          );
+          if (await consumeAnthropicEvents(translated)) {
+            break anthropicRead;
+          }
+        }
+        bufferedChunks = [];
+        continue;
+      }
+      const translated = translator.push(decoder.decode(chunk, { stream: true }));
+      if (await consumeAnthropicEvents(translated)) {
+        break;
+      }
+    }
+  }
+
+  if (!detectedEventStream) {
+    const bodyText = Buffer.concat(bufferedChunks).toString("utf8");
+    const response = tryParseJson(bodyText);
+    if (response) {
+      return {
+        chat: anthropicMessageToChatCompletion(response, route),
+        stream: null,
+      };
+    }
+    throw new UpstreamHttpError(
+      502,
+      `Upstream returned non-JSON body: ${bodyText.slice(0, 500)}`,
+      upstreamUrl,
+      route,
+    );
+  }
+
+  if (!stream.completed) {
+    const decoderTail = decoder.decode();
+    if (decoderTail) {
+      await consumeAnthropicEvents(translator.push(decoderTail));
+    }
+  }
+  if (!stream.completed) {
+    await consumeAnthropicEvents(translator.end());
+  }
+  if (!stream.completed) {
+    const message =
+      `CodexBridge upstream Anthropic stream from ${route.displayName || route.id || route.model || "route"} ` +
+      "ended before finish_reason or message_stop.";
+    const error = new UpstreamStreamError(
+      message,
+      upstreamUrl,
+      route,
+      "upstream_stream_truncated",
+    );
+    if (stream.responseStarted && !res.destroyed && !res.writableEnded) {
+      res.end(buildResponsesStreamErrorSse(message, {
+        code: "upstream_stream_truncated",
+        model: requestedModel || route.id || route.model || null,
+      }));
+    }
+    throw error;
+  }
+  return { chat: stream.chat, stream };
+}
+
 async function callChatCompletionsResponsesStreamUpstream(
   upstreamUrl,
   route,
@@ -2282,6 +2632,29 @@ async function callChatCompletionsResponsesStreamUpstream(
   let detectedEventStream = responseUsesEventStream(upstream);
   let bufferedChunks = [];
   let downstreamHeadersSent = false;
+  const terminalAbortController = new AbortController();
+  const readSignal = context.clientSignal
+    ? AbortSignal.any([context.clientSignal, terminalAbortController.signal])
+    : terminalAbortController.signal;
+  const readContext = { ...context, clientSignal: readSignal };
+  let terminalGraceTimer = null;
+  let terminalGraceExpired = false;
+  const terminalReady = () => {
+    if (stream.sawDone || stream.failed || stream.chat?.usage) {
+      return true;
+    }
+    if (!stream.completed) {
+      return false;
+    }
+    if (!terminalGraceTimer) {
+      terminalGraceTimer = setTimeout(() => {
+        terminalGraceExpired = true;
+        terminalAbortController.abort();
+      }, CHAT_STREAM_TERMINAL_GRACE_MS);
+      terminalGraceTimer.unref?.();
+    }
+    return false;
+  };
   const writeStreamEvents = async (events) => {
     if (events.length > 0 && !downstreamHeadersSent) {
       res.writeHead(200, {
@@ -2295,37 +2668,60 @@ async function callChatCompletionsResponsesStreamUpstream(
       await writeResponseChunk(res, event, context);
     }
   };
-  if (upstream.body) {
-    for await (const chunk of readUpstreamBody(
-      upstream,
-      context,
-      route,
-      activeUpstreamUrl,
-      { streamingResponse: true },
-    )) {
-      if (!detectedEventStream) {
-        bufferedChunks.push(chunk);
-        const bufferedText = Buffer.concat(bufferedChunks).toString("utf8");
-        if (!looksLikeSseResponse(bufferedText)) {
-          continue;
-        }
-        detectedEventStream = true;
-        for (const bufferedChunk of bufferedChunks) {
-          await writeStreamEvents(stream.push(bufferedChunk));
-          if (stream.sawDone) {
+  try {
+    if (upstream.body) {
+      for await (const chunk of readUpstreamBody(
+        upstream,
+        readContext,
+        route,
+        activeUpstreamUrl,
+        { streamingResponse: true },
+      )) {
+        if (!detectedEventStream) {
+          bufferedChunks.push(chunk);
+          const bufferedText = Buffer.concat(bufferedChunks).toString("utf8");
+          if (!looksLikeSseResponse(bufferedText)) {
+            continue;
+          }
+          detectedEventStream = true;
+          for (const bufferedChunk of bufferedChunks) {
+            await writeStreamEvents(stream.push(bufferedChunk));
+            if (terminalReady()) {
+              break;
+            }
+          }
+          bufferedChunks = [];
+          if (terminalReady()) {
             break;
           }
+          continue;
         }
-        bufferedChunks = [];
-        if (stream.sawDone) {
+        await writeStreamEvents(stream.push(chunk));
+        if (terminalReady()) {
           break;
         }
-        continue;
       }
-      await writeStreamEvents(stream.push(chunk));
-      if (stream.sawDone) {
-        break;
-      }
+    }
+  } catch (error) {
+    const postFinishTailError = Boolean(
+      terminalGraceTimer &&
+      stream.completed &&
+      !stream.failed &&
+      !context.clientSignal?.aborted
+    );
+    if (!postFinishTailError) {
+      throw error;
+    }
+    if (!terminalGraceExpired) {
+      console.warn(
+        `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+          `!! ignored post-finish upstream error route=${route.id || "-"} ` +
+          `error=${safeText(error?.message || error, 200)}`,
+      );
+    }
+  } finally {
+    if (terminalGraceTimer) {
+      clearTimeout(terminalGraceTimer);
     }
   }
   if (!detectedEventStream) {
@@ -3217,7 +3613,7 @@ async function recordResponsesHistory(
   response,
   sourceMessages,
   toolContext,
-  { requestBody = {}, route = {} } = {},
+  { requestBody = {}, route = {}, deferPersistence = false } = {},
 ) {
   if (!history || !isResponsesObject(response)) {
     return;
@@ -3227,7 +3623,7 @@ async function recordResponsesHistory(
     response,
     [
       ...sourceMessages,
-      assistantHistoryMessageFromResponse(response, toolContext),
+      assistantHistoryMessageFromResponse(response, toolContext, route),
     ],
     {
       api: "responses",
@@ -3236,7 +3632,7 @@ async function recordResponsesHistory(
       upstreamKnown: true,
       ...responseRequestUserMeta(requestBody),
     },
-    { requestBody, route },
+    { requestBody, route, deferPersistence },
   );
 }
 
@@ -3245,7 +3641,7 @@ async function recordHistoryTurn(
   response,
   messages,
   meta = {},
-  { requestBody = {}, route = {} } = {},
+  { requestBody = {}, route = {}, deferPersistence = false } = {},
 ) {
   if (!history) {
     return;
@@ -3255,6 +3651,18 @@ async function recordHistoryTurn(
     return;
   }
   try {
+    if (
+      deferPersistence &&
+      typeof history.stageTurn === "function" &&
+      typeof history.persistStagedTurnAsync === "function"
+    ) {
+      const responseId = history.stageTurn(turn);
+      await history.persistStagedTurnAsync(responseId);
+      return;
+    }
+    if (deferPersistence) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
     if (typeof history.recordTurnAsync === "function") {
       await history.recordTurnAsync(turn);
       return;
@@ -3315,14 +3723,12 @@ function shouldStripReasoningTags(route = {}) {
 function shouldEmitChatResponseTextDeltas(
   requestBody = {},
   route = {},
-  context = {},
-  converted = {},
+  _context = {},
+  _converted = {},
 ) {
   return (
     !shouldStripReasoningTags(route) &&
-    !interactivePluginKindForRequest(requestBody) &&
-    !context.failoverFromRoute &&
-    !mayContinueWithBridgeCapability(converted, context)
+    !interactivePluginKindForRequest(requestBody)
   );
 }
 
@@ -3354,13 +3760,4 @@ function shouldExposeChatReasoningSummary(route = {}) {
   } catch {
     return false;
   }
-}
-
-function mayContinueWithBridgeCapability(converted = {}, context = {}) {
-  if (typeof context.executeCapabilityRequest !== "function") {
-    return false;
-  }
-  return (converted?.body?.tools || []).some(
-    (tool) => tool?.function?.name === CODEXBRIDGE_CAPABILITY_TOOL_NAME,
-  );
 }

@@ -5,6 +5,11 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { removeOwnedTemporaryDirectory } from "./smoke-temp-cleanup.mjs";
+import {
+  DESKTOP_RELEASE_BUILD_METADATA_FILE,
+  packagedSmokeSourceEvidence,
+} from "./release-source-fingerprint.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const targetArch = process.env.CODEXBRIDGE_MAC_ARCH || process.arch;
@@ -40,6 +45,13 @@ assert.ok(
   `missing packaged Electron Framework target: ${electronFrameworkTargetPath}`,
 );
 assert.ok(fs.existsSync(path.join(appRoot, "src", "server.js")), "missing packaged router script");
+const buildMetadata = readPackagedBuildMetadata(appRoot);
+const sourceEvidence = packagedSmokeSourceEvidence({ buildMetadata }, repoRoot);
+assert.equal(
+  sourceEvidence.ok,
+  true,
+  "packaged macOS app was built from older source; run package:mac again before smoke testing",
+);
 
 if (process.platform === "darwin") {
   await smokeRouter(executablePath, appRoot);
@@ -50,6 +62,18 @@ if (process.platform === "darwin") {
 }
 
 console.log(`Packaged macOS smoke passed: ${appPath}`);
+
+function readPackagedBuildMetadata(appRoot) {
+  const metadataPath = path.join(appRoot, DESKTOP_RELEASE_BUILD_METADATA_FILE);
+  assert.ok(fs.existsSync(metadataPath), `missing packaged build metadata: ${metadataPath}`);
+  const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
+  assert.equal(metadata.schemaVersion, 1, "unsupported packaged build metadata schema");
+  assert.equal(metadata.algorithm, "sha256", "unsupported packaged source fingerprint algorithm");
+  assert.match(String(metadata.sourceFingerprint || ""), /^[a-f0-9]{64}$/u);
+  const packagedApp = JSON.parse(fs.readFileSync(path.join(appRoot, "package.json"), "utf8"));
+  assert.equal(metadata.appVersion, packagedApp.version, "packaged build metadata version mismatch");
+  return metadata;
+}
 
 function newestPackagedAppDir(arch) {
   const releaseDir = path.join(repoRoot, "release");
@@ -133,8 +157,42 @@ async function smokeRouter(executablePath, appRoot) {
       `packaged macOS router smoke failed: ${error.message}\nstdout:\n${stdout}\nstderr:\n${stderr}`,
     );
   } finally {
-    child.kill();
+    await terminateChild(child);
+    removeOwnedTemporaryDirectory(tempDir, {
+      parentDirectory: os.tmpdir(),
+      requiredPrefix: "codexbridge-packaged-macos-",
+    });
   }
+}
+
+async function terminateChild(child) {
+  if (!child || child.exitCode !== null || child.signalCode) {
+    return;
+  }
+  child.kill("SIGTERM");
+  await waitForChildExit(child, 5000);
+  if (child.exitCode === null && !child.signalCode) {
+    child.kill("SIGKILL");
+    await waitForChildExit(child, 2000);
+  }
+  if (child.exitCode === null && !child.signalCode) {
+    throw new Error(`packaged macOS smoke child process did not exit: ${child.pid || "unknown"}`);
+  }
+}
+
+function waitForChildExit(child, timeoutMs) {
+  if (!child || child.exitCode !== null || child.signalCode) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      child.removeListener("exit", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    child.once("exit", finish);
+  });
 }
 
 async function waitForHealth(port, timeoutMs) {

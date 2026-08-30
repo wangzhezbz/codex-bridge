@@ -9,13 +9,15 @@ import { revalidateInstallRootCapability } from "./path-policy.mjs";
 import { isTrustedCatalogService } from "./catalog-trust.mjs";
 
 const COMPONENT_EXTENSIONS = Object.freeze({
-  chatgpt: ".zip",
-  v2rayn: ".7z",
-  git: ".exe",
+  chatgpt: Object.freeze([".zip"]),
+  v2rayn: Object.freeze([".7z", ".zip"]),
+  git: Object.freeze([".exe"]),
 });
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
 const SKILL_ID = /^[a-z0-9][a-z0-9-]{0,63}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
+const MANAGED_COMPONENT_PART = /^(?:chatgpt|v2rayn|git)-\d+(?:\.\d+){0,3}\.(?:zip|7z|exe)\.part$/u;
+const MANAGED_SKILL_PART = /^skill-[a-z0-9][a-z0-9-]{0,63}-\d+(?:\.\d+){0,3}\.zip\.part$/u;
 
 function workspaceError(code, cause) {
   const error = new Error(code, cause === undefined ? undefined : { cause });
@@ -26,6 +28,11 @@ function workspaceError(code, cause) {
 function isOccupied(error) {
   return error?.code === "entry_exists" || error?.code === "EEXIST"
     || error?.nativeCode === 80 || error?.nativeCode === 183;
+}
+
+function isBusy(error) {
+  return error?.code === "EBUSY" || error?.code === "EPERM"
+    || error?.nativeCode === 32 || error?.nativeCode === 33;
 }
 
 function validIdentifier(value, pattern) {
@@ -45,7 +52,7 @@ function validateDownload(request = {}) {
   } catch {
     throw workspaceError("workspace_identifier_invalid");
   }
-  if (extension !== COMPONENT_EXTENSIONS[component]) throw workspaceError("workspace_identifier_invalid");
+  if (!COMPONENT_EXTENSIONS[component].includes(extension)) throw workspaceError("workspace_identifier_invalid");
   if (!Number.isSafeInteger(request.size) || request.size <= 0
     || request.size > MAX_SOFTWARE_PACKAGE_BYTES || !SHA256.test(request.sha256 ?? "")) {
     throw workspaceError("workspace_asset_invalid");
@@ -121,6 +128,32 @@ export function createInstallerWorkspace({
   const authorities = new WeakMap();
   const promotedPackageProofs = new WeakMap();
   const pending = new Map();
+  const currentManagedPartNames = new Set([
+    ...Object.keys(COMPONENT_EXTENSIONS).map((componentId) => {
+      const entry = catalogService.getComponent(componentId);
+      return `${entry.id}-${entry.version}.${entry.format}.part`;
+    }),
+    ...catalogService.listSkills().map((entry) => `skill-${entry.id}-${entry.version}.zip.part`),
+  ].map((name) => name.toLowerCase()));
+
+  async function cleanupStaleManagedParts(session, downloadsDirectory, protectedPartName = "") {
+    if (typeof session.listDirectChildNamesNoFollow !== "function") return;
+    const protectedLower = protectedPartName.toLowerCase();
+    const names = await session.listDirectChildNamesNoFollow(downloadsDirectory, { limit: 256 });
+    for (const name of names) {
+      const lower = name.toLowerCase();
+      if ((!MANAGED_COMPONENT_PART.test(name) && !MANAGED_SKILL_PART.test(name))
+        || currentManagedPartNames.has(lower)
+        || lower === protectedLower) continue;
+      let receipt;
+      try {
+        receipt = await session.openFileChildNoFollow(downloadsDirectory, name);
+        if (receipt) await session.deleteIssuedChildNoFollow(receipt);
+      } catch (error) {
+        if (!isBusy(error)) throw error;
+      }
+    }
+  }
 
   function requireDownloadAuthority(record) {
     const authority = authorities.get(record);
@@ -198,9 +231,9 @@ export function createInstallerWorkspace({
       session = requireSession(openedSession);
     } catch (error) {
       if (typeof openedSession?.close !== "function") throw error;
-      await openedSession.close().catch((closeError) => {
+      try { await openedSession.close(); } catch (closeError) {
         throw new AggregateError([error, closeError], error.message, { cause: error });
-      });
+      }
       throw error;
     }
     try {
@@ -208,9 +241,9 @@ export function createInstallerWorkspace({
       if (confirmed.toLowerCase() !== rootPath.toLowerCase()) throw workspaceError("install_root_identity_changed");
       return { rootPath, session };
     } catch (error) {
-      await session.close().catch((closeError) => {
+      try { await session.close(); } catch (closeError) {
         throw new AggregateError([error, closeError], error.message, { cause: error });
-      });
+      }
       throw error;
     }
   }
@@ -338,6 +371,7 @@ export function createInstallerWorkspace({
         const downloads = await session.createOrOpenDirectoryChildNoFollow(
           session.root, "downloads", { requireEmpty: false, role: "rename-parent" },
         );
+        await cleanupStaleManagedParts(session, downloads, partName);
         const occupied = await session.openFileChildNoFollow(downloads, finalName);
         const fileReceipt = occupied ?? await createOrOpenPart(session, downloads, partName);
         let record;
@@ -370,9 +404,9 @@ export function createInstallerWorkspace({
         authority.downloadTarget = createDownloadTarget(authority);
         return record;
       } catch (error) {
-        await session.close().catch((closeError) => {
+        try { await session.close(); } catch (closeError) {
           throw new AggregateError([error, closeError], error.message, { cause: error });
-        });
+        }
         throw error;
       }
     }, binding);
@@ -459,9 +493,9 @@ export function createInstallerWorkspace({
       });
       return record;
     } catch (error) {
-      await session.close().catch((closeError) => {
+      try { await session.close(); } catch (closeError) {
         throw new AggregateError([error, closeError], error.message, { cause: error });
-      });
+      }
       throw error;
     }
   }

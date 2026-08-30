@@ -67,6 +67,8 @@ test("SSE shape detection recognizes leading and embedded SSE field lines", asyn
 
   assert.equal(looksLikeSseResponse("  data: [DONE]\n\n"), true);
   assert.equal(looksLikeSseResponse("event: response.created\ndata: {}\n\n"), true);
+  assert.equal(looksLikeSseResponse(": keep-alive\n\n"), true);
+  assert.equal(looksLikeSseResponse("gateway-prefix\n: keep-alive\n"), true);
   assert.equal(looksLikeSseResponse("gateway-prefix\nevent: response.failed\n"), true);
 });
 
