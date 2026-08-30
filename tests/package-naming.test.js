@@ -225,6 +225,11 @@ test("project and Windows CI gates include the complete desktop refresh flow", (
   );
   assert.match(
     workflow,
+    /- name: Run isolated software-manager transaction\s+env:\s+CODEXBRIDGE_SKIP_WINDOWS_HOSTED_RUNNER_INTEGRATION: "1"\s+CODEXBRIDGE_SOFTWARE_MANAGER_FAKE_HOST: "1"\s+CODEXBRIDGE_SOFTWARE_MANAGER_TEST_ROOT: "\$\{\{ runner\.temp \}\}\\\\codexbridge-software-manager"\s+run: npm run test:software-manager/,
+    "the isolated fake-host transaction must skip unstable real hosted-runner integrations",
+  );
+  assert.match(
+    workflow,
     /jobs:\s+windows:[\s\S]*?uses: actions\/setup-python@v5[\s\S]*?python-version: "3\.12"[\s\S]*?run: npm run check/u,
     "Windows CI must provision the Python runtime before the complete project check",
   );
