@@ -7,6 +7,7 @@ import { createComponentAdapters } from "../desktop/software-manager/component-a
 import { createTrustedCatalogService, verifyCatalogEnvelope } from "../desktop/software-manager/catalog-trust.mjs";
 import { getOwnershipCoordinator } from "../desktop/software-manager/ownership-coordinator.mjs";
 import { createWindowsHost } from "../desktop/software-manager/windows-host.mjs";
+import { createSoftwareManagerService } from "../desktop/software-manager/service.mjs";
 import {
   authorizeDesktopPath, authorizeInstallRoot, authorizeSkillsRoot,
 } from "../desktop/software-manager/path-policy.mjs";
@@ -80,6 +81,114 @@ function trustedCatalog(entries = {}) {
 }
 
 const TRUSTED_CATALOG = trustedCatalog();
+
+for (const componentId of ["chatgpt", "v2rayn", "git"]) {
+  test(`late ${componentId} prepare cancellation releases its reservation and permits another installation`, async () => {
+    let service;
+    let cancelOnce = true;
+    const cancelAtLastPrepareStep = () => {
+      if (!cancelOnce) return;
+      cancelOnce = false;
+      assert.deepEqual(service.cancelTask(), { cancelled: true });
+    };
+    const gitDiscovery = { kind: "none" };
+    const harness = fixture({
+      gitDiscovery,
+      onVerifyComponent: ({ phase }) => {
+        if (phase === "staging" && componentId !== "git") cancelAtLastPrepareStep();
+      },
+      onGitPin: componentId === "git" ? cancelAtLastPrepareStep : null,
+      onGitInstall: () => Object.assign(gitDiscovery, {
+        ...externalGit, version: "2.51.0", installDir: "D:\\CBApps\\Git",
+        executablePath: "D:\\CBApps\\Git\\cmd\\git.exe", uninstallerPath: "D:\\CBApps\\Git\\unins000.exe",
+      }),
+    });
+    service = createSoftwareManagerService({
+      platform: "win32",
+      catalogService: TRUSTED_CATALOG,
+      adapters: harness.adapters,
+      ownershipStore: { load: async () => harness.getState() },
+      recoverTransactions: async () => [],
+      installRootResolver: {
+        getCurrentToken: () => "root_token_00000001",
+        resolve: async () => INSTALL_CAPABILITY,
+        choose: async () => ({ token: "root_token_00000001", capability: INSTALL_CAPABILITY }),
+        adopt: async () => {}, discard: async () => {},
+      },
+    });
+    const request = { kind: "install", componentIds: [componentId], skillIds: [] };
+    const cancelled = await service.startTask(request);
+    assert.equal(cancelled.status, "cancelled");
+    assert.equal(harness.getState().activeTask, null, "cancelled preparation must not retain a live reservation");
+    assert.equal(harness.calls.promotions.length, 0);
+    assert.equal(harness.calls.gitInstalls.length, 0);
+    assert.deepEqual(service.prepareForQuit(), { allowQuit: true });
+
+    const retried = await service.startTask(request);
+    assert.equal(retried.status, "succeeded", JSON.stringify(retried));
+    assert.equal(harness.getState().activeTask, null);
+    assert.equal(harness.calls.promotions.length + harness.calls.gitInstalls.length, 1);
+  });
+
+  test(`${componentId} prepared cleanup is task-scoped and idempotent`, async () => {
+    const harness = fixture();
+    const adapter = harness.adapters[componentId];
+    assert.equal((await adapter.prepare({ taskId: "prepared-owner", selected: true })).status, "succeeded");
+    const reserved = harness.getState();
+    assert.equal(await adapter.discardPrepared({ taskId: "different-task" }), false);
+    assert.deepEqual(harness.getState(), reserved);
+    assert.equal(harness.calls.discardedPreparedVersions.length + harness.calls.gitReleases.length, 0);
+    assert.equal(await adapter.discardPrepared({ taskId: "prepared-owner" }), true);
+    assert.equal(harness.getState().activeTask, null);
+    assert.equal(harness.getState().installRoot, null);
+    assert.equal(await adapter.discardPrepared({ taskId: "prepared-owner" }), false);
+    assert.equal(harness.calls.discardedPreparedVersions.length + harness.calls.gitReleases.length, 1);
+    assert.equal((await adapter.commit({ taskId: "prepared-owner" })).status, "failed");
+    assert.equal(harness.calls.promotions.length + harness.calls.gitInstalls.length, 0);
+  });
+
+  test(`${componentId} prepared cleanup releases its lease when clearing the journal fails`, async () => {
+    const harness = fixture({ stateSaveFailureAt: componentId === "git" ? 2 : 3 });
+    const adapter = harness.adapters[componentId];
+    assert.equal((await adapter.prepare({ taskId: "cleanup-save-failure", selected: true })).status, "succeeded");
+    await assert.rejects(adapter.discardPrepared({ taskId: "cleanup-save-failure" }), /state_save_failed/u);
+    assert.equal(harness.getState().activeTask.kind, "component-prepare", "failed cleanup must remain recoverable");
+    await harness.createAnotherProcessAdapters()[componentId].inspectInstalled({});
+    assert.equal(harness.getState().activeTask, null, "recovery must not be blocked by the cancelled operation's lease");
+    assert.equal(harness.calls.promotions.length + harness.calls.gitInstalls.length, 0);
+  });
+}
+
+test("discarding an archive preparation preserves the installed component and shortcuts", async () => {
+  const harness = fixture();
+  await harness.adapters.chatgpt.prepare({ taskId: "first-install" });
+  assert.equal((await harness.adapters.chatgpt.commit({ taskId: "first-install" })).status, "succeeded");
+  const installed = harness.getState();
+  await harness.adapters.chatgpt.prepare({ taskId: "cancelled-reinstall" });
+  await harness.adapters.chatgpt.discardPrepared({ taskId: "cancelled-reinstall" });
+  const after = harness.getState();
+  assert.deepEqual(after.components, installed.components);
+  assert.deepEqual(after.shortcuts, installed.shortcuts);
+  assert.deepEqual(after.rollback, installed.rollback);
+  assert.equal(after.installRoot, installed.installRoot);
+  assert.equal(harness.calls.deletedComponents.length, 0);
+  assert.equal(harness.calls.removedShortcuts.length, 0);
+});
+
+test("reinstall repairs a deleted recorded desktop shortcut without duplicating a valid one", async () => {
+  const harness = fixture();
+  await harness.adapters.chatgpt.prepare({ taskId: "shortcut-first" });
+  assert.equal((await harness.adapters.chatgpt.commit({ taskId: "shortcut-first" })).status, "succeeded");
+  const recorded = harness.getState().shortcuts[0];
+  await harness.windowsHost.removeRecordedShortcut(recorded);
+  await harness.adapters.chatgpt.prepare({ taskId: "shortcut-repair" });
+  assert.equal((await harness.adapters.chatgpt.commit({ taskId: "shortcut-repair" })).status, "succeeded");
+  assert.equal(harness.calls.shortcuts.length, 2, "A stale ownership record must not suppress shortcut creation");
+  assert.equal(harness.getState().shortcuts.length, 1);
+  await harness.adapters.chatgpt.prepare({ taskId: "shortcut-again" });
+  assert.equal((await harness.adapters.chatgpt.commit({ taskId: "shortcut-again" })).status, "succeeded");
+  assert.equal(harness.calls.shortcuts.length, 2, "A valid desktop shortcut must be reused");
+});
 
 function emptyState(installRoot = null) {
   return {
@@ -316,6 +425,10 @@ function fixture({
       next.rollback = null;
       await testOwnershipCoordinator.store.save(next);
       return { componentId, version: previous.version, rollbackAvailable: false };
+    },
+    async inspectRollback(componentId) {
+      const record = Array.isArray(currentState.rollback) ? currentState.rollback.find(item => item.componentId === componentId) : null;
+      return { available: Boolean(record), reason: record ? null : "rollback_not_available", version: record?.version ?? null };
     },
   };
   let verifyCalls = 0;
@@ -589,7 +702,7 @@ function fixture({
   };
   const adapters = createComponentAdapters(adapterOptions);
   return {
-    adapters, calls, getState: () => structuredClone(currentState),
+    adapters, calls, windowsHost, getState: () => structuredClone(currentState),
     createAnotherAdapters: () => createComponentAdapters(adapterOptions),
     createAnotherProcessAdapters: () => createComponentAdapters({
       ...adapterOptions,

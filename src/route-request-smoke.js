@@ -1,3 +1,13 @@
+import boundedResponseBody from "../shared/bounded-response-body.cjs";
+import networkDeadline from "../shared/network-deadline.cjs";
+
+const { readBoundedResponseText } = boundedResponseBody;
+const { runWithNetworkDeadline } = networkDeadline;
+const DEFAULT_SMOKE_TIMEOUT_MS = 2 * 60_000;
+const MAX_SMOKE_TIMEOUT_MS = 10 * 60_000;
+const DEFAULT_SMOKE_RESPONSE_BYTES = 8 * 1024 * 1024;
+const MAX_SMOKE_RESPONSE_BYTES = 64 * 1024 * 1024;
+
 export async function runRouteRequestSmoke(options = {}) {
   const {
     baseUrl,
@@ -5,6 +15,8 @@ export async function runRouteRequestSmoke(options = {}) {
     userAgent = "CodexBridge route request smoke",
     cases = defaultRouteRequestSmokeCases(),
     fetchImpl = globalThis.fetch,
+    timeoutMs = DEFAULT_SMOKE_TIMEOUT_MS,
+    maxResponseBytes = DEFAULT_SMOKE_RESPONSE_BYTES,
   } = options;
 
   if (!baseUrl) {
@@ -17,7 +29,15 @@ export async function runRouteRequestSmoke(options = {}) {
   const results = [];
   for (const item of cases) {
     const endpoint = caseEndpoint(baseUrl, item);
-    results.push(await runOneCase(endpoint, item, { authToken, userAgent, fetchImpl }));
+    results.push(await runOneCase(endpoint, item, {
+      authToken,
+      userAgent,
+      fetchImpl,
+      timeoutMs: boundedPositiveInteger(item.timeoutMs, timeoutMs, MAX_SMOKE_TIMEOUT_MS),
+      maxResponseBytes: boundedPositiveInteger(
+        item.maxResponseBytes, maxResponseBytes, MAX_SMOKE_RESPONSE_BYTES,
+      ),
+    }));
   }
 
   const passed = results.filter((result) => result.ok).length;
@@ -62,12 +82,29 @@ async function runOneCase(endpoint, item = {}, context = {}) {
   const startedAt = Date.now();
   const id = String(item.id || "unnamed");
   try {
-    const response = await context.fetchImpl(endpoint, {
-      method: "POST",
-      headers: requestHeaders(item.headers, context),
-      body: JSON.stringify(item.body || {}),
+    const { response, text } = await runWithNetworkDeadline(async (signal) => {
+      const nextResponse = await context.fetchImpl(endpoint, {
+        method: "POST",
+        headers: requestHeaders(item.headers, context),
+        body: JSON.stringify(item.body || {}),
+        signal,
+      });
+      const nextText = await readBoundedResponseText(nextResponse, {
+        maxBytes: context.maxResponseBytes,
+        signal,
+        createTooLargeError: ({ actualBytes }) => smokeError(
+          "route_smoke_response_too_large",
+          `Route smoke response is too large: ${actualBytes} bytes; limit ${context.maxResponseBytes} bytes.`,
+        ),
+      });
+      return { response: nextResponse, text: nextText };
+    }, {
+      timeoutMs: context.timeoutMs,
+      createTimeoutError: () => smokeError(
+        "route_smoke_timeout",
+        `Route smoke request timed out after ${context.timeoutMs}ms.`,
+      ),
     });
-    const text = await response.text();
     const json = parseJson(text);
     const checks = evaluateExpectations(item.expect || {}, {
       response,
@@ -99,9 +136,21 @@ async function runOneCase(endpoint, item = {}, context = {}) {
         },
       ],
       outputText: "",
-      errorCode: "",
+      errorCode: error?.code || "",
     };
   }
+}
+
+function smokeError(code, message) {
+  const error = new Error(message || code);
+  error.code = code;
+  return error;
+}
+
+function boundedPositiveInteger(value, fallback, maximum) {
+  const number = Number(value);
+  const selected = Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback;
+  return Math.min(selected, maximum);
 }
 
 function requestHeaders(extraHeaders = {}, context = {}) {

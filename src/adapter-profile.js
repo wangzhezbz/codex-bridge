@@ -23,10 +23,28 @@ const RESPONSES_SAFE_PARAMS = [
   "user",
 ];
 
-const CODEX_OPENAI_RESPONSES_SAFE_PARAMS = [
+const OPENAI_RESPONSES_SAFE_PARAMS = [
   ...RESPONSES_SAFE_PARAMS,
+  "multi_agent",
+  "context_management",
+];
+
+const CODEX_OPENAI_RESPONSES_SAFE_PARAMS = [
+  ...OPENAI_RESPONSES_SAFE_PARAMS,
   "prompt_cache_key",
   "client_metadata",
+];
+
+const ASTRA_API_RESPONSES_SAFE_PARAMS = [
+  ...OPENAI_RESPONSES_SAFE_PARAMS,
+  "prompt_cache_key",
+  "prompt_cache_options",
+  "prompt_cache_retention",
+];
+
+const SOL_LUNA_API_RESPONSES_SAFE_PARAMS = [
+  ...ASTRA_API_RESPONSES_SAFE_PARAMS,
+  "top_logprobs",
 ];
 
 const CHAT_SAFE_PARAMS = [
@@ -55,6 +73,8 @@ const CHAT_SAFE_PARAMS = [
   "thinking_budget",
   "extra_body",
 ];
+
+const SOL_LUNA_CHAT_SAFE_PARAMS = [...CHAT_SAFE_PARAMS, "logprobs", "top_logprobs"];
 
 const ANTHROPIC_MESSAGES_SAFE_PARAMS = [
   "model",
@@ -108,10 +128,13 @@ export function normalizeAdapterProfile(route = {}) {
     route.catalogContextWindow,
     contextWindow,
   );
-  const supportsTools = api === "responses" || api === "anthropic_messages"
-    ? "native"
-    : "chat-functions";
-  const supportsMcpNamespaces = true;
+  const responsesOnlyChatToolsUnavailable = api === "chat_completions"
+    && providerFamily === "openai"
+    && (isAstraModel(route.model || route.upstreamModel) || isGpt61SolModel(route.model || route.upstreamModel));
+  const supportsTools = responsesOnlyChatToolsUnavailable
+    ? "none"
+    : api === "responses" || api === "anthropic_messages" ? "native" : "chat-functions";
+  const supportsMcpNamespaces = supportsTools !== "none";
   const supportsFiles = route.supportsFiles || route.fileSupport || (
     api === "responses"
       ? "native"
@@ -130,6 +153,7 @@ export function normalizeAdapterProfile(route = {}) {
 
   return {
     adapterId,
+    upstreamModel: String(route.model || route.upstreamModel || ""),
     providerFamily,
     api,
     authMode,
@@ -158,10 +182,18 @@ export function normalizeAdapterProfile(route = {}) {
     safeParams: api === "responses"
       ? authMode === "codex_openai"
         ? CODEX_OPENAI_RESPONSES_SAFE_PARAMS
-        : RESPONSES_SAFE_PARAMS
+        : isGpt6NonAstraModel(route.model || route.upstreamModel)
+          ? SOL_LUNA_API_RESPONSES_SAFE_PARAMS
+          : isAstraModel(route.model || route.upstreamModel)
+            ? ASTRA_API_RESPONSES_SAFE_PARAMS
+            : providerFamily === "openai"
+              ? OPENAI_RESPONSES_SAFE_PARAMS
+              : RESPONSES_SAFE_PARAMS
       : api === "anthropic_messages"
         ? ANTHROPIC_MESSAGES_SAFE_PARAMS
-        : CHAT_SAFE_PARAMS,
+        : isGpt6NonAstraModel(route.model || route.upstreamModel)
+          ? SOL_LUNA_CHAT_SAFE_PARAMS
+          : CHAT_SAFE_PARAMS,
     dropParams,
     maxToolContinuationTurns: positiveInteger(
       route.maxToolContinuationTurns ?? route.max_tool_continuation_turns,
@@ -219,6 +251,7 @@ function capabilitiesForRoute(route, profile) {
     api: profile.api,
     providerFamily: profile.providerFamily,
     tools: profile.supportsTools,
+    ...(profile.supportsTools === "none" ? { toolConstraint: "responses-required" } : {}),
     mcpNamespaces: profile.supportsMcpNamespaces,
     images: profile.supportsImages,
     files: profile.supportsFiles,
@@ -311,7 +344,104 @@ export function filterPayloadForAdapter(payload = {}, profileOrRoute = {}, optio
   }
 
   applyRouteSpecificPayloadDefaults(result, profile, dropped);
+  applyGpt6PayloadContract(result, profile, dropped);
+  if (profile.api === "chat_completions"
+    && ((profile.providerFamily === "zhipu" && /^glm-5\.3(?:$|-)/i.test(profile.upstreamModel))
+      || (profile.providerFamily === "minimax" && /^MiniMax-M3\.1-Flash-Preview$/i.test(profile.upstreamModel)))) {
+    Object.assign(result, reasoningParamsForAdapter(result, { provider: profile.providerFamily,
+      model: profile.upstreamModel, api: "chat_completions" }));
+    // An omitted request effort uses the documented upstream default.
+    if (!hasReasoningControls(result)) delete result.reasoning_effort;
+  }
+  if (profile.api === "responses" && result.multi_agent?.enabled === true) {
+    // Hosted multi-agent does not accept reasoning summaries. Do not change
+    // the selected effort or turn multi-agent on for ordinary requests.
+    if (result.reasoning && typeof result.reasoning === "object") delete result.reasoning.summary;
+  }
   return result;
+}
+
+function isAstraModel(model) {
+  return String(model || "").trim().toLowerCase() === "gpt-6-astra";
+}
+
+function isGpt61SolModel(model) {
+  return String(model || "").trim().toLowerCase() === "gpt-6.1-sol";
+}
+
+function isGpt6NonAstraModel(model) {
+  return ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"].includes(String(model || "").trim().toLowerCase());
+}
+
+function isKnownGpt6Model(model) {
+  return isAstraModel(model) || isGpt6NonAstraModel(model);
+}
+
+function normalizeGpt6Effort(effort, model, authMode) {
+  if (effort === "ultra" && isGpt61SolModel(model) && authMode !== "codex_openai") return "max";
+  return effort === "minimal" || ((isAstraModel(model) || isGpt61SolModel(model)) && effort === "none") ? "low" : effort;
+}
+
+function effectiveGpt6Effort(payload, profile) {
+  if (profile.api !== "responses") return payload.reasoning_effort;
+  let effort = payload.reasoning?.effort;
+  if (!isGpt6NonAstraModel(profile.upstreamModel) || !Array.isArray(payload.input)) return effort;
+  // A standard-mode configuration update changes the active effort without
+  // changing the request-level cache prefix. Inspect only native control items,
+  // never quoted user/tool content, and retain every item's original position.
+  const supported = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
+  if (isGpt61SolModel(profile.upstreamModel)) supported.add("ultra");
+  for (const item of payload.input) {
+    if (item?.type !== "configuration_update" || !supported.has(item.reasoning?.effort)) continue;
+    effort = normalizeGpt6Effort(item.reasoning.effort, profile.upstreamModel, profile.authMode);
+    item.reasoning.effort = effort;
+  }
+  return effort;
+}
+
+function applyGpt6PayloadContract(payload, profile, dropped) {
+  if (!isKnownGpt6Model(profile.upstreamModel)) return;
+  if (profile.api !== "responses" && profile.api !== "chat_completions") return;
+  const astra = isAstraModel(profile.upstreamModel);
+  const sol61 = isGpt61SolModel(profile.upstreamModel);
+  const activeTools = Array.isArray(payload.tools) && payload.tools.length > 0
+    && payload.tool_choice !== "none";
+  if ((astra || sol61) && profile.supportsTools === "none" && activeTools) {
+    const error = new Error(`${astra ? "Astra" : "GPT-6.1 Sol"} 的工具调用需要 Responses 接口。请在模型设置中将此模型的接口改为 Responses 后重试。`);
+    error.code = astra ? "astra_chat_tools_require_responses" : "gpt61_chat_tools_require_responses";
+    error.statusCode = 400;
+    throw error;
+  }
+  // GPT-6 Sol/Luna support none; Astra and GPT-6.1 Sol map it to low. Preserve all other
+  // supported choices, including subscription-only efforts, without switching APIs.
+  if (payload.reasoning && typeof payload.reasoning === "object" && Object.hasOwn(payload.reasoning, "effort")) {
+    payload.reasoning.effort = normalizeGpt6Effort(payload.reasoning.effort, profile.upstreamModel, profile.authMode);
+  }
+  if (Object.hasOwn(payload, "reasoning_effort")) {
+    payload.reasoning_effort = normalizeGpt6Effort(payload.reasoning_effort, profile.upstreamModel, profile.authMode);
+  }
+  const effort = effectiveGpt6Effort(payload, profile);
+  if (!astra && profile.providerFamily === "openai" && profile.api === "chat_completions"
+    && activeTools && effort !== "none") {
+    const error = new Error("GPT-6 Sol/Luna 在 Chat Completions 中仅关闭推理时支持函数调用。请使用 Responses 接口，或明确将 reasoning_effort 设为 none。");
+    error.code = "gpt6_chat_tools_require_no_reasoning";
+    error.statusCode = 400;
+    throw error;
+  }
+  // An omitted effort uses the upstream's reasoning default, not none.
+  if (astra || effort !== "none") {
+    for (const key of ["temperature", "top_p", "top_logprobs", "logprobs"]) delete payload[key];
+    if (Array.isArray(payload.include)) {
+      payload.include = payload.include.filter((value) => value !== "message.output_text.logprobs");
+    }
+  }
+  if (profile.api === "responses" && profile.authMode !== "codex_openai") {
+    if (payload.prompt_cache_retention !== undefined && payload.prompt_cache_options === undefined
+      && !dropped.has("prompt_cache_options")) {
+      payload.prompt_cache_options = { ttl: "30m" };
+    }
+    delete payload.prompt_cache_retention;
+  }
 }
 
 function sanitizePayloadValue(value, context) {
@@ -442,6 +572,9 @@ function applyCodexOpenAiResponsesContract(payload, profile) {
 }
 
 function sanitizeCodexOpenAiInput(payload) {
+  if (typeof payload.input === "string") {
+    payload.input = [{ role: "user", content: [{ type: "input_text", text: payload.input }] }];
+  }
   if (!Array.isArray(payload.input)) {
     return;
   }
@@ -476,6 +609,7 @@ function portableCodexOpenAiInputItems(input, options = {}) {
       .filter(Boolean),
   );
   return portableItems.filter((item) => {
+    if (isNativeAgentOrProgramItem(item)) return true;
     if (!["function_call_output", "custom_tool_call_output"].includes(item?.type)) {
       return true;
     }
@@ -496,7 +630,17 @@ function portableCodexOpenAiInputItem(item, options = {}) {
       return [];
     }
     const id = String(item.id || "").trim();
-    return id ? [{ id, type: "reasoning" }] : [];
+    return id ? [{
+      id,
+      type: "reasoning",
+      ...(typeof item.agent?.agent_name === "string" ? { agent: item.agent } : {}),
+    }] : [];
+  }
+
+  // Native agent/program state is replayable input, not a Chat message or a
+  // client-executed function. Flattening it loses attribution and continuation.
+  if (isNativeAgentOrProgramItem(item)) {
+    return [item];
   }
 
   if (isAssistantOutputMessage(item)) {
@@ -546,6 +690,12 @@ function portableCodexOpenAiInputItem(item, options = {}) {
     return [];
   }
   return [item];
+}
+
+function isNativeAgentOrProgramItem(item) {
+  return typeof item?.agent?.agent_name === "string"
+    || (item?.caller?.type === "program" && typeof item.caller.caller_id === "string")
+    || ["multi_agent_call", "multi_agent_call_output", "agent_message", "program", "program_output"].includes(item?.type);
 }
 
 function portableAssistantMessage(item, content) {
@@ -643,6 +793,10 @@ export function reasoningParamsForAdapter(request = {}, route = {}, options = {}
   if (profile.api !== "chat_completions" || !hasReasoningControls(request)) {
     return {};
   }
+  if (isKnownGpt6Model(route.model || route.upstreamModel)) {
+    const effort = reasoningEffort(request);
+    return effort ? { reasoning_effort: normalizeGpt6Effort(effort, route.model || route.upstreamModel, profile.authMode) } : {};
+  }
   if (profile.customConservative) {
     return rawReasoningParams(request);
   }
@@ -658,6 +812,15 @@ export function reasoningParamsForAdapter(request = {}, route = {}, options = {}
   if (supportsKimiThinkingParams(route, profile.providerFamily)) {
     return kimiReasoningParams(request);
   }
+  if (profile.providerFamily === "zhipu" && /^glm-5\.3(?:$|-)/i.test(String(route.model || ""))) {
+    const effort = reasoningEffort(request);
+    return { thinking: { type: "enabled" }, reasoning_effort: ["none", "minimal", "low"].includes(effort) ? "low"
+      : ["xhigh", "max", "maximum"].includes(effort) ? "max" : "high" };
+  }
+  if (profile.providerFamily === "minimax" && /^MiniMax-M3\.1-Flash-Preview$/i.test(String(route.model || ""))) {
+    const effort = reasoningEffort(request);
+    return { thinking: { type: "adaptive" }, reasoning_effort: ["low", "medium", "high", "xhigh", "max"].includes(effort) ? effort : "low" };
+  }
   if (profile.providerFamily === "qwen" || profile.providerFamily === "zhipu") {
     return enableThinkingParams(request, { hasTools });
   }
@@ -666,7 +829,7 @@ export function reasoningParamsForAdapter(request = {}, route = {}, options = {}
   }
   if (profile.providerFamily === "siliconflow") {
     if (siliconFlowUsesDeepSeekThinking(route)) {
-      return deepSeekReasoningParams(request);
+      return deepSeekReasoningParams(request, { legacyContract: true });
     }
     if (siliconFlowUsesEnableThinking(route)) {
       return enableThinkingParams(request, { hasTools });
@@ -823,7 +986,11 @@ function normalizedDropParams(route, context = {}) {
   const unsupportedReasoningParams = context.api === "chat_completions"
     ? CHAT_REASONING_PARAMS.filter((param) => !allowedReasoningParams.has(param))
     : [];
-  return [...new Set([...configured, ...unsupportedReasoningParams])].sort();
+  const unsupportedAstraParams = (isAstraModel(route.model || route.upstreamModel) || isGpt61SolModel(route.model || route.upstreamModel))
+    && ["responses", "chat_completions"].includes(context.api)
+    ? ["temperature", "top_p", "top_logprobs", "logprobs"]
+    : [];
+  return [...new Set([...configured, ...unsupportedReasoningParams, ...unsupportedAstraParams])].sort();
 }
 
 function reasoningParameterAllowList(route, context = {}) {
@@ -833,6 +1000,9 @@ function reasoningParameterAllowList(route, context = {}) {
   if (context.api === "anthropic_messages") {
     return ["thinking"];
   }
+  if (isKnownGpt6Model(route.model || route.upstreamModel)) {
+    return ["reasoning_effort"];
+  }
   if (context.customConservative) {
     return CHAT_REASONING_PARAMS;
   }
@@ -841,6 +1011,10 @@ function reasoningParameterAllowList(route, context = {}) {
   }
   if (supportsKimiThinkingParams(route, context.providerFamily)) {
     return ["thinking"];
+  }
+  if (context.providerFamily === "zhipu" && /^glm-5\.3(?:$|-)/i.test(String(route.model || route.upstreamModel || ""))
+    || context.providerFamily === "minimax" && /^MiniMax-M3\.1-Flash-Preview$/i.test(String(route.model || route.upstreamModel || ""))) {
+    return ["thinking", "reasoning_effort"];
   }
   if (context.providerFamily === "qwen" || context.providerFamily === "zhipu") {
     return ["enable_thinking", "thinking_budget"];
@@ -870,11 +1044,22 @@ function rawReasoningParams(request) {
   return result;
 }
 
-function deepSeekReasoningParams(request) {
+function deepSeekReasoningParams(request, { legacyContract = false } = {}) {
   const result = {};
-  const effort = deepSeekReasoningEffort(request);
+  const effort = deepSeekReasoningEffort(request, legacyContract);
   if (effort) {
     result.reasoning_effort = effort;
+  }
+  if (!legacyContract) {
+    // Official DeepSeek now defaults to thinking. Omitting the switch for
+    // `none` would silently enable it; minimal is an enabled low effort.
+    if (["none", "off", "disabled"].includes(reasoningEffort(request)) ||
+        request.thinking?.type === "disabled") {
+      result.thinking = { type: "disabled" };
+    } else if (effort || reasoningWantsThinking(request)) {
+      result.thinking = { type: "enabled" };
+    }
+    return result;
   }
   if (reasoningWantsThinking(request)) {
     result.thinking = { type: "enabled" };
@@ -944,8 +1129,14 @@ function reasoningEffort(request) {
   return String(value || "").trim().toLowerCase();
 }
 
-function deepSeekReasoningEffort(request) {
+function deepSeekReasoningEffort(request, legacyContract = false) {
   const effort = reasoningEffort(request);
+  if (!legacyContract) {
+    if (["minimal", "low"].includes(effort)) return "low";
+    if (["medium", "high", "xhigh"].includes(effort)) return "high";
+    if (["max", "maximum", "ultra"].includes(effort)) return "max";
+    return "";
+  }
   if (["xhigh", "max", "maximum"].includes(effort)) {
     return "max";
   }
@@ -980,7 +1171,12 @@ function supportsDeepSeekThinkingParams(route, providerFamily) {
   if (providerFamily !== "deepseek") {
     return false;
   }
-  return /deepseek-v4/i.test(String(route.model || route.id || ""));
+  return isDeepSeekThinkingModel(route.model || route.id);
+}
+
+export function isDeepSeekThinkingModel(model) {
+  const value = String(model || "").trim().toLowerCase();
+  return value === "deepseek-flash" || /deepseek-v4/.test(value);
 }
 
 function supportsKimiThinkingParams(route, providerFamily) {

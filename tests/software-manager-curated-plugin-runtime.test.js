@@ -3,6 +3,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+import { runInNewContext } from "node:vm";
 
 import {
   installCuratedCodexPluginResource,
@@ -147,8 +150,7 @@ test("curated plugin detection never blocks the Electron event loop", async () =
   assert.equal(listed.length, 2);
 });
 
-test("curated plugin install shares one total deadline and reports command timeouts clearly", async () => {
-  assert.match(installCuratedCodexPluginResource.toString(), /timeoutMs = 300000/u);
+test("curated plugin install shares one total deadline and reports command timeouts clearly", async (t) => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "curated-plugin-timeout-"));
   const fixture = fakeCodex(homeDir);
   await assert.rejects(
@@ -165,19 +167,38 @@ test("curated plugin install shares one total deadline and reports command timeo
 
   const sharedHome = fs.mkdtempSync(path.join(os.tmpdir(), "curated-plugin-shared-timeout-"));
   const sharedFixture = fakeCodex(sharedHome);
-  const startedAt = Date.now();
-  await assert.rejects(
-    installCuratedCodexPluginResource({
-      homeDir: sharedHome,
-      id: "claude-mem",
-      executable: process.execPath,
-      codexCliArgsPrefix: [sharedFixture.cli],
-      env: { ...sharedFixture.env, CODEX_FAKE_DELAY_MS: "35" },
-      timeoutMs: 90,
-    }),
-    /命令超时|curated_plugin_timeout/u,
-  );
-  assert.ok(Date.now() - startedAt < 250);
+  let now = 1000;
+  const commands = [];
+  const clock = t.mock.method(Date, "now", () => now);
+  const exec = t.mock.method(childProcess, "execFile", (_file, args, options, callback) => {
+    const command = args.slice(1);
+    commands.push({ command, timeout: options.timeout });
+    now += 40;
+    const result = command[1] === "list" ? { plugins: [] }
+      : command[1] === "marketplace" && command[2] === "list" ? { marketplaces: [] }
+        : { ok: true };
+    queueMicrotask(() => callback(null, JSON.stringify(result), ""));
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(
+      installCuratedCodexPluginResource({
+        homeDir: sharedHome, id: "claude-mem", executable: process.execPath,
+        codexCliArgsPrefix: [sharedFixture.cli], env: sharedFixture.env, timeoutMs: 90,
+      }),
+      { code: "curated_plugin_timeout" },
+    );
+    assert.deepEqual(commands.map(({ timeout }) => timeout), [90, 50, 10]);
+    assert.deepEqual(commands.map(({ command }) => command.slice(0, 3)), [
+      ["plugin", "list", "--json"],
+      ["plugin", "marketplace", "list"],
+      ["plugin", "marketplace", "add"],
+    ]);
+  } finally {
+    exec.mock.restore();
+    clock.mock.restore();
+    syncBuiltinESMExports();
+  }
 });
 
 test("curated plugin installation rejects a same-name marketplace from another repository before mutation", async () => {
@@ -201,22 +222,25 @@ test("curated plugin installation rejects a same-name marketplace from another r
   ]);
 });
 
-test("desktop exposes one tracked curated-plugin batch IPC and integrates it with managed quit", () => {
+test("retired curated-plugin operations are not registered or exposed to the renderer", () => {
   const root = path.resolve(import.meta.dirname, "..");
   const main = fs.readFileSync(path.join(root, "desktop", "main.cjs"), "utf8");
   const preload = fs.readFileSync(path.join(root, "desktop", "preload.cjs"), "utf8");
   const app = fs.readFileSync(path.join(root, "desktop", "renderer", "app.js"), "utf8");
   for (const route of ["curatedPlugin:list", "curatedPlugin:runTask"]) {
-    assert.equal(main.includes(`ipcMain.handle("${route}"`), true);
+    assert.equal(main.includes(`ipcMain.handle("${route}"`), false);
   }
   assert.doesNotMatch(main, /ipcMain\.handle\("curatedPlugin:(?:install|remove)"/u);
-  assert.match(main, /chatgpt\?\.installedVersion[\s\S]*?path\.join\(chatgpt\.installPath, "resources", "codex\.exe"\)/u);
-  assert.match(preload, /listCuratedCodexPlugins:\s*\(\)\s*=>\s*ipcRenderer\.invoke\("curatedPlugin:list"\)/u);
-  assert.match(preload, /runCuratedCodexPluginTask:\s*\(payload\)\s*=>\s*ipcRenderer\.invoke\("curatedPlugin:runTask", payload\)/u);
+  let exposed;
+  runInNewContext(preload, { process: { platform: "win32" }, require: name => {
+    assert.equal(name, "electron");
+    return { contextBridge: { exposeInMainWorld(_name, api) { exposed = api; } }, ipcRenderer: {} };
+  } });
+  assert.equal(typeof exposed.startSoftwareManagerTask, "function");
+  assert.equal(Object.hasOwn(exposed, "listCuratedCodexPlugins"), false);
+  assert.equal(Object.hasOwn(exposed, "runCuratedCodexPluginTask"), false);
   assert.match(app, /selectedPluginIds/u);
-  assert.match(app, /api\.runCuratedCodexPluginTask\(\{[\s\S]*?kind: request\.kind,[\s\S]*?pluginIds/u);
-  assert.match(main, /let curatedPluginTask = null/u);
-  assert.match(main, /CURATED_PLUGIN_TASK_TIMEOUT_MS = 5 \* 60 \* 1000/u);
-  assert.match(main, /prepareCuratedPluginAppQuit/u);
-  assert.match(main, /cancelCuratedPluginTask/u);
+  const softwareManagement = app.slice(app.indexOf("async function ensureSoftwareManagerLoaded"), app.indexOf("softwareManagerRoot?.addEventListener"));
+  assert.ok(softwareManagement.length > 0);
+  assert.doesNotMatch(softwareManagement, /api\.(?:runCuratedCodexPluginTask|listCuratedCodexPlugins)/u);
 });

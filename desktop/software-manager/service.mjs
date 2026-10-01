@@ -57,6 +57,18 @@ function stringError(error) {
   return "software_manager_operation_failed";
 }
 
+function errorCodeChain(error, result = [], depth = 0) {
+  if (!error || depth > 4 || result.length >= 8) return result;
+  if (typeof error.code === "string" && error.code && !result.includes(error.code)) {
+    result.push(error.code);
+  }
+  if (Array.isArray(error.errors)) {
+    for (const nested of error.errors) errorCodeChain(nested, result, depth + 1);
+  }
+  errorCodeChain(error.cause, result, depth + 1);
+  return result;
+}
+
 function decodePercent(value) {
   let decoded = value;
   for (let index = 0; index < 2 && /%[0-9a-f]{2}/iu.test(decoded); index += 1) {
@@ -297,6 +309,7 @@ function summarizeStatus(components, skills, cancelled) {
 
 export function createSoftwareManagerService({
   platform = process.platform,
+  codexOnly = false,
   catalogProvider,
   catalogService: initialCatalogService = null,
   adapters: fixedAdapters = null,
@@ -311,6 +324,9 @@ export function createSoftwareManagerService({
   logWriteTimeoutMs = DEFAULT_LOG_WRITE_TIMEOUT_MS,
   maxListenerQueue = DEFAULT_MAX_LISTENER_QUEUE,
 } = {}) {
+  if (typeof codexOnly !== "boolean") throw serviceError("software_manager_scope_invalid");
+  const managedComponentIds = codexOnly ? ["chatgpt"] : COMPONENT_IDS;
+  const managedComponentSet = new Set(managedComponentIds);
   if (!catalogProvider && !initialCatalogService) throw serviceError("software_manager_catalog_provider_required");
   if (!fixedAdapters && typeof adapterFactory !== "function") throw serviceError("software_manager_adapters_required");
   const loadOwnership = requireMethod(ownershipStore, "load", "software_manager_ownership_store_required");
@@ -608,6 +624,7 @@ export function createSoftwareManagerService({
       phase,
       percent: Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : null,
       cancellable: task.cancellable,
+      critical: task.critical,
       message: typeof message === "string" ? message : phase,
     };
     if (isPlainRecord(details)) {
@@ -664,14 +681,18 @@ export function createSoftwareManagerService({
     return catalogService ?? null;
   }
 
-  function catalogEntries(service) {
+  function catalogEntries(service, { includeLegacy = false } = {}) {
     if (!service) return { components: [], skills: [] };
     try {
+      const ids = includeLegacy ? COMPONENT_IDS : managedComponentIds;
       const entries = {
-        components: COMPONENT_IDS.map((id) => publicCatalogEntry(service.getComponent(id), "component")),
-        skills: service.listSkills().map((entry) => publicCatalogEntry(entry, "skill")),
+        components: ids.map((id) => {
+          const entry = publicCatalogEntry(service.getComponent(id), "component");
+          return codexOnly && id === "chatgpt" ? Object.freeze({ ...entry, name: "Codex" }) : entry;
+        }),
+        skills: codexOnly && !includeLegacy ? [] : service.listSkills().map((entry) => publicCatalogEntry(entry, "skill")),
       };
-      if (new Set(entries.components.map(({ id }) => id)).size !== COMPONENT_IDS.length
+      if (new Set(entries.components.map(({ id }) => id)).size !== ids.length
         || new Set(entries.skills.map(({ id }) => id)).size !== entries.skills.length) {
         throw serviceError("software_manager_catalog_entry_invalid");
       }
@@ -701,7 +722,7 @@ export function createSoftwareManagerService({
     return adapter[name].bind(adapter);
   }
 
-  async function inspectAll(adapters, entries, additionalSkillIds = []) {
+  async function inspectAll(adapters, entries, additionalSkillIds = [], { includeLegacy = false } = {}) {
     const components = [];
     for (const entry of entries.components) {
       try {
@@ -711,6 +732,7 @@ export function createSoftwareManagerService({
         components.push(failedResult(entry.id, "inspect", error));
       }
     }
+    if (codexOnly && !includeLegacy) return { components, skills: [] };
     let skills = [];
     const skillIds = [...new Set([...entries.skills.map(({ id }) => id), ...additionalSkillIds])];
     try {
@@ -734,13 +756,16 @@ export function createSoftwareManagerService({
       externalTask = null;
       recoveryFailure = null;
       const service = await currentCatalog();
-      const entries = catalogEntries(service);
+      // Retired components are inspected only to release an inherited claim;
+      // they remain unavailable for all newly requested operations.
+      const includeLegacy = Boolean(codexOnly && before?.activeTask && before.activeTask.componentId !== "chatgpt");
+      const entries = catalogEntries(service, { includeLegacy });
       // Adapter inspection is also the recovery boundary for abandoned
       // prepare claims. Run it before declaring an inherited claim pending;
       // otherwise a force-closed download can leave this page read-only.
       if (service && !catalogFailure && (fixedAdapters || selectedInstallRootToken)) {
         const adapters = await resolveAdapters(service);
-        lastInspection = await inspectAll(adapters, entries, Object.keys(before?.skills ?? {}));
+        lastInspection = await inspectAll(adapters, entries, Object.keys(before?.skills ?? {}), { includeLegacy });
       }
       const state = await loadOwnership();
       externalTask = state?.activeTask ? publicExternalTask(state.activeTask) : null;
@@ -765,6 +790,7 @@ export function createSoftwareManagerService({
   }
 
   async function refreshRecoveryStateInGate() {
+    if (!recoveryComplete) return runRecovery();
     selectedInstallRootToken = installRootResolver.getCurrentToken() ?? null;
     let state;
     try { state = await loadOwnership(); }
@@ -807,11 +833,11 @@ export function createSoftwareManagerService({
     }
     if (!KINDS.has(request.kind)) throw serviceError("software_manager_request_invalid");
     const { skillIds: catalogSkillIds } = requestCatalogIds(service);
-    for (const id of Object.keys(ownership?.skills ?? {})) {
+    for (const id of codexOnly ? [] : Object.keys(ownership?.skills ?? {})) {
       if (SKILL_ID.test(id)) catalogSkillIds.add(id);
     }
     const componentIds = validateIds(request.componentIds, {
-      allowed: COMPONENT_SET,
+      allowed: managedComponentSet,
       code: "software_manager_request_invalid",
     });
     const skillIds = validateIds(request.skillIds, {
@@ -875,7 +901,7 @@ export function createSoftwareManagerService({
     task.activePhaseNonce = null;
     task.cancellable = false;
     task.critical = true;
-    await progress(componentId, phase, 100, false, "software_manager_critical_operation", undefined, true, task);
+    await progress(componentId, phase, null, false, "software_manager_critical_operation", undefined, true, task);
     await drainLogs();
   }
 
@@ -919,7 +945,13 @@ export function createSoftwareManagerService({
     });
     endCancellable(task, nonce);
     await drainLogs();
-    if (task.acceptedCancel) return failedResult(id, "prepare", serviceError("software_manager_cancelled"));
+    if (task.acceptedCancel) {
+      if (prepared.status === "succeeded") {
+        try { await adapterMethod(adapters, id, "discardPrepared")({ taskId: task.taskId }); }
+        catch (error) { return failedResult(id, "prepare", error); }
+      }
+      return failedResult(id, "prepare", serviceError("software_manager_cancelled"));
+    }
     if (prepared.status !== "succeeded") return prepared;
     await enterCritical(task, id, "commit");
     try { return await callOne(adapters, id, "commit", { taskId: task.taskId }); }
@@ -964,7 +996,15 @@ export function createSoftwareManagerService({
     // selection cannot leak authority or filesystem state across items.
     if (ids.length > 1) {
       const results = [];
-      for (const id of ids) results.push(...await runPreparedSkills(adapters, [id]));
+      for (let index = 0; index < ids.length; index += 1) {
+        if (currentTask?.acceptedCancel) {
+          results.push(...ids.slice(index).map((id) => (
+            failedResult(id, "prepare", serviceError("software_manager_cancelled"))
+          )));
+          break;
+        }
+        results.push(...await runPreparedSkills(adapters, [ids[index]]));
+      }
       return results;
     }
     const task = currentTask;
@@ -990,7 +1030,8 @@ export function createSoftwareManagerService({
       }
       const ready = prepared.filter(({ status }) => status === "succeeded").map(({ componentId }) => componentId);
       if (ready.length === 0) {
-        await discard();
+        try { await discard(); }
+        catch (error) { return ids.map((id) => failedResult(id, "prepare", error)); }
         return prepared;
       }
       let criticalEntered = false;
@@ -1080,6 +1121,12 @@ export function createSoftwareManagerService({
     if (startReserved || currentTask) throw serviceError("software_manager_task_running");
     startReserved = true;
     return withEntryGate(async () => {
+      let request = null;
+      let task = null;
+      let taskId = null;
+      let startedAt = null;
+      const components = [];
+      let skills = [];
       try {
         if (quitReservation) throw serviceError("software_manager_quit_reserved");
         await ensureRecoveryInGate();
@@ -1092,14 +1139,14 @@ export function createSoftwareManagerService({
           recoveryFailure = serviceError("software_manager_pending_recovery");
           throw recoveryFailure;
         }
-        const request = validateRequest(rawRequest, service, state);
+        request = validateRequest(rawRequest, service, state);
         const adapters = await resolveAdapters(service, request.installRootToken);
         if (quitReservation) throw serviceError("software_manager_quit_reserved");
         await ensureRecoveryInGate();
         if (quitReservation) throw serviceError("software_manager_quit_reserved");
-        const taskId = issueTaskId();
-        const startedAt = now();
-        const task = {
+        taskId = issueTaskId();
+        startedAt = now();
+        task = {
           taskId,
           kind: request.kind,
           phase: "starting",
@@ -1113,19 +1160,35 @@ export function createSoftwareManagerService({
         };
         currentTask = task;
         startReserved = false;
-        const components = [];
-        let skills = [];
         if (request.kind === "install" || request.kind === "update") {
-          for (const id of request.componentIds) {
-            if (task.acceptedCancel) break;
+          for (let index = 0; index < request.componentIds.length; index += 1) {
+            if (task.acceptedCancel) {
+              components.push(...request.componentIds.slice(index).map((id) => (
+                failedResult(id, request.kind, serviceError("software_manager_cancelled"))
+              )));
+              break;
+            }
+            const id = request.componentIds[index];
             components.push(request.kind === "update"
               ? await runUpdateComponent(adapters, service, id)
               : await runPreparedComponent(adapters, id));
           }
-          if (!task.acceptedCancel) skills = await runPreparedSkills(adapters, request.skillIds);
+          skills = task.acceptedCancel
+            ? request.skillIds.map((id) => failedResult(id, request.kind, serviceError("software_manager_cancelled")))
+            : await runPreparedSkills(adapters, request.skillIds);
         } else if (request.kind === "uninstall") {
-          for (const id of request.componentIds) components.push(await runUninstallComponent(adapters, id));
-          skills = await runUninstallSkills(adapters, request.skillIds);
+          for (let index = 0; index < request.componentIds.length; index += 1) {
+            if (task.acceptedCancel) {
+              components.push(...request.componentIds.slice(index).map((id) => (
+                failedResult(id, request.kind, serviceError("software_manager_cancelled"))
+              )));
+              break;
+            }
+            components.push(await runUninstallComponent(adapters, request.componentIds[index]));
+          }
+          skills = task.acceptedCancel
+            ? request.skillIds.map((id) => failedResult(id, request.kind, serviceError("software_manager_cancelled")))
+            : await runUninstallSkills(adapters, request.skillIds);
         } else {
           for (const id of request.componentIds) components.push(await runCriticalComponent(adapters, id, request.kind));
           skills = await runCriticalSkills(adapters, request.skillIds, request.kind);
@@ -1144,6 +1207,39 @@ export function createSoftwareManagerService({
           finishedAt: now(),
         }));
         await writeLog({ taskId, phase: "finished", message: `software_manager_task_${result.status}` });
+        await drainLogs();
+        emit({ type: "finished", taskId, result });
+        return result;
+      } catch (error) {
+        if (!task || !request || typeof taskId !== "string" || !Number.isSafeInteger(startedAt)) throw error;
+        task.phase = "finishing";
+        task.cancellable = false;
+        task.critical = false;
+        task.activePhaseNonce = null;
+        const completedComponents = new Set(components.map(({ componentId }) => componentId));
+        const completedSkills = new Set(skills.map(({ componentId }) => componentId));
+        for (const id of request.componentIds) {
+          if (!completedComponents.has(id)) components.push(failedResult(id, request.kind, error));
+        }
+        for (const id of request.skillIds) {
+          if (!completedSkills.has(id)) skills.push(failedResult(id, request.kind, error));
+        }
+        const result = deepFreeze(redactValue({
+          taskId,
+          kind: request.kind,
+          status: summarizeStatus(components, skills, task.acceptedCancel),
+          components,
+          skills,
+          startedAt,
+          finishedAt: now(),
+        }));
+        await writeLog({
+          level: "error",
+          taskId,
+          phase: "finished",
+          message: `software_manager_task_${result.status}`,
+          details: error,
+        });
         await drainLogs();
         emit({ type: "finished", taskId, result });
         return result;
@@ -1233,6 +1329,7 @@ export function createSoftwareManagerService({
       enabled: true,
       readOnly: !service || Boolean(catalogFailure),
       pendingRecovery: Boolean(externalTask || recoveryFailure),
+      recoveryErrorCodes: errorCodeChain(recoveryFailure),
       tabs,
       catalog: {
         available: Boolean(service && !catalogFailure),
@@ -1244,7 +1341,7 @@ export function createSoftwareManagerService({
         refreshError: catalogRefreshFailure,
       },
       components,
-      skills: inspected.skills,
+      skills: codexOnly ? [] : inspected.skills,
       rollback,
       defaults: {
         install: { componentIds: service && !catalogFailure ? ["chatgpt"] : [], skillIds: [] },

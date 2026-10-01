@@ -16,7 +16,7 @@ function modeSwitchToastMessage(transaction) {
     ? "模式已切换且Router已确认；"
     : "模式已切换，配置已原子写入（Router当前未运行）；";
   return transaction.restartAvailable
-    ? `${prefix}请点击“重启 ChatGPT / Codex”使鉴权生效。`
+    ? `${prefix}请点击本应用的“重启 ChatGPT / Codex”使鉴权生效，并兼容 Windows 旧任务。`
     : `${prefix}未定位到 ChatGPT / Codex 启动项，请完全退出 ChatGPT / Codex 后重新打开，使鉴权生效。`;
 }
 
@@ -26,6 +26,66 @@ function resourceReadStatusAvailable(readStatus) {
   }
   const readState = String(readStatus.state || "").trim().toLowerCase();
   return readStatus.ok !== false && (!readState || readState === "ok");
+}
+
+
+function changeBillingMode(button) {
+  return runAction(button, async () => {
+    if (pendingModeSwitch || unresolvedModeSwitch) throw new Error("计费模式切换尚未确认，请等待或刷新后再操作；草稿会保留。");
+    const mode = button.dataset.mode;
+    if (!state || state.stateUnavailable) throw new Error("当前状态不可用，请刷新后重试。");
+    if (mode === state.mode) return;
+    if (mode !== "hybrid" && mode !== "all_api") throw new Error("不支持的计费模式。");
+    const beforeMode = state.mode;
+    const expected = [...state.selectedModelIds];
+    if (JSON.stringify(draftSelection) !== JSON.stringify(expected)) {
+      throw new Error("模型页有未保存的修改，请先保存或撤销，再切换计费模式。");
+    }
+    const confirmed = await showConfirmDialog({
+      title: mode === "hybrid" ? "切回 GPT 走订阅？" : "切换到全部 API？",
+      message: (mode === "hybrid"
+        ? "保留当前已选模型和顺序，不恢复默认列表。需要的订阅模型可在模型页自行加入；API 模型仍使用各供应商的余额。"
+        : "只保留当前已选的 API 模型和顺序，移除订阅专用模型。调用使用各供应商的 API Key 和余额，不再使用 Codex 订阅额度。") +
+        "\n完成后请点击本应用的“重启 ChatGPT / Codex”。Windows 旧任务会同步兼容，原模型和历史不变。",
+      confirmText: "确认切换",
+      returnFocusTo: button,
+    });
+    if (!confirmed) return;
+    if (state.mode !== beforeMode || JSON.stringify(state.selectedModelIds) !== JSON.stringify(expected) ||
+        JSON.stringify(draftSelection) !== JSON.stringify(expected)) throw new Error("模型列表或计费模式已变化，请重新确认。");
+    const result = await applyModeSelectionKeepingDrafts(mode, { preserveSelection: true, expectedSelectedModelIds: expected });
+    if (result) showToast("计费模式已切换，未恢复默认模型列表。请点击本应用的“重启 ChatGPT / Codex”。" +
+      (modeSwitchDraftsToKeep.has(draftSelection) ? "切换期间的模型修改已保留，尚未保存。" : ""), "info");
+  });
+}
+
+async function applyModeSelectionKeepingDrafts(mode, options) {
+  if (pendingModeSwitch || unresolvedModeSwitch) throw new Error("计费模式切换尚未确认，请等待或刷新后再操作；草稿会保留。");
+  pendingModeSwitch = { mode };
+  try {
+    const result = normalizeModeSelectionResult(await api.selectMode(mode, options));
+    if (result.state?.mode === mode && !result.state.stateUnavailable && Array.isArray(result.state.selectedModelIds)) {
+      const retained = draftSelection;
+      const keepDraft = modeSwitchDraftsToKeep.has(retained) || JSON.stringify(retained) !== JSON.stringify(state.selectedModelIds);
+      if (keepDraft) modeSwitchDraftsToKeep.add(retained);
+      adoptStateSnapshot(result.state);
+      draftSelection = keepDraft ? retained : [...state.selectedModelIds];
+      render();
+      return result;
+    }
+    unresolvedModeSwitch = { mode };
+    modeSwitchDraftsToKeep.add(draftSelection);
+    showToast("计费模式切换已提交，但状态刷新失败。请先刷新确认模式，再完全退出并重启 Codex。", "error");
+    void refresh({ lite: true }).catch(() => {});
+    return null;
+  } catch (error) {
+    unresolvedModeSwitch = { mode };
+    modeSwitchDraftsToKeep.add(draftSelection);
+    void refresh({ lite: true }).catch(() => {});
+    throw error;
+  } finally {
+    pendingModeSwitch = null;
+  }
 }
 
 function resourceSummaryReadStatus(resources = {}, key = "") {
@@ -123,6 +183,8 @@ const STATE_UNAVAILABLE_READ_ONLY_API_METHODS = new Set([
   "onNavigate",
 ]);
 const STATE_UNAVAILABLE_READ_ONLY_CONTROL_SELECTOR = [
+  "#modelSearch",
+  "#clearModelSearch",
   ".nav-item",
   "#refreshResources",
   "#runStartupCheck",
@@ -130,6 +192,7 @@ const STATE_UNAVAILABLE_READ_ONLY_CONTROL_SELECTOR = [
   "#savePreflightDiagnostics",
   "#copyResourceDiagnostics",
   "#copyDiagnostics",
+  "#resumeLogFollow",
   "#openConfigFolder",
   "#openUpdateFolder",
   "#openGitHub",
@@ -287,10 +350,12 @@ let softwareManagerLoaded = false;
 let softwareManagerLoading = false;
 let softwareManagerRefreshPromise = null;
 let softwareManagerEventUnsubscribe = null;
-let softwareManagerPendingPluginIds = [];
-let softwareManagerCombinedResultPending = false;
-const softwareManagerCombinedTaskIds = new Set();
 let draftSelection = [];
+const modelSelectionDraftsToKeep = new WeakSet();
+const modeSwitchDraftsToKeep = new WeakSet();
+let pendingModeSwitch = null;
+let unresolvedModeSwitch = null;
+let modelCatalogQuery = "";
 let dragSlotIndex = null;
 let editingCustomPresetId = null;
 let activeProviderId = null;
@@ -313,12 +378,28 @@ let historyRecoveryStatus = null;
 let doubleQuotaState = null;
 let doubleQuotaExtensionGuideActive = false;
 let sessionSearchText = "";
+const desktopSettingsDraft = new Map();
+let desktopSettingsRevision = 0;
+let desktopSettingsSaving = false;
+const usageBudgetDrafts = new Map();
+let usageBudgetRevision = 0;
+let usageBudgetSaving = false;
+let usageBudgetRenderedKey = null;
+let usageBudgetValidationShown = false;
+let routerPortValidationShown = false;
+let logFollowLatest = true;
+let logScrollTop = 0;
+const pageScrollPositions = new Map();
 let stateDetailLoaded = false;
-let stateDetailLoading = false;
+const loadedDetailSections = new Set();
+const loadingDetailSections = new Set();
+let resourceRefreshFailed = false;
+let resourceRefreshFailedAt = 0;
 let settingsDetailLoaded = false;
 let settingsDetailLoading = false;
 const resourceExpandedKeys = new Set();
 const resourceDetailItems = new Map();
+const detailDialogReturnTargets = new WeakMap();
 const DETAIL_STATE_SECTIONS = new Set(["preflight", "capabilities", "resources", "sessions"]);
 const SETTINGS_DETAIL_SECTIONS = new Set(["settings"]);
 const LOCAL_CAPABILITY_ADAPTERS = new Set(["local_browser", "local_computer_use", "local_file"]);
@@ -338,30 +419,20 @@ function renderSoftwareManager() {
 
 function updateSoftwareManager(action) {
   if (!softwareManagerUi || !softwareManagerState) return;
-  const priorSkillList = softwareManagerRoot?.querySelector?.(".software-skill-list");
-  const priorSkillScrollTop = Number(priorSkillList?.scrollTop || 0);
+  if (currentSectionId() !== "softwareManager") {
+    softwareManagerState = softwareManagerUi.reduce(softwareManagerState, action);
+    return;
+  }
   const active = document.activeElement;
-  const focusSelector = active?.matches?.("[data-software-skill]")
-    ? `[data-software-skill="${CSS.escape(active.dataset.softwareSkill)}"]`
-    : active?.matches?.("[data-software-plugin]")
-      ? `[data-software-plugin="${CSS.escape(active.dataset.softwarePlugin)}"]`
-      : "";
-  softwareManagerState = softwareManagerUi.reduce(softwareManagerState, action);
+  const restoreFocus = active?.matches?.('[data-software-component="chatgpt"]')
+    && softwareManagerRoot?.contains?.(active);
+  const nextState = softwareManagerUi.reduce(softwareManagerState, action);
+  if (nextState === softwareManagerState) return;
+  softwareManagerState = nextState;
   renderSoftwareManager();
-  const nextSkillList = softwareManagerRoot?.querySelector?.(".software-skill-list");
-  if (nextSkillList) nextSkillList.scrollTop = priorSkillScrollTop;
-  if (focusSelector) softwareManagerRoot?.querySelector?.(focusSelector)?.focus?.({ preventScroll: true });
+  if (restoreFocus) softwareManagerRoot?.querySelector?.('[data-software-component="chatgpt"]')?.focus?.({ preventScroll: true });
 }
 
-async function refreshSoftwareManagerCuratedPlugins() {
-  try {
-    const plugins = await api.listCuratedCodexPlugins();
-    updateSoftwareManager({ type: "curated-plugins", plugins });
-    return plugins;
-  } catch {
-    return [];
-  }
-}
 
 function refreshSoftwareManager() {
   if (!softwareManagerLoaded) return Promise.resolve();
@@ -369,12 +440,19 @@ function refreshSoftwareManager() {
   softwareManagerLoading = true;
   softwareManagerRefreshPromise = (async () => {
     try {
-      const snapshot = await api.refreshSoftwareManager();
-      const curatedPlugins = softwareManagerState?.snapshot?.curatedPlugins ?? [];
-      updateSoftwareManager({ type: "snapshot", snapshot: { ...snapshot, curatedPlugins } });
-      await refreshSoftwareManagerCuratedPlugins();
-    } catch (error) {
-      updateSoftwareManager({ type: "error", error: error?.message || String(error) });
+      // A refresh started before an install may settle after it. Discard that
+      // response, then read once the task is idle so installed versions refresh.
+      while (true) {
+        const expectedTaskRevision = softwareManagerState?.taskRevision ?? 0;
+        try {
+          const snapshot = await api.refreshSoftwareManager();
+          updateSoftwareManager({ type: "snapshot", snapshot, expectedTaskRevision });
+        } catch (error) {
+          updateSoftwareManager({ type: "error", error: error?.message || String(error), expectedTaskRevision });
+        }
+        if (expectedTaskRevision === (softwareManagerState?.taskRevision ?? 0)
+          || softwareManagerState?.snapshot?.task || softwareManagerState?.submissionId) break;
+      }
     } finally {
       softwareManagerLoading = false;
       softwareManagerRefreshPromise = null;
@@ -388,48 +466,18 @@ async function ensureSoftwareManagerLoaded() {
   softwareManagerLoading = true;
   updateSoftwareManager({ type: "loading", loading: true });
   try {
-    let snapshot = await api.getSoftwareManagerSnapshot();
+    const expectedTaskRevision = softwareManagerState?.taskRevision ?? 0;
+    const snapshot = await api.getSoftwareManagerSnapshot();
     softwareManagerLoaded = true;
-    updateSoftwareManager({ type: "snapshot", snapshot: { ...snapshot, curatedPlugins: [] } });
+    updateSoftwareManager({ type: "snapshot", snapshot, expectedTaskRevision });
     if (!softwareManagerEventUnsubscribe) {
       softwareManagerEventUnsubscribe = api.onSoftwareManagerEvent((event) => {
-        const taskId = String(event?.taskId || event?.result?.taskId || "").trim();
-        if (event?.type === "finished" && taskId && softwareManagerCombinedTaskIds.has(taskId)) {
-          softwareManagerCombinedTaskIds.delete(taskId);
-          return;
-        }
-        if (event?.type === "finished" && softwareManagerCombinedResultPending) {
-          // The managed software service finishes before the separately routed
-          // curated plugins. Do not briefly publish the base result as the
-          // final result and then make it disappear again while plugins run.
-          updateSoftwareManager({
-            type: "task-event",
-            event: {
-              type: "progress",
-              taskId: taskId || `plugins-${Date.now()}`,
-              componentId: softwareManagerPendingPluginIds[0] || null,
-              phase: softwareManagerPendingPluginIds.length > 0 ? "plugin" : "finishing",
-              percent: null,
-              cancellable: false,
-              critical: true,
-              message: softwareManagerPendingPluginIds.length > 0 ? "正在准备完整插件" : "正在汇总任务结果",
-            },
-          });
-          return;
-        }
+        const previous = softwareManagerState;
         updateSoftwareManager({ type: "task-event", event });
-        if (event?.type === "finished") void refreshSoftwareManager();
+        if (event?.type === "finished" && softwareManagerState !== previous && !softwareManagerState?.snapshot?.task) void refreshSoftwareManager();
       });
     }
-    const curatedPluginsPromise = refreshSoftwareManagerCuratedPlugins();
-    try {
-      snapshot = await api.refreshSoftwareManager();
-      const curatedPlugins = softwareManagerState?.snapshot?.curatedPlugins ?? [];
-      updateSoftwareManager({ type: "snapshot", snapshot: { ...snapshot, curatedPlugins } });
-    } catch (error) {
-      if (!snapshot?.catalog?.available) throw error;
-    }
-    await curatedPluginsPromise;
+    await refreshSoftwareManager();
   } catch (error) {
     updateSoftwareManager({ type: "error", error: error?.message || String(error) });
   } finally {
@@ -439,90 +487,57 @@ async function ensureSoftwareManagerLoaded() {
 
 async function startConfirmedSoftwareManagerTask() {
   const snapshot = softwareManagerState?.snapshot;
-  if (!snapshot || snapshot.readOnly || snapshot.task) return;
-  const request = {
-    kind: softwareManagerState.activeTab,
-    componentIds: [...softwareManagerState.selectedComponentIds],
-    skillIds: [...softwareManagerState.selectedSkillIds],
-  };
-  const pluginIds = [...softwareManagerState.selectedPluginIds];
-  softwareManagerPendingPluginIds = [...pluginIds];
-  softwareManagerCombinedResultPending = pluginIds.length > 0;
+  if (!snapshot || snapshot.readOnly || snapshot.task || softwareManagerState.submissionId) return;
+  const componentIds = [...new Set(softwareManagerState.selectedComponentIds)].filter((id) => id === "chatgpt");
+  if (componentIds.length === 0) return;
+  const request = { kind: softwareManagerState.activeTab, componentIds, skillIds: [] };
   if (softwareManagerState.installRootToken) request.installRootToken = softwareManagerState.installRootToken;
-  updateSoftwareManager({ type: "confirm-close" });
+  const submissionId = `software-starting-${Date.now()}-${(softwareManagerState.taskRevision ?? 0) + 1}`;
+  updateSoftwareManager({
+    type: "task-starting",
+    taskId: submissionId,
+    submissionId,
+    kind: request.kind,
+    componentId: "chatgpt",
+  });
+  let result = null;
   try {
-    let result = null;
-    const pluginResults = [];
-    let managedChatGptFailed = false;
-    let pluginTaskBlockedCore = false;
-    const runSelectedPlugins = async () => {
-      if (pluginIds.length === 0) return;
-      if (managedChatGptFailed) {
-        pluginResults.push(...pluginIds.map((id) => ({
-          componentId: id, action: request.kind, status: "failed",
-          versionBefore: null, versionAfter: null,
-          message: "curated_plugin_requires_chatgpt_install", rollbackAvailable: false,
-        })));
-      } else {
-        const pluginTask = await api.runCuratedCodexPluginTask({
-          kind: request.kind,
-          pluginIds,
-        });
-        pluginResults.push(...(pluginTask?.plugins ?? []));
-      }
-      softwareManagerPendingPluginIds = [];
-      pluginTaskBlockedCore = request.kind === "uninstall"
-        && pluginResults.some(({ status }) => !["succeeded", "skipped"].includes(status));
-    };
-    if (request.kind === "uninstall") await runSelectedPlugins();
-    if (!pluginTaskBlockedCore && (request.componentIds.length > 0 || request.skillIds.length > 0)) {
-      result = await api.startSoftwareManagerTask(request);
-    } else if (pluginTaskBlockedCore) {
-      const blocked = (id) => ({
-        componentId: id, action: request.kind, status: "failed",
-        versionBefore: null, versionAfter: null,
-        message: "software_manager_blocked_by_plugin_failure", rollbackAvailable: false,
-      });
-      result = {
-        taskId: `plugins-blocked-${Date.now()}`,
-        kind: request.kind,
-        status: "failed",
-        components: request.componentIds.map(blocked),
-        skills: request.skillIds.map(blocked),
-      };
+    const response = await api.startSoftwareManagerTask(request);
+    if (!response || !["succeeded", "partial", "failed", "cancelled"].includes(response.status)
+      || typeof response.taskId !== "string" || !response.taskId
+      || !Array.isArray(response.components) || response.components.length !== 1
+      || response.components[0]?.componentId !== "chatgpt") {
+      throw new Error("Codex 安装任务返回了无效结果，请重新检测。");
     }
-    managedChatGptFailed = request.kind === "install"
-      && request.componentIds.includes("chatgpt")
-      && result?.components?.some((entry) => entry?.componentId === "chatgpt" && entry?.status === "failed");
-    const managedTaskCancelled = result?.status === "cancelled"
-      || [...(result?.components ?? []), ...(result?.skills ?? [])].some(({ status }) => status === "cancelled");
-    if (request.kind !== "uninstall" && !managedTaskCancelled) await runSelectedPlugins();
-    if (request.kind !== "uninstall" && managedTaskCancelled) {
-      pluginResults.push(...pluginIds.map((id) => ({
-        componentId: id, action: request.kind, status: "cancelled",
-        versionBefore: null, versionAfter: null,
-        message: "software_manager_cancelled", rollbackAvailable: false,
-      })));
-    }
-    const combined = softwareManagerUi.combineTaskResults(result, pluginResults, request.kind);
-    if (pluginIds.length > 0 && combined?.taskId) {
-      softwareManagerCombinedTaskIds.add(combined.taskId);
-      while (softwareManagerCombinedTaskIds.size > 32) {
-        softwareManagerCombinedTaskIds.delete(softwareManagerCombinedTaskIds.values().next().value);
-      }
-    }
-    softwareManagerPendingPluginIds = [];
-    softwareManagerCombinedResultPending = false;
-    updateSoftwareManager({ type: "task-result", result: combined });
-    const feedback = softwareManagerUi.taskResultFeedback(combined);
+    result = response;
+    if (softwareManagerState?.submissionId !== submissionId) return result;
+    updateSoftwareManager({ type: "task-result", result, submissionId });
+    const feedback = softwareManagerUi.taskResultFeedback(result, softwareManagerState);
     showToast(feedback.message, feedback.tone);
     await refreshSoftwareManager();
-    return combined;
+    return result;
   } catch (error) {
-    softwareManagerPendingPluginIds = [];
-    softwareManagerCombinedResultPending = false;
-    updateSoftwareManager({ type: "error", error: error?.message || String(error) });
-    showToast(error?.message || String(error), "error");
+    const failureMessage = error?.message || String(error);
+    const outcome = result ?? (softwareManagerState?.submissionId === submissionId ? softwareManagerState.pendingResult : null) ?? {
+      taskId: softwareManagerState?.snapshot?.task?.taskId || `software-failed-${Date.now()}`,
+      kind: request.kind,
+      status: "failed",
+      components: [{
+        componentId: "chatgpt", action: request.kind, status: "failed",
+        versionBefore: null, versionAfter: null, message: failureMessage, rollbackAvailable: false,
+      }],
+      skills: [],
+    };
+    if (softwareManagerState?.submissionId !== submissionId) {
+      if (result && softwareManagerState?.lastResult === result && !softwareManagerState?.snapshot?.task) {
+        await refreshSoftwareManager();
+      }
+      return outcome;
+    }
+    updateSoftwareManager({ type: "task-result", result: outcome, submissionId });
+    showToast(failureMessage, "error", softwareManagerUi.buildTaskReport(softwareManagerState));
+    await refreshSoftwareManager();
+    return outcome;
   }
 }
 
@@ -537,10 +552,6 @@ softwareManagerRoot?.addEventListener("click", (event) => {
     void refreshSoftwareManager();
     return;
   }
-  if (control.matches("[data-software-toggle-skills]")) {
-    updateSoftwareManager({ type: "toggle-skills" });
-    return;
-  }
   if (control.matches("[data-software-choose-root]")) {
     void (async () => {
       try {
@@ -548,10 +559,6 @@ softwareManagerRoot?.addEventListener("click", (event) => {
         if (selected?.installRootToken) updateSoftwareManager({ type: "install-root", token: selected.installRootToken });
       } catch (error) { showToast(error?.message || String(error), "error"); }
     })();
-    return;
-  }
-  if (control.matches("[data-software-register]")) {
-    void api.openExternal("https://w1.soxo.top/auth/register?code=2aEq");
     return;
   }
   if (control.matches("[data-software-open-folder]")) {
@@ -566,7 +573,7 @@ softwareManagerRoot?.addEventListener("click", (event) => {
     return;
   }
   if (control.matches("[data-software-start]")) {
-    const selection = softwareManagerUi.readSelection(softwareManagerRoot);
+    const selection = softwareManagerUi.readSelection(softwareManagerRoot, softwareManagerState);
     softwareManagerState = {
       ...softwareManagerState,
       selectedComponentIds: [...selection.componentIds],
@@ -595,22 +602,6 @@ softwareManagerRoot?.addEventListener("change", (event) => {
     updateSoftwareManager({ type: "toggle-component", componentId: component.dataset.softwareComponent, checked: component.checked });
     return;
   }
-  const skill = event.target.closest("[data-software-skill]");
-  if (skill) {
-    updateSoftwareManager({ type: "toggle-skill", skillId: skill.dataset.softwareSkill, checked: skill.checked });
-    return;
-  }
-  const plugin = event.target.closest("[data-software-plugin]");
-  if (plugin) updateSoftwareManager({ type: "toggle-plugin", pluginId: plugin.dataset.softwarePlugin, checked: plugin.checked });
-});
-
-softwareManagerRoot?.addEventListener("input", (event) => {
-  if (!event.target.matches("[data-software-skill-query]")) return;
-  const position = event.target.selectionStart;
-  updateSoftwareManager({ type: "skill-query", query: event.target.value });
-  const next = softwareManagerRoot.querySelector("[data-software-skill-query]");
-  next?.focus();
-  next?.setSelectionRange?.(position, position);
 });
 const usageColumnWidths = [168, 190, 128, 84, 112, 112, 112, 112, 176, 168];
 const SMART_ROUTING_RULE_CONTROLS = [
@@ -624,6 +615,15 @@ const SMART_ROUTING_ROUTE_CONTROLS = [
   "smartFailoverRoute2",
   "smartFailoverRoute3",
 ];
+const DESKTOP_SETTINGS_CHECKBOX_IDS = [
+  "bypassSystemProxy", "localRateLimitEnabled", "duplicateRequestProtection",
+  "interceptCodexAuxiliaryTasks", "autoSelectModel", "autoFailover",
+];
+const DESKTOP_SETTINGS_CONTROL_IDS = new Set([
+  ...DESKTOP_SETTINGS_CHECKBOX_IDS, "routerPort", "codexAuxiliaryModelId", "smartFailoverMode",
+  ...SMART_ROUTING_RULE_CONTROLS.flatMap((control) => [control.mode, control.route]),
+  ...SMART_ROUTING_ROUTE_CONTROLS,
+]);
 const CAPABILITY_RUN_PRESETS = [
   {
     id: "browser-open-url",
@@ -943,6 +943,7 @@ prepareRendererLayout();
 
 const els = {
   routerStatus: document.querySelector("#routerStatus"),
+  backToPageTop: document.querySelector("#backToPageTop"),
   modeStatus: document.querySelector("#modeStatus"),
   appVersion: document.querySelector("#appVersion"),
   rootDir: document.querySelector("#rootDir"),
@@ -962,6 +963,7 @@ const els = {
   interceptCodexAuxiliaryTasks: document.querySelector("#interceptCodexAuxiliaryTasks"),
   codexAuxiliaryModelId: document.querySelector("#codexAuxiliaryModelId"),
   routerPort: document.querySelector("#routerPort"),
+  routerPortError: document.querySelector("#routerPortError"),
   autoSelectModel: document.querySelector("#autoSelectModel"),
   autoFailover: document.querySelector("#autoFailover"),
   smartCodeMode: document.querySelector("#smartCodeMode"),
@@ -977,6 +979,8 @@ const els = {
   smartFailoverRoute2: document.querySelector("#smartFailoverRoute2"),
   smartFailoverRoute3: document.querySelector("#smartFailoverRoute3"),
   saveDesktopOptions: document.querySelector("#saveDesktopOptions"),
+  desktopSettingsDraftStatus: document.querySelector("#desktopSettingsDraftStatus"),
+  discardDesktopSettings: document.querySelector("#discardDesktopSettings"),
   repairModelReferences: document.querySelector("#repairModelReferences"),
   modelReferenceStatus: document.querySelector("#modelReferenceStatus"),
   cleanUnavailableModels: document.querySelector("#cleanUnavailableModels"),
@@ -1022,6 +1026,8 @@ const els = {
   resourceRefreshStatus: document.querySelector("#resourceRefreshStatus"),
   resourceList: document.querySelector("#resourceList"),
   resourceSearch: document.querySelector("#resourceSearch"),
+  resourceFilterStatus: document.querySelector("#resourceFilterStatus"),
+  clearResourceFilters: document.querySelector("#clearResourceFilters"),
   searchPluginMarketplaces: document.querySelector("#searchPluginMarketplaces"),
   resourceStatusFilter: document.querySelector("#resourceStatusFilter"),
   resourceSourceFilter: document.querySelector("#resourceSourceFilter"),
@@ -1029,6 +1035,7 @@ const els = {
   refreshPluginMarketplaces: document.querySelector("#refreshPluginMarketplaces"),
   copyResourceDiagnostics: document.querySelector("#copyResourceDiagnostics"),
   sessionSearch: document.querySelector("#sessionSearch"),
+  sessionSearchCount: document.querySelector("#sessionSearchCount"),
   clearSessionSearch: document.querySelector("#clearSessionSearch"),
   sessionList: document.querySelector("#sessionList"),
   recoverCodexProjects: document.querySelector("#recoverCodexProjects"),
@@ -1069,14 +1076,20 @@ const els = {
   usageDailyCostLimit: document.querySelector("#usageDailyCostLimit"),
   usageInputCostPerMillion: document.querySelector("#usageInputCostPerMillion"),
   usageCacheCostPerMillion: document.querySelector("#usageCacheCostPerMillion"),
+  usageCacheWriteCostPerMillion: document.querySelector("#usageCacheWriteCostPerMillion"),
   usageOutputCostPerMillion: document.querySelector("#usageOutputCostPerMillion"),
   saveUsageBudgets: document.querySelector("#saveUsageBudgets"),
+  discardUsageBudget: document.querySelector("#discardUsageBudget"),
+  usageBudgetDraftStatus: document.querySelector("#usageBudgetDraftStatus"),
+  usageBudgetError: document.querySelector("#usageBudgetError"),
   usageBudgetAlerts: document.querySelector("#usageBudgetAlerts"),
   usageCostEstimate: document.querySelector("#usageCostEstimate"),
   usageChart: document.querySelector("#usageChart"),
   usageRange: document.querySelector("#usageRange"),
   usageTable: document.querySelector("#usageTable"),
   logOutput: document.querySelector("#logOutput"),
+  logViewStatus: document.querySelector("#logViewStatus"),
+  resumeLogFollow: document.querySelector("#resumeLogFollow"),
   doubleQuotaStatus: document.querySelector("#doubleQuotaStatus"),
   doubleQuotaServiceBanner: document.querySelector("#doubleQuotaServiceBanner"),
   doubleQuotaServiceTitle: document.querySelector("#doubleQuotaServiceTitle"),
@@ -1142,6 +1155,13 @@ const els = {
 };
 
 function prepareRendererLayout() {
+  decorateConsoleNavigation();
+  const dashboard = document.getElementById("dashboard");
+  const overview = dashboard?.querySelector(".overview-grid");
+  if (overview) {
+    dashboard.append(overview.querySelector(".run-panel"), dashboard.querySelector(".metric-row"), overview.querySelector(".mode-panel"));
+    overview.remove();
+  }
   document.querySelector('[data-section="modelConfig"]')?.remove();
   document.querySelector("#rootDir")?.closest(".metric")?.remove();
   document.querySelector(".metric-row")?.classList.add("three-metrics");
@@ -1169,6 +1189,35 @@ function prepareRendererLayout() {
     preview.className = "provider-preview";
     modelPool.before(preview);
   }
+  if (modelPool && !document.querySelector(".model-browser")) {
+    const browser = document.createElement("div");
+    browser.className = "model-browser";
+    const preview = document.querySelector("#providerPreview");
+    preview.setAttribute("aria-label", "模型供应商");
+    preview.before(browser);
+    browser.append(preview, modelPool);
+  }
+  prepareActionPage("models", ".model-selection-actions");
+  prepareActionPage("settings", ".settings-actions");
+  document.querySelector("#modelSearch")?.addEventListener("input", (event) => {
+    modelCatalogQuery = event.target.value.trim();
+    document.querySelector("#providerPreview").scrollTop = 0;
+    renderProviderPreview();
+    renderModelPool();
+    applyStateUnavailableWriteGuard(document, Boolean(state?.stateUnavailable));
+  });
+  document.querySelector("#clearModelSearch")?.addEventListener("click", () => {
+    modelCatalogQuery = "";
+    document.querySelector("#modelSearch").value = "";
+    renderProviderPreview();
+    renderModelPool();
+    applyStateUnavailableWriteGuard(document, Boolean(state?.stateUnavailable));
+    document.querySelector("#modelSearch").focus();
+  });
+  document.querySelector("#discardModelSelection")?.addEventListener("click", () => {
+    draftSelection = [...(state?.selectedModelIds || [])];
+    render();
+  });
 
   const usageChart = document.querySelector("#usageChart");
   if (usageChart && !document.querySelector("#usageRange")) {
@@ -1180,6 +1229,19 @@ function prepareRendererLayout() {
       .join("");
     usageChart.before(controls);
   }
+}
+
+function prepareActionPage(sectionId, footerSelector) {
+  const section = document.getElementById(sectionId);
+  const footer = section?.querySelector(footerSelector);
+  if (!section || !footer || section.querySelector(":scope > .action-page-scroll")) return;
+  footer.remove();
+  const scroll = document.createElement("div");
+  scroll.className = "action-page-scroll";
+  scroll.append(...Array.from(section.children));
+  footer.classList.add("action-page-footer");
+  section.classList.add("action-page");
+  section.append(scroll, footer);
 }
 
 for (const eventName of ["click", "change", "input", "submit", "dragstart", "drop"]) {
@@ -1199,22 +1261,48 @@ stateUnavailableControlObserver.observe(document.body, { childList: true, subtre
 
 document.querySelectorAll(".nav-item").forEach((button) => {
   button.addEventListener("click", () => {
-    activateSection(button.dataset.section);
+    activateSection(button.dataset.section, { restoreScroll: true });
+  });
+});
+document.querySelector(".main")?.addEventListener("scroll", (event) => {
+  if (event.target === pageScrollContainer()) renderPageTopButton();
+}, { capture: true, passive: true });
+els.backToPageTop?.addEventListener("click", () => {
+  const scroller = pageScrollContainer();
+  if (!scroller) return;
+  scroller.scrollTop = 0;
+  renderPageTopButton();
+  document.querySelector("#pageTitle")?.focus({ preventScroll: true });
+});
+
+document.querySelectorAll("[data-settings-jump]").forEach((link) => {
+  link.addEventListener("click", (event) => {
+    event.preventDefault();
+    const target = document.getElementById(link.dataset.settingsJump);
+    if (!target?.matches("#settings .settings-jump-target")) return;
+    target.scrollIntoView({ block: "start" });
+    target.querySelector("h2")?.focus({ preventScroll: true });
   });
 });
 
-function activateSection(sectionId) {
+function activateSection(sectionId, { restoreScroll = false } = {}) {
   const section = document.querySelector(`#${sectionId}`);
   const button = document.querySelector(`.nav-item[data-section="${sectionId}"]`);
   if (!section || !button) {
     return;
   }
+  const previousSection = currentSectionId();
+  const previousScroller = pageScrollContainer(previousSection);
+  if (previousScroller) pageScrollPositions.set(previousSection, Math.max(0, previousScroller.scrollTop));
   document.querySelectorAll(".nav-item").forEach((item) => item.classList.remove("active"));
   document.querySelectorAll(".section-panel").forEach((item) => item.classList.add("hidden"));
   button.classList.add("active");
+  updateConsolePageHeading(button);
   section.classList.remove("hidden");
   const mainScroller = document.querySelector(".main");
   if (mainScroller) mainScroller.scrollTop = 0;
+  const pageScroller = section.querySelector(".action-page-scroll, .software-scroll-area");
+  if (pageScroller) pageScroller.scrollTop = 0;
   renderActiveSection(sectionId);
   void ensureSettingsDetailForSection(sectionId);
   void ensureDetailedStateForSection(sectionId);
@@ -1227,6 +1315,64 @@ function activateSection(sectionId) {
   if (sectionId === "softwareManager") {
     void ensureSoftwareManagerLoaded();
   }
+  if (restoreScroll) {
+    const scroller = pageScrollContainer(sectionId);
+    if (scroller) scroller.scrollTop = pageScrollPositions.get(sectionId) || 0;
+  }
+  renderPageTopButton();
+}
+
+function pageScrollContainer(sectionId = currentSectionId()) {
+  if (sectionId === "softwareManager" || sectionId === "logs") return null;
+  const section = document.getElementById(sectionId);
+  if (!section) return null;
+  return section.querySelector(":scope > .action-page-scroll") || document.querySelector(".main");
+}
+
+function renderPageTopButton() {
+  if (els.backToPageTop) els.backToPageTop.hidden = !(pageScrollContainer()?.scrollTop > 64);
+}
+
+function updateConsolePageHeading(button) {
+  const descriptions = {
+    dashboard: "网关状态、模型准备情况与运行控制",
+    preflight: "检查连接与配置，定位需要处理的问题",
+    models: "选择模型、管理供应商与连接配置",
+    capabilities: "查看模型能力与图片生成配置",
+    stats: "查看调用趋势、用量与预算",
+    softwareManager: "安装、更新和卸载 Codex",
+    settings: "配置本地网关与应用偏好",
+    resources: "查看 Codex 当前可用的资源",
+    sessions: "浏览项目与会话，管理历史记录",
+    logs: "跟踪请求状态与运行日志",
+    doubleQuota: "管理本地扩展服务与连接状态",
+    vvip: "探索更多功能",
+  };
+  document.querySelectorAll(".nav-item").forEach((item) => item.removeAttribute("aria-current"));
+  button.setAttribute("aria-current", "page");
+  document.querySelector("#pageTitle").textContent = button.textContent.trim();
+  document.querySelector("#pageDescription").textContent = descriptions[button.dataset.section] || "";
+}
+
+function decorateConsoleNavigation() {
+  const paths = {
+    dashboard: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
+    preflight: '<path d="M12 3 4 6v6c0 5 8 9 8 9s8-4 8-9V6z"/><path d="m8 12 3 3 5-6"/>',
+    models: '<path d="m12 3 9 5-9 5-9-5zM3 12l9 5 9-5M3 16l9 5 9-5"/>',
+    capabilities: '<path d="m13 2-9 12h7l-1 8 10-12h-7z"/>',
+    stats: '<path d="M4 4v16h17M9 15V9m5 6V5m5 10v-4"/>',
+    softwareManager: '<path d="M12 3v12m-4-4 4 4 4-4M4 16v5h16v-5"/>',
+    settings: '<path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="8" cy="18" r="2"/>',
+    resources: '<path d="M3 7h7l2-3h9v16H3z"/>',
+    sessions: '<path d="M4 4h16v13H9l-5 4zM8 8h8M8 12h5"/>',
+    logs: '<path d="M6 3h12v18H6zM9 7h6M9 11h6M9 15h4"/>',
+    doubleQuota: '<path d="M4 8h12l-4-4M20 16H8l4 4"/>',
+    vvip: '<path d="m12 3 3 6 6 3-6 3-3 6-3-6-6-3 6-3z"/>',
+  };
+  document.querySelectorAll(".nav-item").forEach((button) => {
+    if (button.querySelector("svg") || !paths[button.dataset.section]) return;
+    button.insertAdjacentHTML("afterbegin", `<svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[button.dataset.section]}</svg>`);
+  });
 }
 
 async function refreshDoubleQuotaState() {
@@ -1355,15 +1501,7 @@ document.querySelectorAll("[data-usage-range]").forEach((button) => {
 });
 
 document.querySelectorAll(".mode-card").forEach((button) => {
-  button.addEventListener("click", () =>
-    runAction(button, async () => {
-      const result = normalizeModeSelectionResult(await api.selectMode(button.dataset.mode));
-      state = result.state;
-      draftSelection = [...state.selectedModelIds];
-      render();
-      showToast(modeSwitchToastMessage(result.transaction));
-    }),
-  );
+  button.addEventListener("click", () => changeBillingMode(button));
 });
 
 document.querySelector("#recoverHistoryAccess")?.addEventListener("click", (event) =>
@@ -1402,7 +1540,7 @@ els.restartCodex.addEventListener("click", () =>
   runAction(els.restartCodex, async () => {
     const result = await api.restartCodex();
     await refresh();
-    showToast(result?.message || "ChatGPT / Codex 已重启。");
+    showToast(result?.message || "ChatGPT / Codex 已重启。", result?.threadProviderCompatibility?.ok === false ? "error" : "info");
   }),
 );
 
@@ -1418,25 +1556,19 @@ els.selectCodexDesktopExe.addEventListener("click", () =>
   }),
 );
 
-els.saveDesktopOptions.addEventListener("click", () =>
-  runAction(els.saveDesktopOptions, async () => {
-    state = await api.saveOptions({
-      bypassSystemProxy: els.bypassSystemProxy.checked,
-      localRateLimitEnabled: els.localRateLimitEnabled.checked,
-      duplicateRequestProtection: els.duplicateRequestProtection.checked,
-      interceptCodexAuxiliaryTasks: els.interceptCodexAuxiliaryTasks?.checked || false,
-      codexAuxiliaryModelId: String(els.codexAuxiliaryModelId?.value || "").trim(),
-      routerPort: Number(els.routerPort.value || 15722),
-      autoSelectModel: els.autoSelectModel.checked,
-      autoFailover: els.autoFailover.checked,
-      smartRouting: smartRoutingOptionsFromInputs(),
-    });
-    render();
-    showToast(
-      "基础设置已保存；端口或代理变更会在重新启动 Router 后生效。",
-    );
-  }),
-);
+els.saveDesktopOptions.addEventListener("click", () => saveDesktopSettings(els.saveDesktopOptions));
+for (const eventName of ["input", "change"]) {
+  document.querySelector("#settingsGeneral")?.addEventListener(eventName, captureDesktopSettingsEdit, true);
+}
+els.discardDesktopSettings?.addEventListener("click", () => {
+  if (desktopSettingsSaving) return;
+  desktopSettingsDraft.clear();
+  routerPortValidationShown = false;
+  if (els.routerPort) els.routerPort.value = desktopSettingsSavedValues().routerPort;
+  render();
+  document.querySelector('[data-settings-jump="settingsGeneral"]')?.focus({ preventScroll: true });
+});
+els.routerPort?.addEventListener("blur", () => renderRouterPortValidation({ report: true }));
 
 els.repairModelReferences?.addEventListener("click", () =>
   runAction(els.repairModelReferences, () => repairStaleModelReferences(els.repairModelReferences)),
@@ -1454,15 +1586,17 @@ els.interceptCodexAuxiliaryTasks?.addEventListener("change", () => {
   renderCodexAuxiliaryTaskSettings();
 });
 
-els.saveUsageBudgets?.addEventListener("click", () =>
-  runAction(els.saveUsageBudgets, async () => {
-    state = await api.saveOptions({
-      usageBudgets: usageBudgetOptionsFromInputs(),
-    });
-    render();
-    showToast("用量预算已保存；达到每日上限后，Router 会在本地停止后续请求。");
-  }),
-);
+els.saveUsageBudgets?.addEventListener("click", () => saveUsageBudgetSettings());
+for (const { id } of usageBudgetFields()) {
+  for (const eventName of ["input", "change"]) els[id]?.addEventListener(eventName, captureUsageBudgetEdit);
+}
+els.discardUsageBudget?.addEventListener("click", () => {
+  if (usageBudgetSaving) return;
+  usageBudgetDrafts.delete(usageBudgetSelectionKey());
+  usageBudgetValidationShown = false;
+  renderUsageBudgetInputs({ resetInputs: true });
+  els.usageBudgetScope?.focus({ preventScroll: true });
+});
 
 SMART_ROUTING_RULE_CONTROLS.forEach((control) => {
   els[control.mode]?.addEventListener("change", syncSmartRoutingControlStates);
@@ -1545,6 +1679,7 @@ els.clearSessionSearch?.addEventListener("click", () => {
     els.sessionSearch.value = "";
   }
   renderSessions();
+  els.sessionSearch?.focus();
 });
 
 els.resetImageProviderForm?.addEventListener("click", () => {
@@ -1676,7 +1811,7 @@ els.saveConfigProfile?.addEventListener("click", () =>
       name,
       selectedModelIds: draftSelection,
     });
-    state = response?.state || await api.getState();
+    adoptStateSnapshot(response?.state || await api.getState());
     draftSelection = [...state.selectedModelIds];
     render();
     showToast(`已保存配置档：${response?.saved?.name || name}`);
@@ -1740,8 +1875,7 @@ els.copyResourceDiagnostics?.addEventListener("click", () =>
 
 els.refreshResources?.addEventListener("click", () =>
   runAction(els.refreshResources, async () => {
-    await refresh({ lite: false, forceResourceRefresh: true });
-    showToast("资源列表已刷新。");
+    if (await ensureDetailedStateForSection("resources", { refreshCore: true })) showToast("资源列表已刷新。");
   }),
 );
 
@@ -1749,6 +1883,7 @@ els.refreshPluginMarketplaces?.addEventListener("click", () =>
   runAction(els.refreshPluginMarketplaces, async () => {
     const accepted = await showConfirmDialog({
       title: "刷新插件市场",
+      returnFocusTo: els.refreshPluginMarketplaces,
       message: "CodexBridge 会调用 Codex CLI 刷新已配置的插件市场快照。这个操作不会安装、卸载或删除插件，只会更新可安装插件列表。",
       confirmText: "刷新插件市场",
     });
@@ -1766,6 +1901,7 @@ els.resourceSearch?.addEventListener("input", (event) => {
   resourceFilterText = String(event.target?.value || "");
   renderResources();
 });
+els.clearResourceFilters?.addEventListener("click", clearResourceFilters);
 
 els.searchPluginMarketplaces?.addEventListener("click", () =>
   runAction(els.searchPluginMarketplaces, async () => {
@@ -1808,6 +1944,7 @@ els.recoverCodexProjects?.addEventListener("click", (event) =>
   runAction(event.currentTarget, async () => {
     const accepted = await showConfirmDialog({
       title: "恢复项目列表",
+      returnFocusTo: els.recoverCodexProjects,
       message: "CodexBridge 会让 ChatGPT / Codex Desktop 逐个打开当前识别到的真实项目目录，用桌面应用自己的方式刷新项目列表；不会修改模型、路由或会话内容。",
       confirmText: "恢复项目列表",
     });
@@ -1833,6 +1970,7 @@ els.recoverHistoryAccessSessions?.addEventListener("click", (event) =>
     const summary = preview?.summary || {};
     const accepted = await showConfirmDialog({
       title: "恢复全部历史会话",
+      returnFocusTo: els.recoverHistoryAccessSessions,
       message: [
         `原始线程 ${formatNumber(summary.rawThreads || 0)} 个，普通用户会话 ${formatNumber(summary.activeUserThreads || 0)} 个。`,
         `当前新版目录 ${formatNumber(summary.catalogThreads || 0)} 个，当前侧栏索引 ${formatNumber(summary.sidebarThreads || 0)} 个。`,
@@ -1900,12 +2038,20 @@ els.retryHistoryRecovery?.addEventListener("click", (event) =>
 );
 
 els.closeRequestDetail?.addEventListener("click", hideRequestDetail);
+els.requestDetailDialog?.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  hideRequestDetail();
+});
 els.requestDetailDialog?.addEventListener("click", (event) => {
   if (event.target === els.requestDetailDialog) {
     hideRequestDetail();
   }
 });
 els.closeResourceDetail?.addEventListener("click", hideResourceDetail);
+els.resourceDetailDialog?.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  hideResourceDetail();
+});
 els.resourceDetailDialog?.addEventListener("click", (event) => {
   if (event.target === els.resourceDetailDialog) {
     hideResourceDetail();
@@ -1919,6 +2065,18 @@ els.copyDiagnostics.addEventListener("click", () =>
     showToast(`诊断信息已复制。最近错误 ${summary?.errorCount || 0} 条，发给我就能排查。`);
   }),
 );
+
+els.logOutput.addEventListener("scroll", () => {
+  if (!els.logOutput.getClientRects().length) return;
+  logScrollTop = els.logOutput.scrollTop;
+  logFollowLatest = els.logOutput.scrollHeight - els.logOutput.clientHeight - logScrollTop <= 8;
+  renderLogViewStatus();
+});
+els.resumeLogFollow?.addEventListener("click", () => {
+  logFollowLatest = true;
+  renderLogs(state?.logs || []);
+  els.logOutput.focus({ preventScroll: true });
+});
 
 document.querySelector("#saveModelSelectionPanel").addEventListener("click", (event) =>
   saveModelSelection(event.currentTarget),
@@ -2048,14 +2206,7 @@ els.vvipDialog?.addEventListener("click", (event) => {
   }
 });
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !els.requestDetailDialog?.classList.contains("hidden")) {
-    hideRequestDetail();
-    return;
-  }
-  if (event.key === "Escape" && !els.resourceDetailDialog?.classList.contains("hidden")) {
-    hideResourceDetail();
-    return;
-  }
+  if (document.querySelector("dialog:modal")) return;
   if (event.key === "Escape" && !els.vvipDialog?.classList.contains("hidden")) {
     hideVvipDialog();
   }
@@ -2093,7 +2244,7 @@ api.onUsage((usage) => {
 });
 api.onState((nextState) => {
   refreshRequestSequence += 1;
-  state = mergeStateWithRetainedDetailSlices(state, nextState);
+  adoptStateSnapshot(nextState);
   if (nextState?.codexResources?.pluginPage) {
     console.info("[resource-flow] stage=renderer-state-assignment", {
       apps: nextState.codexResources.pluginPage.summary?.apps,
@@ -2101,9 +2252,6 @@ api.onState((nextState) => {
       snapshot: nextState.codexResources.pluginPage.snapshot?.state,
     });
   }
-  stateDetailLoaded = Boolean(state?.stateDetailLoaded || stateDetailLoaded);
-  settingsDetailLoaded = Boolean(state?.settingsDetailLoaded || settingsDetailLoaded);
-  draftSelection = [...(state.selectedModelIds || [])];
   render();
 });
 
@@ -2115,35 +2263,60 @@ async function refresh(options = {}) {
   if (requestSequence !== refreshRequestSequence) {
     return false;
   }
-  state = mergeStateWithRetainedDetailSlices(state, nextState);
-  stateDetailLoaded = Boolean(state?.stateDetailLoaded);
-  settingsDetailLoaded = Boolean(state?.settingsDetailLoaded || settingsDetailLoaded);
-  draftSelection = [...(state.selectedModelIds || [])];
+  adoptStateSnapshot(nextState);
   render();
   return true;
 }
 
-async function ensureDetailedStateForSection(sectionId) {
-  if (!DETAIL_STATE_SECTIONS.has(sectionId) || stateDetailLoading) {
+async function ensureDetailedStateForSection(sectionId, { refreshCore = false } = {}) {
+  if (!DETAIL_STATE_SECTIONS.has(sectionId) || loadingDetailSections.has(sectionId)) {
+    return false;
+  }
+  if (sectionId !== "resources" && loadedDetailSections.has(sectionId)) {
     return;
   }
-  if (sectionId !== "resources" && stateDetailLoaded) {
-    return;
-  }
-  stateDetailLoading = true;
-  renderDetailLoading(sectionId);
+  loadingDetailSections.add(sectionId);
+  if (sectionId === "resources") resourceRefreshFailed = false;
+  const includeCore = sectionId === "resources" && refreshCore;
+  const requestSequence = includeCore ? ++refreshRequestSequence : null;
   try {
-    state = await api.getState(sectionId === "resources"
-      ? { lite: false, forceResourceRefresh: true }
-      : { lite: false });
-    stateDetailLoaded = Boolean(state?.stateDetailLoaded);
-    draftSelection = [...(state.selectedModelIds || [])];
-    render();
+    renderDetailLoading(sectionId);
+    const nextState = await api.getState({
+      lite: false,
+      ...(includeCore ? {} : { detailSection: sectionId }),
+      forceResourceRefresh: sectionId === "resources",
+    });
+    // A manual refresh retains its core-recovery behavior and global stale-response guard.
+    // Navigation still owns only its section and never replaces core state.
+    const applied = includeCore
+      ? requestSequence === refreshRequestSequence && Boolean(adoptStateSnapshot(nextState))
+      : adoptDetailStateSnapshot(sectionId, nextState);
+    if (!applied) {
+      if (sectionId === "resources") resourceRefreshFailed = true;
+      return false;
+    }
+    const detailError = state?.detailSectionErrors?.[sectionId];
+    if (detailError?.message) {
+      showToast(detailError.message, "error");
+    }
+    if (sectionId === "resources") {
+      const snapshot = { ...state.codexResources?.snapshot, ...state.codexResources?.pluginPage?.snapshot };
+      resourceRefreshFailed = Boolean(state.stateUnavailable || detailError) || !loadedDetailSections.has("resources") || snapshot.state !== "authoritative";
+      return !resourceRefreshFailed;
+    }
   } catch (error) {
+    if (sectionId === "resources") resourceRefreshFailed = true;
     showToast(error?.message || String(error), "error");
     console.error(error);
+    return false;
   } finally {
-    stateDetailLoading = false;
+    loadingDetailSections.delete(sectionId);
+    if (sectionId === "resources") {
+      const snapshot = { ...state?.codexResources?.snapshot, ...state?.codexResources?.pluginPage?.snapshot };
+      resourceRefreshFailedAt = resourceRefreshFailed ? Date.parse(snapshot.refreshedAt) || 0 : 0;
+      renderResourceRefreshStatus(snapshot);
+    }
+    render();
   }
 }
 
@@ -2155,15 +2328,19 @@ async function ensureSettingsDetailForSection(sectionId) {
   renderSettingsDetailLoading(sectionId);
   try {
     const nextState = await api.getState({ lite: true, settingsDetail: true });
-    state = mergeStateWithRetainedDetailSlices(state, nextState);
-    settingsDetailLoaded = Boolean(state?.settingsDetailLoaded);
-    draftSelection = [...(state.selectedModelIds || [])];
-    renderActiveSection(sectionId);
+    if (!adoptDetailStateSnapshot("settings", nextState)) {
+      return;
+    }
+    const detailError = state?.detailSectionErrors?.settings;
+    if (detailError?.message) {
+      showToast(detailError.message, "error");
+    }
   } catch (error) {
     showToast(error?.message || String(error), "error");
     console.error(error);
   } finally {
     settingsDetailLoading = false;
+    renderActiveSection(sectionId);
   }
 }
 
@@ -2173,12 +2350,42 @@ function renderDetailLoading(sectionId) {
     els.startupCheckList.innerHTML = "";
   }
   if (sectionId === "resources" && els.resourceSummary && els.resourceList) {
+    renderResourceRefreshStatus();
+    if (state?.codexResources) {
+      return;
+    }
     els.resourceSummary.innerHTML = "";
     els.resourceList.innerHTML = `<div class="empty-state">正在读取 Codex 资源...</div>`;
   }
   if (sectionId === "sessions" && els.sessionList) {
     els.sessionList.innerHTML = `<div class="empty-state">正在读取 Codex 会话...</div>`;
   }
+}
+
+function renderResourceRefreshStatus(snapshot = { ...state?.codexResources?.snapshot, ...state?.codexResources?.pluginPage?.snapshot }) {
+  // A successful resource action may publish a new snapshot independently of this loader.
+  // Core-only broadcasts and the same cached snapshot must not erase a failed-read warning.
+  if (resourceRefreshFailed && !state?.stateUnavailable && !state?.detailSectionErrors?.resources &&
+      snapshot.state === "authoritative" && Date.parse(snapshot.refreshedAt) > resourceRefreshFailedAt) {
+    resourceRefreshFailed = false;
+    resourceRefreshFailedAt = 0;
+  }
+  const pending = loadingDetailSections.has("resources");
+  if (els.refreshResources) {
+    els.refreshResources.disabled = pending || els.refreshResources.classList.contains("loading");
+    els.refreshResources.textContent = pending ? "正在刷新…" : "刷新资源";
+    els.refreshResources.setAttribute("aria-busy", String(pending));
+  }
+  if (!els.resourceRefreshStatus) return;
+  const failed = resourceRefreshFailed || Boolean(state?.detailSectionErrors?.resources) || snapshot.state === "cached";
+  const statusLabel = pending ? "正在刷新资源…"
+    : failed ? state?.codexResources ? "暂时无法刷新，显示上次读取的资源" : "未能读取资源，请重试"
+      : snapshot.state === "authoritative" ? "已刷新" : "尚未读取到有效资源";
+  const refreshedAt = snapshot.refreshedAt ? formatTime(snapshot.refreshedAt) : "未知";
+  const appIds = Array.isArray(snapshot.appIds) && snapshot.appIds.length ? `；应用：${snapshot.appIds.join(", ")}` : "";
+  const text = `${statusLabel} · 最后更新：${refreshedAt}`;
+  if (els.resourceRefreshStatus.textContent !== text) els.resourceRefreshStatus.textContent = text;
+  els.resourceRefreshStatus.title = `${statusLabel}；资源快照：${snapshot.state || "unknown"}${appIds}`;
 }
 
 function renderSettingsDetailLoading(sectionId) {
@@ -2198,22 +2405,62 @@ const RETAINED_DETAIL_SLICE_KEYS = [
   "imageGenerationHistory",
 ];
 
+const DETAIL_SLICE_SECTION = Object.freeze({
+  startupCheck: "preflight",
+  codexBackups: "settings",
+  capabilityExecutionHistory: "capabilities",
+  imageGenerationHistory: "capabilities",
+  codexResources: "resources",
+  codexSessions: "sessions",
+  codexSessionTree: "sessions",
+  codexProjectRecoveryPlan: "sessions",
+});
+
 function mergeStateWithRetainedDetailSlices(previousState, nextState) {
   if (!previousState || !nextState || nextState.stateDetailLoaded) {
     return nextState;
   }
-  const shouldRetainDetail = Boolean(previousState.stateDetailLoaded || stateDetailLoaded);
+  const previousSections = new Set(previousState.detailSectionsLoaded || []);
+  const nextSections = new Set(nextState.detailSectionsLoaded || []);
+  if (previousState.stateDetailLoaded) {
+    for (const section of DETAIL_STATE_SECTIONS) previousSections.add(section);
+  }
+  const mergedSections = new Set([...previousSections, ...nextSections]);
+  for (const section of Object.keys(nextState.detailSectionErrors || {})) {
+    if (DETAIL_STATE_SECTIONS.has(section)) mergedSections.delete(section);
+  }
+  const shouldRetainDetail = previousSections.size > 0;
   const shouldRetainSettingsDetail = Boolean(previousState.settingsDetailLoaded || settingsDetailLoaded);
   if (!shouldRetainDetail && !shouldRetainSettingsDetail) {
     return nextState;
   }
   const merged = {
     ...nextState,
-    stateDetailLoaded: Boolean(nextState.stateDetailLoaded || shouldRetainDetail),
+    stateDetailLoaded: Boolean(
+      nextState.stateDetailLoaded ||
+      [...DETAIL_STATE_SECTIONS].every((section) => mergedSections.has(section)),
+    ),
+    detailSectionsLoaded: [...mergedSections],
     settingsDetailLoaded: Boolean(nextState.settingsDetailLoaded || shouldRetainSettingsDetail),
   };
+  const mergedDetailErrors = {
+    ...(previousState.detailSectionErrors || {}),
+    ...(nextState.detailSectionErrors || {}),
+  };
+  for (const section of nextSections) {
+    if (!nextState.detailSectionErrors?.[section]) {
+      delete mergedDetailErrors[section];
+    }
+  }
+  if (nextState.settingsDetailLoaded && !nextState.detailSectionErrors?.settings) {
+    delete mergedDetailErrors.settings;
+  }
+  merged.detailSectionErrors = mergedDetailErrors;
   if (shouldRetainDetail) {
     for (const key of RETAINED_DETAIL_SLICE_KEYS) {
+      if (key === "codexBackups" || nextSections.has(DETAIL_SLICE_SECTION[key])) {
+        continue;
+      }
       if (previousState[key] !== undefined && previousState[key] !== null) {
         merged[key] = previousState[key];
       }
@@ -2223,6 +2470,84 @@ function mergeStateWithRetainedDetailSlices(previousState, nextState) {
     merged.codexBackups = previousState.codexBackups;
   }
   return merged;
+}
+
+function adoptStateSnapshot(nextState) {
+  const saved = state?.selectedModelIds || [];
+  const dirty = Boolean(state) && (modelSelectionDraftsToKeep.has(draftSelection) || modeSwitchDraftsToKeep.has(draftSelection) || draftSelection.length !== saved.length || draftSelection.some((id, index) => id !== saved[index]));
+  const keepModeDraft = modeSwitchDraftsToKeep.has(draftSelection) || Boolean((pendingModeSwitch || unresolvedModeSwitch) && dirty);
+  if (keepModeDraft) modeSwitchDraftsToKeep.add(draftSelection);
+  const modeChanged = Boolean(state?.mode && nextState?.mode && state.mode !== nextState.mode);
+  state = mergeStateWithRetainedDetailSlices(state, nextState);
+  syncLoadedStateDetails();
+  if (!dirty || (modeChanged && !keepModeDraft)) draftSelection = [...(state?.selectedModelIds || [])];
+  if (!nextState?.stateUnavailable && ["hybrid", "all_api"].includes(nextState?.mode) && Array.isArray(nextState?.selectedModelIds)) {
+    unresolvedModeSwitch = null;
+  }
+  return state;
+}
+
+function adoptDetailStateSnapshot(sectionId, nextState) {
+  if (!nextState || nextState.stateUnavailable) {
+    return false;
+  }
+  if (!state) {
+    adoptStateSnapshot(nextState);
+    return true;
+  }
+  if (state.stateConfigRevision !== nextState.stateConfigRevision) {
+    return false;
+  }
+  // A lazy detail request owns only its section, never the core snapshot or draft.
+  // In particular, usage/log updates and other detail requests can finish meanwhile.
+  const detailError = nextState.detailSectionErrors?.[sectionId];
+  const sectionLoaded = !detailError && (sectionId === "settings"
+    ? Boolean(nextState.settingsDetailLoaded)
+    : Boolean(nextState.stateDetailLoaded || nextState.detailSectionsLoaded?.includes(sectionId)));
+  const sections = new Set(state.detailSectionsLoaded || []);
+  if (state.stateDetailLoaded) {
+    for (const section of DETAIL_STATE_SECTIONS) sections.add(section);
+  }
+  if (DETAIL_STATE_SECTIONS.has(sectionId)) {
+    if (sectionLoaded) sections.add(sectionId);
+    else sections.delete(sectionId);
+  }
+  const merged = {
+    ...state,
+    stateDetailLoaded: [...DETAIL_STATE_SECTIONS].every((section) => sections.has(section)),
+    detailSectionsLoaded: [...sections],
+    detailSectionErrors: { ...(state.detailSectionErrors || {}) },
+  };
+  if (sectionId === "settings") {
+    merged.settingsDetailLoaded = sectionLoaded;
+  }
+  if (detailError) {
+    merged.detailSectionErrors[sectionId] = detailError;
+  } else if (sectionLoaded) {
+    delete merged.detailSectionErrors[sectionId];
+  }
+  if (sectionLoaded) {
+    for (const [key, section] of Object.entries(DETAIL_SLICE_SECTION)) {
+      if (section === sectionId && Object.prototype.hasOwnProperty.call(nextState, key)) {
+        merged[key] = nextState[key];
+      }
+    }
+  }
+  state = merged;
+  syncLoadedStateDetails();
+  return true;
+}
+
+function syncLoadedStateDetails() {
+  stateDetailLoaded = Boolean(state?.stateDetailLoaded);
+  loadedDetailSections.clear();
+  for (const section of state?.detailSectionsLoaded || []) {
+    if (DETAIL_STATE_SECTIONS.has(section)) loadedDetailSections.add(section);
+  }
+  if (stateDetailLoaded) {
+    for (const section of DETAIL_STATE_SECTIONS) loadedDetailSections.add(section);
+  }
+  settingsDetailLoaded = Boolean(state?.settingsDetailLoaded);
 }
 
 function render() {
@@ -2253,23 +2578,25 @@ function render() {
   if (els.rootDir) {
     els.rootDir.textContent = state.rootDir;
   }
-  els.selectedCount.textContent = String(draftSelection.length);
+  els.selectedCount.textContent = String(state.selectedModelIds?.length || 0);
   const keySummary = keySummaryInfo();
   els.keySummary.textContent = keySummary.text;
   els.keySummaryDetail.textContent = keySummary.detail;
-  els.bypassSystemProxy.checked = Boolean(state.desktopOptions?.bypassSystemProxy);
-  els.localRateLimitEnabled.checked = Boolean(state.desktopOptions?.localRateLimitEnabled);
-  els.duplicateRequestProtection.checked = state.desktopOptions?.duplicateRequestProtection === true;
+  els.bypassSystemProxy.checked = desktopSettingsDraftValue("bypassSystemProxy", Boolean(state.desktopOptions?.bypassSystemProxy));
+  els.localRateLimitEnabled.checked = desktopSettingsDraftValue("localRateLimitEnabled", Boolean(state.desktopOptions?.localRateLimitEnabled));
+  els.duplicateRequestProtection.checked = desktopSettingsDraftValue("duplicateRequestProtection", state.desktopOptions?.duplicateRequestProtection === true);
   if (els.interceptCodexAuxiliaryTasks) {
-    els.interceptCodexAuxiliaryTasks.checked = Boolean(state.desktopOptions?.interceptCodexAuxiliaryTasks);
+    els.interceptCodexAuxiliaryTasks.checked = desktopSettingsDraftValue("interceptCodexAuxiliaryTasks", Boolean(state.desktopOptions?.interceptCodexAuxiliaryTasks));
   }
-  els.autoSelectModel.checked = Boolean(state.desktopOptions?.autoSelectModel);
-  els.autoFailover.checked = Boolean(state.desktopOptions?.autoFailover);
-  if (document.activeElement !== els.routerPort) {
-    els.routerPort.value = String(state.desktopOptions?.routerPort || 15722);
+  els.autoSelectModel.checked = desktopSettingsDraftValue("autoSelectModel", Boolean(state.desktopOptions?.autoSelectModel));
+  els.autoFailover.checked = desktopSettingsDraftValue("autoFailover", Boolean(state.desktopOptions?.autoFailover));
+  if (document.activeElement !== els.routerPort && !els.routerPort.validity?.badInput) {
+    els.routerPort.value = desktopSettingsDraftValue("routerPort", String(state.desktopOptions?.routerPort || 15722));
   }
+  renderRouterPortValidation();
   renderCodexAuxiliaryTaskSettings();
   renderSmartRoutingSettings();
+  renderDesktopSettingsDraftStatus();
   renderModelReferenceStatus();
   if (els.acceptanceReleaseDir) {
     els.acceptanceReleaseDir.textContent = state.desktopOptions?.acceptanceReleaseDir || "未选择";
@@ -2279,9 +2606,11 @@ function render() {
 
   document.querySelectorAll(".mode-card").forEach((button) => {
     button.classList.toggle("active", button.dataset.mode === state.mode);
+    button.setAttribute("aria-pressed", String(button.dataset.mode === state.mode));
   });
 
   renderActiveSection(currentSectionId());
+  renderPageTopButton();
   applyStateUnavailableWriteGuard(document, stateUnavailable);
 }
 
@@ -2419,7 +2748,7 @@ function renderDoubleQuota() {
       : "双倍额度服务已关闭";
   els.doubleQuotaServiceDetail.textContent = serviceRunning
     ? `已监听 ${current.url || "http://127.0.0.1:4317/"}`
-    : "当前不会接收 G某T 网页请求";
+    : "当前不会接收 ChatGPT 网页请求";
   els.doubleQuotaUrl.textContent = current.url || "http://127.0.0.1:4317/";
   els.doubleQuotaServiceVersion.textContent = current.serviceVersion ? `v${current.serviceVersion}` : "-";
   els.doubleQuotaProtocolVersion.textContent = current.protocolVersion ? `v${current.protocolVersion}` : "-";
@@ -2526,9 +2855,10 @@ function renderDoubleQuota() {
       : "服务独立运行，不会改变 15722 模型 Router。");
   els.startDoubleQuota.disabled = Boolean(current.running);
   els.restartDoubleQuota.disabled = !current.ownedProcess || current.bridgeTaskActive === true;
-  els.stopDoubleQuota.disabled = !current.running;
+  const canStopService = Boolean(current.running || current.ownedProcess);
+  els.stopDoubleQuota.disabled = !canStopService;
   els.startDoubleQuota.textContent = current.running ? "服务已启动" : "启动服务";
-  els.stopDoubleQuota.textContent = current.running ? "停止服务" : "服务已停止";
+  els.stopDoubleQuota.textContent = canStopService ? "停止服务" : "服务已停止";
   els.saveDoubleQuotaPort.disabled = false;
 }
 
@@ -2542,13 +2872,197 @@ function setDoubleQuotaExtensionLayerState(element, text, {
   element.classList.toggle("failed", failed);
 }
 
+function desktopSettingsSavedValues() {
+  const options = state?.desktopOptions || {};
+  const values = Object.fromEntries(DESKTOP_SETTINGS_CHECKBOX_IDS.map((id) => [
+    id, id === "duplicateRequestProtection" ? options[id] === true : Boolean(options[id]),
+  ]));
+  values.routerPort = String(options.routerPort || 15722);
+  values.codexAuxiliaryModelId = String(options.codexAuxiliaryModelId || "").trim() || codexAuxiliaryRouteOptions()[0]?.id || "";
+  const rules = options.smartRouting?.autoSelectRules || {};
+  for (const control of SMART_ROUTING_RULE_CONTROLS) {
+    const rule = normalizeSmartRoutingRuleForUi(rules[control.key]);
+    values[control.mode] = rule.mode;
+    values[control.route] = rule.routeId;
+  }
+  const failover = normalizeSmartRoutingFailoverForUi(options.smartRouting?.failover);
+  values.smartFailoverMode = failover.mode;
+  SMART_ROUTING_ROUTE_CONTROLS.forEach((id, index) => { values[id] = failover.routeIds[index] || ""; });
+  return values;
+}
+
+function desktopSettingsDraftValue(id, savedValue) {
+  return desktopSettingsDraft.has(id) ? desktopSettingsDraft.get(id).value : savedValue;
+}
+
+function captureDesktopSettingsEdit(event) {
+  const control = event.target;
+  if (!DESKTOP_SETTINGS_CONTROL_IDS.has(control?.id)) return;
+  const value = control.type === "checkbox" ? Boolean(control.checked) : String(control.value ?? "");
+  const revision = ++desktopSettingsRevision;
+  const preserve = desktopSettingsSaving || desktopSettingsDraft.get(control.id)?.preserve === true;
+  if (!preserve && Object.is(value, desktopSettingsSavedValues()[control.id])) {
+    desktopSettingsDraft.delete(control.id);
+  } else {
+    desktopSettingsDraft.set(control.id, { value, revision, preserve });
+  }
+  renderDesktopSettingsDraftStatus();
+  if (control.id === "routerPort" && routerPortValidationShown) renderRouterPortValidation();
+}
+
+function routerPortValidationMessage(value, badInput = false) {
+  const text = String(value ?? "").trim();
+  const numeric = Number(text);
+  if (!badInput && (!text || (Number.isInteger(numeric) && numeric >= 1024 && numeric <= 65535))) return "";
+  return "端口需要是 1024 到 65535 之间的整数。";
+}
+
+function renderRouterPortValidation({ report = false, focus = false } = {}) {
+  const port = els.routerPort;
+  const message = routerPortValidationMessage(port?.value, port?.validity?.badInput);
+  if (!message) routerPortValidationShown = false;
+  else if (report) routerPortValidationShown = true;
+  const visible = routerPortValidationShown && Boolean(message);
+  if (els.routerPortError) {
+    const text = visible ? message : "";
+    if (els.routerPortError.textContent !== text) els.routerPortError.textContent = text;
+    els.routerPortError.hidden = !visible;
+  }
+  port?.setAttribute("aria-invalid", String(visible));
+  if (visible && focus && port) {
+    port.scrollIntoView({ block: "center" });
+    port.focus({ preventScroll: true });
+  }
+  return message;
+}
+
+function renderDesktopSettingsDraftStatus() {
+  const saved = desktopSettingsSavedValues();
+  let dirtyCount = 0;
+  for (const [id, entry] of desktopSettingsDraft) {
+    if (entry.preserve || !Object.is(entry.value, saved[id])) dirtyCount += 1;
+    else if (!desktopSettingsSaving) desktopSettingsDraft.delete(id);
+  }
+  const text = desktopSettingsSaving ? "正在保存基础设置…" : dirtyCount ? `基础设置：${dirtyCount} 项未保存` : "基础设置未修改";
+  if (els.desktopSettingsDraftStatus) {
+    if (els.desktopSettingsDraftStatus.textContent !== text) els.desktopSettingsDraftStatus.textContent = text;
+    els.desktopSettingsDraftStatus.classList.toggle("has-changes", dirtyCount > 0);
+  }
+  if (els.discardDesktopSettings) els.discardDesktopSettings.disabled = desktopSettingsSaving || dirtyCount === 0;
+  if (els.saveDesktopOptions) {
+    els.saveDesktopOptions.textContent = desktopSettingsSaving ? "正在保存…" : "保存设置";
+    els.saveDesktopOptions.setAttribute("aria-busy", String(desktopSettingsSaving));
+  }
+}
+
+function focusInvalidControl(control) {
+  if (!control) return;
+  for (let parent = control.parentElement; parent; parent = parent.parentElement) {
+    if (parent.tagName === "DETAILS") parent.open = true;
+  }
+  control.scrollIntoView({ block: "center" });
+  control.focus({ preventScroll: true });
+}
+
+function incompleteRoutingChoice(smartRouting) {
+  const available = new Set((state?.models || []).map((model) => model.id));
+  for (const control of SMART_ROUTING_RULE_CONTROLS) {
+    const rule = normalizeSmartRoutingRuleForUi(smartRouting.autoSelectRules?.[control.key]);
+    if (rule.mode === "route" && (!rule.routeId || !available.has(rule.routeId))) {
+      const field = els[control.route];
+      const label = field?.closest?.("label")?.querySelector("span")?.textContent?.trim() || "该任务";
+      return { control: field, message: `${label}：请选择一个当前可用的模型，再保存设置。` };
+    }
+  }
+  const failover = normalizeSmartRoutingFailoverForUi(smartRouting.failover);
+  if (failover.mode === "ordered" && !failover.routeIds.length) {
+    return { control: els[SMART_ROUTING_ROUTE_CONTROLS[0]], message: "有序切换需要至少一个可用的备用模型，请补齐选择后保存。" };
+  }
+  if (failover.mode === "ordered") {
+    const unavailable = new Set(failover.routeIds.filter((id) => !available.has(id)));
+    if (unavailable.size) {
+      const index = SMART_ROUTING_ROUTE_CONTROLS.findIndex((id) => unavailable.has(String(els[id]?.value || "").trim()));
+      return {
+        control: els[SMART_ROUTING_ROUTE_CONTROLS[Math.max(0, index)]],
+        message: index >= 0 ? `备用位 ${index + 1} 的模型已不可用，请重新选择。` : "备用列表中有不可用的模型，请重新选择。",
+      };
+    }
+  }
+  return null;
+}
+
+function basicSettingsReceiptMatches(expected, snapshot) {
+  const saved = snapshot?.desktopOptions;
+  if (snapshot?.stateUnavailable || !saved || typeof saved !== "object" || Array.isArray(saved)) return false;
+  for (const [key, value] of Object.entries(expected)) {
+    if (key !== "smartRouting" && (!Object.hasOwn(saved, key) || saved[key] !== value)) return false;
+  }
+  const rules = saved.smartRouting?.autoSelectRules;
+  const failover = saved.smartRouting?.failover;
+  if (!rules || typeof rules !== "object" || Array.isArray(rules) || !failover || !Array.isArray(failover.routeIds)) return false;
+  for (const [key, value] of Object.entries(expected.smartRouting.autoSelectRules)) {
+    const expectedRule = normalizeSmartRoutingRuleForUi(value);
+    const rule = rules[key];
+    if (!Object.hasOwn(rules, key) || !rule || rule.mode !== expectedRule.mode || rule.routeId !== expectedRule.routeId) return false;
+  }
+  const expectedFailover = normalizeSmartRoutingFailoverForUi(expected.smartRouting.failover);
+  return failover.mode === expectedFailover.mode && failover.routeIds.length === expectedFailover.routeIds.length &&
+    failover.routeIds.every((id, index) => id === expectedFailover.routeIds[index]);
+}
+
+function saveDesktopSettings(button = els.saveDesktopOptions) {
+  if (desktopSettingsSaving) return Promise.resolve();
+  return runAction(button, async () => {
+    if (renderRouterPortValidation({ report: true, focus: true })) return;
+    const submitted = new Map([...desktopSettingsDraft].map(([id, entry]) => [id, entry.revision]));
+    desktopSettingsSaving = true;
+    let applied = false;
+    try {
+      renderDesktopSettingsDraftStatus();
+      const options = {
+        bypassSystemProxy: els.bypassSystemProxy.checked,
+        localRateLimitEnabled: els.localRateLimitEnabled.checked,
+        duplicateRequestProtection: els.duplicateRequestProtection.checked,
+        interceptCodexAuxiliaryTasks: els.interceptCodexAuxiliaryTasks?.checked || false,
+        codexAuxiliaryModelId: String(els.codexAuxiliaryModelId?.value || "").trim(),
+        routerPort: Number(els.routerPort.value || 15722),
+        autoSelectModel: els.autoSelectModel.checked,
+        autoFailover: els.autoFailover.checked,
+        smartRouting: smartRoutingOptionsFromInputs(),
+      };
+      const incomplete = incompleteRoutingChoice(options.smartRouting);
+      if (incomplete) {
+        showToast(incomplete.message, "error");
+        focusInvalidControl(incomplete.control);
+        return;
+      }
+      const nextState = await api.saveOptions(options);
+      if (!basicSettingsReceiptMatches(options, nextState)) {
+        throw new Error("无法确认基础设置已保存，修改已保留；请刷新后重试。");
+      }
+      adoptStateSnapshot(nextState);
+      for (const [id, entry] of desktopSettingsDraft) {
+        if (entry.revision === submitted.get(id)) desktopSettingsDraft.delete(id);
+      }
+      applied = true;
+    } finally {
+      desktopSettingsSaving = false;
+      if (applied) render();
+      else renderDesktopSettingsDraftStatus();
+    }
+    showToast(desktopSettingsDraft.size
+      ? "本次提交已保存，后续修改仍未保存；端口或代理变更需重启 Router 生效。"
+      : "基础设置已保存；端口或代理变更会在重新启动 Router 后生效。");
+  });
+}
+
 function renderCodexAuxiliaryTaskSettings() {
   if (!els.codexAuxiliaryModelId) {
     return;
   }
   const routeOptions = codexAuxiliaryRouteOptions();
   const savedRouteId = String(state.desktopOptions?.codexAuxiliaryModelId || "").trim();
-  const selectedRouteId = savedRouteId || routeOptions[0]?.id || "";
+  const selectedRouteId = desktopSettingsDraftValue("codexAuxiliaryModelId", savedRouteId || routeOptions[0]?.id || "");
   if (document.activeElement !== els.codexAuxiliaryModelId) {
     populateCodexAuxiliaryRouteSelect(els.codexAuxiliaryModelId, selectedRouteId, routeOptions);
   }
@@ -2590,19 +3104,19 @@ function renderSmartRoutingSettings() {
     }
     const rule = normalizeSmartRoutingRuleForUi(rules[control.key]);
     if (document.activeElement !== modeEl) {
-      modeEl.value = rule.mode;
+      modeEl.value = desktopSettingsDraftValue(control.mode, rule.mode);
     }
-    populateSmartRoutingRouteSelect(routeEl, rule.routeId);
+    if (document.activeElement !== routeEl) populateSmartRoutingRouteSelect(routeEl, desktopSettingsDraftValue(control.route, rule.routeId));
   });
 
   const failover = normalizeSmartRoutingFailoverForUi(smartRouting.failover);
   if (els.smartFailoverMode && document.activeElement !== els.smartFailoverMode) {
-    els.smartFailoverMode.value = failover.mode;
+    els.smartFailoverMode.value = desktopSettingsDraftValue("smartFailoverMode", failover.mode);
   }
   SMART_ROUTING_ROUTE_CONTROLS.forEach((controlId, index) => {
     const select = els[controlId];
-    if (select) {
-      populateSmartRoutingRouteSelect(select, failover.routeIds[index] || "", { emptyLabel: `备用位 ${index + 1}` });
+    if (select && document.activeElement !== select) {
+      populateSmartRoutingRouteSelect(select, desktopSettingsDraftValue(controlId, failover.routeIds[index] || ""), { emptyLabel: `备用位 ${index + 1}` });
     }
   });
   syncSmartRoutingControlStates();
@@ -2720,8 +3234,8 @@ function renderModelReferenceStatus() {
   if (!issues.length) {
     els.modelReferenceStatus.innerHTML = `
       <div class="model-reference-ok">
-        <strong>模型引用正常</strong>
-        <span>模型选择、辅助任务、智能切换和备用顺序都指向当前可用模型。</span>
+        <strong>已保存配置：模型引用正常</strong>
+        <span>仅检查已保存配置，不包含尚未保存的修改。</span>
       </div>
     `;
     return;
@@ -2731,7 +3245,7 @@ function renderModelReferenceStatus() {
   els.modelReferenceStatus.innerHTML = `
     <div class="model-reference-warning">
       <div>
-        <strong>${formatNumber(issues.length)} 项模型引用失效</strong>
+        <strong>已保存配置：${formatNumber(issues.length)} 项模型引用失效</strong>
         <span>可以自动修复为当前可用模型；模型栏里的失效项也可以直接移除并保存。</span>
       </div>
       <ul>
@@ -2788,7 +3302,7 @@ function bindModelReferenceIssueActions(root = document) {
 async function repairStaleModelReferences() {
   const response = await api.repairModelReferences();
   const message = modelReferenceRepairToast(response?.result);
-  state = response?.state || await api.getState();
+  adoptStateSnapshot(response?.state || await api.getState());
   draftSelection = [...(state.selectedModelIds || [])];
   render();
   showToast(message);
@@ -3179,7 +3693,7 @@ function testCapabilityProviderFromForm(button) {
     const response = await api.testCapabilityProvider({
       provider: capabilityProviderPayloadFromForm(),
     });
-    state = response?.state || await api.getState();
+    adoptStateSnapshot(response?.state || await api.getState());
     renderCapabilityProviderList();
     renderCapabilityProviderTestResult(response);
     showToast(
@@ -4147,7 +4661,7 @@ function testImageProviderFromForm(button) {
       provider: imageProviderPayloadFromForm(),
       prompt: els.imageProviderTestPrompt?.value?.trim() || "",
     });
-    state = response?.state || await api.getState();
+    adoptStateSnapshot(response?.state || await api.getState());
     renderImageProviderSettings();
     renderImageProviderTestResult(response);
     renderImageGenerationHistory();
@@ -4169,7 +4683,7 @@ function testSavedImageProvider(button) {
       provider,
       prompt: els.imageProviderTestPrompt?.value?.trim() || "",
     });
-    state = response?.state || await api.getState();
+    adoptStateSnapshot(response?.state || await api.getState());
     renderImageProviderSettings();
     renderImageProviderTestResult(response);
     renderImageGenerationHistory();
@@ -4368,7 +4882,7 @@ function clearCapabilityExecutionHistory(button) {
       olderThanDays: 30,
       keepLatest: 50,
     });
-    state = response?.state || await api.getState();
+    adoptStateSnapshot(response?.state || await api.getState());
     button.dataset.confirmClear = "false";
     button.textContent = "清理旧记录";
     renderCapabilityExecutionHistory();
@@ -4424,8 +4938,7 @@ function fileNameFromPath(value) {
 function saveImageProviderSettings(button) {
   return runAction(button, async () => {
     const response = await api.saveImageProvider(imageProviderPayloadFromForm());
-    state = response?.state || await api.getState();
-    draftSelection = [...state.selectedModelIds];
+    adoptStateSnapshot(response?.state || await api.getState());
     render();
     showToast("图片供应商已保存。非 GPT 模型可继承默认图片代理。");
   });
@@ -4434,8 +4947,7 @@ function saveImageProviderSettings(button) {
 function saveCapabilityProviderSettings(button) {
   return runAction(button, async () => {
     const response = await api.saveCapabilityProvider(capabilityProviderPayloadFromForm());
-    state = response?.state || await api.getState();
-    draftSelection = [...state.selectedModelIds];
+    adoptStateSnapshot(response?.state || await api.getState());
     render();
     showToast("实验能力供应商已保存；除图片生成外，仅用于手动体检和试运行。");
   });
@@ -4457,8 +4969,7 @@ function removeCapabilityProvider(button) {
       return;
     }
     const response = await api.removeCapabilityProvider(providerId);
-    state = response?.state || await api.getState();
-    draftSelection = [...state.selectedModelIds];
+    adoptStateSnapshot(response?.state || await api.getState());
     resetCapabilityProviderForm();
     render();
     showToast("能力供应商已移除。");
@@ -4481,8 +4992,7 @@ function removeImageProvider(button) {
       return;
     }
     const response = await api.removeImageProvider(providerId);
-    state = response?.state || await api.getState();
-    draftSelection = [...state.selectedModelIds];
+    adoptStateSnapshot(response?.state || await api.getState());
     resetImageProviderForm();
     render();
     showToast("图片供应商已移除。");
@@ -4521,7 +5031,8 @@ function renderStartupCheck() {
   }
   const check = state.startupCheck;
   if (!check) {
-    els.startupCheckSummary.innerHTML = `<div class="empty-state">${stateDetailLoaded ? "暂无体检结果。" : "进入体检页后会读取结果。"}</div>`;
+    const detailError = state.detailSectionErrors?.preflight?.message;
+    els.startupCheckSummary.innerHTML = `<div class="empty-state">${escapeHtml(detailError || (loadedDetailSections.has("preflight") ? "暂无体检结果。" : "进入体检页后会读取结果。"))}</div>`;
     els.startupCheckList.innerHTML = "";
     return;
   }
@@ -4777,7 +5288,7 @@ function renderProfiles() {
           return;
         }
         const response = await api.saveConfigProfile({ ...profile, name: nextName });
-        state = response?.state || await api.getState();
+        adoptStateSnapshot(response?.state || await api.getState());
         render();
         showToast("配置档名称已保存。");
       }),
@@ -4786,7 +5297,7 @@ function renderProfiles() {
   els.profileList.querySelectorAll("[data-apply-profile]").forEach((button) => {
     button.addEventListener("click", () =>
       runAction(button, async () => {
-        state = await api.applyConfigProfile(button.dataset.applyProfile);
+        adoptStateSnapshot(await api.applyConfigProfile(button.dataset.applyProfile));
         draftSelection = [...(state.selectedModelIds || [])];
         render();
         showToast("配置档已应用。");
@@ -4853,6 +5364,7 @@ function renderBackups() {
       runAction(button, async () => {
         const accepted = await showConfirmDialog({
           title: "恢复 Codex 配置备份",
+          returnFocusTo: button,
           message: "将用选中的备份覆盖当前 config.toml。当前配置会先自动备份，方便回退。",
           confirmText: "恢复备份",
         });
@@ -4881,26 +5393,44 @@ function backupKindLabel(kind) {
   return "配置备份";
 }
 
-function showConfirmDialog({ title, message, confirmText = "确认", cancelText = "取消" } = {}) {
+function showConfirmDialog({ title, message, confirmText = "确认", cancelText = "取消", returnFocusTo = document.activeElement } = {}) {
   return new Promise((resolve) => {
-    const backdrop = document.createElement("div");
-    backdrop.className = "modal-backdrop runtime-confirm-backdrop";
+    const backdrop = document.createElement("dialog");
+    backdrop.className = "modal-backdrop console-modal runtime-confirm-backdrop";
+    backdrop.setAttribute("aria-label", title || "确认操作");
     backdrop.innerHTML = `
-      <div class="request-detail-dialog runtime-confirm-dialog" role="dialog" aria-modal="true">
+      <div class="runtime-confirm-dialog">
         <header>
           <h2>${escapeHtml(title || "确认操作")}</h2>
         </header>
-        <p>${escapeHtml(message || "")}</p>
+        <p class="runtime-confirm-message">${escapeHtml(message || "")}</p>
         <div class="runtime-confirm-actions">
           <button class="ghost-button light" type="button" data-confirm-cancel>${escapeHtml(cancelText)}</button>
           <button class="primary-button" type="button" data-confirm-ok>${escapeHtml(confirmText)}</button>
         </div>
       </div>
     `;
+    let settled = false;
     const close = (accepted) => {
+      if (settled) return;
+      settled = true;
+      if (backdrop.open) backdrop.close();
       backdrop.remove();
       resolve(accepted);
+      if (!accepted) {
+        window.setTimeout(() => {
+          if (document.activeElement === document.body && returnFocusTo?.isConnected && !returnFocusTo.disabled &&
+              !document.querySelector("dialog:modal, .modal-backdrop:not(.hidden)")) {
+            returnFocusTo.focus({ preventScroll: true });
+          }
+        }, 0);
+      }
     };
+    backdrop.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      close(false);
+    });
+    backdrop.addEventListener("close", () => close(false));
     backdrop.addEventListener("click", (event) => {
       if (event.target === backdrop) {
         close(false);
@@ -4909,7 +5439,8 @@ function showConfirmDialog({ title, message, confirmText = "确认", cancelText 
     backdrop.querySelector("[data-confirm-cancel]")?.addEventListener("click", () => close(false));
     backdrop.querySelector("[data-confirm-ok]")?.addEventListener("click", () => close(true));
     document.body.appendChild(backdrop);
-    backdrop.querySelector("[data-confirm-ok]")?.focus();
+    backdrop.showModal();
+    backdrop.querySelector("[data-confirm-cancel]")?.focus();
   });
 }
 
@@ -4917,8 +5448,10 @@ function renderResources() {
   if (!(els.resourceSummary && els.resourceList)) {
     return;
   }
+  renderResourceFilterStatus();
+  const diagnosticsOpen = els.resourceList.querySelector?.(".resource-diagnostics")?.open === true;
   resourceDetailItems.clear();
-  const rawResources = state.codexResources || {};
+  const rawResources = state?.codexResources || {};
   const pluginPage = rawResources.pluginPage || null;
   const resources = pluginPage
     ? {
@@ -4941,25 +5474,14 @@ function renderResources() {
       snapshot: resources.snapshot?.state,
     });
   }
-  if (!stateDetailLoaded && !state.codexResources) {
+  renderResourceRefreshStatus(resources.snapshot || {});
+  if (!state || (!loadedDetailSections.has("resources") && !state.codexResources)) {
     els.resourceSummary.innerHTML = "";
-    els.resourceList.innerHTML = `<div class="empty-state">进入资源页后会读取 Codex 当前资源。</div>`;
+    const detailError = state?.detailSectionErrors?.resources?.message;
+    els.resourceList.innerHTML = `<div class="empty-state">${escapeHtml(detailError || "进入资源页后会读取 Codex 当前资源。")}</div>`;
     return;
   }
   const summary = resources.summary || {};
-  if (els.resourceRefreshStatus) {
-    const snapshot = resources.snapshot || {};
-    const refreshedAt = snapshot.refreshedAt ? formatTime(snapshot.refreshedAt) : "未知";
-    const statusLabel = snapshot.state === "authoritative"
-      ? "权威读取成功"
-      : snapshot.state === "cached"
-        ? "App Server 暂不可用，使用最近有效缓存"
-        : "尚未取得权威结果";
-    const appIds = Array.isArray(snapshot.appIds) && snapshot.appIds.length
-      ? `；应用：${snapshot.appIds.join(", ")}`
-      : "";
-    els.resourceRefreshStatus.textContent = `资源状态：${statusLabel}；最后有效读取：${refreshedAt}${appIds}`;
-  }
   const discoveredSummary = resources.discoveredSummary || {};
   const discovered = resources.discovered || {};
   const filteredResources = {
@@ -4990,14 +5512,14 @@ function renderResources() {
     <article><span>规则文件</span><strong>${resourceSummaryDisplay(resources, "agentFiles")}</strong></article>
   `;
   const availableBlocks = [
-    resourceBlock("插件 MCP", filteredResources.mcpServers, resourceShortLabel, "mcpServers", resourceSummaryReadStatus(resources, "mcpServers")),
-    resourceBlock("已安装插件", filteredResources.plugins, resourceShortLabel, "plugins", resourceSummaryReadStatus(resources, "plugins")),
-    resourceBlock("应用", filteredResources.apps, resourceShortLabel, "apps", resourceSummaryReadStatus(resources, "apps")),
-    resourceBlock(skillLabel, filteredResources.skills, resourceShortLabel, "skills", resourceSummaryReadStatus(resources, "skills")),
-    resourceBlock("插件市场", filteredResources.marketplaces, resourceShortLabel, "marketplaces", resourceSummaryReadStatus(resources, "marketplaces")),
-    resourceBlock("提示词", filteredResources.prompts, resourceShortLabel, "prompts", resourceSummaryReadStatus(resources, "prompts")),
-    resourceBlock("规则文件", filteredResources.agentFiles, resourceShortLabel, "agentFiles", resourceSummaryReadStatus(resources, "agentFiles")),
-  ];
+    resourceBlock("插件 MCP", filteredResources.mcpServers, resourceShortLabel, "mcpServers", resourceSummaryReadStatus(resources, "mcpServers"), true),
+    resourceBlock("已安装插件", filteredResources.plugins, resourceShortLabel, "plugins", resourceSummaryReadStatus(resources, "plugins"), true),
+    resourceBlock("应用", filteredResources.apps, resourceShortLabel, "apps", resourceSummaryReadStatus(resources, "apps"), true),
+    resourceBlock(skillLabel, filteredResources.skills, resourceShortLabel, "skills", resourceSummaryReadStatus(resources, "skills"), true),
+    resourceBlock("插件市场", filteredResources.marketplaces, resourceShortLabel, "marketplaces", resourceSummaryReadStatus(resources, "marketplaces"), true),
+    resourceBlock("提示词", filteredResources.prompts, resourceShortLabel, "prompts", resourceSummaryReadStatus(resources, "prompts"), true),
+    resourceBlock("规则文件", filteredResources.agentFiles, resourceShortLabel, "agentFiles", resourceSummaryReadStatus(resources, "agentFiles"), true),
+  ].filter(Boolean);
   const discoveredBlocks = [
     resourceBlock("未启用 MCP", filteredDiscovered.mcpServers, resourceShortLabel, "discoveredMcpServers"),
     resourceBlock("未计入当前可用的插件", filteredDiscovered.plugins, resourceShortLabel, "discoveredPlugins"),
@@ -5009,16 +5531,18 @@ function renderResources() {
     resourceBreakdownSummary(resources.breakdown),
     ...discoveredBlocks,
   ].filter(Boolean).join("");
+  els.resourceList.classList?.toggle("single-resource-group", availableBlocks.length === 1);
   els.resourceList.innerHTML = `
     <div class="resource-section-title">当前可用</div>
     ${availableBlocks.join("")}
+    ${!availableBlocks.length && !emptyFilter ? '<div class="empty-state">当前没有可用资源。安装插件或 Skill 后，可以点击“刷新资源”重新读取。</div>' : ""}
     ${emptyFilter ? `
       <div class="resource-filter-empty">
-        没有匹配的资源。可以清空搜索词，或者把筛选状态切回“全部资源”。
+        没有匹配的资源。点击“清除筛选”可恢复全部资源。
       </div>
     ` : ""}
     ${diagnosticsBlocks ? `
-      <details class="resource-diagnostics">
+      <details class="resource-diagnostics"${diagnosticsOpen ? " open" : ""}>
         <summary>
           <strong>高级诊断</strong>
           <span>${discoveredTotal ? `${formatNumber(discoveredTotal)} 项未计入当前可用` : "查看来源说明"}</span>
@@ -5129,8 +5653,11 @@ function renderSessions() {
     return;
   }
   renderHistoryRecoveryStatus();
-  if (!stateDetailLoaded && !state.codexSessionTree) {
-    els.sessionList.innerHTML = `<div class="empty-state">进入会话页后会读取本机 Codex 会话。</div>`;
+  if (els.clearSessionSearch) els.clearSessionSearch.disabled = !sessionSearchText;
+  if (!state || (!loadedDetailSections.has("sessions") && !state.codexSessionTree)) {
+    const detailError = state?.detailSectionErrors?.sessions?.message;
+    if (els.sessionSearchCount) els.sessionSearchCount.textContent = detailError ? "读取失败" : "等待读取";
+    els.sessionList.innerHTML = `<div class="empty-state">${escapeHtml(detailError || "进入会话页后会读取本机 Codex 会话。")}</div>`;
     return;
   }
   const sessions = Array.isArray(state.codexSessions) ? state.codexSessions : [];
@@ -5146,10 +5673,12 @@ function renderSessions() {
   const visibleLooseSessions = displayTree.looseSessions.length;
   const visibleProjectSessions = displayTree.projects.reduce((sum, project) => sum + project.sessions.length, 0);
   const visibleSessions = visibleProjectSessions + visibleLooseSessions;
+  if (els.sessionSearchCount) els.sessionSearchCount.textContent = `${formatNumber(visibleProjects)} 个项目 · ${formatNumber(visibleSessions)} 个会话`;
+  const diagnosticsOpen = els.sessionList.querySelector?.(".session-diagnostics")?.open === true;
   const sessionLimit = Number(tree.summary?.limit || 0);
   const sessionMayHaveMore = Boolean(tree.summary?.mayHaveMore);
   const filterNote = searchTerm
-    ? `<div class="session-filter-note">当前筛选：${formatNumber(visibleProjects)} 个项目、${formatNumber(visibleSessions)} 个会话。原始索引仍是 ${formatNumber(totalProjects)} 个项目、${formatNumber(totalSessions)} 个会话。筛选只影响当前页面显示；可导出当前筛选 Markdown，其它导出按钮仍按原始范围导出。</div>`
+    ? `<div class="session-filter-note">仅筛选当前列表；“导出当前筛选”导出匹配会话，“导出全部”仍导出全部已加载会话。</div>`
     : "";
   const projectFolderCount = searchTerm
     ? `${formatNumber(visibleProjects)} / ${formatNumber(totalProjects)} 个项目`
@@ -5181,16 +5710,6 @@ function renderSessions() {
     return;
   }
   els.sessionList.innerHTML = `
-    <div class="session-overview">
-      <span>原始线程总数 ${formatNumber(sessionSummary?.rawThreads || totalSessions)} 个</span>
-      <span>普通用户会话 ${formatNumber(sessionSummary?.activeUserThreads || totalSessions)} 个</span>
-      <span>Codex 当前目录 ${formatNumber(sessionSummary?.catalogThreads || 0)} 个</span>
-      <span>Codex 当前侧栏索引 ${formatNumber(sessionSummary?.sidebarThreads || 0)} 个</span>
-      <span>仅可恢复 ${formatNumber(sessionSummary?.recoverableThreads || 0)} 个</span>
-      <span>子代理/内部线程 ${formatNumber((sessionSummary?.subagentThreads || 0) + (sessionSummary?.internalThreads || 0))} 个</span>
-      <span>已归档会话 ${formatNumber(sessionSummary?.archivedThreads || 0)} 个</span>
-    </div>
-    <div class="session-limit-note">“Codex 当前目录”是新版 local_thread_catalog 的实际数量；“仅可恢复”表示原始会话仍在，但尚未进入新版目录。恢复前会预览、退出 ChatGPT、完整备份并在事务后回读验证。</div>
     <div class="session-project-actions">
       <button
         class="ghost-button light small"
@@ -5207,13 +5726,21 @@ function renderSessions() {
     </div>
     ${filterNote}
     ${recoveryResult}
-    ${classificationNote || sessionLimitNote ? `
-      <details class="session-diagnostics">
-        <summary>查看归类依据</summary>
+      <details class="session-diagnostics"${diagnosticsOpen ? " open" : ""}>
+        <summary>查看索引与归类依据</summary>
+        <div class="session-overview">
+          <span>原始线程总数 ${formatNumber(sessionSummary?.rawThreads || totalSessions)} 个</span>
+          <span>普通用户会话 ${formatNumber(sessionSummary?.activeUserThreads || totalSessions)} 个</span>
+          <span>Codex 当前目录 ${formatNumber(sessionSummary?.catalogThreads || 0)} 个</span>
+          <span>Codex 当前侧栏索引 ${formatNumber(sessionSummary?.sidebarThreads || 0)} 个</span>
+          <span>仅可恢复 ${formatNumber(sessionSummary?.recoverableThreads || 0)} 个</span>
+          <span>子代理/内部线程 ${formatNumber((sessionSummary?.subagentThreads || 0) + (sessionSummary?.internalThreads || 0))} 个</span>
+          <span>已归档会话 ${formatNumber(sessionSummary?.archivedThreads || 0)} 个</span>
+        </div>
+        <div class="session-limit-note">“Codex 当前目录”是新版 local_thread_catalog 的实际数量；“仅可恢复”表示原始会话仍在，但尚未进入新版目录。恢复前会预览、退出 ChatGPT、完整备份并在事务后回读验证。</div>
         ${sessionLimitNote}
         ${classificationNote}
       </details>
-    ` : ""}
     <details class="session-folder" open>
       <summary>
         <strong>项目文件夹</strong>
@@ -5325,7 +5852,7 @@ function bindAllSessionsExportButton() {
         }
         const sessionCount = response?.tree?.summary?.sessions || 0;
         const projectCount = response?.tree?.summary?.projects || 0;
-        showToast(`全部会话 Markdown 已保存：${response?.filePath || "未知位置"}，包含 ${formatNumber(projectCount)} 个项目、${formatNumber(sessionCount)} 个会话。`);
+        showToast(`全部会话 Markdown 已保存：${response?.filePath || "未知位置"}，包含 ${formatNumber(projectCount)} 个项目、${formatNumber(sessionCount)} 个会话${sessionExportClipboardNote(response)}。`);
       }),
     );
   });
@@ -5348,7 +5875,7 @@ function bindFilteredSessionsExportButton() {
           return;
         }
         const sessionCount = response?.tree?.summary?.sessions || sessionIds.length || 0;
-        showToast(`当前筛选 Markdown 已保存：${response?.filePath || "未知位置"}，共 ${formatNumber(sessionCount)} 个会话，已复制到剪贴板。`);
+        showToast(`当前筛选 Markdown 已保存：${response?.filePath || "未知位置"}，共 ${formatNumber(sessionCount)} 个会话${sessionExportClipboardNote(response)}。`);
       }),
     );
   });
@@ -5363,8 +5890,8 @@ function bindLooseSessionsExportButton() {
           showToast("已取消导出无项目会话。");
           return;
         }
-        const sessionCount = response?.group?.sessions?.length || 0;
-        showToast(`无项目会话 Markdown 已保存：${response?.filePath || "未知位置"}，共 ${formatNumber(sessionCount)} 个会话，已复制到剪贴板。`);
+        const sessionCount = response?.group?.sessionCount || 0;
+        showToast(`无项目会话 Markdown 已保存：${response?.filePath || "未知位置"}，共 ${formatNumber(sessionCount)} 个会话${sessionExportClipboardNote(response)}。`);
       }),
     );
   });
@@ -5380,7 +5907,7 @@ function bindProjectExportButtons() {
           showToast("已取消导出项目。");
           return;
         }
-        showToast(`项目 Markdown 已保存：${response?.filePath || "未知位置"}，并已复制到剪贴板：${formatNumber(response?.markdownLength || 0)} 字符。`);
+        showToast(`项目 Markdown 已保存：${response?.filePath || "未知位置"}，${formatNumber(response?.markdownLength || 0)} 字符${sessionExportClipboardNote(response)}。`);
       });
     });
   });
@@ -5395,10 +5922,16 @@ function bindSessionExportButtons() {
           showToast("已取消导出会话。");
           return;
         }
-        showToast(`会话 Markdown 已保存：${response?.filePath || "未知位置"}，并已复制到剪贴板：${formatNumber(response?.markdownLength || 0)} 字符。`);
+        showToast(`会话 Markdown 已保存：${response?.filePath || "未知位置"}，${formatNumber(response?.markdownLength || 0)} 字符${sessionExportClipboardNote(response)}。`);
       }),
     );
   });
+}
+
+function sessionExportClipboardNote(response = {}) {
+  return response.clipboardCopied
+    ? "，已复制到剪贴板"
+    : "，内容较大，未复制到剪贴板";
 }
 
 function bindSessionFolderButtons() {
@@ -5567,6 +6100,32 @@ function resourceFilterActive() {
   return Boolean(resourceFilterText.trim()) || resourceStatusFilter !== "all" || resourceSourceFilter !== "all";
 }
 
+function clearResourceFilters() {
+  resourceFilterText = "";
+  resourceStatusFilter = "all";
+  resourceSourceFilter = "all";
+  if (els.resourceSearch) els.resourceSearch.value = "";
+  if (els.resourceStatusFilter) els.resourceStatusFilter.value = "all";
+  if (els.resourceSourceFilter) els.resourceSourceFilter.value = "all";
+  renderResources();
+  els.resourceSearch?.focus();
+}
+
+function renderResourceFilterStatus() {
+  const parts = [
+    resourceSourceFilter !== "all" ? els.resourceSourceFilter?.selectedOptions?.[0]?.textContent || "指定来源" : "",
+    resourceStatusFilter !== "all" ? els.resourceStatusFilter?.selectedOptions?.[0]?.textContent || "指定状态" : "",
+    resourceFilterText.trim() ? `关键词：${resourceFilterText.trim()}` : "",
+  ].filter(Boolean);
+  if (els.resourceFilterStatus) {
+    const text = parts.length ? `当前筛选：${parts.join(" · ")}` : "";
+    els.resourceFilterStatus.textContent = text;
+    els.resourceFilterStatus.title = text;
+    els.resourceFilterStatus.hidden = parts.length === 0;
+  }
+  if (els.clearResourceFilters) els.clearResourceFilters.disabled = !resourceFilterText && resourceStatusFilter === "all" && resourceSourceFilter === "all";
+}
+
 function resourceIsCurrentResource(item = {}, status = "info", key = "") {
   if (key.startsWith("discovered")) {
     return false;
@@ -5656,12 +6215,13 @@ function resourceMatchesSourceFilter(item = {}, key = "") {
   return pluginSource === filter || source === filter;
 }
 
-function resourceBlock(title, items = [], labelFn = resourceShortLabel, key = title, readStatus = null) {
+function resourceBlock(title, items = [], labelFn = resourceShortLabel, key = title, readStatus = null, hideEmpty = false) {
   const list = Array.isArray(items) ? items : [];
   if (!list.length && key.startsWith("discovered")) {
     return "";
   }
   const readable = resourceReadStatusAvailable(readStatus);
+  if (hideEmpty && readable && !list.length) return "";
   const expanded = resourceExpandedKeys.has(key);
   const visible = expanded ? list : list.slice(0, 6);
   const rows = !readable
@@ -6078,6 +6638,7 @@ function bindResourceActionButtons() {
           const actionLabel = button.textContent.trim() || "更新插件";
           const accepted = await showConfirmDialog({
             title: actionLabel,
+            returnFocusTo: button,
             message: `CodexBridge 会调用 Codex CLI 刷新插件市场并${actionLabel.includes("安装") ? "安装" : "重新安装"}：${id}。这个操作不会删除插件目录，完成后请重启 ChatGPT / Codex 最稳。`,
             confirmText: actionLabel,
           });
@@ -6108,6 +6669,7 @@ function bindResourceActionButtons() {
         const id = button.dataset.resourceRemoveId || "";
         const accepted = await showConfirmDialog({
           title: "卸载插件",
+          returnFocusTo: button,
           message: `CodexBridge 会调用 Codex CLI 卸载插件：${id}。卸载后如果 ChatGPT / Codex 已经打开，建议重启桌面应用，让插件列表重新加载。`,
           confirmText: "卸载插件",
         });
@@ -6130,6 +6692,7 @@ function bindResourceActionButtons() {
         const label = resourceKindLabel(kind);
         const accepted = await showConfirmDialog({
           title: enabled ? "启用资源" : "停用资源",
+          returnFocusTo: button,
           message: `${enabled ? "启用" : "停用"}${label}：${id}？${kind === "skill" ? "这会移动单个本地技能文件，重启 ChatGPT / Codex 后最稳。" : "修改会写入 Codex config.toml，重启 ChatGPT / Codex 后最稳。"}`,
           confirmText: enabled ? "启用" : "停用",
         });
@@ -6596,6 +7159,7 @@ function renderModelPageView() {
   catalog?.classList.toggle("hidden", modelPageView !== "catalog");
   providerPanel?.classList.toggle("hidden", modelPageView !== "provider");
   customPanel?.classList.toggle("hidden", modelPageView !== "custom");
+  document.querySelector(".model-selection-actions")?.classList.toggle("hidden", modelPageView !== "catalog");
 }
 
 function openProviderEditor(providerId) {
@@ -6754,8 +7318,7 @@ function bindProviderRefreshButtons(root) {
       runAction(button, async () => {
         await saveProviderSettingsBeforeRemoteAction(button);
         const response = await api.refreshProviderModels(button.dataset.refreshProviderModels);
-        state = response?.state || await api.getState();
-        draftSelection = [...state.selectedModelIds];
+        adoptStateSnapshot(response?.state || await api.getState());
         render();
         const result = response?.result || {};
         showToast(
@@ -6946,8 +7509,7 @@ function bindProviderEditorActions(root) {
         if (response?.canceled) {
           return;
         }
-        state = response?.state || await api.getState();
-        draftSelection = [...state.selectedModelIds];
+        adoptStateSnapshot(response?.state || await api.getState());
         render();
         showToast("供应商图标已更新。");
       });
@@ -7041,8 +7603,7 @@ function saveProviderSettings(button) {
 
 async function saveProviderSettingsFromCard(card) {
   const response = await api.saveProvider(providerSettingsPayload(card));
-  state = response?.state || await api.getState();
-  draftSelection = [...state.selectedModelIds];
+  adoptStateSnapshot(response?.state || await api.getState());
   return response;
 }
 
@@ -7050,7 +7611,7 @@ function resetProviderSettings(button) {
   return runAction(button, async () => {
     const providerId = button.dataset.resetProviderSettings || button.closest(".provider-editor-card")?.dataset.providerId || "";
     const response = await api.resetProvider(providerId);
-    state = response?.state || await api.getState();
+    adoptStateSnapshot(response?.state || await api.getState());
     draftSelection = [...state.selectedModelIds];
     render();
     showToast("供应商默认配置已恢复，失效模型引用也已同步修复。");
@@ -7162,8 +7723,10 @@ function saveProviderSecret(button) {
 }
 
 function renderSelectedModels() {
+  renderModelSelectionStatus();
   const modelsById = modelMap();
   const unavailableIds = unavailableDraftSelectionIds(modelsById);
+  els.selectedModels.setAttribute("role", draftSelection.length ? "list" : "status");
   if (els.cleanUnavailableModels) {
     els.cleanUnavailableModels.disabled = unavailableIds.length === 0;
   }
@@ -7186,23 +7749,44 @@ function renderSelectedModels() {
       const model = modelsById.get(presetId);
       const unavailableAttr = model ? "" : ` data-unavailable-model-id="${escapeHtml(presetId)}"`;
       return `
-        <div class="slot-card ${model ? "filled" : "missing"}" draggable="true" data-slot-index="${index}"${unavailableAttr}>
+        <div class="slot-card ${model ? "filled" : "missing"}" draggable="true" data-slot-index="${index}" data-selected-model="${escapeHtml(presetId)}" tabindex="-1" role="listitem" aria-label="第 ${index + 1} 个模型：${escapeHtml(model?.displayName || presetId)}"${unavailableAttr}>
           <button class="slot-remove" type="button" data-remove-selected-slot="${index}" title="移除这个模型" aria-label="移除这个模型">移除</button>
           <span>第 ${index + 1} 个模型</span>
-          <strong>${model ? escapeHtml(model.displayName) : "模型不可用"}</strong>
-          <small>${model ? `${escapeHtml(model.model)} · ${escapeHtml(providerName(model.providerId))}` : escapeHtml(presetId)}</small>
+          <strong title="${escapeHtml(model?.displayName || presetId)}">${model ? escapeHtml(model.displayName) : "模型不可用"}</strong>
+          <small title="${escapeHtml(model ? `${model.model} · ${providerName(model.providerId)}` : presetId)}">${model ? `${escapeHtml(model.model)} · ${escapeHtml(providerName(model.providerId))}` : escapeHtml(presetId)}</small>
           ${model ? "" : `
             <div class="slot-actions">
               <button class="mini-link" type="button" data-repair-stale-model-reference="${escapeHtml(presetId)}">自动修复</button>
               <button class="mini-link danger" type="button" data-remove-stale-model-reference="${escapeHtml(presetId)}">移除并保存</button>
             </div>
           `}
+          <div class="slot-order-actions">
+            <button class="plain-button small" type="button" data-move-selected-slot="${index}" data-move-direction="up" aria-label="上移 ${escapeHtml(model?.displayName || presetId)}"${index === 0 ? " disabled" : ""}>↑ 上移</button>
+            <button class="plain-button small" type="button" data-move-selected-slot="${index}" data-move-direction="down" aria-label="下移 ${escapeHtml(model?.displayName || presetId)}"${index === draftSelection.length - 1 ? " disabled" : ""}>↓ 下移</button>
+          </div>
         </div>
       `;
     })
     .join("");
 
   bindModelReferenceIssueActions(els.selectedModels);
+
+  els.selectedModels.querySelectorAll("[data-move-selected-slot]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const presetId = button.closest("[data-selected-model]")?.dataset.selectedModel;
+      let index = Number(button.dataset.moveSelectedSlot);
+      if (draftSelection[index] !== presetId) index = draftSelection.indexOf(presetId);
+      const direction = button.dataset.moveDirection;
+      const movedIndex = moveDraftSelectionBy(index, direction === "up" ? -1 : direction === "down" ? 1 : 0);
+      if (movedIndex === null) return;
+      render();
+      const card = els.selectedModels.querySelector(`[data-slot-index="${movedIndex}"]`);
+      const nextButton = card?.querySelector(`[data-move-direction="${direction}"]`);
+      (nextButton && !nextButton.disabled ? nextButton : card)?.focus({ preventScroll: true });
+    });
+  });
 
   els.selectedModels.querySelectorAll("[data-remove-selected-slot]").forEach((button) => {
     button.addEventListener("click", (event) => {
@@ -7242,6 +7826,20 @@ function renderSelectedModels() {
   });
 }
 
+function renderModelSelectionStatus() {
+  const saved = state?.selectedModelIds || [];
+  const dirty = modelSelectionDraftsToKeep.has(draftSelection) || draftSelection.length !== saved.length || draftSelection.some((id, index) => id !== saved[index]);
+  const status = document.querySelector("#modelSelectionStatus");
+  if (status) {
+    status.textContent = dirty ? `有未保存修改 · 当前选择 ${draftSelection.length} 个模型` : `模型选择已保存 · ${saved.length} 个模型`;
+    status.classList.toggle("has-changes", dirty);
+  }
+  const discard = document.querySelector("#discardModelSelection");
+  if (discard) discard.disabled = !dirty;
+  const summary = document.querySelector("#selectedModelsSummary");
+  if (summary) summary.textContent = `已选 ${draftSelection.length} 个模型`;
+}
+
 function unavailableDraftSelectionIds(modelsById = modelMap()) {
   return draftSelection.filter((presetId) => !modelsById.has(presetId));
 }
@@ -7253,13 +7851,14 @@ function cleanUnavailableSelectedModels() {
     showToast("当前模型栏没有不可用模型。");
     return;
   }
-  draftSelection = draftSelection.filter((presetId) => modelsById.has(presetId));
+  updateModelSelectionDraft(draftSelection.filter((presetId) => modelsById.has(presetId)));
   render();
   showToast(`已清理 ${unavailableIds.length} 个不可用模型，点击“保存选择”后生效。`);
 }
 
 function restoreDefaultModelSelection(button) {
   return runAction(button, async () => {
+    if (pendingModeSwitch || unresolvedModeSwitch) throw new Error("计费模式切换尚未确认，请等待或刷新后再恢复默认模型。");
     const result = normalizeModeSelectionResult(await api.selectMode(state.mode || "hybrid"));
     state = result.state;
     draftSelection = [...state.selectedModelIds];
@@ -7272,7 +7871,7 @@ function removeDraftSelectionAt(index) {
   if (!Number.isInteger(index) || index < 0 || index >= draftSelection.length) {
     return;
   }
-  draftSelection = draftSelection.filter((_, itemIndex) => itemIndex !== index);
+  updateModelSelectionDraft(draftSelection.filter((_, itemIndex) => itemIndex !== index));
   render();
   showToast("已从模型栏移除，点击“保存选择”后生效。");
 }
@@ -7285,22 +7884,34 @@ function reorderDraftSelection(fromIndex, targetSlotIndex) {
   const [moved] = next.splice(fromIndex, 1);
   const insertIndex = Math.max(0, Math.min(targetSlotIndex, next.length));
   next.splice(insertIndex, 0, moved);
-  draftSelection = next;
+  updateModelSelectionDraft(next);
+}
+
+function moveDraftSelectionBy(index, direction) {
+  if (!Number.isInteger(index) || (direction !== -1 && direction !== 1)) return null;
+  const nextIndex = index + direction;
+  if (index < 0 || index >= draftSelection.length || nextIndex < 0 || nextIndex >= draftSelection.length) return null;
+  reorderDraftSelection(index, nextIndex);
+  return nextIndex;
 }
 
 function renderProviderPreview() {
   if (!els.providerPreview || !state) {
     return;
   }
-  const grouped = groupByProvider(state.modelPresets || []);
+  const matched = (state.modelPresets || []).filter(modelMatchesCatalogQuery);
+  const grouped = groupByProvider(matched);
   const providerIds = grouped.map(([providerId]) => providerId);
-  if (!activeProviderId || (!providerIds.includes(activeProviderId) && activeProviderId !== "__custom__")) {
+  const keepCustomView = activeProviderId === "__custom__" && (!modelCatalogQuery || matched.some(model => model.custom));
+  if (providerIds.length && (!activeProviderId || (!providerIds.includes(activeProviderId) && !keepCustomView))) {
     activeProviderId = providerIds[0] || "__custom__";
   }
+  const count = document.querySelector("#modelSearchCount");
+  if (count) count.textContent = `${matched.length} 个模型`;
   const customCount = (state.modelPresets || []).filter((model) => model.custom).length;
   const tiles = [
     `
-      <button class="provider-preview-card ${activeProviderId === "__custom__" ? "active" : ""}" type="button" data-provider-preview="__custom__" data-open-custom-editor>
+      <button class="provider-preview-card ${activeProviderId === "__custom__" ? "active" : ""}" type="button" data-provider-preview="__custom__" data-open-custom-editor aria-pressed="${activeProviderId === "__custom__"}">
         ${providerLogo({ id: "__custom__", name: "Custom" })}
         <strong>自定义</strong>
         <small>${customCount ? `${customCount} 个模型` : "添加模型"}</small>
@@ -7309,7 +7920,7 @@ function renderProviderPreview() {
     ...grouped.map(([providerId, models]) => {
       const provider = providerFor(providerId);
       return `
-        <button class="provider-preview-card ${activeProviderId === providerId ? "active" : ""}" type="button" data-provider-preview="${escapeHtml(providerId)}">
+        <button class="provider-preview-card ${activeProviderId === providerId ? "active" : ""}" type="button" data-provider-preview="${escapeHtml(providerId)}" aria-pressed="${activeProviderId === providerId}" title="${escapeHtml(provider?.name || providerId)}">
           ${providerLogo(provider)}
           <strong>${escapeHtml(provider?.shortName || provider?.name || providerId)}</strong>
           <small>${models.length} 个模型</small>
@@ -7317,7 +7928,9 @@ function renderProviderPreview() {
       `;
     }),
   ];
+  const previousScrollTop = els.providerPreview.scrollTop;
   els.providerPreview.innerHTML = tiles.join("");
+  els.providerPreview.scrollTop = previousScrollTop;
   els.providerPreview.querySelectorAll("[data-provider-preview]").forEach((button) => {
     button.addEventListener("click", () => {
       activeProviderId = button.dataset.providerPreview;
@@ -7395,6 +8008,7 @@ const PROVIDER_LOGO_FILES = {
 };
 
 function renderModelPool() {
+  if (!state) return;
   const selected = new Set(draftSelection);
   renderModelCardGroups(els.modelPool, selected, false);
   bindModelSelection(els.modelPool);
@@ -7410,11 +8024,12 @@ function renderModelCardGroups(target, selected, includeControls) {
   if (!target) {
     return;
   }
-  const visibleModels = activeProviderId === "__custom__"
+  const providerModels = activeProviderId === "__custom__"
     ? (state.modelPresets || []).filter((model) => model.custom)
     : activeProviderId
       ? (state.modelPresets || []).filter((model) => model.providerId === activeProviderId)
       : (state.modelPresets || []);
+  const visibleModels = providerModels.filter(modelMatchesCatalogQuery);
   const grouped = groupByProvider(visibleModels);
   target.innerHTML = grouped
     .map(([providerId, models]) => {
@@ -7442,7 +8057,7 @@ function renderModelCardGroups(target, selected, includeControls) {
     })
     .join("");
   if (!grouped.length) {
-    target.innerHTML = `<div class="empty-state">请选择一个供应商，或进入自定义模型页面添加模型。</div>`;
+    target.innerHTML = `<div class="empty-state">${modelCatalogQuery ? "没有匹配的模型，请尝试其他名称或清空搜索。" : "请选择一个供应商，或进入自定义模型页面添加模型。"}</div>`;
   }
   bindProviderRefreshButtons(target);
   target.querySelectorAll("[data-provider-edit]").forEach((button) => {
@@ -7451,6 +8066,14 @@ function renderModelCardGroups(target, selected, includeControls) {
       openProviderEditor(button.dataset.providerEdit);
     });
   });
+}
+
+function modelMatchesCatalogQuery(model) {
+  if (model?.hiddenFromPicker && !model.custom) return false;
+  if (!modelCatalogQuery) return true;
+  const provider = providerFor(model.providerId);
+  const text = [model.displayName, model.model, model.providerId, provider?.name, provider?.shortName].filter(Boolean).join(" ").normalize("NFKC").toLocaleLowerCase();
+  return modelCatalogQuery.normalize("NFKC").toLocaleLowerCase().split(/\s+/u).every(term => text.includes(term));
 }
 
 function bindModelSelection(target) {
@@ -7469,11 +8092,10 @@ function bindModelConfigControls(target) {
       runAction(button, async () => {
         const model = modelMap().get(button.dataset.imageInputToggle);
         const next = !modelSupportsImage(model);
-        state = await api.saveModelImageInput({
+        adoptStateSnapshot(await api.saveModelImageInput({
           presetId: button.dataset.imageInputToggle,
           imageInput: next,
-        });
-        draftSelection = [...state.selectedModelIds];
+        }));
         render();
         showToast(next ? "图片上传已开启。" : "图片上传已关闭。");
       });
@@ -7486,11 +8108,10 @@ function bindModelConfigControls(target) {
       runAction(select, async () => {
         const presetId = select.dataset.imageProviderSelect;
         const model = modelMap().get(presetId);
-        state = await api.saveModelImageGeneration({
+        adoptStateSnapshot(await api.saveModelImageGeneration({
           presetId,
           imageGeneration: imageGenerationOverrideFromSelectValue(select.value, model),
-        });
-        draftSelection = [...state.selectedModelIds];
+        }));
         render();
         showToast("这个模型的生图代理已更新。");
       });
@@ -7539,8 +8160,7 @@ function bindModelConfigControls(target) {
       event.stopPropagation();
       runAction(button, async () => {
         const response = await api.resetModelCapabilities(button.dataset.resetModelCapabilities);
-        state = response?.state || await api.getState();
-        draftSelection = [...state.selectedModelIds];
+        adoptStateSnapshot(response?.state || await api.getState());
         render();
         showToast("模型能力已恢复默认；上下文如需修改可重新保存。");
       });
@@ -7567,7 +8187,7 @@ function bindModelConfigControls(target) {
         if (editingCustomPresetId === button.dataset.removeCustom) {
           resetCustomModelForm();
         }
-        state = await api.removeCustomModel(button.dataset.removeCustom);
+        adoptStateSnapshot(await api.removeCustomModel(button.dataset.removeCustom));
         draftSelection = [...state.selectedModelIds];
         render();
         showToast("自定义模型已删除。");
@@ -7586,7 +8206,7 @@ function modelCard(model, selected, includeControls = true) {
     : providerName(model.providerId);
   return `
     <div class="model-card-shell">
-      <button class="model-card ${isSelected ? "selected" : ""}" data-model-id="${escapeHtml(model.presetId)}" ${disabled ? "disabled" : ""}>
+      <button class="model-card ${isSelected ? "selected" : ""}" data-model-id="${escapeHtml(model.presetId)}" aria-pressed="${isSelected}" ${disabled ? "disabled" : ""}>
         <span class="model-title">${escapeHtml(model.displayName)}</span>
         <span class="model-meta">${escapeHtml(model.model)} · ${escapeHtml(providerName(model.providerId))}</span>
         <span class="model-capability-summary">${escapeHtml(includeControls ? modelFriendlySummary(model) : modelCatalogSummary(model))}</span>
@@ -7899,11 +8519,10 @@ function saveImageGenerationSettings(button) {
         imageGeneration.apiKey = apiKey;
       }
     }
-    state = await api.saveModelImageGeneration({
+    adoptStateSnapshot(await api.saveModelImageGeneration({
       presetId: panel.dataset.presetId,
       imageGeneration,
-    });
-    draftSelection = [...state.selectedModelIds];
+    }));
     render();
     showToast("图片生成设置已保存，只影响这一张模型卡。");
   });
@@ -8000,8 +8619,7 @@ function saveModelCapabilitySettings(button) {
         reasoning: reasoningMode ? { mode: reasoningMode } : undefined,
       },
     });
-    state = response?.state || await api.getState();
-    draftSelection = [...state.selectedModelIds];
+    adoptStateSnapshot(response?.state || await api.getState());
     render();
     showToast("模型能力覆盖已保存。");
   });
@@ -8023,8 +8641,7 @@ function saveInlineModelContext(button) {
         contextWindow,
       },
     });
-    state = response?.state || await api.getState();
-    draftSelection = [...state.selectedModelIds];
+    adoptStateSnapshot(response?.state || await api.getState());
     render();
     showToast("这个模型的上下文大小已保存。");
   });
@@ -8046,8 +8663,7 @@ function saveInlineModelApi(button) {
         api: apiType,
       },
     });
-    state = response?.state || await api.getState();
-    draftSelection = [...state.selectedModelIds];
+    adoptStateSnapshot(response?.state || await api.getState());
     render();
     showToast("这个模型的接口类型已保存。");
   });
@@ -8869,22 +9485,56 @@ function inputModalitiesForModel(model) {
   return model?.api === "responses" ? ["text", "image"] : ["text"];
 }
 
+function updateModelSelectionDraft(next) {
+  if (modelSelectionDraftsToKeep.has(draftSelection)) modelSelectionDraftsToKeep.add(next);
+  if (pendingModeSwitch || unresolvedModeSwitch || modeSwitchDraftsToKeep.has(draftSelection)) modeSwitchDraftsToKeep.add(next);
+  draftSelection = next;
+}
+
 function toggleModel(presetId) {
   if (draftSelection.includes(presetId)) {
-    draftSelection = draftSelection.filter((id) => id !== presetId);
+    updateModelSelectionDraft(draftSelection.filter((id) => id !== presetId));
   } else {
-    draftSelection = [...draftSelection, presetId];
+    updateModelSelectionDraft([...draftSelection, presetId]);
   }
   render();
 }
 
 function saveModelSelection(button) {
   return runAction(button, async () => {
-    const nextState = await api.saveModelSelection(draftSelection);
+    if (pendingModeSwitch || unresolvedModeSwitch) throw new Error("计费模式切换尚未确认，请等待或刷新后再保存；草稿已保留。");
+    const submitted = [...draftSelection];
+    if (!submitted.length) throw new Error("请至少选择一个模型，再保存选择。");
+    if (modeSwitchDraftsToKeep.has(draftSelection)) {
+      const models = new Map((state.modelPresets || []).map((model) => [model.presetId, model]));
+      const unavailable = submitted.filter((id) => !models.has(id) ||
+        (state.mode === "all_api" && models.get(id).authMode === "codex_openai"));
+      if (unavailable.length) throw new Error("保留的草稿包含当前计费模式不可用的模型，请先移除或重新选择；不会替换成其他模型。");
+    }
+    const mode = state?.mode;
+    let nextState;
+    try {
+      if (modeSwitchDraftsToKeep.has(draftSelection)) {
+        nextState = await api.saveModelSelection(submitted, { exactSelection: true, expectedMode: mode });
+      } else {
+        nextState = await api.saveModelSelection(submitted);
+      }
+      if (nextState?.stateUnavailable || !Array.isArray(nextState?.selectedModelIds) ||
+          nextState.selectedModelIds.length !== submitted.length || nextState.selectedModelIds.some((id, index) => id !== submitted[index])) {
+        throw new Error("无法确认模型选择已保存，修改已保留；请刷新后重试。");
+      }
+    } catch (error) {
+      if (state?.mode === mode && (draftSelection.length !== submitted.length || draftSelection.some((id, index) => id !== submitted[index]))) {
+        modelSelectionDraftsToKeep.add(draftSelection);
+        renderModelSelectionStatus();
+      }
+      throw error;
+    }
+    const editedWhileSaving = draftSelection.length !== submitted.length || draftSelection.some((id, index) => id !== submitted[index]);
     state = mergeStateWithRetainedDetailSlices(state, nextState);
-    draftSelection = [...state.selectedModelIds];
+    if (!editedWhileSaving) draftSelection = [...state.selectedModelIds];
     render();
-    showToast("模型选择已保存，并已更新 Router 配置。");
+    showToast(editedWhileSaving ? "提交的模型选择已保存；后续修改仍未保存。" : "模型选择已保存，并已更新 Router 配置。");
   });
 }
 
@@ -9095,40 +9745,205 @@ function renderUsage() {
   renderUsageTableStable(ranged.byModel || [], events, history);
 }
 
-function renderUsageBudgetInputs({ keepTarget = true } = {}) {
+function usageBudgetFields() {
+  return [
+    { id: "usageDailyTokenLimit", property: "dailyTokenLimit", label: "每日 Token 上限" },
+    { id: "usageDailyCallLimit", property: "dailyCallLimit", label: "每日请求上限" },
+    { id: "usageDailyCostLimit", property: "dailyCostLimit", label: "每日费用上限" },
+    { id: "usageInputCostPerMillion", property: "inputCostPerMillion", label: "输入单价" },
+    { id: "usageCacheCostPerMillion", property: "cacheCostPerMillion", label: "缓存读取单价" },
+    { id: "usageCacheWriteCostPerMillion", property: "cacheWriteCostPerMillion", label: "缓存写入单价" },
+    { id: "usageOutputCostPerMillion", property: "outputCostPerMillion", label: "输出单价" },
+  ];
+}
+
+function usageBudgetSelectionKey(scope = els.usageBudgetScope?.value || "global", target = els.usageBudgetTarget?.value || "") {
+  return JSON.stringify([scope, scope === "global" ? "global" : target]);
+}
+
+function usageBudgetSavedInput(budget, property) {
+  const value = budget[property];
+  return property === "cacheWriteCostPerMillion" ? value === undefined ? "" : String(value) : value ? String(value) : "";
+}
+
+function captureUsageBudgetEdit(event) {
+  const field = usageBudgetFields().find(({ id }) => id === event.target?.id);
+  if (!field) return;
+  const key = usageBudgetSelectionKey();
+  const [scope, target] = JSON.parse(key);
+  const value = String(event.target.value ?? "");
+  const badInput = Boolean(event.target.validity?.badInput);
+  const draft = usageBudgetDrafts.get(key) || new Map();
+  const preserve = usageBudgetSaving || draft.get(field.id)?.preserve === true;
+  if (!preserve && !badInput && value === usageBudgetSavedInput(usageBudgetForSelection(scope, target), field.property)) {
+    draft.delete(field.id);
+  } else {
+    draft.set(field.id, { value, badInput, revision: ++usageBudgetRevision, preserve });
+  }
+  if (draft.size) usageBudgetDrafts.set(key, draft);
+  else usageBudgetDrafts.delete(key);
+  renderUsageBudgetDraftStatus();
+}
+
+function usageBudgetInputError() {
+  const scope = els.usageBudgetScope?.value || "global";
+  const target = els.usageBudgetTarget?.value || "";
+  if (scope !== "global" && !usageBudgetTargetOptions(scope).some((item) => item.value === target)) {
+    return { control: els.usageBudgetTarget, message: "当前预算对象已不可用，请重新选择。" };
+  }
+  const draft = usageBudgetDrafts.get(usageBudgetSelectionKey());
+  for (const { id, label } of usageBudgetFields()) {
+    const control = els[id];
+    const text = String(control?.value ?? "").trim();
+    if (control?.validity?.badInput || draft?.get(id)?.badInput || (text && (!Number.isFinite(Number(text)) || Number(text) < 0))) {
+      return { control, message: `${label}需要填写大于或等于 0 的有效数字；留空使用默认规则。` };
+    }
+  }
+  return null;
+}
+
+function renderUsageBudgetDraftStatus() {
+  const key = usageBudgetSelectionKey();
+  const fields = usageBudgetFields();
+  for (const [draftKey, draft] of usageBudgetDrafts) {
+    const [scope, target] = JSON.parse(draftKey);
+    const budget = usageBudgetForSelection(scope, target);
+    if (!usageBudgetSaving) {
+      for (const { id, property } of fields) {
+        const entry = draft.get(id);
+        if (entry && !entry.preserve && !entry.badInput && entry.value === usageBudgetSavedInput(budget, property)) draft.delete(id);
+      }
+      if (!draft.size) usageBudgetDrafts.delete(draftKey);
+    }
+  }
+  const count = usageBudgetDrafts.get(key)?.size || 0;
+  const others = usageBudgetDrafts.size - Number(count > 0);
+  const text = (usageBudgetSaving ? "正在保存预算…" : count ? `当前对象：${count} 项未保存` : "当前预算未修改") +
+    (others > 0 ? ` · 另有 ${others} 个对象未保存` : "");
+  if (els.usageBudgetDraftStatus) {
+    if (els.usageBudgetDraftStatus.textContent !== text) els.usageBudgetDraftStatus.textContent = text;
+    els.usageBudgetDraftStatus.classList.toggle("has-changes", count > 0 || others > 0);
+  }
+  if (els.discardUsageBudget) els.discardUsageBudget.disabled = usageBudgetSaving || count === 0;
+  if (els.saveUsageBudgets) {
+    els.saveUsageBudgets.textContent = usageBudgetSaving ? "正在保存…" : "保存当前预算";
+    els.saveUsageBudgets.setAttribute("aria-busy", String(usageBudgetSaving));
+  }
+  const error = usageBudgetInputError();
+  if (!error) usageBudgetValidationShown = false;
+  const incomplete = [...(usageBudgetDrafts.get(key)?.values() || [])].some((entry) => entry.badInput);
+  const visibleError = (usageBudgetValidationShown || incomplete) && error;
+  if (els.usageBudgetError) {
+    const message = visibleError?.message || "";
+    if (els.usageBudgetError.textContent !== message) els.usageBudgetError.textContent = message;
+    els.usageBudgetError.hidden = !message;
+  }
+  for (const control of [els.usageBudgetTarget, ...fields.map(({ id }) => els[id])]) {
+    control?.setAttribute?.("aria-invalid", String(Boolean(visibleError && error.control === control)));
+  }
+}
+
+function saveUsageBudgetSettings(button = els.saveUsageBudgets) {
+  if (usageBudgetSaving) return Promise.resolve();
+  return runAction(button, async () => {
+    const error = usageBudgetInputError();
+    if (error) {
+      usageBudgetValidationShown = true;
+      renderUsageBudgetDraftStatus();
+      error.control?.scrollIntoView({ block: "center" });
+      error.control?.focus({ preventScroll: true });
+      return;
+    }
+    const key = usageBudgetSelectionKey();
+    const [scope, target] = JSON.parse(key);
+    const submitted = new Map([...(usageBudgetDrafts.get(key) || [])].map(([id, entry]) => [id, entry.revision]));
+    const usageBudgets = usageBudgetOptionsFromInputs();
+    usageBudgetSaving = true;
+    let applied = false;
+    try {
+      renderUsageBudgetDraftStatus();
+      const nextState = await api.saveOptions({ usageBudgets });
+      const receivedBudgets = nextState?.desktopOptions?.usageBudgets;
+      if (!nextState?.desktopOptions || typeof nextState.desktopOptions !== "object" || nextState.stateUnavailable ||
+          !receivedBudgets || typeof receivedBudgets !== "object" || Array.isArray(receivedBudgets) ||
+          !usageBudgetScopeMatches(usageBudgetForSelection(scope, target, usageBudgets),
+            usageBudgetForSelection(scope, target, receivedBudgets || {}))) {
+        throw new Error("无法确认预算保存结果，修改已保留；请刷新后重试。");
+      }
+      adoptStateSnapshot(nextState);
+      const draft = usageBudgetDrafts.get(key);
+      if (draft) {
+        for (const [id, entry] of draft) if (entry.revision === submitted.get(id)) draft.delete(id);
+        if (!draft.size) usageBudgetDrafts.delete(key);
+      }
+      applied = true;
+    } finally {
+      usageBudgetSaving = false;
+      if (applied) render();
+      else renderUsageBudgetDraftStatus();
+    }
+    showToast(usageBudgetDrafts.size ? "本次预算已保存，其他未保存的修改已保留。"
+      : "当前预算已保存；达到每日上限后，Router 会在本地停止后续请求。");
+  });
+}
+
+function usageBudgetScopeMatches(expected, actual) {
+  // Match desktop/settings.mjs normalization; this confirms the receipt and does not change the submitted values.
+  const normalize = (budget) => usageBudgetFields().map(({ property }) => {
+    const value = property === "cacheWriteCostPerMillion"
+      ? budget[property] ?? budget.cache_write_cost_per_million : budget[property];
+    const number = Number(value);
+    if (property === "cacheWriteCostPerMillion") {
+      return (typeof value === "number" || typeof value === "string") && String(value).trim() && Number.isFinite(number) && number >= 0
+        ? number : null;
+    }
+    if (!Number.isFinite(number) || number <= 0) return 0;
+    return property === "dailyTokenLimit" || property === "dailyCallLimit" ? Math.floor(number) : Math.round(number * 1_000_000) / 1_000_000;
+  });
+  if (!actual || typeof actual !== "object" || Array.isArray(actual)) return false;
+  const saved = normalize(actual);
+  return normalize(expected).every((value, index) => value === saved[index]);
+}
+
+function renderUsageBudgetInputs({ keepTarget = true, resetInputs = false } = {}) {
   if (!els.usageBudgetScope || !els.usageBudgetTarget) {
     return;
   }
   const previousTarget = keepTarget ? els.usageBudgetTarget.value : "";
   const scope = els.usageBudgetScope.value || "global";
   const targets = usageBudgetTargetOptions(scope);
-  els.usageBudgetTarget.innerHTML = targets
+  const retainedTargets = new Set(previousTarget ? [previousTarget] : []);
+  for (const draftKey of usageBudgetDrafts.keys()) {
+    const [draftScope, draftTarget] = JSON.parse(draftKey);
+    if (draftScope === scope && draftTarget) retainedTargets.add(draftTarget);
+  }
+  for (const target of retainedTargets) {
+    if (scope !== "global" && !targets.some((item) => item.value === target)) {
+      targets.push({ value: target, label: `${target}（当前不可用）` });
+    }
+  }
+  const options = targets
     .map((target) => `<option value="${escapeHtml(target.value)}">${escapeHtml(target.label)}</option>`)
     .join("");
+  if (els.usageBudgetTarget.innerHTML !== options) els.usageBudgetTarget.innerHTML = options;
   const selectedTarget = targets.some((target) => target.value === previousTarget)
     ? previousTarget
     : targets[0]?.value || "";
   els.usageBudgetTarget.value = selectedTarget;
   els.usageBudgetTarget.disabled = scope === "global";
   const budget = usageBudgetForSelection(scope, selectedTarget);
-  if (els.usageDailyTokenLimit && document.activeElement !== els.usageDailyTokenLimit) {
-    els.usageDailyTokenLimit.value = budget.dailyTokenLimit ? String(budget.dailyTokenLimit) : "";
+  const key = usageBudgetSelectionKey(scope, selectedTarget);
+  const switched = usageBudgetRenderedKey !== null && usageBudgetRenderedKey !== key;
+  usageBudgetRenderedKey = key;
+  if (switched) usageBudgetValidationShown = false;
+  const draft = usageBudgetDrafts.get(key);
+  for (const { id, property } of usageBudgetFields()) {
+    const control = els[id];
+    if (control && (switched || resetInputs || (document.activeElement !== control && !control.validity?.badInput))) {
+      control.value = draft?.get(id)?.value ?? usageBudgetSavedInput(budget, property);
+    }
   }
-  if (els.usageDailyCallLimit && document.activeElement !== els.usageDailyCallLimit) {
-    els.usageDailyCallLimit.value = budget.dailyCallLimit ? String(budget.dailyCallLimit) : "";
-  }
-  if (els.usageDailyCostLimit && document.activeElement !== els.usageDailyCostLimit) {
-    els.usageDailyCostLimit.value = budget.dailyCostLimit ? String(budget.dailyCostLimit) : "";
-  }
-  if (els.usageInputCostPerMillion && document.activeElement !== els.usageInputCostPerMillion) {
-    els.usageInputCostPerMillion.value = budget.inputCostPerMillion ? String(budget.inputCostPerMillion) : "";
-  }
-  if (els.usageCacheCostPerMillion && document.activeElement !== els.usageCacheCostPerMillion) {
-    els.usageCacheCostPerMillion.value = budget.cacheCostPerMillion ? String(budget.cacheCostPerMillion) : "";
-  }
-  if (els.usageOutputCostPerMillion && document.activeElement !== els.usageOutputCostPerMillion) {
-    els.usageOutputCostPerMillion.value = budget.outputCostPerMillion ? String(budget.outputCostPerMillion) : "";
-  }
+  renderUsageBudgetDraftStatus();
 }
 
 function usageBudgetOptionsFromInputs() {
@@ -9141,6 +9956,8 @@ function usageBudgetOptionsFromInputs() {
   const dailyCostLimit = Number(els.usageDailyCostLimit?.value || 0);
   const inputCostPerMillion = Number(els.usageInputCostPerMillion?.value || 0);
   const cacheCostPerMillion = Number(els.usageCacheCostPerMillion?.value || 0);
+  const writePriceText = String(els.usageCacheWriteCostPerMillion?.value ?? "").trim();
+  const cacheWriteCostPerMillion = Number(writePriceText);
   const outputCostPerMillion = Number(els.usageOutputCostPerMillion?.value || 0);
   if (Number.isFinite(dailyTokenLimit) && dailyTokenLimit > 0) {
     nextBudget.dailyTokenLimit = Math.floor(dailyTokenLimit);
@@ -9156,6 +9973,9 @@ function usageBudgetOptionsFromInputs() {
   }
   if (Number.isFinite(cacheCostPerMillion) && cacheCostPerMillion > 0) {
     nextBudget.cacheCostPerMillion = cacheCostPerMillion;
+  }
+  if (writePriceText && Number.isFinite(cacheWriteCostPerMillion) && cacheWriteCostPerMillion >= 0) {
+    nextBudget.cacheWriteCostPerMillion = cacheWriteCostPerMillion;
   }
   if (Number.isFinite(outputCostPerMillion) && outputCostPerMillion > 0) {
     nextBudget.outputCostPerMillion = outputCostPerMillion;
@@ -9184,8 +10004,7 @@ function usageBudgetTargetOptions(scope) {
   return [{ value: "global", label: "全部模型" }];
 }
 
-function usageBudgetForSelection(scope, target) {
-  const budgets = state?.desktopOptions?.usageBudgets || {};
+function usageBudgetForSelection(scope, target, budgets = state?.desktopOptions?.usageBudgets || {}) {
   if (scope === "route") {
     return budgets.routes?.[target] || {};
   }
@@ -9269,7 +10088,9 @@ function renderUsageCostEstimate() {
   }
   const breakdown = [
     `输入 ${formatCostValue(estimate.inputCost)}`,
-    `缓存 ${formatCostValue(estimate.cacheCost)}`,
+    ...(estimate.cacheReadCost !== undefined || estimate.cacheWriteCost !== undefined
+      ? [`缓存读取 ${formatCostValue(estimate.cacheReadCost)}`, `缓存写入 ${formatCostValue(estimate.cacheWriteCost)}`]
+      : [`缓存 ${formatCostValue(estimate.cacheCost)}`]),
     `输出 ${formatCostValue(estimate.outputCost)}`,
   ];
   const topScopes = [
@@ -9659,6 +10480,13 @@ function ensureUsageColumnCssRules() {
 }
 
 function renderUsageTableStable(rows, events, history = {}) {
+  rows = Array.isArray(rows) ? rows : [];
+  events = Array.isArray(events) ? events : [];
+  if (!rows.length && !events.length) {
+    els.usageTable.innerHTML = "";
+    return;
+  }
+  const fullDetailsOpen = els.usageTable.querySelector("#usageFullDetails")?.open === true;
   const historyNotice = "这里展示的是历史请求，不代表模型正在后台运行。辅助任务模型只处理 ChatGPT 内部辅助请求；普通会话仍按会话实际选择的模型记录。";
   const modelRows = rows.length
     ? rows
@@ -9708,6 +10536,9 @@ function renderUsageTableStable(rows, events, history = {}) {
   const eventHeaders = ["当前显示名", "实际上游模型", "接口", "状态", "输入", "缓存", "输出", "总量", "耗时", "时间"];
   els.usageTable.innerHTML = `
     <p class="section-note">${escapeHtml(historyNotice)}</p>
+    ${renderUsageCompactTables(rows, events)}
+    <details class="console-disclosure usage-full-details" id="usageFullDetails"${fullDetailsOpen ? " open" : ""}>
+      <summary><span>完整字段</span><span class="disclosure-hint">上游模型、接口与列宽调整</span></summary>
     <h3>按模型汇总</h3>
     <div class="usage-table-block">
       <div class="usage-grid usage-grid-resizable">
@@ -9726,10 +10557,29 @@ function renderUsageTableStable(rows, events, history = {}) {
         ${eventRows}
       </div>
     </div>
+    </details>
   `;
   applyUsageColumnWidths();
   bindUsageColumnResizers();
   bindRequestDetailButtons(events);
+}
+
+function renderUsageCompactTables(rows, events) {
+  const table = (caption, headers, body) => `<h3>${caption}</h3><div class="usage-compact-scroll" role="region" aria-label="${caption}" tabindex="0"><table class="usage-compact-table"><thead><tr>${headers.map((label, index) => `<th scope="col"${index >= 2 && index <= 5 ? ' class="usage-token-cell"' : ""}>${label}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table></div>`;
+  const tokens = (item) => {
+    const read = Number(item.cacheReadTokens || 0);
+    const write = Number(item.cacheCreationTokens || 0);
+    const cacheDetail = write > 0 ? `<small class="usage-token-detail"><span>读 ${formatNumber(read)}</span><span>写 ${formatNumber(write)}</span></small>` : "";
+    return `<td class="usage-token-cell">${formatNumber(item.totalTokens)}</td><td class="usage-token-cell">${formatInputTokens(item)}</td><td class="usage-token-cell">${formatNumber(item.completionTokens)}</td><td class="usage-token-cell">${formatNumber(read + write)}${cacheDetail}</td>`;
+  };
+  const tokenHeaders = ["总 Token", "输入 Token", "输出 Token", "缓存 Token"];
+  const models = rows.length ? table("按模型汇总", ["模型", "调用次数", ...tokenHeaders, "状态", "最近调用"], rows.map(row => `
+    <tr><td>${escapeHtml(displayRoute(row.route))}</td><td>${formatNumber(row.calls)}</td>${tokens(row)}<td>${escapeHtml(usageStatusText(row))}</td><td>${escapeHtml(formatTime(row.lastAt))}</td></tr>
+  `).join("")) : "";
+  const requests = events.length ? table("最近请求", ["模型", "状态", ...tokenHeaders, "耗时", "时间 / 详情"], events.slice(0, 40).map((event, index) => `
+    <tr><td>${escapeHtml(displayRoute(event.route))}</td><td>${escapeHtml(usageEventStatusText(event))}</td>${tokens(event)}<td>${formatDuration(event.durationMs)}</td><td>${escapeHtml(formatTime(event.finishedAt || event.startedAt))}<small><button class="mini-link" type="button" data-request-detail="${escapeHtml(event.requestId || event.id || index)}">查看详情</button></small></td></tr>
+  `).join("")) : "";
+  return models + requests;
 }
 
 function bindRequestDetailButtons(events = []) {
@@ -9744,6 +10594,49 @@ function bindRequestDetailButtons(events = []) {
   });
 }
 
+function resourceFocusIdentity(entry) {
+  if (!entry?.item) return null;
+  const item = entry.item;
+  const id = item.id || item.pluginId || item.name || item.path || item.command;
+  if (!id) return null;
+  return JSON.stringify([entry.key || "", id, item.path || "", item.command || "", item.source || item.pluginSource || ""]);
+}
+
+function rememberDetailDialogFocus(dialog, attribute) {
+  if (dialog.open) return;
+  const opener = document.activeElement;
+  const key = opener?.getAttribute(attribute);
+  detailDialogReturnTargets.set(dialog, {
+    opener,
+    section: opener?.closest(".section-panel"),
+    attribute,
+    key,
+    view: attribute === "data-request-detail" && opener?.closest(".usage-full-details") ? ".usage-full-details " : "",
+    resourceIdentity: attribute === "data-resource-detail" ? resourceFocusIdentity(resourceDetailItems.get(key)) : null,
+  });
+}
+
+function restoreDetailDialogFocus(dialog) {
+  const target = detailDialogReturnTargets.get(dialog);
+  detailDialogReturnTargets.delete(dialog);
+  if (!target || (document.activeElement !== document.body && !dialog.contains(document.activeElement)) ||
+      document.querySelector("dialog:modal, .modal-backdrop:not(.hidden)")) return;
+  const visible = (element) => element?.isConnected && !element.disabled && element.getClientRects().length > 0;
+  let next = target.opener;
+  if (!visible(next) && target.key !== null && target.section && !target.section.classList.contains("hidden")) {
+    next = [...target.section.querySelectorAll(`${target.view}[${target.attribute}]`)]
+      .find((element) => {
+        const key = element.getAttribute(target.attribute);
+        const sameItem = target.attribute === "data-resource-detail"
+          ? target.resourceIdentity !== null && resourceFocusIdentity(resourceDetailItems.get(key)) === target.resourceIdentity
+          : key === target.key;
+        return sameItem && visible(element);
+      });
+  }
+  if (!visible(next)) next = document.querySelector("#pageTitle");
+  next?.focus({ preventScroll: true });
+}
+
 function showRequestDetail(event) {
   if (!(els.requestDetailDialog && els.requestDetailBody)) {
     return;
@@ -9752,6 +10645,7 @@ function showRequestDetail(event) {
     showToast("没有找到这条请求详情。", "error");
     return;
   }
+  rememberDetailDialogFocus(els.requestDetailDialog, "data-request-detail");
   const upstreamUrl = event.upstreamUrl || event.baseUrl || event.url || "";
   const smartExclusionText = smartRouteExclusionText(event);
   const rows = [
@@ -9769,12 +10663,14 @@ function showRequestDetail(event) {
     ...(smartExclusionText ? [["智能路由跳过", smartExclusionText]] : []),
   ];
   els.requestDetailBody.innerHTML = `
-    <div class="request-detail-grid">
+    <dl class="request-detail-grid">
       ${rows.map(([label, value]) => requestDetailItem(label, redactDetail(value))).join("")}
-    </div>
+    </dl>
   `;
   els.requestDetailDialog.classList.remove("hidden");
   els.requestDetailDialog.setAttribute("aria-hidden", "false");
+  if (!els.requestDetailDialog.open) els.requestDetailDialog.showModal();
+  els.closeRequestDetail?.focus();
 }
 
 function smartRouteExclusionText(event = {}) {
@@ -9824,6 +10720,7 @@ function showResourceDetail(entry = {}) {
     showToast("没有找到这条资源详情。", "error");
     return;
   }
+  rememberDetailDialogFocus(els.resourceDetailDialog, "data-resource-detail");
   const diagnostic = resourceDiagnostic(item);
   const update = resourceUpdateNote(item);
   const managementNote = resourceManagementNote(item);
@@ -9848,30 +10745,36 @@ function showResourceDetail(entry = {}) {
     ["插件", item.pluginId || item.id || "-"],
   ].filter(([, value]) => String(value || "").trim() && String(value || "").trim() !== "-");
   els.resourceDetailBody.innerHTML = `
-    <div class="request-detail-grid">
+    <dl class="request-detail-grid">
       ${rows.map(([label, value]) => requestDetailItem(label, redactDetail(value))).join("")}
-    </div>
+    </dl>
   `;
   els.resourceDetailDialog.classList.remove("hidden");
   els.resourceDetailDialog.setAttribute("aria-hidden", "false");
+  if (!els.resourceDetailDialog.open) els.resourceDetailDialog.showModal();
+  els.closeResourceDetail?.focus();
 }
 
 function hideResourceDetail() {
+  if (els.resourceDetailDialog?.open) els.resourceDetailDialog.close();
   els.resourceDetailDialog?.classList.add("hidden");
   els.resourceDetailDialog?.setAttribute("aria-hidden", "true");
+  if (els.resourceDetailDialog) restoreDetailDialogFocus(els.resourceDetailDialog);
 }
 
 function hideRequestDetail() {
+  if (els.requestDetailDialog?.open) els.requestDetailDialog.close();
   els.requestDetailDialog?.classList.add("hidden");
   els.requestDetailDialog?.setAttribute("aria-hidden", "true");
+  if (els.requestDetailDialog) restoreDetailDialogFocus(els.requestDetailDialog);
 }
 
 function requestDetailItem(label, value) {
   return `
-    <article>
-      <span>${escapeHtml(label)}</span>
-      <strong>${escapeHtml(value || "-")}</strong>
-    </article>
+    <div class="request-detail-field${String(value || "").length > 100 ? " wide" : ""}">
+      <dt>${escapeHtml(label)}</dt>
+      <dd>${escapeHtml(value || "-")}</dd>
+    </div>
   `;
 }
 
@@ -9971,7 +10874,7 @@ function keySummaryInfo() {
 
   const needed = new Set();
   const modelsById = modelMap();
-  for (const id of draftSelection) {
+  for (const id of state.selectedModelIds || []) {
     const model = modelsById.get(id);
     const provider = providerFor(model?.providerId);
     if (model?.authMode === "api_key" && (model.apiKeyEnv || model.keyEnv || provider?.keyEnv)) {
@@ -9997,10 +10900,19 @@ function keySummaryInfo() {
 }
 
 function renderLogs(logs) {
-  els.logOutput.textContent = logs.length
+  const text = logs.length
     ? logs.join("\n")
     : "暂无日志。启动 Router 或点击操作按钮后，这里会显示执行结果。";
-  els.logOutput.scrollTop = els.logOutput.scrollHeight;
+  if (els.logOutput.textContent !== text) els.logOutput.textContent = text;
+  if (els.logOutput.getClientRects().length) {
+    els.logOutput.scrollTop = logFollowLatest ? els.logOutput.scrollHeight : logScrollTop;
+  }
+  renderLogViewStatus(logs.length);
+}
+
+function renderLogViewStatus(count = state?.logs?.length || 0) {
+  if (els.logViewStatus) els.logViewStatus.textContent = `${formatNumber(count)} 条日志 · ${logFollowLatest ? "跟随最新" : "已暂停滚动"}`;
+  if (els.resumeLogFollow) els.resumeLogFollow.hidden = logFollowLatest;
 }
 
 function showVvipDialog(featureName) {
@@ -10101,8 +11013,11 @@ function renderUpdateProgress(progress = {}) {
   els.updateProgress.classList.remove("hidden");
   const downloadedBytes = Number(progress.downloadedBytes || 0);
   const totalBytes = Number(progress.totalBytes || 0);
-  const percent = Number.isFinite(Number(progress.percent))
-    ? Math.max(0, Math.min(100, Math.floor(Number(progress.percent))))
+  const explicitPercent = progress.percent === null || progress.percent === undefined || progress.percent === ""
+    ? null
+    : Number(progress.percent);
+  const percent = Number.isFinite(explicitPercent)
+    ? Math.max(0, Math.min(100, Math.floor(explicitPercent)))
     : totalBytes > 0
       ? Math.max(0, Math.min(100, Math.floor((downloadedBytes / totalBytes) * 100)))
       : 0;
@@ -10146,12 +11061,49 @@ function updateProgressText(phase, details) {
 }
 
 function showToast(message, type = "success") {
-  els.toast.textContent = message;
-  els.toast.className = `toast ${type}`;
+  initializeToast();
+  const toast = els.toast;
+  if (!toast.contains(document.activeElement)) showToast.returnFocus = document.activeElement;
   window.clearTimeout(showToast.timer);
+  showToast.timer = null;
+  showToast.version = (showToast.version || 0) + 1;
+  showToast.message = String(message ?? "");
+  const text = toast.querySelector("[data-toast-message]");
+  text.setAttribute("role", type === "error" ? "alert" : "status");
+  text.setAttribute("aria-live", type === "error" ? "assertive" : "polite");
+  text.textContent = showToast.message;
+  text.scrollTop = 0;
+  toast.className = `toast ${type === "error" ? "error" : type === "success" ? "success" : "info"}`;
+  const version = showToast.version;
   showToast.timer = window.setTimeout(() => {
-    els.toast.classList.add("hidden");
-  }, 3600);
+    if (showToast.version === version) hideToast();
+  }, 5000);
+}
+
+function initializeToast() {
+  if (showToast.initialized) return;
+  showToast.initialized = true;
+  const toast = els.toast;
+  toast.querySelector("[data-toast-close]").addEventListener("click", hideToast);
+  toast.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || event.isComposing || event.keyCode === 229) return;
+    event.preventDefault();
+    event.stopPropagation();
+    hideToast();
+  });
+}
+
+function hideToast() {
+  const hadFocus = els.toast.contains(document.activeElement);
+  window.clearTimeout(showToast.timer);
+  showToast.timer = null;
+  showToast.version = (showToast.version || 0) + 1;
+  els.toast.classList.add("hidden");
+  if (hadFocus) {
+    const target = showToast.returnFocus;
+    if (target?.isConnected && !target.disabled && target.getClientRects().length) target.focus();
+    else document.querySelector("#pageTitle")?.focus();
+  }
 }
 
 function emptyUsageSummary() {
@@ -10318,6 +11270,9 @@ function formatCostValue(value) {
   if (!Number.isFinite(number) || number <= 0) {
     return "0";
   }
+  if (number < 0.000001) {
+    return Number(number.toPrecision(6)).toString();
+  }
   if (number < 0.01) {
     return number.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
   }
@@ -10342,8 +11297,9 @@ function formatCompactContext(value) {
 }
 
 function formatInputTokens(item) {
-  const fresh = Number(item?.freshPromptTokens ?? item?.promptTokens ?? 0);
-  return formatNumber(fresh);
+  const input = item?.promptTokens ?? (Number(item?.freshPromptTokens || 0)
+    + Number(item?.cacheReadTokens || 0) + Number(item?.cacheCreationTokens || 0));
+  return formatNumber(input);
 }
 
 function formatCacheTokens(item) {

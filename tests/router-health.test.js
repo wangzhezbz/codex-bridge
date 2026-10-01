@@ -70,6 +70,46 @@ test("probeRouterHealth reports failed router health with concrete reason", asyn
   assert.match(result.message, /ECONNREFUSED/);
 });
 
+test("probeRouterHealth stops a fetch implementation that ignores AbortSignal", async () => {
+  let requestSignal = null;
+  const startedAt = Date.now();
+  const result = await probeRouterHealth({
+    origin: "http://127.0.0.1:15722",
+    timeoutMs: 20,
+    fetchImpl: async (_url, options) => {
+      requestSignal = options.signal;
+      return new Promise(() => {});
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(requestSignal?.aborted, true);
+  assert.match(result.message, /timed out/i);
+  assert.ok(Date.now() - startedAt < 250);
+});
+
+test("probeRouterHealth cancels a response body stalled after the headers", async () => {
+  let cancelled = false;
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('{"ok":true'));
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const result = await probeRouterHealth({
+    origin: "http://127.0.0.1:15722",
+    timeoutMs: 20,
+    fetchImpl: async () => new Response(body, { status: 200 }),
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(result.ok, false);
+  assert.equal(cancelled, true);
+  assert.match(result.message, /timed out/i);
+});
+
 test("waitForRouterHealth keeps polling while router is still starting", async () => {
   let calls = 0;
   const sleeps = [];

@@ -9,6 +9,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>CodexBridge</title>
     <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="./console-layout.css" />
   </head>
   <body>
     <div class="app-shell">
@@ -23,7 +24,7 @@
         <nav class="nav-list" aria-label="主导航">
           <div class="nav-group" role="group" aria-labelledby="navGroupWorkbench">
             <div class="nav-group-label" id="navGroupWorkbench">工作台</div>
-            <button class="nav-item active" data-section="dashboard">概览</button>
+            <button class="nav-item active" data-section="dashboard" aria-current="page">概览</button>
             <button class="nav-item" data-section="preflight">体检</button>
             <button class="nav-item" data-section="models">模型</button>
             <button class="nav-item" data-section="capabilities">能力</button>
@@ -45,30 +46,33 @@
         </nav>
         <div class="sidebar-actions">
           <div class="app-version">
-            <span>当前版本</span>
+            <span class="sr-only">当前版本</span>
             <strong id="appVersion">v-</strong>
+            <button class="sidebar-update" id="checkUpdates" type="button">检查更新</button>
+            <button class="sidebar-more" id="sidebarUtilityToggle" type="button" popovertarget="sidebarUtilityMenu" aria-label="更多应用操作" title="更多应用操作">···</button>
           </div>
-          <button class="ghost-button full" id="checkUpdates">检查更新</button>
-          <button class="ghost-button full" id="openUpdateFolder">更新目录</button>
-          <button class="ghost-button full" id="openGitHub">GitHub</button>
+          <div id="sidebarUtilityMenu" class="sidebar-utility-menu" popover>
+            <button class="plain-button full" id="openUpdateFolder" type="button" popovertarget="sidebarUtilityMenu" popovertargetaction="hide">打开更新目录</button>
+            <button class="plain-button full" id="openGitHub" type="button" popovertarget="sidebarUtilityMenu" popovertargetaction="hide">GitHub 项目主页</button>
+          </div>
         </div>
       </aside>
 
       <main class="main">
         <header class="topbar">
           <div>
-            <h1>CodexBridge 控制台</h1>
-            <p>把 GPT、DeepSeek、Kimi 和更多模型放进同一个 Codex 模型栏。</p>
+            <h1 id="pageTitle" tabindex="-1">概览</h1>
+            <p id="pageDescription">网关状态、模型准备情况与运行控制</p>
           </div>
           <div class="status-cluster">
             <span class="status-pill muted" id="routerStatus">Router 未启动</span>
             <span class="status-pill muted" id="modeStatus">读取中</span>
+            <button class="plain-button small" id="backToPageTop" type="button" data-state-unavailable-readonly title="回到当前页面顶部" hidden>回到顶部</button>
           </div>
         </header>
 
-        <div class="toast hidden" id="toast"></div>
-        <div class="modal-backdrop hidden" id="requestDetailDialog" aria-hidden="true">
-          <div class="request-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="requestDetailTitle">
+        <dialog class="modal-backdrop console-modal hidden" id="requestDetailDialog" aria-hidden="true" aria-labelledby="requestDetailTitle">
+          <div class="request-detail-dialog">
             <div class="update-dialog-header">
               <div>
                 <h2 id="requestDetailTitle">请求详情</h2>
@@ -76,11 +80,11 @@
               </div>
               <button class="ghost-button light small" id="closeRequestDetail" type="button">关闭</button>
             </div>
-            <div class="request-detail-body" id="requestDetailBody"></div>
+            <div class="request-detail-body" id="requestDetailBody" tabindex="0" role="region" aria-label="请求详细信息"></div>
           </div>
-        </div>
-        <div class="modal-backdrop hidden" id="resourceDetailDialog" aria-hidden="true">
-          <div class="resource-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="resourceDetailTitle">
+        </dialog>
+        <dialog class="modal-backdrop console-modal hidden" id="resourceDetailDialog" aria-hidden="true" aria-labelledby="resourceDetailTitle">
+          <div class="resource-detail-dialog">
             <div class="update-dialog-header">
               <div>
                 <h2 id="resourceDetailTitle">资源详情</h2>
@@ -88,9 +92,9 @@
               </div>
               <button class="ghost-button light small" id="closeResourceDetail" type="button">关闭</button>
             </div>
-            <div class="resource-detail-body" id="resourceDetailBody"></div>
+            <div class="resource-detail-body" id="resourceDetailBody" tabindex="0" role="region" aria-label="资源详细信息"></div>
           </div>
-        </div>
+        </dialog>
         <div class="modal-backdrop hidden" id="updateDialog" aria-hidden="true">
           <div class="update-dialog" role="dialog" aria-modal="true" aria-labelledby="updateDialogTitle">
             <div class="update-dialog-header">
@@ -146,27 +150,27 @@
               <div class="panel-header">
                 <div>
                   <h2>计费模式</h2>
-                  <p>决定 GPT、DeepSeek、Kimi 和自定义模型分别走订阅还是 API。</p>
+                  <p>选择模型使用订阅还是 API 账户。</p>
                 </div>
               </div>
               <div class="mode-grid">
                 <button class="mode-card" data-mode="hybrid">
-                  <span class="mode-title">推荐：GPT 走订阅</span>
-                  <span class="mode-copy">5.5 / 5.4 使用 Codex 登录态，DeepSeek、Kimi 和其他模型使用各自 API Key。</span>
+                  <span class="mode-title">GPT 走订阅</span>
+                  <span class="mode-copy">GPT 使用 Codex 登录态，其他供应商使用各自 API Key。</span>
                 </button>
                 <button class="mode-card" data-mode="all_api">
                   <span class="mode-title">全部 API</span>
-                  <span class="mode-copy">所有模型都使用你配置的 API Key，适合统一走 API 或团队接口账户。</span>
+                  <span class="mode-copy">所有模型使用已配置的 API Key。</span>
                 </button>
               </div>
-              <p class="mode-note">切换模式后，下面的模型栏和密钥状态会按当前选择自动刷新。</p>
+              <p class="mode-note">切换后自动更新模型列表和密钥状态。</p>
             </article>
 
             <article class="panel run-panel">
               <div class="panel-header">
                 <div>
                   <h2>运行控制</h2>
-                  <p>启动 Router 时会自动刷新 CodexBridge 配置；关闭 Router 时会自动恢复 Codex 原配置。</p>
+                  <p>启动时应用网关配置，关闭时恢复 Codex 原配置。</p>
                 </div>
               </div>
               <button class="router-toggle" id="routerToggle" aria-pressed="false">
@@ -233,14 +237,28 @@
               <div class="header-actions selection-tools">
                 <button class="ghost-button light small" id="cleanUnavailableModels" type="button">清理不可用模型</button>
                 <button class="ghost-button light small" id="restoreDefaultModels" type="button">恢复默认选择</button>
-                <button class="primary-button small" id="saveModelSelectionPanel">保存选择</button>
                 <button class="ghost-button light small" id="openConfigFolder">打开配置目录</button>
               </div>
             </div>
-            <div class="selection-strip" id="selectedModels" aria-label="当前已选模型"></div>
+            <details class="console-disclosure model-selected-details" id="modelSelectedDetails" open>
+              <summary><span id="selectedModelsSummary">已选模型</span><span class="disclosure-hint">排序与移除</span></summary>
+              <div class="selection-strip" id="selectedModels" aria-label="当前已选模型" role="list"></div>
+            </details>
+            <div class="model-search-row">
+              <label for="modelSearch" class="sr-only">搜索模型或供应商</label>
+              <input id="modelSearch" type="search" placeholder="搜索模型名称、真实模型名或供应商" autocomplete="off" />
+              <span id="modelSearchCount" aria-live="polite"></span>
+              <button class="plain-button small" id="clearModelSearch" type="button">清空</button>
+            </div>
             <div class="model-pool" id="modelPool"></div>
           </article>
-
+          <div class="model-selection-actions">
+            <span id="modelSelectionStatus" role="status" aria-live="polite">模型选择已保存</span>
+            <div class="header-actions">
+              <button class="plain-button" id="discardModelSelection" type="button" disabled>撤销未保存修改</button>
+              <button class="primary-button" id="saveModelSelectionPanel" type="button">保存选择</button>
+            </div>
+          </div>
         </section>
 
         <section class="section-panel hidden" id="capabilities">
@@ -679,8 +697,8 @@
           <article class="panel stats-panel">
             <div class="panel-header">
               <div>
-                <h2>当前调用统计</h2>
-                <p>展示当前生效模型的请求、状态码、耗时和 token。</p>
+                <h2>调用概况</h2>
+                <p>按上游返回统计用量。输入包含缓存，缓存不重复计入总 Token。</p>
               </div>
             </div>
             <div class="grid six stat-summary">
@@ -709,10 +727,12 @@
                 <strong id="statCost">未设置</strong>
               </article>
             </div>
+            <details class="console-disclosure" id="usageBudgetDetails">
+              <summary><span>预算设置</span><span class="disclosure-hint">上限与计费单价</span></summary>
             <div class="usage-budget-controls">
               <label>
                 <span>预算范围</span>
-                <select id="usageBudgetScope">
+                <select id="usageBudgetScope" data-state-unavailable-readonly>
                   <option value="global">全部模型</option>
                   <option value="route">单个模型</option>
                   <option value="provider">供应商</option>
@@ -720,7 +740,7 @@
               </label>
               <label>
                 <span>具体对象</span>
-                <select id="usageBudgetTarget"></select>
+                <select id="usageBudgetTarget" data-state-unavailable-readonly></select>
               </label>
               <label>
                 <span>每日 Token 上限</span>
@@ -739,16 +759,29 @@
                 <input id="usageInputCostPerMillion" type="number" min="0" step="0.000001" placeholder="可选" />
               </label>
               <label>
-                <span>缓存单价 / 百万</span>
+                <span>缓存读取单价 / 百万</span>
                 <input id="usageCacheCostPerMillion" type="number" min="0" step="0.000001" placeholder="默认同输入" />
+              </label>
+              <label>
+                <span>缓存写入单价 / 百万</span>
+                <input id="usageCacheWriteCostPerMillion" type="number" min="0" step="any" placeholder="留空用默认，0 不计费" />
               </label>
               <label>
                 <span>输出单价 / 百万</span>
                 <input id="usageOutputCostPerMillion" type="number" min="0" step="0.000001" placeholder="可选" />
               </label>
-              <button class="plain-button" id="saveUsageBudgets" type="button">保存预算</button>
             </div>
+            <div class="usage-budget-actions">
+              <span class="settings-draft-status" id="usageBudgetDraftStatus" role="status" aria-live="polite">当前预算未修改</span>
+              <div class="header-actions">
+                <button class="plain-button" id="discardUsageBudget" type="button" data-state-unavailable-readonly disabled>放弃当前修改</button>
+                <button class="primary-button" id="saveUsageBudgets" type="button">保存当前预算</button>
+              </div>
+            </div>
+            <p class="field-error" id="usageBudgetError" role="alert" hidden></p>
             <p class="usage-budget-note">达到 80% 会提醒；超过每日上限后本地拦截，避免继续请求上游和消耗额度。</p>
+            <p class="usage-budget-note">费用按所设费率估算，不替代上游账单；写入价留空使用默认规则。</p>
+            </details>
             <div class="usage-budget-alerts hidden" id="usageBudgetAlerts"></div>
             <div class="usage-cost-estimate hidden" id="usageCostEstimate"></div>
             <div class="usage-chart" id="usageChart"></div>
@@ -756,24 +789,33 @@
           </article>
         </section>
 
-        <section class="section-panel hidden software-manager-section" id="softwareManager">
+        <section class="section-panel hidden software-manager-section action-page" id="softwareManager">
           <div id="softwareManagerRoot" aria-live="polite">
             <div class="software-loading">打开软件管理后才会开始检测。</div>
           </div>
         </section>
 
         <section class="section-panel hidden" id="settings">
-          <article class="panel">
+          <nav class="settings-jump-nav" aria-label="设置分类">
+            <a href="#settingsGeneral" data-settings-jump="settingsGeneral" data-state-unavailable-readonly>基础设置</a>
+            <a href="#settingsProfiles" data-settings-jump="settingsProfiles" data-state-unavailable-readonly>配置档</a>
+            <a href="#settingsBackups" data-settings-jump="settingsBackups" data-state-unavailable-readonly>备份恢复</a>
+          </nav>
+          <article class="panel settings-jump-target" id="settingsGeneral">
             <div class="panel-header">
               <div>
-                <h2>基础设置</h2>
+                <h2 tabindex="-1">基础设置</h2>
                 <p>这些设置只影响 CodexBridge 本地 Router。修改端口或代理后，重新启动 Router 生效。</p>
               </div>
             </div>
+            <fieldset class="settings-section">
+              <legend>连接</legend>
             <div class="settings-grid">
               <label>
                 <span>Router 端口</span>
-                <input id="routerPort" type="number" min="1024" max="65535" step="1" placeholder="15722" />
+                <input id="routerPort" type="number" min="1024" max="65535" step="1" placeholder="15722" aria-describedby="routerPortHelp routerPortError" />
+                <small class="field-hint" id="routerPortHelp">1024–65535，留空使用 15722。</small>
+                <small class="field-error" id="routerPortError" role="alert" hidden></small>
               </label>
               <label class="option-toggle">
                 <input id="bypassSystemProxy" type="checkbox" />
@@ -782,6 +824,11 @@
                   <small>遇到 502、fetch failed 或 VPN/代理冲突时可开启；只影响 CodexBridge Router。</small>
                 </span>
               </label>
+            </div>
+            </fieldset>
+            <fieldset class="settings-section">
+              <legend>请求与辅助任务</legend>
+            <div class="settings-grid">
               <label class="option-toggle">
                 <input id="localRateLimitEnabled" type="checkbox" />
                 <span>
@@ -807,6 +854,11 @@
                 <span>辅助任务模型</span>
                 <select id="codexAuxiliaryModelId"></select>
               </label>
+            </div>
+            </fieldset>
+            <fieldset class="settings-section">
+              <legend>自动路由</legend>
+            <div class="settings-grid">
               <label class="option-toggle">
                 <input id="autoSelectModel" type="checkbox" />
                 <span>
@@ -825,6 +877,8 @@
             <p class="smart-routing-safety-note">
               下面的规则只有在上方“自动选模型”或“失败自动切换”开启时才生效；开关关闭时，CodexBridge 不会接管用户手动选择。
             </p>
+            <details class="console-disclosure routing-disclosure">
+              <summary><span>自动路由规则</span><span class="disclosure-hint">任务模型与备用顺序</span></summary>
             <div class="smart-routing-policy">
               <div class="smart-routing-rule-grid">
                 <label>
@@ -880,16 +934,22 @@
                 </div>
               </div>
             </div>
+            </details>
+            </fieldset>
             <div class="model-reference-status" id="modelReferenceStatus" aria-live="polite"></div>
             <div class="settings-actions">
-              <button class="primary-button" id="saveDesktopOptions" type="button">保存设置</button>
-              <button class="ghost-button light" id="repairModelReferences" type="button">修复失效模型引用</button>
+              <span class="settings-draft-status" id="desktopSettingsDraftStatus" role="status" title="未保存的修改只保留在当前窗口；撤销可回到最新保存值。">基础设置未修改</span>
+              <div class="header-actions">
+                <button class="ghost-button light" id="repairModelReferences" type="button">修复失效模型引用</button>
+                <button class="plain-button" id="discardDesktopSettings" type="button" data-state-unavailable-readonly disabled>撤销未保存修改</button>
+                <button class="primary-button" id="saveDesktopOptions" type="button">保存设置</button>
+              </div>
             </div>
           </article>
-          <article class="panel">
+          <article class="panel settings-jump-target" id="settingsProfiles">
             <div class="panel-header">
               <div>
-                <h2>配置档</h2>
+                <h2 tabindex="-1">配置档</h2>
                 <p>把当前模式、模型选择和基础设置保存成一个可快速切换的配置。</p>
                 <p class="config-package-note">配置包会带走模型、供应商、能力代理和预算；本地上传 Logo 会随配置包恢复；API Key、本机 ChatGPT / Codex 路径、本地文件路径和测试缓存不会导出。</p>
               </div>
@@ -904,10 +964,10 @@
             <div class="config-sync-status" id="configPackageImportBackupStatus" aria-live="polite"></div>
             <div class="profile-list" id="profileList"></div>
           </article>
-          <article class="panel">
+          <article class="panel settings-jump-target" id="settingsBackups">
             <div class="panel-header">
               <div>
-                <h2>备份恢复中心</h2>
+                <h2 tabindex="-1">备份恢复中心</h2>
                 <p>每次写入 Codex 配置前会保留备份；这里可以恢复指定备份。</p>
               </div>
             </div>
@@ -919,19 +979,19 @@
           <article class="panel">
             <div class="panel-header">
               <div>
-                <h2>资源中心</h2>
-                <p>主列表只显示 Codex 当前确认可用的插件、MCP、技能和规则文件。</p>
+                <h2>当前资源</h2>
+                <p>查看可用的插件、MCP、技能和规则文件。</p>
               </div>
               <div class="header-actions">
                 <button class="ghost-button light small" id="refreshResources" type="button">刷新资源</button>
-                <button class="primary-button small" id="copyResourceDiagnostics" type="button">复制诊断</button>
+                <button class="plain-button small" id="copyResourceDiagnostics" type="button">复制诊断</button>
               </div>
             </div>
             <div class="resource-controls" aria-label="资源筛选">
               <label class="resource-search-control">
                 <span>搜索当前资源</span>
                 <div class="resource-search-row">
-                  <input id="resourceSearch" type="search" placeholder="输入名称、分类、能力、路径或诊断内容" autocomplete="off" />
+                  <input id="resourceSearch" type="search" aria-describedby="resourceFilterStatus" placeholder="输入名称、分类、能力、路径或诊断内容" autocomplete="off" />
                 </div>
               </label>
               <label>
@@ -943,8 +1003,10 @@
                   <option value="not-current">未启用/缓存/需处理</option>
                 </select>
               </label>
+              <button class="plain-button small" id="clearResourceFilters" type="button" data-state-unavailable-readonly disabled>清除筛选</button>
             </div>
-            <details class="resource-advanced-controls">
+            <p class="resource-filter-status" id="resourceFilterStatus" role="status" hidden></p>
+            <details class="resource-advanced-controls console-disclosure">
               <summary>高级资源诊断</summary>
               <div class="resource-controls compact" aria-label="资源高级筛选">
                 <button class="ghost-button light small" id="refreshPluginMarketplaces" type="button">刷新插件市场</button>
@@ -964,9 +1026,9 @@
                 </select>
               </label>
               </div>
-            </details>
             <p class="resource-count-note">插件、应用和插件 MCP 对应当前 Codex 插件页；用户技能来自 Codex app-server skills/list，并按当前用户 CODEX_HOME 下的非系统技能统计。manifest 声明、磁盘技能文件、全局运行时 MCP 和缓存候选只放高级诊断。</p>
-            <p class="resource-count-note" id="resourceRefreshStatus">资源状态：尚未读取</p>
+            </details>
+            <p class="resource-count-note" id="resourceRefreshStatus" role="status" aria-live="polite">资源状态：尚未读取</p>
             <div class="resource-layout">
               <div class="resource-summary" id="resourceSummary"></div>
               <div class="resource-grid" id="resourceList"></div>
@@ -1005,28 +1067,31 @@
               <div class="history-recovery-failure hidden" id="historyRecoveryFailure"></div>
             </div>
             <div class="session-search-row">
-              <label>
-                <span>搜索会话</span>
-                <input id="sessionSearch" placeholder="搜索项目、路径、会话标题、模型或摘要" />
-              </label>
+              <label class="sr-only" for="sessionSearch">搜索会话</label>
+              <input id="sessionSearch" aria-describedby="sessionSearchCount" placeholder="搜索项目、路径、会话标题、模型或摘要" />
               <div class="session-search-actions">
-                <button class="ghost-button light small" id="clearSessionSearch" type="button">清空搜索</button>
+                <span id="sessionSearchCount" role="status">等待读取</span>
+                <button class="ghost-button light small" id="clearSessionSearch" type="button" disabled>清空搜索</button>
               </div>
             </div>
             <div class="session-list" id="sessionList"></div>
           </article>
         </section>
 
-        <section class="section-panel hidden" id="logs">
+        <section class="section-panel action-page hidden" id="logs">
           <article class="panel logs-panel">
             <div class="panel-header">
               <div>
                 <h2>实时日志</h2>
-                <p>确认请求实际走到哪个 provider、哪个真实模型，以及按钮执行结果。</p>
+                <p>查看请求路由、真实模型和操作结果；向上滚动可暂停自动跟随。</p>
               </div>
               <button class="primary-button small" id="copyDiagnostics">复制诊断信息</button>
             </div>
-            <pre id="logOutput"></pre>
+            <div class="log-toolbar">
+              <span id="logViewStatus">0 条日志 · 跟随最新</span>
+              <button class="plain-button small" id="resumeLogFollow" type="button" hidden>回到最新</button>
+            </div>
+            <pre id="logOutput" tabindex="0" role="region" aria-label="运行日志" aria-describedby="logViewStatus"></pre>
           </article>
         </section>
 
@@ -1034,32 +1099,16 @@
           <article class="panel double-quota-hero">
             <div class="panel-header">
               <div>
-                <span class="double-quota-kicker">G某T + CODEX</span>
+                <span class="double-quota-kicker">ChatGPT + CODEX</span>
                 <h2>双倍额度</h2>
-                <p>把你的 G某T 网页会话接入 Codex，在保留当前模型 Router 的同时使用另一份订阅额度。</p>
+                <p>把你的 ChatGPT 网页会话接入 Codex，在保留当前模型 Router 的同时使用另一份订阅额度。</p>
               </div>
               <span class="status-pill muted" id="doubleQuotaStatus">正在读取</span>
             </div>
             <div class="double-quota-metrics">
-              <div>
+              <div class="double-quota-endpoint">
                 <span>服务地址</span>
                 <strong id="doubleQuotaUrl">http://127.0.0.1:4317/</strong>
-              </div>
-              <div>
-                <span>服务版本</span>
-                <strong id="doubleQuotaServiceVersion">-</strong>
-              </div>
-              <div>
-                <span>Bridge 协议</span>
-                <strong id="doubleQuotaProtocolVersion">-</strong>
-              </div>
-              <div>
-                <span>扩展协议</span>
-                <strong id="doubleQuotaExtensionProtocol">-</strong>
-              </div>
-              <div>
-                <span>嵌入版本</span>
-                <strong id="doubleQuotaEmbeddedVersion">-</strong>
               </div>
               <div>
                 <span>服务来源</span>
@@ -1068,6 +1117,22 @@
               <div>
                 <span>MCP</span>
                 <strong id="doubleQuotaMcpStatus">尚未安装</strong>
+              </div>
+              <div class="double-quota-version">
+                <span>服务版本</span>
+                <strong id="doubleQuotaServiceVersion">-</strong>
+              </div>
+              <div class="double-quota-version">
+                <span>嵌入版本</span>
+                <strong id="doubleQuotaEmbeddedVersion">-</strong>
+              </div>
+              <div class="double-quota-version">
+                <span>Bridge 协议</span>
+                <strong id="doubleQuotaProtocolVersion">-</strong>
+              </div>
+              <div class="double-quota-version">
+                <span>扩展协议</span>
+                <strong id="doubleQuotaExtensionProtocol">-</strong>
               </div>
             </div>
           </article>
@@ -1152,7 +1217,7 @@
               </div>
               <button class="primary-button" id="repairDoubleQuotaMcp" type="button">安装 / 修复 MCP</button>
             </div>
-            <p class="double-quota-note">写入前会备份 config.toml；完成后不会自动关闭或重启 G某T / Codex。</p>
+            <p class="double-quota-note">写入前会备份 config.toml；完成后不会自动关闭或重启 ChatGPT / Codex。</p>
           </article>
         </section>
 
@@ -1180,6 +1245,12 @@
             </div>
           </article>
         </section>
+        <div class="toast hidden" id="toast" role="group" aria-label="操作提示">
+          <div class="toast-message" data-toast-message role="status" aria-live="polite" aria-atomic="true" tabindex="0"></div>
+          <div class="toast-actions">
+            <button class="plain-button small" data-toast-close data-state-unavailable-readonly type="button" aria-label="关闭提示">关闭</button>
+          </div>
+        </div>
       </main>
     </div>
     <script src="./software-manager-ui.js"></script>

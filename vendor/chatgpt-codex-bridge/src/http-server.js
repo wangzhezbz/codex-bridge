@@ -29,6 +29,9 @@ import {
   claimNextSyncJob,
   completeSyncJob,
   createSyncJob,
+  createMissingArtifactRecovery,
+  missingArtifactRecoveryFilenames,
+  missingArtifactRecoveryId,
   failSyncJob,
   getSyncJob,
   listSyncJobs,
@@ -40,6 +43,7 @@ import {
   recordSyncJobRouterTerminalReconciliationFailure,
   reopenFailedSyncJobForCapture,
   reopenFailedSyncJobForResend,
+  syncJobAttemptStartedAt,
   withSyncJobRouterTerminalReconciliationLease
 } from "./sync-store.js";
 import {
@@ -85,6 +89,7 @@ import {
   waitForSyncJobResult
 } from "./gpt-file-analysis.js";
 import { createBridgeTools } from "./bridge-tools.js";
+import { readProjectRoutingRuleStatus } from "./bridge-routing-rules.js";
 import {
   getExtensionHeartbeat,
   listExtensionHeartbeats,
@@ -95,6 +100,7 @@ import { normalizeChatGptPreferences } from "./preference-compat.js";
 import { assertTextIntegrity } from "./text-integrity.js";
 import { renderRealBrowserAcceptanceRecord } from "./user-package.js";
 import { resolveBridgeDataDir, resolveBridgeExtensionDir } from "./runtime-config.js";
+import { runtimeIdentity } from "./runtime-identity.js";
 import {
   EXTENSION_PROTOCOL_VERSION,
   healthPayload,
@@ -506,6 +512,7 @@ function stripChatGptReplyWrapper(text = "") {
 function looksLikeInterruptedChatGptReply(text = "") {
   const cleaned = stripChatGptReplyWrapper(text);
   const concise = cleaned.replace(/\s+/g, " ").trim();
+  if (/^(?:消息流中的错误|error in message stream)[。.!！]?(?:\s*(?:重试|重新生成|retry|try again)[。.!！]?)?$/i.test(concise)) return true;
   return concise.length <= 220 &&
     /\u8fde\u63a5.{0,10}(?:\u4e2d\u65ad|\u65ad\u5f00|\u5df2\u65ad)|(?:\u7b49\u5f85|\u6b63\u5728\u7b49\u5f85).{0,16}(?:\u5b8c\u6574\u56de\u590d|\u5b8c\u6574\u7b54\u590d|\u5b8c\u6574\u54cd\u5e94)|connection.{0,20}(?:interrupted|lost|disconnected)|waiting.{0,20}(?:complete|full).{0,16}(?:reply|response)/i.test(
       concise
@@ -898,7 +905,11 @@ async function hideSupersededSyncFailureMessages(storeRoot, job = {}) {
 }
 
 function hasArtifactRequestSignal(job = {}) {
-  const text = `${job.userText || ""} ${job.payloadText || ""}`;
+  // A negated generation instruction is not a request for a downloadable output.
+  // Keep other positive actions in the same request intact.
+  const text = `${job.userText || ""} ${job.payloadText || ""}`
+    .replace(/(?:不要|不需要|无需|禁止|避免|别|不)\s*(?:再|重新|提前)?\s*(?:生成|创建|制作|导出|保存)\s*(?:(?:任何|新的?|额外的?|无关的?)\s*)?(?:文件|附件|图片|图像|海报|配图)/gu, " ")
+    .replace(/\b(?:do not|don't|never|without)\s+(?:generate|create|make|export|save|generating|creating|making|exporting|saving)\s+(?:(?:any|a|an|new|additional)\s+)*(?:files?|attachments?|images?|pictures?|posters?)\b/gi, " ");
   const hasActionSignal =
     /\b(?:generate|create|make|download|downloadable|export|save)\b/i.test(text) ||
     /(?:\u751f\u6210|\u521b\u5efa|\u5236\u4f5c|\u5bfc\u51fa|\u4fdd\u5b58|\u53ef\u4e0b\u8f7d|\u771f\u5b9e\u53ef\u4e0b\u8f7d|\u70b9\u51fb\u4e0b\u8f7d|\u63d0\u4f9b\u4e0b\u8f7d)/u.test(text);
@@ -926,10 +937,10 @@ function inferMissingArtifactErrors(replyText, artifactIds = [], artifactErrors 
     job.kind === "image_request" &&
     !hasExplicitNoImageRequestSignal(jobText);
   if (
-    job.kind === "codex_file_analysis" &&
+    !requiresImageArtifact &&
     Array.isArray(job.inputArtifacts) &&
     job.inputArtifacts.length > 0 &&
-    (hasNegativeArtifactSignal(jobText) || !hasArtifactRequestSignal(job))
+    ((job.kind === "codex_file_analysis" && hasNegativeArtifactSignal(jobText)) || !hasArtifactRequestSignal(job))
   ) {
     return [];
   }
@@ -988,11 +999,27 @@ function inferMissingArtifactErrors(replyText, artifactIds = [], artifactErrors 
   return missingArtifacts;
 }
 
+function unmatchedRecoveryFilenames(filenames = [], artifacts = []) {
+  const remaining = [...filenames];
+  const used = new Set();
+  // Exact names win before Chrome's collision suffix aliases. Each artifact
+  // can satisfy at most one requested file.
+  for (const aliases of [false,true]) {
+    for (let index=0;index<remaining.length;index++) {
+      if (!remaining[index]) continue;
+      const found=artifacts.findIndex((artifact,i)=>!used.has(i) &&
+        (aliases ? artifact.filename.replace(/ \(\d+\)(?=\.[^.]+$)/,"") : artifact.filename).toLowerCase() === remaining[index].toLowerCase());
+      if(found>=0){used.add(found);remaining[index]=null;}
+    }
+  }
+  return remaining.filter(Boolean);
+}
+
 function shouldFailForMissingArtifactCapture(job = {}, replyText = "", artifactIds = [], artifactErrors = []) {
   return (
-    artifactIds.length === 0 &&
-    artifactErrors.some((error) => error?.code === "missing_download" || error?.error) &&
-    (job.kind === "image_request" || hasArtifactRequestSignal(job) || hasArtifactReplySignal(replyText))
+    artifactErrors.some((error) => error?.code === "missing_download" ||
+      (error?.error && (artifactIds.length === 0 || Boolean(error.filename)))) &&
+    (Boolean(job.recoverySourceJobId) || job.kind === "image_request" || hasArtifactRequestSignal(job) || hasArtifactReplySignal(replyText))
   );
 }
 
@@ -1104,6 +1131,9 @@ function normalizeSyncFailureBody(body = {}) {
 
 function conciseSyncFailureReason(error = "", errorCode = null) {
   const message = String(error || "").trim();
+  if (errorCode === "preference_not_applied") {
+    return "所选模型或思考强度未能确认，消息尚未发送。请重新选择网页支持的模型和档位后重试。";
+  }
   if (errorCode === "manual_cancelled") {
     return "已手动停止这次 GPT 任务。";
   }
@@ -1145,6 +1175,9 @@ function conciseSyncFailureReason(error = "", errorCode = null) {
 
 function visibleSyncFailureText(error = "", errorCode = null) {
   const message = String(error || "").trim();
+  if (errorCode === "preference_not_applied") {
+    return ["模型或思考强度未应用", "", conciseSyncFailureReason(message, errorCode)].join("\n");
+  }
   if (isClientBlockedError(message, errorCode)) {
     return [
       "GPT 页面被 Chrome 拦截",
@@ -1205,6 +1238,8 @@ function gptVisibleText(value = "") {
   const text = String(value || "").trim();
   if (!text) return "";
   return text
+    .replace(/g某t\.com/gi, "chatgpt.com")
+    .replace(/g某t/gi, "GPT")
     .replace(
       /ChatGPT page cannot receive messages yet/gi,
       "GPT 页面暂时不能接收任务"
@@ -1289,7 +1324,13 @@ function hasExplicitExtensionVersion(workerId = "") {
 }
 
 function extensionNeedsReload(version) {
-  return Boolean(version && version !== EXPECTED_EXTENSION_VERSION);
+  return Boolean(version && version !== EXPECTED_EXTENSION_VERSION && !extensionAheadOfBackend(version));
+}
+
+function extensionAheadOfBackend(version) {
+  const actualDate = /^v(\d{8})/.exec(version || "")?.[1];
+  const expectedDate = /^v(\d{8})/.exec(EXPECTED_EXTENSION_VERSION)?.[1];
+  return Boolean(actualDate && expectedDate && actualDate > expectedDate);
 }
 
 function isExpectedExtensionVersion(workerId = "") {
@@ -1335,14 +1376,20 @@ function extensionCompatibilityState(version) {
   return COMPATIBLE_EXTENSION_VERSIONS.has(version) ? "warning" : "blocked";
 }
 
-function selectExtensionHeartbeat(heartbeats = [], workspace = null) {
+function selectExtensionHeartbeat(heartbeats = [], workspace = null, activeJob = null) {
   const connected = heartbeats.filter((heartbeat) => heartbeat.connected);
   const workspaceMatch = (heartbeat) => extensionProjectMatches(workspace, heartbeat) === true;
   const expected = (heartbeat) => isExpectedExtensionVersion(heartbeat?.workerId || "");
   const compatible = (heartbeat) => isCompatibleExtensionVersion(heartbeat?.workerId || "");
+  const ready = (heartbeat) => heartbeat.pageStatus?.state === "ready";
   return (
+    connected.find((heartbeat) => workspaceMatch(heartbeat) && expected(heartbeat) &&
+      activeJob?.workerId && sameExtensionWorkerController(heartbeat.workerId, activeJob.workerId)) ||
+    connected.find((heartbeat) => workspaceMatch(heartbeat) && expected(heartbeat) && ready(heartbeat)) ||
     connected.find((heartbeat) => workspaceMatch(heartbeat) && expected(heartbeat)) ||
+    connected.find((heartbeat) => workspaceMatch(heartbeat) && compatible(heartbeat) && ready(heartbeat)) ||
     connected.find((heartbeat) => workspaceMatch(heartbeat) && compatible(heartbeat)) ||
+    connected.find(workspaceMatch) ||
     heartbeats.find((heartbeat) => workspaceMatch(heartbeat) && expected(heartbeat)) ||
     heartbeats.find((heartbeat) => workspaceMatch(heartbeat) && compatible(heartbeat)) ||
     connected.find(expected) ||
@@ -1682,9 +1729,9 @@ function buildConnectionStatus({ workspace, heartbeat, extensionVersion, project
   const ready = blockers.length === 0 && working.length === 0;
   let label = "连接就绪";
   if (blockers.length) {
-    if (extensionVersionState === "blocked") label = "扩展需重载";
+    if (extensionVersionState === "blocked") label = extensionAheadOfBackend(extensionVersion) ? "后端需更新" : "扩展需重载";
     else if (!workspace?.chatgptProjectUrl) label = "未绑定";
-    else if (!heartbeat?.connected) label = "等待扩展";
+    else if (!heartbeat?.connected) label = heartbeat && projectMatches === true ? "连接待确认" : "等待扩展";
     else if (projectMatches === false) label = "页面不匹配";
     else if (pageStateCheck.state === "blocked") {
       if (pageStatus?.code === "client_blocked") label = "页面被拦截";
@@ -1891,6 +1938,15 @@ function buildWorkflowStatus({ workspace, heartbeat, extensionVersion, projectMa
   }
 
   if (extensionVersionState === "blocked") {
+    if (extensionAheadOfBackend(extensionVersion)) {
+      return {
+        level: "blocked",
+        label: "后端需更新",
+        title: "Bridge 后端版本落后于扩展",
+        detail: "已收到扩展心跳 " + extensionVersion + "，但运行中的后端仍要求 " + EXPECTED_EXTENSION_VERSION + "。",
+        nextStep: "请配套更新并重启 Bridge 后端服务。反复刷新 GPT 页面不会更新后端；版本一致前不会发送任务。"
+      };
+    }
     return {
       level: "blocked",
       label: "扩展需重载",
@@ -1904,10 +1960,10 @@ function buildWorkflowStatus({ workspace, heartbeat, extensionVersion, projectMa
     if (heartbeat && projectMatches === true) {
       return {
         level: "blocked",
-        label: "绑定页断开",
-        title: "绑定的 GPT 页面已断开",
-        detail: gptVisibleText(heartbeatConnectionDetail(heartbeat)) + "。如果页面显示“已被屏蔽”或“页面被客户端拦截”，说明 Chrome 或其它扩展拦截了 chatgpt.com。",
-        nextStep: "先关闭拦截 chatgpt.com 的扩展或加入白名单，然后只刷新这个绑定的 GPT 会话。Bridge 不会继续自动刷新。"
+        label: "连接待确认",
+        title: "暂时无法确认绑定的 GPT 页面状态",
+        detail: gptVisibleText(heartbeatConnectionDetail(heartbeat)) + "。心跳延迟可能来自后台节流、页面忙碌或连接中断，当前证据不足以确认具体原因。",
+        nextStep: "先切回绑定的 GPT 页面并重新检测；确认状态前不要重复发送任务。Bridge 不会据此自动刷新或重发。"
       };
     }
     return {
@@ -2013,7 +2069,7 @@ function syncJobAgeMs(job) {
 }
 
 function syncJobSentAgeMs(job) {
-  const timestamp = Date.parse(job?.sentAt || job?.updatedAt || job?.createdAt || "");
+  const timestamp = Date.parse(syncJobAttemptStartedAt(job) || "");
   if (!Number.isFinite(timestamp)) {
     return 0;
   }
@@ -2043,6 +2099,35 @@ function isRetryableSyncJob(job, { heartbeat = null } = {}) {
     isRunningSyncStale(job) ||
     isReadyPageSentSyncStale(job, heartbeat)
   );
+}
+
+function syncRetryPlan(job, options = {}) {
+  if (!isRetryableSyncJob(job, options)) return { action: null, reason: null };
+  if (job.errorCode === "manual_cancelled") {
+    return { action: null, reason: "任务已停止，不会重新启动。" };
+  }
+  if (job.status === "failed") {
+    if (job.sentAt && job.errorCode === "reply_scope_ambiguous" &&
+        typeof job.submittedPromptTurnId === "string" && job.submittedPromptTurnId.trim()) {
+      return { action: "capture", reason: null };
+    }
+    if (job.errorCode === "pre_send_expired" ||
+        (job.sentAt && ["reply_timeout", "missing_download"].includes(job.errorCode))) {
+      return { action: "capture", reason: null };
+    }
+    if (job.sentAt && job.errorCode === "client_blocked") {
+      return options.heartbeat?.pageStatus?.state === "ready"
+        ? { action: "capture", reason: null }
+        : { action: null, reason: "请先恢复绑定的 GPT 页面，再重新收取结果。" };
+    }
+    if (["send_not_confirmed", "prompt_not_found"].includes(job.errorCode) ||
+        (!job.sentAt && ["input_artifact_fetch_failed", "preference_not_applied", "pre_send_stale", "composer_text_not_applied"].includes(job.errorCode))) {
+      return { action: "resend", reason: null };
+    }
+  }
+  return job.routerTerminalSignalRequired === true
+    ? { action: null, reason: "无法安全重试，请先核对原任务结果；不会另建任务。" }
+    : { action: "resend", reason: null };
 }
 
 function isImageGenerationSyncJob(job = null) {
@@ -2336,14 +2421,16 @@ async function getScopedWorkspaceBinding(storeRoot, currentCodexThreadId = null,
         modePreference: project.modePreference || null,
         modelPreference: project.modelPreference || null,
         preferenceUpdatedAt: project.preferenceUpdatedAt || project.updatedAt || null,
-        updatedAt: project.updatedAt || null
+        updatedAt: project.updatedAt || null,
+        ...await readProjectRoutingRuleStatus(project)
       },
       scopedOut: false,
       outOfScopeProjectId: null
     };
   }
 
-  const workspace = await getWorkspaceBinding(storeRoot);
+  const storedWorkspace = await getWorkspaceBinding(storeRoot);
+  const workspace = { ...storedWorkspace, ...await readProjectRoutingRuleStatus(storedWorkspace) };
   if (!currentCodexThreadId || !workspace.projectId) {
     return { workspace, scopedOut: false, outOfScopeProjectId: null };
   }
@@ -2480,6 +2567,7 @@ function syncProgress(job, options = {}) {
     createdAt: job.createdAt || null,
     claimedAt: job.claimedAt || null,
     sentAt: job.sentAt || null,
+    recoveryStartedAt: job.recoveryStartedAt || null,
     completedAt
   };
   const durations = {
@@ -2487,6 +2575,7 @@ function syncProgress(job, options = {}) {
     preSendMs: durationBetweenMs(timeline.claimedAt, timeline.sentAt),
     responseMs: durationBetweenMs(timeline.sentAt, timeline.completedAt),
     totalMs: durationBetweenMs(timeline.createdAt, timeline.completedAt),
+    recoveryMs: durationBetweenMs(timeline.recoveryStartedAt, timeline.completedAt),
     gptThoughtMs: Number.isFinite(Number(job.thoughtDurationMs)) && Number(job.thoughtDurationMs) > 0
       ? Number(job.thoughtDurationMs)
       : null
@@ -2500,6 +2589,9 @@ function syncProgress(job, options = {}) {
   }
   if (durations.responseMs === null && timeline.sentAt && stage === "waiting_reply") {
     durations.responseMs = durationBetweenMs(timeline.sentAt, new Date().toISOString());
+  }
+  if (durations.recoveryMs === null && timeline.recoveryStartedAt && !completedAt) {
+    durations.recoveryMs = durationBetweenMs(timeline.recoveryStartedAt, new Date().toISOString());
   }
 
   const reason = syncStatusReason(job, options);
@@ -2536,9 +2628,18 @@ function syncProgress(job, options = {}) {
     }
   }[stage];
 
+  const recovering = ["pending", "running"].includes(job.status) && job.recoveryStartedAt &&
+    ["capture", "resend"].includes(job.recoveryMode) && !staleSending && !staleWaitingReply;
   return {
     stage,
     ...stageCopy,
+    ...(recovering ? {
+      label: "正在恢复",
+      shortLabel: job.recoveryMode === "capture" ? "正在重新收取结果" : "正在恢复发送",
+      message: job.recoveryMode === "capture"
+        ? "正在重新收取原任务结果，不会重新发送任务。"
+        : job.status === "pending" ? "原任务已进入重发队列，等待扩展领取。" : "正在恢复原任务的发送和结果回收。"
+    } : {}),
     timeline,
     durations
   };
@@ -2957,9 +3058,9 @@ async function buildDiagnosticsSnapshot({
     conversationId: workspace.conversationId
   });
   const heartbeats = await listExtensionHeartbeats(storeRoot, { includeDisconnected: true });
-  const rawHeartbeat = selectExtensionHeartbeat(heartbeats, workspace) || (await getExtensionHeartbeat(storeRoot));
   const latestSyncJob = userVisibleSyncJobs[0] || null;
   const activeSyncJob = selectActiveSyncJob(workspaceSyncJobs);
+  const rawHeartbeat = selectExtensionHeartbeat(heartbeats, workspace, activeSyncJob) || (await getExtensionHeartbeat(storeRoot));
   const heartbeat = heartbeatWithActiveJobGrace(workspace, rawHeartbeat, activeSyncJob);
   const latestArtifact = artifacts[0] || null;
   const workerId = heartbeat?.workerId || activeSyncJob?.workerId || latestSyncJob?.workerId || null;
@@ -3026,6 +3127,7 @@ async function buildDiagnosticsSnapshot({
     workspace,
     runnerMode,
     currentCodexThreadId,
+    runtime: runtimeIdentity({ storeRoot, currentCodexThreadId }),
     latestSyncJob: latestSyncJobWithProgress,
     activeSyncJob: activeSyncJobWithProgress,
     latestArtifact,
@@ -3041,6 +3143,7 @@ async function buildDiagnosticsSnapshot({
       expectedVersion: EXPECTED_EXTENSION_VERSION,
       sourceDir: extensionSourceDir,
       needsReload: extensionNeedsReload(extensionVersion),
+      backendNeedsUpdate: extensionAheadOfBackend(extensionVersion),
       projectMatches,
       expectedHref: workspace?.chatgptProjectUrl || null,
       heartbeat: visibleHeartbeat,
@@ -3048,7 +3151,7 @@ async function buildDiagnosticsSnapshot({
       connected: Boolean(visibleHeartbeat?.connected),
       rawConnected: Boolean(rawHeartbeat?.connected),
       heartbeatDelayed: Boolean(visibleHeartbeat?.heartbeatDelayed),
-      connectionState: visibleHeartbeat?.connectionState || (visibleHeartbeat?.connected ? "connected" : "disconnected"),
+      connectionState: visibleHeartbeat?.connectionState || (visibleHeartbeat?.connected ? "connected" : visibleHeartbeat ? "unknown" : "disconnected"),
       href: visibleHeartbeat?.href || null,
       title: visibleHeartbeat?.title || null
     },
@@ -3077,6 +3180,7 @@ function gptPreflightAction(snapshot = {}) {
   if (!snapshot.workspace?.chatgptProjectUrl) {
     return "bind_chatgpt_project";
   }
+  if (extension.backendNeedsUpdate) return "restart_bridge_backend";
   if (extension.needsReload && extensionVersionCheck?.state === "blocked") {
     return "reload_extension";
   }
@@ -3142,6 +3246,11 @@ function buildGptSendBlock(snapshot = {}) {
   const boundPageCheck = checkById("bound-page");
   const pageStateCheck = checkById("page-state");
 
+  if (extension.backendNeedsUpdate) {
+    return { status: 409, code: "bridge_backend_outdated", action: "restart_bridge_backend",
+      error: "Bridge 后端版本落后于扩展，请配套更新并重启后端；不要重复刷新或发送。", workflowStatus, connection };
+  }
+
   if (extensionVersionCheck?.state === "blocked" && hasExplicitExtensionVersion(extension.workerId || "")) {
     return {
       status: 409,
@@ -3179,6 +3288,7 @@ function buildGptSendBlock(snapshot = {}) {
 }
 
 function decorateRoomMessagesWithSyncState(messages = [], syncJobs = [], options = {}) {
+  const jobsById = new Map(syncJobs.map(job => [job.id, job]));
   const jobsBySourceMessage = new Map();
   for (const job of syncJobs) {
     if (job.sourceMessageId && !jobsBySourceMessage.has(job.sourceMessageId)) {
@@ -3187,9 +3297,28 @@ function decorateRoomMessagesWithSyncState(messages = [], syncJobs = [], options
   }
 
   return messages.map((message) => {
+    if (message.from === "gpt" && message.metadata?.syncJobId) {
+      const current = jobsById.get(message.metadata.syncJobId);
+      const sameConversation = Boolean(message.conversationId && current?.conversationId === message.conversationId);
+      return {...message, metadata: {...message.metadata,
+        syncCurrentStatus: sameConversation ? current.status : null,
+        syncRecovered: sameConversation && current.status === "succeeded" && message.metadata.syncStatus === "failed"
+      }};
+    }
     const job = jobsBySourceMessage.get(message.id);
     if (!job) return message;
     const progress = syncProgress(job);
+    const missingNames = missingArtifactRecoveryFilenames(job,(job.projectArtifacts || []).map(item=>item.filename || item.artifact?.filename).filter(Boolean));
+    const recoveryCandidate = missingNames.length ? jobsById.get(missingArtifactRecoveryId(job.id)) : null;
+    const recovery = recoveryCandidate?.recoverySourceJobId === job.id && recoveryCandidate.conversationId === job.conversationId &&
+      recoveryCandidate.projectId === job.projectId ? recoveryCandidate : null;
+    if (missingNames.length && progress) progress.message = recovery?.status === "succeeded"
+      ? "缺失附件已补收，原记录已保留。"
+      : `结果不完整：仍缺 ${missingNames.join("、")}。可仅补收，不会重新发送。`;
+    const retryPlan = syncRetryPlan(job, options);
+    if (retryPlan.action === "capture" && progress) {
+      progress.message = "本次任务的结果尚未收回，可重新收取结果，不会重新发送任务。";
+    }
     const shouldDisplayPayload =
       job.payloadText &&
       job.payloadText !== message.text &&
@@ -3211,11 +3340,14 @@ function decorateRoomMessagesWithSyncState(messages = [], syncJobs = [], options
             }
           : {}),
         syncJobId: job.id,
+        ...(missingNames.length ? {syncMissingArtifactNames:missingNames,syncMissingRecoveryId:recovery?.id || null,syncMissingRecoveryStatus:recovery?.status || null} : {}),
         syncStatus: job.status,
         syncReason: progress?.message || syncInputArtifactReason(job),
         syncProgress: progress,
         syncDurationTotalMs: progress?.durations?.totalMs ?? null,
-        syncCanRetry: isRetryableSyncJob(job, options),
+        syncCanRetry: Boolean(retryPlan.action),
+        syncRetryAction: retryPlan.action,
+        syncRetryReason: retryPlan.reason,
         syncCanCancel: job.status === "pending" || job.status === "running",
         syncSentAt: job.sentAt,
         syncUpdatedAt: job.updatedAt,
@@ -3679,7 +3811,8 @@ async function handleApi(request, response, options) {
 
       const artifactIds = Array.isArray(job.artifactIds) ? job.artifactIds : [];
       const artifacts = await loadArtifactsByIds(storeRoot, artifactIds);
-      const visibleReplyText =
+      const visibleReplyText = job.recoverySourceJobId
+        ? `已补收缺失附件：${artifacts.map(artifact => artifact.filename).join("、")}` :
         artifactIds.length > 0 && artifacts.length === artifactIds.length && artifacts.every(isImageArtifactLike)
           ? "已捕获 " + artifacts.length + " 张图片"
           : summarizeVisibleReplyWithArtifacts(
@@ -3739,6 +3872,7 @@ async function handleApi(request, response, options) {
               projectArtifactErrors: job.projectArtifactErrors || [],
               sourceMessageId: job.sourceMessageId || null,
               source: "chatgpt_project",
+              recoverySourceJobId: job.recoverySourceJobId || null,
               imageBatchParentJobId: job._bridgeImageBatchParentJobId || null,
               imageBatchCapturedTotal:
                 job._bridgeImageBatchParentJobId ||
@@ -3917,6 +4051,7 @@ async function handleApi(request, response, options) {
       runnerMode: options.runnerMode,
       autoExecutesCodex: options.runnerMode === "codex",
       currentCodexThreadId,
+      runtime: runtimeIdentity({ storeRoot, currentCodexThreadId }),
       apiToken: options.apiToken,
       expectedExtensionVersion: EXPECTED_EXTENSION_VERSION,
       extensionSourceDir,
@@ -5165,6 +5300,34 @@ async function handleApi(request, response, options) {
       return;
     }
 
+    if (request.method === "POST" && parts[4] === "recover-artifacts") {
+      const body = await readJsonBody(request);
+      if (!explicitProjectId || body.captureOnly !== true) {
+        sendJson(response,400,{error:"Explicit project and captureOnly are required"});return;
+      }
+      const before = await getSyncJob(storeRoot,jobId);
+      if (before.projectId !== explicitProjectId || before.conversationId !== workspace.conversationId ||
+          !currentCodexThreadId || before.codexThreadId !== currentCodexThreadId ||
+          path.resolve(before.targetRepo || "").toLowerCase() !== path.resolve(workspace.targetRepo || "").toLowerCase() ||
+          !chatgptUrlsMatch(before.projectUrl,workspace.chatgptProjectUrl)) {
+        sendJson(response,404,{error:"Recovery source is outside the current project scope"});return;
+      }
+      const captured = await loadArtifactsByIds(storeRoot,before.artifactIds || []);
+      if (!missingArtifactRecoveryFilenames(before,captured.map(a=>a.filename)).length) {
+        sendJson(response,409,{error:"No safely recoverable missing artifacts"});return;
+      }
+      const existing = await getSyncJob(storeRoot,missingArtifactRecoveryId(before.id)).catch(error=>{
+        if(error.code === "ENOENT")return null;throw error;
+      });
+      if (!existing) {
+        const snapshot = await buildDiagnosticsSnapshot({storeRoot,runnerMode:options.runnerMode,currentCodexThreadId,extensionSourceDir,workspace});
+        const block = buildGptSendBlock(snapshot);
+        if(block){sendJson(response,block.status,block);return;}
+      }
+      const syncJob = await createMissingArtifactRecovery(storeRoot,before.id,{capturedFilenames:captured.map(a=>a.filename)});
+      sendJson(response,200,{syncJob,recoverySourceJobId:before.id,captureOnly:true,resend:false});return;
+    }
+
     if (request.method === "POST" && parts[4] === "cancel") {
       const before = await getSyncJob(storeRoot, jobId);
       if (!syncJobMatchesWorkspace(before, workspace)) {
@@ -5277,6 +5440,12 @@ async function handleApi(request, response, options) {
       const currentArtifacts = requestedArtifactIds.length > artifacts.length
         ? await loadArtifactsByIds(storeRoot, requestedArtifactIds)
         : artifacts;
+      if (before.recoverySourceJobId && currentArtifacts.some(artifact =>
+        artifact.syncJobId !== before.id || artifact.conversationId !== before.conversationId ||
+        !(before.recoveryFilenames || []).some(name => artifact.filename.toLowerCase() === name.toLowerCase() ||
+          artifact.filename.replace(/ \(\d+\)(?=\.[^.]+$)/,"").toLowerCase() === name.toLowerCase()))) {
+        sendJson(response,409,{error:"Recovery only accepts its own missing-file downloads",code:"recovery_artifact_scope_mismatch"});return;
+      }
       const artifactIds = currentArtifacts.map((artifact) => artifact.id);
       const resolvedArtifactIdSet = new Set(artifactIds);
       for (const artifactId of importedArtifactIds) {
@@ -5294,7 +5463,11 @@ async function handleApi(request, response, options) {
       const requirementArtifactIds = before.kind === "image_request"
         ? currentArtifacts.filter(isImageArtifactLike).map((artifact) => artifact.id)
         : artifactIds;
-      artifactErrors.push(...inferMissingArtifactErrors(body.replyText || "", requirementArtifactIds, artifactErrors, before));
+      if (before.recoverySourceJobId) {
+        for (const filename of unmatchedRecoveryFilenames(before.recoveryFilenames,currentArtifacts)) {
+          artifactErrors.push({code:"missing_download",filename,error:"缺失附件尚未补收。"});
+        }
+      } else artifactErrors.push(...inferMissingArtifactErrors(body.replyText || "", requirementArtifactIds, artifactErrors, before));
       if (shouldFailForMissingArtifactCapture(before, body.replyText || "", requirementArtifactIds, artifactErrors)) {
         const error = missingArtifactFailureMessage(artifactErrors);
         const {
@@ -5635,12 +5808,24 @@ async function handleApi(request, response, options) {
         return;
       }
 
-      if (
-        before.status === "failed" &&
-        ((before.sentAt && before.errorCode === "reply_timeout") ||
-          before.errorCode === "pre_send_expired")
-      ) {
-        const syncJob = await reopenFailedSyncJobForCapture(storeRoot, before.id);
+      const retryPlan = syncRetryPlan(before, { heartbeat: gptSnapshot.extension?.heartbeat });
+      if (!retryPlan.action) {
+        sendJson(response, 409, {
+          error: retryPlan.reason || "此任务当前不能重试。",
+          code: "router_retry_requires_recovery",
+          retriedSyncJobId: before.id
+        });
+        return;
+      }
+      const resolvedClientBlock = before.errorCode === "client_blocked" &&
+        gptSnapshot.extension?.heartbeat?.pageStatus?.state === "ready";
+      const canCaptureOnly = retryPlan.action === "capture";
+      if (body.captureOnly === true && !canCaptureOnly) {
+        sendJson(response, 409, {error:"This job cannot be retried by capture only",code:"capture_only_unavailable"});
+        return;
+      }
+      if (canCaptureOnly) {
+        const syncJob = await reopenFailedSyncJobForCapture(storeRoot, before.id, {allowResolvedClientBlock:resolvedClientBlock});
         sendJson(response, 200, {
           message: null,
           syncJob,
@@ -5656,6 +5841,32 @@ async function handleApi(request, response, options) {
         ["send_not_confirmed", "prompt_not_found"].includes(before.errorCode || "")
       ) {
         const syncJob = await reopenFailedSyncJobForResend(storeRoot, before.id);
+        sendJson(response, 200, {
+          message: null,
+          syncJob,
+          retriedSyncJobId: before.id,
+          captureOnly: false,
+          resend: true
+        });
+        return;
+      }
+
+      // Router stages keep a durable transportRequestId. A generic replacement
+      // job would lose that link even if it copied routerRunId onto the new job.
+      if (before.routerTerminalSignalRequired === true) {
+        const syncJob = await reopenFailedSyncJobForResend(storeRoot, before.id, {
+          allowUnsentRouterFailure: true,
+          modePreference: body.modePreference,
+          modelPreference: body.modelPreference
+        });
+        if (syncJob.status !== "pending") {
+          sendJson(response, 409, {
+            error: "此 Router 任务不能安全地重新发送。请先恢复原任务结果；已取消的流程不会重新启动。",
+            code: "router_retry_requires_recovery",
+            retriedSyncJobId: before.id
+          });
+          return;
+        }
         sendJson(response, 200, {
           message: null,
           syncJob,
@@ -5892,11 +6103,18 @@ export function createHttpServer(options = {}) {
         return;
       }
       if (requestUrl.pathname.startsWith("/api/")) {
+        // Native media/download requests have no custom headers. Match the
+        // standalone API client only for explicitly project-scoped binary reads.
+        const standaloneArtifactRead = request.method === "GET" &&
+          /^\/api\/artifacts\/[^/]+\/(raw|view|download)$/.test(requestUrl.pathname) &&
+          requestUrl.searchParams.get("context") === "standalone" &&
+          Boolean(requestUrl.searchParams.get("projectId"));
         await handleApi(request, response, {
           storeRoot,
           runnerMode,
           currentCodexThreadId:
-            resolvedScope.value?.currentCodexThreadId || currentCodexThreadId,
+            resolvedScope.value?.currentCodexThreadId ||
+            (request.headers["x-bridge-context"] === "standalone" || standaloneArtifactRead ? null : currentCodexThreadId),
           requestScope: resolvedScope.value,
           extensionSourceDir,
           apiToken,

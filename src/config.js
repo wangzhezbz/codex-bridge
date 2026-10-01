@@ -1,8 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
+import { canonicalModelReference } from "../shared/model-preset-aliases.cjs";
 
 const DEFAULT_CONFIG = path.resolve("config", "router.config.json");
 const EXAMPLE_CONFIG = path.resolve("config", "router.config.example.json");
+const MAX_ROUTER_CONFIG_BYTES = 16 * 1024 * 1024;
+const MAX_ROUTER_SECRETS_BYTES = 4 * 1024 * 1024;
+const MAX_ROUTER_MODELS = 1_024;
+let secretsFileCache = null;
 
 export function resolveConfigPath(configPath = process.env.ROUTER_CONFIG) {
   if (configPath) {
@@ -16,7 +21,11 @@ export function resolveConfigPath(configPath = process.env.ROUTER_CONFIG) {
 
 export function loadConfig(configPath) {
   const resolved = resolveConfigPath(configPath);
-  const raw = fs.readFileSync(resolved, "utf8");
+  const raw = readBoundedUtf8File(resolved, MAX_ROUTER_CONFIG_BYTES, {
+    invalidCode: "router_config_file_invalid",
+    tooLargeCode: "router_config_too_large",
+    label: "Router 配置文件",
+  });
   const config = JSON.parse(raw);
   config.__path = resolved;
   validateConfig(config);
@@ -26,6 +35,11 @@ export function loadConfig(configPath) {
 export function validateConfig(config) {
   if (!Array.isArray(config.models) || config.models.length === 0) {
     throw new Error("Router 配置必须包含非空的 models 数组。");
+  }
+  if (config.models.length > MAX_ROUTER_MODELS) {
+    const error = new Error(`Router 配置包含过多模型，最多允许 ${MAX_ROUTER_MODELS} 个。`);
+    error.code = "router_config_model_limit";
+    throw error;
   }
 
   const seen = new Set();
@@ -71,6 +85,8 @@ export function routeForModel(config, requestedModel, options = {}) {
   const routes = activeModels(config);
   const slotRoute = routes.find((model) =>
     modelSlotAliases(model).some((alias) => alias === normalized),
+  ) || routes.find((model) =>
+    modelSlotAliases(model).includes(normalizeModelName(canonicalModelReference(requested))),
   );
   if (slotRoute) {
     return slotRoute;
@@ -166,15 +182,90 @@ export function apiKeyForRoute(route) {
 function secretFileValue(keyEnv) {
   const secretsFile = process.env.CODEXBRIDGE_SECRETS_FILE;
   if (!secretsFile || !fs.existsSync(secretsFile)) {
+    secretsFileCache = null;
     return undefined;
   }
+  const resolved = path.resolve(secretsFile);
   try {
-    const secrets = JSON.parse(fs.readFileSync(secretsFile, "utf8"));
+    const currentFingerprint = localFileFingerprint(resolved);
+    let secrets = secretsFileCache?.path === resolved && secretsFileCache.fingerprint === currentFingerprint
+      ? secretsFileCache.value
+      : null;
+    if (!secrets) {
+      let before = currentFingerprint;
+      let stableFingerprint = "";
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        secrets = JSON.parse(readBoundedUtf8File(resolved, MAX_ROUTER_SECRETS_BYTES, {
+          invalidCode: "router_secrets_file_invalid",
+          tooLargeCode: "router_secrets_too_large",
+          label: "Router secrets 文件",
+        }));
+        const after = localFileFingerprint(resolved);
+        if (after === before) {
+          stableFingerprint = after;
+          break;
+        }
+        before = after;
+      }
+      if (!stableFingerprint) {
+        secretsFileCache = null;
+        return undefined;
+      }
+      if (!secrets || typeof secrets !== "object" || Array.isArray(secrets)) {
+        secretsFileCache = null;
+        return undefined;
+      }
+      secretsFileCache = { path: resolved, fingerprint: stableFingerprint, value: secrets };
+    }
     const value = secrets?.[keyEnv];
     return typeof value === "string" && value.trim() ? value.trim() : undefined;
   } catch {
+    secretsFileCache = null;
     return undefined;
   }
+}
+
+function localFileFingerprint(filePath) {
+  const stat = fs.statSync(filePath, { bigint: true });
+  return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs]
+    .map(String)
+    .join(":");
+}
+
+function readBoundedUtf8File(filePath, maxBytes, { invalidCode, tooLargeCode, label }) {
+  let descriptor = null;
+  try {
+    descriptor = fs.openSync(filePath, "r");
+    const stat = fs.fstatSync(descriptor);
+    if (!stat.isFile() || !Number.isSafeInteger(stat.size) || stat.size < 0) {
+      throw configFileError(invalidCode, `${label}不是可读取的普通文件。`);
+    }
+    if (stat.size > maxBytes) {
+      throw configFileError(tooLargeCode, `${label}过大，最大允许 ${maxBytes} bytes。`);
+    }
+    const bytes = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = fs.readSync(descriptor, bytes, offset, bytes.length - offset, offset);
+      if (!Number.isInteger(count) || count <= 0) {
+        throw configFileError(invalidCode, `${label}在读取过程中发生变化。`);
+      }
+      offset += count;
+    }
+    const after = fs.fstatSync(descriptor);
+    if (after.size !== stat.size || after.dev !== stat.dev || after.ino !== stat.ino) {
+      throw configFileError(invalidCode, `${label}在读取过程中发生变化。`);
+    }
+    return bytes.toString("utf8");
+  } finally {
+    if (descriptor !== null) fs.closeSync(descriptor);
+  }
+}
+
+function configFileError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
 }
 
 export function authModeForRoute(route) {

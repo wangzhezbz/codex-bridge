@@ -1427,6 +1427,31 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal, insta
     } finally { await binding.workspace.close(); }
   }
 
+  async function inspectRollback(componentId) {
+    namesFor(componentId);
+    const state = await ownershipStore.load();
+    const rollback = rollbackFor(state, componentId);
+    if (!rollback) return { available: false, reason: "rollback_not_available", version: null };
+    let root = null;
+    try {
+      await requireNoPendingTransaction(state);
+      const rootPath = canonicalRoot(rollback.rootPath);
+      requireAuthorizedRoot(state, rootPath, componentId);
+      const slots = namesFor(componentId);
+      root = await openRoot(rootPath);
+      const current = validateOpenedSlot(await root.openSlotNoFollow(slots.current), slots.current, componentId)?.evidence ?? null;
+      const previous = validateOpenedSlot(await root.openSlotNoFollow(slots.previous), slots.previous, componentId)?.evidence ?? null;
+      if (!current || !previous) throw slotError("rollback_slot_missing");
+      requireManagedState(state, componentId, rootPath, current, previous);
+      if (await root.openSlotNoFollow(slots.staging) !== null || await root.openSlotNoFollow(slots.retiring) !== null) {
+        throw slotError("slot_recovery_required");
+      }
+      return { available: true, reason: null, version: previous.version };
+    } catch (error) {
+      return { available: false, reason: error.code || error.message, version: rollback.version ?? null };
+    } finally { if (root) await root.close(); }
+  }
+
   async function rollbackVersion(componentId) {
     namesFor(componentId);
     const state = await ownershipStore.load();
@@ -1587,6 +1612,9 @@ export function createVersionSlotManager({ fsApi, ownershipStore, journal, insta
     },
     rollbackVersion(componentId) {
       return ownershipCoordinator.runExclusive(() => rollbackVersion(componentId));
+    },
+    inspectRollback(componentId) {
+      return ownershipCoordinator.runExclusive(() => inspectRollback(componentId));
     },
     recoverJournalTransactions(recoveryJournal) {
       return ownershipCoordinator.runExclusive(() => recoverJournalTransactions(recoveryJournal));

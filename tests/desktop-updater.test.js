@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -21,6 +22,9 @@ import {
   updateDownloadProxyLabel,
   validateDownloadedReleaseAsset,
 } from "../desktop/updater.mjs";
+import updateDownload from "../desktop/update-download.cjs";
+
+const { downloadUpdateFile } = updateDownload;
 
 const release = {
   tag_name: "v0.1.66",
@@ -399,6 +403,484 @@ test("updater reports release API and latest-page fallback failures in Chinese",
     "https://api.github.com/repos/wangzhezbz/codex-bridge/releases/latest",
     "https://github.com/wangzhezbz/codex-bridge/releases/latest",
   ]);
+});
+
+test("updater stops API and latest-page checks that ignore AbortSignal", async () => {
+  const signals = [];
+  const startedAt = Date.now();
+
+  await assert.rejects(
+    () => fetchLatestRelease({
+      releaseUrl: "https://api.github.com/repos/wangzhezbz/codex-bridge/releases/latest",
+      latestReleasePageUrl: "https://github.com/wangzhezbz/codex-bridge/releases/latest",
+      timeoutMs: 20,
+      fetchImpl: async (_url, init) => {
+        signals.push(init.signal);
+        return new Promise(() => {});
+      },
+    }),
+    (error) => {
+      assert.match(error.message, /检查更新失败/);
+      assert.match(error.message, /超时/);
+      return true;
+    },
+  );
+
+  assert.equal(signals.length, 2);
+  assert.equal(signals.every((signal) => signal?.aborted), true);
+  assert.ok(Date.now() - startedAt < 500);
+});
+
+test("update download enforces the signed asset size and removes an oversized partial", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-update-download-size-"));
+  const targetPath = path.join(tempDir, "update.zip");
+  let pulls = 0;
+  let canceled = false;
+  const body = new ReadableStream({
+    pull(controller) {
+      pulls += 1;
+      if (pulls <= 100) {
+        controller.enqueue(new Uint8Array(800));
+      } else {
+        controller.close();
+      }
+    },
+    cancel() {
+      canceled = true;
+    },
+  });
+
+  try {
+    await assert.rejects(
+      () => downloadUpdateFile("https://downloads.example/update.zip", targetPath, {
+        expectedBytes: 1000,
+        timeoutMs: 1000,
+        fetchImpl: async () => ({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          body,
+        }),
+      }),
+      (error) => {
+        assert.equal(error.code, "update_download_too_large");
+        return true;
+      },
+    );
+    assert.equal(fs.existsSync(targetPath), false);
+    assert.equal(canceled, true);
+    assert.ok(pulls < 101);
+  } finally {
+    if (fs.existsSync(targetPath)) fs.unlinkSync(targetPath);
+    fs.rmdirSync(tempDir);
+  }
+});
+
+for (const framing of ["content-length", "chunked"]) {
+  test(`update download rejects an empty ${framing} response and permits a retry`, async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-update-empty-"));
+    const targetPath = path.join(tempDir, "update.zip");
+    const bytes = Buffer.from("safe-update");
+    let empty = true;
+    let requests = 0;
+    const server = http.createServer((_req, res) => {
+      requests += 1;
+      if (empty) {
+        res.writeHead(200, framing === "content-length"
+          ? { "content-length": "0" }
+          : { "transfer-encoding": "chunked" });
+        res.end();
+      } else {
+        res.writeHead(200, { "content-type": "application/octet-stream" });
+        res.end(bytes);
+      }
+    });
+    try {
+      await new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", () => {
+          server.removeListener("error", reject);
+          resolve();
+        });
+      });
+      const url = `http://127.0.0.1:${server.address().port}/update.zip`;
+      await assert.rejects(
+        downloadUpdateFile(url, targetPath, { timeoutMs: 5000 }),
+        (error) => error?.code === "update_download_empty",
+      );
+      assert.equal(fs.existsSync(targetPath), false);
+
+      empty = false;
+      const retried = await downloadUpdateFile(url, targetPath, { timeoutMs: 5000 });
+      assert.equal(retried.bytes, bytes.length);
+      assert.deepEqual(fs.readFileSync(targetPath), bytes);
+      assert.equal(requests, 2);
+    } finally {
+      server.closeAllConnections?.();
+      await new Promise((resolve) => server.close(resolve));
+      if (fs.existsSync(targetPath)) fs.unlinkSync(targetPath);
+      fs.rmdirSync(tempDir);
+    }
+  });
+}
+
+test("update download rejects an oversized signed asset before network access", async () => {
+  let fetchCalls = 0;
+  await assert.rejects(
+    downloadUpdateFile("https://downloads.example/update.zip", "unused-update.zip", {
+      expectedBytes: (1024 * 1024 * 1024) + 1,
+      maxBytes: Number.MAX_SAFE_INTEGER,
+      fetchImpl: async () => { fetchCalls += 1; throw new Error("must not fetch"); },
+    }),
+    (error) => error?.code === "update_download_too_large",
+  );
+  assert.equal(fetchCalls, 0);
+});
+
+test("update download stops a stalled fetch and leaves no partial file", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-update-download-timeout-"));
+  const targetPath = path.join(tempDir, "update.zip");
+  let seenSignal = null;
+  const startedAt = Date.now();
+
+  try {
+    await assert.rejects(
+      () => downloadUpdateFile("https://downloads.example/update.zip", targetPath, {
+        expectedBytes: 1024,
+        timeoutMs: 20,
+        fetchImpl: async (_url, init) => {
+          seenSignal = init.signal;
+          return new Promise(() => {});
+        },
+      }),
+      (error) => {
+        assert.equal(error.code, "update_download_timeout");
+        assert.match(error.message, /已停止等待/);
+        return true;
+      },
+    );
+    assert.equal(seenSignal?.aborted, true);
+    assert.equal(fs.existsSync(targetPath), false);
+    assert.ok(Date.now() - startedAt < 500);
+  } finally {
+    if (fs.existsSync(targetPath)) fs.unlinkSync(targetPath);
+    fs.rmdirSync(tempDir);
+  }
+});
+
+test("update download cancels a late fetch response without creating a file after timeout", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-update-late-response-"));
+  const targetPath = path.join(tempDir, "update.zip");
+  const fetched = Promise.withResolvers();
+  const canceled = Promise.withResolvers();
+  const body = new ReadableStream({ cancel() { canceled.resolve(); } });
+  const progress = [];
+
+  try {
+    await assert.rejects(
+      downloadUpdateFile("https://downloads.example/update.zip", targetPath, {
+        expectedBytes: 16,
+        timeoutMs: 20,
+        fetchImpl: () => fetched.promise,
+        onProgress: (event) => progress.push(event),
+      }),
+      (error) => error?.code === "update_download_timeout",
+    );
+    assert.equal(fs.existsSync(targetPath), false);
+
+    fetched.resolve(new Response(body, { status: 200 }));
+    await canceled.promise;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(fs.existsSync(targetPath), false, "a timed-out download must not create a late partial");
+    assert.deepEqual(progress, [], "a timed-out download must not publish late progress");
+  } finally {
+    if (fs.existsSync(targetPath)) fs.unlinkSync(targetPath);
+    fs.rmdirSync(tempDir);
+  }
+});
+
+test("update download cancels its adapted response when output initialization fails", async (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-update-output-init-"));
+  const targetPath = path.join(tempDir, "update.zip");
+  const setupError = new Error("output initialization failed");
+  let openedFd = null;
+  let canceled = false;
+  const body = new ReadableStream({ cancel() { canceled = true; } });
+  t.mock.method(fs, "createWriteStream", (_filePath, options) => {
+    openedFd = options.fd;
+    throw setupError;
+  });
+
+  try {
+    await assert.rejects(
+      downloadUpdateFile("https://downloads.example/update.zip", targetPath, {
+        expectedBytes: 16,
+        timeoutMs: 1000,
+        fetchImpl: async () => new Response(body, { status: 200 }),
+      }),
+      (error) => error === setupError,
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.throws(() => fs.fstatSync(openedFd), (error) => error?.code === "EBADF");
+    assert.equal(fs.existsSync(targetPath), false);
+    assert.equal(canceled, true, "the adapted response must be canceled instead of left locked and live");
+  } finally {
+    if (fs.existsSync(targetPath)) fs.unlinkSync(targetPath);
+    fs.rmdirSync(tempDir);
+  }
+});
+
+test("update download aborts a stalled response body and removes its owned partial", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-update-body-timeout-"));
+  const targetPath = path.join(tempDir, "update.zip");
+  let canceled = false;
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(256));
+    },
+    pull() {
+      return new Promise(() => {});
+    },
+    cancel() {
+      canceled = true;
+    },
+  });
+
+  try {
+    await assert.rejects(
+      () => downloadUpdateFile("https://downloads.example/update.zip", targetPath, {
+        expectedBytes: 1024,
+        timeoutMs: 20,
+        fetchImpl: async () => ({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          body,
+        }),
+      }),
+      (error) => {
+        assert.equal(error.code, "update_download_timeout");
+        return true;
+      },
+    );
+    assert.equal(canceled, true);
+    assert.equal(fs.existsSync(targetPath), false);
+  } finally {
+    if (fs.existsSync(targetPath)) fs.unlinkSync(targetPath);
+    fs.rmdirSync(tempDir);
+  }
+});
+
+test("update download waits for its output handle to close before timeout cleanup completes", async (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-update-delayed-close-"));
+  const targetPath = path.join(tempDir, "update.zip");
+  const closeStarted = Promise.withResolvers();
+  const releaseClose = Promise.withResolvers();
+  const outputClosed = Promise.withResolvers();
+  const createWriteStream = fs.createWriteStream.bind(fs);
+  t.mock.method(fs, "createWriteStream", (filePath, options) => {
+    const output = createWriteStream(filePath, {
+      ...options,
+      fs: {
+        write: fs.write.bind(fs),
+        writev: fs.writev.bind(fs),
+        close(fd, callback) {
+          closeStarted.resolve();
+          releaseClose.promise.then(() => fs.close(fd, callback));
+        },
+      },
+    });
+    output.once("close", () => outputClosed.resolve());
+    return output;
+  });
+  const body = new ReadableStream({
+    start(controller) { controller.enqueue(new Uint8Array(4)); },
+    pull() { return new Promise(() => {}); },
+  });
+  let settled = false;
+  const checkedDownload = assert.rejects(
+    downloadUpdateFile("https://downloads.example/update.zip", targetPath, {
+      expectedBytes: 16,
+      timeoutMs: 20,
+      fetchImpl: async () => new Response(body, { status: 200 }),
+    }),
+    (error) => error?.code === "update_download_timeout",
+  ).finally(() => { settled = true; });
+
+  try {
+    await closeStarted.promise;
+    await new Promise((resolve) => setImmediate(resolve));
+    const settledBeforeClose = settled;
+    const existedBeforeClose = fs.existsSync(targetPath);
+    releaseClose.resolve();
+    await checkedDownload;
+    await outputClosed.promise;
+    assert.equal(settledBeforeClose, false, "timeout cleanup must await the real output close");
+    assert.equal(existedBeforeClose, true, "the partial must not be unlinked while its handle is closing");
+    assert.equal(fs.existsSync(targetPath), false);
+  } finally {
+    releaseClose.resolve();
+    await checkedDownload;
+    await outputClosed.promise;
+    if (fs.existsSync(targetPath)) fs.unlinkSync(targetPath);
+    fs.rmdirSync(tempDir);
+  }
+});
+
+test("update download preserves a replacement file when cleaning up a failed transfer", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-update-replaced-target-"));
+  const targetPath = path.join(tempDir, "update.zip");
+  const movedPath = path.join(tempDir, "moved-partial.zip");
+  const foreign = Buffer.from("foreign-update-file");
+  const sourceError = new Error("upstream body failed");
+  let controller;
+  let replaced = false;
+  const body = new ReadableStream({
+    start(value) {
+      controller = value;
+      controller.enqueue(new Uint8Array(4));
+    },
+  });
+
+  try {
+    await assert.rejects(
+      downloadUpdateFile("https://downloads.example/update.zip", targetPath, {
+        expectedBytes: 16,
+        timeoutMs: 1000,
+        fetchImpl: async () => new Response(body, { status: 200 }),
+        onProgress(event) {
+          if (event.downloadedBytes > 0 && !replaced) {
+            fs.renameSync(targetPath, movedPath);
+            fs.writeFileSync(targetPath, foreign, { flag: "wx" });
+            replaced = true;
+            controller.error(sourceError);
+          }
+        },
+      }),
+      (error) => error === sourceError,
+    );
+    assert.equal(replaced, true);
+    assert.equal(fs.existsSync(targetPath), true, "cleanup must not remove a foreign replacement");
+    assert.deepEqual(fs.readFileSync(targetPath), foreign);
+  } finally {
+    if (fs.existsSync(targetPath)) fs.unlinkSync(targetPath);
+    if (fs.existsSync(movedPath)) fs.unlinkSync(movedPath);
+    fs.rmdirSync(tempDir);
+  }
+});
+
+test("update download rejects a completed transfer whose target was replaced", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-update-replaced-completion-"));
+  const targetPath = path.join(tempDir, "update.zip");
+  const movedPath = path.join(tempDir, "moved-download.zip");
+  const foreign = Buffer.from("evil");
+  let replaced = false;
+
+  try {
+    await assert.rejects(
+      downloadUpdateFile("https://downloads.example/update.zip", targetPath, {
+        expectedBytes: 4,
+        timeoutMs: 1000,
+        fetchImpl: async () => new Response(Buffer.from("safe"), { status: 200 }),
+        onProgress(event) {
+          if (event.downloadedBytes > 0 && !replaced) {
+            fs.renameSync(targetPath, movedPath);
+            fs.writeFileSync(targetPath, foreign, { flag: "wx" });
+            replaced = true;
+          }
+        },
+      }),
+      (error) => error?.code === "update_download_target_changed",
+    );
+    assert.equal(replaced, true);
+    assert.deepEqual(fs.readFileSync(targetPath), foreign);
+    assert.equal(fs.readFileSync(movedPath, "utf8"), "safe");
+  } finally {
+    if (fs.existsSync(targetPath)) fs.unlinkSync(targetPath);
+    if (fs.existsSync(movedPath)) fs.unlinkSync(movedPath);
+    fs.rmdirSync(tempDir);
+  }
+});
+
+test("update download preserves a pre-existing target collision", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-update-download-collision-"));
+  const targetPath = path.join(tempDir, "update.zip");
+  const foreign = Buffer.from("foreign-update-file");
+  fs.writeFileSync(targetPath, foreign, { flag: "wx" });
+
+  try {
+    await assert.rejects(
+      () => downloadUpdateFile("https://downloads.example/update.zip", targetPath, {
+        expectedBytes: 4,
+        timeoutMs: 1000,
+        fetchImpl: async () => new Response(Buffer.from("safe"), { status: 200 }),
+      }),
+      (error) => {
+        assert.equal(error.code, "EEXIST");
+        return true;
+      },
+    );
+    assert.deepEqual(fs.readFileSync(targetPath), foreign);
+  } finally {
+    fs.unlinkSync(targetPath);
+    fs.rmdirSync(tempDir);
+  }
+});
+
+test("update download treats progress callback failures as non-authoritative", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-update-progress-"));
+  const targetPath = path.join(tempDir, "update.zip");
+  const bytes = Buffer.from("safe-update");
+  let progressCalls = 0;
+  try {
+    const result = await downloadUpdateFile("https://downloads.example/update.zip", targetPath, {
+      expectedBytes: bytes.length,
+      timeoutMs: 1000,
+      fetchImpl: async () => new Response(bytes, { status: 200 }),
+      onProgress() {
+        progressCalls += 1;
+        if (progressCalls === 1) throw new Error("renderer unavailable");
+        return Promise.reject(new Error("renderer closed"));
+      },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(result.bytes, bytes.length);
+    assert.deepEqual(fs.readFileSync(targetPath), bytes);
+    assert.ok(progressCalls >= 2);
+  } finally {
+    if (fs.existsSync(targetPath)) fs.unlinkSync(targetPath);
+    fs.rmdirSync(tempDir);
+  }
+});
+
+test("update download cancels an HTTP error body without creating a partial", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-update-http-error-"));
+  const targetPath = path.join(tempDir, "update.zip");
+  let canceled = false;
+  const body = new ReadableStream({
+    cancel() { canceled = true; },
+  });
+  try {
+    await assert.rejects(
+      downloadUpdateFile("https://downloads.example/update.zip", targetPath, {
+        expectedBytes: 16,
+        timeoutMs: 1000,
+        fetchImpl: async () => ({
+          ok: false,
+          status: 502,
+          headers: new Headers(),
+          body,
+        }),
+      }),
+      (error) => error?.code === "update_download_http_error",
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(canceled, true);
+    assert.equal(fs.existsSync(targetPath), false);
+  } finally {
+    if (fs.existsSync(targetPath)) fs.unlinkSync(targetPath);
+    fs.rmdirSync(tempDir);
+  }
 });
 
 test("updater rejects downloaded installer and portable assets with invalid file headers", async () => {

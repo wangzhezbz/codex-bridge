@@ -755,6 +755,45 @@ test("version-root rename rejects identity drift before invoking the native rena
   assert.equal(fake.handles.size, 0);
 });
 
+test("version-tree verification yields to the event loop while scanning a large installed tree", async () => {
+  const fake = createFakeNative([
+    { path: "C:\\work\\versions" },
+    { path: "C:\\work\\versions\\ct" },
+  ]);
+  const api = capabilities(fake);
+  const verified = await issueVersionReceipt(api, "C:\\work\\versions\\ct");
+  for (let index = 0; index < 64; index += 1) {
+    fake.add(`C:\\work\\versions\\ct\\extra-${String(index).padStart(2, "0")}.bin`, {
+      kind: "file",
+      data: `extra-${index}`,
+    });
+  }
+  const root = await api.openVersionRootNoFollow("C:\\work\\versions");
+  const staging = await root.openSlotNoFollow("ct");
+  let eventLoopYielded = false;
+  setImmediate(() => {
+    eventLoopYielded = true;
+  });
+
+  await assert.rejects(
+    root.sealPreparedSlotNoFollow(staging.descriptor, {
+      schemaVersion: 2,
+      componentId: "chatgpt",
+      version: "1.0.0",
+      treeDigest: verified.treeDigest,
+      manifestDigest: verified.manifestDigest,
+    }, verified.verificationReceipt),
+    /version_tree_digest_mismatch/u,
+  );
+  assert.equal(eventLoopYielded, true);
+  assert.equal(
+    fake.calls.some((call) => call[0] === "read-chunk" && call[1].includes("extra-")),
+    true,
+  );
+  await root.close();
+  assert.equal(fake.handles.size, 0);
+});
+
 test("version-root descriptor deletes a retiring tree only through the shared handle-bound safe walker", async () => {
   const fake = createFakeNative([
     { path: "C:\\work\\versions" },

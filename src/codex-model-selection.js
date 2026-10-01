@@ -1,10 +1,28 @@
+import { canonicalModelReference } from "../shared/model-preset-aliases.cjs";
+
 const DEFAULT_SELECTION_TTL_MS = 2 * 60 * 1000;
+const DEFAULT_SELECTION_CAPACITY = 4_096;
+const DEFAULT_PRUNE_INTERVAL = 128;
+const MAX_SCOPE_VALUE_CHARS = 512;
 
 export function createCodexModelSelectionState(options = {}) {
   const now = typeof options.now === "function" ? options.now : Date.now;
   const ttlMs = positiveNumber(options.ttlMs, DEFAULT_SELECTION_TTL_MS);
+  const capacity = positiveInteger(options.capacity, DEFAULT_SELECTION_CAPACITY);
+  const pruneInterval = positiveInteger(options.pruneInterval, DEFAULT_PRUNE_INTERVAL);
   const latestModelByScope = new Map();
   const selectionByScope = new Map();
+  let operationsSincePrune = 0;
+
+  function maintain(timestamp, force = false) {
+    operationsSincePrune += 1;
+    if (force || operationsSincePrune >= pruneInterval) {
+      pruneExpired(selectionByScope, latestModelByScope, timestamp, ttlMs);
+      operationsSincePrune = 0;
+    }
+    trimOldest(selectionByScope, capacity);
+    trimOldest(latestModelByScope, capacity);
+  }
 
   function recordModelSetting({
     headers,
@@ -33,14 +51,14 @@ export function createCodexModelSelectionState(options = {}) {
           previousSelection?.previousModel ||
           previousModelHint,
       );
-      selectionByScope.set(key, {
+      setRecent(selectionByScope, key, {
         selectedModel,
         previousModel: previousModel && previousModel !== selectedModel ? previousModel : "",
         updatedAt: timestamp,
-      });
-      latestModelByScope.set(key, { model: selectedModel, seenAt: timestamp });
+      }, capacity);
+      setRecent(latestModelByScope, key, { model: selectedModel, seenAt: timestamp }, capacity);
     }
-    pruneExpired(selectionByScope, latestModelByScope, timestamp, ttlMs);
+    maintain(timestamp, true);
     return {
       recorded: true,
       selectedModel,
@@ -54,18 +72,21 @@ export function createCodexModelSelectionState(options = {}) {
     const requestedModel = normalizedText(body?.model);
     const keys = requestScopeKeys(headers, body);
     const timestamp = now();
+    maintain(timestamp);
     const selection = newestFreshSelection(keys, selectionByScope, timestamp, ttlMs);
     if (!selection) {
-      observeRequest(keys, requestedModel, timestamp, latestModelByScope);
+      observeRequest(keys, requestedModel, timestamp, latestModelByScope, capacity);
       return { changed: false, requestedModel };
     }
+    setRecent(selectionByScope, selection.key, selection.value, capacity);
 
     const selectedModel = normalizedText(selection.value.selectedModel);
     const configured = new Set(
       Array.from(configuredModelIds || [], (value) => normalizedText(value)).filter(Boolean),
     );
-    if (!selectedModel || (configured.size > 0 && !configured.has(selectedModel))) {
-      observeRequest(keys, requestedModel, timestamp, latestModelByScope);
+    if (!selectedModel || (configured.size > 0 && !configured.has(selectedModel) &&
+        !configured.has(canonicalModelReference(selectedModel)))) {
+      observeRequest(keys, requestedModel, timestamp, latestModelByScope, capacity);
       return {
         changed: false,
         requestedModel,
@@ -74,7 +95,7 @@ export function createCodexModelSelectionState(options = {}) {
     }
 
     if (requestedModel === selectedModel) {
-      observeRequest(keys, selectedModel, timestamp, latestModelByScope);
+      observeRequest(keys, selectedModel, timestamp, latestModelByScope, capacity);
       return { changed: false, requestedModel, selectedModel, scope: selection.key };
     }
 
@@ -85,7 +106,7 @@ export function createCodexModelSelectionState(options = {}) {
     );
     if (requestedModel && requestedModel === previousModel && reconnect) {
       body.model = selectedModel;
-      observeRequest(keys, selectedModel, timestamp, latestModelByScope);
+      observeRequest(keys, selectedModel, timestamp, latestModelByScope, capacity);
       return {
         changed: true,
         requestedModel,
@@ -96,7 +117,7 @@ export function createCodexModelSelectionState(options = {}) {
       };
     }
 
-    observeRequest(keys, requestedModel, timestamp, latestModelByScope);
+    observeRequest(keys, requestedModel, timestamp, latestModelByScope, capacity);
     return {
       changed: false,
       requestedModel,
@@ -149,7 +170,7 @@ function responseScopeKey(responseId) {
 
 function scopeKey(kind, value) {
   const text = normalizedText(value);
-  return text ? `${kind}:${text}` : "";
+  return text && text.length <= MAX_SCOPE_VALUE_CHARS ? `${kind}:${text}` : "";
 }
 
 function uniqueScopeKeys(keys) {
@@ -178,12 +199,26 @@ function freshSelection(value, timestamp, ttlMs) {
   return value;
 }
 
-function observeRequest(keys, model, timestamp, latestModels) {
+function observeRequest(keys, model, timestamp, latestModels, capacity) {
   if (!model) {
     return;
   }
   for (const key of keys) {
-    latestModels.set(key, { model, seenAt: timestamp });
+    setRecent(latestModels, key, { model, seenAt: timestamp }, capacity);
+  }
+}
+
+function setRecent(map, key, value, capacity) {
+  map.delete(key);
+  map.set(key, value);
+  trimOldest(map, capacity);
+}
+
+function trimOldest(map, capacity) {
+  while (map.size > capacity) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) return;
+    map.delete(oldest);
   }
 }
 
@@ -221,4 +256,9 @@ function normalizedText(value) {
 function positiveNumber(value, fallback) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+function positiveInteger(value, fallback) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number > 0 ? number : fallback;
 }

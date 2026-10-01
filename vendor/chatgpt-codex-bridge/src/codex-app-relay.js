@@ -1,3 +1,5 @@
+import { SERVICE_VERSION } from "./service-metadata.js";
+
 export function buildRoomCodexPrompt(task, options = {}) {
   const bridgeBaseUrl = options.bridgeBaseUrl || "http://127.0.0.1:4317";
   const targetRepo = task.targetRepo || "未指定";
@@ -111,7 +113,7 @@ export async function relayCodexTaskToThread(task, options = {}) {
       {
         clientInfo: {
           name: "chatgpt-codex-bridge",
-          version: "0.1.0"
+          version: SERVICE_VERSION
         },
         capabilities: {
           experimentalApi: true

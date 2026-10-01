@@ -120,7 +120,11 @@ async function readRequestBuffer(req, limitBytes) {
   }
 
   const rawBody = Buffer.concat(chunks);
-  const decodedBody = decodeRequestBody(rawBody, req.headers?.["content-encoding"]);
+  const decodedBody = decodeRequestBody(
+    rawBody,
+    req.headers?.["content-encoding"],
+    limitBytes,
+  );
   if (decodedBody.length > limitBytes) {
     throw requestBodyTooLargeError(limitBytes, decodedBody.length);
   }
@@ -165,37 +169,45 @@ function normalizeMultipartScalar(key, value) {
   return text;
 }
 
-function decodeRequestBody(body, contentEncoding = "") {
+function decodeRequestBody(body, contentEncoding = "", limitBytes = 25 * 1024 * 1024) {
   const encodings = String(contentEncoding || "")
     .split(",")
     .map((encoding) => encoding.trim().toLowerCase())
     .filter(Boolean);
 
   let decoded = body;
+  const options = { maxOutputLength: limitBytes };
   for (const encoding of encodings.reverse()) {
     if (encoding === "identity") {
       continue;
     }
-    if (encoding === "gzip" || encoding === "x-gzip") {
-      decoded = zlib.gunzipSync(decoded);
-      continue;
-    }
-    if (encoding === "deflate") {
-      decoded = zlib.inflateSync(decoded);
-      continue;
-    }
-    if (encoding === "br") {
-      decoded = zlib.brotliDecompressSync(decoded);
-      continue;
-    }
-    if (encoding === "zstd") {
-      if (typeof zlib.zstdDecompressSync !== "function") {
-        const error = new Error("当前 Node 运行环境不能解码 zstd 请求体。");
-        error.statusCode = 415;
-        throw error;
+    try {
+      if (encoding === "gzip" || encoding === "x-gzip") {
+        decoded = zlib.gunzipSync(decoded, options);
+        continue;
       }
-      decoded = zlib.zstdDecompressSync(decoded);
-      continue;
+      if (encoding === "deflate") {
+        decoded = zlib.inflateSync(decoded, options);
+        continue;
+      }
+      if (encoding === "br") {
+        decoded = zlib.brotliDecompressSync(decoded, options);
+        continue;
+      }
+      if (encoding === "zstd") {
+        if (typeof zlib.zstdDecompressSync !== "function") {
+          const error = new Error("当前 Node 运行环境不能解码 zstd 请求体。");
+          error.statusCode = 415;
+          throw error;
+        }
+        decoded = zlib.zstdDecompressSync(decoded, options);
+        continue;
+      }
+    } catch (error) {
+      if (error?.code === "ERR_BUFFER_TOO_LARGE") {
+        throw requestBodyTooLargeError(limitBytes, limitBytes + 1);
+      }
+      throw error;
     }
     const error = new Error(`不支持的请求 Content-Encoding：${contentEncoding}`);
     error.statusCode = 415;

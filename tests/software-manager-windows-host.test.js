@@ -108,6 +108,7 @@ test("default Git registry discovery invokes only fixed reg.exe keys and argumen
   const registryCalls = fixture.calls.execFile.filter(({ file }) => file === "reg.exe");
   assert.deepEqual(registryCalls.map(({ args }) => args), REGISTRY_KEYS.map((key) => ["query", key]));
   assert.equal(registryCalls.every(({ options }) => options.shell === false), true);
+  assert.equal(registryCalls.every(({ options }) => options.timeout === 30_000), true);
 });
 
 test("rejects multiple registered Git installations before selecting a target", async () => {
@@ -204,6 +205,7 @@ test("Authenticode uses one fixed PowerShell command and a child-only package en
   assert.equal(call.args.includes(packagePath), false);
   assert.notEqual(call.options.env, parentEnv);
   assert.deepEqual(call.options.env, { CB_SM_PACKAGE_PATH: packagePath });
+  assert.equal(call.options.timeout, 120_000);
 });
 
 test("Authenticode rejects malformed output instead of treating it as unsigned metadata", async () => {

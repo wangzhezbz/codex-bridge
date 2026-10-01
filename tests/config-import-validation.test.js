@@ -234,6 +234,30 @@ test("the current exporter produces a package accepted by the strict validator",
   assert.equal(result.candidate.includesSecrets, false);
 });
 
+test("portable remote model marker is accepted only as an explicit true capability", () => {
+  const pkg = validPackage();
+  pkg.customModels[0].presetId = "remote-custom-demo-demo-model";
+  pkg.customModels[0].portableRemote = true;
+  const valid = validateConfigPackageImport(pkg);
+  assert.equal(valid.ok, true);
+  assert.equal(valid.candidate.customModels[0].portableRemote, true);
+
+  for (const value of [false, "true", 1, null]) {
+    const invalid = validPackage();
+    invalid.customModels[0].presetId = "remote-custom-demo-demo-model";
+    invalid.customModels[0].portableRemote = value;
+    const result = validateConfigPackageImport(invalid);
+    assert.equal(result.ok, false);
+    assert.equal(result.issues.some(issue => issue.path === "$.customModels[0].portableRemote"), true);
+  }
+
+  const mismatched = validPackage();
+  mismatched.customModels[0].portableRemote = true;
+  const mismatchResult = validateConfigPackageImport(mismatched);
+  assert.equal(mismatchResult.ok, false);
+  assert.equal(mismatchResult.issues.some(issue => issue.path === "$.customModels[0].portableRemote"), true);
+});
+
 test("strict config package validation returns one immutable complete candidate", () => {
   const input = validPackage({
     selection: {

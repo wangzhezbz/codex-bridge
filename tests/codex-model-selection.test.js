@@ -190,3 +190,36 @@ test("per-response model settings use durable history as the previous model hint
   assert.equal(result.changed, true);
   assert.equal(reconnectBody.model, "gpt-5.6-sol");
 });
+
+test("model selection scope state is capacity bounded without changing recent reconnects", () => {
+  const state = createCodexModelSelectionState({ capacity: 2, pruneInterval: 1_000 });
+  const configuredModelIds = ["old-a", "old-b", "old-c", "new-model"];
+  for (const suffix of ["a", "b", "c"]) {
+    state.applyToRequest({
+      headers: { "x-codex-thread-id": `thread-${suffix}` },
+      body: { model: `old-${suffix}` },
+      configuredModelIds,
+    });
+  }
+
+  const recent = state.recordModelSetting({
+    headers: { "x-codex-thread-id": "thread-b" },
+    body: { model: "new-model" },
+  });
+  assert.equal(recent.previousModel, "old-b");
+
+  const evicted = state.recordModelSetting({
+    headers: { "x-codex-thread-id": "thread-a" },
+    body: { model: "new-model" },
+  });
+  assert.equal(evicted.previousModel, "");
+});
+
+test("model selection ignores oversized client scope identifiers", () => {
+  const state = createCodexModelSelectionState();
+  const result = state.recordModelSetting({
+    headers: { "x-codex-thread-id": "x".repeat(513) },
+    body: { model: "gpt-5.6-sol" },
+  });
+  assert.deepEqual(result, { recorded: false, reason: "missing_scope" });
+});

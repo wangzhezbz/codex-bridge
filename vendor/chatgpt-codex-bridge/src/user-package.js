@@ -1,4 +1,5 @@
 import { looksLikeQuestionMarkEncodingLoss } from "./text-integrity.js";
+import { readFileSync } from "node:fs";
 
 export const DEFAULT_PACKAGE_NAME = "CodexBridge";
 
@@ -6,14 +7,40 @@ const COPY_ENTRIES = [
   "package.json",
   "package-lock.json",
   "README.md",
+  "README.en.md",
+  "README.ru.md",
+  "README.ja.md",
+  "README.ko.md",
+  "assets",
   "src",
   "public",
   "chrome-extension",
-  "scripts",
-  "docs",
+  "scripts/acceptance-contract.js",
+  "scripts/product-smoke.js",
   ".codex-plugin/plugin.json",
   ".mcp.json"
 ];
+
+const SOURCE_PACKAGE_JSON = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+const USER_PACKAGE_SCRIPTS = ["start", "mcp", "smoke:product", "acceptance:contract"];
+
+export function assertPortableUserPackageText(relativePath, text) {
+  const value = String(text || "").replaceAll("\\", "/");
+  const machinePath = /\b[A-Z]:\/(?:Users\/[^/\s]+|game_code\/bridge)(?:\/|\b)/i;
+  const codexThreadId = /\b019[a-f0-9]{5}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b/i;
+  const dataRootFingerprint = /\b[a-f0-9]{64}\b/i;
+  if (machinePath.test(value) || codexThreadId.test(value) || dataRootFingerprint.test(value)) {
+    throw new Error(`Machine-specific content is not allowed in user package: ${relativePath}`);
+  }
+}
+
+function renderUserPackageJson(sourcePackage, version) {
+  const scripts = {};
+  for (const name of USER_PACKAGE_SCRIPTS) {
+    if (sourcePackage.scripts?.[name]) scripts[name] = sourcePackage.scripts[name];
+  }
+  return JSON.stringify({ ...sourcePackage, version, scripts }, null, 2) + "\n";
+}
 
 export function renderStartCommand() {
   return [
@@ -537,7 +564,7 @@ export function renderRealBrowserAcceptanceRecord({
   ].join("\n");
 }
 
-export function renderInstallGuide({ packageDir = "<CodexBridge 安装目录>", version = "0.1.0" } = {}) {
+export function renderInstallGuide({ packageDir = "<CodexBridge 安装目录>", version = "0.1.95" } = {}) {
   const displayPackageDir = String(packageDir).replaceAll("\\", "/").replace(/\/+$/, "");
   return [
     "# CodexBridge 安装说明",
@@ -588,8 +615,19 @@ export function renderInstallGuide({ packageDir = "<CodexBridge 安装目录>", 
   ].join("\n");
 }
 
-export function buildUserPackagePlan({ version = "0.1.0", packageName = DEFAULT_PACKAGE_NAME, packageDir = "<CodexBridge 安装目录>" } = {}) {
-  const copyEntries = COPY_ENTRIES.map((from) => ({ from, to: from }));
+export function buildUserPackagePlan({ version = "0.1.95", packageName = DEFAULT_PACKAGE_NAME, packageDir = "<CodexBridge 安装目录>", packageJson = SOURCE_PACKAGE_JSON } = {}) {
+  const copyEntries = COPY_ENTRIES.map((from) => ({
+    from, to: from,
+    ...(from === "package.json" ? {
+      content: renderUserPackageJson(packageJson, version)
+    } : from === ".mcp.json" ? {
+      // Local development may use an isolated data root. Never ship that
+      // machine's environment or credentials as a user's default MCP config.
+      content: JSON.stringify({ mcpServers: { chatgpt_codex_bridge: {
+        command: "node", args: ["./src/mcp-server.js"]
+      } } }, null, 2) + "\n"
+    } : {})
+  }));
   const generatedEntries = [
     {
       generatedPath: "INSTALL-CodexBridge.md",

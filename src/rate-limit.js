@@ -1,12 +1,14 @@
 const DEFAULT_429_COOLDOWN_MS = 30_000;
 const MAX_429_COOLDOWN_MS = 120_000;
+const HARD_MAX_RATE_LIMIT_WAIT_MS = 24 * 60 * 60_000;
+const MAX_RATE_LIMIT_STATES = 2_048;
 
 const providerCooldowns = new Map();
 const localPacingStates = new Map();
 
 let clock = {
   now: () => Date.now(),
-  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  sleep: abortableSleep,
 };
 
 export class RouteRateLimitedError extends Error {
@@ -29,30 +31,60 @@ export class RouteRateLimitedError extends Error {
 }
 
 export async function waitForRouteCapacity(route = {}, context = {}, options = {}) {
+  throwIfRouteWaitAborted(context.clientSignal);
   await waitForProviderCooldown(route, context, options);
+  throwIfRouteWaitAborted(context.clientSignal);
   if (!localRateLimitEnabled(route, options)) {
     return;
   }
   const state = localPacingStateForRoute(route);
-  state.queue = state.queue
-    .catch(() => {})
-    .then(() => reserveLocalPacing(state, route, context, options));
-  return state.queue;
+  return new Promise((resolve, reject) => {
+    const entry = { route, context, options, resolve, reject, onAbort: null };
+    entry.onAbort = () => {
+      const index = state.queue.indexOf(entry);
+      if (index < 0) return; // Active waits have their own abort handling.
+      state.queue.splice(index, 1);
+      context.clientSignal?.removeEventListener("abort", entry.onAbort);
+      reject(routeWaitAbortReason(context.clientSignal));
+    };
+    context.clientSignal?.addEventListener("abort", entry.onAbort, { once: true });
+    state.queue.push(entry);
+    drainLocalPacingQueue(state);
+  });
+}
+
+async function drainLocalPacingQueue(state) {
+  if (state.running) return;
+  state.running = true;
+  try {
+    while (state.queue.length) {
+      const entry = state.queue.shift();
+      try {
+        await reserveLocalPacing(state, entry.route, entry.context, entry.options);
+        entry.resolve();
+      } catch (error) {
+        entry.reject(error);
+      } finally {
+        entry.context.clientSignal?.removeEventListener("abort", entry.onAbort);
+      }
+    }
+  } finally {
+    state.running = false;
+  }
 }
 
 export function markRouteRateLimited(route = {}, headers) {
-  const headerCooldownMs = retryAfterMs(headers);
+  const hint = parseRetryAfter(headerValue(headers, "retry-after"), clock.now());
   const fallbackCooldownMs = Math.max(
     Number(route.cooldownMs || 0),
     DEFAULT_429_COOLDOWN_MS,
   );
-  const cooldownMs = clampCooldownMs(
-    headerCooldownMs || fallbackCooldownMs,
-    route,
-  );
+  // Provider deadlines are a minimum wait, not our bounded fallback policy.
+  // Keep the full deadline; individual sleeps remain bounded and abortable.
+  const cooldownMs = hint ? hint.delayMs : clampCooldownMs(fallbackCooldownMs, route);
   const cooldownUntil = clock.now() + Math.max(0, cooldownMs);
   const key = providerIdentityKey(route);
-  providerCooldowns.set(
+  setBoundedState(providerCooldowns,
     key,
     Math.max(Number(providerCooldowns.get(key) || 0), cooldownUntil),
   );
@@ -89,12 +121,46 @@ export function __resetRateLimiterForTests() {
   localPacingStates.clear();
   clock = {
     now: () => Date.now(),
-    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    sleep: abortableSleep,
   };
 }
 
+export function __rateLimiterStateSizesForTests() {
+  return {
+    providerCooldowns: providerCooldowns.size,
+    localPacingStates: localPacingStates.size,
+  };
+}
+
+function abortableSleep(milliseconds, signal = undefined) {
+  throwIfRouteWaitAborted(signal);
+  return new Promise((resolve, reject) => {
+    let timer = null;
+    const cleanup = () => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(routeWaitAbortReason(signal));
+    };
+    timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, Math.min(Math.max(0, Number(milliseconds) || 0), HARD_MAX_RATE_LIMIT_WAIT_MS));
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 async function reserveLocalPacing(state, route, context, options = {}) {
-  await waitUntil(state.nextAt || 0);
+  throwIfRouteWaitAborted(context.clientSignal);
+  await waitUntil(state.nextAt || 0, context.clientSignal);
+  // Another in-flight request may have received 429 while this one was queued.
+  await waitForProviderCooldown(route, context, options);
+  throwIfRouteWaitAborted(context.clientSignal);
 
   const intervalMs = routeIntervalMs(route, options);
   if (intervalMs <= 0) {
@@ -132,15 +198,53 @@ async function waitForProviderCooldown(route, context, options = {}) {
       }
       throw new RouteRateLimitedError(route, cooldownRemainingMs);
     }
-    await clock.sleep(cooldownRemainingMs);
+    await waitForClockSleep(cooldownRemainingMs, context.clientSignal);
   }
 }
 
-async function waitUntil(timestamp) {
+async function waitUntil(timestamp, signal = undefined) {
   const waitMs = Math.max(0, Number(timestamp || 0) - clock.now());
   if (waitMs > 0) {
-    await clock.sleep(waitMs);
+    await waitForClockSleep(waitMs, signal);
   }
+}
+
+async function waitForClockSleep(delayMs, signal = undefined) {
+  throwIfRouteWaitAborted(signal);
+  const boundedDelayMs = Math.min(delayMs, HARD_MAX_RATE_LIMIT_WAIT_MS);
+  if (!signal) {
+    await clock.sleep(boundedDelayMs);
+    return;
+  }
+  let onAbort = null;
+  try {
+    await Promise.race([
+      Promise.resolve().then(() => clock.sleep(boundedDelayMs, signal)),
+      new Promise((_resolve, reject) => {
+        onAbort = () => reject(routeWaitAbortReason(signal));
+        signal.addEventListener("abort", onAbort, { once: true });
+      }),
+    ]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+  throwIfRouteWaitAborted(signal);
+}
+
+function throwIfRouteWaitAborted(signal) {
+  if (signal?.aborted) {
+    throw routeWaitAbortReason(signal);
+  }
+}
+
+function routeWaitAbortReason(signal) {
+  if (signal?.reason instanceof Error) {
+    return signal.reason;
+  }
+  const error = new Error("Client disconnected while waiting for route capacity.");
+  error.name = "AbortError";
+  error.code = "client_closed_request";
+  return error;
 }
 
 function routeIntervalMs(route = {}, options = {}) {
@@ -151,7 +255,7 @@ function routeIntervalMs(route = {}, options = {}) {
   if (!Number.isFinite(rpm) || rpm <= 0) {
     return 0;
   }
-  return Math.ceil(60_000 / rpm);
+  return Math.min(Math.ceil(60_000 / rpm), HARD_MAX_RATE_LIMIT_WAIT_MS);
 }
 
 function effectiveRouteRpm(route = {}) {
@@ -213,7 +317,7 @@ function clampCooldownMs(value, route = {}) {
 function maxCooldownMsForRoute(route = {}) {
   const configured = Number(route.maxCooldownMs || route.rateLimit?.maxCooldownMs || 0);
   if (Number.isFinite(configured) && configured > 0) {
-    return configured;
+    return Math.min(configured, HARD_MAX_RATE_LIMIT_WAIT_MS);
   }
   return MAX_429_COOLDOWN_MS;
 }
@@ -221,12 +325,25 @@ function maxCooldownMsForRoute(route = {}) {
 function localPacingStateForRoute(route = {}) {
   const key = providerIdentityKey(route);
   if (!localPacingStates.has(key)) {
-    localPacingStates.set(key, {
-      queue: Promise.resolve(),
+    setBoundedState(localPacingStates, key, {
+      queue: [],
+      running: false,
       nextAt: 0,
     });
+  } else {
+    setBoundedState(localPacingStates, key, localPacingStates.get(key));
   }
   return localPacingStates.get(key);
+}
+
+function setBoundedState(map, key, value) {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > MAX_RATE_LIMIT_STATES) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) return;
+    map.delete(oldest);
+  }
 }
 
 function providerIdentityKey(route = {}) {
@@ -259,23 +376,26 @@ function nonSecretBaseUrl(value) {
   }
 }
 
-function retryAfterMs(headers) {
-  const value = headerValue(headers, "retry-after");
-  if (!value) {
-    return 0;
+export function parseRetryAfter(value, now = Date.now()) {
+  const raw = String(value ?? "");
+  if (/[\r\n]/.test(raw)) return null;
+  const header = raw.trim();
+  // Retain compatible providers' existing fractional-second hints as well.
+  if (/^\d+(?:\.\d+)?$/.test(header)) {
+    const delayMs = Math.ceil(Number(header) * 1000);
+    return Number.isFinite(delayMs) ? { value: header, delayMs } : null;
   }
-
-  const seconds = Number(value);
-  if (Number.isFinite(seconds)) {
-    return Math.max(0, seconds * 1000);
-  }
-
-  const timestamp = Date.parse(value);
-  if (Number.isFinite(timestamp)) {
-    return Math.max(0, timestamp - clock.now());
-  }
-
-  return 0;
+  // Accept HTTP-date's preferred form and its two legacy wire formats, not
+  // JavaScript's permissive date strings (e.g. "-1" or "1.5.2").
+  const httpDate = /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(header)
+    || /^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), \d{2}-[A-Za-z]{3}-\d{2} \d{2}:\d{2}:\d{2} GMT$/.test(header)
+    || /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Za-z]{3} [ \d]\d \d{2}:\d{2}:\d{2} \d{4}$/.test(header);
+  if (!httpDate) return null;
+  // HTTP-date is always UTC, including asctime's zone-less legacy syntax.
+  const timestamp = Date.parse(header.endsWith(" GMT") ? header : `${header} GMT`);
+  return Number.isFinite(timestamp)
+    ? { value: header, delayMs: Math.max(0, timestamp - now) }
+    : null;
 }
 
 function headerValue(headers, name) {
@@ -286,5 +406,6 @@ function headerValue(headers, name) {
     return headers.get(name) || "";
   }
   const lower = name.toLowerCase();
-  return headers[name] || headers[lower] || "";
+  const entry = Object.entries(headers).find(([key]) => key.toLowerCase() === lower);
+  return entry?.[1] ?? "";
 }

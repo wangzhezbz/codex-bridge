@@ -18,6 +18,85 @@ import {
   reasoningParamsForAdapter,
 } from "../src/adapter-profile.js";
 import { routeCapabilityMatrix, routeCapabilitySummary } from "../src/route-capability-matrix.js";
+import { modelCatalogEntry } from "../src/model-catalog.js";
+import { responsesToChatRequest } from "../src/responses-to-chat.js";
+
+test("GLM 5.3 thinking uses the documented always-on contract instead of enable_thinking", () => {
+  const route = { provider: "zhipu", model: "glm-5.3", api: "chat_completions" };
+  for (const [requested, expected] of [["none", "low"], ["low", "low"], ["medium", "high"], ["high", "high"], ["xhigh", "max"], ["max", "max"]]) {
+    const params = reasoningParamsForAdapter({ reasoning: { effort: requested } }, route);
+    const filtered = filterPayloadForAdapter({ model: route.model, messages: [{ role: "user", content: "hello" }], ...params }, route);
+    assert.deepEqual(filtered.thinking, { type: "enabled" });
+    assert.equal(filtered.reasoning_effort, expected);
+    assert.equal(filtered.enable_thinking, undefined);
+  }
+});
+
+test("MiniMax M3.1 keeps adaptive thinking and its supported effort after filtering", () => {
+  const route = { provider: "minimax", model: "MiniMax-M3.1-Flash-Preview", api: "chat_completions" };
+  const params = reasoningParamsForAdapter({ reasoning: { effort: "xhigh" } }, route);
+  const filtered = filterPayloadForAdapter({ model: route.model, messages: [{ role: "user", content: "hello" }], ...params }, route);
+  assert.deepEqual(filtered.thinking, { type: "adaptive" });
+  assert.equal(filtered.reasoning_effort, "xhigh");
+});
+
+test("direct Chat requests cannot disable thinking on GLM 5.3 or MiniMax M3.1", () => {
+  for (const [provider, model, type, expected] of [
+    ["zhipu", "glm-5.3", "enabled", "low"],
+    ["minimax", "MiniMax-M3.1-Flash-Preview", "adaptive", "low"],
+  ]) {
+    const body = filterPayloadForAdapter({ model, messages: [{ role: "user", content: "hello" }], thinking: { type: "disabled" }, reasoning_effort: "none" }, { provider, model, api: "chat_completions" });
+    assert.deepEqual(body.thinking, { type });
+    assert.equal(body.reasoning_effort, expected);
+  }
+});
+
+test("Astra Chat preserves valid reasoning efforts without switching the chosen protocol", () => {
+  for (const provider of ["openai", "custom"]) {
+    const route = { id: "custom-astra-chat", provider, model: "gpt-6-astra", api: "chat_completions", contextWindow: 1050000 };
+    for (const [requested, expected] of [
+      ["low", "low"], ["medium", "medium"], ["high", "high"], ["xhigh", "xhigh"], ["max", "max"], ["none", "low"], ["minimal", "low"],
+    ]) {
+      const input = { model: "gpt-6-astra", messages: [{ role: "user", content: "hello" }], reasoning_effort: requested };
+      const result = filterPayloadForAdapter(input, route);
+      assert.equal(result.reasoning_effort, expected);
+      assert.equal(result.model, "gpt-6-astra");
+      assert.equal(route.api, "chat_completions");
+      assert.equal(input.reasoning_effort, requested);
+    }
+    const converted = responsesToChatRequest({ input: "hello", reasoning: { effort: "xhigh" } }, route).body;
+    assert.equal(filterPayloadForAdapter(converted, route).reasoning_effort, "xhigh");
+    assert.deepEqual(reasoningParamsForAdapter({ reasoning_effort: "high", reasoning: { effort: "max" } }, route), { reasoning_effort: "high" });
+  }
+});
+
+test("Astra Chat advertises its tool limitation and rejects active tool requests with a useful error", () => {
+  const route = { id: "custom-astra-chat", provider: "openai", model: "gpt-6-astra", api: "chat_completions", contextWindow: 1050000 };
+  const profile = normalizeAdapterProfile(route);
+  assert.equal(profile.supportsTools, "none");
+  assert.equal(profile.supportsMcpNamespaces, false);
+  const catalog = modelCatalogEntry(route);
+  assert.equal(catalog.supports_tools, "none");
+  assert.equal(catalog.supports_parallel_tool_calls, false);
+  const tools = routeCapabilityMatrix(route).items.find((item) => item.key === "tools");
+  assert.equal(tools.state, "unavailable");
+  assert.match(tools.detail, /Responses/);
+  const tool = { type: "function", function: { name: "lookup", parameters: { type: "object" } } };
+  assert.throws(() => filterPayloadForAdapter({ tools: [tool], tool_choice: "auto" }, route), (error) => {
+    assert.equal(error.code, "astra_chat_tools_require_responses");
+    assert.equal(error.statusCode, 400);
+    assert.match(error.message, /Responses/);
+    return true;
+  });
+  // Explicitly disabled tools are not a request to invoke one. Do not rewrite
+  // the user's text-only request or its prompt prefix.
+  assert.deepEqual(filterPayloadForAdapter({ tools: [tool], tool_choice: "none" }, route).tools, [tool]);
+  assert.deepEqual(filterPayloadForAdapter({ tools: [] }, route).tools, []);
+  const native = { ...route, api: "responses" };
+  assert.equal(normalizeAdapterProfile(native).supportsTools, "native");
+  assert.doesNotThrow(() => filterPayloadForAdapter({ tools: [{ type: "function", name: "lookup" }] }, native));
+  assert.doesNotThrow(() => filterPayloadForAdapter({ tools: [tool] }, { ...route, provider: "custom" }));
+});
 
 test("adapter profiles classify native responses routes", () => {
   const profile = normalizeAdapterProfile({
@@ -1049,6 +1128,10 @@ const BUILT_IN_PROVIDER_CONTRACTS = {
     supportsFiles: "text-placeholder",
     supportsResponsePreviousId: false,
   },
+  "hunyuan-tokenhub": {
+    providerFamily: "openai-compatible", adapterId: "chat-openai-compatible", api: "chat_completions",
+    supportsTools: "chat-functions", supportsFiles: "text-placeholder", supportsResponsePreviousId: false,
+  },
   volcengine: {
     providerFamily: "doubao",
     adapterId: "chat-doubao",
@@ -1124,7 +1207,6 @@ test("built-in presets cover required provider categories", () => {
     "messages-anthropic",
     "chat-xai",
     "chat-gemini",
-    "chat-deepseek",
     "chat-kimi",
     "chat-minimax",
     "chat-doubao",
@@ -1143,6 +1225,22 @@ for (const route of MODEL_PRESETS) {
 }
 
 const BUILT_IN_PRESET_CONTRACT_OVERRIDES = {
+  "deepseek-v4-pro": {
+    providerFamily: "deepseek", adapterId: "responses-native", api: "responses", supportsTools: "native",
+    supportsFiles: "text-placeholder", supportsResponsePreviousId: false,
+  },
+  "xai-grok-4-7": {
+    providerFamily: "xai", adapterId: "responses-native", api: "responses", supportsTools: "native",
+    supportsFiles: "native", supportsResponsePreviousId: true,
+  },
+  "deepseek-v4-1-flash": {
+    providerFamily: "deepseek",
+    adapterId: "responses-native",
+    api: "responses",
+    supportsTools: "native",
+    supportsFiles: "text-placeholder",
+    supportsResponsePreviousId: false,
+  },
   "deepseek-v4-flash": {
     providerFamily: "deepseek",
     adapterId: "responses-native",

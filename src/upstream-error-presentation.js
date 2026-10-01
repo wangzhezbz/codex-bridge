@@ -2,6 +2,7 @@ import { jsonResponse, openAiError, tryParseJson } from "./json.js";
 import { redactSecretText } from "./redact.js";
 import { classifyUpstreamError } from "./route-health.js";
 import { buildResponsesStreamErrorSse } from "./sse.js";
+import { parseRetryAfter } from "./rate-limit.js";
 
 export function createUpstreamErrorPresentation({
   UpstreamHttpError,
@@ -12,6 +13,10 @@ export function createUpstreamErrorPresentation({
   const isHttpError = (error) => isInstanceOf(error, UpstreamHttpError);
 
   function sendUpstreamError(res, error, options = {}) {
+    const retryAfter = isHttpError(error) && [429, 503].includes(Number(error.statusCode))
+      ? parseRetryAfter(error.retryAfter)?.value
+      : "";
+    const retryAfterHeaders = retryAfter ? { "retry-after": retryAfter } : {};
     if (options.asResponsesStream) {
       const localHistoryError = Boolean(
         error?.localHistoryError || error?.code === "local_history_storage_unavailable",
@@ -24,6 +29,7 @@ export function createUpstreamErrorPresentation({
           ? "context_switch_compaction_failed"
           : classification.code || error?.code || "upstream_stream_error";
       sendResponsesStreamFailure(res, streamErrorMessage(error), {
+        headers: retryAfterHeaders,
         model: options.model || error?.route?.model || null,
         code,
         ...(localHistoryError
@@ -87,6 +93,7 @@ export function createUpstreamErrorPresentation({
             error.statusCode,
             "codex_subscription_missing_api_scope",
           ),
+          retryAfterHeaders,
         );
         return;
       }
@@ -98,6 +105,7 @@ export function createUpstreamErrorPresentation({
           error.statusCode,
           classification.code,
         ),
+        retryAfterHeaders,
       );
       return;
     }
@@ -163,7 +171,7 @@ export function createUpstreamErrorPresentation({
       case "upstream_rate_limit":
         return userFacingErrorSentence(prefix, `供应商限流，请稍后再试或切换备用模型。${retryAfterAdvice(error?.retryAfter)}`, errorInfo);
       case "upstream_provider_unavailable":
-        return userFacingErrorSentence(prefix, "供应商服务暂时不可用或网关异常，请稍后重试。", errorInfo);
+        return userFacingErrorSentence(prefix, `供应商服务暂时不可用或网关异常，请稍后重试。${retryAfterAdvice(error?.retryAfter)}`, errorInfo);
       case "upstream_payload_too_large":
         return payloadTooLargeClientMessage({ routeLabel, statusCode, errorInfo });
       case "upstream_media_unsupported":
@@ -240,6 +248,7 @@ function sendResponsesStreamFailure(res, message, options = {}) {
       "content-type": "text/event-stream; charset=utf-8",
       "cache-control": "no-cache",
       connection: "keep-alive",
+      ...options.headers,
     });
   }
   if (!res.writableEnded) {
@@ -375,21 +384,10 @@ function userFacingRouteLabel(route = {}) {
 }
 
 function retryAfterAdvice(value) {
-  if (!value) {
-    return "";
-  }
-  const seconds = Number(value);
-  if (Number.isFinite(seconds) && seconds > 0) {
-    return `建议约 ${formatDuration(seconds)} 后再试；`;
-  }
-  const retryAtMs = Date.parse(value);
-  if (Number.isFinite(retryAtMs)) {
-    const waitSeconds = Math.ceil((retryAtMs - Date.now()) / 1000);
-    if (waitSeconds > 0) {
-      return `建议约 ${formatDuration(waitSeconds)} 后再试；`;
-    }
-  }
-  return "";
+  const hint = parseRetryAfter(value);
+  return hint?.delayMs > 0
+    ? `请至少等待 ${formatDuration(hint.delayMs / 1000)} 后再试；`
+    : "";
 }
 
 function formatDuration(seconds) {

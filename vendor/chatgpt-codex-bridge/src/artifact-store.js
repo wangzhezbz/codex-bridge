@@ -86,16 +86,11 @@ function extensionFromContentType(contentType = "") {
 }
 
 function artifactFilenamePrefix(contentType = "") {
-  return contentType.toLowerCase().startsWith("image/") ? "G某T-图片" : "G某T-文件";
+  return contentType.toLowerCase().startsWith("image/") ? "GPT-图片" : "GPT-文件";
 }
 
-function promotionSafeArtifactFilename(value = "") {
-  return String(value)
-    .replace(/chatgpt-image/gi, "G某T-图片")
-    .replace(/gpt-image/gi, "G某T-图片")
-    .replace(/chatgpt-file/gi, "G某T-文件")
-    .replace(/gpt-file/gi, "G某T-文件")
-    .replace(/chatgpt|gpt/gi, "G某T");
+function readableArtifactFilename(value = "") {
+  return String(value).replace(/g某t/gi, "GPT");
 }
 
 function shortArtifactId(id = "") {
@@ -116,16 +111,16 @@ function normalizeArtifactFilename(value, contentType, artifactId) {
   const inferredExtension = extensionFromContentType(contentType);
 
   if (isOpaqueExtensionlessName(filename) && inferredExtension) {
-    return promotionSafeArtifactFilename(
+    return readableArtifactFilename(
       `${artifactFilenamePrefix(contentType)}-${shortArtifactId(artifactId)}.${inferredExtension}`
     );
   }
 
   if (!parsed.ext && inferredExtension) {
-    return promotionSafeArtifactFilename(`${filename}.${inferredExtension}`);
+    return readableArtifactFilename(`${filename}.${inferredExtension}`);
   }
 
-  return promotionSafeArtifactFilename(filename);
+  return readableArtifactFilename(filename);
 }
 
 function normalizeStoredArtifact(artifact) {

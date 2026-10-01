@@ -23,6 +23,10 @@ const REQUIRED_SOFTWARE_MANAGER_PATHS = Object.freeze([
 
 export const WINDOWS_PACKAGE_HARDENING_RULES = Object.freeze([
   Object.freeze({
+    id: "local_audit_artifacts",
+    pattern: /^\/\.audit-artifacts(?:\/|$)/i,
+  }),
+  Object.freeze({
     id: "deployment_infrastructure",
     pattern: /^\/deploy(?:\/|$)/i,
   }),
@@ -67,6 +71,14 @@ export const WINDOWS_PACKAGE_HARDENING_RULES = Object.freeze([
   Object.freeze({
     id: "runtime_state_backup",
     pattern: /(?:^|\/)(?:state(?:_\d+)?\.sqlite(?:\.(?:bak|backup|shm|wal))?|response-history\.sqlite(?:-(?:shm|wal))?)$/i,
+  }),
+  Object.freeze({
+    id: "development_log",
+    pattern: /\.log(?:\.\d+)?(?:\.gz)?$/i,
+  }),
+  Object.freeze({
+    id: "npm_credentials_config",
+    pattern: /(?:^|\/)\.npmrc$/i,
   }),
 ]);
 

@@ -17,11 +17,14 @@ const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
-const { Readable, Transform } = require("node:stream");
-const { pipeline } = require("node:stream/promises");
 const { pathToFileURL } = require("node:url");
-const { Worker } = require("node:worker_threads");
 const { resolveDataRootDir } = require("./data-dir.cjs");
+const { readBoundedJsonRequest } = require("./bounded-json-request.cjs");
+const { listenServerWithDeadline } = require("./bounded-server-listen.cjs");
+const { runWorkerForMessage } = require("./bounded-worker-task.cjs");
+const { buildConsistentStateSnapshot } = require("./consistent-state-snapshot.cjs");
+const { createKeyedSingleFlight } = require("./keyed-single-flight.cjs");
+const { compatibilityFailureCode, compatibilityFailureDetail } = require("./thread-provider-diagnostics.cjs");
 const { createDesktopLocalCapabilityExecutor } = require("./local-capabilities.cjs");
 const {
   DESKTOP_APP_IMAGE_NAMES,
@@ -42,6 +45,7 @@ const {
   openAIDesktopTargetFromShortcutResolution,
   openAIDesktopBrand,
   prioritizeOpenAIDesktopCandidates,
+  readManagedOpenAIDesktopCandidate,
   recoverOpenAIProjectsSequentially,
   runCommandCaptureWithTimeout,
   selectMacOpenAIDesktopApp,
@@ -59,6 +63,7 @@ const { runRouterStartForIpc } = require("./router-start-result.cjs");
 const { readBoundedRegularUtf8File } = require("./safe-import-file.cjs");
 const { createChatgptBridgeService } = require("./chatgpt-bridge-service.cjs");
 const { createTrayIcon } = require("./tray-icon.cjs");
+const { downloadUpdateFile } = require("./update-download.cjs");
 const {
   chromeExtensionManagerPlan,
   parseChromeExtensionManagerResult,
@@ -76,6 +81,25 @@ const {
   installRendererNavigationGuards,
   shouldDisableChromiumSandbox,
 } = require("./window-security.cjs");
+
+const CODEX_RESOURCE_SNAPSHOT_WORKER_TIMEOUT_MS = 90_000;
+const CODEX_SESSION_SNAPSHOT_WORKER_TIMEOUT_MS = 60_000;
+const CODEX_SESSION_EXPORT_WORKER_TIMEOUT_MS = 2 * 60_000;
+const SESSION_EXPORT_CLIPBOARD_MAX_BYTES = 2 * 1024 * 1024;
+const SESSION_EXPORT_ACTIONS = new Set(["session", "project", "loose", "all", "filtered"]);
+const SESSION_EXPORT_MAX_IDS = 1_000;
+const SESSION_EXPORT_MAX_ID_CHARS = 512;
+const SESSION_EXPORT_MAX_FILTER_CHARS = 1_000;
+const CLIPBOARD_TEXT_MAX_BYTES = 2 * 1024 * 1024;
+const DESKTOP_LOG_LINE_MAX_CHARS = 16 * 1024;
+const LOG_RENDERER_PUBLISH_DEBOUNCE_MS = 100;
+const USAGE_EVENTS_MAX_BYTES = 32 * 1024 * 1024;
+const USAGE_EVENTS_PERSIST_DEBOUNCE_MS = 500;
+const USAGE_EVENTS_FLUSH_TIMEOUT_MS = 2_000;
+const runResourceSnapshotSingleFlight = createKeyedSingleFlight();
+const runSessionSnapshotSingleFlight = createKeyedSingleFlight();
+const runSessionExportSingleFlight = createKeyedSingleFlight();
+const runCodexRestartSingleFlight = createKeyedSingleFlight();
 
 if (shouldDisableChromiumSandbox({ env: process.env, platform: process.platform })) {
   app.commandLine.appendSwitch("no-sandbox");
@@ -141,8 +165,6 @@ let softwareManagerIpcPromise = null;
 let softwareManagerRuntimePromise = null;
 let softwareManagerUnavailableServicePromise = null;
 let softwareManagerStartupFailure = null;
-let curatedPluginTask = null;
-let curatedPluginTaskSequence = 0;
 let chatgptBridgeService = null;
 let routerLifecyclePromise = null;
 let codexHistoryRecoveryFlowPromise = null;
@@ -156,6 +178,11 @@ let evaluateUsageBudgets = () => [];
 let estimateUsageCosts = () => emptyUsageCostEstimate();
 let usageBudgets = {};
 let usageRoutes = [];
+let logRendererPublishTimer = null;
+let usageEventsPersistTimer = null;
+let usageEventsPersistGeneration = 0;
+let usageEventsPersistedGeneration = 0;
+let usageEventsPersistChain = Promise.resolve();
 let lastHealth = null;
 let tray = null;
 let isQuitting = false;
@@ -169,6 +196,8 @@ let desktopSmokeLoadHookRegistered = false;
 let localExecutorServer = null;
 let localExecutorUrl = "";
 let localExecutorToken = "";
+let localExecutorStartingServer = null;
+let localExecutorStartPromise = null;
 let deferredStartupScheduled = false;
 let legacyDataMigration = { copiedFiles: 0, skippedFiles: 0, sourceDirs: [], messages: [] };
 let legacyDataMigrationPromise = null;
@@ -180,7 +209,6 @@ const ROUTER_RESTART_MAX_ATTEMPTS = 12;
 const ROUTER_RESTART_BASE_DELAY_MS = 1500;
 const ROUTER_RESTART_MAX_DELAY_MS = 30000;
 const ROUTER_RESTART_STABLE_WINDOW_MS = 60000;
-const CURATED_PLUGIN_TASK_TIMEOUT_MS = 5 * 60 * 1000;
 const ROUTER_CONFIG_RECOVERY_RETRY_MS = 5000;
 const ROUTER_SPAWN_TIMEOUT_MS = 5000;
 const ROUTER_GRACEFUL_STOP_TIMEOUT_MS = 2000;
@@ -214,7 +242,13 @@ function desktopHomeDir() {
     : os.homedir();
 }
 
-async function capturePageScreenshot({ url = "", viewport = "desktop", fullPage = false } = {}) {
+async function capturePageScreenshot({
+  url = "",
+  viewport = "desktop",
+  fullPage = false,
+  signal = undefined,
+} = {}) {
+  throwIfCaptureAborted(signal);
   const size = screenshotViewportSize(viewport);
   const captureWindow = new BrowserWindow({
     width: size.width,
@@ -226,21 +260,31 @@ async function capturePageScreenshot({ url = "", viewport = "desktop", fullPage 
       nodeIntegration: false,
     },
   });
+  const abortCapture = () => {
+    try { captureWindow.webContents.stop(); } catch {}
+    if (!captureWindow.isDestroyed()) captureWindow.destroy();
+  };
+  signal?.addEventListener("abort", abortCapture, { once: true });
   try {
-    await loadHiddenPage(captureWindow, url);
+    await loadHiddenPage(captureWindow, url, { signal });
+    throwIfCaptureAborted(signal);
     if (fullPage) {
       await resizeWindowForFullPage(captureWindow, size);
+      throwIfCaptureAborted(signal);
     }
     const image = await captureWindow.webContents.capturePage();
+    throwIfCaptureAborted(signal);
     return image.toPNG();
   } finally {
+    signal?.removeEventListener("abort", abortCapture);
     if (!captureWindow.isDestroyed()) {
       captureWindow.destroy();
     }
   }
 }
 
-async function captureDesktopScreenshot({ displayId = "" } = {}) {
+async function captureDesktopScreenshot({ displayId = "", signal = undefined } = {}) {
+  throwIfCaptureAborted(signal);
   const normalizedDisplayId = String(displayId || "").trim();
   const displays = typeof screen.getAllDisplays === "function" ? screen.getAllDisplays() : [];
   const targetDisplay = normalizedDisplayId
@@ -254,6 +298,7 @@ async function captureDesktopScreenshot({ displayId = "" } = {}) {
       height: clampScreenshotSize(Number(size.height), 900, 2160),
     },
   });
+  throwIfCaptureAborted(signal);
   const source = normalizedDisplayId
     ? sources.find((item) =>
         String(item.display_id || "") === normalizedDisplayId ||
@@ -271,22 +316,30 @@ async function captureDesktopScreenshot({ displayId = "" } = {}) {
   return png;
 }
 
+function throwIfCaptureAborted(signal) {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw new DOMException("Desktop capture was aborted", "AbortError");
+}
+
 function screenshotViewportSize(viewport = "") {
   return String(viewport || "").toLowerCase() === "mobile"
     ? { width: 390, height: 844 }
     : { width: 1440, height: 900 };
 }
 
-function loadHiddenPage(win, url) {
+function loadHiddenPage(win, url, { signal = undefined } = {}) {
   return new Promise((resolve, reject) => {
+    const webContents = win.webContents;
     const timer = setTimeout(() => {
       cleanup();
       reject(new Error("网页加载超时"));
     }, 30000);
     const cleanup = () => {
       clearTimeout(timer);
-      win.webContents.removeListener("did-finish-load", onFinish);
-      win.webContents.removeListener("did-fail-load", onFail);
+      try { webContents.removeListener("did-finish-load", onFinish); } catch {}
+      try { webContents.removeListener("did-fail-load", onFail); } catch {}
+      signal?.removeEventListener("abort", onAbort);
     };
     const onFinish = () => {
       cleanup();
@@ -296,8 +349,20 @@ function loadHiddenPage(win, url) {
       cleanup();
       reject(new Error(errorDescription || `网页加载失败：${errorCode}`));
     };
-    win.webContents.once("did-finish-load", onFinish);
-    win.webContents.once("did-fail-load", onFail);
+    const onAbort = () => {
+      cleanup();
+      try { webContents.stop(); } catch {}
+      reject(signal?.reason instanceof Error
+        ? signal.reason
+        : new DOMException("Page capture was aborted", "AbortError"));
+    };
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    webContents.once("did-finish-load", onFinish);
+    webContents.once("did-fail-load", onFail);
+    signal?.addEventListener("abort", onAbort, { once: true });
     win.loadURL(url).catch((error) => {
       cleanup();
       reject(error);
@@ -606,6 +671,7 @@ async function loadRouterLifecycleController() {
             appendRuntimeLog(formatError("doubleQuotaStopOnQuit", error));
           }
         }
+        await flushUsageEventsPersistence();
         cancelRouterRestartTimer();
         managedQuitReady = true;
       },
@@ -623,7 +689,7 @@ function recoverPendingConfigTransactions() {
       recoverConfigTransactionsAtStartup({
         recover: () => settings.recoverSharedConfigTransactions({
           rootDir: dataRootDir,
-          homeDir: os.homedir(),
+          homeDir: desktopHomeDir(),
         }),
         onRetry: ({ attempt, delayMs, code }) => {
           appendRuntimeLog(
@@ -692,7 +758,7 @@ async function resumePendingCodexHistoryRecoveryOnStartup() {
 
 async function repairManagedCodexCompatibilityOnStartup() {
   const settings = await loadSettings();
-  const plan = settings.managedCodexConfigCompatibilityPlan({ homeDir: os.homedir() });
+  const plan = settings.managedCodexConfigCompatibilityPlan({ homeDir: desktopHomeDir() });
   if (!plan.needsRepair) {
     return { repaired: false, skipped: true, reason: plan.reason, target: plan.target };
   }
@@ -742,69 +808,117 @@ async function runLegacyDataMigration() {
   return legacyDataMigrationPromise;
 }
 
-function runLegacyDataMigrationWorker({ targetDir, execPath } = {}) {
-  return new Promise((resolve, reject) => {
-    const worker = new Worker(path.join(__dirname, "legacy-migration-worker.cjs"), {
-      workerData: { targetDir, execPath },
-    });
-    let settled = false;
-    worker.once("message", (message) => {
-      settled = true;
-      if (message?.ok) {
-        resolve(message.result || { copiedFiles: 0, skippedFiles: 0, sourceDirs: [], messages: [] });
-        return;
-      }
-      reject(new Error(message?.error || "Legacy data migration worker failed"));
-    });
-    worker.once("error", (error) => {
-      settled = true;
-      reject(error);
-    });
-    worker.once("exit", (code) => {
-      if (!settled && code !== 0) {
-        reject(new Error(`Legacy data migration worker exited with code ${code}`));
-      }
-    });
+async function runLegacyDataMigrationWorker({ targetDir, execPath } = {}) {
+  const message = await runWorkerForMessage({
+    workerPath: path.join(__dirname, "legacy-migration-worker.cjs"),
+    workerData: { targetDir, execPath },
+    label: "Legacy data migration worker",
+  });
+  if (message?.ok) {
+    return message.result || { copiedFiles: 0, skippedFiles: 0, sourceDirs: [], messages: [] };
+  }
+  throw new Error(message?.error || "Legacy data migration worker failed");
+}
+
+async function runCodexResourceSnapshotWorker(options = {}) {
+  const message = await runWorkerForMessage({
+    workerPath: path.join(__dirname, "resource-snapshot-worker.cjs"),
+    workerData: { options },
+    timeoutMs: CODEX_RESOURCE_SNAPSHOT_WORKER_TIMEOUT_MS,
+    label: "Codex resource snapshot worker",
+  });
+  if (message?.ok) {
+    return message.result || {};
+  }
+  throw new Error(message?.error || "Codex resource snapshot worker failed");
+}
+
+function readCodexResourceSnapshotsRetained(options = {}) {
+  return runResourceSnapshotSingleFlight(snapshotFlightKey("resources", options), async () => {
+    let fresh = await runCodexResourceSnapshotWorker(options);
+    if (!lastCodexResourceSnapshots && !hasCodexResourceAuthority(fresh)) {
+      await delay(350);
+      fresh = await runCodexResourceSnapshotWorker(options);
+    }
+    const retained = retainCodexResourceSnapshots(fresh, lastCodexResourceSnapshots);
+    if (hasCodexResourceAuthority(retained)) {
+      lastCodexResourceSnapshots = retained;
+    }
+    return retained;
   });
 }
 
-function runCodexResourceSnapshotWorker(options = {}) {
-  return new Promise((resolve, reject) => {
-    const worker = new Worker(path.join(__dirname, "resource-snapshot-worker.cjs"), {
-      workerData: { options },
-    });
-    let settled = false;
-    worker.once("message", (message) => {
-      settled = true;
-      if (message?.ok) {
-        resolve(message.result || {});
-        return;
-      }
-      reject(new Error(message?.error || "Codex resource snapshot worker failed"));
-    });
-    worker.once("error", (error) => {
-      settled = true;
-      reject(error);
-    });
-    worker.once("exit", (code) => {
-      if (!settled && code !== 0) {
-        reject(new Error(`Codex resource snapshot worker exited with code ${code}`));
-      }
-    });
+function readCurrentCodexResourceSnapshots(settings, { forceRefresh = false } = {}) {
+  return readCodexResourceSnapshotsRetained({
+    forceRefresh,
+    desktopOptions: settings.loadDesktopOptions(dataRootDir),
+    homeDir: desktopHomeDir(),
+    rootDir: appRootDir,
   });
 }
 
-async function readCodexResourceSnapshotsRetained(options = {}) {
-  let fresh = await runCodexResourceSnapshotWorker(options);
-  if (!lastCodexResourceSnapshots && !hasCodexResourceAuthority(fresh)) {
-    await delay(350);
-    fresh = await runCodexResourceSnapshotWorker(options);
+async function runCodexSessionSnapshotWorker({ homeDir, limit } = {}) {
+  return runSessionSnapshotSingleFlight(snapshotFlightKey("sessions", { homeDir, limit }), async () => {
+    const message = await runWorkerForMessage({
+      workerPath: path.join(__dirname, "session-snapshot-worker.cjs"),
+      workerData: { homeDir, limit },
+      timeoutMs: CODEX_SESSION_SNAPSHOT_WORKER_TIMEOUT_MS,
+      label: "Codex session snapshot worker",
+    });
+    if (message?.ok) return message.result || {};
+    throw new Error(message?.error || "Codex session snapshot worker failed");
+  });
+}
+
+function snapshotFlightKey(kind, value) {
+  return crypto.createHash("sha256")
+    .update(JSON.stringify([kind, value || null]))
+    .digest("hex");
+}
+
+function runCodexSessionExportWorker(action, payload = {}) {
+  const homeDir = desktopHomeDir();
+  const request = normalizeSessionExportRequest(action, payload);
+  const key = snapshotFlightKey("session-export", { ...request, homeDir });
+  return runSessionExportSingleFlight(key, async () => {
+    const message = await runWorkerForMessage({
+      workerPath: path.join(__dirname, "session-export-worker.cjs"),
+      workerData: { ...request, homeDir },
+      timeoutMs: CODEX_SESSION_EXPORT_WORKER_TIMEOUT_MS,
+      label: "Codex session export worker",
+    });
+    if (message?.ok) return message.result || {};
+    const error = new Error(message?.error || "Codex session export worker failed");
+    error.code = safeConfigDiagnostic(message?.code, "session_export_failed");
+    throw error;
+  });
+}
+
+function normalizeSessionExportRequest(action, payload = {}) {
+  const normalizedAction = String(action || "").trim();
+  if (!SESSION_EXPORT_ACTIONS.has(normalizedAction)) {
+    throw Object.assign(new Error("会话导出请求无效。"), { code: "session_export_request_invalid" });
   }
-  const retained = retainCodexResourceSnapshots(fresh, lastCodexResourceSnapshots);
-  if (hasCodexResourceAuthority(retained)) {
-    lastCodexResourceSnapshots = retained;
+  const source = payload && typeof payload === "object" ? payload : {};
+  if (normalizedAction === "session") {
+    return { action: normalizedAction, payload: {
+      sessionId: String(source.sessionId || "").slice(0, SESSION_EXPORT_MAX_ID_CHARS),
+    } };
   }
-  return retained;
+  if (normalizedAction === "project") {
+    return { action: normalizedAction, payload: {
+      projectKey: String(source.projectKey || "").slice(0, SESSION_EXPORT_MAX_ID_CHARS),
+    } };
+  }
+  if (normalizedAction === "filtered") {
+    return { action: normalizedAction, payload: {
+      sessionIds: (Array.isArray(source.sessionIds) ? source.sessionIds : [])
+        .slice(0, SESSION_EXPORT_MAX_IDS)
+        .map((value) => String(value || "").slice(0, SESSION_EXPORT_MAX_ID_CHARS)),
+      filterText: String(source.filterText || "").slice(0, SESSION_EXPORT_MAX_FILTER_CHARS),
+    } };
+  }
+  return { action: normalizedAction, payload: {} };
 }
 
 async function initUsageStore() {
@@ -995,7 +1109,6 @@ function initializeSoftwareManagerIpc() {
           return (await getSoftwareManagerRuntime()).selectInstallRoot(selection.filePaths[0]);
         },
         sendEvent: (event) => sendToRenderer("softwareManager:event", event),
-        cancelExternalTask: () => cancelCuratedPluginTask(),
       });
     }).catch((error) => {
       softwareManagerIpcPromise = null;
@@ -1117,22 +1230,15 @@ app.whenReady().then(async () => {
     return;
   }
   if (process.platform === "win32") {
-    let runtime = null;
     try {
-      // Recovery is local-only and deliberately precedes renderer access. It
-      // neither refreshes the signed catalog nor launches external software.
-      runtime = await getSoftwareManagerRuntime();
+      // Construct the optional runtime early so native dependency failures are
+      // isolated before the window opens. Potentially long transaction
+      // recovery remains lazy: every software-manager read or mutation already
+      // enters the service recovery gate before exposing or changing state.
+      await getSoftwareManagerRuntime();
     } catch (error) {
       appendRuntimeLog(formatError("softwareManagerStartup", error));
       softwareManagerStartupFailure = error;
-    }
-    try {
-      // Interrupted installs can fail the first recovery attempt transiently
-      // while Windows releases child-process handles. Keep the real service
-      // available so opening the page or clicking refresh can retry safely.
-      if (runtime) await runtime.recoverOffline();
-    } catch (error) {
-      appendRuntimeLog(formatError("softwareManagerRecovery", error));
     }
   }
   try {
@@ -1373,7 +1479,8 @@ ipcMain.handle("state:get", async (_event, options = {}) => {
   return payload;
 });
 
-ipcMain.handle("mode:select", async (_event, mode) => {
+ipcMain.handle("mode:select", async (_event, mode, options = {}) => {
+  if (!options || typeof options !== "object" || Array.isArray(options)) throw new Error("Invalid mode options.");
   const settings = await loadSettings();
   const [{ runModeSelect }, { locateCodexInstall }] = await Promise.all([
     import("./mode-switch-handler.mjs"),
@@ -1382,8 +1489,11 @@ ipcMain.handle("mode:select", async (_event, mode) => {
   return runModeSelect({
     settings,
     rootDir: dataRootDir,
-    homeDir: os.homedir(),
+    homeDir: desktopHomeDir(),
     mode,
+    preserveApiSelection: options.preserveApiSelection,
+    preserveSelection: options.preserveSelection,
+    expectedSelectedModelIds: options.expectedSelectedModelIds,
     routerRunning: Boolean(routerProcess),
     refreshRouterHealth,
     locateCodexInstall: () => locateCodexRestartTarget(settings, locateCodexInstall),
@@ -1416,15 +1526,14 @@ ipcMain.handle("options:save", async (_event, options) => {
       : "System proxy bypass disabled for Router process.",
   );
   appendLog(`Router port configured: ${committed.routerConfig.port}. Restart Router for port changes to take effect.`);
-  return getStatePayload(settings);
+  return getStatePayload(settings, { lite: true });
 });
 
 ipcMain.handle("startup:check", async () => {
   const settings = await loadSettings();
-  const config = settings.readRouterConfig(dataRootDir);
-  const desktopOptions = settings.loadDesktopOptions(dataRootDir);
   const { codexCliSnapshot, codexPromptInputSnapshot } =
-    settings.readCodexResourceSnapshots({ desktopOptions });
+    await readCurrentCodexResourceSnapshots(settings, { forceRefresh: true });
+  const config = settings.readRouterConfig(dataRootDir);
   const check = settings.buildStartupCheck(dataRootDir, {
     appVersion: app.getVersion(),
     routerRunning: Boolean(routerProcess),
@@ -1438,10 +1547,13 @@ ipcMain.handle("startup:check", async () => {
   return check;
 });
 
-ipcMain.handle("models:saveSelection", async (_event, selectedModelIds) => {
+ipcMain.handle("models:saveSelection", async (_event, selectedModelIds, options = {}) => {
+  if (!options || typeof options !== "object" || Array.isArray(options) ||
+      (options.exactSelection !== undefined && typeof options.exactSelection !== "boolean")) throw new Error("Invalid selection options.");
   const settings = await loadSettings();
   const committed = await commitConfigMutation(settings, "models:saveSelection", {
     selectedModelIds,
+    ...(options.exactSelection ? { exactSelection: true, expectedMode: options.expectedMode } : {}),
   }, { publish: false });
   const saved = committed.selectedModelIds;
   appendLog(`Saved model selection: ${saved.join(", ")}.`);
@@ -1459,7 +1571,7 @@ ipcMain.handle("models:saveImageInput", async (_event, payload) => {
   appendLog(
     `Updated image upload support: ${saved.presetId} ${saved.imageInput ? "enabled" : "disabled"}.`,
   );
-  return getStatePayload(settings);
+  return getStatePayload(settings, { lite: true });
 });
 
 ipcMain.handle("models:saveImageGeneration", async (_event, payload) => {
@@ -1473,7 +1585,7 @@ ipcMain.handle("models:saveImageGeneration", async (_event, payload) => {
   appendLog(
     `Updated image generation provider: ${saved.presetId} -> ${saved.imageGeneration.mode}.`,
   );
-  return getStatePayload(settings);
+  return getStatePayload(settings, { lite: true });
 });
 
 ipcMain.handle("models:repairReferences", async () => {
@@ -1482,7 +1594,7 @@ ipcMain.handle("models:repairReferences", async () => {
   appendLog(`Repaired model references: ${result.selectedModelIds.length} selected route(s).`);
   return {
     result,
-    state: await getStatePayload(settings),
+    state: await getStatePayload(settings, { lite: true }),
   };
 });
 
@@ -1495,7 +1607,7 @@ ipcMain.handle("imageProviders:save", async (_event, provider) => {
   appendLog(`Saved image generation provider: ${saved.name}.`);
   return {
     saved,
-    state: await getStatePayload(settings),
+    state: await getStatePayload(settings, { lite: true }),
   };
 });
 
@@ -1509,7 +1621,7 @@ ipcMain.handle("imageProviders:remove", async (_event, providerId) => {
   appendLog(`Removed image generation provider: ${removedId || "unknown"}.`);
   return {
     config,
-    state: await getStatePayload(settings),
+    state: await getStatePayload(settings, { lite: true }),
   };
 });
 
@@ -1522,7 +1634,7 @@ ipcMain.handle("capabilityProviders:save", async (_event, provider) => {
   appendLog(`Saved capability provider: ${saved?.name || saved?.id || "unknown"}.`);
   return {
     saved,
-    state: await getStatePayload(settings),
+    state: await getStatePayload(settings, { lite: true }),
   };
 });
 
@@ -1536,7 +1648,7 @@ ipcMain.handle("capabilityProviders:remove", async (_event, providerId) => {
   appendLog(`Removed capability provider: ${removedId || "unknown"}.`);
   return {
     config,
-    state: await getStatePayload(settings),
+    state: await getStatePayload(settings, { lite: true }),
   };
 });
 
@@ -1738,7 +1850,7 @@ ipcMain.handle("models:saveCapabilities", async (_event, payload) => {
   appendLog(`Updated model capabilities: ${presetId}.`);
   return {
     saved,
-    state: await getStatePayload(settings),
+    state: await getStatePayload(settings, { lite: true }),
   };
 });
 
@@ -1751,7 +1863,7 @@ ipcMain.handle("models:resetCapabilities", async (_event, presetId) => {
   appendLog(`Reset model capabilities: ${reset.presetId}.`);
   return {
     reset,
-    state: await getStatePayload(settings),
+    state: await getStatePayload(settings, { lite: true }),
   };
 });
 
@@ -1767,7 +1879,7 @@ ipcMain.handle("providers:refreshModels", async (_event, providerId) => {
   const { providerFingerprint: _providerFingerprint, ...publicResult } = result;
   return {
     result: publicResult,
-    state: await getStatePayload(settings),
+    state: await getStatePayload(settings, { lite: true }),
   };
 });
 
@@ -1782,7 +1894,7 @@ ipcMain.handle("providers:save", async (_event, provider) => {
   return {
     saved,
     sync: committed,
-    state: await getStatePayload(settings),
+    state: await getStatePayload(settings, { lite: true }),
   };
 });
 
@@ -1794,7 +1906,7 @@ ipcMain.handle("providers:reset", async (_event, providerId) => {
   appendLog(`Reset provider settings: ${providerName}.`);
   return {
     result: committed.result,
-    state: await getStatePayload(settings),
+    state: await getStatePayload(settings, { lite: true }),
   };
 });
 
@@ -1836,7 +1948,7 @@ ipcMain.handle("logos:select", async (_event, payload = {}) => {
     appendLog(`Updated provider logo: ${providerId}.`);
     return {
       ...saved,
-      state: await getStatePayload(settings),
+      state: await getStatePayload(settings, { lite: true }),
     };
   }
   return saved;
@@ -1857,7 +1969,7 @@ ipcMain.handle("customModel:remove", async (_event, presetId) => {
   const settings = await loadSettings();
   await commitConfigMutation(settings, "customModel:remove", { presetId });
   appendLog(`Removed custom model: ${presetId}.`);
-  return getStatePayload(settings);
+  return getStatePayload(settings, { lite: true });
 });
 
 ipcMain.handle("profiles:save", async (_event, profile) => {
@@ -1873,7 +1985,7 @@ ipcMain.handle("profiles:save", async (_event, profile) => {
   appendLog(`Saved config profile: ${saved.name}.`);
   return {
     saved,
-    state: await getStatePayload(settings),
+    state: await getStatePayload(settings, { lite: true }),
   };
 });
 
@@ -1885,15 +1997,14 @@ ipcMain.handle("profiles:apply", async (_event, profileId) => {
   const profile = committed.result.profile;
   appendLog(`Applied config profile: ${profile.name}.`);
   refreshTrayMenu();
-  return getStatePayload(settings);
+  return getStatePayload(settings, { lite: true });
 });
 
 ipcMain.handle("configPackage:export", async () => {
   const settings = await loadSettings();
+  const { codexCliSnapshot, codexPromptInputSnapshot } =
+    await readCurrentCodexResourceSnapshots(settings);
   const pkg = await settings.runSharedConfigExclusive(() => {
-    const resourceSnapshotOptions = { desktopOptions: settings.loadDesktopOptions(dataRootDir) };
-    const { codexCliSnapshot, codexPromptInputSnapshot } =
-      settings.readCodexResourceSnapshots(resourceSnapshotOptions);
     return settings.exportConfigPackage(dataRootDir, {
       codexCliSnapshot,
       includeCodexCliSnapshot: true,
@@ -1912,7 +2023,7 @@ ipcMain.handle("configPackage:export", async () => {
   if (result.canceled || !result.filePath) {
     return { canceled: true };
   }
-  fs.writeFileSync(result.filePath, `${JSON.stringify(pkg, null, 2)}\n`, "utf8");
+  await fs.promises.writeFile(result.filePath, `${JSON.stringify(pkg, null, 2)}\n`, "utf8");
   appendLog(`Exported config package: ${result.filePath}`);
   return {
     canceled: false,
@@ -1938,10 +2049,9 @@ ipcMain.handle("configPackage:exportToSyncDir", async () => {
   if (result.canceled || !result.filePaths?.[0]) {
     return { canceled: true };
   }
+  const { codexCliSnapshot, codexPromptInputSnapshot } =
+    await readCurrentCodexResourceSnapshots(settings);
   const exported = await settings.runSharedConfigExclusive(() => {
-    const resourceSnapshotOptions = { desktopOptions: settings.loadDesktopOptions(dataRootDir) };
-    const { codexCliSnapshot, codexPromptInputSnapshot } =
-      settings.readCodexResourceSnapshots(resourceSnapshotOptions);
     return settings.exportConfigPackageToDirectory(dataRootDir, result.filePaths[0], {
       codexCliSnapshot,
       includeCodexCliSnapshot: true,
@@ -2194,162 +2304,11 @@ ipcMain.handle("resource:refreshMarketplaces", async () => {
   };
 });
 
-async function managedCuratedPluginCliOptions() {
-  try {
-    const runtime = await getSoftwareManagerRuntime();
-    const snapshot = await runtime.service.getSnapshot();
-    const chatgpt = snapshot?.components?.find((entry) => entry?.id === "chatgpt");
-    // ChatGPT has no external-install mode in the software manager, so its
-    // successful installed-version inspection is the ownership signal. The
-    // public snapshot intentionally exposes `ownership` only for Git.
-    if (typeof chatgpt?.installedVersion !== "string" || typeof chatgpt.installPath !== "string") return {};
-    const executable = path.join(chatgpt.installPath, "resources", "codex.exe");
-    return fs.existsSync(executable) ? { executable } : {};
-  } catch {
-    return {};
-  }
-}
-
-ipcMain.handle("curatedPlugin:list", async () => {
-  const settings = await loadSettings();
-  const cliOptions = await managedCuratedPluginCliOptions();
-  return settings.listCuratedCodexPluginResources(cliOptions);
-});
-
-function curatedPluginTaskError(code, cause = undefined) {
-  const error = new Error(code, cause === undefined ? undefined : { cause });
-  error.code = code;
-  return error;
-}
-
-async function validateCuratedPluginTaskRequest(payload) {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)
-    || Object.getPrototypeOf(payload) !== Object.prototype
-    || Object.keys(payload).sort().join("\0") !== ["kind", "pluginIds"].sort().join("\0")
-    || !["install", "uninstall"].includes(payload.kind)
-    || !Array.isArray(payload.pluginIds) || payload.pluginIds.length < 1 || payload.pluginIds.length > 2
-    || new Set(payload.pluginIds).size !== payload.pluginIds.length) {
-    throw curatedPluginTaskError("curated_plugin_task_request_invalid");
-  }
-  const { CURATED_CODEX_PLUGINS } = await import("../shared/software-manager/curated-plugins.mjs");
-  const allowed = new Set(CURATED_CODEX_PLUGINS.map(({ id }) => id));
-  if (payload.pluginIds.some((id) => typeof id !== "string" || !allowed.has(id))) {
-    throw curatedPluginTaskError("curated_plugin_task_request_invalid");
-  }
-  return Object.freeze({ kind: payload.kind, pluginIds: Object.freeze([...payload.pluginIds]) });
-}
-
-function curatedPluginTaskStatus(entries) {
-  const succeeded = entries.filter(({ status }) => ["succeeded", "skipped"].includes(status)).length;
-  const failed = entries.filter(({ status }) => status === "failed").length;
-  const cancelled = entries.filter(({ status }) => status === "cancelled").length;
-  if (failed > 0) return succeeded > 0 ? "partial" : "failed";
-  if (cancelled > 0) return succeeded > 0 ? "partial" : "cancelled";
-  return "succeeded";
-}
-
-function cancelCuratedPluginTask() {
-  const task = curatedPluginTask;
-  if (!task) return null;
-  if (task.controller.signal.aborted) return { cancelled: false, reason: "cancelling" };
-  task.controller.abort(curatedPluginTaskError("curated_plugin_cancelled"));
-  sendToRenderer("softwareManager:event", {
-    type: "progress", taskId: task.taskId, componentId: task.currentPluginId,
-    phase: "cancelling", percent: null, cancellable: false,
-    message: "正在安全取消完整插件任务",
-  });
-  return { cancelled: true };
-}
-
-async function runCuratedPluginTask(payload) {
-  const request = await validateCuratedPluginTaskRequest(payload);
-  if (curatedPluginTask) throw curatedPluginTaskError("curated_plugin_task_running");
-  const taskId = `plugins-${Date.now().toString(36)}-${(++curatedPluginTaskSequence).toString(36)}`;
-  const startedAt = Date.now();
-  const deadlineAt = startedAt + CURATED_PLUGIN_TASK_TIMEOUT_MS;
-  const controller = new AbortController();
-  let resolveDone;
-  const done = new Promise((resolve) => { resolveDone = resolve; });
-  const task = {
-    taskId, kind: request.kind, pluginIds: [...request.pluginIds], currentPluginId: null,
-    controller, deadlineAt, done,
-  };
-  curatedPluginTask = task;
-  appendRuntimeLog(`curated-plugin-task start id=${taskId} kind=${request.kind} count=${request.pluginIds.length}`);
-  const entries = [];
-  try {
-    const settings = await loadSettings();
-    const cliOptions = await managedCuratedPluginCliOptions();
-    for (let index = 0; index < request.pluginIds.length; index += 1) {
-      const id = request.pluginIds[index];
-      task.currentPluginId = id;
-      if (controller.signal.aborted) {
-        entries.push({
-          componentId: id, action: request.kind, status: "cancelled",
-          versionBefore: null, versionAfter: null, message: "curated_plugin_cancelled", rollbackAvailable: false,
-        });
-        continue;
-      }
-      const remainingMs = deadlineAt - Date.now();
-      if (remainingMs <= 0) {
-        entries.push({
-          componentId: id, action: request.kind, status: "failed",
-          versionBefore: null, versionAfter: null, message: "curated_plugin_timeout", rollbackAvailable: false,
-        });
-        continue;
-      }
-      sendToRenderer("softwareManager:event", {
-        type: "progress", taskId, componentId: id, phase: "plugin",
-        percent: (index / request.pluginIds.length) * 100, cancellable: true,
-        message: request.kind === "install" ? "正在安装完整插件" : "正在卸载完整插件",
-      });
-      try {
-        const pluginResult = await settings.runSharedConfigExclusive(() => (
-          request.kind === "install"
-            ? settings.installCuratedCodexPluginResource({
-                id, ...cliOptions, timeoutMs: remainingMs, signal: controller.signal,
-              })
-            : settings.removeCuratedCodexPluginResource({
-                id, ...cliOptions, timeoutMs: remainingMs, signal: controller.signal,
-              })
-        ));
-        entries.push({
-          componentId: id, action: request.kind, status: "succeeded",
-          versionBefore: null, versionAfter: pluginResult?.version || null,
-          message: request.kind === "install" ? "curated_plugin_installed" : "curated_plugin_removed",
-          rollbackAvailable: false,
-        });
-      } catch (error) {
-        const cancelled = controller.signal.aborted || error?.code === "curated_plugin_cancelled";
-        entries.push({
-          componentId: id, action: request.kind, status: cancelled ? "cancelled" : "failed",
-          versionBefore: null, versionAfter: null,
-          message: cancelled ? "curated_plugin_cancelled" : error?.message || String(error),
-          rollbackAvailable: false,
-        });
-      }
-    }
-    const result = Object.freeze({
-      taskId, kind: request.kind, status: curatedPluginTaskStatus(entries),
-      plugins: Object.freeze(entries.map((entry) => Object.freeze({ ...entry }))),
-      startedAt, finishedAt: Date.now(),
-    });
-    appendRuntimeLog(`curated-plugin-task finish id=${taskId} status=${result.status}`);
-    await broadcastState();
-    return result;
-  } finally {
-    if (curatedPluginTask === task) curatedPluginTask = null;
-    resolveDone();
-  }
-}
-
-ipcMain.handle("curatedPlugin:runTask", async (_event, payload) => runCuratedPluginTask(payload));
-
 ipcMain.handle("backups:restore", async (_event, backupPath) => {
   const settings = await loadSettings();
   const result = await settings.restoreCodexConfigFromBackup(
     String(backupPath || ""),
-    { homeDir: os.homedir() },
+    { homeDir: desktopHomeDir() },
   );
   appendLog(`Restored Codex config from selected backup: ${result.backup}`);
   if (result.currentBackup) {
@@ -2362,9 +2321,30 @@ ipcMain.handle("backups:restore", async (_event, backupPath) => {
   };
 });
 
+function copySessionExportMarkdown(markdown, markdownBytes) {
+  if (markdownBytes > SESSION_EXPORT_CLIPBOARD_MAX_BYTES) return false;
+  clipboard.writeText(markdown);
+  return true;
+}
+
+function writeBoundedClipboardText(value, {
+  tooLargeMessage = "内容过大，无法复制到剪贴板；请改用保存文件。",
+} = {}) {
+  const text = String(value || "");
+  const bytes = Buffer.byteLength(text, "utf8");
+  if (bytes > CLIPBOARD_TEXT_MAX_BYTES) {
+    const error = new Error(tooLargeMessage);
+    error.code = "clipboard_text_too_large";
+    throw error;
+  }
+  clipboard.writeText(text);
+  return { length: text.length, bytes };
+}
+
 ipcMain.handle("sessions:export", async (_event, sessionId) => {
-  const settings = await loadSettings();
-  const exported = settings.exportCodexSessionMarkdown(String(sessionId || ""));
+  const exported = await runCodexSessionExportWorker("session", {
+    sessionId: String(sessionId || ""),
+  });
   const result = await dialog.showSaveDialog(mainWindow, {
     title: "导出 Codex 会话 Markdown",
     defaultPath: path.join(
@@ -2376,8 +2356,8 @@ ipcMain.handle("sessions:export", async (_event, sessionId) => {
   if (result.canceled || !result.filePath) {
     return { ok: false, canceled: true };
   }
-  fs.writeFileSync(result.filePath, exported.markdown, "utf8");
-  clipboard.writeText(exported.markdown);
+  await fs.promises.writeFile(result.filePath, exported.markdown, "utf8");
+  const clipboardCopied = copySessionExportMarkdown(exported.markdown, exported.markdownBytes);
   appendLog(`Exported Codex session markdown: ${exported.session?.id || sessionId} -> ${result.filePath}.`);
   return {
     ok: true,
@@ -2386,12 +2366,14 @@ ipcMain.handle("sessions:export", async (_event, sessionId) => {
     session: exported.session,
     databasePath: exported.databasePath,
     markdownLength: exported.markdown.length,
+    clipboardCopied,
   };
 });
 
 ipcMain.handle("sessions:exportProject", async (_event, projectKey) => {
-  const settings = await loadSettings();
-  const exported = settings.exportCodexProjectMarkdown(String(projectKey || ""));
+  const exported = await runCodexSessionExportWorker("project", {
+    projectKey: String(projectKey || ""),
+  });
   const result = await dialog.showSaveDialog(mainWindow, {
     title: "导出 Codex 项目 Markdown",
     defaultPath: path.join(
@@ -2403,8 +2385,8 @@ ipcMain.handle("sessions:exportProject", async (_event, projectKey) => {
   if (result.canceled || !result.filePath) {
     return { ok: false, canceled: true };
   }
-  fs.writeFileSync(result.filePath, exported.markdown, "utf8");
-  clipboard.writeText(exported.markdown);
+  await fs.promises.writeFile(result.filePath, exported.markdown, "utf8");
+  const clipboardCopied = copySessionExportMarkdown(exported.markdown, exported.markdownBytes);
   appendLog(`Exported Codex project markdown: ${exported.project?.key || projectKey} -> ${result.filePath}.`);
   return {
     ok: true,
@@ -2412,12 +2394,12 @@ ipcMain.handle("sessions:exportProject", async (_event, projectKey) => {
     filePath: result.filePath,
     project: exported.project,
     markdownLength: exported.markdown.length,
+    clipboardCopied,
   };
 });
 
 ipcMain.handle("sessions:exportLoose", async () => {
-  const settings = await loadSettings();
-  const exported = settings.exportCodexLooseSessionsMarkdown();
+  const exported = await runCodexSessionExportWorker("loose");
   const result = await dialog.showSaveDialog(mainWindow, {
     title: "导出 Codex 无项目会话 Markdown",
     defaultPath: path.join(
@@ -2429,21 +2411,21 @@ ipcMain.handle("sessions:exportLoose", async () => {
   if (result.canceled || !result.filePath) {
     return { ok: false, canceled: true };
   }
-  fs.writeFileSync(result.filePath, exported.markdown, "utf8");
-  clipboard.writeText(exported.markdown);
-  appendLog(`Exported Codex no-project sessions markdown: ${exported.group?.sessions?.length || 0} sessions -> ${result.filePath}.`);
+  await fs.promises.writeFile(result.filePath, exported.markdown, "utf8");
+  const clipboardCopied = copySessionExportMarkdown(exported.markdown, exported.markdownBytes);
+  appendLog(`Exported Codex no-project sessions markdown: ${exported.group?.sessionCount || 0} sessions -> ${result.filePath}.`);
   return {
     ok: true,
     canceled: false,
     filePath: result.filePath,
     group: exported.group,
     markdownLength: exported.markdown.length,
+    clipboardCopied,
   };
 });
 
 ipcMain.handle("sessions:exportAll", async () => {
-  const settings = await loadSettings();
-  const exported = settings.exportCodexSessionTreeMarkdown();
+  const exported = await runCodexSessionExportWorker("all");
   const result = await dialog.showSaveDialog(mainWindow, {
     title: "导出全部 Codex 会话与项目 Markdown",
     defaultPath: path.join(
@@ -2455,8 +2437,8 @@ ipcMain.handle("sessions:exportAll", async () => {
   if (result.canceled || !result.filePath) {
     return { ok: false, canceled: true };
   }
-  fs.writeFileSync(result.filePath, exported.markdown, "utf8");
-  clipboard.writeText(exported.markdown);
+  await fs.promises.writeFile(result.filePath, exported.markdown, "utf8");
+  const clipboardCopied = copySessionExportMarkdown(exported.markdown, exported.markdownBytes);
   appendLog(`Exported all Codex sessions markdown: ${exported.tree?.summary?.sessions || 0} sessions -> ${result.filePath}.`);
   return {
     ok: true,
@@ -2464,12 +2446,12 @@ ipcMain.handle("sessions:exportAll", async () => {
     filePath: result.filePath,
     tree: exported.tree,
     markdownLength: exported.markdown.length,
+    clipboardCopied,
   };
 });
 
 ipcMain.handle("sessions:exportFiltered", async (_event, payload = {}) => {
-  const settings = await loadSettings();
-  const exported = settings.exportCodexFilteredSessionsMarkdown({
+  const exported = await runCodexSessionExportWorker("filtered", {
     sessionIds: Array.isArray(payload?.sessionIds) ? payload.sessionIds : [],
     filterText: String(payload?.filterText || ""),
   });
@@ -2484,8 +2466,8 @@ ipcMain.handle("sessions:exportFiltered", async (_event, payload = {}) => {
   if (result.canceled || !result.filePath) {
     return { ok: false, canceled: true };
   }
-  fs.writeFileSync(result.filePath, exported.markdown, "utf8");
-  clipboard.writeText(exported.markdown);
+  await fs.promises.writeFile(result.filePath, exported.markdown, "utf8");
+  const clipboardCopied = copySessionExportMarkdown(exported.markdown, exported.markdownBytes);
   appendLog(`Exported filtered Codex sessions markdown: ${exported.tree?.summary?.sessions || 0} sessions -> ${result.filePath}.`);
   return {
     ok: true,
@@ -2494,6 +2476,7 @@ ipcMain.handle("sessions:exportFiltered", async (_event, payload = {}) => {
     tree: exported.tree,
     filterText: exported.filterText,
     markdownLength: exported.markdown.length,
+    clipboardCopied,
   };
 });
 
@@ -2508,8 +2491,8 @@ ipcMain.handle("codex:apply", async () => {
   const settings = await loadSettings();
   const committed = await commitConfigMutation(settings, "codex:apply");
   const result = {
-    target: settings.codexConfigPath(os.homedir()),
-    modelCatalog: settings.codexCatalogPath(os.homedir()),
+    target: settings.codexConfigPath(desktopHomeDir()),
+    modelCatalog: settings.codexCatalogPath(desktopHomeDir()),
     unchanged: false,
     backup: null,
     revision: committed.configRevision,
@@ -2527,8 +2510,8 @@ ipcMain.handle("codex:initialize", async () => {
     revision: committed.configRevision,
   };
   const codexResult = {
-    target: settings.codexConfigPath(os.homedir()),
-    modelCatalog: settings.codexCatalogPath(os.homedir()),
+    target: settings.codexConfigPath(desktopHomeDir()),
+    modelCatalog: settings.codexCatalogPath(desktopHomeDir()),
     backup: null,
     revision: committed.configRevision,
   };
@@ -2542,7 +2525,7 @@ ipcMain.handle("codex:initialize", async () => {
 
 ipcMain.handle("codex:restore", async () => {
   const settings = await loadSettings();
-  const result = await settings.restoreCodexConfig({ homeDir: os.homedir() });
+  const result = await settings.restoreCodexConfig({ homeDir: desktopHomeDir() });
   appendLog(`Restored Codex config from backup: ${result.backup}`);
   if (result.currentBackup) {
     appendLog(`Current config backed up before restore: ${result.currentBackup}`);
@@ -2812,10 +2795,9 @@ async function stopRouterWithManagedConfigCleanup({ source = "unknown" } = {}) {
 
 ipcMain.handle("diagnostics:copy", async () => {
   const settings = await loadSettings();
-  const config = settings.readRouterConfig(dataRootDir);
-  const resourceSnapshotOptions = { desktopOptions: settings.loadDesktopOptions(dataRootDir) };
   const { codexCliSnapshot, codexPromptInputSnapshot } =
-    settings.readCodexResourceSnapshots(resourceSnapshotOptions);
+    await readCurrentCodexResourceSnapshots(settings, { forceRefresh: true });
+  const config = settings.readRouterConfig(dataRootDir);
   const diagnostics = settings.supportDiagnostics(dataRootDir, {
     appVersion: app.getVersion(),
     routerRunning: Boolean(routerProcess),
@@ -2828,7 +2810,9 @@ ipcMain.handle("diagnostics:copy", async () => {
     codexCliSnapshot,
     codexPromptInputSnapshot,
   });
-  clipboard.writeText(diagnostics.text);
+  writeBoundedClipboardText(diagnostics.text, {
+    tooLargeMessage: "诊断信息过大，无法复制到剪贴板；请点击“保存体检报告”。",
+  });
   appendLog("Copied sanitized diagnostics to clipboard.");
   broadcastState();
   return diagnostics.summary;
@@ -2847,10 +2831,9 @@ ipcMain.handle("diagnostics:save", async () => {
   if (result.canceled || !result.filePath) {
     return { canceled: true };
   }
-  const config = settings.readRouterConfig(dataRootDir);
-  const resourceSnapshotOptions = { desktopOptions: settings.loadDesktopOptions(dataRootDir) };
   const { codexCliSnapshot, codexPromptInputSnapshot } =
-    settings.readCodexResourceSnapshots(resourceSnapshotOptions);
+    await readCurrentCodexResourceSnapshots(settings, { forceRefresh: true });
+  const config = settings.readRouterConfig(dataRootDir);
   const diagnostics = settings.supportDiagnostics(dataRootDir, {
     appVersion: app.getVersion(),
     routerRunning: Boolean(routerProcess),
@@ -2863,7 +2846,7 @@ ipcMain.handle("diagnostics:save", async () => {
     codexCliSnapshot,
     codexPromptInputSnapshot,
   });
-  fs.writeFileSync(result.filePath, diagnostics.text, "utf8");
+  await fs.promises.writeFile(result.filePath, diagnostics.text, "utf8");
   appendLog(`Saved sanitized diagnostics report: ${result.filePath}`);
   broadcastState();
   return {
@@ -2886,10 +2869,9 @@ ipcMain.handle("releaseGate:save", async () => {
   if (result.canceled || !result.filePath) {
     return { canceled: true };
   }
-  const config = settings.readRouterConfig(dataRootDir);
-  const resourceSnapshotOptions = { desktopOptions: settings.loadDesktopOptions(dataRootDir) };
   const { codexCliSnapshot, codexPromptInputSnapshot } =
-    settings.readCodexResourceSnapshots(resourceSnapshotOptions);
+    await readCurrentCodexResourceSnapshots(settings, { forceRefresh: true });
+  const config = settings.readRouterConfig(dataRootDir);
   const releaseAssets = releaseAssetsForDesktopPreflight(settings, { logErrors: true });
   const reportResult = settings.saveReleaseGateReport(dataRootDir, result.filePath, {
     appVersion: app.getVersion(),
@@ -2967,9 +2949,7 @@ ipcMain.handle("acceptance:save", async () => {
 });
 
 ipcMain.handle("clipboard:write", async (_event, text) => {
-  const value = String(text || "");
-  clipboard.writeText(value);
-  return { ok: true, length: value.length };
+  return { ok: true, ...writeBoundedClipboardText(text) };
 });
 
 ipcMain.handle("updates:check", async () => {
@@ -3061,7 +3041,7 @@ ipcMain.handle("updates:install", async () => {
     message: "Update package downloaded; restarting into the new version.",
   });
   try {
-    launchPortableUpdateScript(prepared.scriptPath);
+    await launchPortableUpdateScript(prepared.scriptPath);
   } catch (error) {
     appendRuntimeLog(formatError("launchPortableUpdateScript", error));
     try {
@@ -3161,34 +3141,72 @@ ipcMain.handle("dialog:error", async (_event, message) => {
 });
 
 async function ensureLocalExecutorServer() {
-  if (localExecutorServer && localExecutorUrl && localExecutorToken) {
+  if (localExecutorServer?.listening && localExecutorUrl && localExecutorToken) {
     return { url: localExecutorUrl, token: localExecutorToken };
   }
-  localExecutorToken = crypto.randomBytes(32).toString("hex");
-  localExecutorServer = http.createServer(handleLocalExecutorRequest);
-  await new Promise((resolve, reject) => {
-    localExecutorServer.once("error", reject);
-    localExecutorServer.listen(0, "127.0.0.1", () => {
-      localExecutorServer.off("error", reject);
-      resolve();
-    });
+  if (localExecutorStartPromise) return localExecutorStartPromise;
+  let tracked = startLocalExecutorServer();
+  tracked = tracked.finally(() => {
+    if (localExecutorStartPromise === tracked) localExecutorStartPromise = null;
   });
-  localExecutorServer.on("error", (error) => appendRuntimeLog(formatError("localExecutorServer", error)));
-  const address = localExecutorServer.address();
-  localExecutorUrl = `http://127.0.0.1:${address.port}/local-capability/execute`;
-  appendLog(`Local capability executor listening on ${localExecutorUrl}.`);
-  return { url: localExecutorUrl, token: localExecutorToken };
+  localExecutorStartPromise = tracked;
+  return tracked;
+}
+
+async function startLocalExecutorServer() {
+  const token = crypto.randomBytes(32).toString("hex");
+  const server = http.createServer(handleLocalExecutorRequest);
+  localExecutorStartingServer = server;
+  try {
+    const address = await listenServerWithDeadline(server, {
+      port: 0,
+      host: "127.0.0.1",
+      timeoutMs: 5_000,
+    });
+    if (!address || !Number.isInteger(address.port) || address.port < 1 || address.port > 65535) {
+      const error = new Error("Local capability executor returned an invalid listen address.");
+      error.code = "LOCAL_EXECUTOR_ADDRESS_INVALID";
+      throw error;
+    }
+    if (localExecutorStartingServer !== server) {
+      try { server.close(); } catch {}
+      const error = new Error("Local capability executor start was cancelled.");
+      error.code = "LOCAL_EXECUTOR_START_CANCELLED";
+      throw error;
+    }
+    localExecutorStartingServer = null;
+    localExecutorServer = server;
+    localExecutorToken = token;
+    localExecutorUrl = `http://127.0.0.1:${address.port}/local-capability/execute`;
+    server.on("error", (error) => appendRuntimeLog(formatError("localExecutorServer", error)));
+    server.once("close", () => clearLocalExecutorServer(server));
+    appendLog(`Local capability executor listening on ${localExecutorUrl}.`);
+    return { url: localExecutorUrl, token: localExecutorToken };
+  } catch (error) {
+    if (localExecutorStartingServer === server) localExecutorStartingServer = null;
+    try { server.close(); } catch {}
+    throw error;
+  }
 }
 
 function stopLocalExecutorServer() {
-  if (!localExecutorServer) {
-    return;
+  const starting = localExecutorStartingServer;
+  localExecutorStartingServer = null;
+  if (starting) {
+    try { starting.close(); } catch {}
   }
+  const active = localExecutorServer;
+  clearLocalExecutorServer(active);
+  if (!active) return;
   try {
-    localExecutorServer.close();
+    active.close();
   } catch (error) {
     appendRuntimeLog(formatError("localExecutorClose", error));
   }
+}
+
+function clearLocalExecutorServer(server) {
+  if (!server || localExecutorServer !== server) return;
   localExecutorServer = null;
   localExecutorUrl = "";
   localExecutorToken = "";
@@ -3211,7 +3229,7 @@ async function handleLocalExecutorRequest(req, res) {
       });
       return;
     }
-    const payload = await readLocalExecutorJson(req);
+    const payload = await readBoundedJsonRequest(req);
     if (!isAllowedLocalExecutorPayload(payload)) {
       writeLocalExecutorJson(res, 400, {
         ok: false,
@@ -3248,34 +3266,15 @@ function isAllowedLocalExecutorPayload(payload = {}) {
   );
 }
 
-function readLocalExecutorJson(req, limitBytes = 1024 * 1024) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let total = 0;
-    req.on("data", (chunk) => {
-      total += chunk.length;
-      if (total > limitBytes) {
-        reject(new Error("本地能力执行器请求体过大，请减少输入内容后重试。"));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on("error", reject);
-    req.on("end", () => {
-      try {
-        const text = Buffer.concat(chunks).toString("utf8");
-        resolve(text.trim() ? JSON.parse(text) : {});
-      } catch (error) {
-        reject(new Error("本地能力执行器请求不是有效的 JSON。"));
-      }
-    });
-  });
-}
-
 function writeLocalExecutorJson(res, statusCode, body) {
-  res.writeHead(statusCode, { "content-type": "application/json; charset=utf-8" });
-  res.end(JSON.stringify(body));
+  if (!res || res.destroyed || res.writableEnded) return false;
+  try {
+    res.writeHead(statusCode, { "content-type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify(body));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function requestManagedAppQuit(reason = "application") {
@@ -3290,49 +3289,11 @@ function requestManagedAppQuit(reason = "application") {
   return tracked;
 }
 
-async function prepareCuratedPluginAppQuit() {
-  const task = curatedPluginTask;
-  if (!task) return { allowQuit: true };
-  const result = await dialog.showMessageBox(mainWindow, {
-    type: "question",
-    title: "完整插件任务正在进行",
-    message: "完整插件正在写入 Codex 配置。你可以让 CodexBridge 继续在后台运行，或安全取消任务后退出。",
-    buttons: ["继续后台运行", "取消任务并退出"],
-    defaultId: 0,
-    cancelId: 0,
-    noLink: true,
-  });
-  if (result.response !== 1) return { allowQuit: false, reason: "background" };
-  cancelCuratedPluginTask();
-  let completed = false;
-  await Promise.race([
-    task.done.then(() => { completed = true; }),
-    new Promise((resolve) => setTimeout(resolve, 30_000)),
-  ]);
-  if (!completed || curatedPluginTask === task) {
-    await dialog.showMessageBox(mainWindow, {
-      type: "warning",
-      title: "完整插件任务正在取消",
-      message: "任务尚未完成安全清理，CodexBridge 暂不退出。请稍后再次尝试。",
-      buttons: ["知道了"],
-      defaultId: 0,
-      cancelId: 0,
-      noLink: true,
-    });
-    return { allowQuit: false, reason: "cancelling" };
-  }
-  return { allowQuit: true };
-}
-
 async function runManagedAppQuit(reason = "application") {
   if (managedQuitReady) {
     cancelRouterRestartTimer();
     app.quit();
     return { ok: true, alreadyReady: true };
-  }
-  const pluginDecision = await prepareCuratedPluginAppQuit();
-  if (!pluginDecision.allowQuit) {
-    return { ok: false, cancelled: true, reason: pluginDecision.reason };
   }
   const { prepareSoftwareManagerQuit } = await import("./software-manager/ipc.mjs");
   const softwareDecision = await prepareSoftwareManagerQuit({
@@ -3382,7 +3343,11 @@ function reportManagedQuitFailure(reason, error) {
     "配置清理失败，Router 已保持运行，CodexBridge 未退出。请检查日志后重试。",
   );
 }
-async function restartCodexDesktop() {
+function restartCodexDesktop() {
+  return runCodexRestartSingleFlight("desktop", restartCodexDesktopOnce);
+}
+
+async function restartCodexDesktopOnce() {
   if (process.platform === "win32") {
     return restartCodexDesktopWindows();
   }
@@ -3424,7 +3389,7 @@ async function restartCodexDesktop() {
 }
 
 async function locateMacOpenAIDesktopApp(desktopOptions = {}) {
-  const homeDir = os.homedir();
+  const homeDir = desktopHomeDir();
   const installed = selectMacOpenAIDesktopApp({
     homeDir,
     preferredTargets: [canonicalSavedOpenAIDesktopTarget(desktopOptions)],
@@ -3666,6 +3631,11 @@ async function stopMacOpenAIDesktopForSidebarRecovery(settings) {
 
 async function restartCodexDesktopWindows() {
   const settings = await loadSettings();
+  // Wait for ongoing configuration work while the user's Codex is still open.
+  return settings.runSharedConfigExclusive(() => restartCodexDesktopWindowsExclusive(settings));
+}
+
+async function restartCodexDesktopWindowsExclusive(settings) {
   const desktopOptions = settings.loadDesktopOptions(dataRootDir);
   const candidateEntries = await codexDesktopLaunchCandidateEntries(desktopOptions);
   const restartPlan = buildOpenAIDesktopRestartPlan(
@@ -3695,18 +3665,76 @@ async function restartCodexDesktopWindows() {
   if (stopResult.stopped > 0) {
     await delay(900);
   }
+  let threadProviderCompatibility;
+  try {
+    threadProviderCompatibility = await prepareCodexThreadProvidersForRestart(settings, launchPath);
+  } catch {
+    threadProviderCompatibility = { ok: false, updated: [], failed: [], code: "compatibility_lock_failed" };
+  }
+  if (threadProviderCompatibility.restartBlocked) {
+    throw new Error(`后台兼容任务未能确认完全退出（诊断 PID ${threadProviderCompatibility.processId || "unknown"}）。为避免同时改动会话，暂未自动重开 Codex。Bridge 仍可正常退出；确认后台任务结束后可手动打开 Codex。`);
+  }
   await launchCodexDesktopTarget(launchPath);
+  const compatibilityNotice = threadProviderCompatibility.ok === false
+    ? `；${compatibilityFailureDetail(threadProviderCompatibility)}。`
+    : threadProviderCompatibility.updated?.length
+      ? `；已兼容 ${threadProviderCompatibility.updated.length} 个旧任务，任务编号、模型和历史保持不变。`
+      : "";
+  const cacheNotice = threadProviderCompatibility.cacheWarning
+    ? "；兼容缓存未保存，下次点击重启时会重新检测，已兼容的任务不受影响。"
+    : "";
   return {
     ok: true,
     appName,
+    threadProviderCompatibility,
     message: stopResult.stopped > 0
-      ? `${appName} restarted: ${launchPath}`
-      : `${appName} started: ${launchPath}`,
+      ? `${appName} restarted: ${launchPath}${compatibilityNotice}${cacheNotice}`
+      : `${appName} started: ${launchPath}${compatibilityNotice}${cacheNotice}`,
   };
 }
 
+async function prepareCodexThreadProvidersForRestart(settings, launchPath) {
+  try {
+    const homeDir = desktopHomeDir();
+    const mode = settings.detectModeFromConfig(settings.readRouterConfig(dataRootDir));
+    const plan = settings.managedCodexConfigCompatibilityPlan({ homeDir, mode });
+    if (["codex_config_missing", "codexbridge_not_managed"].includes(plan.reason)) {
+      return { ok: true, updated: [], failed: [], skipped: true };
+    }
+    if (plan.needsRepair || (await listRunningCodexDesktopProcesses()).length) {
+      return { ok: false, updated: [], failed: [], code: "desktop_or_config_not_ready" };
+    }
+    appendLog("正在兼容旧任务的计费模式；不会发起模型生成或改写聊天历史。");
+    const execution = await runCommandCapture(nodeExecutable(), [
+      scriptPath("desktop/thread-provider-compat-worker.mjs"),
+      JSON.stringify({ codexHome: path.join(homeDir, ".codex"), markerPath: path.join(dataRootDir, "state", "codex-thread-provider-compat.json"), mode, desktopTarget: launchPath }),
+    ], { timeoutMs: 75000, killProcessTree: true, maxOutputBytes: 2 * 1024 * 1024, env: { ...process.env, ...(app.isPackaged ? { ELECTRON_RUN_AS_NODE: "1" } : {}) } });
+    if (execution.terminationConfirmed === false) {
+      return { ok: false, updated: [], failed: [], restartBlocked: true, processId: execution.processId, code: "compatibility_cleanup_unconfirmed" };
+    }
+    const executionCode = execution.timedOut ? "compatibility_worker_timeout"
+      : execution.outputTooLarge ? "compatibility_output_limit" : "";
+    let result;
+    try { result = execution.stdout ? JSON.parse(execution.stdout) : null; } catch { result = null; }
+    if (!result || !Array.isArray(result.updated) || !Array.isArray(result.failed)) {
+      return { ok: false, updated: [], failed: [], code: executionCode || "compatibility_worker_failed" };
+    }
+    const outcome = { ...result, ok: execution.ok && result.ok === true };
+    if (executionCode) outcome.code = executionCode;
+    else if (result.code) outcome.code = compatibilityFailureCode(result.code);
+    else if (!execution.ok) outcome.code = "compatibility_worker_failed";
+    appendLog(`旧任务模式兼容：已处理 ${result.updated.length}，失败 ${result.failed.length}${outcome.code ? `（${outcome.code}）` : ""}。`);
+    if (!outcome.ok) appendLog(`旧任务兼容未完成：${compatibilityFailureDetail(outcome)}。`);
+    if (result.cacheRecovered) appendLog("旧任务兼容缓存已保留备份并自动重建，没有改动聊天历史。");
+    if (result.cacheWarning) appendLog("旧任务兼容缓存未能保存；本次已确认的任务结果仍然有效。");
+    return outcome;
+  } catch {
+    return { ok: false, updated: [], failed: [], code: "thread_provider_compatibility_failed" };
+  }
+}
+
 async function locateCodexRestartTarget(settings, locateCodexInstall) {
-  const homeDir = os.homedir();
+  const homeDir = desktopHomeDir();
   const desktopOptions = settings.loadDesktopOptions(dataRootDir);
   const canonicalSavedTarget = canonicalSavedOpenAIDesktopTarget(desktopOptions);
   const candidateEntries = process.platform === "win32"
@@ -4109,6 +4137,12 @@ async function codexDesktopLaunchCandidateEntries(desktopOptions = {}) {
   if (process.platform !== "win32") {
     return codexDesktopCandidateEntries(desktopOptions);
   }
+  let managedCandidate = null;
+  try {
+    managedCandidate = await readManagedOpenAIDesktopCandidate(getSoftwareManagerService);
+  } catch (error) {
+    appendRuntimeLog(formatError("managedCodexLaunchDiscovery", error));
+  }
   const canonicalSavedTarget = canonicalSavedOpenAIDesktopTarget(desktopOptions);
   const savedShortcutCandidates = openAIDesktopLaunchKind(canonicalSavedTarget) === "shortcut"
     ? [canonicalSavedTarget]
@@ -4120,6 +4154,7 @@ async function codexDesktopLaunchCandidateEntries(desktopOptions = {}) {
   const savedShortcutSet = new Set(savedShortcutCandidates.map((target) => target.toLowerCase()));
   const resolvedShortcuts = await resolveOpenAIDesktopShortcutCandidates(shortcutCandidates);
   const entries = [
+    ...(managedCandidate ? [managedCandidate] : []),
     ...codexDesktopCandidateEntries(desktopOptions),
     ...resolvedShortcuts.map((item) => ({
       target: item.shortcutPath,
@@ -4482,7 +4517,8 @@ function cleanupInstallerPackageAfterUpdate(attempt = 0) {
   } catch (error) {
     appendRuntimeLog(formatError("cleanupUpdateInstaller", error));
     if (attempt < 5) {
-      setTimeout(() => cleanupInstallerPackageAfterUpdate(attempt + 1), 3000);
+      const retryTimer = setTimeout(() => cleanupInstallerPackageAfterUpdate(attempt + 1), 3000);
+      retryTimer.unref?.();
     }
   }
 }
@@ -4795,7 +4831,7 @@ async function prepareInstallerUpdate(updater, plan, onProgress) {
       ? `Update installer download using proxy ${proxyLabel}.`
       : "Update installer download using direct GitHub connection.",
   );
-  await downloadFile(plan.asset.downloadUrl, installerPath, {
+  await downloadUpdateFile(plan.asset.downloadUrl, installerPath, {
     expectedBytes: plan.asset.size,
     fetchInitForDownload: updater.fetchInitForUpdateDownload,
     onProgress,
@@ -4827,7 +4863,7 @@ async function preparePortableUpdate(updater, plan, onProgress) {
       ? `Update download using proxy ${proxyLabel}.`
       : "Update download using direct GitHub connection.",
   );
-  await downloadFile(plan.asset.downloadUrl, downloadPath, {
+  await downloadUpdateFile(plan.asset.downloadUrl, downloadPath, {
     expectedBytes: plan.asset.size,
     fetchInitForDownload: updater.fetchInitForUpdateDownload,
     onProgress,
@@ -4969,34 +5005,31 @@ async function launchDownloadedInstaller(installerPath) {
     }
     return;
   }
-  const child = spawn(installerPath, [], {
+  await spawnDetachedWithConfirmation(installerPath, [], {
     detached: true,
     stdio: "ignore",
-  });
-  child.unref?.();
+  }, { spawnImpl: spawn });
 }
 
-function launchPortableUpdateScript(scriptPath) {
+async function launchPortableUpdateScript(scriptPath) {
   if (!scriptPath) {
     throw new Error("Missing portable update script path.");
   }
-  const child = process.platform === "win32"
-    ? spawn("powershell.exe", [
+  const command = process.platform === "win32" ? "powershell.exe" : "/bin/sh";
+  const args = process.platform === "win32"
+    ? [
         "-NoProfile",
         "-ExecutionPolicy",
         "Bypass",
         "-File",
         scriptPath,
-      ], {
-        detached: true,
-        stdio: "ignore",
-        windowsHide: true,
-      })
-    : spawn("/bin/sh", [scriptPath], {
-        detached: true,
-        stdio: "ignore",
-      });
-  child.unref?.();
+      ]
+    : [scriptPath];
+  await spawnDetachedWithConfirmation(command, args, {
+    detached: true,
+    stdio: "ignore",
+    ...(process.platform === "win32" ? { windowsHide: true } : {}),
+  }, { spawnImpl: spawn });
 }
 
 function writeInstallerUpdateInstructions({
@@ -5062,81 +5095,6 @@ function writeManualUpdateInstructions({
   fs.writeFileSync(manualNotePath, `${lines.join("\n")}\n`, "utf8");
 }
 
-async function downloadFile(url, targetPath, {
-  expectedBytes = 0,
-  fetchInitForDownload,
-  onProgress,
-} = {}) {
-  const baseInit = {
-    headers: {
-      "user-agent": "CodexBridge",
-    },
-  };
-  const response = await fetch(
-    url,
-    typeof fetchInitForDownload === "function"
-      ? fetchInitForDownload(url, baseInit)
-      : baseInit,
-  );
-  if (!response.ok) {
-    throw new Error(`更新包下载失败：HTTP ${response.status}`);
-  }
-  if (!response.body) {
-    throw new Error("更新包下载失败：响应体为空。");
-  }
-  const contentLength = Number(response.headers.get("content-length") || 0);
-  const totalBytes = Number.isFinite(contentLength) && contentLength > 0
-    ? contentLength
-    : Number(expectedBytes || 0);
-  let downloadedBytes = 0;
-  const startedAt = Date.now();
-  let lastEmitAt = 0;
-  let lastPercent = -1;
-  const emit = (force = false) => {
-    if (typeof onProgress !== "function") {
-      return;
-    }
-    const percent = totalBytes > 0
-      ? Math.min(100, Math.floor((downloadedBytes / totalBytes) * 100))
-      : 0;
-    const now = Date.now();
-    if (!force && now - lastEmitAt < 200 && percent === lastPercent) {
-      return;
-    }
-    lastEmitAt = now;
-    lastPercent = percent;
-    const elapsedSeconds = Math.max(0.001, (now - startedAt) / 1000);
-    onProgress({
-      phase: "downloading",
-      downloadedBytes,
-      totalBytes,
-      percent,
-      bytesPerSecond: Math.floor(downloadedBytes / elapsedSeconds),
-    });
-  };
-  emit(true);
-  const progressStream = new Transform({
-    transform(chunk, _encoding, callback) {
-      downloadedBytes += chunk.length;
-      emit(false);
-      callback(null, chunk);
-    },
-    flush(callback) {
-      emit(true);
-      callback();
-    },
-  });
-  await pipeline(Readable.fromWeb(response.body), progressStream, fs.createWriteStream(targetPath));
-  emit(true);
-  const expectedFinalBytes = Number(expectedBytes || totalBytes || 0);
-  if (expectedFinalBytes > 0) {
-    const finalBytes = fs.statSync(targetPath).size;
-    if (finalBytes !== expectedFinalBytes) {
-      throw new Error(`更新包下载不完整：expected ${expectedFinalBytes} bytes, got ${finalBytes} bytes`);
-    }
-  }
-}
-
 function currentMacAppBundle() {
   let current = process.execPath;
   while (current && current !== path.dirname(current)) {
@@ -5146,32 +5104,6 @@ function currentMacAppBundle() {
     current = path.dirname(current);
   }
   throw new Error("无法定位当前 CodexBridge.app。");
-}
-
-async function runNodeScript(args) {
-  const settings = await loadSettings();
-  const nodePath = nodeExecutable();
-  return new Promise((resolve) => {
-    const child = spawn(nodePath, args, {
-      cwd: appRootDir,
-      env: runtimeEnv(settings),
-      windowsHide: true,
-    });
-    let output = "";
-    child.stdout.on("data", (chunk) => {
-      const text = chunk.toString("utf8");
-      output += text;
-      appendLog(text.trimEnd());
-    });
-    child.stderr.on("data", (chunk) => {
-      const text = chunk.toString("utf8");
-      output += text;
-      appendLog(text.trimEnd());
-    });
-    child.on("exit", (code) => {
-      resolve({ ok: code === 0, code, output: output.trim() });
-    });
-  });
 }
 
 function nodeExecutable() {
@@ -5232,16 +5164,40 @@ function appendLog(line) {
       return;
     }
     for (const entry of String(line).split(/\r?\n/)) {
-      usageStore?.recordLine(entry);
-      logLines.push(`[${new Date().toLocaleTimeString()}] ${entry}`);
+      const boundedEntry = boundedDesktopLogLine(entry);
+      usageStore?.recordLine(boundedEntry);
+      logLines.push(`[${new Date().toLocaleTimeString()}] ${boundedEntry}`);
     }
-    persistUsageEvents();
+    scheduleUsageEventsPersistence();
     logLines = logLines.slice(-300);
-    sendToRenderer("logs:update", logLines);
-    sendToRenderer("usage:update", usagePayload());
+    scheduleLogRendererPublication();
   } catch {
     appendRuntimeLog("appendLog failed; the diagnostic entry was dropped.");
   }
+}
+
+function boundedDesktopLogLine(value) {
+  const line = String(value || "");
+  if (line.length <= DESKTOP_LOG_LINE_MAX_CHARS) {
+    return line;
+  }
+  const marker = " …[日志过长，已截断]… ";
+  const available = DESKTOP_LOG_LINE_MAX_CHARS - marker.length;
+  const headLength = Math.max(0, Math.floor(available * 0.75));
+  const tailLength = Math.max(0, available - headLength);
+  return `${line.slice(0, headLength)}${marker}${line.slice(-tailLength)}`;
+}
+
+function scheduleLogRendererPublication() {
+  if (logRendererPublishTimer !== null) {
+    return;
+  }
+  logRendererPublishTimer = setTimeout(() => {
+    logRendererPublishTimer = null;
+    sendToRenderer("logs:update", logLines);
+    sendToRenderer("usage:update", usagePayload());
+  }, LOG_RENDERER_PUBLISH_DEBOUNCE_MS);
+  logRendererPublishTimer.unref?.();
 }
 
 function sendToRenderer(channel, payload) {
@@ -5350,7 +5306,9 @@ function readUsageEvents() {
     if (!fs.existsSync(usageEventsPath)) {
       return [];
     }
-    const parsed = JSON.parse(fs.readFileSync(usageEventsPath, "utf8"));
+    const parsed = JSON.parse(readBoundedRegularUtf8File(usageEventsPath, {
+      maxBytes: USAGE_EVENTS_MAX_BYTES,
+    }));
     return Array.isArray(parsed?.events) ? parsed.events : [];
   } catch (error) {
     appendRuntimeLog(formatError("readUsageEvents", error));
@@ -5358,21 +5316,87 @@ function readUsageEvents() {
   }
 }
 
-function persistUsageEvents() {
+function scheduleUsageEventsPersistence() {
   if (!usageStore) {
     return;
   }
-  try {
-    fs.mkdirSync(path.dirname(usageEventsPath), { recursive: true });
-    const events = usageStore.events().slice().reverse();
-    fs.writeFileSync(
-      usageEventsPath,
-      `${JSON.stringify({ version: 1, events }, null, 2)}\n`,
-      "utf8",
-    );
-  } catch (error) {
-    appendRuntimeLog(formatError("persistUsageEvents", error));
+  usageEventsPersistGeneration += 1;
+  if (usageEventsPersistTimer !== null) {
+    return;
   }
+  usageEventsPersistTimer = setTimeout(() => {
+    usageEventsPersistTimer = null;
+    enqueueUsageEventsPersistence();
+  }, USAGE_EVENTS_PERSIST_DEBOUNCE_MS);
+  usageEventsPersistTimer.unref?.();
+}
+
+function enqueueUsageEventsPersistence() {
+  const requestedGeneration = usageEventsPersistGeneration;
+  usageEventsPersistChain = usageEventsPersistChain.then(async () => {
+    if (!usageStore || requestedGeneration <= usageEventsPersistedGeneration) {
+      return;
+    }
+    const events = usageStore.events().slice().reverse();
+    const content = `${JSON.stringify({ version: 1, events }, null, 2)}\n`;
+    if (Buffer.byteLength(content, "utf8") > USAGE_EVENTS_MAX_BYTES) {
+      throw Object.assign(new Error("usage events snapshot exceeds its local byte limit"), {
+        code: "USAGE_EVENTS_TOO_LARGE",
+      });
+    }
+    await writeUsageEventsSnapshot(content, requestedGeneration);
+    usageEventsPersistedGeneration = requestedGeneration;
+  }).catch((error) => {
+    appendRuntimeLog(formatError("persistUsageEvents", error));
+  });
+  return usageEventsPersistChain;
+}
+
+async function writeUsageEventsSnapshot(content, generation) {
+  await fs.promises.mkdir(path.dirname(usageEventsPath), { recursive: true });
+  const temporaryPath = `${usageEventsPath}.${process.pid}.${generation}.tmp`;
+  try {
+    await fs.promises.writeFile(temporaryPath, content, "utf8");
+    await fs.promises.rename(temporaryPath, usageEventsPath);
+  } catch (error) {
+    await fs.promises.unlink(temporaryPath).catch(() => {});
+    throw error;
+  }
+}
+
+async function flushUsageEventsPersistence({ timeoutMs = USAGE_EVENTS_FLUSH_TIMEOUT_MS } = {}) {
+  if (usageEventsPersistTimer !== null) {
+    clearTimeout(usageEventsPersistTimer);
+    usageEventsPersistTimer = null;
+  }
+  const targetGeneration = usageEventsPersistGeneration;
+  const deadline = Date.now() + Math.max(1, Number(timeoutMs) || USAGE_EVENTS_FLUSH_TIMEOUT_MS);
+  for (let attempt = 0; attempt < 2 && usageEventsPersistedGeneration < targetGeneration; attempt += 1) {
+    enqueueUsageEventsPersistence();
+    const remainingMs = Math.max(0, deadline - Date.now());
+    if (remainingMs <= 0) {
+      break;
+    }
+    let timeoutId = null;
+    const completed = await Promise.race([
+      usageEventsPersistChain.then(() => true),
+      new Promise((resolve) => {
+        timeoutId = setTimeout(() => resolve(false), remainingMs);
+        timeoutId.unref?.();
+      }),
+    ]);
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+    }
+    if (!completed) {
+      break;
+    }
+  }
+  const persisted = usageEventsPersistedGeneration >= targetGeneration;
+  if (!persisted) {
+    appendRuntimeLog(`usage event flush did not finish within ${timeoutMs} ms; continuing managed quit`);
+  }
+  return persisted;
 }
 
 function formatError(prefix, error) {
@@ -5393,7 +5417,10 @@ async function broadcastState() {
 async function getStatePayload(settings, options = {}) {
   if (!statePayloadReader) {
     statePayloadReader = createResilientStateReader({
-      readSnapshot: (options = {}) => buildStatePayload(settings, options),
+      readSnapshot: (options = {}) => buildConsistentStateSnapshot({
+        readRevision: () => desktopStateRevision(settings),
+        buildSnapshot: () => buildStatePayload(settings, options),
+      }),
       createFallbackSnapshot: buildStateUnavailablePayload,
       reportFailure: () => {
         appendRuntimeLog("State snapshot unavailable; serving the last complete snapshot.");
@@ -5409,11 +5436,25 @@ async function getStatePayload(settings, options = {}) {
   return payload;
 }
 
+function desktopStateRevision(settings) {
+  return desktopStateFingerprint(
+    settings.readRouterConfig(dataRootDir),
+    settings.loadDesktopOptions(dataRootDir),
+  );
+}
+
+function desktopStateFingerprint(config, desktopOptions) {
+  return crypto.createHash("sha256")
+    .update(JSON.stringify([config || null, desktopOptions || null]))
+    .digest("hex");
+}
+
 function buildStateUnavailablePayload() {
   return {
     rootDir: dataRootDir,
     appRootDir,
     appVersion: "",
+    stateConfigRevision: "",
     packaged: Boolean(app.isPackaged),
     mode: null,
     routerRunning: Boolean(routerProcess),
@@ -5432,6 +5473,8 @@ function buildStateUnavailablePayload() {
     capabilityProviders: [],
     capabilityProviderGroups: [],
     stateDetailLoaded: false,
+    detailSectionsLoaded: [],
+    detailSectionErrors: {},
     capabilityExecutionHistory: [],
     imageGenerationHistory: [],
     configPackageSyncStatus: null,
@@ -5457,9 +5500,40 @@ function buildStateUnavailablePayload() {
   };
 }
 
+function detailSnapshotError(section, error) {
+  const normalizedSection = ["preflight", "capabilities", "resources", "sessions", "settings"]
+    .includes(section)
+    ? section
+    : "detail";
+  const labels = {
+    preflight: "体检详情",
+    capabilities: "能力历史",
+    resources: "Codex 资源",
+    sessions: "Codex 会话",
+    settings: "配置备份",
+    detail: "页面详情",
+  };
+  const code = safeConfigDiagnostic(error?.code, "detail_snapshot_failed");
+  appendRuntimeLog(`detail-snapshot-failed section=${normalizedSection} code=${code}`);
+  return {
+    code,
+    message: `${labels[normalizedSection]}暂时读取失败，其他功能仍可正常使用。请稍后重新进入该页面。`,
+  };
+}
+
 async function buildStatePayload(settings, options = {}) {
   const lite = Boolean(options.lite);
-  const includeSettingsDetail = !lite || Boolean(options.settingsDetail);
+  const detailSection = ["preflight", "capabilities", "resources", "sessions"]
+    .includes(String(options.detailSection || ""))
+    ? String(options.detailSection)
+    : "";
+  const fullDetail = !lite && !detailSection;
+  const includePreflightDetail = fullDetail || detailSection === "preflight";
+  const includeCapabilityDetail = fullDetail || detailSection === "capabilities";
+  const includeResourceDetail = fullDetail || detailSection === "resources";
+  const includeSessionDetail = fullDetail || detailSection === "sessions";
+  const includeResourceSnapshots = includePreflightDetail || includeResourceDetail;
+  const includeSettingsDetail = fullDetail || Boolean(options.settingsDetail);
   const config = settings.readRouterConfig(dataRootDir);
   usageRoutes = config?.models || [];
   const desktopOptions = settings.loadDesktopOptions(dataRootDir);
@@ -5468,29 +5542,53 @@ async function buildStatePayload(settings, options = {}) {
   const mode = settings.detectModeFromConfig(config);
   const diagnostics = settings.routerConfigDiagnostics(dataRootDir, config);
   const homeDir = desktopHomeDir();
-  const codexSessionTree = lite ? null : settings.listCodexSessionTree({ homeDir, limit: SESSION_CENTER_LIMIT });
-  const codexSessions = Array.isArray(codexSessionTree?.sessions)
-    ? codexSessionTree.sessions
-    : lite ? [] : settings.listCodexSessions({ homeDir, limit: SESSION_CENTER_LIMIT });
+  const detailSectionErrors = {};
+  let codexSessionSnapshot = null;
+  if (includeSessionDetail) {
+    try {
+      codexSessionSnapshot = await runCodexSessionSnapshotWorker({
+        homeDir,
+        limit: SESSION_CENTER_LIMIT,
+      });
+    } catch (error) {
+      detailSectionErrors.sessions = detailSnapshotError("sessions", error);
+    }
+  }
+  const codexSessionTree = codexSessionSnapshot?.codexSessionTree || null;
+  const codexSessions = Array.isArray(codexSessionSnapshot?.codexSessions)
+    ? codexSessionSnapshot.codexSessions
+    : [];
   const smokeResourceSnapshotPath = process.env.CODEXBRIDGE_DESKTOP_SMOKE === "1"
     ? String(process.env.CODEXBRIDGE_DESKTOP_SMOKE_RESOURCE_SNAPSHOT || "").trim()
     : "";
-  const codexResourceSnapshots = lite
-    ? null
-    : smokeResourceSnapshotPath
-      ? JSON.parse(fs.readFileSync(smokeResourceSnapshotPath, "utf8"))
-      : await readCodexResourceSnapshotsRetained({
-          forceRefresh: Boolean(options.forceResourceRefresh),
-          desktopOptions,
-          homeDir,
-          rootDir: appRootDir,
-        });
+  let codexResourceSnapshots = null;
+  if (includeResourceSnapshots) {
+    try {
+      codexResourceSnapshots = smokeResourceSnapshotPath
+        ? JSON.parse(fs.readFileSync(smokeResourceSnapshotPath, "utf8"))
+        : await readCodexResourceSnapshotsRetained({
+            forceRefresh: Boolean(options.forceResourceRefresh),
+            desktopOptions,
+            homeDir,
+            rootDir: appRootDir,
+          });
+    } catch (error) {
+      if (includePreflightDetail) {
+        detailSectionErrors.preflight = detailSnapshotError("preflight", error);
+      }
+      if (includeResourceDetail) {
+        detailSectionErrors.resources = detailSnapshotError("resources", error);
+      }
+      codexResourceSnapshots = lastCodexResourceSnapshots;
+    }
+  }
   const codexCliSnapshot = codexResourceSnapshots?.codexCliSnapshot || null;
   const codexPromptInputSnapshot = codexResourceSnapshots?.codexPromptInputSnapshot || null;
   const codexAppServerSnapshot = codexResourceSnapshots?.codexAppServerSnapshot || null;
-  const codexResources = lite
-    ? null
-    : settings.listCodexResources({
+  let codexResources = null;
+  if (includeResourceDetail) {
+    try {
+      codexResources = settings.listCodexResources({
         rootDir: appRootDir,
         homeDir,
         codexCliSnapshot,
@@ -5500,7 +5598,11 @@ async function buildStatePayload(settings, options = {}) {
         codexAppServerSnapshot,
         includeCodexAppServerSnapshot: true,
       });
-  if (!lite && options.forceResourceRefresh) {
+    } catch (error) {
+      detailSectionErrors.resources = detailSnapshotError("resources", error);
+    }
+  }
+  if (includeResourceDetail && options.forceResourceRefresh) {
     const appItems = codexAppServerSnapshot?.apps?.items || [];
     appendRuntimeLog(
       `[resource-flow] stage=readCodexResourceSnapshots apps=${appItems.length} app_ids=${appItems.map((item) => item.id).join(",")} source=${codexAppServerSnapshot?.snapshotSource || "unavailable"} cached=${codexAppServerSnapshot?.cached === true} refreshed_at=${codexAppServerSnapshot?.authoritativeRefreshedAt || codexAppServerSnapshot?.refreshedAt || "unknown"}`,
@@ -5509,10 +5611,60 @@ async function buildStatePayload(settings, options = {}) {
       `[resource-flow] stage=listCodexResources plugins=${codexResources?.pluginPage?.summary?.plugins ?? "unavailable"} apps=${codexResources?.pluginPage?.summary?.apps ?? "unavailable"} app_ids=${(codexResources?.pluginPage?.apps || []).map((item) => item.id).join(",")} mcp=${codexResources?.pluginPage?.summary?.mcpServers ?? "unavailable"} skills=${codexResources?.pluginPage?.summary?.skills ?? "unavailable"}`,
     );
   }
+  let capabilityExecutionHistory = [];
+  let imageGenerationHistory = [];
+  if (includeCapabilityDetail) {
+    try {
+      capabilityExecutionHistory = settings.readCapabilityExecutionHistory(
+        dataRootDir,
+        { includeThumbnails: true },
+      );
+      imageGenerationHistory = settings.readImageGenerationHistory(
+        dataRootDir,
+        { includeThumbnails: true },
+      );
+    } catch (error) {
+      detailSectionErrors.capabilities = detailSnapshotError("capabilities", error);
+    }
+  }
+  let startupCheck = null;
+  if (includePreflightDetail) {
+    try {
+      startupCheck = settings.buildStartupCheck(dataRootDir, {
+        appVersion: app.getVersion(),
+        routerRunning: Boolean(routerProcess),
+        lastHealth,
+        config,
+        releaseAssets: releaseAssetsForDesktopPreflight(settings),
+        codexCliSnapshot,
+        codexPromptInputSnapshot,
+      });
+    } catch (error) {
+      detailSectionErrors.preflight = detailSnapshotError("preflight", error);
+    }
+  }
+  let codexBackups = [];
+  let settingsDetailAvailable = includeSettingsDetail;
+  if (includeSettingsDetail) {
+    try {
+      codexBackups = settings.listCodexBackups();
+    } catch (error) {
+      settingsDetailAvailable = false;
+      detailSectionErrors.settings = detailSnapshotError("settings", error);
+    }
+  }
+  const detailSectionsLoaded = [];
+  if (includePreflightDetail && startupCheck) detailSectionsLoaded.push("preflight");
+  if (includeCapabilityDetail && !detailSectionErrors.capabilities) detailSectionsLoaded.push("capabilities");
+  if (includeResourceDetail && codexResources) detailSectionsLoaded.push("resources");
+  if (includeSessionDetail && codexSessionSnapshot) detailSectionsLoaded.push("sessions");
+  const allDetailSectionsLoaded = detailSectionsLoaded.length === 4;
+
   return {
     rootDir: dataRootDir,
     appRootDir,
     appVersion: app.getVersion(),
+    stateConfigRevision: desktopStateFingerprint(config, desktopOptions),
     packaged: app.isPackaged,
     mode,
     routerRunning: Boolean(routerProcess),
@@ -5530,36 +5682,24 @@ async function buildStatePayload(settings, options = {}) {
     imageProviderConfig: settings.readImageProviderConfig(dataRootDir),
     capabilityProviders: settings.readCapabilityProviders(dataRootDir),
     capabilityProviderGroups: settings.readCapabilityProviderGroups(dataRootDir),
-    stateDetailLoaded: !lite,
-    capabilityExecutionHistory: lite
-      ? []
-      : settings.readCapabilityExecutionHistory(dataRootDir, { includeThumbnails: true }),
-    imageGenerationHistory: lite
-      ? []
-      : settings.readImageGenerationHistory(dataRootDir, { includeThumbnails: true }),
+    stateDetailLoaded: fullDetail && allDetailSectionsLoaded,
+    detailSectionsLoaded,
+    detailSectionErrors,
+    capabilityExecutionHistory,
+    imageGenerationHistory,
     configPackageSyncStatus: settings.readConfigPackageSyncStatus(dataRootDir),
     configPackageImportBackupStatus: settings.readConfigPackageImportBackupStatus(dataRootDir),
     secretStatus: settings.secretStatus(dataRootDir),
     desktopOptions,
     diagnostics,
-    startupCheck: lite
-      ? null
-      : settings.buildStartupCheck(dataRootDir, {
-        appVersion: app.getVersion(),
-        routerRunning: Boolean(routerProcess),
-        lastHealth,
-        config,
-        releaseAssets: releaseAssetsForDesktopPreflight(settings),
-        codexCliSnapshot,
-        codexPromptInputSnapshot,
-      }),
-    settingsDetailLoaded: includeSettingsDetail,
+    startupCheck,
+    settingsDetailLoaded: settingsDetailAvailable,
     configProfiles: settings.loadConfigProfiles(dataRootDir),
-    codexBackups: includeSettingsDetail ? settings.listCodexBackups() : [],
+    codexBackups,
     codexResources,
     codexSessions,
     codexSessionTree,
-    codexProjectRecoveryPlan: lite ? null : settings.codexProjectRecoveryPlan({ limit: SESSION_CENTER_LIMIT }),
+    codexProjectRecoveryPlan: codexSessionSnapshot?.codexProjectRecoveryPlan || null,
     lastHealth,
     usageEvents: usageStore?.events() || [],
     usageSummary,
@@ -5882,7 +6022,25 @@ async function runDesktopSmokeChecks() {
         if (!document.querySelector("#usageBudgetScope") || !document.querySelector("#usageBudgetTarget")) {
           throw new Error("Usage budget controls missing");
         }
+        const writePrice = document.querySelector("#usageCacheWriteCostPerMillion");
+        const saveBudget = document.querySelector("#saveUsageBudgets");
+        if (!writePrice || !saveBudget) throw new Error("Cache-write budget controls missing");
+        const scope = document.querySelector("#usageBudgetScope");
+        scope.value = "global";
+        scope.dispatchEvent(new Event("change", { bubbles: true }));
+        for (const price of ["0", "12.5", ""]) {
+          writePrice.value = price;
+          saveBudget.click();
+          await waitFor(() => !saveBudget.disabled && !saveBudget.classList.contains("loading"), 15000, "cache-write budget save");
+          const savedState = await window.codexBridge.getState({ lite: true });
+          const savedPrice = savedState?.desktopOptions?.usageBudgets?.global?.cacheWriteCostPerMillion;
+          if (price === "" ? savedPrice !== undefined : savedPrice !== Number(price)) {
+            throw new Error("Cache-write rate did not round-trip: " + price);
+          }
+          if (writePrice.value !== price) throw new Error("Cache-write price was not rendered correctly");
+        }
         return {
+          cacheWriteBudgetRoundTrip: true,
           providers: document.querySelectorAll("[data-provider-preview]").length,
           resources: resourceValues.join("/"),
           resourceSummary: {
@@ -5899,11 +6057,16 @@ async function runDesktopSmokeChecks() {
         };
       })()
     `);
+    const budgetScreenshot = String(process.env.CODEXBRIDGE_DESKTOP_SMOKE_BUDGET_SCREENSHOT || "").trim();
+    if (budgetScreenshot) {
+      fs.mkdirSync(path.dirname(budgetScreenshot), { recursive: true });
+      fs.writeFileSync(budgetScreenshot, (await mainWindow.webContents.capturePage()).toPNG());
+    }
     let softwareManagerSmoke = null;
     if (process.env.CODEXBRIDGE_DESKTOP_SMOKE_SOFTWARE_MANAGER === "1") {
-      const expectedSoftwareHealthLabel = process.env.CODEXBRIDGE_DESKTOP_SMOKE_SOFTWARE_MANAGER_OFFLINE === "1"
-        ? "使用内置清单"
-        : "安装服务可用";
+      const expectedSoftwareHealthLabels = process.env.CODEXBRIDGE_DESKTOP_SMOKE_SOFTWARE_MANAGER_OFFLINE === "1"
+        ? ["使用内置清单", "在线刷新失败", "使用缓存清单"]
+        : ["安装服务可用"];
       softwareManagerSmoke = await mainWindow.webContents.executeJavaScript(`
         (async () => {
           const waitFor = (fn, timeoutMs = 60000, label = "software manager") => new Promise((resolve, reject) => {
@@ -5919,7 +6082,18 @@ async function runDesktopSmokeChecks() {
               } catch {}
               if (Date.now() - started > timeoutMs) {
                 clearInterval(timer);
-                reject(new Error("Timed out waiting for " + label));
+                const root = document.querySelector("#softwareManagerRoot");
+                const toggle = root?.querySelector("[data-software-toggle-skills]");
+                const diagnostics = {
+                  cards: root?.querySelectorAll(".software-component-card").length ?? 0,
+                  skillRows: root?.querySelectorAll("[data-software-skill]").length ?? 0,
+                  pluginRows: root?.querySelectorAll("[data-software-plugin]").length ?? 0,
+                  togglePresent: Boolean(toggle),
+                  toggleDisabled: toggle?.disabled ?? null,
+                  listExpanded: Boolean(root?.querySelector(".software-skill-list")),
+                  healthLabel: root?.querySelector(".software-health-badge")?.textContent?.trim().slice(0, 100) || "",
+                };
+                reject(new Error("Timed out waiting for " + label + ": " + JSON.stringify(diagnostics)));
               }
             }, 100);
           });
@@ -5927,28 +6101,41 @@ async function runDesktopSmokeChecks() {
           if (!nav || nav.hidden) throw new Error("Software Manager navigation is unavailable");
           nav.click();
           await waitFor(
-            () => document.querySelectorAll("#softwareManagerRoot .software-component-card").length === 4,
+            () => document.querySelectorAll("#softwareManagerRoot .software-component-card").length === 1,
             60000,
-            "four software cards",
+            "single Codex card",
           );
           await waitFor(
-            () => document.querySelector("#softwareManagerRoot .software-health-badge")?.textContent?.includes(${JSON.stringify(expectedSoftwareHealthLabel)}),
+            () => {
+              const label = document.querySelector("#softwareManagerRoot .software-health-badge")?.textContent || "";
+              return ${JSON.stringify(expectedSoftwareHealthLabels)}.some((expected) => label.includes(expected));
+            },
             60000,
             "trusted software manager UI",
+          );
+          await waitFor(
+            () => softwareManagerLoaded && !softwareManagerLoading,
+            45000,
+            "software manager initialization",
           );
           let snapshot = await window.codexBridge.getSoftwareManagerSnapshot();
           if (snapshot?.readOnly === true) {
             throw new Error("Software Manager is read-only: " + String(snapshot.unavailableReason || "unknown"));
           }
           if (snapshot?.catalog?.available !== true) throw new Error("Software Manager catalog is unavailable");
-          if (snapshot?.components?.length !== 3) {
+          if (snapshot?.components?.length !== 1 || snapshot.components[0]?.id !== "chatgpt") {
             throw new Error("Software Manager component count mismatch: " + String(snapshot?.components?.length));
           }
-          if (snapshot?.catalog?.skills?.length !== 7) {
+          if (snapshot?.catalog?.skills?.length !== 0) {
             throw new Error("Software Manager Skill count mismatch: " + String(snapshot?.catalog?.skills?.length));
           }
           if (String(snapshot?.installRootPath || "").length < 4) {
-            throw new Error("Software Manager default install root is missing");
+            throw new Error("Software Manager default install root is missing: " + JSON.stringify({
+              pendingRecovery: snapshot?.pendingRecovery,
+              recoveryErrorCodes: snapshot?.recoveryErrorCodes,
+              unavailableReason: snapshot?.unavailableReason || null,
+              logs: Array.isArray(snapshot?.logs) ? snapshot.logs.slice(-5) : [],
+            }));
           }
           const initialInstallRootPath = snapshot.installRootPath;
           const selectedInstallRootPath = ${JSON.stringify(String(process.env.CODEXBRIDGE_DESKTOP_SMOKE_SELECTED_INSTALL_ROOT || "").trim())};
@@ -5966,26 +6153,19 @@ async function runDesktopSmokeChecks() {
               "selected install root UI",
             );
           }
-          document.querySelector("#softwareManagerRoot [data-software-toggle-skills]")?.click();
-          await waitFor(
-            () => document.querySelectorAll("#softwareManagerRoot [data-software-skill]").length === 7
-              && document.querySelectorAll("#softwareManagerRoot [data-software-plugin]").length === 2,
-            15000,
-            "unified Skill list",
-          );
           const cardNames = Array.from(document.querySelectorAll("#softwareManagerRoot .software-component-head strong"))
             .map((node) => String(node.textContent || "").trim());
-          const expandedSkillRows = document.querySelectorAll("#softwareManagerRoot [data-software-skill]").length;
-          const expandedPluginRows = document.querySelectorAll("#softwareManagerRoot [data-software-plugin]").length;
-          const selectablePluginRows = Array.from(document.querySelectorAll("#softwareManagerRoot [data-software-plugin]"))
-            .filter((input) => !input.disabled).length;
-          document.querySelector('#softwareManagerRoot [data-software-tab="update"]')?.click();
-          await waitFor(
-            () => document.querySelectorAll("#softwareManagerRoot .software-component-card").length === 3
-              && !document.querySelector("#softwareManagerRoot [data-software-toggle-skills]"),
-            15000,
-            "update view without Skills",
-          );
+          if (cardNames.join(",") !== "Codex") throw new Error("Unexpected software card: " + cardNames);
+          for (const tab of ["update", "uninstall", "install"]) {
+            document.querySelector('#softwareManagerRoot [data-software-tab="' + tab + '"]')?.click();
+            await waitFor(
+              () => document.querySelectorAll("#softwareManagerRoot .software-component-card").length === 1
+                && document.querySelectorAll('#softwareManagerRoot [data-software-component="chatgpt"]').length === 1
+                && !document.querySelector("#softwareManagerRoot [data-software-toggle-skills], #softwareManagerRoot [data-software-plugin], #softwareManagerRoot [data-software-skill]"),
+              15000,
+              "Codex-only " + tab + " view",
+            );
+          }
           return {
             readOnly: snapshot.readOnly,
             catalogAvailable: snapshot.catalog.available,
@@ -5997,11 +6177,8 @@ async function runDesktopSmokeChecks() {
               ? initialInstallRootPath !== snapshot.installRootPath && snapshot.installRootPath === selectedInstallRootPath
               : false,
             cards: cardNames,
-            expandedSkillRows,
-            expandedPluginRows,
-            selectablePluginRows,
-            updateCards: document.querySelectorAll("#softwareManagerRoot .software-component-card").length,
-            updateHasSkills: Boolean(document.querySelector("#softwareManagerRoot [data-software-toggle-skills]")),
+            checkedTabs: ["install", "update", "uninstall"],
+            healthLabel: document.querySelector("#softwareManagerRoot .software-health-badge")?.textContent?.trim() || "",
             mainScrollTop: document.querySelector(".main")?.scrollTop ?? -1,
           };
         })()
@@ -6134,28 +6311,30 @@ async function runDesktopSmokeChecks() {
           if (initial?.desktopOptions?.duplicateRequestProtection !== false) {
             throw new Error("Legacy duplicate request protection was not migrated off");
           }
-          let started = false;
-          try {
-            const startResult = await window.codexBridge.startRouter();
-            if (startResult?.ok !== true) {
-              const code = String(startResult?.error?.causeCode || "operation_failed");
-              throw new Error("Router lifecycle smoke start failed: " + code);
-            }
-            started = true;
-            const running = await window.codexBridge.getState({ lite: true });
-            if (running?.routerRunning !== true) {
-              throw new Error("Router lifecycle smoke did not publish running state");
-            }
-            return true;
-          } finally {
-            if (started) {
-              await window.codexBridge.stopRouter();
-              const stopped = await window.codexBridge.getState({ lite: true });
-              if (stopped?.routerRunning !== false) {
-                throw new Error("Router lifecycle smoke did not publish stopped state");
+          for (let cycle = 1; cycle <= 2; cycle += 1) {
+            let started = false;
+            try {
+              const startResult = await window.codexBridge.startRouter();
+              if (startResult?.ok !== true) {
+                const code = String(startResult?.error?.causeCode || "operation_failed");
+                throw new Error("Router lifecycle smoke cycle " + cycle + " start failed: " + code);
+              }
+              started = true;
+              const running = await window.codexBridge.getState({ lite: true });
+              if (running?.routerRunning !== true) {
+                throw new Error("Router lifecycle smoke cycle " + cycle + " did not publish running state");
+              }
+            } finally {
+              if (started) {
+                await window.codexBridge.stopRouter();
+                const stopped = await window.codexBridge.getState({ lite: true });
+                if (stopped?.routerRunning !== false) {
+                  throw new Error("Router lifecycle smoke cycle " + cycle + " did not publish stopped state");
+                }
               }
             }
           }
+          return true;
         })()
       `);
     }

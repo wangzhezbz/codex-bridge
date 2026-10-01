@@ -1,9 +1,12 @@
+import { estimateUsageTokenCosts, hasUsageCostRates, normalizeUsageCostRates } from "../shared/usage-cost.cjs";
+import { canonicalModelReference } from "../shared/model-preset-aliases.cjs";
+
 const START_RE =
   /\[(?<iso>\d{4}-\d\d-\d\dT[^\]]+)] (?<requestId>req_[a-z0-9]+) <- \/v1\/responses model=(?<codexModel>\S+) route=(?<route>\S+) api=(?<api>\S+) upstream_model=(?<upstreamModel>\S+) stream=(?<stream>\S+)/i;
 const UPSTREAM_RE =
   /\[(?<iso>\d{4}-\d\d-\d\dT[^\]]+)] (?<requestId>req_[a-z0-9]+) -> upstream route=(?<route>\S+) api=(?<api>\S+) upstream_model=(?<upstreamModel>\S+) url=(?<url>\S+)/i;
 const USAGE_RE =
-  /\[(?<iso>\d{4}-\d\d-\d\dT[^\]]+)] (?<requestId>req_[a-z0-9]+) <- upstream route=(?<route>\S+) usage prompt=(?<promptTokens>\d+)(?: cached=(?<cacheReadTokens>\d+) fresh=(?<freshPromptTokens>\d+))?(?: cache_write=(?<cacheCreationTokens>\d+))? completion=(?<completionTokens>\d+) total=(?<totalTokens>\d+)/i;
+  /\[(?<iso>\d{4}-\d\d-\d\dT[^\]]+)] (?<requestId>req_[a-z0-9]+) <- upstream route=(?<route>\S+) usage prompt=(?<promptTokens>\d+)(?: cached=(?<cacheReadTokens>\d+) fresh=(?<freshPromptTokens>\d+))?(?: cache_write=(?<cacheCreationTokens>\d+))?(?: cache_write_rate=(?<cacheWriteRateKind>openai|input))? completion=(?<completionTokens>\d+) total=(?<totalTokens>\d+)/i;
 const NO_USAGE_RE =
   /\[(?<iso>\d{4}-\d\d-\d\dT[^\]]+)] (?<requestId>req_[a-z0-9]+) <- upstream route=(?<route>\S+) usage=\(none\)/i;
 const STATUS_RE =
@@ -16,14 +19,33 @@ const SMART_ROUTE_EXCLUSIONS_RE =
   /\[(?<iso>\d{4}-\d\d-\d\dT[^\]]+)] (?<requestId>req_[a-z0-9]+) !! smart-route-exclusions phase=(?<phase>\S+) excluded=(?<excluded>.*)$/i;
 const ROUTE_PLAN_RE =
   /\[(?<iso>\d{4}-\d\d-\d\dT[^\]]+)] (?<requestId>req_[a-z0-9]+) !! route-plan kind=(?<requestKind>\S+) reason=(?<routeReason>\S+) requested_model=(?<requestedModel>\S+) route=(?<route>\S+)/i;
+const DEFAULT_PENDING_TTL_MS = 30 * 60_000;
+const DEFAULT_PENDING_PRUNE_INTERVAL = 128;
 
-export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
+export function createUsageStore({
+  maxEvents = 800,
+  maxPending = undefined,
+  pendingTtlMs = DEFAULT_PENDING_TTL_MS,
+  pruneInterval = DEFAULT_PENDING_PRUNE_INTERVAL,
+  now = Date.now,
+  initialEvents = [],
+} = {}) {
+  const eventLimit = boundedPositiveInteger(maxEvents, 800, 10_000);
+  const pendingLimit = boundedPositiveInteger(
+    maxPending,
+    Math.min(Math.max(eventLimit * 2, 256), 4_096),
+    4_096,
+  );
+  const pendingTtl = boundedPositiveInteger(pendingTtlMs, DEFAULT_PENDING_TTL_MS, 24 * 60 * 60_000);
+  const pendingPruneInterval = boundedPositiveInteger(pruneInterval, DEFAULT_PENDING_PRUNE_INTERVAL, 4_096);
   const pending = new Map();
+  let pendingOperations = 0;
   let records = Array.isArray(initialEvents)
-    ? initialEvents.map(normalizeEvent).filter(Boolean).slice(-maxEvents)
+    ? initialEvents.map(normalizeEvent).filter(Boolean).slice(-eventLimit)
     : [];
 
   function recordLine(line) {
+    maintainPending();
     const text = String(line || "");
     const routePlan = ROUTE_PLAN_RE.exec(text)?.groups;
     if (routePlan) {
@@ -41,7 +63,7 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
     const start = START_RE.exec(text)?.groups;
     if (start) {
       const previous = pending.get(start.requestId) || {};
-      pending.set(start.requestId, {
+      setPending(start.requestId, {
         requestId: start.requestId,
         startedAt: start.iso,
         finishedAt: "",
@@ -90,8 +112,9 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
       item.promptTokens = Number(usage.promptTokens || 0);
       item.cacheReadTokens = Number(usage.cacheReadTokens || 0);
       item.cacheCreationTokens = Number(usage.cacheCreationTokens || 0);
+      item.cacheWriteRateKind = usage.cacheWriteRateKind || "";
       item.freshPromptTokens = Number(
-        usage.freshPromptTokens ?? Math.max(0, item.promptTokens - item.cacheReadTokens),
+        usage.freshPromptTokens ?? Math.max(0, item.promptTokens - item.cacheReadTokens - item.cacheCreationTokens),
       );
       item.completionTokens = Number(usage.completionTokens || 0);
       item.totalTokens = Number(usage.totalTokens || 0);
@@ -227,7 +250,7 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
     }
 
     const byModel = [...byModelMap.values()].map((item) => {
-      const active = activeRoutes.get(item.route) || activeRoutes.get(item.codexModel);
+      const active = activeRouteForEvent(item, activeRoutes);
       const routeMatches =
         !hasActiveRoutes ||
         Boolean(
@@ -290,7 +313,7 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
 
   function ensurePending(requestId, iso, route) {
     if (!pending.has(requestId)) {
-      pending.set(requestId, {
+      setPending(requestId, {
         requestId,
         startedAt: iso,
         finishedAt: "",
@@ -317,18 +340,51 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
         requestedModel: "",
         routeSource: "manual",
       });
+    } else {
+      const existing = pending.get(requestId);
+      setPending(requestId, existing);
     }
     return pending.get(requestId);
   }
 
+  function setPending(requestId, item) {
+    item._pendingTouchedAt = Number(now());
+    pending.delete(requestId);
+    pending.set(requestId, item);
+    trimPending();
+  }
+
+  function maintainPending() {
+    pendingOperations += 1;
+    if (pendingOperations < pendingPruneInterval) return;
+    pendingOperations = 0;
+    const timestamp = Number(now());
+    for (const [requestId, item] of pending) {
+      if (!Number.isFinite(item?._pendingTouchedAt)
+        || timestamp - item._pendingTouchedAt > pendingTtl) {
+        pending.delete(requestId);
+      }
+    }
+    trimPending();
+  }
+
+  function trimPending() {
+    while (pending.size > pendingLimit) {
+      const oldest = pending.keys().next().value;
+      if (oldest === undefined) return;
+      pending.delete(oldest);
+    }
+  }
+
   function finalize(item) {
+    const { _pendingTouchedAt: _ignored, ...publicItem } = item;
     const record = {
-      ...item,
+      ...publicItem,
       durationMs: durationMs(item.startedAt, item.finishedAt),
     };
     records = records.filter((event) => event.requestId !== record.requestId);
     records.push(record);
-    records = records.slice(-maxEvents);
+    records = records.slice(-eventLimit);
     pending.delete(record.requestId);
   }
 
@@ -339,12 +395,19 @@ export function createUsageStore({ maxEvents = 800, initialEvents = [] } = {}) {
   };
 }
 
+function boundedPositiveInteger(value, fallback, max) {
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number <= 0) return fallback;
+  return Math.min(number, max);
+}
+
 export function evaluateUsageBudgets(summary = {}, budgets = {}, { routes = [], now = new Date() } = {}) {
   const budgetConfig = normalizeBudgetConfig(budgets);
   if (!budgetConfig) {
     return [];
   }
   const routeProviders = routeProviderMap(routes);
+  const activeRoutes = activeRouteMap(routes);
   const events = todayUsageEvents(summary, now);
   const globalMetrics = usageMetrics(events);
   const alerts = [];
@@ -353,16 +416,17 @@ export function evaluateUsageBudgets(summary = {}, budgets = {}, { routes = [], 
     alerts.push(globalAlert);
   }
 
-  const eventsByRoute = groupEvents(events, (event) => event.route || event.codexModel || "");
+  const eventsByRoute = groupEvents(events, (event) => usageRouteId(event, activeRoutes));
   for (const [route, routeBudget] of Object.entries(budgetConfig.routes)) {
-    const alert = budgetAlert("route", route, usageMetrics(eventsByRoute.get(route) || []), routeBudget);
+    const eventRoute = configuredRouteIdForReference(route, activeRoutes);
+    const alert = budgetAlert("route", route, usageMetrics(eventsByRoute.get(eventRoute) || []), routeBudget);
     if (alert) {
       alerts.push(alert);
     }
   }
 
   const eventsByProvider = groupEvents(events, (event) => {
-    const route = event.route || event.codexModel || "";
+    const route = usageRouteId(event, activeRoutes);
     return routeProviders.get(route) || "";
   });
   for (const [provider, providerBudget] of Object.entries(budgetConfig.providers)) {
@@ -381,21 +445,23 @@ export function estimateUsageCosts(summary = {}, budgets = {}, { routes = [], no
     return emptyCostEstimate();
   }
   const routeProviders = routeProviderMap(routes);
+  const activeRoutes = activeRouteMap(routes);
   const events = todayUsageEvents(summary, now);
   const global = costEstimate("global", "全部模型", usageMetrics(events), budgetConfig.global);
   const routeEstimates = [];
   const providerEstimates = [];
 
-  const eventsByRoute = groupEvents(events, (event) => event.route || event.codexModel || "");
+  const eventsByRoute = groupEvents(events, (event) => usageRouteId(event, activeRoutes));
   for (const [route, routeBudget] of Object.entries(budgetConfig.routes)) {
-    const estimate = costEstimate("route", route, usageMetrics(eventsByRoute.get(route) || []), routeBudget);
+    const eventRoute = configuredRouteIdForReference(route, activeRoutes);
+    const estimate = costEstimate("route", route, usageMetrics(eventsByRoute.get(eventRoute) || []), routeBudget);
     if (estimate) {
       routeEstimates.push(estimate);
     }
   }
 
   const eventsByProvider = groupEvents(events, (event) => {
-    const route = event.route || event.codexModel || "";
+    const route = usageRouteId(event, activeRoutes);
     return routeProviders.get(route) || "";
   });
   for (const [provider, providerBudget] of Object.entries(budgetConfig.providers)) {
@@ -491,9 +557,7 @@ function normalizeBudgetScope(input = {}) {
     dailyTokenLimit: positiveNumber(input.dailyTokenLimit ?? input.daily_tokens ?? input.tokens),
     dailyCallLimit: positiveNumber(input.dailyCallLimit ?? input.daily_calls ?? input.calls),
     dailyCostLimit: positiveNumber(input.dailyCostLimit ?? input.daily_cost_limit ?? input.daily_cost ?? input.cost),
-    inputCostPerMillion: positiveNumber(input.inputCostPerMillion ?? input.input_cost_per_million),
-    cacheCostPerMillion: positiveNumber(input.cacheCostPerMillion ?? input.cache_cost_per_million),
-    outputCostPerMillion: positiveNumber(input.outputCostPerMillion ?? input.output_cost_per_million),
+    ...normalizeUsageCostRates(input),
   };
 }
 
@@ -502,7 +566,7 @@ function hasBudgetLimits(scope = {}) {
 }
 
 function hasCostRates(scope = {}) {
-  return Boolean(scope.inputCostPerMillion || scope.cacheCostPerMillion || scope.outputCostPerMillion);
+  return hasUsageCostRates(scope);
 }
 
 function hasBudgetSettings(scope = {}) {
@@ -546,6 +610,8 @@ function usageMetrics(events = []) {
     freshPromptTokens: events.reduce((sum, event) => sum + Number(event.freshPromptTokens ?? event.promptTokens ?? 0), 0),
     cacheReadTokens: events.reduce((sum, event) => sum + Number(event.cacheReadTokens || 0), 0),
     cacheCreationTokens: events.reduce((sum, event) => sum + Number(event.cacheCreationTokens || 0), 0),
+    openaiCacheWriteTokens: events.reduce((sum, event) => sum + (event.cacheWriteRateKind === "openai" ? Number(event.cacheCreationTokens || 0) : 0), 0),
+    inputCacheWriteTokens: events.reduce((sum, event) => sum + (event.cacheWriteRateKind === "input" ? Number(event.cacheCreationTokens || 0) : 0), 0),
     completionTokens: events.reduce((sum, event) => sum + Number(event.completionTokens || 0), 0),
   };
 }
@@ -580,6 +646,9 @@ function budgetAlert(scope, label, metrics = {}, budget = {}) {
   if (!active) {
     return null;
   }
+  const limitStateText = active.status === "exceeded"
+    ? active.ratio === 1 ? "已达上限" : "已超限"
+    : "接近上限";
   return {
     scope,
     label,
@@ -589,7 +658,7 @@ function budgetAlert(scope, label, metrics = {}, budget = {}) {
     limit: active.limit,
     remaining: active.remaining,
     ratio: active.ratio,
-    message: `${label} 今日${active.name}已用 ${active.used} / ${active.limit}，已用比例 ${formatBudgetRatio(active.ratio)}，剩余 ${active.remaining} ${active.unit}，${active.status === "exceeded" ? "已超限" : "接近上限"}。`,
+    message: `${label} 今日${active.name}已用 ${active.used} / ${active.limit}，已用比例 ${formatBudgetRatio(active.ratio)}，剩余 ${active.remaining} ${active.unit}，${limitStateText}。`,
   };
 }
 
@@ -605,13 +674,14 @@ function budgetMetricAlert(metric, name, used, limit) {
   if (!limit) {
     return null;
   }
-  const ratio = used / limit;
-  const remaining = Math.max(0, limit - used);
   const unit = metric === "calls" ? "次请求" : metric === "cost" ? "费用单位" : "Token";
   const normalizedUsed = metric === "cost" ? roundBudgetCost(used) : used;
   const normalizedLimit = metric === "cost" ? roundBudgetCost(limit) : limit;
+  const rawRatio = normalizedUsed / normalizedLimit;
+  const ratio = metric === "cost" && Number.isFinite(rawRatio) ? roundBudgetCost(rawRatio) : rawRatio;
+  const remaining = Math.max(0, normalizedLimit - normalizedUsed);
   const normalizedRemaining = metric === "cost" ? roundBudgetCost(remaining) : remaining;
-  if (ratio > 1) {
+  if (ratio >= 1) {
     return {
       metric,
       name,
@@ -650,30 +720,18 @@ function costEstimate(scope, label, metrics = {}, rates = {}) {
   if (!hasCostRates(rates)) {
     return null;
   }
-  const inputCost = costForTokens(metrics.freshPromptTokens, rates.inputCostPerMillion);
-  const cacheTokens = Number(metrics.cacheReadTokens || 0) + Number(metrics.cacheCreationTokens || 0);
-  const cacheRate = rates.cacheCostPerMillion || rates.inputCostPerMillion || 0;
-  const cacheCost = costForTokens(cacheTokens, cacheRate);
-  const outputCost = costForTokens(metrics.completionTokens, rates.outputCostPerMillion);
   return {
     scope,
     label,
     calls: Number(metrics.calls || 0),
     tokens: Number(metrics.tokens || 0),
-    inputCost,
-    cacheCost,
-    outputCost,
-    totalCost: inputCost + cacheCost + outputCost,
+    ...estimateUsageTokenCosts(metrics, rates),
   };
-}
-
-function costForTokens(tokens, costPerMillion) {
-  return (Number(tokens || 0) / 1_000_000) * Number(costPerMillion || 0);
 }
 
 function roundBudgetCost(value) {
   const number = Number(value || 0);
-  return Number.isFinite(number) ? Math.round(number * 1_000_000) / 1_000_000 : 0;
+  return Number.isFinite(number) ? Number(number.toPrecision(15)) : 0;
 }
 
 function sumCostEstimates(estimates = []) {
@@ -682,6 +740,8 @@ function sumCostEstimates(estimates = []) {
     tokens: total.tokens + Number(item.tokens || 0),
     inputCost: total.inputCost + Number(item.inputCost || 0),
     cacheCost: total.cacheCost + Number(item.cacheCost || 0),
+    cacheReadCost: total.cacheReadCost + Number(item.cacheReadCost || 0),
+    cacheWriteCost: total.cacheWriteCost + Number(item.cacheWriteCost || 0),
     outputCost: total.outputCost + Number(item.outputCost || 0),
     totalCost: total.totalCost + Number(item.totalCost || 0),
   }), emptyCostEstimate());
@@ -694,6 +754,8 @@ function emptyCostEstimate() {
     tokens: 0,
     inputCost: 0,
     cacheCost: 0,
+    cacheReadCost: 0,
+    cacheWriteCost: 0,
     outputCost: 0,
     totalCost: 0,
     global: null,
@@ -728,9 +790,11 @@ function normalizeEvent(event) {
     stream: Boolean(event.stream),
     status: Number.isFinite(Number(event.status)) ? Number(event.status) : null,
     promptTokens: Number(event.promptTokens || 0),
-    freshPromptTokens: Number(event.freshPromptTokens ?? event.promptTokens ?? 0),
+    freshPromptTokens: Number(event.freshPromptTokens ?? Math.max(0,
+      Number(event.promptTokens || 0) - Number(event.cacheReadTokens || 0) - Number(event.cacheCreationTokens || 0))),
     cacheReadTokens: Number(event.cacheReadTokens || 0),
     cacheCreationTokens: Number(event.cacheCreationTokens || 0),
+    cacheWriteRateKind: ["openai", "input"].includes(event.cacheWriteRateKind) ? event.cacheWriteRateKind : "",
     completionTokens: Number(event.completionTokens || 0),
     totalTokens: Number(event.totalTokens || 0),
     durationMs: Number.isFinite(Number(event.durationMs)) ? Number(event.durationMs) : null,
@@ -789,12 +853,36 @@ function eventMatchesActiveRoute(event, activeRoutes, hasActiveRoutes) {
   if (!hasActiveRoutes) {
     return true;
   }
-  const active = activeRoutes.get(event.route) || activeRoutes.get(event.codexModel);
+  const active = activeRouteForEvent(event, activeRoutes);
   return Boolean(
     active &&
       (!active.model || active.model === event.upstreamModel) &&
       (!active.api || active.api === event.api),
   );
+}
+
+function activeRouteForEvent(event, activeRoutes) {
+  const exact = activeRoutes.get(event.route) || activeRoutes.get(event.codexModel);
+  if (exact) return exact;
+  const promoted = activeRoutes.get(canonicalModelReference(event.route)) ||
+    activeRoutes.get(canonicalModelReference(event.codexModel));
+  return promoted && (!promoted.model || promoted.model === event.upstreamModel) &&
+    (!promoted.api || promoted.api === event.api) ? promoted : undefined;
+}
+
+function usageRouteId(event, activeRoutes) {
+  return activeRouteForEvent(event, activeRoutes)?.id || event.route || event.codexModel || "";
+}
+
+function configuredRouteIdForReference(value, activeRoutes) {
+  const id = String(value || "");
+  if (!id || activeRoutes.has(id)) return id;
+  const canonical = canonicalModelReference(id);
+  if (activeRoutes.has(canonical)) return canonical;
+  for (const active of activeRoutes.values()) {
+    if (canonicalModelReference(active.id) === canonical) return active.id;
+  }
+  return id;
 }
 
 function totalsForEvents(events = []) {

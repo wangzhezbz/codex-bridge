@@ -100,10 +100,17 @@ test("registers only the fixed software-manager IPC surface and forwards events"
   ]]);
 });
 
-test("software-manager cancel reaches a tracked external plugin task before the component service", async () => {
+test("software-manager cancel reaches its service without interception by the retired external plugin hook", async () => {
   const value = fixture({ externalCancelResult: { cancelled: true } });
   assert.deepEqual(await value.invoke("softwareManager:cancelTask"), { cancelled: true });
-  assert.deepEqual(value.calls, [["cancelExternalTask"]]);
+  assert.deepEqual(value.calls, [["cancelTask"]]);
+  assert.equal(value.serviceLoads, 1);
+});
+
+test("software-manager cancel preserves the service refusal when cancellation is unsafe", async () => {
+  const value = fixture({ externalCancelResult: { cancelled: true } });
+  value.service.cancelTask = () => ({ cancelled: false, reason: "critical" });
+  assert.deepEqual(await value.invoke("softwareManager:cancelTask"), { cancelled: false, reason: "critical" });
 });
 
 test("non-Windows rejects every software-manager IPC before creating the service", async () => {
@@ -293,6 +300,57 @@ test("two simultaneous main quit requests execute one shared software and Router
   await third;
 });
 
+test("main quit keeps the software safety gate and Router lifecycle without retired plugin coordination", async () => {
+  const mainSource = require("node:fs").readFileSync(new URL("../desktop/main.cjs", import.meta.url), "utf8");
+  const source = mainSource.match(/async function runManagedAppQuit\([^)]*\)[\s\S]*?\n\}/u)?.[0];
+  assert.ok(source);
+  const runnable = source.replace('"./software-manager/ipc.mjs"', JSON.stringify(new URL("../desktop/software-manager/ipc.mjs", import.meta.url).href));
+  const createQuit = new Function(
+    "process", "getSoftwareManagerService", "loadRouterLifecycleController", "cancelRouterRestartTimer",
+    "dialog", "prepareCuratedPluginAppQuit", "managedQuitReady", "app",
+    `const mainWindow = null; ${runnable}; return runManagedAppQuit;`,
+  );
+  for (const scenario of [
+    { name: "idle", decision: { allowQuit: true }, expected: { ok: true } },
+    { name: "critical", decision: { allowQuit: false, reason: "critical" }, expected: { ok: false, cancelled: true, reason: "critical" } },
+    { name: "background", decision: { allowQuit: false, reason: "running", canCancel: true }, expected: { ok: false, cancelled: true, reason: "background" } },
+    { name: "cancel-and-quit", decision: { allowQuit: false, reason: "running", canCancel: true }, expected: { ok: true } },
+    { name: "router-failure", decision: { allowQuit: true }, fails: true },
+    { name: "non-windows", platform: "darwin", expected: { ok: true } },
+    { name: "already-ready", ready: true, expected: { ok: true, alreadyReady: true } },
+  ]) {
+    const value = fixture({ decision: scenario.decision });
+    const effects = [];
+    value.service.getSnapshot = async () => ({});
+    const quit = createQuit(
+      { platform: scenario.platform ?? "win32" },
+      async () => { effects.push("service"); return value.service; },
+      async () => ({ quit: async ({ reason }) => {
+        effects.push(`router:${reason}`);
+        if (scenario.fails) throw new Error("router quit failed");
+        return { ok: true };
+      } }),
+      () => effects.push("stop-watchdog"),
+      { showMessageBox: async () => ({ response: scenario.name === "cancel-and-quit" ? 1 : 0 }) },
+      () => { throw new Error("retired plugin quit hook must not be consulted"); },
+      scenario.ready ?? false,
+      { quit: () => effects.push("app-quit") },
+    );
+    if (scenario.fails) await assert.rejects(quit("tray"), /router quit failed/u);
+    else assert.deepEqual(await quit("tray"), scenario.expected, scenario.name);
+    if (scenario.ready) {
+      assert.deepEqual(effects, ["stop-watchdog", "app-quit"]);
+    } else if (scenario.platform === "darwin") {
+      assert.deepEqual(effects, ["stop-watchdog", "router:tray"]);
+    } else {
+      const allowed = scenario.expected?.ok || scenario.fails;
+      assert.deepEqual(effects, allowed ? ["service", "stop-watchdog", "router:tray"] : ["service"], scenario.name);
+      assert.equal(value.calls.filter(([name]) => name === "releaseQuit").length, 1, scenario.name);
+      assert.equal(value.calls.filter(([name]) => name === "cancelTask").length, scenario.name === "cancel-and-quit" ? 1 : 0, scenario.name);
+    }
+  }
+});
+
 test("closing a window remains hide-to-tray and does not become a task cancellation path", () => {
   const mainSource = require("node:fs").readFileSync(new URL("../desktop/main.cjs", import.meta.url), "utf8");
   const closeHandler = mainSource.match(/mainWindow\.on\("close",[\s\S]*?\n  \}\);/u)?.[0] ?? "";
@@ -301,7 +359,7 @@ test("closing a window remains hide-to-tray and does not become a task cancellat
   assert.doesNotMatch(closeHandler, /cancelTask|softwareManager/u);
 });
 
-test("main delegates Windows runtime construction and recovers offline before renderer creation", () => {
+test("main constructs the optional Windows runtime without blocking renderer creation on recovery", () => {
   const mainSource = require("node:fs").readFileSync(new URL("../desktop/main.cjs", import.meta.url), "utf8");
   const runtime = mainSource.match(/async function createSoftwareManagerRuntimeService\(\)[\s\S]*?\n\}/u)?.[0] ?? "";
   assert.match(runtime, /process\.platform !== "win32"[\s\S]*?import\("\.\/software-manager\/runtime-factory\.mjs"\)/u);
@@ -315,37 +373,31 @@ test("main delegates Windows runtime construction and recovers offline before re
   assert.match(runtime, /defaultInstallRoot:\s*smokeDefaultInstallRoot\s*\|\|\s*path\.join\(localAppData, "CBApps"\)/u);
   assert.match(runtime, /CODEXBRIDGE_DESKTOP_SMOKE_SOFTWARE_MANAGER_OFFLINE/u);
   assert.doesNotMatch(mainSource, /softwareManagerUnavailableAdapter|software_manager_runtime_not_provisioned/u);
-  const startupRecovery = mainSource.indexOf("runtime.recoverOffline()");
-  const createWindow = mainSource.indexOf("createWindow();", startupRecovery);
-  assert.equal(startupRecovery > 0 && createWindow > startupRecovery, true);
+  const startup = mainSource.match(/app\.whenReady\(\)\.then\(async \(\) => \{[\s\S]*?\n\}\);\n\napp\.on\("before-quit"/u)?.[0] ?? "";
+  assert.match(startup, /await getSoftwareManagerRuntime\(\)/u);
+  assert.doesNotMatch(startup, /recoverOffline\(\)/u);
+  assert.ok(startup.indexOf("await getSoftwareManagerRuntime()") < startup.indexOf("createWindow();"));
 });
 
-test("software-manager runtime failure degrades only that feature and recovery remains retryable", () => {
+test("software-manager runtime failure degrades only that feature while recovery stays lazy", () => {
   const mainSource = require("node:fs").readFileSync(new URL("../desktop/main.cjs", import.meta.url), "utf8");
   const startup = mainSource.match(/app\.whenReady\(\)\.then\(async \(\) => \{[\s\S]*?\n\}\);\n\napp\.on\("before-quit"/u)?.[0] ?? "";
-  const recovery = startup.indexOf("runtime.recoverOffline()");
-  const construction = startup.lastIndexOf("runtime = await getSoftwareManagerRuntime()", recovery);
+  const construction = startup.indexOf("await getSoftwareManagerRuntime()");
   const constructionCatch = startup.indexOf("catch (error)", construction);
   const constructionCatchEnd = startup.indexOf("\n    }", constructionCatch);
-  const recoveryCatch = startup.indexOf("catch (error)", recovery);
-  const recoveryComplete = startup.indexOf("configRecoveryComplete = true;", recovery);
-  const createWindow = startup.indexOf("createWindow();", recovery);
+  const recoveryComplete = startup.indexOf("configRecoveryComplete = true;", constructionCatchEnd);
+  const createWindow = startup.indexOf("createWindow();", recoveryComplete);
   assert.equal(
-    construction >= 0 && constructionCatch > construction && recovery >= 0
-      && recoveryCatch > recovery && recoveryComplete > recoveryCatch && createWindow > recoveryComplete,
+    construction >= 0 && constructionCatch > construction
+      && recoveryComplete > constructionCatch && createWindow > recoveryComplete,
     true,
   );
-  const recoveryCatchEnd = startup.indexOf("\n    }", recoveryCatch);
   const constructionCatchBody = startup.slice(constructionCatch, constructionCatchEnd);
-  const catchBody = startup.slice(recoveryCatch, recoveryCatchEnd);
   assert.match(constructionCatchBody, /appendRuntimeLog\(formatError\("softwareManagerStartup", error\)\)/u);
   assert.match(constructionCatchBody, /softwareManagerStartupFailure\s*=\s*error/u);
-  assert.match(catchBody, /appendRuntimeLog\(formatError\("softwareManagerRecovery", error\)\)/u);
-  assert.doesNotMatch(catchBody, /softwareManagerStartupFailure\s*=\s*error/u);
-  assert.doesNotMatch(catchBody, /app\.quit\(\)|return;/u);
-  assert.doesNotMatch(catchBody, /configRecoveryComplete = true/u);
+  assert.doesNotMatch(startup, /runtime\.recoverOffline\(\)/u);
   assert.equal((startup.match(/configRecoveryComplete = true;/gu) ?? []).length, 1);
-  assert.doesNotMatch(startup.slice(recovery, createWindow), /\.refresh\(|\bfetch\s*\(/u);
+  assert.match(startup.slice(constructionCatchEnd, recoveryComplete), /initializeSoftwareManagerIpc\(\)/u);
 });
 
 test("main process spawn adapter exposes bounded start, completion, and cancellation evidence", async () => {

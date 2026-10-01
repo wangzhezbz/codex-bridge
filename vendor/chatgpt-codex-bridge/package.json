@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-codex-bridge",
-  "version": "0.1.0",
+  "version": "0.1.95",
   "private": true,
   "type": "module",
   "description": "Local GPT-session bridge with a Codex inbox handoff.",
@@ -13,10 +13,10 @@
     "smoke:product": "node scripts/product-smoke.js",
     "smoke:semantic-router": "node scripts/semantic-router-smoke.js",
     "acceptance:contract": "node scripts/acceptance-contract.js",
-    "test": "node --max-old-space-size=4096 --test"
+    "test": "node scripts/run-tests.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "zod": "^4.1.0"
   },
   "devDependencies": {}

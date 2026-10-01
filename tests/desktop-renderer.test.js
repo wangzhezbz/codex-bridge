@@ -14,6 +14,343 @@ const mainSource = readFileSync(resolve(__dirname, "../desktop/main.cjs"), "utf8
 const kimiLogoSource = readFileSync(resolve(__dirname, "../desktop/renderer/assets/providers/kimi.svg"), "utf8");
 const defaultLogoSource = readFileSync(resolve(__dirname, "../desktop/renderer/assets/providers/default.svg"), "utf8");
 
+test("an unready owned double-quota process keeps its stop button available", () => {
+  const start = rendererSource.indexOf("function renderDoubleQuota(");
+  const layer = rendererSource.indexOf("function setDoubleQuotaExtensionLayerState(", start);
+  const end = rendererSource.indexOf("\nfunction ", layer + 1);
+  assert.ok(start >= 0 && layer > start && end > layer);
+  for (const entry of [
+    { status: "starting", running: false, ownedProcess: true, canStop: true },
+    { status: "running", running: true, ownedProcess: true, canStop: true },
+    { status: "stopped", running: false, ownedProcess: false, canStop: false },
+    { status: "attached", running: true, ownedProcess: false, externalProcess: true, canStop: true },
+    { status: "error", running: false, ownedProcess: false, externalProcess: true, canStop: false },
+  ]) {
+    const els = Object.fromEntries([
+      "doubleQuotaStatus", "doubleQuotaServiceBanner", "doubleQuotaServiceTitle", "doubleQuotaServiceDetail",
+      "doubleQuotaUrl", "doubleQuotaServiceVersion", "doubleQuotaProtocolVersion", "doubleQuotaExtensionProtocol",
+      "doubleQuotaEmbeddedVersion", "doubleQuotaServiceSource", "doubleQuotaMcpStatus", "doubleQuotaPort",
+      "doubleQuotaExtensionPath", "doubleQuotaExtensionDiskState", "doubleQuotaExtensionBrowserState",
+      "doubleQuotaExtensionRuntimeState", "doubleQuotaMessage", "startDoubleQuota", "restartDoubleQuota",
+      "stopDoubleQuota", "saveDoubleQuotaPort",
+    ].map((key) => [key, { textContent: "", value: "", disabled: false, classList: { add() {}, toggle() {} } }]));
+    const sandbox = {
+      els, document: { activeElement: null }, doubleQuotaExtensionGuideActive: false,
+      doubleQuotaState: { ...entry, port: 4317, error: "retained diagnostic" },
+    };
+    runInNewContext(rendererSource.slice(start, end), sandbox);
+    sandbox.renderDoubleQuota();
+    assert.equal(els.stopDoubleQuota.disabled, !entry.canStop, entry.status);
+    assert.equal(els.stopDoubleQuota.textContent, entry.canStop ? "停止服务" : "服务已停止", entry.status);
+    assert.equal(els.doubleQuotaMessage.textContent, "retained diagnostic");
+  }
+});
+
+function budgetInputHarness(scope = "global", value = 12.5) {
+  const budget = { dailyCostLimit: 1.1, inputCostPerMillion: 10, cacheCostPerMillion: 1, cacheWriteCostPerMillion: value };
+  const sandbox = {
+    usageBudgetDrafts: new Map(), usageBudgetRevision: 0, usageBudgetSaving: false, usageBudgetRenderedKey: null, usageBudgetValidationShown: false,
+    state: { models: [{ id: "r", provider: "openai" }], desktopOptions: { usageBudgets: {
+      global: { ...budget }, routes: { r: { ...budget } }, providers: { openai: { ...budget } },
+    } } },
+    els: Object.fromEntries([
+      "usageDailyTokenLimit", "usageDailyCallLimit", "usageDailyCostLimit", "usageInputCostPerMillion",
+      "usageCacheCostPerMillion", "usageCacheWriteCostPerMillion", "usageOutputCostPerMillion",
+    ].map((key) => [key, { id: key, value: "" }])),
+    document: { activeElement: null }, escapeHtml: (value) => String(value), providerName: (value) => value,
+  };
+  sandbox.els.usageBudgetScope = { value: scope };
+  sandbox.els.usageBudgetTarget = { value: scope === "route" ? "r" : scope === "provider" ? "openai" : "global" };
+  const start = rendererSource.indexOf("function usageBudgetFields(");
+  const end = rendererSource.indexOf("function renderUsageBudgetAlerts(", start);
+  assert.ok(start >= 0 && end > start);
+  runInNewContext(rendererSource.slice(start, end), sandbox);
+  return sandbox;
+}
+
+test("write-cache rate renders and survives saving global, route and provider budgets including zero", () => {
+  for (const scope of ["global", "route", "provider"]) {
+    for (const value of [12.5, 0, 0.0000004]) {
+      const sandbox = budgetInputHarness(scope, value);
+      sandbox.renderUsageBudgetInputs();
+      assert.equal(sandbox.els.usageCacheWriteCostPerMillion.value, String(value));
+      const result = sandbox.usageBudgetOptionsFromInputs();
+      const selected = scope === "global" ? result.global : scope === "route" ? result.routes.r : result.providers.openai;
+      assert.equal(selected.cacheWriteCostPerMillion, value);
+      assert.equal(selected.dailyCostLimit, 1.1);
+      assert.equal(selected.inputCostPerMillion, 10);
+      assert.equal(result.providers.openai.cacheWriteCostPerMillion, value);
+    }
+  }
+});
+
+test("clearing the write-cache rate restores defaults without changing other budget scopes", () => {
+  const sandbox = budgetInputHarness("route");
+  sandbox.renderUsageBudgetInputs();
+  sandbox.els.usageCacheWriteCostPerMillion.value = "";
+  const result = sandbox.usageBudgetOptionsFromInputs();
+  assert.equal(Object.hasOwn(result.routes.r, "cacheWriteCostPerMillion"), false);
+  assert.equal(result.global.cacheWriteCostPerMillion, 12.5);
+  assert.equal(result.providers.openai.cacheWriteCostPerMillion, 12.5);
+  assert.equal(sandbox.state.desktopOptions.usageBudgets.routes.r.cacheWriteCostPerMillion, 12.5);
+});
+
+test("live budget rendering does not replace the focused write-cache price draft", () => {
+  const sandbox = budgetInputHarness();
+  sandbox.els.usageCacheWriteCostPerMillion.value = "2.75";
+  sandbox.document.activeElement = sandbox.els.usageCacheWriteCostPerMillion;
+  sandbox.renderUsageBudgetInputs();
+  assert.equal(sandbox.els.usageCacheWriteCostPerMillion.value, "2.75");
+  assert.equal(sandbox.usageBudgetOptionsFromInputs().global.cacheWriteCostPerMillion, 2.75);
+});
+
+function editBudget(sandbox, id, value, badInput = false) {
+  sandbox.els[id].value = value;
+  sandbox.els[id].validity = { badInput };
+  sandbox.captureUsageBudgetEdit({target:sandbox.els[id]});
+}
+
+function budgetSaveHarness(saveOptions) {
+  const sandbox = budgetInputHarness();
+  sandbox.api = {saveOptions};
+  sandbox.runAction = (_button,action) => action();
+  sandbox.adoptStateSnapshot = value => { sandbox.state = value; };
+  sandbox.render = () => sandbox.renderUsageBudgetInputs();
+  sandbox.showToast = () => {};
+  sandbox.render();
+  return sandbox;
+}
+
+test("invalid budget input stays inline without opening an overlay or submitting settings", async () => {
+  let saves = 0, notices = 0, focused = false;
+  const sandbox = budgetSaveHarness(async () => { saves++; });
+  sandbox.els.usageBudgetError = { hidden: true, textContent: "" };
+  sandbox.els.discardUsageBudget = { disabled: true };
+  sandbox.els.usageDailyCallLimit.focus = () => { focused = true; };
+  sandbox.els.usageDailyCallLimit.scrollIntoView = () => {};
+  sandbox.showToast = () => { notices++; };
+  editBudget(sandbox, 'usageDailyCallLimit', '', true);
+  await sandbox.saveUsageBudgetSettings();
+  assert.equal(saves, 0);
+  assert.equal(sandbox.els.usageBudgetError.hidden, false);
+  assert.match(sandbox.els.usageBudgetError.textContent, /每日请求上限/u);
+  assert.equal(sandbox.els.discardUsageBudget.disabled, false);
+  assert.equal(focused, true);
+  assert.equal(notices, 0);
+});
+
+test("budget drafts retain blank and zero edits after focus leaves the field without changing saved values", () => {
+  const sandbox = budgetInputHarness();
+  sandbox.renderUsageBudgetInputs();
+  editBudget(sandbox,'usageDailyCallLimit','123');
+  editBudget(sandbox,'usageCacheWriteCostPerMillion','0');
+  editBudget(sandbox,'usageDailyCostLimit','');
+  sandbox.renderUsageBudgetInputs();
+  assert.equal(sandbox.els.usageDailyCallLimit.value,'123');
+  assert.equal(sandbox.els.usageCacheWriteCostPerMillion.value,'0');
+  assert.equal(sandbox.els.usageDailyCostLimit.value,'');
+  assert.equal(sandbox.state.desktopOptions.usageBudgets.global.dailyCostLimit,1.1);
+  assert.equal(sandbox.state.desktopOptions.usageBudgets.global.cacheWriteCostPerMillion,12.5);
+});
+
+test("budget scopes retain independent drafts and saving options includes only the current scope", () => {
+  const sandbox = budgetInputHarness();
+  for (const [scope,value] of [['global','123'],['route','7'],['provider','9']]) {
+    sandbox.els.usageBudgetScope.value = scope;
+    sandbox.renderUsageBudgetInputs({keepTarget:false});
+    editBudget(sandbox,'usageDailyCallLimit',value);
+  }
+  sandbox.els.usageBudgetScope.value = 'route';
+  sandbox.renderUsageBudgetInputs({keepTarget:false});
+  assert.equal(sandbox.els.usageDailyCallLimit.value,'7');
+  const submitted = sandbox.usageBudgetOptionsFromInputs();
+  assert.equal(submitted.routes.r.dailyCallLimit,7);
+  assert.equal(submitted.global.dailyCallLimit,undefined);
+  assert.equal(submitted.providers.openai.dailyCallLimit,undefined);
+  sandbox.els.usageBudgetScope.value = 'global';
+  sandbox.renderUsageBudgetInputs({keepTarget:false});
+  assert.equal(sandbox.els.usageDailyCallLimit.value,'123');
+});
+
+test("budget save acknowledges submitted revisions but retains newer edits even when they match old saved values", async () => {
+  let finishSave;
+  const requests = [];
+  const sandbox = budgetSaveHarness(options => { requests.push(options); return new Promise(resolve => { finishSave = resolve; }); });
+  editBudget(sandbox,'usageDailyCallLimit','123');
+  const saving = sandbox.saveUsageBudgetSettings();
+  editBudget(sandbox,'usageDailyCallLimit','');
+  sandbox.els.usageBudgetScope.value = 'route';
+  sandbox.renderUsageBudgetInputs({keepTarget:false});
+  editBudget(sandbox,'usageDailyCallLimit','7');
+  await sandbox.saveUsageBudgetSettings();
+  assert.equal(requests.length,1);
+  finishSave({...sandbox.state,desktopOptions:{usageBudgets:requests[0].usageBudgets}});
+  await saving;
+  assert.equal(sandbox.usageBudgetSaving,false);
+  assert.equal(sandbox.els.usageDailyCallLimit.value,'7');
+  sandbox.els.usageBudgetScope.value = 'global';
+  sandbox.renderUsageBudgetInputs({keepTarget:false});
+  assert.equal(sandbox.els.usageDailyCallLimit.value,'');
+  assert.equal(sandbox.state.desktopOptions.usageBudgets.global.dailyCallLimit,123);
+});
+
+test("a rejected budget save keeps the draft and allows retry", async () => {
+  const sandbox = budgetSaveHarness(async () => { throw new Error('save rejected'); });
+  editBudget(sandbox,'usageDailyCallLimit','123');
+  await assert.rejects(sandbox.saveUsageBudgetSettings(),/save rejected/);
+  assert.equal(sandbox.usageBudgetSaving,false);
+  sandbox.renderUsageBudgetInputs();
+  assert.equal(sandbox.els.usageDailyCallLimit.value,'123');
+  sandbox.api.saveOptions = async options => ({...sandbox.state,desktopOptions:{usageBudgets:options.usageBudgets}});
+  await sandbox.saveUsageBudgetSettings();
+  assert.equal(sandbox.usageBudgetDrafts.size,0);
+  assert.equal(sandbox.state.desktopOptions.usageBudgets.global.dailyCallLimit,123);
+});
+
+test("a budget explicitly undone during an unconfirmed save survives the later authoritative refresh", async () => {
+  let fail;
+  const sandbox=budgetSaveHarness(() => new Promise((_resolve,reject) => {fail=reject;}));
+  editBudget(sandbox,'usageDailyCallLimit','123');
+  const saving=sandbox.saveUsageBudgetSettings();
+  editBudget(sandbox,'usageDailyCallLimit','');
+  fail(new Error('save result unavailable'));
+  await assert.rejects(saving);
+  sandbox.state.desktopOptions.usageBudgets.global.dailyCallLimit=123;
+  sandbox.renderUsageBudgetInputs();
+  assert.equal(sandbox.els.usageDailyCallLimit.value,'');
+});
+
+test("a failed budget snapshot confirmation must not acknowledge the user's draft", async () => {
+  for (const response of [null,{}, {stateUnavailable:true,desktopOptions:{}}, {desktopOptions:{}},
+    {desktopOptions:{usageBudgets:{global:{dailyCallLimit:5}}}}]) {
+    const sandbox = budgetSaveHarness(async () => response);
+    editBudget(sandbox,'usageDailyCallLimit','123');
+    await assert.rejects(sandbox.saveUsageBudgetSettings());
+    assert.equal(sandbox.usageBudgetSaving,false);
+    assert.ok(sandbox.usageBudgetDrafts.size > 0);
+  }
+});
+
+test("budget confirmation follows existing rounding and zero rules without requiring other objects to match", async () => {
+  const sandbox = budgetSaveHarness(async options => {
+    const budgets = structuredClone(options.usageBudgets);
+    budgets.global.dailyCostLimit = 1.234568;
+    budgets.routes.r = {dailyCallLimit:999};
+    return {...sandbox.state,desktopOptions:{usageBudgets:budgets}};
+  });
+  editBudget(sandbox,'usageDailyCallLimit','1.9');
+  editBudget(sandbox,'usageDailyCostLimit','1.23456789');
+  editBudget(sandbox,'usageCacheWriteCostPerMillion','0');
+  await sandbox.saveUsageBudgetSettings();
+  assert.equal(sandbox.usageBudgetDrafts.size,0);
+  assert.equal(sandbox.state.desktopOptions.usageBudgets.global.dailyCallLimit,1);
+  assert.equal(sandbox.state.desktopOptions.usageBudgets.global.cacheWriteCostPerMillion,0);
+  assert.equal(sandbox.state.desktopOptions.usageBudgets.global.dailyCostLimit,1.234568);
+  assert.equal(sandbox.state.desktopOptions.usageBudgets.routes.r.dailyCallLimit,999);
+});
+
+test("clearing a budget requires an explicit saved budget container and retains other scopes if confirmation is missing", async () => {
+  const sandbox = budgetSaveHarness(async () => ({desktopOptions:{}}));
+  for (const {id} of sandbox.usageBudgetFields()) editBudget(sandbox,id,'');
+  await assert.rejects(sandbox.saveUsageBudgetSettings());
+  assert.ok(sandbox.usageBudgetDrafts.size > 0);
+  assert.equal(sandbox.state.desktopOptions.usageBudgets.routes.r.cacheWriteCostPerMillion,12.5);
+  sandbox.api.saveOptions = async options => ({...sandbox.state,desktopOptions:{usageBudgets:options.usageBudgets}});
+  await sandbox.saveUsageBudgetSettings();
+  assert.equal(sandbox.usageBudgetDrafts.size,0);
+  assert.equal(sandbox.state.desktopOptions.usageBudgets.global,undefined);
+  assert.equal(sandbox.state.desktopOptions.usageBudgets.routes.r.cacheWriteCostPerMillion,12.5);
+});
+
+test("a negative-zero cache-write price confirms against its persisted JSON zero", async () => {
+  const sandbox = budgetSaveHarness(async options => JSON.parse(JSON.stringify({...sandbox.state,desktopOptions:{usageBudgets:options.usageBudgets}})));
+  editBudget(sandbox,'usageCacheWriteCostPerMillion','-0');
+  await sandbox.saveUsageBudgetSettings();
+  assert.equal(sandbox.usageBudgetDrafts.size,0);
+  assert.equal(sandbox.state.desktopOptions.usageBudgets.global.cacheWriteCostPerMillion,0);
+});
+
+test("a missing budget target does not silently retarget an edit to another model", () => {
+  const sandbox = budgetInputHarness('route');
+  sandbox.renderUsageBudgetInputs();
+  editBudget(sandbox,'usageDailyCallLimit','7');
+  sandbox.state.models = [{id:'replacement',provider:'openai'}];
+  sandbox.renderUsageBudgetInputs();
+  assert.equal(sandbox.els.usageBudgetTarget.value,'r');
+  assert.equal(sandbox.els.usageDailyCallLimit.value,'7');
+  assert.equal(sandbox.usageBudgetInputError().control,sandbox.els.usageBudgetTarget);
+});
+
+test("a draft for a removed budget target remains reachable after visiting another scope", () => {
+  const sandbox = budgetInputHarness('route');
+  sandbox.renderUsageBudgetInputs();
+  editBudget(sandbox,'usageDailyCallLimit','7');
+  sandbox.els.usageBudgetScope.value='global';
+  sandbox.renderUsageBudgetInputs({keepTarget:false});
+  sandbox.state.models=[{id:'replacement',provider:'openai'}];
+  sandbox.els.usageBudgetScope.value='route';
+  sandbox.renderUsageBudgetInputs({keepTarget:false});
+  assert.match(sandbox.els.usageBudgetTarget.innerHTML,/value="r"/);
+  sandbox.els.usageBudgetTarget.value='r';
+  sandbox.renderUsageBudgetInputs();
+  assert.equal(sandbox.els.usageDailyCallLimit.value,'7');
+  assert.equal(sandbox.usageBudgetInputError().control,sandbox.els.usageBudgetTarget);
+});
+
+test("budget validation rejects invalid numbers and incomplete native input without rejecting tiny valid prices", () => {
+  const sandbox = budgetInputHarness();
+  sandbox.renderUsageBudgetInputs();
+  for (const value of ['','0','0.0000004','1e-8','123']) {
+    editBudget(sandbox,'usageCacheWriteCostPerMillion',value);
+    assert.equal(sandbox.usageBudgetInputError(),null,value);
+  }
+  for (const value of ['-1','Infinity','invalid']) {
+    editBudget(sandbox,'usageCacheWriteCostPerMillion',value);
+    assert.equal(sandbox.usageBudgetInputError().control,sandbox.els.usageCacheWriteCostPerMillion,value);
+  }
+  editBudget(sandbox,'usageCacheWriteCostPerMillion','',true);
+  sandbox.renderUsageBudgetInputs();
+  assert.equal(sandbox.usageBudgetInputError().control,sandbox.els.usageCacheWriteCostPerMillion);
+});
+
+test("cost breakdown distinguishes cache reads from cache writes", () => {
+  const output = { innerHTML: "", classList: { toggle() {} } };
+  const sandbox = {
+    state: { usageCostEstimate: { hasRates: true, inputCost: 1, cacheReadCost: 2, cacheWriteCost: 3, cacheCost: 5, outputCost: 4, totalCost: 10 } },
+    els: { usageCostEstimate: output }, formatCostValue: String, escapeHtml: String,
+  };
+  const start = rendererSource.indexOf("function renderUsageCostEstimate(");
+  const end = rendererSource.indexOf("function usageBudgetScopeLabel(", start);
+  runInNewContext(rendererSource.slice(start, end), sandbox);
+  sandbox.renderUsageCostEstimate();
+  assert.match(output.innerHTML, /缓存读取 2/);
+  assert.match(output.innerHTML, /缓存写入 3/);
+});
+
+test("cost labels and breakdown preserve nonzero amounts below the decimal display precision", () => {
+  const output = { innerHTML: "", classList: { toggle() {} } };
+  const sandbox = {
+    state: { usageCostEstimate: { hasRates: true, cacheWriteCost: 4e-10, totalCost: 4e-10 } },
+    els: { usageCostEstimate: output }, escapeHtml: String,
+  };
+  const formatStart = rendererSource.indexOf("function formatCostValue(");
+  const formatEnd = rendererSource.indexOf("function formatCompactContext(", formatStart);
+  runInNewContext(rendererSource.slice(formatStart, formatEnd), sandbox);
+  for (const amount of [4e-10, 5e-7, Number.MIN_VALUE]) {
+    const label = sandbox.formatCostValue(amount);
+    assert.equal(Number(label), amount);
+    assert.ok(label.length <= 18, "tiny amounts must not create hundreds of leading zeroes");
+  }
+  assert.equal(sandbox.formatCostValue(0), "0");
+  assert.equal(sandbox.formatCostValue(0.0022), "0.0022");
+  assert.equal(sandbox.formatCostValue(1234.5), "1,234.50");
+  const start = rendererSource.indexOf("function renderUsageCostEstimate(");
+  const end = rendererSource.indexOf("function usageBudgetScopeLabel(", start);
+  runInNewContext(rendererSource.slice(start, end), sandbox);
+  sandbox.renderUsageCostEstimate();
+  assert.match(output.innerHTML, /缓存写入 4e-10/);
+});
+
 test("sidebar navigation keeps the existing order while separating workbench, management, and service groups", () => {
   assert.match(htmlSource, /id="navGroupWorkbench">工作台<\/div>[\s\S]*?data-section="dashboard"[\s\S]*?data-section="stats"/u);
   assert.match(htmlSource, /id="navGroupManagement">管理<\/div>[\s\S]*?data-section="softwareManager"[\s\S]*?data-section="resources"/u);
@@ -33,8 +370,8 @@ test("double quota is a dedicated desktop page backed by narrow IPC methods", ()
   const section = htmlSource.slice(sectionStart, sectionEnd);
   assert.match(section, /<h2>双倍额度<\/h2>/);
   assert.doesNotMatch(section, /GPT Bridge/i);
-  assert.match(section, /G某T/);
-  assert.doesNotMatch(section, /CHATGPT|ChatGPT/);
+  assert.match(section, /ChatGPT/);
+  assert.doesNotMatch(section, /G某T/);
   for (const id of [
     "doubleQuotaStatus",
     "doubleQuotaServiceBanner",
@@ -181,7 +518,7 @@ test("desktop renderer parses mode transaction results and gives verified restar
 
   assert.equal(
     modeSwitchToastMessage(transaction),
-    "模式已切换且Router已确认；请点击“重启 ChatGPT / Codex”使鉴权生效。",
+    "模式已切换且Router已确认；请点击本应用的“重启 ChatGPT / Codex”使鉴权生效，并兼容 Windows 旧任务。",
   );
   assert.equal(
     modeSwitchToastMessage({ ...transaction, restartAvailable: false }),
@@ -189,17 +526,14 @@ test("desktop renderer parses mode transaction results and gives verified restar
   );
   assert.equal(
     modeSwitchToastMessage({ ...transaction, routerVerified: false }),
-    "模式已切换，配置已原子写入（Router当前未运行）；请点击“重启 ChatGPT / Codex”使鉴权生效。",
+    "模式已切换，配置已原子写入（Router当前未运行）；请点击本应用的“重启 ChatGPT / Codex”使鉴权生效，并兼容 Windows 旧任务。",
   );
   assert.equal(
     modeSwitchToastMessage({ ...transaction, routerVerified: false, restartAvailable: false }),
     "模式已切换，配置已原子写入（Router当前未运行）；未定位到 ChatGPT / Codex 启动项，请完全退出 ChatGPT / Codex 后重新打开，使鉴权生效。",
   );
 
-  assert.equal(
-    (rendererSource.match(/normalizeModeSelectionResult\(await api\.selectMode\(/g) || []).length,
-    2,
-  );
+  assert.equal(normalizeModeSelectionResult({ state: nextState, transaction: null }).transaction, null);
 });
 
 test("Router start IPC failures become a local Chinese Error before the success toast", () => {
@@ -363,6 +697,9 @@ test("desktop renderer resource blocks do not turn unreadable authorities into e
   );
   assert.match(successfulEmptyHtml, /<span>0<\/span>/);
   assert.match(successfulEmptyHtml, /<li class="muted">暂无<\/li>/);
+  assert.equal(resourceBlock("已安装插件", [], sandbox.resourceShortLabel, "plugins", {ok: true, state: "ok"}, true), "");
+  assert.match(resourceBlock("已安装插件", [], sandbox.resourceShortLabel, "plugins", {ok: false, state: "unavailable"}, true), /无法读取/);
+  assert.match(resourceBlock("已安装插件", [], sandbox.resourceShortLabel, "plugins", resourceSummaryReadStatus({summary:{plugins:null}}, "plugins"), true), /无法读取/);
 
   const missingStatusHtml = resourceBlock(
     "已安装插件",
@@ -419,11 +756,26 @@ test("desktop renderer keeps unknown Codex resource totals out of config package
   assert.match(rendererSource, /`Codex 资源 \$\{codexResourceCountLabel\(status\)\}`/);
 });
 
-test("desktop renderer resource refresh bypasses the resource snapshot cache", () => {
-  assert.match(
-    rendererSource,
-    /els\.refreshResources\?\.addEventListener\("click",[\s\S]*?await refresh\(\{ lite: false, forceResourceRefresh: true \}\);/,
-  );
+test("manual resource refresh shares the deduplicated loader and announces only a successful read", async () => {
+  const start = rendererSource.indexOf('els.refreshResources?.addEventListener("click"');
+  const end = rendererSource.indexOf('els.refreshPluginMarketplaces?.addEventListener', start);
+  let clickHandler;
+  let readSucceeded = false;
+  const requests = [];
+  const toasts = [];
+  runInNewContext(rendererSource.slice(start,end), {
+    els:{refreshResources:{addEventListener:(_event,handler) => { clickHandler = handler; }}},
+    runAction:(_button,action) => action(),
+    ensureDetailedStateForSection:async (section,options) => { requests.push({section,...options}); return readSucceeded; },
+    showToast:message => toasts.push(message),
+  });
+  await clickHandler();
+  assert.deepEqual(toasts, []);
+  readSucceeded = true;
+  await clickHandler();
+  assert.deepEqual(requests, [{section:'resources',refreshCore:true},{section:'resources',refreshCore:true}]);
+  assert.equal(toasts.length, 1);
+  assert.match(toasts[0], /已刷新/);
 });
 
 test("desktop renderer keeps starting health state out of failed styling", () => {
@@ -456,6 +808,7 @@ test("desktop renderer exposes update from sidebar without a dedicated page", ()
   assert.match(rendererSource, /api\.onUpdateProgress\?\.\(\(progress\) => renderUpdateProgress\(progress\)\)/);
   assert.match(rendererSource, /api\.onUpdateFinished\?\.\(\(result\) =>/);
   assert.match(rendererSource, /function renderUpdateProgress/);
+  assert.match(rendererSource, /progress\.percent === null \|\| progress\.percent === undefined \|\| progress\.percent === ""/u);
   assert.match(rendererSource, /result\.relaunching \? "restarting" : result\.installerPath \? "launching" : "ready"/);
   assert.match(rendererSource, /result\.nextStep \|\| result\.message/);
   assert.match(rendererSource, /bytesPerSecond/);
@@ -765,7 +1118,7 @@ test("desktop renderer treats missing duplicate protection as default off and ex
   );
   assert.match(
     rendererSource,
-    /els\.duplicateRequestProtection\.checked = state\.desktopOptions\?\.duplicateRequestProtection === true/,
+    /els\.duplicateRequestProtection\.checked = desktopSettingsDraftValue\("duplicateRequestProtection", state\.desktopOptions\?\.duplicateRequestProtection === true\)/,
   );
   assert.match(rendererSource, /api\.repairModelReferences/);
   assert.match(rendererSource, /function renderModelReferenceStatus/);
@@ -842,7 +1195,7 @@ test("desktop renderer keeps heavy startup data lazy and dense pages folded", ()
   assert.match(preloadSource, /getState: \(options\) => ipcRenderer\.invoke\("state:get", options \|\| \{\}\)/);
   assert.match(mainSource, /ipcMain\.handle\("state:get", async \(_event, options = \{\}\) =>/);
   assert.match(mainSource, /const lite = Boolean\(options\.lite\);/);
-  assert.match(mainSource, /stateDetailLoaded: !lite/);
+  assert.match(mainSource, /stateDetailLoaded: fullDetail/);
   assert.doesNotMatch(mainSource, /rendererNeedsDetailedState/);
   assert.match(mainSource, /function initUsageStore\(\)/);
   assert.match(mainSource, /scheduleDeferredStartupWork\(\)/);
@@ -853,8 +1206,9 @@ test("desktop renderer keeps heavy startup data lazy and dense pages folded", ()
   assert.match(mainSource, /markStartupOnce\("core-state-loaded"\)/);
   assert.match(mainSource, /markStartupOnce\("deferred-scan-start"\)/);
   assert.match(mainSource, /getStatePayload\(settings, \{ lite: true \}\)/);
-  assert.match(mainSource, /lite \? null : settings\.listCodexSessionTree/);
-  assert.match(mainSource, /const codexResourceSnapshots = lite[\s\S]*?: await readCodexResourceSnapshotsRetained\(\{[\s\S]*?forceRefresh: Boolean\(options\.forceResourceRefresh\),[\s\S]*?\}\);/);
+  assert.match(mainSource, /let codexSessionSnapshot = null;[\s\S]*?if \(includeSessionDetail\)[\s\S]*?await runCodexSessionSnapshotWorker/);
+  assert.doesNotMatch(mainSource, /const codexSessionTree = includeSessionDetail[\s\S]*?settings\.listCodexSessionTree/);
+  assert.match(mainSource, /let codexResourceSnapshots = null;[\s\S]*?if \(includeResourceSnapshots\)[\s\S]*?await readCodexResourceSnapshotsRetained\(\{[\s\S]*?forceRefresh: Boolean\(options\.forceResourceRefresh\),[\s\S]*?\}\)/);
   assert.match(mainSource, /const codexCliSnapshot = codexResourceSnapshots\?\.codexCliSnapshot \|\| null;/);
   assert.match(mainSource, /const codexPromptInputSnapshot = codexResourceSnapshots\?\.codexPromptInputSnapshot \|\| null;/);
   assert.match(rendererSource, /refresh\(\{ lite: true \}\)/);
@@ -876,19 +1230,457 @@ test("desktop renderer keeps heavy startup data lazy and dense pages folded", ()
   assert.doesNotMatch(renderBody, /renderSessions\(\);/);
   assert.doesNotMatch(renderBody, /renderCapabilityDiagnostics\(\);/);
   assert.doesNotMatch(renderBody, /renderModelPool\(\);/);
-  assert.match(mainSource, /const includeSettingsDetail = !lite \|\| Boolean\(options\.settingsDetail\);/);
-  assert.match(mainSource, /settingsDetailLoaded: includeSettingsDetail/);
-  assert.match(mainSource, /codexBackups: includeSettingsDetail \? settings\.listCodexBackups\(\) : \[\]/);
+  assert.match(mainSource, /const includeSettingsDetail = fullDetail \|\| Boolean\(options\.settingsDetail\);/);
+  assert.match(mainSource, /settingsDetailLoaded: settingsDetailAvailable/);
+  assert.match(mainSource, /let codexBackups = \[\];[\s\S]*?if \(includeSettingsDetail\)[\s\S]*?settings\.listCodexBackups\(\)/);
   assert.match(rendererSource, /capability-model-details/);
   assert.match(rendererSource, /<details class="capability-matrix-row capability-model-details">/);
-  assert.match(rendererSource, /<details class="resource-diagnostics">/);
-  assert.match(rendererSource, /<details class="session-diagnostics">/);
+  assert.match(rendererSource, /<details class="resource-diagnostics"/);
+  assert.match(rendererSource, /<details class="session-diagnostics"/);
   assert.match(rendererSource, /check-passed-details/);
   assert.match(rendererSource, /startupCheckSummaryFromItems\(items,\s*summary\)/);
   assert.match(rendererSource, /visibleSummary\.warn/);
   assert.match(cssSource, /\.capability-model-details > summary/);
   assert.match(cssSource, /\.resource-diagnostics/);
   assert.match(cssSource, /\.session-diagnostics/);
+});
+
+test("detailed pages request only their own expensive state slices", () => {
+  assert.match(rendererSource, /detailSection:\s*sectionId/u);
+  assert.match(rendererSource, /const loadedDetailSections = new Set\(\)/u);
+  assert.match(rendererSource, /const loadingDetailSections = new Set\(\)/u);
+  assert.match(mainSource, /const includeResourceDetail = fullDetail \|\| detailSection === "resources"/u);
+  assert.match(mainSource, /const includeSessionDetail = fullDetail \|\| detailSection === "sessions"/u);
+  assert.match(mainSource, /const includeCapabilityDetail = fullDetail \|\| detailSection === "capabilities"/u);
+  assert.match(mainSource, /const includePreflightDetail = fullDetail \|\| detailSection === "preflight"/u);
+});
+
+test("partial detail snapshots replace only their own slice and retain the others", () => {
+  const start = rendererSource.indexOf("const RETAINED_DETAIL_SLICE_KEYS");
+  const end = rendererSource.indexOf("\nfunction render()", start);
+  assert.ok(start >= 0 && end > start);
+  const sandbox = {
+    stateDetailLoaded: false,
+    settingsDetailLoaded: false,
+    DETAIL_STATE_SECTIONS: new Set(["preflight", "capabilities", "resources", "sessions"]),
+  };
+  runInNewContext(
+    `${rendererSource.slice(start, end)}\n` +
+      "globalThis.mergeState = mergeStateWithRetainedDetailSlices;",
+    sandbox,
+  );
+  const previous = {
+    stateDetailLoaded: false,
+    detailSectionsLoaded: ["resources", "sessions", "capabilities"],
+    codexResources: { marker: "old-resources" },
+    codexSessionTree: { marker: "old-sessions" },
+    capabilityExecutionHistory: [{ id: "old-history" }],
+    imageGenerationHistory: [{ id: "old-image" }],
+  };
+  const resources = sandbox.mergeState(previous, {
+    stateDetailLoaded: false,
+    detailSectionsLoaded: ["resources"],
+    codexResources: { marker: "new-resources" },
+    codexSessionTree: null,
+    capabilityExecutionHistory: [],
+    imageGenerationHistory: [],
+  });
+  assert.equal(resources.codexResources.marker, "new-resources");
+  assert.equal(resources.codexSessionTree.marker, "old-sessions");
+  assert.equal(resources.capabilityExecutionHistory[0].id, "old-history");
+
+  const capabilities = sandbox.mergeState(resources, {
+    stateDetailLoaded: false,
+    detailSectionsLoaded: ["capabilities"],
+    codexResources: null,
+    codexSessionTree: null,
+    capabilityExecutionHistory: [],
+    imageGenerationHistory: [],
+  });
+  assert.equal(capabilities.codexResources.marker, "new-resources");
+  assert.equal(capabilities.codexSessionTree.marker, "old-sessions");
+  assert.equal(capabilities.capabilityExecutionHistory.length, 0);
+  assert.equal(capabilities.imageGenerationHistory.length, 0);
+});
+
+test("a failed optional detail read preserves writable core state and clears on retry", () => {
+  const start = rendererSource.indexOf("const RETAINED_DETAIL_SLICE_KEYS");
+  const end = rendererSource.indexOf("\nfunction render()", start);
+  const sandbox = {
+    stateDetailLoaded: false,
+    settingsDetailLoaded: false,
+    DETAIL_STATE_SECTIONS: new Set(["preflight", "capabilities", "resources", "sessions"]),
+  };
+  runInNewContext(
+    `${rendererSource.slice(start, end)}\n` +
+      "globalThis.mergeState = mergeStateWithRetainedDetailSlices;",
+    sandbox,
+  );
+  const previous = {
+    stateUnavailable: false,
+    models: [{ id: "old" }],
+    stateDetailLoaded: false,
+    detailSectionsLoaded: ["sessions"],
+    detailSectionErrors: {},
+    codexSessionTree: { marker: "last-good" },
+  };
+  const failed = sandbox.mergeState(previous, {
+    stateUnavailable: false,
+    models: [{ id: "new" }],
+    stateDetailLoaded: false,
+    detailSectionsLoaded: [],
+    detailSectionErrors: {
+      sessions: { code: "worker_task_timeout", message: "会话读取失败" },
+    },
+    codexSessionTree: null,
+  });
+  assert.equal(failed.stateUnavailable, false);
+  assert.equal(failed.models[0].id, "new");
+  assert.equal(failed.codexSessionTree.marker, "last-good");
+  assert.equal(failed.detailSectionErrors.sessions.code, "worker_task_timeout");
+  assert.equal(failed.detailSectionsLoaded.includes("sessions"), false);
+  assert.equal(failed.stateDetailLoaded, false);
+
+  const recovered = sandbox.mergeState(failed, {
+    stateUnavailable: false,
+    models: [{ id: "new" }],
+    stateDetailLoaded: false,
+    detailSectionsLoaded: ["sessions"],
+    detailSectionErrors: {},
+    codexSessionTree: { marker: "recovered" },
+  });
+  assert.equal(recovered.codexSessionTree.marker, "recovered");
+  assert.equal(recovered.detailSectionErrors.sessions, undefined);
+  assert.equal(recovered.detailSectionsLoaded.includes("sessions"), true);
+});
+
+test("lightweight mutation responses retain already loaded detail slices", () => {
+  assert.match(rendererSource, /function adoptStateSnapshot\(nextState\)/u);
+  assert.match(rendererSource, /adoptStateSnapshot\(await api\.saveModelImageGeneration\(/u);
+  assert.match(
+    rendererSource,
+    /adoptStateSnapshot\(response\?\.state \|\| await api\.getState\(\)\)/u,
+  );
+  assert.doesNotMatch(
+    rendererSource,
+    /state\s*=\s*await api\.(?:saveOptions|saveModelImageInput|saveModelImageGeneration|removeCustomModel|applyConfigProfile)\(/u,
+  );
+});
+
+test("a budget save's lightweight snapshot retains previously loaded resources and sessions", async () => {
+  const sandbox = budgetSaveHarness(async options => detailStateSnapshot({desktopOptions:{usageBudgets:options.usageBudgets}}));
+  const detail = createDetailStateHarness(detailStateSnapshot({
+    desktopOptions:sandbox.state.desktopOptions,
+    detailSectionsLoaded:['resources','sessions'],codexResources:{marker:'retained-resources'},codexSessions:[{id:'retained-session'}],
+  }));
+  sandbox.state = detail.snapshot();
+  sandbox.adoptStateSnapshot = next => { detail.adopt(next); sandbox.state = detail.snapshot(); };
+  editBudget(sandbox,'usageDailyCallLimit','123');
+  await sandbox.saveUsageBudgetSettings();
+  assert.equal(sandbox.state.desktopOptions.usageBudgets.global.dailyCallLimit,123);
+  assert.equal(sandbox.state.codexResources.marker,'retained-resources');
+  assert.equal(sandbox.state.codexSessions[0].id,'retained-session');
+});
+
+function detailStateSnapshot(overrides = {}) {
+  return {
+    stateConfigRevision: "config-before",
+    stateUnavailable: false,
+    models: [{ id: "model-before" }],
+    selectedModelIds: ["model-before"],
+    routerRunning: false,
+    stateDetailLoaded: false,
+    detailSectionsLoaded: [],
+    settingsDetailLoaded: false,
+    detailSectionErrors: {},
+    startupCheck: null,
+    codexResources: null,
+    codexSessions: [],
+    codexSessionTree: null,
+    codexProjectRecoveryPlan: null,
+    capabilityExecutionHistory: [],
+    imageGenerationHistory: [],
+    codexBackups: [],
+    usageEvents: [],
+    usageSummary: {},
+    usageBudgetAlerts: [],
+    usageCostEstimate: {},
+    logs: [],
+    ...overrides,
+  };
+}
+
+function createDetailStateHarness(initialState = detailStateSnapshot()) {
+  const helperEnd = rendererSource.indexOf("const api = createStateUnavailableGuardedApi");
+  const detailDeclarationsStart = rendererSource.indexOf("let stateDetailLoaded = false;");
+  const detailDeclarationsEnd = rendererSource.indexOf("const LOCAL_CAPABILITY_ADAPTERS", detailDeclarationsStart);
+  const subscriptionsStart = rendererSource.indexOf("api.onLogs((logs) => {");
+  const subscriptionsEnd = rendererSource.indexOf("\nrefresh({ lite: true });", subscriptionsStart);
+  const detailFunctionsStart = rendererSource.indexOf("async function refresh(options = {})");
+  const detailFunctionsEnd = rendererSource.indexOf("\nfunction render()", detailFunctionsStart);
+  const pending = [];
+  const listeners = {};
+  const renders = [];
+  const toasts = [];
+  const sandbox = {
+    bridge: {
+      getState(options) {
+        return new Promise((resolve, reject) => pending.push({ options, resolve, reject }));
+      },
+      onState(callback) { listeners.state = callback; },
+      onUsage(callback) { listeners.usage = callback; },
+      onLogs(callback) { listeners.logs = callback; },
+      saveOptions() { return "write-ok"; },
+    },
+    els: { sessionList: { innerHTML: "" }, backupList: { innerHTML: "" } },
+    console: { info() {}, error() {} },
+    showToast(message, type) { toasts.push({ message, type }); },
+    render() { renders.push("all"); },
+    renderActiveSection(section) { renders.push(section); },
+    renderLogs() {},
+    renderUsage() {},
+    renderUsageBudgetAlerts() {},
+    renderUsageCostEstimate() {},
+    renderOverviewUsage() {},
+  };
+  runInNewContext(
+    `${rendererSource.slice(0, helperEnd)}\n` +
+      "const api = createStateUnavailableGuardedApi(bridge, () => state);\nlet draftSelection = [];\nconst modelSelectionDraftsToKeep = new WeakSet();\nconst modeSwitchDraftsToKeep = new WeakSet();\nlet pendingModeSwitch = null;\nlet unresolvedModeSwitch = null;\n" +
+      `${rendererSource.slice(detailDeclarationsStart, detailDeclarationsEnd)}\n` +
+      `${rendererSource.slice(subscriptionsStart, subscriptionsEnd)}\n` +
+      `${rendererSource.slice(detailFunctionsStart, detailFunctionsEnd)}\n` +
+      "globalThis.detailHarness = {\n" +
+      "  adopt: adoptStateSnapshot,\n" +
+      "  load(section, options) { return section === 'settings' ? ensureSettingsDetailForSection(section) : ensureDetailedStateForSection(section, options); },\n" +
+      "  snapshot() { return state; },\n" +
+      "  draft() { return draftSelection; },\n" +
+      "  setDraft(ids) { draftSelection = [...ids]; },\n" +
+      "  loaded(section) { return section === 'settings' ? settingsDetailLoaded : loadedDetailSections.has(section); },\n" +
+      "  loading(section) { return section === 'settings' ? settingsDetailLoading : loadingDetailSections.has(section); },\n" +
+      "  saveOptions() { return api.saveOptions({ routerPort: 15722 }); },\n" +
+      "};",
+    sandbox,
+  );
+  const harness = { ...sandbox.detailHarness, pending, listeners, renders, toasts };
+  harness.adopt(initialState);
+  return harness;
+}
+
+for (const section of ["sessions", "settings"]) {
+  test(`late ${section} detail cannot roll back a newer saved or broadcast snapshot`, async () => {
+    for (const arrival of ["save", "broadcast"]) {
+      const harness = createDetailStateHarness();
+      const loading = harness.load(section);
+      const latest = detailStateSnapshot({
+        stateConfigRevision: "config-after",
+        models: [{ id: "model-after" }],
+        selectedModelIds: ["model-after"],
+        routerRunning: true,
+      });
+      if (arrival === "save") harness.adopt(latest);
+      else harness.listeners.state(latest);
+      harness.setDraft(["unsaved-selection"]);
+      harness.pending[0].resolve(detailStateSnapshot({
+        detailSectionsLoaded: section === "sessions" ? ["sessions"] : [],
+        settingsDetailLoaded: section === "settings",
+        codexSessionTree: { marker: "stale-sessions" },
+        codexBackups: [{ name: "stale-backup" }],
+      }));
+      await loading;
+
+      assert.equal(harness.snapshot().stateConfigRevision, "config-after", arrival);
+      assert.equal(harness.snapshot().models[0].id, "model-after", arrival);
+      assert.deepEqual([...harness.snapshot().selectedModelIds], ["model-after"], arrival);
+      assert.equal(harness.snapshot().routerRunning, true, arrival);
+      assert.deepEqual([...harness.draft()], ["unsaved-selection"], arrival);
+      assert.equal(harness.loaded(section), false, "stale detail must remain retryable");
+      assert.equal(harness.loading(section), false, "the stale request must release its loading flag");
+
+      const retry = harness.load(section);
+      assert.equal(harness.pending.length, 2);
+      harness.pending[1].resolve(detailStateSnapshot({
+        ...latest,
+        detailSectionsLoaded: section === "sessions" ? ["sessions"] : [],
+        settingsDetailLoaded: section === "settings",
+        codexSessionTree: { marker: "fresh-sessions" },
+        codexBackups: [{ name: "fresh-backup" }],
+      }));
+      await retry;
+      assert.equal(harness.loaded(section), true);
+      assert.equal(harness.loading(section), false);
+    }
+  });
+
+  test(`late unavailable ${section} detail cannot relock recovered core state`, async () => {
+    const harness = createDetailStateHarness(detailStateSnapshot({ stateUnavailable: true }));
+    const loading = harness.load(section);
+    harness.listeners.state(detailStateSnapshot({ routerRunning: true }));
+    harness.pending[0].resolve(detailStateSnapshot({ stateUnavailable: true }));
+    await loading;
+
+    assert.equal(harness.snapshot().stateUnavailable, false);
+    assert.equal(harness.snapshot().routerRunning, true);
+    assert.equal(harness.saveOptions(), "write-ok");
+    assert.equal(harness.loaded(section), false);
+    assert.equal(harness.loading(section), false);
+  });
+
+  test(`rejected ${section} detail clears its loading display and allows retry`, async () => {
+    const harness = createDetailStateHarness();
+    const loading = harness.load(section);
+    const rendersBeforeFailure = harness.renders.length;
+    harness.pending[0].reject(new Error("detail transport unavailable"));
+    await loading;
+
+    assert.equal(harness.loading(section), false);
+    assert.equal(harness.loaded(section), false);
+    assert.ok(harness.renders.length > rendersBeforeFailure, "replace the pending loading display after rejection");
+    assert.equal(harness.saveOptions(), "write-ok");
+    const retry = harness.load(section);
+    harness.pending[1].resolve(detailStateSnapshot({
+      detailSectionsLoaded: section === "sessions" ? ["sessions"] : [],
+      settingsDetailLoaded: section === "settings",
+      codexSessionTree: { marker: "retry" },
+      codexBackups: [{ name: "retry" }],
+    }));
+    await retry;
+    assert.equal(harness.loaded(section), true);
+  });
+}
+
+test("concurrent detail loads retain each slice without replacing newer core or live telemetry", async () => {
+  const harness = createDetailStateHarness();
+  const sessions = harness.load("sessions");
+  const resources = harness.load("resources");
+  const settings = harness.load("settings");
+  harness.listeners.state(detailStateSnapshot({ routerRunning: true }));
+  harness.listeners.usage({
+    usageEvents: [{ id: "live-event" }],
+    usageSummary: { requests: 10 },
+    usageBudgetAlerts: [{ id: "live-alert" }],
+    usageCostEstimate: { cost: 12 },
+  });
+  harness.listeners.logs(["live-log"]);
+  harness.setDraft(["draft-after-navigation"]);
+
+  harness.pending[1].resolve(detailStateSnapshot({
+    detailSectionsLoaded: ["resources"],
+    codexResources: { marker: "loaded-resources" },
+  }));
+  await resources;
+  harness.pending[2].resolve(detailStateSnapshot({
+    settingsDetailLoaded: true,
+    codexBackups: [{ name: "loaded-backup" }],
+  }));
+  await settings;
+  harness.pending[0].resolve(detailStateSnapshot({
+    detailSectionsLoaded: ["sessions"],
+    codexSessions: [{ id: "loaded-session" }],
+    codexSessionTree: { marker: "loaded-sessions" },
+    codexProjectRecoveryPlan: { marker: "loaded-recovery" },
+  }));
+  await sessions;
+
+  const actual = harness.snapshot();
+  assert.equal(actual.routerRunning, true);
+  assert.equal(actual.usageEvents[0].id, "live-event");
+  assert.equal(actual.usageSummary.requests, 10);
+  assert.equal(actual.usageBudgetAlerts[0].id, "live-alert");
+  assert.equal(actual.usageCostEstimate.cost, 12);
+  assert.deepEqual([...actual.logs], ["live-log"]);
+  assert.deepEqual([...harness.draft()], ["draft-after-navigation"]);
+  assert.equal(actual.codexResources.marker, "loaded-resources");
+  assert.equal(actual.codexBackups[0].name, "loaded-backup");
+  assert.equal(actual.codexSessions[0].id, "loaded-session");
+  assert.equal(actual.codexSessionTree.marker, "loaded-sessions");
+  assert.equal(actual.codexProjectRecoveryPlan.marker, "loaded-recovery");
+  for (const section of ["sessions", "resources", "settings"]) {
+    assert.equal(harness.loaded(section), true, section);
+    assert.equal(harness.loading(section), false, section);
+  }
+  await harness.load("sessions");
+  await harness.load("settings");
+  assert.equal(harness.pending.length, 3, "completed lazy sections must not request again");
+});
+
+for (const section of ["resources", "settings"]) {
+  test(`${section} detail errors retain last-good data and clear after a successful retry`, async () => {
+    const harness = createDetailStateHarness(detailStateSnapshot({
+      detailSectionsLoaded: section === "resources" ? ["resources"] : [],
+      codexResources: { marker: "last-good-resources" },
+      codexBackups: [{ name: "last-good-backup" }],
+    }));
+    const loading = harness.load(section);
+    harness.pending[0].resolve(detailStateSnapshot({
+      detailSectionErrors: { [section]: { code: "detail_timeout", message: "detail read failed" } },
+    }));
+    await loading;
+    assert.equal(harness.snapshot().detailSectionErrors[section].code, "detail_timeout");
+    assert.equal(harness.loaded(section), false);
+    assert.equal(
+      section === "resources" ? harness.snapshot().codexResources.marker : harness.snapshot().codexBackups[0]?.name,
+      section === "resources" ? "last-good-resources" : "last-good-backup",
+    );
+
+    const retry = harness.load(section);
+    harness.pending[1].resolve(detailStateSnapshot({
+      detailSectionsLoaded: section === "resources" ? ["resources"] : [],
+      settingsDetailLoaded: section === "settings",
+      codexResources: { marker: "retried-resources" },
+      codexBackups: [{ name: "retried-backup" }],
+    }));
+    await retry;
+    assert.equal(harness.snapshot().detailSectionErrors[section], undefined);
+    assert.equal(harness.loaded(section), true);
+    assert.equal(
+      section === "resources" ? harness.snapshot().codexResources.marker : harness.snapshot().codexBackups[0]?.name,
+      section === "resources" ? "retried-resources" : "retried-backup",
+    );
+  });
+}
+
+test("resource refresh reports success only for a current authoritative snapshot and remains retryable", async () => {
+  const harness = createDetailStateHarness(detailStateSnapshot({
+    detailSectionsLoaded: ["resources"],
+    codexResources: { marker: "last-good", snapshot: { state: "authoritative" } },
+  }));
+  const cases = [
+    { response: { codexResources: { snapshot: { state: "cached" } }, detailSectionsLoaded: ["resources"] }, want: false },
+    { response: { detailSectionErrors: { resources: { message: "read failed" } } }, want: false },
+    { response: { stateUnavailable: true }, want: false },
+    { response: { stateConfigRevision: "stale-revision" }, want: false },
+    { rejected: true, want: false },
+    { response: { codexResources: { snapshot: { state: "authoritative" }, pluginPage: { snapshot: { state: "cached" } } }, detailSectionsLoaded: ["resources"] }, want: false },
+    { response: { codexResources: { snapshot: { state: "authoritative" } }, detailSectionsLoaded: ["resources"] }, want: true },
+  ];
+  for (const [index, scenario] of cases.entries()) {
+    const refreshing = harness.load("resources");
+    await harness.load("resources");
+    assert.equal(harness.pending.length, index + 1, "a pending refresh must be deduplicated");
+    assert.equal(harness.pending[index].options.forceResourceRefresh, true);
+    if (scenario.rejected) harness.pending[index].reject(new Error("resource transport failed"));
+    else harness.pending[index].resolve(detailStateSnapshot(scenario.response));
+    assert.equal(await refreshing, scenario.want);
+    assert.equal(harness.loading("resources"), false);
+    assert.equal(harness.snapshot().stateConfigRevision, "config-before");
+  }
+});
+
+test("manual resource refresh can recover unavailable core state without overwriting a newer broadcast", async () => {
+  const harness = createDetailStateHarness(detailStateSnapshot({ stateUnavailable: true }));
+  const recovered = detailStateSnapshot({stateConfigRevision:"config-recovered",detailSectionsLoaded:["resources"],
+    codexResources:{snapshot:{state:"authoritative"}}});
+  const recovering = harness.load("resources", { refreshCore: true });
+  harness.pending[0].resolve(recovered);
+  assert.equal(await recovering, true);
+  assert.equal(harness.snapshot().stateUnavailable, false);
+  assert.equal(harness.snapshot().stateConfigRevision, "config-recovered");
+  const refreshing = harness.load("resources", { refreshCore: true });
+  harness.listeners.state({...recovered,stateConfigRevision:"config-newer",routerRunning:true});
+  harness.pending[1].resolve(recovered);
+  assert.equal(await refreshing, false);
+  assert.equal(harness.snapshot().stateConfigRevision, "config-newer");
+  assert.equal(harness.snapshot().routerRunning, true);
 });
 
 test("desktop renderer labels a resilient fallback as an unavailable cached snapshot", () => {
@@ -1006,6 +1798,7 @@ test("desktop renderer fails closed for every write while cached state is unavai
   const providerSave = control("providerSave");
   const refreshResources = control("refreshResources");
   const copyDiagnostics = control("copyDiagnostics");
+  const resumeLogFollow = control("resumeLogFollow");
   const exportDiagnostics = control("savePreflightDiagnostics");
   const independentlyDisabled = control("providerRefreshWithoutKey", { disabled: true });
   const selectedModelSlot = control("selectedModelSlot", { draggable: true });
@@ -1016,6 +1809,7 @@ test("desktop renderer fails closed for every write while cached state is unavai
     providerSave,
     refreshResources,
     copyDiagnostics,
+    resumeLogFollow,
     exportDiagnostics,
     independentlyDisabled,
     selectedModelSlot,
@@ -1027,7 +1821,7 @@ test("desktop renderer fails closed for every write while cached state is unavai
     assert.equal(item.disabled, true, `${item.id} should be locked`);
     assert.equal(item.dataset.stateUnavailableLocked, "true");
   }
-  for (const item of [refreshResources, copyDiagnostics, exportDiagnostics]) {
+  for (const item of [refreshResources, copyDiagnostics, resumeLogFollow, exportDiagnostics]) {
     assert.equal(item.disabled, false, `${item.id} should stay read-only available`);
   }
   assert.equal(independentlyDisabled.disabled, true);
@@ -1044,6 +1838,7 @@ test("desktop renderer fails closed for every write while cached state is unavai
   assert.equal(prevented, 1);
   assert.equal(stopped, 1);
   assert.equal(stateUnavailableControlEventGuard({ target: copyDiagnostics }, { stateUnavailable: true }), false);
+  assert.equal(stateUnavailableControlEventGuard({ target: resumeLogFollow }, { stateUnavailable: true }), false);
 
   setState({ stateUnavailable: true });
   let actionRuns = 0;
@@ -1095,8 +1890,8 @@ test("desktop renderer keeps release, capability, resource, and session copy con
   assert.match(htmlSource, /插件、应用和插件 MCP 对应当前 Codex 插件页/);
   assert.match(htmlSource, /用户技能来自 Codex app-server skills\/list/);
   assert.match(htmlSource, /id="resourceRefreshStatus"/);
-  assert.match(rendererSource, /App Server 暂不可用，使用最近有效缓存/);
-  assert.match(rendererSource, /最后有效读取/);
+  assert.match(rendererSource, /暂时无法刷新，显示上次读取的资源/);
+  assert.match(rendererSource, /最后更新/);
   assert.match(htmlSource, /用户技能来自 Codex app-server skills\/list/);
   assert.match(htmlSource, /manifest 声明、磁盘技能文件/);
   assert.doesNotMatch(htmlSource, /当前会话技能/);
@@ -1253,7 +2048,8 @@ test("desktop renderer exposes startup checks, profiles, backups, resources, and
   assert.match(preloadSource, /saveConfigProfile: \(payload\) => ipcRenderer\.invoke\("profiles:save", payload\)/);
   assert.match(preloadSource, /applyConfigProfile: \(profileId\) => ipcRenderer\.invoke\("profiles:apply", profileId\)/);
   assert.match(preloadSource, /restoreCodexBackup: \(backupPath\) => ipcRenderer\.invoke\("backups:restore", backupPath\)/);
-  assert.match(preloadSource, /exportSessionMarkdown: \(sessionId\) => ipcRenderer\.invoke\("sessions:export", sessionId\)/);
+  assert.match(preloadSource, /exportSessionMarkdown: \(sessionId\) => ipcRenderer\.invoke\("sessions:export", String\(sessionId \|\| ""\)\.slice\(0, 512\)\)/);
+  assert.match(preloadSource, /exportFilteredSessionsMarkdown:[\s\S]*?\.slice\(0, 1000\)[\s\S]*?\.slice\(0, 512\)/u);
   assert.match(mainSource, /ipcMain\.handle\("startup:check"/);
   assert.match(mainSource, /ipcMain\.handle\("profiles:save"/);
   assert.match(mainSource, /ipcMain\.handle\("profiles:apply"/);
@@ -1273,7 +2069,7 @@ test("desktop renderer exposes startup checks, profiles, backups, resources, and
   assert.match(rendererSource, /function canonicalProjectPathKey/);
   assert.match(rendererSource, /项目文件夹/);
   assert.match(rendererSource, /无项目会话/);
-  assert.match(rendererSource, /查看归类依据/);
+  assert.match(rendererSource, /查看索引与归类依据/);
   assert.doesNotMatch(rendererSource, /class="session-reason"/);
   assert.match(rendererSource, /data-session-project/);
   assert.match(rendererSource, /data-resource-expand/);
@@ -1293,7 +2089,8 @@ test("desktop renderer exposes startup checks, profiles, backups, resources, and
   assert.match(rendererSource, /data-rename-profile/);
   assert.match(rendererSource, /function profileModeLabel/);
   assert.match(rendererSource, /function sessionProjectLabel/);
-  assert.match(mainSource, /settings\.listCodexSessions\(\{ homeDir, limit: SESSION_CENTER_LIMIT \}\)/);
+  assert.match(mainSource, /runCodexSessionSnapshotWorker\(\{[\s\S]*?homeDir,[\s\S]*?limit: SESSION_CENTER_LIMIT,[\s\S]*?\}\)/);
+  assert.doesNotMatch(mainSource, /settings\.listCodexSessions\(\{ homeDir, limit: SESSION_CENTER_LIMIT \}\)/);
   assert.match(cssSource, /\.backup-list[\s\S]*max-height/);
   assert.match(cssSource, /\.check-list[\s\S]*margin-top:\s*18px/);
   assert.match(cssSource, /\.resource-layout/);
@@ -1304,6 +2101,13 @@ test("desktop renderer exposes startup checks, profiles, backups, resources, and
   assert.doesNotMatch(cssSource, /\.session-reason/);
   assert.doesNotMatch(htmlSource, /id="recoverHistoryAccess"/);
   assert.match(htmlSource, /id="recoverHistoryAccessSessions"/);
+});
+
+test("session export copy explains when large markdown is intentionally not copied", () => {
+  assert.match(rendererSource, /function sessionExportClipboardNote\(response = \{\}\)/u);
+  assert.match(rendererSource, /response\.clipboardCopied/u);
+  assert.match(rendererSource, /内容较大，未复制到剪贴板/u);
+  assert.match(rendererSource, /response\?\.group\?\.sessionCount/u);
 });
 
 test("session center treats every scanned history row as recoverable sidebar state", () => {
@@ -1377,7 +2181,8 @@ test("model selection save merges the lightweight response without discarding lo
   const start = rendererSource.indexOf("function saveModelSelection(button)");
   const end = rendererSource.indexOf("function startCustomModelEdit", start);
   const body = rendererSource.slice(start, end);
-  assert.match(body, /const nextState = await api\.saveModelSelection\(draftSelection\);/);
+  assert.match(body, /const submitted = \[\.\.\.draftSelection\];/);
+  assert.match(body, /nextState = await api\.saveModelSelection\(submitted\);/);
   assert.match(body, /state = mergeStateWithRetainedDetailSlices\(state, nextState\);/);
   assert.doesNotMatch(body, /state = await api\.saveModelSelection\(draftSelection\);/);
 });

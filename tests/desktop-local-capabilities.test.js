@@ -160,6 +160,33 @@ test("local browser capability can read a safe http page into clean text", async
   assert.doesNotMatch(result.text, /display: none/);
 });
 
+test("local browser capability cancels an HTTP error body before reporting failure", async () => {
+  const { createDesktopLocalCapabilityExecutor } = require("../desktop/local-capabilities.cjs");
+  let canceled = false;
+  const execute = createDesktopLocalCapabilityExecutor({
+    fetchImpl: async () => ({
+      ok: false,
+      status: 503,
+      headers: new Headers(),
+      body: {
+        cancel() {
+          canceled = true;
+          return Promise.resolve();
+        },
+      },
+    }),
+  });
+
+  await assert.rejects(execute({
+    adapter: "local_browser",
+    capability: "browser",
+    provider: { id: "local-browser" },
+    request: { input: { action: "read_url", url: "https://example.com/unavailable" } },
+  }), (error) => error?.code === "local_browser_fetch_failed");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(canceled, true);
+});
+
 test("local browser capability normalizes bare domain inputs to https", async () => {
   const { createDesktopLocalCapabilityExecutor } = require("../desktop/local-capabilities.cjs");
   const fetched = [];
@@ -229,6 +256,124 @@ test("local browser capability rejects oversized read responses before reading t
   );
 });
 
+test("local browser hard byte ceiling cannot be raised by request input", async () => {
+  const { createDesktopLocalCapabilityExecutor } = require("../desktop/local-capabilities.cjs");
+  const execute = createDesktopLocalCapabilityExecutor({
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({
+        "content-type": "text/plain",
+        "content-length": String((16 * 1024 * 1024) + 1),
+      }),
+      body: { getReader() { throw new Error("hard-limit body must not be opened"); } },
+    }),
+  });
+
+  await assert.rejects(execute({
+    adapter: "local_browser",
+    capability: "browser",
+    request: { input: {
+      action: "read_url",
+      url: "https://example.com/hard-limit",
+      maxBytes: Number.MAX_SAFE_INTEGER,
+    } },
+  }), (error) => {
+    assert.equal(error.code, "local_browser_response_too_large");
+    assert.match(error.message, /16777216 bytes/u);
+    return true;
+  });
+});
+
+test("local browser capability cancels a chunked body as soon as it exceeds the byte limit", async () => {
+  const { createDesktopLocalCapabilityExecutor } = require("../desktop/local-capabilities.cjs");
+  let pulls = 0;
+  let canceled = false;
+  let textCalled = false;
+  const body = new ReadableStream({
+    pull(controller) {
+      pulls += 1;
+      if (pulls <= 5) {
+        controller.enqueue(new Uint8Array(800));
+      } else {
+        controller.close();
+      }
+    },
+    cancel() {
+      canceled = true;
+    },
+  });
+  const execute = createDesktopLocalCapabilityExecutor({
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-type": "text/plain" }),
+      body,
+      async text() {
+        textCalled = true;
+        throw new Error("unbounded text reader must not be called");
+      },
+    }),
+  });
+
+  await assert.rejects(
+    execute({
+      adapter: "local_browser",
+      capability: "browser",
+      request: {
+        input: {
+          action: "read_url",
+          url: "https://example.com/chunked",
+          maxBytes: 1000,
+        },
+      },
+    }),
+    (error) => {
+      assert.equal(error.code, "local_browser_response_too_large");
+      assert.match(error.message, /1600 bytes/);
+      return true;
+    },
+  );
+
+  assert.equal(canceled, true);
+  assert.equal(textCalled, false);
+  assert.ok(pulls < 6, `chunked body was read to completion (${pulls} pulls)`);
+});
+
+test("local browser capability stops a fetch that ignores AbortSignal at its hard deadline", async () => {
+  const { createDesktopLocalCapabilityExecutor } = require("../desktop/local-capabilities.cjs");
+  let seenSignal = null;
+  const execute = createDesktopLocalCapabilityExecutor({
+    fetchImpl: async (_url, init) => {
+      seenSignal = init.signal;
+      return new Promise(() => {});
+    },
+  });
+  const startedAt = Date.now();
+
+  await assert.rejects(
+    execute({
+      adapter: "local_browser",
+      capability: "browser",
+      request: {
+        input: {
+          action: "read_url",
+          url: "https://example.com/stalled",
+          timeoutMs: 20,
+        },
+      },
+    }),
+    (error) => {
+      assert.equal(error.code, "local_browser_timeout");
+      assert.match(error.message, /已停止等待/);
+      return true;
+    },
+  );
+
+  assert.equal(seenSignal?.aborted, true);
+  assert.ok(Date.now() - startedAt < 500);
+});
+
 test("local browser capability can capture a safe http page screenshot", async () => {
   const { createDesktopLocalCapabilityExecutor } = require("../desktop/local-capabilities.cjs");
   const captured = [];
@@ -268,6 +413,49 @@ test("local browser capability can capture a safe http page screenshot", async (
   assert.equal(result.mimeType, "image/png");
   assert.equal(result.screenshotBase64, Buffer.from("fake-local-screenshot").toString("base64"));
   assert.match(result.text, /网页截图已生成/);
+});
+
+test("local browser screenshot has a hard deadline", async () => {
+  const { createDesktopLocalCapabilityExecutor } = require("../desktop/local-capabilities.cjs");
+  let seenSignal;
+  const execute = createDesktopLocalCapabilityExecutor({
+    capturePageScreenshot: async ({ signal }) => {
+      seenSignal = signal;
+      return new Promise(() => {});
+    },
+  });
+  const startedAt = Date.now();
+  await assert.rejects(execute({
+    adapter: "local_browser",
+    capability: "webpage_screenshot",
+    request: {
+      input: {
+        action: "screenshot_url",
+        url: "https://example.com/stalled.png",
+        timeoutMs: 20,
+      },
+    },
+  }), (error) => error.code === "local_browser_screenshot_timeout");
+  assert.ok(Date.now() - startedAt < 500);
+  assert.equal(seenSignal?.aborted, true);
+});
+
+test("local browser screenshot enforces its bounded output size before base64 conversion", async () => {
+  const { createDesktopLocalCapabilityExecutor } = require("../desktop/local-capabilities.cjs");
+  const execute = createDesktopLocalCapabilityExecutor({
+    capturePageScreenshot: async () => Buffer.from("oversized"),
+  });
+  await assert.rejects(execute({
+    adapter: "local_browser",
+    capability: "webpage_screenshot",
+    request: {
+      input: {
+        action: "screenshot_url",
+        url: "https://example.com/large.png",
+        maxBytes: 4,
+      },
+    },
+  }), (error) => error.code === "local_screenshot_too_large");
 });
 
 test("local browser capability rejects unsafe URLs before opening or fetching", async () => {
@@ -392,6 +580,36 @@ test("local file capability rejects directories instead of scanning them", async
   );
 });
 
+test("local file hard byte ceiling cannot be raised and the main thread uses no synchronous file read", async () => {
+  const { createDesktopLocalCapabilityExecutor } = require("../desktop/local-capabilities.cjs");
+  const fileDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-local-file-limit-"));
+  const filePath = path.join(fileDir, "oversized.txt");
+  const handle = fs.openSync(filePath, "w");
+  fs.ftruncateSync(handle, (8 * 1024 * 1024) + 1);
+  fs.closeSync(handle);
+  try {
+    const execute = createDesktopLocalCapabilityExecutor({});
+    await assert.rejects(execute({
+      adapter: "local_file",
+      capability: "file_processing",
+      request: { input: {
+        action: "extract_text",
+        path: filePath,
+        maxBytes: Number.MAX_SAFE_INTEGER,
+      } },
+    }), (error) => {
+      assert.equal(error.code, "local_file_too_large");
+      assert.match(error.message, /8388608 bytes/u);
+      return true;
+    });
+    const source = fs.readFileSync(path.join(import.meta.dirname, "..", "desktop", "local-capabilities.cjs"), "utf8");
+    assert.doesNotMatch(source, /fs\.readFileSync|fs\.statSync/u);
+  } finally {
+    fs.unlinkSync(filePath);
+    fs.rmdirSync(fileDir);
+  }
+});
+
 test("local computer use capability reports a safe diagnostic-only status", async () => {
   const { createDesktopLocalCapabilityExecutor } = require("../desktop/local-capabilities.cjs");
   const execute = createDesktopLocalCapabilityExecutor({
@@ -424,6 +642,16 @@ test("local computer use capability reports a safe diagnostic-only status", asyn
   assert.equal(result.allowedApps[0].command, undefined);
   assert.equal(result.requiresGptResponses, true);
   assert.match(result.text, /Computer Use/);
+});
+
+test("default local app launching uses bounded spawn confirmation", () => {
+  const source = fs.readFileSync(
+    path.join(import.meta.dirname, "..", "desktop", "local-capabilities.cjs"),
+    "utf8",
+  );
+  assert.match(source, /spawnDetachedWithConfirmation/u);
+  assert.match(source, /spawnImpl:\s*spawn/u);
+  assert.match(source, /timeoutMs:\s*5000/u);
 });
 
 test("local computer use capability can list allowlisted apps without launching them", async () => {
@@ -516,13 +744,41 @@ test("local computer use capability can capture a desktop screenshot without mou
     },
   });
 
-  assert.deepEqual(captures, [{ displayId: "" }]);
+  assert.equal(captures.length, 1);
+  assert.equal(captures[0].displayId, "");
+  assert.equal(captures[0].signal instanceof AbortSignal, true);
   assert.equal(result.action, "screenshot_desktop");
   assert.equal(result.mimeType, "image/png");
   assert.equal(result.screenshotBase64, screenshotBytes.toString("base64"));
   assert.equal(result.canControlDesktop, false);
   assert.equal(result.canScreenshot, true);
   assert.match(result.text, /桌面截图已生成/);
+});
+
+test("local desktop screenshot has a hard deadline and bounded output", async () => {
+  const { createDesktopLocalCapabilityExecutor } = require("../desktop/local-capabilities.cjs");
+  let seenSignal;
+  const stalled = createDesktopLocalCapabilityExecutor({
+    captureDesktopScreenshot: async ({ signal }) => {
+      seenSignal = signal;
+      return new Promise(() => {});
+    },
+  });
+  await assert.rejects(stalled({
+    adapter: "local_computer_use",
+    capability: "computer_use",
+    request: { input: { action: "screenshot_desktop", timeoutMs: 20 } },
+  }), (error) => error.code === "local_desktop_screenshot_timeout");
+  assert.equal(seenSignal?.aborted, true);
+
+  const oversized = createDesktopLocalCapabilityExecutor({
+    captureDesktopScreenshot: async () => Buffer.from("oversized"),
+  });
+  await assert.rejects(oversized({
+    adapter: "local_computer_use",
+    capability: "computer_use",
+    request: { input: { action: "screenshot_desktop", maxBytes: 4 } },
+  }), (error) => error.code === "local_screenshot_too_large");
 });
 
 test("local computer use capability rejects apps outside the allowlist", async () => {

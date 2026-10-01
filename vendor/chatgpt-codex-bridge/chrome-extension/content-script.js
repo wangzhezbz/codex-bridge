@@ -3,7 +3,7 @@ if (!BRIDGE_ORIGIN) {
   throw new Error("Codex GPT Bridge extension is missing bridge-config.js");
 }
 globalThis.__CODEX_GPT_BRIDGE_CONTENT_SCRIPT_ACTIVE__ = true;
-const WORKER_ID = "codex-chatgpt-project-extension-v20260801-adaptive-office-wait";
+const WORKER_ID = "codex-chatgpt-project-extension-v20260923-missing-recovery";
 const POLL_MS = 1500;
 const HEARTBEAT_REQUEST_TIMEOUT_MS = 5_000;
 const RESPONSE_IDLE_TIMEOUT_MS = 15 * 60_000;
@@ -21,6 +21,7 @@ const PRE_SEND_REFRESH_KEY = "chatgpt-codex-bridge:pre-send-refresh-job";
 const HEARTBEAT_RECOVERY_KEY = "chatgpt-codex-bridge:last-heartbeat-recovery";
 const CLIENT_ID_KEY = "chatgpt-codex-bridge:client-id";
 const EXTENSION_RELOAD_COOLDOWN_KEY = "chatgpt-codex-bridge:extension-reload-requested-at";
+const EXTENSION_RELOAD_ATTEMPT_KEY = "chatgpt-codex-bridge:extension-reload-attempt";
 const EXTENSION_RELOAD_COOLDOWN_MS = 60_000;
 const HEARTBEAT_RECOVERY_COOLDOWN_MS = 60_000;
 
@@ -31,13 +32,16 @@ let lastPreferenceStatus = null;
 let lastPreferenceAttemptDiagnostic = null;
 let lastCaptureStatus = null;
 let fallbackClientId = null;
+let extensionReloadRequest = null;
 let pollInFlight = false;
+let pollHeartbeatComplete = false;
 let busyHeartbeatInFlight = false;
 let cachedBridgeApiToken = String(globalThis.CODEX_BRIDGE_CONFIG?.apiToken || "");
 let bridgeApiTokenPromise = null;
 let assistantActivityObserver = null;
 let assistantActivityNotifyTimer = null;
 const assistantActivityWaiters = new Set();
+const inFlightReplyCaptures = new Map();
 
 function newBridgeClientId() {
   return `tab_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
@@ -98,7 +102,7 @@ async function sendHeartbeat(options = {}) {
       workerId: currentWorkerId(),
       href: location.href,
       title: document.title || "",
-      preferenceStatus: lastPreferenceStatus,
+      preferenceStatus: lastPreferenceStatus?.pageUrl && lastPreferenceStatus.pageUrl !== location.href ? null : lastPreferenceStatus,
       pageStatus: options.lightweight ? lightweightBusyPageStatus() : currentPageStatus(),
       captureStatus: lastCaptureStatus
     })
@@ -109,20 +113,34 @@ function maybeReloadExtensionFromHeartbeat(heartbeat) {
   if (!heartbeat?.reloadExtension) {
     return false;
   }
+  const expectedVersion = String(heartbeat.expectedExtensionVersion || "");
+  const backendDate = /^v(\d{8})/.exec(expectedVersion)?.[1];
+  const clientDate = /-v(\d{8})/.exec(WORKER_ID)?.[1];
+  // Reloading current files cannot downgrade them to an older backend build.
+  // Keep polling, but do not proceed to preferences or claims while mismatched.
+  if (backendDate && clientDate && backendDate < clientDate) return true;
   if (typeof chrome === "undefined" || !chrome.runtime || typeof chrome.runtime.sendMessage !== "function") {
-    return false;
+    return true;
   }
+  const attempt = JSON.stringify([WORKER_ID, expectedVersion]);
+  if (extensionReloadRequest?.attempt === attempt && extensionReloadRequest.confirmed) return true;
+  let previous = extensionReloadRequest?.startedAt || 0;
   try {
-    const previous = Number(sessionStorage.getItem(EXTENSION_RELOAD_COOLDOWN_KEY) || 0);
-    const now = Date.now();
-    if (previous && now - previous < EXTENSION_RELOAD_COOLDOWN_MS) {
-      return true;
-    }
-    sessionStorage.setItem(EXTENSION_RELOAD_COOLDOWN_KEY, String(now));
-    chrome.runtime.sendMessage({
-      type: "bridge:reloadExtension",
-      expectedVersion: heartbeat.expectedExtensionVersion || null
-    });
+    if (sessionStorage.getItem(EXTENSION_RELOAD_ATTEMPT_KEY) === attempt) return true;
+    previous = Math.max(previous, Number(sessionStorage.getItem(EXTENSION_RELOAD_COOLDOWN_KEY)) || 0);
+  } catch { /* In-memory cooldown still protects pages with unavailable storage. */ }
+  const now = Date.now();
+  if (previous && now - previous < EXTENSION_RELOAD_COOLDOWN_MS) return true;
+  const request = { attempt, startedAt: now, confirmed: false, settled: false };
+  extensionReloadRequest = request;
+  try { sessionStorage.setItem(EXTENSION_RELOAD_COOLDOWN_KEY, String(now)); } catch { /* best effort */ }
+  const settle = (response, error = null) => {
+    if (request.settled || extensionReloadRequest !== request || Date.now() - request.startedAt >= EXTENSION_RELOAD_COOLDOWN_MS) return;
+    request.settled = true;
+    if (error || response?.ok !== true) return;
+    request.confirmed = true;
+    // Persist only an acknowledged handoff. Failure may retry after cooldown.
+    try { sessionStorage.setItem(EXTENSION_RELOAD_ATTEMPT_KEY, attempt); } catch { /* best effort */ }
     if (typeof location !== "undefined" && typeof location.reload === "function") {
       setTimeout(() => {
         try {
@@ -132,10 +150,16 @@ function maybeReloadExtensionFromHeartbeat(heartbeat) {
         }
       }, 750);
     }
-    return true;
-  } catch {
-    return false;
-  }
+  };
+  try {
+    const pending = chrome.runtime.sendMessage({
+      type: "bridge:reloadExtension",
+      expectedVersion: heartbeat.expectedExtensionVersion || null
+    }, response => settle(response, chrome.runtime.lastError || null));
+    if (pending && typeof pending.then === "function") pending.then(response => settle(response), error => settle(null, error));
+  } catch (error) { settle(null, error); }
+  // A failed handoff must not fall through to preference writes or job claims.
+  return true;
 }
 
 async function maybeOpenProjectTabFromHeartbeat(heartbeat) {
@@ -284,12 +308,44 @@ function preSendClaimExpired(job = {}, nowMs = Date.now()) {
 
 function preSendExpiredError() {
   return bridgeClassifiedError(
-    "G某T 任务已被扩展领取，但 60 秒内没有真正发送。Bridge 已终止本次发送并释放队列，请重试。",
+    "GPT 任务已被扩展领取，但 60 秒内没有真正发送。Bridge 已终止本次发送并释放队列，请重试。",
     {
       errorCode: "pre_send_expired",
       recoveryAction: "retry"
     }
   );
+}
+
+async function assertPreSendActive(job, { afterSendAttempt = false } = {}) {
+  const checkDeadline = () => {
+    if (!preSendClaimExpired(job)) return;
+    if (afterSendAttempt) throw preSendExpiredError();
+    throw bridgeClassifiedError("发送前等待超过 60 秒，已停止本次发送；没有点击发送按钮。", {
+      errorCode: "pre_send_stale", recoveryAction: "retry_send"
+    });
+  };
+  checkDeadline();
+  if (!syncJobNeedsActiveCheck(job)) return;
+  let result;
+  try {
+    result = await bridgeApi(`/api/sync/jobs/${encodeURIComponent(job.id)}`);
+  } catch {
+    throw bridgeClassifiedError("无法确认任务是否仍有效，已暂停发送。", {
+      errorCode: "pre_send_state_unconfirmed", recoveryAction: "check_connection"
+    });
+  }
+  if (result?.job?.id !== job.id) {
+    throw bridgeClassifiedError("发送前任务状态不匹配，已暂停发送。", {
+      errorCode: "pre_send_state_unconfirmed", recoveryAction: "check_connection"
+    });
+  }
+  if (syncJobIsTerminal(result.job)) {
+    traceCapturePhase(job, "cancelled");
+    const error = new Error("Bridge sync job stopped before sending.");
+    error.bridgeJobStopped = true;
+    throw error;
+  }
+  checkDeadline();
 }
 
 async function withPreSendTimeout(job, operation) {
@@ -611,14 +667,17 @@ function generationFailureBlocker() {
 }
 
 function hasGenerationFailureText(value = "") {
+  if (isMessageStreamErrorText(value)) return true;
   return /something went wrong while generating the response|something seems to have gone wrong|\u751f\u6210\u56de\u590d\u65f6\u51fa\u9519|\u751f\u6210\u5931\u8d25/i.test(
     normalizeText(value)
   );
 }
 
 function detectScopedGenerationFailure(options = {}) {
-  if (options.afterUserText) {
-    const turns = assistantTurnsAfterUserText(options.afterUserText);
+  if (options.afterUserTurnId || options.afterUserText) {
+    const turns = options.afterUserTurnId
+      ? assistantTurnsAfterTurnId(options.afterUserTurnId)
+      : assistantTurnsAfterUserText(options.afterUserText);
     const lastTurn = turns[turns.length - 1];
     if (lastTurn && hasGenerationFailureText(lastTurn.textContent || "")) {
       return generationFailureBlocker();
@@ -814,13 +873,42 @@ function syncJobMutationBody(input = {}) {
 }
 
 function updateCaptureStatus(job, state, details = {}) {
+  const previous = lastCaptureStatus?.jobId === job?.id ? lastCaptureStatus : null;
+  // Explicitly cancelled jobs cannot resume under the same id. Late observers
+  // must not turn their diagnostics back into waiting/capturing states.
+  if (previous?.state === "cancelled" && state !== "cancelled") return previous;
   lastCaptureStatus = {
     jobId: job?.id || null,
     state,
+    ...(previous?.trace ? {trace: previous.trace, traceStartedAt: previous.traceStartedAt} : {}),
     ...details,
     updatedAt: new Date().toISOString()
   };
   return lastCaptureStatus;
+}
+
+function traceCapturePhase(job, phase, details = {}) {
+  if (!job?.id) return null;
+  const previous = lastCaptureStatus?.jobId === job.id ? lastCaptureStatus : null;
+  const now = new Date().toISOString();
+  const startedAt = previous?.traceStartedAt || now;
+  const event = {phase, at: now, elapsedMs: Math.max(0, Date.parse(now) - Date.parse(startedAt))};
+  // Local diagnostics must not retain response bodies or signed download URLs.
+  if (details.filename) event.filename = String(details.filename).slice(0, 160);
+  for (const key of ["controlLabel", "controlClass"]) {
+    if (details[key]) event[key] = String(details[key]).replace(/https?:\/\/\S+/gi, "[url]").slice(0, 160);
+  }
+  for (const key of ["timeoutMs", "artifactCount", "buttonCount", "anchorCount", "resourceCount"]) {
+    if (Number.isFinite(details[key])) event[key] = Math.max(0, details[key]);
+  }
+  if (phase.startsWith("pre_send_")) {
+    event.claimAgeMs = unsentClaimAgeMs(job);
+    event.visibilityState = document.visibilityState || "unknown";
+  }
+  return updateCaptureStatus(job, phase, {
+    traceStartedAt: startedAt,
+    trace: [...(previous?.trace || []).slice(-23), event]
+  });
 }
 
 function recordCompletionCaptureStatus(job, completion = null, details = {}) {
@@ -833,6 +921,7 @@ function recordCompletionCaptureStatus(job, completion = null, details = {}) {
     });
     return false;
   }
+  traceCapturePhase(job, "captured");
   updateCaptureStatus(job, "captured", details);
   return true;
 }
@@ -1024,6 +1113,8 @@ function modeLabelForPreference(preference = "", modelPreference = "") {
 
 function modePreferencesForModel(modelPreference) {
   const preferences = {
+    latest: ["fast", "balanced", "advanced", "high", "pro"],
+    "gpt-6-astra": [],
     "gpt-5.6-sol": ["fast", "balanced", "advanced", "high", "pro"],
     "gpt-5.5": ["fast", "balanced", "advanced", "high", "pro"],
     "gpt-5.4": ["fast", "balanced", "advanced", "high", "pro"],
@@ -1047,6 +1138,8 @@ function compatibleModePreference(modelPreference, modePreference) {
 
 function modelLabelsForPreference(preference = "") {
   const labels = {
+    latest: ["最新", "Latest"],
+    "gpt-6-astra": ["GPT-6 Astra", "6 Astra"],
     "gpt-5.6-sol": ["GPT-5.6 Sol", "5.6 Sol"],
     "gpt-5.5": ["GPT-5.5", "5.5"],
     "gpt-5.4": ["GPT-5.4", "5.4"],
@@ -1100,7 +1193,7 @@ function knownModeLabels() {
 }
 
 function knownModelLabels() {
-  return ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.3", "o3"].flatMap(modelLabelsForPreference).filter(Boolean);
+  return ["latest", "gpt-6-astra", "gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.3", "o3"].flatMap(modelLabelsForPreference).filter(Boolean);
 }
 
 function looksLikeSpecificModeControl(element) {
@@ -1267,6 +1360,7 @@ function menuCandidateElements() {
     ...document.querySelectorAll("[role='menuitemradio']")
   ]
     .filter(isVisibleElement)
+    .filter((element) => !element.closest?.('[inert], [aria-hidden="true"]'))
     .filter((element) => !isConversationTurnElement(element));
 }
 
@@ -1504,30 +1598,324 @@ async function selectMenuPreference(labelOrLabels, kind = "model") {
   return false;
 }
 
+let intelligencePickerDetected = false;
+let observedIntelligenceModels = null;
+let manuallyChangedPreferenceKey = null;
+
+function observeIntelligenceModels(root) {
+  const radios = [...(root?.querySelectorAll('[role="menuitemradio"]') || [])];
+  if (!radios.length) return;
+  const ids = ["latest", "gpt-6-astra", "gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.3", "o3"];
+  const labels = radios.filter((item) => item.getAttribute("aria-disabled") !== "true")
+    .map((item) => normalizeText(item.textContent || ""));
+  observedIntelligenceModels = { pageUrl: location.href, models: ids.filter((id) => modelLabelsForPreference(id).some((label) => labels.includes(label))) };
+}
+
+function invalidateManualPreferenceSelection(event) {
+  if (!event.isTrusted || !intelligencePickerDetected || !lastPreferenceStatus) return;
+  if (event.type === "keydown" && !["ArrowLeft", "ArrowRight", "Enter", " "].includes(event.key)) return;
+  const target = event.target;
+  const trigger = intelligencePickerTrigger();
+  if (!target?.closest?.('[data-testid="composer-intelligence-picker-content"]') &&
+      target !== trigger && !trigger?.contains?.(target)) return;
+  manuallyChangedPreferenceKey = lastHeartbeatPreferenceKey;
+  lastPreferenceStatus = { ...lastPreferenceStatus, state: "unverified" };
+}
+
+function intelligencePickerRoot() {
+  return document.querySelector('[data-testid="composer-intelligence-picker-content"]');
+}
+
+function intelligencePickerTrigger() {
+  // Restrict discovery to the composer. Reply "switch model" and profile Pro
+  // buttons must never become candidates, even if their text matches.
+  for (const scope of preferenceControlScopes()) {
+    if (scope === document) continue;
+    const button = [...(scope.querySelectorAll?.('button,[role="button"]') || [])]
+      .filter(isVisibleElement)
+      .find((element) => element.getAttribute?.("aria-haspopup") === "menu" &&
+        /^(?:思考强度|Thinking effort|Reasoning effort|即时|中|高|极高|极速(?:\s*5\.5)?|Instant|Medium|High|Extra High|(?:6\s*)?Pro|GPT-[56].*|5\.[56].*)$/i.test(normalizeText(element.textContent || "")));
+    if (button) return button;
+  }
+  return null;
+}
+
+async function waitForDomEvidence(read, timeoutMs = 1000) {
+  const budget = Math.min(60000, Math.max(0, Number(timeoutMs) || 0));
+  const deadline = Date.now() + budget;
+  const immediate = read();
+  if (immediate) return immediate;
+  const root = document.documentElement || document.body;
+  if (typeof MutationObserver === "function" && root) {
+    return new Promise((resolve, reject) => {
+      let observer = null;
+      let timer = null;
+      let settled = false;
+      const finish = (value, error = null) => {
+        if (settled) return;
+        settled = true;
+        observer?.disconnect();
+        if (timer !== null) clearTimeout(timer);
+        if (error) reject(error);
+        else resolve(value);
+      };
+      const probe = () => {
+        if (settled) return;
+        if (Date.now() >= deadline) return finish(null);
+        try {
+          const value = read();
+          if (Date.now() >= deadline) finish(null);
+          else if (value) finish(value);
+        } catch (error) {
+          finish(null, error);
+        }
+      };
+      try {
+        observer = new MutationObserver(probe);
+        observer.observe(root, { subtree: true, childList: true, attributes: true, characterData: true });
+        if (!settled) timer = setTimeout(() => finish(null), Math.max(0, deadline - Date.now()));
+        // Close the gap between the initial read and subscribing to mutations.
+        probe();
+      } catch (error) {
+        finish(null, error);
+      }
+    });
+  }
+  // Legacy environments retain bounded polling, but delayed callbacks cannot
+  // multiply the budget into ten minutes in a background tab.
+  for (let attempt = 0; attempt < Math.ceil(budget / 100) && Date.now() < deadline; attempt += 1) {
+    const result = read();
+    if (result) return result;
+    await sleep(Math.min(100, Math.max(0, deadline - Date.now())));
+  }
+  return null;
+}
+
+async function waitForPreferenceEvidence(read) {
+  return waitForDomEvidence(read, 1000);
+}
+
+function composerTextNotAppliedError() {
+  return bridgeClassifiedError("输入框内容与本次任务不一致，已停止发送。", {
+    errorCode: "composer_text_not_applied", recoveryAction: "retry_send"
+  });
+}
+
+async function openIntelligencePicker(trigger) {
+  if (!trigger) return null;
+  openPreferenceTrigger(trigger);
+  let root = await waitForPreferenceEvidence(intelligencePickerRoot);
+  if (!root) {
+    trigger.click?.();
+    root = await waitForPreferenceEvidence(intelligencePickerRoot);
+  }
+  return root;
+}
+
+function intelligenceOptionInteractive(element) {
+  return isVisibleElement(element) && !element.closest?.('[inert], [aria-hidden="true"]');
+}
+
+function intelligenceSliderState(root) {
+  const slider = root?.querySelector('[role="slider"]');
+  const owner = root?.querySelector('[role="menuitem"][aria-label="能力"], [role="menuitem"][aria-label="Capability"]');
+  if (!slider || !owner || !intelligenceOptionInteractive(owner)) return null;
+  const number = (name) => {
+    const value = slider.getAttribute(name);
+    return value === null || value === "" ? NaN : Number(value);
+  };
+  const value = number("aria-valuenow");
+  const min = number("aria-valuemin");
+  const max = number("aria-valuemax");
+  if (![value, min, max].every(Number.isInteger) || min !== 0 || max < value || value < min || max > 8) return null;
+  const description = String(owner.getAttribute("aria-describedby") || "").split(/\s+/)
+    .map((id) => document.getElementById?.(id)?.textContent || "").join(" ");
+  return { owner, value, min, max, label: normalizeText(slider.getAttribute("aria-valuetext") || description.split(/[，,]/)[0]) };
+}
+
+function intelligenceModeMatches(mode, current) {
+  const targets = { fast: 0, balanced: 1, advanced: 2, high: 3, pro: 4 };
+  const aliases = {
+    fast: ["即时", "极速", "极速 5.5", "Instant", "Fast"], balanced: ["中", "Medium"],
+    advanced: ["高", "High"], high: ["极高", "Extra High"], pro: ["Pro", "6 Pro", "Pro 深度模式"]
+  };
+  return Boolean(current && current.value === targets[mode] && aliases[mode]?.includes(current.label));
+}
+
+async function verifyIntelligencePreferences(job) {
+  const root = intelligencePickerRoot() || await openIntelligencePicker(intelligencePickerTrigger());
+  try {
+    const selected = [...(root?.querySelectorAll('[role="menuitemradio"]') || [])]
+      .find((item) => item.getAttribute("aria-checked") === "true");
+    const label = normalizeText(selected?.textContent || "");
+    const slider = intelligenceSliderState(root);
+    const result = {
+      modelSynced: !job.modelPreference || modelLabelsForPreference(job.modelPreference).includes(label),
+      modeSynced: !job.modePreference || intelligenceModeMatches(job.modePreference, slider)
+    };
+    lastPreferenceAttemptDiagnostic = { kind: "verify", adapter: "intelligence-picker", requestedModel: job.modelPreference || null,
+      requestedMode: job.modePreference || null, observedModel: label,
+      observedSlider: slider ? {value: slider.value, max: slider.max, label: slider.label} : null };
+    return result;
+  } finally {
+    dismissOpenMenus();
+    await waitForPreferenceEvidence(() => !intelligencePickerRoot());
+  }
+}
+
+function preferenceApplicationError(message) {
+  const error = new Error(message);
+  error.errorCode = "preference_not_applied";
+  error.recoveryAction = "review_preferences";
+  error.details = lastPreferenceAttemptDiagnostic || {};
+  return error;
+}
+
+async function selectIntelligencePreference(job, kind) {
+  lastPreferenceAttemptDiagnostic = { kind, adapter: "intelligence-picker", requestedModel: job.modelPreference || null, requestedMode: job.modePreference || null };
+  let root = intelligencePickerRoot();
+  const trigger = intelligencePickerTrigger();
+  if (!root && !trigger) return null;
+  if (!root) {
+    root = await openIntelligencePicker(trigger);
+    if (!root) {
+      dismissOpenMenus();
+      return intelligencePickerDetected ? false : null; // Old web layout only.
+    }
+  }
+  intelligencePickerDetected = true;
+  observeIntelligenceModels(root);
+  try {
+    if (kind === "model") {
+      const labels = modelLabelsForPreference(job.modelPreference);
+      const radios = () => [...(intelligencePickerRoot()?.querySelectorAll('[role="menuitemradio"]') || [])];
+      const matching = () => radios().find((element) => labels.includes(normalizeText(element.textContent || "")));
+      const checked = () => matching()?.getAttribute("aria-checked") === "true";
+      lastPreferenceAttemptDiagnostic.availableModels = radios().map((element) => normalizeText(element.textContent || ""));
+      if (checked()) return true;
+      const toggle = root.querySelector('[role="menuitem"][aria-label="选择模型"], [role="menuitem"][aria-label="Select model"]');
+      if (toggle && intelligenceOptionInteractive(toggle)) toggle.click();
+      const option = await waitForPreferenceEvidence(() => {
+        const candidate = matching();
+        return candidate && intelligenceOptionInteractive(candidate) ? candidate : null;
+      });
+      if (!option) return false;
+      option.click();
+      // React may close the menu after click returns but before committing the
+      // radio. Reopen once during readback, never repeat the option activation.
+      const evidence = await waitForPreferenceEvidence(() => checked() ? "checked" :
+        !intelligencePickerRoot() ? "closed" : null);
+      if (evidence === "checked") return true;
+      if (evidence === "closed" && trigger) {
+        await openIntelligencePicker(intelligencePickerTrigger() || trigger);
+        return Boolean(await waitForPreferenceEvidence(checked));
+      }
+      return false;
+    }
+    const targets = { fast: 0, balanced: 1, advanced: 2, high: 3, pro: 4 };
+    const target = targets[job.modePreference];
+    let current = intelligenceSliderState(root);
+    if (!current && trigger) {
+      dismissOpenMenus();
+      await waitForPreferenceEvidence(() => !intelligencePickerRoot());
+      await openIntelligencePicker(intelligencePickerTrigger() || trigger);
+      current = await waitForPreferenceEvidence(() => intelligenceSliderState(intelligencePickerRoot()));
+    }
+    if (!current || !Number.isInteger(target) || target > current.max) return false;
+    for (let moves = 0; current.value !== target && moves < 8; moves += 1) {
+      const before = current.value;
+      const key = before < target ? "ArrowRight" : "ArrowLeft";
+      current.owner.focus?.();
+      dispatchPreferenceEvent(current.owner, typeof KeyboardEvent === "function" ? KeyboardEvent : null, "keydown", {key, code:key});
+      dispatchPreferenceEvent(current.owner, typeof KeyboardEvent === "function" ? KeyboardEvent : null, "keyup", {key, code:key});
+      current = await waitForPreferenceEvidence(() => {
+        const next = intelligenceSliderState(intelligencePickerRoot());
+        return next && next.value !== before ? next : null;
+      });
+      if (!current) return false;
+    }
+    lastPreferenceAttemptDiagnostic.observedSlider = { value: current.value, max: current.max, label: current.label };
+    return intelligenceModeMatches(job.modePreference, current);
+  } finally {
+    dismissOpenMenus();
+    await waitForPreferenceEvidence(() => !intelligencePickerRoot());
+  }
+}
+
 async function selectModePreference(job = {}) {
-  return selectMenuPreference(modeLabelsForPreference(job.modePreference, job.modelPreference), "mode");
+  const modern = await selectIntelligencePreference(job, "mode");
+  return modern === null ? selectMenuPreference(modeLabelsForPreference(job.modePreference, job.modelPreference), "mode") : modern;
 }
 
 async function selectModelPreference(job = {}) {
-  return selectMenuPreference(modelLabelsForPreference(job.modelPreference), "model");
+  const modern = await selectIntelligencePreference(job, "model");
+  return modern === null ? selectMenuPreference(modelLabelsForPreference(job.modelPreference), "model") : modern;
+}
+
+async function applyJobPreferences(job, { strict = false } = {}) {
+  const modelSynced = job.modelPreference ? await selectModelPreference(job) : true;
+  if ((intelligencePickerDetected || strict) && !modelSynced) {
+    throw preferenceApplicationError("网页未找到或无法确认所选模型，请在 Bridge 选择该网页支持的模型。");
+  }
+  const modeSynced = job.modePreference ? await selectModePreference(job) : true;
+  if ((intelligencePickerDetected || strict) && !modeSynced) {
+    throw preferenceApplicationError("无法确认所选思考强度，请重新选择网页支持的档位。");
+  }
+  if (intelligencePickerDetected) {
+    const verified = await verifyIntelligencePreferences(job);
+    if (!verified.modelSynced || !verified.modeSynced) {
+      throw preferenceApplicationError("网页当前模型或思考强度与请求不一致，尚未发送消息。");
+    }
+    if (lastPreferenceStatus?.pageUrl === location.href &&
+        lastPreferenceStatus.modelPreference === (job.modelPreference || null) &&
+        lastPreferenceStatus.modePreference === (job.modePreference || null)) {
+      setPreferenceStatus({...job,updatedAt:lastPreferenceStatus.updatedAt},{state:"applied",...verified});
+      manuallyChangedPreferenceKey = null;
+    }
+  }
 }
 
 function findFileInput() {
   return document.querySelector('input[type="file"]');
 }
 
-async function fetchInputArtifactFile(artifact) {
-  const url = bridgeUrl(inputArtifactUploadUrl(artifact));
+async function fetchInputArtifactFile(artifact, options = {}) {
+  const target = new URL(bridgeUrl(inputArtifactUploadUrl(artifact)));
+  if (options.projectId) target.searchParams.set("projectId", options.projectId);
+  const url = target.toString();
   let lastError = null;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
-      const response = await fetch(url, { cache: "no-store" });
-      if (!response.ok) {
-        throw new Error(`Could not fetch ${artifact.filename || artifact.id}: ${response.status}`);
+      let bytes;
+      let contentType;
+      if (canAskBackgroundForDownloads()) {
+        if (target.origin !== new URL(BRIDGE_ORIGIN).origin) {
+          throw new Error("Input artifacts must belong to the configured Bridge origin");
+        }
+        const result = await chromeRuntimeMessage({
+          type: "bridge:api",
+          bridgeOrigin: BRIDGE_ORIGIN,
+          path: `${target.pathname}${target.search}`,
+          options: {method: "GET", cache: "no-store", responseType: "base64"}
+        }, {timeoutMs: 30_000});
+        if (!result?.ok || !result.response?.ok || typeof result.response.base64Data !== "string") {
+          throw new Error(result?.error || result?.response?.bodyText || "Bridge did not return input artifact bytes");
+        }
+        bytes = Uint8Array.from(atob(result.response.base64Data), (character) => character.charCodeAt(0));
+        contentType = result.response.contentType;
+      } else {
+        const response = await fetch(url, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`Could not fetch ${artifact.filename || artifact.id}: ${response.status}`);
+        }
+        bytes = await response.arrayBuffer();
+        contentType = response.headers?.get("content-type");
       }
-      const bytes = await response.arrayBuffer();
+      if (Number.isFinite(artifact.sizeBytes) && bytes.byteLength !== artifact.sizeBytes) {
+        throw new Error("Input artifact byte length does not match its metadata");
+      }
       return new File([bytes], artifact.filename || "artifact", {
-        type: artifact.contentType || response.headers?.get("content-type") || "application/octet-stream"
+        type: artifact.contentType || contentType || "application/octet-stream"
       });
     } catch (error) {
       lastError = error;
@@ -1536,7 +1924,10 @@ async function fetchInputArtifactFile(artifact) {
       }
     }
   }
-  throw lastError;
+  throw bridgeClassifiedError(`Could not read input artifact ${artifact.filename || artifact.id}: ${lastError?.message || lastError}`, {
+    errorCode: "input_artifact_fetch_failed",
+    recoveryAction: "retry"
+  });
 }
 
 function inputArtifactUploadUrl(artifact = {}) {
@@ -1598,38 +1989,105 @@ function uploadPreviewElements() {
   return [...document.querySelectorAll("img,[data-testid],[aria-label],[title],a,button,div,span,p")]
     .filter(isVisibleElement)
     .filter((element) => {
-      if (isInsideElement(element, composer)) {
+      if (isInsideElement(element, composer) || isInsideElement(composer, element)) {
         return false;
       }
-      if (element.closest?.('[data-testid^="conversation-turn-"]')) {
+      if (element.closest?.('[data-testid^="conversation-turn-"]') ||
+          element.querySelector?.('[data-testid^="conversation-turn-"]')) {
         return false;
       }
       return true;
     });
 }
 
+function uploadLabelMatchesFilename(label, filename) {
+  if (!filename) return false;
+  const boundary = new RegExp(`(?:^|[\\s"'<>()[\\]{}:：;,])${escapeRegExp(filename)}(?=$|[\\s"'<>()[\\]{}:：;,])`, "u");
+  return boundary.test(label);
+}
+
 function inputArtifactAppearsUploaded(artifact = {}, previewElements = null) {
   const filename = String(artifact.filename || "").trim();
-  const isImage = /^image\//i.test(artifact.contentType || "") || /\.(png|jpe?g|webp|gif|svg)$/i.test(filename);
   const candidates = Array.isArray(previewElements) ? previewElements : uploadPreviewElements();
-  return candidates.some((element) => {
-    const label = uploadPreviewLabel(element);
-    if (filename && label.includes(filename)) {
-      return true;
+  return candidates.some(element => uploadLabelMatchesFilename(uploadPreviewLabel(element), filename));
+}
+
+function uploadImagePreviewLabel(element, form) {
+  let label = uploadPreviewLabel(element);
+  let parent = element.parentElement;
+  while (parent && parent !== form) {
+    if ((parent.querySelectorAll?.("img") || []).length !== 1) break;
+    label += " " + uploadPreviewLabel(parent);
+    parent = parent.parentElement;
+  }
+  return label;
+}
+
+function missingInputArtifacts(inputArtifacts, previewElements) {
+  const composer = findComposer();
+  const form = composer?.closest?.("form") || findFileInput()?.closest?.("form");
+  const namedBudgets = new Map();
+  const missing = inputArtifacts.filter(artifact => {
+    const filename = String(artifact.filename || "").trim();
+    if (!namedBudgets.has(filename)) {
+      const duplicate = inputArtifacts.filter(a => String(a.filename || "").trim() === filename).length > 1;
+      const isImage = /^image\//i.test(artifact.contentType || "") || /\.(png|jpe?g|webp|gif|svg)$/i.test(filename);
+      const keys = new Set();
+      if (duplicate && isImage) {
+        for (const element of previewElements) {
+          const src = element.currentSrc || element.getAttribute?.("src");
+          if (String(element.tagName || "").toLowerCase() === "img" && src &&
+              uploadLabelMatchesFilename(uploadImagePreviewLabel(element, form), filename)) keys.add(src);
+        }
+      }
+      namedBudgets.set(filename, duplicate && isImage ? keys.size : Number(inputArtifactAppearsUploaded(artifact, previewElements)));
     }
-    return isImage && String(element.tagName || "").toLowerCase() === "img";
+    const remaining = namedBudgets.get(filename);
+    if (remaining > 0) { namedBudgets.set(filename, remaining - 1); return false; }
+    return true;
+  });
+  if (!missing.length) return [];
+  const anonymousImages = new Set();
+  const namedImages = new Set();
+  if (form) {
+    for (const element of previewElements) {
+      if (String(element.tagName || "").toLowerCase() !== "img" || !isInsideElement(element, form)) continue;
+      const src = element.currentSrc || element.getAttribute?.("src") || "";
+      if (!/^(?:blob:|data:image\/)/i.test(src)) continue;
+      // Associate a thumbnail with its own single-image card, never with an
+      // ancestor that aggregates several attachment previews or the composer.
+      const label = uploadImagePreviewLabel(element, form);
+      if (/\.(?:png|jpe?g|webp|gif|svg)(?=$|[\s"'<>()[\]{}:：;,])/i.test(label)) {
+        namedImages.add(src);
+        continue;
+      }
+      anonymousImages.add(src);
+    }
+  }
+  for (const key of namedImages) anonymousImages.delete(key);
+  let remainingImages = anonymousImages.size;
+  return missing.filter(artifact => {
+    const isImage = /^image\//i.test(artifact.contentType || "") || /\.(png|jpe?g|webp|gif|svg)$/i.test(artifact.filename || "");
+    if (isImage && remainingImages > 0) { remainingImages--; return false; }
+    return true;
   });
 }
 
-async function waitForInputArtifactsVisible(inputArtifacts = [], timeoutMs = 60000) {
+async function waitForInputArtifactsVisible(inputArtifacts = [], timeoutMs = 60000, job = null) {
   const started = Date.now();
   const observesPageChanges = installAssistantActivityObserver();
   let pageScanNeeded = true;
+  let lastActiveCheckAt = -Infinity;
   while (Date.now() - started <= timeoutMs) {
+    // Cancellation does not mutate the GPT DOM, so check even on a quiet page.
+    if (job && Date.now() - lastActiveCheckAt >= ACTIVE_JOB_CHECK_INTERVAL_MS) {
+      await assertPreSendActive(job);
+      lastActiveCheckAt = Date.now();
+    }
     if (pageScanNeeded) {
       assertNoChatGptBlocker();
       const previewElements = uploadPreviewElements();
-      if (inputArtifacts.every((artifact) => inputArtifactAppearsUploaded(artifact, previewElements))) {
+      if (missingInputArtifacts(inputArtifacts, previewElements).length === 0) {
         return;
       }
       pageScanNeeded = false;
@@ -1639,8 +2097,7 @@ async function waitForInputArtifactsVisible(inputArtifacts = [], timeoutMs = 600
   }
 
   const previewElements = uploadPreviewElements();
-  const missing = inputArtifacts
-    .filter((artifact) => !inputArtifactAppearsUploaded(artifact, previewElements))
+  const missing = missingInputArtifacts(inputArtifacts, previewElements)
     .map((artifact) => artifact.filename || artifact.id || "artifact")
     .join(", ");
   throw new Error("GPT 附件没有出现在输入框里：" + missing);
@@ -1660,14 +2117,21 @@ async function uploadInputArtifacts(job = {}, options = {}) {
   const transfer = new DataTransfer();
   const files = [];
   for (const artifact of inputArtifacts) {
-    const file = await fetchInputArtifactFile(artifact);
+    await assertPreSendActive(job);
+    traceCapturePhase(job, "reading_input_artifact", {filename: artifact.filename});
+    const file = await fetchInputArtifactFile(artifact, {projectId: job.projectId});
     transfer.items.add(file);
     files.push(file);
   }
 
+  // File reads can outlive cancellation or the claim deadline. Uploading is
+  // itself an external side effect, even before the message Send button.
+  await assertPreSendActive(job);
   fileInput.files = transfer.files;
   fileInput.dispatchEvent(new Event("change", { bubbles: true }));
-  await waitForInputArtifactsVisible(inputArtifacts, options.attachmentTimeoutMs ?? 60000);
+  traceCapturePhase(job, "waiting_upload_preview", {artifactCount: files.length});
+  await waitForInputArtifactsVisible(inputArtifacts, options.attachmentTimeoutMs ?? 60000, job);
+  traceCapturePhase(job, "input_files_ready", {artifactCount: files.length});
   return files;
 }
 
@@ -1699,11 +2163,16 @@ function isDisabledButton(button) {
   );
 }
 
-async function waitForReadySendButton(timeoutMs = 60000) {
+async function waitForReadySendButton(timeoutMs = 60000, job = null) {
   const started = Date.now();
   const observesPageChanges = installAssistantActivityObserver();
   let pageBlockerScanNeeded = true;
+  let lastActiveCheckAt = -Infinity;
   while (Date.now() - started < timeoutMs) {
+    if (job && Date.now() - lastActiveCheckAt >= ACTIVE_JOB_CHECK_INTERVAL_MS) {
+      await assertPreSendActive(job);
+      lastActiveCheckAt = Date.now();
+    }
     if (pageBlockerScanNeeded) {
       assertNoChatGptBlocker();
       pageBlockerScanNeeded = false;
@@ -1834,7 +2303,17 @@ function promptNeedles(value = "") {
 }
 
 function promptTextCandidates(...values) {
-  return uniqueNonEmptyStrings(values.flat().filter(Boolean));
+  const seen = new Set();
+  const candidates = [];
+  for (const value of values.flat().filter(Boolean)) {
+    const text = String(value).trim();
+    const key = normalizeText(text);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    // Preserve line boundaries until full Markdown normalization has run.
+    candidates.push(text);
+  }
+  return candidates;
 }
 
 function promptCandidatesForJob(job = {}) {
@@ -1846,13 +2325,92 @@ function promptCandidatesForJob(job = {}) {
 }
 
 function conversationTurns() {
+  const wrappers = [...document.querySelectorAll('[data-turn-id-container]')]
+    .filter(node => node.getAttribute?.("data-turn-id-container") != null)
+    .filter(node => node.parentElement?.closest?.('[data-turn-id-container]')?.getAttribute?.("data-turn-id-container")
+      !== node.getAttribute("data-turn-id-container"));
+  if (wrappers.length > 0) return wrappers;
   return [...document.querySelectorAll('[data-testid^="conversation-turn-"]')];
+}
+
+function conversationTurnId(turn) {
+  const value = turn?.getAttribute?.("data-turn-id") ||
+    turn?.getAttribute?.("data-turn-id-container") ||
+    turn?.closest?.('[data-turn-id-container]')?.getAttribute?.("data-turn-id-container") ||
+    turn?.closest?.('[data-turn-id]')?.getAttribute?.("data-turn-id");
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function assertUniqueTurnIds(turns) {
+  const seen = new Set();
+  for (const turn of turns) {
+    const id = conversationTurnId(turn);
+    const explicitlyIdentified = turn?.getAttribute?.("data-turn-id-container") != null ||
+      turn?.getAttribute?.("data-turn-id") != null;
+    if ((explicitlyIdentified && !id) || (id && (id.length > 256 || /[\u0000-\u001f]/.test(id))) || seen.has(id)) {
+      throw bridgeClassifiedError("GPT message identity is ambiguous; refusing to capture another turn.", {
+        errorCode: "reply_scope_ambiguous", recoveryAction: "check_original_reply"
+      });
+    }
+    if (!id) continue;
+    seen.add(id);
+  }
+}
+
+function promptTurnById(turnId, turns = conversationTurns()) {
+  assertUniqueTurnIds(turns);
+  const index = turns.findIndex(turn => conversationTurnId(turn) === turnId);
+  if (index < 0) return null;
+  const turn = turns[index];
+  if (modernTurnRole(turn) === "assistant" || turn.getAttribute?.("data-message-author-role") === "assistant" ||
+      turn.querySelector?.('[data-message-author-role="assistant"]')) return null;
+  return { index, turn, turnId };
+}
+
+function assistantTurnsAfterTurnId(turnId, turnsSnapshot = null) {
+  const turns = Array.isArray(turnsSnapshot) ? turnsSnapshot : conversationTurns();
+  const prompt = promptTurnById(turnId, turns);
+  if (!prompt) return [];
+  const replies = [];
+  for (const turn of turns.slice(prompt.index + 1)) {
+    // An unknown virtualized turn may be the next user prompt. Never cross it.
+    if (!conversationTurnId(turn) || isUserLikeTurn(turn) || !isAssistantLikeTurn(turn)) break;
+    replies.push(turn);
+  }
+  return replies;
+}
+
+function submissionTurnBaseline(turns) {
+  assertUniqueTurnIds(turns);
+  const ids = turns.map(conversationTurnId);
+  if (ids.some(Boolean) && !ids.every(Boolean)) {
+    throw bridgeClassifiedError("GPT message identity baseline is incomplete; refusing an ambiguous send.", {
+      errorCode: "reply_scope_ambiguous", recoveryAction: "check_original_reply"
+    });
+  }
+  return ids.every(Boolean) ? ids : null;
+}
+
+function modernTurnRole(turn) {
+  const direct = turn?.getAttribute?.("data-turn");
+  if (direct === "user" || direct === "assistant") return direct;
+  for (const role of ["user", "assistant"]) {
+    const node = turn?.querySelector?.(`[data-turn="${role}"]`);
+    if (node?.getAttribute?.("data-turn") === role) return role;
+  }
+  return null;
 }
 
 function isAssistantLikeTurn(turn) {
   if (!turn) {
     return false;
   }
+
+  const role = modernTurnRole(turn);
+  if (role) return role === "assistant";
+
+  if (turn.getAttribute?.("data-message-author-role") === "assistant") return true;
+  if (turn.getAttribute?.("data-message-author-role") === "user") return false;
 
   if (turn.querySelector?.('[data-message-author-role="assistant"]')) {
     return true;
@@ -1869,6 +2427,12 @@ function isUserLikeTurn(turn) {
   if (!turn) {
     return false;
   }
+
+  const role = modernTurnRole(turn);
+  if (role) return role === "user";
+
+  if (turn.getAttribute?.("data-message-author-role") === "user") return true;
+  if (turn.getAttribute?.("data-message-author-role") === "assistant") return false;
 
   if (turn.querySelector?.('[data-message-author-role="user"]')) {
     return true;
@@ -1889,18 +2453,31 @@ function latestUserPromptTurnInfo(userTexts = [], options = {}) {
 
   const afterTurnIndex = Number.isInteger(options.afterTurnIndex) ? options.afterTurnIndex : -1;
   const turns = Array.isArray(options.turns) ? options.turns : conversationTurns();
+  const initialIds = Array.isArray(options.initialTurnIds) ? new Set(options.initialTurnIds) : null;
+  assertUniqueTurnIds(turns);
+  let identityMatch = null;
   for (let index = turns.length - 1; index >= 0; index -= 1) {
-    if (index <= afterTurnIndex) {
+    const turnId = conversationTurnId(turns[index]);
+    if (initialIds && (initialIds.size > 0 || turnId)) {
+      if (!turnId || initialIds.has(turnId)) continue;
+    } else if (index <= afterTurnIndex) {
       break;
     }
     const turnText = normalizeText(turns[index].textContent || "");
     const matchingNeedle = needles.find((needle) => turnText.includes(needle));
     if (matchingNeedle && isUserLikeTurn(turns[index])) {
-      return { index, turn: turns[index], needle: matchingNeedle };
+      const match = { index, turn: turns[index], needle: matchingNeedle, ...(turnId ? { turnId } : {}) };
+      if (!initialIds || !turnId) return match;
+      if (identityMatch) {
+        throw bridgeClassifiedError("More than one new GPT prompt matches this submission; refusing an ambiguous binding.", {
+          errorCode: "reply_scope_ambiguous", recoveryAction: "check_original_reply"
+        });
+      }
+      identityMatch = match;
     }
   }
 
-  return null;
+  return identityMatch;
 }
 
 function assistantTurnsAfterTurnIndex(turnIndex, turnsSnapshot = null) {
@@ -1914,12 +2491,17 @@ function assistantTurnsAfterTurnIndex(turnIndex, turnsSnapshot = null) {
     return [];
   }
 
-  return turns.slice(index + 1).filter(isAssistantLikeTurn);
+  const replies = [];
+  for (const turn of turns.slice(index + 1)) {
+    if (isUserLikeTurn(turn)) break;
+    if (isAssistantLikeTurn(turn)) replies.push(turn);
+  }
+  return replies;
 }
 
 function assistantTurnsAfterUserTexts(userTexts = [], turnsSnapshot = null) {
   const turns = Array.isArray(turnsSnapshot) ? turnsSnapshot : conversationTurns();
-  const promptInfo = latestUserPromptTurnInfo(userTexts, { turns });
+  const promptInfo = uniqueUserPromptTurnInfo(userTexts, turns);
   if (!promptInfo) {
     return [];
   }
@@ -1927,17 +2509,50 @@ function assistantTurnsAfterUserTexts(userTexts = [], turnsSnapshot = null) {
   return assistantTurnsAfterTurnIndex(promptInfo.index, turns);
 }
 
+function uniqueUserPromptTurnInfo(userTexts, turns = conversationTurns()) {
+  const comparable = value => normalizeText(String(value || "").replace(/(^|\n)\s{0,3}(?:[-*+]|\d+[.)])\s+/g, "$1"));
+  const candidates = uniqueNonEmptyStrings(promptTextCandidates(userTexts).filter(value => {
+    const text = normalizeText(value);
+    return !filenamesFromText(value).some(filename => normalizeText(filename) === text);
+  }).map(comparable));
+  assertUniqueTurnIds(turns);
+  let match = null;
+  for (let index = 0; index < turns.length; index += 1) {
+    const turn = turns[index];
+    if (conversationTurnId(turn) && !normalizeText(nodePlainText(turn)) &&
+        (isUserLikeTurn(turn) || !isAssistantLikeTurn(turn))) {
+      throw bridgeClassifiedError("GPT history is partially virtualized; the original prompt cannot be uniquely verified.", {
+        errorCode: "reply_scope_ambiguous", recoveryAction: "check_original_reply"
+      });
+    }
+    const roleNode = turn.querySelector?.('[data-message-author-role="user"]') || turn.querySelector?.('[data-turn="user"]');
+    const text = comparable(nodePlainText(roleNode) || nodePlainText(turn));
+    if (!candidates.includes(text) || (!roleNode && !isUserLikeTurn(turn))) continue;
+    if (match) {
+      throw bridgeClassifiedError("The original GPT prompt is not unique; refusing to choose a historical reply.", {
+        errorCode: "reply_scope_ambiguous", recoveryAction: "check_original_reply"
+      });
+    }
+    match = { index, turn, needle: text, turnId: conversationTurnId(turn) };
+  }
+  return match;
+}
+
 function assistantTurnsAfterUserText(userText = "", turnsSnapshot = null) {
   return assistantTurnsAfterUserTexts([userText], turnsSnapshot);
 }
 
-function assistantMessagesForReplyScope(afterUserTurnIndex, afterUserTexts = [], turnsSnapshot = null) {
+function assistantMessagesForReplyScope(afterUserTurnIndex, afterUserTexts = [], turnsSnapshot = null, afterUserTurnId = null) {
+  if (afterUserTurnId) return assistantTurnsAfterTurnId(afterUserTurnId, turnsSnapshot);
+  if (afterUserTexts.length > 0) return assistantTurnsAfterUserTexts(afterUserTexts, turnsSnapshot);
   const indexedMessages = Number.isInteger(afterUserTurnIndex)
     ? assistantTurnsAfterTurnIndex(afterUserTurnIndex, turnsSnapshot)
     : [];
   if (indexedMessages.length > 0) {
     return indexedMessages;
   }
+  const turns = Array.isArray(turnsSnapshot) ? turnsSnapshot : conversationTurns();
+  if (Number.isInteger(afterUserTurnIndex) && isUserLikeTurn(turns[afterUserTurnIndex])) return [];
   return afterUserTexts.length > 0 ? assistantTurnsAfterUserTexts(afterUserTexts, turnsSnapshot) : [];
 }
 
@@ -2248,23 +2863,28 @@ function lastAssistantText(options = {}) {
 function lastAssistantMessage(options = {}) {
   let requiredScopeMissed = false;
   const turnsSnapshot = Array.isArray(options.turns) ? options.turns : null;
-  if (Number.isInteger(options.afterUserTurnIndex)) {
+  const afterUserTexts = promptTextCandidates(options.afterUserTexts || [], options.afterUserText);
+  if (options.afterUserTurnId) {
+    const scoped = assistantTurnsAfterTurnId(options.afterUserTurnId, turnsSnapshot);
+    return scoped[scoped.length - 1] || null;
+  }
+  if (Number.isInteger(options.afterUserTurnIndex) && afterUserTexts.length === 0) {
     const scoped = assistantTurnsAfterTurnIndex(options.afterUserTurnIndex, turnsSnapshot);
     if (scoped.length > 0) {
       return scoped[scoped.length - 1];
     }
+    if (isUserLikeTurn((turnsSnapshot || conversationTurns())[options.afterUserTurnIndex])) return null;
     if (options.requireAfterUserText && (turnsSnapshot || conversationTurns()).length > 0) {
       requiredScopeMissed = true;
     }
   }
 
-  const afterUserTexts = promptTextCandidates(options.afterUserTexts || [], options.afterUserText);
   if (afterUserTexts.length > 0) {
     const scoped = assistantTurnsAfterUserTexts(afterUserTexts, turnsSnapshot);
     if (scoped.length > 0) {
       return scoped[scoped.length - 1];
     }
-    if (options.requireAfterUserText && (turnsSnapshot || conversationTurns()).length > 0) {
+    if ((turnsSnapshot || conversationTurns()).length > 0) {
       requiredScopeMissed = true;
     }
   }
@@ -2287,7 +2907,8 @@ function latestChangedAssistantMessage(previousText = "") {
 }
 
 function assistantDownloadScope(messageNode) {
-  return messageNode?.closest?.('[data-testid^="conversation-turn-"]') || messageNode;
+  return messageNode?.closest?.('[data-turn-id-container]') ||
+    messageNode?.closest?.('[data-testid^="conversation-turn-"]') || messageNode;
 }
 
 function hasUsableAssistantText(current, previousText, options = {}) {
@@ -2309,8 +2930,13 @@ function isImagePlanningAssistantText(value = "") {
   return text.length <= 180 && /\u6b63\u5728(?:\u751f\u6210|\u521b\u5efa)|\u8bf7\u7a0d\u7b49/i.test(text);
 }
 
+function isMessageStreamErrorText(value = "") {
+  return /^(?:消息流中的错误|error in message stream)[。.!！]?(?:\s*(?:重试|重新生成|retry|try again)[。.!！]?)?$/i.test(normalizeText(value));
+}
+
 function isInterruptedAssistantText(value = "") {
   const text = normalizeText(value);
+  if (isMessageStreamErrorText(text)) return true;
   return text.length <= 220 &&
     /\u8fde\u63a5.{0,10}(?:\u4e2d\u65ad|\u65ad\u5f00|\u5df2\u65ad)|(?:\u7b49\u5f85|\u6b63\u5728\u7b49\u5f85).{0,16}(?:\u5b8c\u6574\u56de\u590d|\u5b8c\u6574\u7b54\u590d|\u5b8c\u6574\u54cd\u5e94)|connection.{0,20}(?:interrupted|lost|disconnected)|waiting.{0,20}(?:complete|full).{0,16}(?:reply|response)/i.test(
       text
@@ -2352,7 +2978,9 @@ function hasGeneratedImage(messageNode) {
 }
 
 function hasDownloadableArtifact(messageNode) {
-  return downloadButtonCandidates(assistantDownloadScope(messageNode)).length > 0;
+  const scope = assistantDownloadScope(messageNode);
+  return downloadButtonCandidates(scope).length > 0 ||
+    [...(scope?.querySelectorAll?.("a[href]") || [])].some(isDownloadCandidate);
 }
 
 function hasUsableAssistantContent(messageNode, previousText, options = {}) {
@@ -2549,6 +3177,15 @@ function hasNegativeArtifactSignal(value = "") {
 }
 
 function shouldSkipArtifactCapture(job = {}, replyText = "") {
+  // "No images" does not cancel an explicit spreadsheet/document deliverable.
+  // Keep explicit no-file/example-only instructions authoritative.
+  const prompt = jobPromptText(job);
+  const nonImageFileRequest = /(?:生成|创建|制作|导出|下载|保存|\b(?:generate|create|make|download|export|save)\b)/iu.test(prompt) &&
+    /\.(?:txt|md|csv|json|pdf|docx?|xlsx?|pptx?|zip|html?)\b|Excel|Word|PowerPoint|电子表格|工作簿|文档|演示文稿/iu.test(prompt);
+  const noFile = (value) => /only an example|example filename|no file was generated|no downloadable file|not a real file|(?:do not|don't|without)\s+(?:generate|generating|create|creating)\s+(?:any\s+)?files?|(?:不要|无需|不需要|禁止|不)\s*(?:生成|创建|制作|导出)?\s*(?:任何)?(?:文件|附件)|不要添加链接/iu.test(value || "");
+  if (nonImageFileRequest && !noFile(prompt) && !noFile(replyText)) {
+    return false;
+  }
   if (hasNegativeArtifactSignal(jobPromptText(job)) || hasNegativeArtifactSignal(replyText)) {
     return true;
   }
@@ -2735,11 +3372,11 @@ function filenamesFromText(value = "") {
       }
       return;
     }
-    if (clean && /[^\x00-\x7F]/.test(clean)) {
+    // Preserve real Chinese filenames; trim only legacy mojibake prefixes
+    // containing private-use characters, not arbitrary non-ASCII text.
+    if (clean && /[\uE000-\uF8FF]/u.test(clean)) {
       const asciiTail = clean.match(new RegExp(`([A-Za-z0-9][A-Za-z0-9._-]{0,150}\\.(${FILENAME_EXTENSIONS}))$`, "iu"));
-      if (asciiTail) {
-        clean = asciiTail[1];
-      }
+      if (asciiTail) clean = asciiTail[1];
     }
     const thinkingSecondsPrefix = clean?.match(
       new RegExp(`^\\d+(?:\\.\\d+)?s(?=([A-Za-z][A-Za-z0-9._-]{0,150}\\.(${FILENAME_EXTENSIONS}))$)`, "iu")
@@ -2770,7 +3407,7 @@ function filenamesFromText(value = "") {
   }
 
   const looseAsciiPattern = new RegExp(
-    `(?:^|[^A-Za-z0-9._-])([A-Za-z0-9][A-Za-z0-9._-]{0,150}\\.(${FILENAME_EXTENSIONS}))(?=$|[^A-Za-z0-9._-])`,
+    `(?:^|[^\\p{L}\\p{N}._-])([A-Za-z0-9][A-Za-z0-9._-]{0,150}\\.(${FILENAME_EXTENSIONS}))(?=$|[^\\p{L}\\p{N}._-])`,
     "giu"
   );
   for (const match of text.matchAll(looseAsciiPattern)) {
@@ -2956,8 +3593,43 @@ function closestFileCard(element, boundary) {
   return null;
 }
 
+function filenameFromCardMetadata(value = "") {
+  const text = String(value || "").trim();
+  return text.length <= 255 && !/[<>:"/\\|?*\u0000-\u001f]/.test(text) && /^.+\.[a-z0-9]{1,16}$/i.test(text) ? text : null;
+}
+
 function expectedFilenameForButton(button, boundary) {
   const label = elementLabel(button);
+  // Native cards may visually truncate the name but retain the full title.
+  // Prefer the nearest card's own metadata over filenames in surrounding prose.
+  let current = button;
+  for (let depth = 0; current && depth < 6; depth += 1) {
+    const ownNames = uniqueNonEmptyStrings(["download", "data-filename", "title"]
+      .map(attribute => filenameFromCardMetadata(current.getAttribute?.(attribute))));
+    if (ownNames.length === 1) {
+      const links = [...(current.querySelectorAll?.("a[href]") || [])].filter(isDownloadCandidate);
+      if (links.every(link => (filenameFromCardMetadata(link.getAttribute?.("download")) || filenameFromUrl(link.href || link.getAttribute?.("href"))) === ownNames[0])) return ownNames[0];
+      return null;
+    }
+    if (ownNames.length > 1) return null;
+    if (current !== button && isNativeFileDownloadButton(button) &&
+        ([...(current.querySelectorAll?.("button") || [])].filter(isNativeFileDownloadButton).length > 1 ||
+         [...(current.querySelectorAll?.("a[href]") || [])].some(isDownloadCandidate))) return null;
+    const metadata = [];
+    for (const attribute of ["download", "data-filename", "title"]) {
+      metadata.push(current.getAttribute?.(attribute) || "");
+      if (current !== boundary && !current.getAttribute?.("data-turn-id-container") &&
+          !current.getAttribute?.("data-message-author-role") && !current.getAttribute?.("data-turn")) {
+        for (const child of current.querySelectorAll?.(`[${attribute}]`) || []) metadata.push(child.getAttribute?.(attribute) || "");
+      }
+    }
+    const names = uniqueNonEmptyStrings(metadata.map(filenameFromCardMetadata));
+    if (names.length === 1) return names[0];
+    if (names.length > 1 || current === boundary) break;
+    const localNames = filenamesFromText(current.textContent || "");
+    if (localNames.length > 0) break;
+    current = current.parentElement || current.parentNode;
+  }
   if (/zip/i.test(label) || shouldUseTrustedClick(button)) {
     const filenames = filenamesFromText(`${label} ${textNearElement(button, boundary)}`);
     const zipFilename = filenames.find((filename) => /\.zip$/i.test(filename));
@@ -2966,7 +3638,20 @@ function expectedFilenameForButton(button, boundary) {
     }
   }
 
-  return filenameFromText(elementLabel(button)) || filenameFromText(textNearElement(button, boundary));
+  const explicit = filenameFromText(label);
+  if (explicit) return explicit;
+  const nearby = filenamesFromText(textNearElement(button, boundary));
+  if (isNativeFileDownloadButton(button) && nearby.length > 1) return null;
+  return nearby[0] || null;
+}
+
+function isUserOwnedDownloadControl(element, boundary) {
+  for (let current = element; current; current = current.parentElement || current.parentNode) {
+    const role = current.getAttribute?.("data-message-author-role") || current.getAttribute?.("data-turn");
+    if (role === "user") return true;
+    if (role === "assistant" || current === boundary) return false;
+  }
+  return false;
 }
 
 function isLikelyFileDownloadButton(button, boundary) {
@@ -2975,6 +3660,7 @@ function isLikelyFileDownloadButton(button, boundary) {
   }
 
   const label = elementLabel(button);
+  if (/^(?:copy\b|复制)/iu.test(label.trim())) return false;
   const className = typeof button?.className === "string" ? button.className : button?.className?.baseVal || "";
   if (/download|\u4e0b\u8f7d/i.test(label)) {
     return Boolean(expectedFilenameForButton(button, boundary) || /download|\u4e0b\u8f7d/i.test(label));
@@ -2982,6 +3668,10 @@ function isLikelyFileDownloadButton(button, boundary) {
   if (/\bbehavior-btn\b/.test(className) && expectedFilenameForButton(button, boundary) && !isExpansionLikeButton(button)) {
     return true;
   }
+
+  // A labelled thought/menu/share control is not a download merely because
+  // the surrounding assistant turn mentions a file. Keep icon-only fallback.
+  if (label.trim() && !hasDownloadLikeExtension(label)) return false;
 
   const card = closestFileCard(button, boundary);
   if (!card || !expectedFilenameForButton(button, boundary) || isExpansionLikeButton(button)) {
@@ -3007,10 +3697,22 @@ function isInterpreterFileReferenceButton(button, boundary) {
   );
 }
 
+function isNativeFileDownloadButton(button) {
+  return /^(?:下载文件|Download file)$/i.test(String(button?.getAttribute?.("aria-label") || "").trim());
+}
+
+function isExplicitFileDownloadControl(control) {
+  return Boolean(filenameFromCardMetadata(control.getAttribute?.("download")) ||
+    (/^(?:下载|download\b)/i.test(elementLabel(control).trim()) && filenameFromText(elementLabel(control))));
+}
+
 function downloadButtonCandidates(messageNode) {
   return [...(messageNode?.querySelectorAll?.("button") || [])].filter((button) =>
-    isLikelyFileDownloadButton(button, messageNode)
-  );
+    !isUserOwnedDownloadControl(button, messageNode) && isLikelyFileDownloadButton(button, messageNode)
+  ).sort((a,b) => {
+    const direct = (button) => /^(?:下载文件|Download file)$/i.test(String(button.getAttribute?.("aria-label") || "").trim()) ? 1 : 0;
+    return direct(b) - direct(a);
+  });
 }
 
 function cssBackgroundImageUrl(element) {
@@ -3622,10 +4324,18 @@ async function downloadArtifactFromAnchor(anchor) {
     throw new Error(`Download failed with status ${response.status}`);
   }
 
+  const filename = filenameFromAnchor(anchor, response);
+  const contentType = response.headers?.get("content-type") || "application/octet-stream";
+  // A successful fetch may be a login/SPA page, not the named attachment.
+  // Leave genuine HTML artifacts supported; mismatches use scoped click recovery.
+  if (/^(?:text\/html|application\/xhtml\+xml)(?:;|$)/i.test(contentType.trim()) &&
+      !/\.(?:html?|xhtml)$/i.test(filename || "")) {
+    throw new Error("Download returned an HTML page instead of the expected file");
+  }
   const buffer = await response.arrayBuffer();
   return {
-    filename: filenameFromAnchor(anchor, response),
-    contentType: response.headers?.get("content-type") || "application/octet-stream",
+    filename,
+    contentType,
     originalUrl: response.url || originalUrl,
     base64Data: arrayBufferToBase64(buffer)
   };
@@ -3867,17 +4577,26 @@ async function scrollElementIntoClickView(element) {
   }
 }
 
-async function triggerDownloadButton(button) {
+async function triggerDownloadButton(button, options = {}) {
+  // File-card controls are pointer-events:none until hover/focus in the new UI.
+  button.focus?.();
+  await sleep(100);
+  if (isNativeFileDownloadButton(button)) {
+    traceCapturePhase({id: options.syncJobId}, "native_dom_click");
+    button.click();
+    return;
+  }
   if (canAskBackgroundForDownloads()) {
     try {
       await scrollElementIntoClickView(button);
       const point = clickCoordinates(button);
       if (point) {
+        traceCapturePhase({id: options.syncJobId}, "trusted_click");
         const clicked = await chromeRuntimeMessage({
           type: "bridge:trustedClick",
           x: point.x,
           y: point.y
-        });
+        }, { timeoutMs: 10000 });
         if (clicked?.ok) {
           return;
         }
@@ -3887,6 +4606,7 @@ async function triggerDownloadButton(button) {
     }
   }
 
+  traceCapturePhase({id: options.syncJobId}, "fallback_dom_click");
   button.click();
 }
 
@@ -3974,6 +4694,7 @@ async function retryUnsentComposerDraft(job, context = {}) {
   await sleep(150);
 
   if (sendButton && !isDisabledButton(sendButton)) {
+    await assertPreSendActive(job, { afterSendAttempt: true });
     sendButton.click?.();
     attempt.domClick = true;
     await sleep(700);
@@ -3982,6 +4703,7 @@ async function retryUnsentComposerDraft(job, context = {}) {
   if (composerContainsBridgeDraft(composer, job?.payloadText)) {
     const form = composer.closest?.("form") || sendButton?.closest?.("form") || null;
     if (form?.requestSubmit) {
+      await assertPreSendActive(job, { afterSendAttempt: true });
       try {
         form.requestSubmit(sendButton || undefined);
         attempt.formSubmit = true;
@@ -3993,6 +4715,7 @@ async function retryUnsentComposerDraft(job, context = {}) {
   }
 
   if (composerContainsBridgeDraft(composer, job?.payloadText)) {
+    await assertPreSendActive(job, { afterSendAttempt: true });
     composer.focus?.();
     attempt.enterSubmit = dispatchEnterSubmit(composer);
     await sleep(700);
@@ -4007,14 +4730,79 @@ function isDownloadTimeoutError(error) {
   return /Timed out waiting for Chrome download/i.test(String(error?.message || error || ""));
 }
 
+function findMatchingLibraryPreviewDownload(expectedFilename) {
+  if (!expectedFilename) return null;
+  const titlePrefix = new RegExp(`^(?:资料库|Library)\\s*/\\s*${expectedFilename.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?=\\s|$)`, "i");
+  const chatScope = '[data-message-author-role], [data-turn], [data-turn-id-container]';
+  const matches = new Set();
+  for (const button of document.querySelectorAll("button")) {
+    const label = String(button.getAttribute?.("aria-label") || button.title || button.textContent || "").trim();
+    if (!isVisibleElement(button) || isDisabledButton(button) || button.closest?.(chatScope) ||
+        !/^(?:下载(?:文件)?|Download(?: file)?)$/i.test(label)) continue;
+    for (let parent = button.parentElement, depth = 0; parent && depth < 8; parent = parent.parentElement, depth++) {
+      if (/^(?:BODY|HTML)$/.test(parent.tagName) ||
+          parent.matches?.(chatScope) ||
+          parent.querySelector?.(`${chatScope}, #prompt-textarea, textarea`)) break;
+      const text = String(parent.textContent || "").trim();
+      // The library header is outside chat turns. Never identify it from a
+      // filename mentioned in the conversation or inside another file's body.
+      if (!titlePrefix.test(text)) continue;
+      const buttons = [...parent.querySelectorAll("button")].filter(isVisibleElement);
+      const close = buttons.some(control => /^(?:关闭(?:预览)?|Close(?: preview)?|Dismiss|×|✕)$/i.test(
+        String(control.getAttribute?.("aria-label") || control.title || control.textContent || "").trim()));
+      if (close) { matches.add(button); break; }
+    }
+  }
+  return matches.size === 1 ? [...matches][0] : null;
+}
+
+async function followMatchingLibraryPreview(button, expectedFilename, options = {}) {
+  if (!isExplicitFileDownloadControl(button) && !(options.preferExistingPreview && isNativeFileDownloadButton(button))) return;
+  const href = options.expectedHref || String(location.href);
+  const budget = Math.max(100, Math.min(Number(options.timeoutMs) || 2000, DOWNLOAD_CAPTURE_TIMEOUT_MS));
+  const deadline = Date.now() + budget;
+  for (let attempt = 0; attempt < Math.ceil(budget / 100) && Date.now() < deadline; attempt++) {
+    if (options.shouldStop?.() || String(location.href) !== href) return;
+    const download = findMatchingLibraryPreviewDownload(expectedFilename);
+    if (download) {
+      // A second click must not outlive cancellation or a disconnected backend.
+      if (!options.syncJobId) return;
+      let result;
+      try { result = await bridgeApi(`/api/sync/jobs/${encodeURIComponent(options.syncJobId)}`, {
+        bridgeRequestTimeoutMs: Math.max(1, Math.min(2000, deadline - Date.now())),
+        skipBackgroundOnTimeout: true
+      }); }
+      catch { return; }
+      if (options.shouldStop?.() || Date.now() >= deadline || result?.job?.id !== options.syncJobId || result.job.status !== "running" ||
+          String(location.href) !== href) return;
+      if (findMatchingLibraryPreviewDownload(expectedFilename) !== download) {
+        // React can replace the toolbar while the running-job check is in flight.
+        // Reacquire and revalidate, never click the stale element.
+        await sleep(100);
+        continue;
+      }
+      traceCapturePhase({id:options.syncJobId}, "preview_download_click", {filename:expectedFilename});
+      // No async focus/scroll gap after revalidating identity and cancellation.
+      download.click();
+      return;
+    }
+    await sleep(100);
+  }
+}
+
 async function captureArtifactFromDownloadButtonAttempt(button, options = {}) {
+  const expectedHref = String(location.href);
   const expectedFilename = expectedFilenameForButton(button, options.messageNode) || null;
+  const nativeDownloadOnly = isNativeFileDownloadButton(button);
+  const traceJob = {id: options.syncJobId};
+  traceCapturePhase(traceJob, "starting_download_watch", {filename: expectedFilename, timeoutMs: options.timeoutMs || DOWNLOAD_CAPTURE_TIMEOUT_MS});
   const watch = await chromeRuntimeMessage({
     type: "bridge:startDownloadWatch",
     bridgeOrigin: BRIDGE_ORIGIN,
     bridgeApiToken: cachedBridgeApiToken || null,
     syncJobId: options.syncJobId || null,
     expectedFilename,
+    ...(nativeDownloadOnly ? {nativeDownloadOnly:true} : {}),
     timeoutMs: options.timeoutMs || DOWNLOAD_CAPTURE_TIMEOUT_MS
   });
 
@@ -4022,22 +4810,43 @@ async function captureArtifactFromDownloadButtonAttempt(button, options = {}) {
     throw new Error(watch?.error || "Could not start Chrome download watch");
   }
 
-  if (options.domClickOnly) {
+  traceCapturePhase(traceJob, "clicking_download", {
+    filename: expectedFilename,
+    controlLabel: button.getAttribute?.("aria-label") || button.title || button.textContent || "",
+    controlClass: typeof button.className === "string" ? button.className : ""
+  });
+  if (options.preferExistingPreview && findMatchingLibraryPreviewDownload(expectedFilename)) {
+    traceCapturePhase(traceJob, "preview_already_open", {filename:expectedFilename});
+  } else if (options.domClickOnly) {
+    traceCapturePhase(traceJob, "retry_dom_click");
     button.click?.();
   } else {
-    await triggerDownloadButton(button);
+    await triggerDownloadButton(button, options);
   }
 
-  const captured = await chromeRuntimeMessage({
+  traceCapturePhase(traceJob, "waiting_download", {filename: expectedFilename});
+  let watchSettled = false;
+  const capturePromise = chromeRuntimeMessage({
     type: "bridge:awaitDownloadWatch",
     bridgeOrigin: BRIDGE_ORIGIN,
     watchId: watch.watchId
-  });
+  }, {timeoutMs:(options.timeoutMs || DOWNLOAD_CAPTURE_TIMEOUT_MS)+5000}).then(
+    value => { watchSettled = true; return value; },
+    error => { watchSettled = true; return {ok:false,error:error.message}; }
+  );
+  const previewPromise = followMatchingLibraryPreview(button, expectedFilename, {
+    ...options, expectedHref, timeoutMs:options.timeoutMs || DOWNLOAD_CAPTURE_TIMEOUT_MS,
+    shouldStop:()=>watchSettled
+  }).catch(() => { traceCapturePhase(traceJob, "preview_check_failed", {filename:expectedFilename}); });
+  await Promise.race([previewPromise, capturePromise]);
+  const captured = await capturePromise;
 
   if (!captured?.ok || !captured.artifact?.id) {
+    traceCapturePhase(traceJob, "download_failed", {filename: expectedFilename});
     throw new Error(captured?.error || "Chrome download was not captured");
   }
 
+  traceCapturePhase(traceJob, "download_received", {filename: expectedFilename});
   return captured.artifact;
 }
 
@@ -4062,6 +4871,7 @@ async function captureArtifactFromDownloadButton(button, options = {}) {
 }
 
 async function captureArtifactFromDownloadUrl(resource, options = {}) {
+  traceCapturePhase({id: options.syncJobId}, "url_download_started", {filename: resource.filename});
   const captured = await chromeRuntimeMessage({
     type: "bridge:downloadUrl",
     bridgeOrigin: BRIDGE_ORIGIN,
@@ -4074,9 +4884,11 @@ async function captureArtifactFromDownloadUrl(resource, options = {}) {
   });
 
   if (!captured?.ok || !captured.artifact?.id) {
+    traceCapturePhase({id: options.syncJobId}, "url_download_failed", {filename: resource.filename});
     throw new Error(captured?.error || "Chrome URL download was not captured");
   }
 
+  traceCapturePhase({id: options.syncJobId}, "url_download_received", {filename: resource.filename});
   return captured.artifact;
 }
 
@@ -4180,6 +4992,7 @@ async function collectInterpreterDownloadArtifacts(messageNode, errors = [], opt
   const seen = new Set();
   const filenames = downloadFilenamesFromMessage(messageNode);
   const resources = interpreterDownloadResourcesForFilenames(filenames);
+  traceCapturePhase({id: options.syncJobId}, "interpreter_resources", {resourceCount: resources.length});
 
   for (const resource of resources) {
     if (seen.has(resource.url)) {
@@ -4297,7 +5110,13 @@ async function collectAnchorAndButtonArtifacts(messageNode, errors = [], options
   const artifacts = [];
   const artifactIds = [];
   const seen = new Set();
-  const anchors = [...(messageNode?.querySelectorAll?.("a[href]") || [])].filter(isDownloadCandidate);
+  const capturedNames = new Set();
+  const onlyNames = Array.isArray(options.onlyFilenames) ? new Set(options.onlyFilenames) : null;
+  const anchors = [...(messageNode?.querySelectorAll?.("a[href]") || [])].filter(anchor =>
+    !isUserOwnedDownloadControl(anchor, messageNode) && isDownloadCandidate(anchor) &&
+    (!onlyNames || onlyNames.has(expectedFilenameForButton(anchor,messageNode))) &&
+    (!options.nativeDownloadOnly || isExplicitFileDownloadControl(anchor)));
+  traceCapturePhase({id: options.syncJobId}, "direct_download_candidates", {anchorCount: anchors.length, buttonCount: downloadButtonCandidates(messageNode).length});
 
   for (const anchor of anchors) {
     const href = anchor.href || anchor.getAttribute?.("href");
@@ -4307,8 +5126,22 @@ async function collectAnchorAndButtonArtifacts(messageNode, errors = [], options
     seen.add(href);
 
     try {
-      artifacts.push(await downloadArtifactFromAnchor(anchor));
+      traceCapturePhase({id: options.syncJobId}, "anchor_download_started", {filename: anchor.download || filenameFromUrl(href)});
+      const artifact = await downloadArtifactFromAnchor(anchor);
+      artifacts.push(artifact);
+      if (artifact.filename) capturedNames.add(artifact.filename.toLowerCase());
+      traceCapturePhase({id: options.syncJobId}, "anchor_download_received");
     } catch (error) {
+      traceCapturePhase({id: options.syncJobId}, "anchor_download_failed");
+      if (isExplicitFileDownloadControl(anchor)) {
+        try {
+          const artifact = await captureArtifactFromDownloadButton(anchor, {messageNode,syncJobId:options.syncJobId || null});
+          artifactIds.push(artifact.id);
+          const filename = artifact.filename || expectedFilenameForButton(anchor,messageNode);
+          if (filename) capturedNames.add(filename.toLowerCase());
+          continue;
+        } catch (clickError) { error = clickError; }
+      }
       errors.push({
         filename: anchor.download || filenameFromUrl(href) || null,
         originalUrl: href,
@@ -4320,7 +5153,8 @@ async function collectAnchorAndButtonArtifacts(messageNode, errors = [], options
   const attemptedButtonElements = new Set();
   const attemptedNonZipButtonKeys = new Set();
   const buttons = downloadButtonCandidates(messageNode).filter(
-    (button) => options.includeInterpreterButtons || !isInterpreterFileReferenceButton(button, messageNode)
+    (button) => (!onlyNames || onlyNames.has(expectedFilenameForButton(button,messageNode))) &&
+      (options.nativeDownloadOnly ? (isNativeFileDownloadButton(button) || isExplicitFileDownloadControl(button)) : options.includeInterpreterButtons || !isInterpreterFileReferenceButton(button, messageNode))
   );
   for (const button of buttons) {
     if (attemptedButtonElements.has(button)) {
@@ -4328,7 +5162,13 @@ async function collectAnchorAndButtonArtifacts(messageNode, errors = [], options
     }
     attemptedButtonElements.add(button);
 
-    const expectedFilename = expectedFilenameForButton(button, messageNode) || elementLabel(button);
+    const resolvedFilename = expectedFilenameForButton(button, messageNode);
+    if (resolvedFilename && capturedNames.has(resolvedFilename.toLowerCase())) continue;
+    if (isNativeFileDownloadButton(button) && !resolvedFilename) {
+      errors.push({code:"download_filename_ambiguous",filename:null,originalUrl:null,error:"无法确定当前下载按钮所属的文件，未点击或猜测其他文件名。"});
+      continue;
+    }
+    const expectedFilename = resolvedFilename || elementLabel(button);
     const buttonKey = expectedFilename || elementLabel(button) || `button-${attemptedButtonElements.size}`;
     const allowSameFilenameRetry = /\.zip$/i.test(expectedFilename || "");
     if (!allowSameFilenameRetry && attemptedNonZipButtonKeys.has(buttonKey)) {
@@ -4343,10 +5183,12 @@ async function collectAnchorAndButtonArtifacts(messageNode, errors = [], options
     try {
       const artifact = await captureArtifactFromDownloadButton(button, {
         messageNode,
+        preferExistingPreview:Boolean(onlyNames),
         syncJobId: options.syncJobId || null
       });
       errors.splice(errorIndex);
       artifactIds.push(artifact.id);
+      if (resolvedFilename) capturedNames.add(resolvedFilename.toLowerCase());
     } catch (error) {
       const recoveredArtifactIds = await recoverArtifactIdsForSyncJob(options.syncJobId, [expectedFilename]);
       if (recoveredArtifactIds.length > 0) {
@@ -4369,6 +5211,13 @@ async function collectDownloadArtifacts(messageNode, options = {}) {
   const artifacts = [];
   const artifactIds = [];
   const errors = [];
+  if (Array.isArray(options.onlyFilenames)) {
+    return {...await collectAnchorAndButtonArtifacts(messageNode,errors,{...options,includeInterpreterButtons:true}),errors};
+  }
+  if (downloadButtonCandidates(messageNode).some(isNativeFileDownloadButton)) {
+    const original = await collectAnchorAndButtonArtifacts(messageNode, errors, {...options,nativeDownloadOnly:true});
+    return {...original,errors};
+  }
 
   if (options.preferImages && imageCandidates(messageNode, options).length > 0) {
     const imageSeen = new Set();
@@ -4506,12 +5355,8 @@ async function collectDownloadArtifacts(messageNode, options = {}) {
       errors.splice(0);
       return { artifacts, artifactIds, errors };
     }
-    const rebuiltSpreadsheetArtifacts = generatedSpreadsheetArtifactsFromMessage(messageNode);
-    if (rebuiltSpreadsheetArtifacts.length > 0) {
-      artifacts.push(...rebuiltSpreadsheetArtifacts);
-      errors.splice(0);
-      return { artifacts, artifactIds, errors };
-    }
+    // A preview omits formulas, types and workbook features. It must never be
+    // exported as though it were the original downloadable Office file.
     if (!hasExplicitNonImageDownloadFilename(messageNode)) {
       artifacts.push(...(await collectImageArtifacts(messageNode, errors, options)));
     }
@@ -4538,7 +5383,7 @@ async function waitForAssistantReply(previousText, options = {}) {
     if (!pageBlockerScanNeeded) {
       return;
     }
-    assertNoChatGptBlocker(blockerOptions);
+    assertNoChatGptBlocker({ ...blockerOptions, afterUserTurnId: options.afterUserTurnId });
     pageBlockerScanNeeded = false;
   };
 
@@ -4552,19 +5397,20 @@ async function waitForAssistantReply(previousText, options = {}) {
     }
     lastActiveCheckAt = options.job && now - lastActiveCheckAt >= ACTIVE_JOB_CHECK_INTERVAL_MS ? now : lastActiveCheckAt;
     const turnsSnapshot =
-      Number.isInteger(options.afterUserTurnIndex) || afterUserTexts.length > 0
+      options.afterUserTurnId || Number.isInteger(options.afterUserTurnIndex) || afterUserTexts.length > 0
         ? conversationTurns()
         : null;
-    const requiresScopedReply = Number.isInteger(options.afterUserTurnIndex) || afterUserTexts.length > 0;
+    const requiresScopedReply = Boolean(options.afterUserTurnId) || Number.isInteger(options.afterUserTurnIndex) || afterUserTexts.length > 0;
     const hasScopedTurnSnapshot = Array.isArray(turnsSnapshot) && turnsSnapshot.length > 0;
     const scopedMessages = assistantMessagesForReplyScope(
       options.afterUserTurnIndex,
       afterUserTexts,
-      turnsSnapshot
+      turnsSnapshot,
+      options.afterUserTurnId
     );
     const scopedCurrentMessage =
       scopedMessages[scopedMessages.length - 1] ||
-      (!requiresScopedReply || !hasScopedTurnSnapshot
+      (!options.afterUserTurnId && (!requiresScopedReply || !hasScopedTurnSnapshot)
         ? lastAssistantMessage({
             afterUserTurnIndex: options.afterUserTurnIndex,
             afterUserTexts,
@@ -4575,7 +5421,7 @@ async function waitForAssistantReply(previousText, options = {}) {
         : null);
        const currentMessage =
       scopedCurrentMessage ||
-      (Number.isInteger(options.afterUserTurnIndex)
+      (!options.afterUserTurnId && !hasScopedTurnSnapshot && Number.isInteger(options.afterUserTurnIndex)
         ? latestChangedAssistantMessage(previousText)
         : null);
        const pageStillGenerating = isGenerating();
@@ -4729,10 +5575,13 @@ async function waitForAssistantReply(previousText, options = {}) {
 }
 
 async function markJobSent(job, previousAssistantText, submittedPromptInfo = null) {
+  if (submittedPromptInfo?.turnId) job.submittedPromptTurnId = submittedPromptInfo.turnId;
+  if (Number.isInteger(submittedPromptInfo?.index)) job.submittedPromptTurnIndex = submittedPromptInfo.index;
   await bridgeApi(`/api/sync/jobs/${job.id}/sent`, {
     method: "POST",
     body: JSON.stringify(syncJobMutationBody({
       previousAssistantText,
+      submittedPromptTurnId: job.submittedPromptTurnId || null,
       submittedPromptTurnIndex: Number.isInteger(submittedPromptInfo?.index)
         ? submittedPromptInfo.index
         : null,
@@ -4754,7 +5603,8 @@ async function waitForSubmittedPrompt(job, timeoutMs = 15000, contextOrComposer 
   const composer = context.composer || null;
   while (Date.now() - started < timeoutMs) {
     const promptInfo = latestUserPromptTurnInfo(promptCandidates, {
-      afterTurnIndex: context.afterTurnIndex
+      afterTurnIndex: context.afterTurnIndex,
+      initialTurnIds: context.initialTurnIds
     });
     if (promptInfo) {
       return promptInfo;
@@ -4762,11 +5612,14 @@ async function waitForSubmittedPrompt(job, timeoutMs = 15000, contextOrComposer 
     const directPromptInfo = latestDirectUserPromptInfo(promptCandidates, {
       afterUserMessageCount: context.afterUserMessageCount
     });
-    if (directPromptInfo) {
-      return directPromptInfo;
+    // A newly visible user message is evidence; an empty composer alone is not.
+    if (directPromptInfo && !context.initialTurnIds?.length) {
+      const turnId = conversationTurnId(directPromptInfo.turn);
+      return { ...directPromptInfo, ...(turnId ? { turnId } : {}) };
     }
     if (
       Number.isInteger(context.afterTurnIndex) &&
+      !Array.isArray(context.initialTurnIds) &&
       composer &&
       !composerContainsBridgeDraft(composer, job?.payloadText) &&
       isGenerating()
@@ -4878,6 +5731,12 @@ async function syncJobStillActive(job) {
   try {
     const result = await bridgeApi(`/api/sync/jobs/${encodeURIComponent(job.id)}`);
     if (result && Object.prototype.hasOwnProperty.call(result, "job")) {
+      if (result.job?.id === job.id && result.job.status === "failed" &&
+          result.job.errorCode === "manual_cancelled" &&
+          (!lastCaptureStatus || lastCaptureStatus.jobId === job.id) &&
+          lastCaptureStatus?.state !== "cancelled") {
+        traceCapturePhase(job, "cancelled");
+      }
       return !syncJobIsTerminal(result.job);
     }
   } catch {
@@ -5130,6 +5989,8 @@ function setPreferenceStatus(preferences = {}, result = {}) {
     updatedAt: preferences.updatedAt || null,
     modeSynced: Boolean(result.modeSynced),
     modelSynced: Boolean(result.modelSynced),
+    ...(intelligencePickerDetected ? { pageUrl: location.href } : {}),
+    ...(observedIntelligenceModels?.pageUrl === location.href ? {availableModels: observedIntelligenceModels.models} : {}),
     ...(result.error ? { error: result.error } : {}),
     ...(result.diagnostics ? { diagnostics: result.diagnostics } : {})
   };
@@ -5180,6 +6041,13 @@ async function applyHeartbeatPreferences(preferences = null) {
     return false;
   }
 
+  // New picker hides the model while collapsed. Do not reopen it on every
+  // heartbeat; each outgoing job independently revalidates current preferences.
+  if (key === manuallyChangedPreferenceKey) return false;
+  if (intelligencePickerDetected && key === lastHeartbeatPreferenceKey && preferencesAlreadyApplied(normalizedPreferences)) {
+    return true;
+  }
+
   try {
     assertNoChatGptBlocker();
     await waitForComposer();
@@ -5209,14 +6077,17 @@ async function applyHeartbeatPreferences(preferences = null) {
     return false;
   }
 
-  const modelSynced = normalizedPreferences.modelPreference ? await selectModelPreference(normalizedPreferences).catch((error) => {
+  let modelSynced = normalizedPreferences.modelPreference ? await selectModelPreference(normalizedPreferences).catch((error) => {
     console.warn("Bridge model sync skipped:", error);
     return false;
   }) : true;
-  const modeSynced = normalizedPreferences.modePreference ? await selectModePreference(normalizedPreferences).catch((error) => {
+  let modeSynced = !modelSynced ? false : normalizedPreferences.modePreference ? await selectModePreference(normalizedPreferences).catch((error) => {
     console.warn("Bridge mode sync skipped:", error);
     return false;
   }) : true;
+  if (modelSynced && modeSynced && intelligencePickerDetected) {
+    ({modelSynced,modeSynced} = await verifyIntelligencePreferences(normalizedPreferences));
+  }
   if (!modeSynced || !modelSynced) {
     rememberPreferenceSyncFailure(key);
     setPreferenceStatus(normalizedPreferences, {
@@ -5243,15 +6114,7 @@ async function processPreferenceSyncJob(job) {
   }
   await waitForComposer();
   const normalizedJob = normalizeChatGptPreferences(job);
-
-  const modelSynced = normalizedJob.modelPreference ? await selectModelPreference(normalizedJob).catch((error) => {
-    console.warn("Bridge model sync skipped:", error);
-    return false;
-  }) : true;
-  const modeSynced = normalizedJob.modePreference ? await selectModePreference(normalizedJob).catch((error) => {
-    console.warn("Bridge mode sync skipped:", error);
-    return false;
-  }) : true;
+  await applyJobPreferences(normalizedJob, { strict: true });
 
   await bridgeApi(`/api/sync/jobs/${job.id}/complete`, {
     method: "POST",
@@ -5259,15 +6122,22 @@ async function processPreferenceSyncJob(job) {
       replyText: "GPT 偏好已同步",
       artifacts: [],
       artifactIds: [],
-      artifactErrors: [
-        ...(!modeSynced && normalizedJob.modePreference ? [{ error: `Mode preference was not found: ${normalizedJob.modePreference}` }] : []),
-        ...(!modelSynced && normalizedJob.modelPreference ? [{ error: `Model preference was not found: ${normalizedJob.modelPreference}` }] : [])
-      ]
+      artifactErrors: []
     }))
   });
 }
 
 async function processJob(job, options = {}) {
+  if (job.recoverySourceJobId) {
+    if (!job.sentAt || !job.submittedPromptTurnId || !Array.isArray(job.recoveryFilenames) || !job.recoveryFilenames.length) {
+      throw Object.assign(new Error("补收任务缺少原消息定位，未发送任何内容。"),{errorCode:"capture_only_invalid"});
+    }
+    if (!(await syncJobStillActive(job)) || !ensureExpectedChatGptPage(job)) return;
+    const message = lastAssistantMessage({afterUserTurnId:job.submittedPromptTurnId,afterUserText:job.payloadText,requireAfterUserText:true});
+    if (!message) throw Object.assign(new Error("找不到原任务回复，未重新发送。"),{errorCode:"reply_scope_ambiguous"});
+    await completeAssistantReplyOnce(job,message,visibleReplyTextFromAssistant(message));
+    return;
+  }
   if (job.kind === "preference_sync") {
     await processPreferenceSyncJob(job);
     return;
@@ -5296,10 +6166,11 @@ async function processJob(job, options = {}) {
   }
   const previous = job.previousAssistantText || lastAssistantText();
   let submittedPromptInfo = Number.isInteger(job.submittedPromptTurnIndex)
-    ? { index: job.submittedPromptTurnIndex }
-    : null;
+    ? { index: job.submittedPromptTurnIndex, turnId: job.submittedPromptTurnId || null }
+    : job.submittedPromptTurnId ? { turnId: job.submittedPromptTurnId } : null;
 
   if (!isResume) {
+    traceCapturePhase(job, "pre_send_prepare");
     let preSendShouldReturn = false;
     try {
       // Do not race the mutating send path against an outer timer. A timed-out
@@ -5341,24 +6212,27 @@ async function processJob(job, options = {}) {
     }
 
     const normalizedJob = normalizeChatGptPreferences(job);
-    if (!preferencesAlreadyApplied(normalizedJob)) {
-      await selectModelPreference(normalizedJob).catch((error) => {
-        console.warn("Bridge model sync skipped:", error);
-      });
-      if (normalizedJob.modePreference) {
-        await selectModePreference(normalizedJob).catch((error) => {
-          console.warn("Bridge mode sync skipped:", error);
-        });
-      }
+    traceCapturePhase(job, "pre_send_preferences");
+    if (!preferencesAlreadyApplied(normalizedJob) || intelligencePickerDetected ||
+        ((normalizedJob.modelPreference || normalizedJob.modePreference) && intelligencePickerTrigger())) {
+      await applyJobPreferences(normalizedJob);
     }
+    await assertPreSendActive(job);
+    traceCapturePhase(job, "pre_send_fill");
     await fillComposerText(composer, job.payloadText);
-    await sleep(300);
+    composer = await waitForDomEvidence(() => {
+      const current = findComposer() || composer;
+      return composerContainsBridgeDraft(current, job.payloadText) ? current : null;
+    }, 2000);
+    if (!composer) throw composerTextNotAppliedError();
     try {
+      await assertPreSendActive(job);
+      traceCapturePhase(job, "pre_send_upload");
       await uploadInputArtifacts(job);
-      await sleep(700);
+      traceCapturePhase(job, "pre_send_button");
       let sendButton = null;
       try {
-        sendButton = await waitForReadySendButton();
+        sendButton = await waitForReadySendButton(60000, job);
       } catch (error) {
         if (/send button not ready|\u53d1\u9001\u6309\u94ae\u8fd8\u6ca1(?:\u6709)?\u51c6\u5907\u597d/i.test(error.message || "")) {
           throw sendButtonNotReadyError(job, { composer });
@@ -5366,9 +6240,16 @@ async function processJob(job, options = {}) {
         throw error;
       }
 
-      const lastTurnIndexBeforeSend = conversationTurns().length - 1;
+      const turnsBeforeSend = conversationTurns();
+      const lastTurnIndexBeforeSend = turnsBeforeSend.length - 1;
+      const initialTurnIds = submissionTurnBaseline(turnsBeforeSend);
       const userMessageCountBeforeSend = directUserPromptNodes().length;
       job.artifactBaselineImageKeys = generatedImageBaselineKeys();
+      await assertPreSendActive(job);
+      if (!composerContainsBridgeDraft(findComposer() || composer, job.payloadText)) {
+        throw composerTextNotAppliedError();
+      }
+      traceCapturePhase(job, "pre_send_click");
       const sendAttempt = await triggerSendButton(sendButton);
       try {
         submittedPromptInfo = await waitForSubmittedPrompt(job, 4000, {
@@ -5376,6 +6257,7 @@ async function processJob(job, options = {}) {
             sendButton,
             sendAttempt,
             afterTurnIndex: lastTurnIndexBeforeSend,
+            initialTurnIds,
             afterUserMessageCount: userMessageCountBeforeSend
         });
       } catch (error) {
@@ -5389,6 +6271,7 @@ async function processJob(job, options = {}) {
             sendButton,
             sendAttempt,
             afterTurnIndex: lastTurnIndexBeforeSend,
+            initialTurnIds,
             afterUserMessageCount: userMessageCountBeforeSend
         });
       }
@@ -5422,6 +6305,7 @@ async function processJob(job, options = {}) {
   }
 
   let replyText = "";
+  traceCapturePhase(job, "waiting_reply");
   try {
     if (!(await syncJobStillActive(job))) {
       return;
@@ -5429,6 +6313,7 @@ async function processJob(job, options = {}) {
     const promptFallback = submittedPromptInfo?.fallback === "composer_cleared";
     replyText = await waitForAssistantReply(previous, {
       job,
+      afterUserTurnId: submittedPromptInfo?.turnId || job.submittedPromptTurnId || null,
       afterUserTurnIndex: Number.isInteger(submittedPromptInfo?.index) ? submittedPromptInfo.index : undefined,
       afterUserText: promptFallback ? "" : job.payloadText,
       afterUserTexts: promptFallback ? [] : promptCandidates,
@@ -5460,39 +6345,69 @@ async function processJob(job, options = {}) {
   }
   const assistantMessage =
     lastAssistantMessage({
+      afterUserTurnId: submittedPromptInfo?.turnId || job.submittedPromptTurnId || null,
       afterUserTurnIndex: Number.isInteger(submittedPromptInfo?.index) ? submittedPromptInfo.index : undefined,
       afterUserTexts: submittedPromptInfo?.fallback === "composer_cleared" ? [] : promptCandidates,
       afterUserText: submittedPromptInfo?.fallback === "composer_cleared" ? "" : job.payloadText,
       requireAfterUserText: submittedPromptInfo?.fallback === "composer_cleared" ? false : Boolean(job.payloadText)
-    }) || lastAssistantMessage();
-  const downloaded = shouldSkipArtifactCapture(job, replyText)
-    ? { artifacts: [], artifactIds: [], errors: [] }
-    : await collectDownloadArtifacts(assistantDownloadScope(assistantMessage), {
-        syncJobId: job.id,
-        preferImages: expectsImageArtifact(job),
-        expectedImageCount: requestedImageCount(job),
-        excludeImageKeys: job.artifactBaselineImageKeys || [],
-        requestedFilename: requestedImageFilename(job),
-        requestedFilenames: requestedImageFilenames(job)
-      });
-
-  if (!(await syncJobStillActive(job))) {
+    });
+  if (!assistantMessage) {
+    updateCaptureStatus(job, "assistant_not_found");
     return;
   }
-  const completion = await bridgeApi(`/api/sync/jobs/${job.id}/complete`, {
-    method: "POST",
-    body: JSON.stringify(syncJobMutationBody({
-      replyText,
-      artifacts: downloaded.artifacts,
-      artifactIds: downloaded.artifactIds,
-      artifactErrors: downloaded.errors,
-      thoughtDurationMs: assistantThoughtDurationMs(assistantMessage)
-    }))
-  });
-  recordCompletionCaptureStatus(job, completion, {
-    replyLength: replyText.length,
-    artifactCount: downloaded.artifacts.length + downloaded.artifactIds.length
-  });
+  await completeAssistantReplyOnce(job, assistantMessage, replyText);
+}
+
+async function completeAssistantReplyOnce(job, assistantMessage, replyText, options = {}) {
+  // The normal reply waiter and heartbeat recovery can reach the same file card.
+  // Share the entire download-to-completion operation, not just the final POST.
+  if (inFlightReplyCaptures.has(job.id)) {
+    return inFlightReplyCaptures.get(job.id);
+  }
+  const capture = (async () => {
+    if (!(await syncJobStillActive(job))) {
+      return lastCaptureStatus?.jobId === job.id && lastCaptureStatus.state === "captured";
+    }
+    traceCapturePhase(job, "collecting_artifacts");
+    const downloaded = !job.recoverySourceJobId && shouldSkipArtifactCapture(job, replyText)
+      ? { artifacts: [], artifactIds: [], errors: [] }
+      : await collectDownloadArtifacts(assistantDownloadScope(assistantMessage), {
+          syncJobId: job.id,
+          ...(job.recoverySourceJobId ? {onlyFilenames:job.recoveryFilenames} : {}),
+          preferImages: expectsImageArtifact(job),
+          expectedImageCount: requestedImageCount(job),
+          includePageGallery: Boolean(options.includePageGallery && expectsImageArtifact(job)),
+          excludeImageKeys: job.artifactBaselineImageKeys || [],
+          requestedFilename: requestedImageFilename(job),
+          requestedFilenames: requestedImageFilenames(job)
+        });
+    if (!(await syncJobStillActive(job))) {
+      if (lastCaptureStatus?.jobId === job.id && lastCaptureStatus.state === "captured") return true;
+      updateCaptureStatus(job, "job_ended_during_capture");
+      return false;
+    }
+    traceCapturePhase(job, "submitting_completion", {artifactCount: downloaded.artifacts.length + downloaded.artifactIds.length});
+    const completion = await bridgeApi(`/api/sync/jobs/${job.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify(syncJobMutationBody({
+        replyText,
+        artifacts: downloaded.artifacts,
+        artifactIds: downloaded.artifactIds,
+        artifactErrors: downloaded.errors,
+        thoughtDurationMs: assistantThoughtDurationMs(assistantMessage)
+      }))
+    });
+    return recordCompletionCaptureStatus(job, completion, {
+      replyLength: replyText.length,
+      artifactCount: downloaded.artifacts.length + downloaded.artifactIds.length
+    });
+  })();
+  inFlightReplyCaptures.set(job.id, capture);
+  try {
+    return await capture;
+  } finally {
+    inFlightReplyCaptures.delete(job.id);
+  }
 }
 
 async function captureExistingReply(job) {
@@ -5513,8 +6428,11 @@ async function captureExistingReply(job) {
   }
 
   const promptCandidates = promptCandidatesForJob(job);
-  const promptInfo = latestUserPromptTurnInfo(promptCandidates);
+  const promptInfo = job.submittedPromptTurnId
+    ? promptTurnById(job.submittedPromptTurnId)
+    : uniqueUserPromptTurnInfo(promptCandidates);
   const assistantMessage = lastAssistantMessage({
+    afterUserTurnId: job.submittedPromptTurnId || null,
     afterUserTexts: promptCandidates,
     afterUserText: job.payloadText,
     requireAfterUserText: true
@@ -5547,7 +6465,7 @@ async function captureExistingReply(job) {
     expectsImageArtifact(job) &&
     imageCandidates(assistantDownloadScope(assistantMessage), {
       expectedImageCount: requestedImageCount(job),
-      includePageGallery: true,
+      includePageGallery: !job.submittedPromptTurnId,
       excludeImageKeys: job.artifactBaselineImageKeys || []
     }).length > 0;
   const downloadableArtifactReady =
@@ -5583,40 +6501,8 @@ async function captureExistingReply(job) {
     return false;
   }
 
-  const downloaded = shouldSkipArtifactCapture(job, replyText)
-    ? { artifacts: [], artifactIds: [], errors: [] }
-    : await collectDownloadArtifacts(assistantDownloadScope(assistantMessage), {
-        syncJobId: job.id,
-        preferImages: expectsImageArtifact(job),
-        expectedImageCount: requestedImageCount(job),
-        includePageGallery: expectsImageArtifact(job),
-        excludeImageKeys: job.artifactBaselineImageKeys || [],
-        requestedFilename: requestedImageFilename(job),
-        requestedFilenames: requestedImageFilenames(job)
-      });
-  if (!(await syncJobStillActive(job))) {
-    if (lastCaptureStatus?.jobId === job.id && lastCaptureStatus.state === "captured") {
-      return true;
-    }
-    updateCaptureStatus(job, "job_ended_during_capture");
-    return false;
-  }
-
   try {
-    const completion = await bridgeApi(`/api/sync/jobs/${job.id}/complete`, {
-      method: "POST",
-      body: JSON.stringify(syncJobMutationBody({
-        replyText,
-        artifacts: downloaded.artifacts,
-        artifactIds: downloaded.artifactIds,
-        artifactErrors: downloaded.errors,
-        thoughtDurationMs: assistantThoughtDurationMs(assistantMessage)
-      }))
-    });
-    return recordCompletionCaptureStatus(job, completion, {
-      replyLength: replyText.length,
-      artifactCount: downloaded.artifacts.length + downloaded.artifactIds.length
-    });
+    return await completeAssistantReplyOnce(job, assistantMessage, replyText, { includePageGallery: !job.submittedPromptTurnId });
   } catch (error) {
     updateCaptureStatus(job, "completion_rejected", {
       errorCode: error?.errorCode || null,
@@ -5641,6 +6527,7 @@ async function runPollCycle() {
     // The bridge may be stopped; keep polling quietly.
   }
 
+  pollHeartbeatComplete = true;
   if (maybeReloadExtensionFromHeartbeat(heartbeat)) {
     return;
   }
@@ -5726,9 +6613,22 @@ async function poll() {
     return;
   }
   if (pollInFlight) {
+    // Preference sync and recovery preparation can wait on the page for a long
+    // time. Keep liveness independent without running another action cycle.
+    if (pollHeartbeatComplete && !busyHeartbeatInFlight) {
+      busyHeartbeatInFlight = true;
+      try {
+        await sendHeartbeat();
+      } catch {
+        // A later poll will retry; never turn a ping into a second task claim.
+      } finally {
+        busyHeartbeatInFlight = false;
+      }
+    }
     return;
   }
   pollInFlight = true;
+  pollHeartbeatComplete = false;
   try {
     await runPollCycle();
   } finally {
@@ -5741,6 +6641,7 @@ async function processJobAndReportFailure(job, options = {}) {
     await processJob(job, options);
     return true;
   } catch (error) {
+    if (error?.bridgeJobStopped) return false;
     if (isRetryableCompletionApiError(error)) {
       return false;
     }
@@ -5753,5 +6654,7 @@ async function processJobAndReportFailure(job, options = {}) {
 }
 
 setInterval(poll, POLL_MS);
+document.addEventListener?.("pointerdown", invalidateManualPreferenceSelection, true);
+document.addEventListener?.("keydown", invalidateManualPreferenceSelection, true);
 installAssistantActivityObserver();
 poll();

@@ -1480,6 +1480,7 @@ export function createWindowsFileCapabilities({
 
         const hasher = crypto.createHash("sha256");
         let totalBytes = 0;
+        let chunkCount = 0;
         for (;;) {
           throwIfAborted(options.signal);
           const chunk = await nativeApi.readChunk(internal.handle, WORKSPACE_HASH_CHUNK_BYTES);
@@ -1493,6 +1494,8 @@ export function createWindowsFileCapabilities({
             throw capabilityError("workspace_file_size_mismatch");
           }
           hasher.update(chunk);
+          chunkCount += 1;
+          if (chunkCount % 8 === 0) await yieldToEventLoop();
         }
         throwIfAborted(options.signal);
         if (totalBytes !== options.size) throw capabilityError("workspace_file_size_mismatch");
@@ -1822,6 +1825,29 @@ export function createWindowsFileCapabilities({
       let entryCount = 0;
       let totalBytes = 0;
 
+      async function hashFile(handle, expectedSize) {
+        await nativeApi.setFilePosition(handle, 0);
+        const hash = crypto.createHash("sha256");
+        let readBytes = 0;
+        let chunkCount = 0;
+        for (;;) {
+          const chunk = await nativeApi.readChunk(handle, WORKSPACE_HASH_CHUNK_BYTES);
+          if (!Buffer.isBuffer(chunk) || chunk.length > WORKSPACE_HASH_CHUNK_BYTES) {
+            throw capabilityError("version_tree_read_invalid");
+          }
+          if (chunk.length === 0) break;
+          readBytes += chunk.length;
+          if (!Number.isSafeInteger(readBytes) || readBytes > expectedSize) {
+            throw capabilityError("version_tree_read_invalid");
+          }
+          hash.update(chunk);
+          chunkCount += 1;
+          if (chunkCount % 8 === 0) await yieldToEventLoop();
+        }
+        if (readBytes !== expectedSize) throw capabilityError("version_tree_read_invalid");
+        return hash.digest("hex");
+      }
+
       async function namesFor(record) {
         const names = [];
         try {
@@ -1846,6 +1872,7 @@ export function createWindowsFileCapabilities({
         for (const name of await namesFor(record)) {
           if (depth === 0 && name === VERSION_MARKER_NAME) continue;
           entryCount += 1;
+          if (entryCount % COOPERATIVE_YIELD_INTERVAL === 0) await yieldToEventLoop();
           if (entryCount > MAX_ENTRIES) throw capabilityError("version_tree_entry_count_exceeded");
           const childPath = ensureDirectChild(record.path, name);
           const handle = await nativeApi.openPath(childPath, {
@@ -1872,15 +1899,11 @@ export function createWindowsFileCapabilities({
               if (!Number.isSafeInteger(totalBytes) || totalBytes > MAX_SOFTWARE_PACKAGE_BYTES) {
                 throw capabilityError("version_tree_size_exceeded");
               }
-              const content = await nativeApi.readFile(handle, MAX_SOFTWARE_PACKAGE_BYTES);
-              if (!Buffer.isBuffer(content) || content.length !== info.size) {
-                throw capabilityError("version_tree_read_invalid");
-              }
               entries.push({
                 path: relative,
                 size: info.size,
                 directory: false,
-                sha256: crypto.createHash("sha256").update(content).digest("hex"),
+                sha256: await hashFile(handle, info.size),
               });
             }
           } catch (error) {
@@ -2171,6 +2194,7 @@ export function createWindowsFileCapabilities({
     try {
       const hash = crypto.createHash("sha256");
       let total = 0;
+      let chunkCount = 0;
       await nativeApi.setFilePosition(pin.leaf.handle, 0);
       for (;;) {
         const chunk = await nativeApi.readChunk(pin.leaf.handle, WORKSPACE_HASH_CHUNK_BYTES);
@@ -2181,6 +2205,8 @@ export function createWindowsFileCapabilities({
           throw capabilityError("windows_executable_too_large");
         }
         hash.update(chunk);
+        chunkCount += 1;
+        if (chunkCount % 8 === 0) await yieldToEventLoop();
       }
       if (hash.digest("hex") !== expectedSha256) {
         throw capabilityError("windows_executable_hash_mismatch");
@@ -2653,8 +2679,24 @@ export function createWindowsFileCapabilities({
           await nativeApi.flushFile(handle);
           await nativeApi.assertNoAlternateDataStreams(handle);
           await nativeApi.setFilePosition(handle, 0);
-          const copied = await nativeApi.readFile(handle, MAX_SOFTWARE_PACKAGE_BYTES);
-          if (crypto.createHash("sha256").update(copied).digest("hex") !== entry.sha256) {
+          const copiedHash = crypto.createHash("sha256");
+          let copiedBytes = 0;
+          let copiedChunks = 0;
+          for (;;) {
+            const chunk = await nativeApi.readChunk(handle, WORKSPACE_HASH_CHUNK_BYTES);
+            if (!Buffer.isBuffer(chunk) || chunk.length > WORKSPACE_HASH_CHUNK_BYTES) {
+              throw capabilityError("skill_copy_read_invalid");
+            }
+            if (chunk.length === 0) break;
+            copiedBytes += chunk.length;
+            if (!Number.isSafeInteger(copiedBytes) || copiedBytes > entry.size) {
+              throw capabilityError("skill_copy_read_invalid");
+            }
+            copiedHash.update(chunk);
+            copiedChunks += 1;
+            if (copiedChunks % 8 === 0) await yieldToEventLoop();
+          }
+          if (copiedBytes !== entry.size || copiedHash.digest("hex") !== entry.sha256) {
             throw capabilityError("skill_copy_hash_mismatch");
           }
         }

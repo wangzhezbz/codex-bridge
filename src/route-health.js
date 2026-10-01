@@ -102,6 +102,10 @@ export function createRouteHealthStore({
       : Array.isArray(configOrRoutes?.models)
         ? configOrRoutes.models
         : [];
+    const currentKeys = new Set(routes.map(routeHealthKey));
+    for (const key of records.keys()) {
+      if (!currentKeys.has(key)) records.delete(key);
+    }
     const routeSnapshots = routes.map((route) => routeSnapshot(route, records.get(routeHealthKey(route)), rateLimitStatus));
     return {
       routes: routeSnapshots,

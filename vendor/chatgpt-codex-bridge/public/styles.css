@@ -2194,6 +2194,26 @@ label {
   gap: 8px;
 }
 
+.artifact-diagnostics,
+.recovered-message-history {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.artifact-diagnostics > summary,
+.recovered-message-history > summary {
+  cursor: pointer;
+  padding: 8px 0;
+}
+
+.artifact-diagnostics > summary:focus-visible,
+.recovered-message-history > summary:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 2px;
+}
+
 .artifact-error {
   width: min(760px, 100%);
   border: 1px solid color-mix(in srgb, var(--danger) 55%, var(--line));

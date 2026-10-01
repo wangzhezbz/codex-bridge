@@ -1,5 +1,6 @@
 export function maskVisibleBrandName(input = "") {
-  return String(input ?? "").replace(/chatgpt|gpt/gi, "G某T");
+  // Restore legacy display aliases without rewriting real model names or URLs.
+  return String(input ?? "").replace(/g某t\.com/gi, "chatgpt.com").replace(/g某t/gi, "GPT");
 }
 
 const VISIBLE_ATTRIBUTES = ["alt", "aria-label", "placeholder", "title"];

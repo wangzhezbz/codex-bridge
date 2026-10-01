@@ -6,6 +6,7 @@ import path from "node:path";
 
 import { createConfigWriteCoordinator } from "../desktop/config-write-coordinator.mjs";
 import * as settings from "../desktop/settings.mjs";
+import { runModeSelect } from "../desktop/mode-switch-handler.mjs";
 
 const API_MODEL_ID = "deepseek-v4-pro";
 const API_ROUTE_ID = "cb-deepseek-v4-pro";
@@ -13,6 +14,113 @@ const SECRET_VALUE = "test-only-provider-key-must-not-leak";
 const ROUTER_AUTH_TOKEN = "cbr_00000000000000000000000000000000";
 const noOpPrivateAcl = Object.freeze({
   async securePath() {},
+});
+
+const legacyFlashId = "remote-deepseek-deepseek-flash";
+const currentFlashId = "deepseek-v4-1-flash";
+
+function legacyModeWorkspace(label) {
+  const workspace = makeWorkspace(label);
+  fs.writeFileSync(settings.selectionPath(workspace.rootDir), JSON.stringify({ selectedModelIds: [legacyFlashId] }));
+  fs.writeFileSync(settings.modelDirectoryPath(workspace.rootDir), JSON.stringify({ version: 1, providers: { deepseek: {
+    providerId: "deepseek", providerName: "DeepSeek", baseUrl: "https://api.deepseek.com/v1",
+    source: "remote", fetchedAt: "2026-09-22T00:00:00.000Z",
+    models: [{ id: "deepseek-v4-pro" }, { id: "deepseek-flash" }],
+  } } }));
+  fs.writeFileSync(settings.modelCapabilitiesPath(workspace.rootDir), JSON.stringify({ version: 3, overrides: {
+    [legacyFlashId]: { contextWindow: 131072, api: "responses", inputModalities: ["text"] },
+  } }));
+  return workspace;
+}
+
+for (const [flag, mode] of [["preserveApiSelection", "all_api"], ["preserveSelection", "all_api"], ["preserveSelection", "hybrid"]]) {
+  test(`legacy Flash ${flag} to ${mode} commits through both checks and preserves its settings`, async () => {
+    const workspace = legacyModeWorkspace(`legacy-mode-${flag}-${mode}`);
+    const coordinator = coordinatorFor(workspace);
+    const expected = settings.readSelection(workspace.rootDir, "hybrid");
+    assert.deepEqual(expected, [currentFlashId]);
+    await runModeSelect({ ...workspace, mode, [flag]: true, expectedSelectedModelIds: expected, routerRunning: false,
+      settings: { ...settings, applyModeSwitchTransaction: args => settings.applyModeSwitchTransaction({ ...args, coordinator }) },
+      locateCodexInstall: async () => ({ found: false }), getStatePayload: async () => ({}),
+      broadcastState: async () => {}, appendLog: () => {},
+    });
+    const config = settings.readRouterConfig(workspace.rootDir);
+    assert.equal(config.mode, mode);
+    assert.equal(config.models.length, 1);
+    assert.equal(config.models[0].model, "deepseek-flash");
+    assert.equal(config.models[0].api, "responses");
+    assert.equal(config.models[0].contextWindow, 131072);
+    assert.deepEqual(config.models[0].inputModalities, ["text"]);
+    assert.deepEqual(JSON.parse(fs.readFileSync(settings.selectionPath(workspace.rootDir))).selectedModelIds, [currentFlashId]);
+    assert.match(fs.readFileSync(settings.codexConfigPath(workspace.homeDir), "utf8"), /preserve-byte-for-byte/);
+  });
+}
+
+test("legacy mode normalization does not hide an intervening selection edit under the transaction lock", async () => {
+  const workspace = legacyModeWorkspace("legacy-mode-race");
+  const coordinator = coordinatorFor(workspace);
+  const routerBefore = fs.readFileSync(settings.routerConfigPath(workspace.rootDir));
+  const tomlBefore = fs.readFileSync(settings.codexConfigPath(workspace.homeDir));
+  const externalSelection = JSON.stringify({ selectedModelIds: [API_MODEL_ID] });
+  let transactionCalls = 0;
+  await assert.rejects(runModeSelect({ ...workspace, mode: "all_api", preserveApiSelection: true,
+    expectedSelectedModelIds: [currentFlashId], routerRunning: false,
+    settings: { ...settings, applyModeSwitchTransaction: async args => {
+      transactionCalls += 1;
+      fs.writeFileSync(settings.selectionPath(workspace.rootDir), externalSelection);
+      return settings.applyModeSwitchTransaction({ ...args, coordinator });
+    } },
+    locateCodexInstall: async () => ({ found: false }), getStatePayload: async () => ({}),
+    broadcastState: async () => {}, appendLog: () => {},
+  }), error => error.code === "config_transaction_failed" && error.failurePhase === "planning");
+  assert.equal(transactionCalls, 1, "the known alias must pass the first check so the in-lock check is exercised");
+  assert.equal(fs.readFileSync(settings.selectionPath(workspace.rootDir), "utf8"), externalSelection);
+  assert.deepEqual(fs.readFileSync(settings.routerConfigPath(workspace.rootDir)), routerBefore);
+  assert.deepEqual(fs.readFileSync(settings.codexConfigPath(workspace.homeDir)), tomlBefore);
+});
+
+test("API recovery checks the latest selection inside the configuration transaction", async () => {
+  const {rootDir,homeDir}=makeWorkspace('api-recovery-stale');
+  const files=[settings.selectionPath(rootDir),settings.routerConfigPath(rootDir),settings.codexConfigPath(homeDir)];
+  const before=files.map(file=>fs.readFileSync(file));
+  await assert.rejects(settings.applyModeSwitchTransaction({rootDir,homeDir,mode:settings.MODE_ALL_API,
+    selectedModelIds:[API_MODEL_ID],preserveApiSelection:true,expectedSelectedModelIds:['previous-choice'],
+    coordinator:coordinatorFor({rootDir,homeDir})}));
+  for(const [index,file] of files.entries()) assert.deepEqual(fs.readFileSync(file),before[index]);
+});
+
+test("hybrid return rechecks a preserving selection inside the configuration transaction", async () => {
+  const {rootDir,homeDir}=makeWorkspace('hybrid-return-stale');
+  const files=[settings.selectionPath(rootDir),settings.routerConfigPath(rootDir),settings.codexConfigPath(homeDir)];
+  const before=files.map(file=>fs.readFileSync(file));
+  await assert.rejects(settings.applyModeSwitchTransaction({rootDir,homeDir,mode:settings.MODE_HYBRID,
+    selectedModelIds:[API_MODEL_ID],preserveSelection:true,expectedSelectedModelIds:['previous-choice'],
+    coordinator:coordinatorFor({rootDir,homeDir})}));
+  for(const [index,file] of files.entries()) assert.deepEqual(fs.readFileSync(file),before[index]);
+});
+
+test("exact draft saves refuse stale billing modes and incompatible subscription presets without writes", async () => {
+  for (const payload of [
+    {selectedModelIds:[API_MODEL_ID],expectedMode:'hybrid'},
+    {selectedModelIds:['codex-gpt-6-astra'],expectedMode:'all_api'},
+    {selectedModelIds:['missing-custom-api'],expectedMode:'all_api'},
+  ]) {
+    const {rootDir,homeDir}=makeWorkspace('exact-draft');
+    const files=[settings.selectionPath(rootDir),settings.routerConfigPath(rootDir),settings.codexConfigPath(homeDir)];
+    const before=files.map(file=>fs.readFileSync(file));
+    await assert.rejects(settings.applyConfigMutationTransaction({rootDir,homeDir,operation:'models:saveSelection',
+      payload:{...payload,exactSelection:true},coordinator:coordinatorFor({rootDir,homeDir})}));
+    for(const [index,file] of files.entries()) assert.deepEqual(fs.readFileSync(file),before[index]);
+  }
+});
+
+test("exact draft saves commit compatible API IDs without normalizing their order", async () => {
+  const {rootDir,homeDir}=makeWorkspace('exact-draft-valid');
+  const ids=['deepseek-v4-flash',API_MODEL_ID];
+  await settings.applyConfigMutationTransaction({rootDir,homeDir,operation:'models:saveSelection',
+    payload:{selectedModelIds:ids,expectedMode:'all_api',exactSelection:true},coordinator:coordinatorFor({rootDir,homeDir})});
+  assert.deepEqual(JSON.parse(fs.readFileSync(settings.selectionPath(rootDir),'utf8')).selectedModelIds,ids);
+  assert.deepEqual(JSON.parse(fs.readFileSync(settings.routerConfigPath(rootDir),'utf8')).models.map(model=>model.id),['cb-deepseek-v4-flash',API_ROUTE_ID]);
 });
 
 function makeWorkspace(label) {
@@ -1251,6 +1359,102 @@ test("a current remote model refresh commits through the shared config transacti
     settings.readModelDirectory(workspace.rootDir).providers.deepseek.models[0].id,
     "deepseek-current-model",
   );
+});
+
+async function addPortableRemoteModel(workspace, modelId = "deepseek-portable-fixture-model") {
+  settings.saveSecrets(workspace.rootDir, { DEEPSEEK_API_KEY: SECRET_VALUE });
+  const refresh = await settings.fetchProviderModelDirectoryCandidate(workspace.rootDir, "deepseek", {
+    fetchImpl: async () => new Response(JSON.stringify({ data: [
+      { id: modelId, display_name: "Portable fixture model", context_window: 131072 },
+      { id: "deepseek-unselected-fixture-model" },
+    ] }), { status: 200, headers: { "content-type": "application/json" } }),
+    now: () => "2026-09-23T00:00:00.000Z",
+  });
+  await settings.applyConfigMutationTransaction({
+    ...workspace, coordinator: coordinatorFor(workspace), operation: "providers:refreshModels",
+    payload: { refreshResult: refresh },
+  });
+  const model = settings.modelCatalog(workspace.rootDir).find(item => item.model === modelId);
+  assert.ok(model?.presetId.startsWith("remote-deepseek-"));
+  await settings.applyConfigMutationTransaction({
+    ...workspace, coordinator: coordinatorFor(workspace), operation: "models:saveSelection",
+    payload: { selectedModelIds: [model.presetId], expectedMode: settings.MODE_ALL_API, exactSelection: true },
+  });
+  return model;
+}
+
+for (const preRefreshTarget of [false, true]) {
+  test(`exported remote directory model imports on a ${preRefreshTarget ? "pre-refreshed" : "clean"} target without substitution`, async () => {
+    const source = makeWorkspace(`portable-remote-source-${preRefreshTarget}`);
+    const sourceModel = await addPortableRemoteModel(source);
+    const pkg = settings.exportConfigPackage(source.rootDir, { includeCodexResources: false });
+    assert.deepEqual(pkg.selection.selectedModelIds, [sourceModel.presetId]);
+    assert.equal(pkg.customModels.some(model => model.model === "deepseek-portable-fixture-model" && model.portableRemote === true), true);
+    assert.equal(pkg.customModels.some(model => model.model === "deepseek-unselected-fixture-model"), false);
+    assert.doesNotMatch(JSON.stringify(pkg), new RegExp(SECRET_VALUE));
+    assert.doesNotThrow(() => settings.parseConfigPackageImportCandidate(pkg));
+
+    const target = makeWorkspace(`portable-remote-target-${preRefreshTarget}`);
+    settings.saveSecrets(target.rootDir, { DEEPSEEK_API_KEY: SECRET_VALUE });
+    if (preRefreshTarget) await addPortableRemoteModel(target);
+    const committed = await settings.applyConfigMutationTransaction({
+      ...target, coordinator: coordinatorFor(target), operation: "configPackage:import",
+      payload: { candidate: settings.parseConfigPackageImportCandidate(pkg) },
+    });
+    assert.deepEqual(committed.selectedModelIds, [sourceModel.presetId]);
+    const routes = settings.readRouterConfig(target.rootDir).models;
+    assert.equal(routes.length, 1);
+    assert.equal(routes[0].model, "deepseek-portable-fixture-model");
+    assert.equal(routes[0].api, sourceModel.api);
+    assert.equal(routes[0].contextWindow, sourceModel.contextWindow);
+    assert.equal(routes[0].apiKeyEnv, "DEEPSEEK_API_KEY");
+    assert.equal(settings.modelCatalog(target.rootDir).filter(model => model.presetId === sourceModel.presetId).length, 1);
+    const savedPortable = settings.readCustomModels(target.rootDir).find(model => model.presetId === sourceModel.presetId);
+    assert.equal(savedPortable?.portableRemote, true);
+    const reexported = settings.exportConfigPackage(target.rootDir, { includeCodexResources: false });
+    assert.equal(reexported.customModels.filter(model => model.presetId === sourceModel.presetId).length, 1);
+    assert.equal(reexported.customModels.find(model => model.presetId === sourceModel.presetId)?.portableRemote, true);
+    assert.doesNotMatch(JSON.stringify(reexported), new RegExp(SECRET_VALUE));
+  });
+}
+
+test("a selected remote model from a custom intermediary provider imports on a clean target", async () => {
+  const source = makeWorkspace("portable-custom-provider-source");
+  settings.saveCustomModel(source.rootDir, {
+    providerId: "custom-portable-relay", providerName: "Portable Relay",
+    displayName: "Relay Seed", model: "relay-seed", baseUrl: "https://relay.example.invalid/v1",
+    api: "responses", keyEnv: "CUSTOM_PORTABLE_RELAY_KEY",
+  });
+  settings.saveSecrets(source.rootDir, { CUSTOM_PORTABLE_RELAY_KEY: SECRET_VALUE });
+  const refresh = await settings.fetchProviderModelDirectoryCandidate(source.rootDir, "custom-portable-relay", {
+    fetchImpl: async () => new Response(JSON.stringify({ data: [
+      { id: "relay-seed" }, { id: "relay-portable-remote" },
+    ] }), { status: 200, headers: { "content-type": "application/json" } }),
+  });
+  await settings.applyConfigMutationTransaction({
+    ...source, coordinator: coordinatorFor(source), operation: "providers:refreshModels",
+    payload: { refreshResult: refresh },
+  });
+  const remote = settings.modelCatalog(source.rootDir).find(model => model.model === "relay-portable-remote");
+  await settings.applyConfigMutationTransaction({
+    ...source, coordinator: coordinatorFor(source), operation: "models:saveSelection",
+    payload: { selectedModelIds: [remote.presetId], expectedMode: settings.MODE_ALL_API, exactSelection: true },
+  });
+  const pkg = settings.exportConfigPackage(source.rootDir, { includeCodexResources: false });
+  assert.equal(pkg.customModels.some(model => model.model === "relay-portable-remote" && model.portableRemote === true), true);
+  assert.doesNotMatch(JSON.stringify(pkg), new RegExp(SECRET_VALUE));
+
+  const target = makeWorkspace("portable-custom-provider-target");
+  settings.saveSecrets(target.rootDir, { CUSTOM_PORTABLE_RELAY_KEY: SECRET_VALUE });
+  const committed = await settings.applyConfigMutationTransaction({
+    ...target, coordinator: coordinatorFor(target), operation: "configPackage:import",
+    payload: { candidate: settings.parseConfigPackageImportCandidate(pkg) },
+  });
+  assert.deepEqual(committed.selectedModelIds, [remote.presetId]);
+  const [route] = settings.readRouterConfig(target.rootDir).models;
+  assert.equal(route.model, "relay-portable-remote");
+  assert.equal(route.baseUrl, "https://relay.example.invalid/v1");
+  assert.equal(route.apiKeyEnv, "CUSTOM_PORTABLE_RELAY_KEY");
 });
 
 test("a current custom intermediary model refresh commits through the shared config transaction", async () => {

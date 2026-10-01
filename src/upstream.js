@@ -10,6 +10,7 @@ import {
 import {
   codexOpenAiPortableHistoryRetryPayload,
   filterPayloadForAdapter,
+  isDeepSeekThinkingModel,
   normalizeAdapterProfile,
 } from "./adapter-profile.js";
 import {
@@ -61,7 +62,7 @@ import {
   proxyLogLabel,
   refreshFetchInitWithProxy,
 } from "./proxy.js";
-import { markRouteRateLimited, waitForRouteCapacity } from "./rate-limit.js";
+import { markRouteRateLimited, parseRetryAfter, waitForRouteCapacity } from "./rate-limit.js";
 import { annotateSmartFailoverResponse } from "./smart-failover-response.js";
 import {
   createRouteTrace,
@@ -74,6 +75,7 @@ import {
   extractResponseObjectFromSse,
   responsesSseStreamComplete,
 } from "./sse.js";
+
 import {
   buildToolContext,
   isResponseToolCallItem,
@@ -184,6 +186,9 @@ import {
   shouldAggregateForcedResponsesStream,
 } from "./responses-stream-policy.js";
 
+const DEFAULT_HISTORY_WRITE_TIMEOUT_MS = 30_000;
+const MAX_HISTORY_WRITE_TIMEOUT_MS = 2 * 60_000;
+
 export {
   ClientClosedRequestError,
   UpstreamResponseTooLargeError,
@@ -225,7 +230,7 @@ export async function handleResponsesRequest(
   context = {},
 ) {
   const compactKind = compactKindForResponsesRequest(requestBody, context);
-  if (shouldServeIdleResumeLocally(requestBody, route, history, context)) {
+  if (!compactKind && shouldServeIdleResumeLocally(requestBody, route, history, context)) {
     return sendIdleResumeResponse(requestBody, route, history, res, context);
   }
   const duplicateContext = compactKind ? { ...context, compactKind } : context;
@@ -849,11 +854,28 @@ function shouldServeIdleResumeLocally(
   history = null,
   context = {},
 ) {
-  return (
+  const idleResume = (
     ["chat_completions", "anthropic_messages", "responses"].includes(route.api) &&
     Boolean(requestBody.previous_response_id) &&
     !requestHasFreshInput(requestBody)
   );
+  if (!idleResume || route.api !== "responses") return idleResume;
+
+  const stored = history?.getResponse?.(requestBody.previous_response_id);
+  if (stored && responseHasRunnableToolCall(stored)) return true;
+  const output = Array.isArray(stored?.output) ? stored.output : [];
+  const nativeContinuation = requestBody.multi_agent?.enabled === true
+    || (Array.isArray(requestBody.tools) && requestBody.tools.some((tool) => tool?.type === "programmatic_tool_calling"))
+    || output.some((item) => ["program", "program_output", "multi_agent_call", "multi_agent_call_output", "agent_message"].includes(item?.type)
+      || typeof item?.agent?.agent_name === "string" || item?.caller?.type === "program");
+  const hasRootFinalAnswer = stored?.status === "completed" && output.some((item) => item?.type === "message"
+    && item.role === "assistant"
+    && (!item.agent?.agent_name || item.agent.agent_name === "/root")
+    && (!item.phase || item.phase === "final_answer")
+    && Array.isArray(item.content) && item.content.length > 0);
+  // A completed HTTP turn is not necessarily a completed hosted program or
+  // agent tree. Empty input is how the client resumes it before a final answer.
+  return !(nativeContinuation && !hasRootFinalAnswer);
 }
 
 function requestHasFreshInput(requestBody = {}) {
@@ -1195,9 +1217,10 @@ export async function proxyResponsesApi(
             `!! upstream route=${route.id} returned HTTP ${upstream.status} with completed Responses SSE; ` +
             "treating stream as completed for compatibility",
         );
-        await recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
+        const historyWrite = recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
           requestBody,
           route,
+          deferPersistence: true,
         });
         logUsage(
           context,
@@ -1209,6 +1232,7 @@ export async function proxyResponsesApi(
           "content-type": "text/event-stream; charset=utf-8",
         });
         res.end(bodyText);
+        settleStreamingHistoryWrite(historyWrite, context, route);
         return;
       }
       if (
@@ -1365,9 +1389,10 @@ export async function proxyResponsesApi(
           route,
         );
       }
-      await recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
+      const historyWrite = recordResponsesHistory(history, completedResponse, sourceMessages, toolContext, {
         requestBody,
         route,
+        deferPersistence: true,
       });
       logUsage(
         context,
@@ -1376,6 +1401,7 @@ export async function proxyResponsesApi(
       );
       res.writeHead(upstream.status, filteredHeaders(upstream.headers));
       res.end(responseText);
+      settleStreamingHistoryWrite(historyWrite, context, route);
       return;
     }
     console.warn(
@@ -1526,7 +1552,7 @@ export async function proxyResponsesApi(
       );
       res.end(terminalText);
       logUsage(context, route, usage);
-      await historyWrite;
+      settleStreamingHistoryWrite(historyWrite, context, route);
       return;
     }
     res.end(terminalText);
@@ -1565,11 +1591,7 @@ export async function proxyResponsesApi(
   );
   logUsage(context, route, usage);
   res.end(terminalText);
-  try {
-    await historyWrite;
-  } catch (error) {
-    throw asLocalHistoryStorageError(error);
-  }
+  settleStreamingHistoryWrite(historyWrite, context, route);
 }
 
 function responsesUpstreamRequestInit(payload, route, context) {
@@ -2154,7 +2176,7 @@ export async function proxyChatCompletions(
       toolResultSignatures,
       ...(localFallback ? { localFallback } : {}),
     },
-    { requestBody, route, deferPersistence: converted.wantsStream },
+    { requestBody, route, deferPersistence: context.compactKind === "v2" },
   );
   if (converted.wantsStream) {
     const payload = chatResponseStream
@@ -2171,7 +2193,7 @@ export async function proxyChatCompletions(
       });
     }
     res.end(payload);
-    await historyWrite;
+    settleStreamingHistoryWrite(historyWrite, context, route);
     return;
   }
 
@@ -2312,7 +2334,7 @@ async function proxyChatCompact(requestBody, route, history, res, context = {}) 
     outcome: localFallback ? "local_fallback" : "completed",
     reasonCode: localFallback || "remote_summary_completed",
   });
-  await recordHistoryTurn(
+  const historyWrite = recordHistoryTurn(
     history,
     response,
     [
@@ -2330,7 +2352,7 @@ async function proxyChatCompact(requestBody, route, history, res, context = {}) 
       ...responseRequestUserMeta(requestBody),
       localFallback: localFallback || "compact",
     },
-    { requestBody, route },
+    { requestBody, route, deferPersistence: converted.wantsStream },
   );
   if (context.compactKind === "v2") {
     res.writeHead(200, {
@@ -2339,9 +2361,11 @@ async function proxyChatCompact(requestBody, route, history, res, context = {}) 
       connection: "keep-alive",
     });
     res.end(compactResponseToSse(response));
+    settleStreamingHistoryWrite(historyWrite, context, route);
     return;
   }
 
+  await historyWrite;
   jsonResponse(res, 200, response);
 }
 
@@ -2455,6 +2479,8 @@ async function callAnthropicMessagesResponsesStreamUpstream(
   );
   const translator = createAnthropicChatCompletionStreamTranslator(route);
   const decoder = new TextDecoder();
+  const sniffDecoder = new TextDecoder();
+  let sniffText = "";
   let detectedEventStream = responseUsesEventStream(upstream);
   let bufferedChunks = [];
   let downstreamHeadersSent = false;
@@ -2492,8 +2518,9 @@ async function callAnthropicMessagesResponsesStreamUpstream(
     )) {
       if (!detectedEventStream) {
         bufferedChunks.push(chunk);
-        const bufferedText = Buffer.concat(bufferedChunks).toString("utf8");
-        if (!looksLikeSseResponse(bufferedText)) {
+        const sniffCandidate = `${sniffText}${sniffDecoder.decode(chunk, { stream: true })}`;
+        if (!looksLikeSseResponse(sniffCandidate)) {
+          sniffText = sniffCandidate.slice(-2048);
           continue;
         }
         detectedEventStream = true;
@@ -2629,6 +2656,8 @@ async function callChatCompletionsResponsesStreamUpstream(
     null,
     { emitTextDeltas, emitReasoningDeltas },
   );
+  const sniffDecoder = new TextDecoder();
+  let sniffText = "";
   let detectedEventStream = responseUsesEventStream(upstream);
   let bufferedChunks = [];
   let downstreamHeadersSent = false;
@@ -2679,8 +2708,9 @@ async function callChatCompletionsResponsesStreamUpstream(
       )) {
         if (!detectedEventStream) {
           bufferedChunks.push(chunk);
-          const bufferedText = Buffer.concat(bufferedChunks).toString("utf8");
-          if (!looksLikeSseResponse(bufferedText)) {
+          const sniffCandidate = `${sniffText}${sniffDecoder.decode(chunk, { stream: true })}`;
+          if (!looksLikeSseResponse(sniffCandidate)) {
+            sniffText = sniffCandidate.slice(-2048);
             continue;
           }
           detectedEventStream = true;
@@ -2825,7 +2855,7 @@ async function proxyResponsesCompact(requestBody, route, history, res, context =
     outcome: upstream ? "completed" : "local_fallback",
     reasonCode: upstream ? "remote_summary_completed" : "compact_local_fallback",
   });
-  await recordHistoryTurn(
+  const historyWrite = recordHistoryTurn(
     history,
     response,
     [
@@ -2843,7 +2873,7 @@ async function proxyResponsesCompact(requestBody, route, history, res, context =
       ...responseRequestUserMeta(requestBody),
       localFallback: upstream ? "compact" : "compact_local_fallback",
     },
-    { requestBody, route },
+    { requestBody, route, deferPersistence: context.compactKind === "v2" },
   );
   if (context.compactKind === "v2") {
     res.writeHead(200, {
@@ -2852,9 +2882,11 @@ async function proxyResponsesCompact(requestBody, route, history, res, context =
       connection: "keep-alive",
     });
     res.end(compactResponseToSse(response));
+    settleStreamingHistoryWrite(historyWrite, context, route);
     return;
   }
 
+  await historyWrite;
   jsonResponse(res, 200, response);
 }
 
@@ -3176,7 +3208,7 @@ async function sendLocalImageRejectedResponse({
     { stripReasoningTags: false },
   );
 
-  await recordHistoryTurn(
+  const historyWrite = recordHistoryTurn(
     history,
     response,
     [...messagesForHistory, assistantHistoryMessageFromChat(localChat)],
@@ -3188,7 +3220,7 @@ async function sendLocalImageRejectedResponse({
       ...responseRequestUserMeta(requestBody),
       localFallback: "image_rejected",
     },
-    { requestBody, route },
+    { requestBody, route, deferPersistence: converted.wantsStream },
   );
   logUsage(context, route, null);
 
@@ -3199,9 +3231,11 @@ async function sendLocalImageRejectedResponse({
       connection: "keep-alive",
     });
     res.end(responseToSse(response));
+    settleStreamingHistoryWrite(historyWrite, context, route);
     return;
   }
 
+  await historyWrite;
   jsonResponse(res, 200, response);
 }
 
@@ -3398,7 +3432,7 @@ function logUsage(context, route, usage) {
     );
     return;
   }
-  const normalized = normalizeUsage(usage);
+  const normalized = normalizeUsage(usage, route);
   notifyUpstreamUsage(context, route, normalized);
   recordRouteTraceEvent(ensureRouteTrace(context, route), "upstream_usage", {
     usage: normalized,
@@ -3406,8 +3440,10 @@ function logUsage(context, route, usage) {
   console.log(
     `[${new Date().toISOString()}] ${requestId} <- upstream ` +
       `route=${route.id} usage prompt=${normalized.prompt_tokens} ` +
-      `cached=${normalized.cache_read_tokens} fresh=${normalized.fresh_prompt_tokens} ` +
-      `completion=${normalized.completion_tokens} total=${normalized.total_tokens}`,
+        `cached=${normalized.cache_read_tokens} fresh=${normalized.fresh_prompt_tokens} ` +
+        (normalized.cache_creation_tokens > 0 ? `cache_write=${normalized.cache_creation_tokens} ` : "") +
+        (normalized.cache_write_rate_kind ? `cache_write_rate=${normalized.cache_write_rate_kind} ` : "") +
+        `completion=${normalized.completion_tokens} total=${normalized.total_tokens}`,
   );
 }
 
@@ -3535,7 +3571,10 @@ async function fetchAndTrackRateLimit(upstreamUrl, init, route, options = {}, co
   );
   try {
     const response = await fetch(upstreamUrl, abortable.init);
-    if (response.status === 429 && options.trackRateLimit !== false) {
+    if (options.trackRateLimit !== false && (
+      response.status === 429 ||
+      (response.status === 503 && parseRetryAfter(response.headers.get("retry-after")))
+    )) {
       markRouteRateLimited(route, response.headers);
     }
     abortable.responseStarted(response);
@@ -3559,11 +3598,15 @@ function responseWithAbortLifecycle(response, abortable, upstreamUrl, route) {
     }
     settled = true;
     abortable.cleanup();
+    reader.releaseLock();
   };
   const body = new ReadableStream({
     async pull(controller) {
       try {
         const result = await reader.read();
+        if (settled) {
+          return;
+        }
         if (result.done) {
           settle();
           controller.close();
@@ -3571,13 +3614,17 @@ function responseWithAbortLifecycle(response, abortable, upstreamUrl, route) {
         }
         controller.enqueue(result.value);
       } catch (error) {
+        if (settled) {
+          return;
+        }
         settle();
         controller.error(abortable.errorFor(error));
       }
     },
-    async cancel(reason) {
+    cancel(reason) {
       try {
-        await reader.cancel(reason);
+        // Transport cancellation may never settle; release our lifecycle now.
+        Promise.resolve(reader.cancel(reason)).catch(() => {});
       } finally {
         settle();
       }
@@ -3606,6 +3653,17 @@ function extractResponsesObject(text) {
     extractResponseObjectFromSse(text),
     text,
   );
+}
+
+function settleStreamingHistoryWrite(historyWrite, context = {}, route = {}) {
+  Promise.resolve(historyWrite).catch((error) => {
+    const normalized = asLocalHistoryStorageError(error);
+    console.warn(
+      `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+        `!! history-write-after-stream route=${route.id || route.model || "-"} ` +
+        `error=${safeText(normalized.message || normalized, 240)}`,
+    );
+  });
 }
 
 async function recordResponsesHistory(
@@ -3664,7 +3722,10 @@ async function recordHistoryTurn(
       await new Promise((resolve) => setImmediate(resolve));
     }
     if (typeof history.recordTurnAsync === "function") {
-      await history.recordTurnAsync(turn);
+      await waitForHistoryWrite(
+        history.recordTurnAsync(turn),
+        historyWriteTimeoutMs(route),
+      );
       return;
     }
     if (typeof history.recordTurn === "function") {
@@ -3676,6 +3737,32 @@ async function recordHistoryTurn(
   } catch (error) {
     throw asLocalHistoryStorageError(error);
   }
+}
+
+async function waitForHistoryWrite(write, timeoutMs) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      Promise.resolve(write),
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(() => {
+          const error = new Error(`Response history write timed out after ${timeoutMs}ms.`);
+          error.code = "history_write_timeout";
+          reject(error);
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
+function historyWriteTimeoutMs(route = {}) {
+  const value = Number(route.historyWriteTimeoutMs || route.history_write_timeout_ms);
+  const selected = Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : DEFAULT_HISTORY_WRITE_TIMEOUT_MS;
+  return Math.min(selected, MAX_HISTORY_WRITE_TIMEOUT_MS);
 }
 
 function asLocalHistoryStorageError(error) {
@@ -3692,6 +3779,7 @@ function asLocalHistoryStorageError(error) {
   wrapped.code = "local_history_storage_unavailable";
   wrapped.localHistoryError = true;
   wrapped.cause = error;
+  wrapped.internalCode = error?.code || "";
   return wrapped;
 }
 
@@ -3751,12 +3839,12 @@ function shouldExposeChatReasoningSummary(route = {}) {
   const provider = String(route.provider || route.providerId || "").toLowerCase();
   const model = String(route.model || route.id || "").toLowerCase();
   if (provider === "deepseek") {
-    return model.includes("deepseek-v4") || model.includes("deepseek-reasoner");
+    return isDeepSeekThinkingModel(model) || model.includes("deepseek-reasoner");
   }
   try {
     const hostname = new URL(route.baseUrl || "").hostname.toLowerCase();
     return hostname.includes("deepseek") &&
-      (model.includes("deepseek-v4") || model.includes("deepseek-reasoner"));
+      (isDeepSeekThinkingModel(model) || model.includes("deepseek-reasoner"));
   } catch {
     return false;
   }

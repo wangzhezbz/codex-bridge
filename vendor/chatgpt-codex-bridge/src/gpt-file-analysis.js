@@ -121,6 +121,7 @@ function stripChatGptReplyWrapper(text = "") {
 
 function looksLikeInterruptedChatGptReply(text = "") {
   const concise = String(text || "").replace(/\s+/g, " ").trim();
+  if (/^(?:消息流中的错误|error in message stream)[。.!！]?(?:\s*(?:重试|重新生成|retry|try again)[。.!！]?)?$/i.test(concise)) return true;
   return concise.length <= 220 &&
     /连接.{0,8}(?:中断|断开)|(?:等待|正在等待).{0,12}(?:完整回复|完整答复|完整响应)|connection.{0,16}(?:interrupted|lost|disconnected)|waiting.{0,16}(?:complete|full).{0,12}(?:reply|response)/i.test(
       concise
@@ -262,7 +263,11 @@ export async function waitForSyncJobResult(storeRoot, syncJobId, options = {}) {
     throw latestReadError;
   }
 
-  const finalJob = latestJob || (await getSyncJob(storeRoot, syncJobId));
+  // The job may finish during the last sleep. Never report the pre-sleep
+  // snapshot as current, especially before an explicit timeout mutation.
+  throwIfAborted(options.signal);
+  const finalJob = await getSyncJob(storeRoot, syncJobId);
+  throwIfAborted(options.signal);
   if (finalJob.status === "succeeded" || finalJob.status === "failed") {
     return {
       finalJob,
@@ -278,10 +283,13 @@ export async function waitForSyncJobResult(storeRoot, syncJobId, options = {}) {
       errorCode: "reply_timeout",
       recoveryAction: "retry_after_refresh"
     });
+    // A completion or cancellation may have won the store lock after our last
+    // read. failSyncJob preserves that winner; the response must preserve it too.
+    const timedOut = failedJob.status === "failed" && failedJob.errorCode === "reply_timeout";
     return {
       finalJob: failedJob,
-      timedOut: true,
-      replyText: null
+      timedOut,
+      replyText: timedOut ? null : sanitizeGptFileAnalysisReply(failedJob.replyText)
     };
   }
 

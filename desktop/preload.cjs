@@ -2,12 +2,16 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("codexBridge", {
   getState: (options) => ipcRenderer.invoke("state:get", options || {}),
-  selectMode: (mode) => ipcRenderer.invoke("mode:select", mode),
+  selectMode: (mode, options) => options === undefined
+    ? ipcRenderer.invoke("mode:select", mode)
+    : ipcRenderer.invoke("mode:select", mode, options),
   saveSecrets: (secrets) => ipcRenderer.invoke("secrets:save", secrets),
   getSecret: (keyEnv) => ipcRenderer.invoke("secrets:get", keyEnv),
   saveOptions: (options) => ipcRenderer.invoke("options:save", options),
   runStartupCheck: () => ipcRenderer.invoke("startup:check"),
-  saveModelSelection: (selectedModelIds) => ipcRenderer.invoke("models:saveSelection", selectedModelIds),
+  saveModelSelection: (selectedModelIds, options) => options === undefined
+    ? ipcRenderer.invoke("models:saveSelection", selectedModelIds)
+    : ipcRenderer.invoke("models:saveSelection", selectedModelIds, options),
   saveModelImageInput: (payload) => ipcRenderer.invoke("models:saveImageInput", payload),
   saveModelImageGeneration: (payload) => ipcRenderer.invoke("models:saveImageGeneration", payload),
   saveImageProvider: (payload) => ipcRenderer.invoke("imageProviders:save", payload),
@@ -40,14 +44,17 @@ contextBridge.exposeInMainWorld("codexBridge", {
   updateCodexResource: (payload) => ipcRenderer.invoke("resource:update", payload),
   removeCodexResource: (payload) => ipcRenderer.invoke("resource:remove", payload),
   refreshCodexPluginMarketplaces: () => ipcRenderer.invoke("resource:refreshMarketplaces"),
-  listCuratedCodexPlugins: () => ipcRenderer.invoke("curatedPlugin:list"),
-  runCuratedCodexPluginTask: (payload) => ipcRenderer.invoke("curatedPlugin:runTask", payload),
   restoreCodexBackup: (backupPath) => ipcRenderer.invoke("backups:restore", backupPath),
-  exportSessionMarkdown: (sessionId) => ipcRenderer.invoke("sessions:export", sessionId),
-  exportProjectMarkdown: (projectKey) => ipcRenderer.invoke("sessions:exportProject", projectKey),
+  exportSessionMarkdown: (sessionId) => ipcRenderer.invoke("sessions:export", String(sessionId || "").slice(0, 512)),
+  exportProjectMarkdown: (projectKey) => ipcRenderer.invoke("sessions:exportProject", String(projectKey || "").slice(0, 512)),
   exportLooseSessionsMarkdown: () => ipcRenderer.invoke("sessions:exportLoose"),
   exportAllSessionsMarkdown: () => ipcRenderer.invoke("sessions:exportAll"),
-  exportFilteredSessionsMarkdown: (payload) => ipcRenderer.invoke("sessions:exportFiltered", payload),
+  exportFilteredSessionsMarkdown: (payload = {}) => ipcRenderer.invoke("sessions:exportFiltered", {
+    sessionIds: (Array.isArray(payload?.sessionIds) ? payload.sessionIds : [])
+      .slice(0, 1000)
+      .map((value) => String(value || "").slice(0, 512)),
+    filterText: String(payload?.filterText || "").slice(0, 1000),
+  }),
   generateCatalog: () => ipcRenderer.invoke("catalog:generate"),
   applyCodexConfig: () => ipcRenderer.invoke("codex:apply"),
   initializeCodex: () => ipcRenderer.invoke("codex:initialize"),

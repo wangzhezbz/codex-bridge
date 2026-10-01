@@ -9,7 +9,7 @@ export const PROVIDERS = [
     docsUrl: "https://developers.openai.com/codex",
     baseUrl: "https://chatgpt.com/backend-api/codex",
     authMode: "codex_openai",
-    description: "5.5 / 5.4 走 Codex 订阅，不需要 API Key。",
+    description: "GPT-6 与现有 GPT 模型使用 Codex 订阅；可用性取决于账号，不需要 API Key。",
   },
   {
     id: "openai",
@@ -172,6 +172,14 @@ export const PROVIDERS = [
     description: "Volcano Ark / Doubao OpenAI-compatible API.",
   },
   {
+    id: "hunyuan-tokenhub", name: "Tencent Hunyuan TokenHub", shortName: "混元 TokenHub",
+    keyEnv: "TOKENHUB_API_KEY", keyLabel: "TokenHub API Key",
+    keyUrl: "https://console.cloud.tencent.com/tokenhub",
+    docsUrl: "https://cloud.tencent.com/document/product/1823/130051",
+    baseUrl: "https://tokenhub.tencentmaas.com/v1", authMode: "api_key",
+    description: "腾讯混元新平台；使用独立 TokenHub Key，旧混元配置保持不变。",
+  },
+  {
     id: "qwen",
     name: "Qwen / DashScope",
     shortName: "Qwen",
@@ -222,6 +230,31 @@ export const PROVIDERS = [
 ];
 
 export const MODEL_PRESETS = [
+  route("codex-gpt-6-astra", "codex", "6-Astra", "gpt-6-astra", "responses", 872000, imageInput(codexFastMode({
+    ...codex56Metadata("medium", true, "v2"),
+    // Codex's default window is smaller than its supported opt-in maximum.
+    // Keep the subscription limits separate from the public API limits.
+    catalogContextWindow: 272000,
+    description: "通过 ChatGPT 订阅使用 Astra，支持图像、工具调用和多档推理。",
+    serviceTiers: [{ id: "priority", name: "Fast", description: "2x speed, increased usage" }],
+  }))),
+  route("codex-gpt-6-1-sol", "codex", "6.1-Sol", "gpt-6.1-sol", "responses", 272000, imageInput({
+    ...gpt6ReasoningMetadata(false, true),
+    additionalSpeedTiers: ["fast"],
+    serviceTiers: [{ id: "priority", name: "Fast", description: "账号和地区支持时可用" }],
+    description: "通过 ChatGPT 订阅使用 GPT-6.1 Sol；可用性、Fast 与 Ultra 取决于账号和客户端。上下文暂用保守的 272K 回退值，并非官方上限。",
+  })),
+  // Native model metadata is not yet present in the verified Codex cache.
+  // 272K is a conservative fallback, not a claim about the upstream maximum.
+  // Do not infer Responses Lite, multi-agent protocol versions or Fast tiers.
+  route("codex-gpt-6-sol", "codex", "6-Sol", "gpt-6-sol", "responses", 272000, imageInput({
+    ...gpt6ReasoningMetadata(false, true),
+    description: "通过 ChatGPT 订阅使用 GPT-6 Sol；可用性与 Ultra 取决于账号和客户端。上下文暂用保守的 272K 回退值，并非官方上限。",
+  })),
+  route("codex-gpt-6-luna", "codex", "6-Luna", "gpt-6-luna", "responses", 272000, imageInput({
+    ...gpt6ReasoningMetadata(false, false),
+    description: "通过 ChatGPT 订阅使用 GPT-6 Luna；可用性取决于账号和客户端，推理最高为 Max，不支持 Ultra。上下文暂用保守的 272K 回退值，并非官方上限。",
+  })),
   route(
     "codex-gpt-5-6",
     "codex",
@@ -241,8 +274,29 @@ export const MODEL_PRESETS = [
   route("codex-gpt-5-5", "codex", "5.5", "gpt-5.5", "responses", 258400, imageInput(codexFastMode())),
   route("codex-gpt-5-4", "codex", "5.4", "gpt-5.4", "responses", 258400, imageInput(codexFastMode())),
   route("codex-gpt-5-4-mini", "codex", "5.4-Mini", "gpt-5.4-mini", "responses", 258400, imageInput()),
-  route("openai-gpt-4-1", "openai", "OpenAI 4.1", "gpt-4.1", "responses", 1047576, imageInput()),
-  route("openai-gpt-4-1-mini", "openai", "OpenAI 4.1 Mini", "gpt-4.1-mini", "responses", 1047576, imageInput()),
+  route("openai-gpt-6-astra", "openai", "OpenAI 6-Astra", "gpt-6-astra", "responses", 1050000, imageInput({
+    ...codex56Metadata("medium", false, "v2"),
+    truncationPolicy: { mode: "tokens", limit: 922000 },
+    description: "通过 OpenAI API 使用 Astra，支持图像、工具调用和长上下文。",
+  })),
+  route("openai-gpt-6-1-sol", "openai", "OpenAI 6.1-Sol", "gpt-6.1-sol", "responses", 1050000, imageInput({
+    ...gpt6ReasoningMetadata(false, false),
+    truncationPolicy: { mode: "tokens", limit: 922000 },
+    description: "通过 OpenAI Responses API 使用 GPT-6.1 Sol，支持图像、工具调用及 low 至 max 推理；不支持 none 或 minimal。",
+  })),
+  route("openai-gpt-6-sol", "openai", "OpenAI 6-Sol", "gpt-6-sol", "responses", 1050000, imageInput({
+    ...gpt6ReasoningMetadata(true, false),
+    truncationPolicy: { mode: "tokens", limit: 922000 },
+    description: "通过 OpenAI Responses API 使用 GPT-6 Sol，支持图像、工具调用和 none 至 max 推理。",
+  })),
+  route("openai-gpt-6-luna", "openai", "OpenAI 6-Luna", "gpt-6-luna", "responses", 1050000, imageInput({
+    ...gpt6ReasoningMetadata(true, false),
+    truncationPolicy: { mode: "tokens", limit: 922000 },
+    description: "通过 OpenAI Responses API 使用 GPT-6 Luna，支持图像、工具调用和 none 至 max 推理。",
+  })),
+  // Retain saved routes/history compatibility, but do not offer these in new selections.
+  route("openai-gpt-4-1", "openai", "OpenAI 4.1", "gpt-4.1", "responses", 1047576, imageInput({ hiddenFromPicker: true })),
+  route("openai-gpt-4-1-mini", "openai", "OpenAI 4.1 Mini", "gpt-4.1-mini", "responses", 1047576, imageInput({ hiddenFromPicker: true })),
   route("anthropic-claude-sonnet-4-6", "anthropic", "Claude Sonnet 4.6", "claude-sonnet-4-6", "anthropic_messages", 200000, imageInput({
     dropParams: ["response_format", "parallel_tool_calls"],
   })),
@@ -258,14 +312,31 @@ export const MODEL_PRESETS = [
   route("gemini-3-1-flash-lite", "gemini", "Gemini 3.1 Flash Lite", "gemini-3.1-flash-lite", "chat_completions", 1048576, imageInput({
     dropParams: ["response_format", "parallel_tool_calls"],
   })),
-  route("deepseek-v4-pro", "deepseek", "DeepSeek V4 Pro", "deepseek-v4-pro", "chat_completions", 1000000, {
-    dropParams: ["response_format", "parallel_tool_calls"],
+  route("deepseek-v4-pro", "deepseek", "DeepSeek V4 Pro", "deepseek-v4-pro", "responses", 1000000, {
+    baseUrl: "https://api.deepseek.com", inputModalities: ["text"],
+    supportsFiles: "text-placeholder", supportsResponsePreviousId: false,
+    defaultReasoningLevel: "high", supportedReasoningLevels: [
+      { effort: "none", description: "关闭思考" }, ...reasoningLevels(["low", "high", "max"]),
+    ],
   }),
   route("deepseek-v4-flash", "deepseek", "DeepSeek V4 Flash", "deepseek-v4-flash", "responses", 1048576, {
     baseUrl: "https://api.deepseek.com",
     supportsFiles: "text-placeholder",
     supportsResponsePreviousId: false,
   }),
+  route("deepseek-v4-1-flash", "deepseek", "DeepSeek V4.1 Flash", "deepseek-flash", "responses", 1048576, imageInput({
+    baseUrl: "https://api.deepseek.com",
+    supportsFiles: "text-placeholder",
+    supportsResponsePreviousId: false,
+    defaultReasoningLevel: "high",
+    supportedReasoningLevels: [
+      { effort: "none", description: "关闭思考，直接回答" },
+      { effort: "low", description: "轻量推理，优先速度" },
+      { effort: "high", description: "深入推理，适合复杂任务" },
+      { effort: "max", description: "最高推理强度" },
+    ],
+    description: "通过 DeepSeek 原生 Responses API 使用 V4.1 Flash，支持图像、工具调用和 1M 上下文。",
+  })),
   route("kimi-k2-7-code", "kimi", "Kimi K2.7 Code", "kimi-k2.7-code", "chat_completions", 258400, imageInput({
     dropParams: ["response_format", "parallel_tool_calls"],
   })),
@@ -341,13 +412,47 @@ export const MODEL_PRESETS = [
   route("siliconflow-qwen3-coder", "siliconflow", "SiliconFlow Qwen3 Coder", "Qwen/Qwen3-Coder-480B-A35B-Instruct", "chat_completions", 262144, {
     dropParams: ["parallel_tool_calls"],
   }),
+
+  // Verified against the official provider directories on 2026-09-28.
+  // Additive only: existing preset IDs, protocols and saved selections remain intact.
+  route("openai-gpt-5-6-sol", "openai", "OpenAI 5.6-Sol", "gpt-5.6-sol", "responses", 1050000, imageInput({ ...gpt6ReasoningMetadata(true, false), truncationPolicy: { mode: "tokens", limit: 922000 } })),
+  route("openai-gpt-5-6-terra", "openai", "OpenAI 5.6-Terra", "gpt-5.6-terra", "responses", 1050000, imageInput({ ...gpt6ReasoningMetadata(true, false), truncationPolicy: { mode: "tokens", limit: 922000 } })),
+  route("openai-gpt-5-6-luna", "openai", "OpenAI 5.6-Luna", "gpt-5.6-luna", "responses", 1050000, imageInput({ ...gpt6ReasoningMetadata(true, false), truncationPolicy: { mode: "tokens", limit: 922000 } })),
+  route("anthropic-claude-fable-5-1", "anthropic", "Claude Fable 5.1", "claude-fable-5-1", "anthropic_messages", 1000000, imageInput({ dropParams: ["response_format", "parallel_tool_calls"] })),
+  route("anthropic-claude-opus-5-5", "anthropic", "Claude Opus 5.5", "claude-opus-5-5", "anthropic_messages", 1000000, imageInput({ dropParams: ["response_format", "parallel_tool_calls"] })),
+  route("anthropic-claude-sonnet-5", "anthropic", "Claude Sonnet 5", "claude-sonnet-5", "anthropic_messages", 1000000, imageInput({ dropParams: ["response_format", "parallel_tool_calls"] })),
+  route("anthropic-claude-haiku-4-5", "anthropic", "Claude Haiku 4.5", "claude-haiku-4-5-20251001", "anthropic_messages", 200000, imageInput({ dropParams: ["response_format", "parallel_tool_calls"] })),
+  route("xai-grok-4-7", "xai", "Grok 4.7", "grok-4.7", "responses", 500000, imageInput({ defaultReasoningLevel: "high", supportedReasoningLevels: reasoningLevels(["low", "medium", "high", "xhigh"]) })),
+  route("gemini-3-8-flash", "gemini", "Gemini 3.8 Flash", "gemini-3.8-flash", "chat_completions", 1048576, imageInput({ dropParams: ["response_format", "parallel_tool_calls"] })),
+  route("gemini-3-7-flash", "gemini", "Gemini 3.7 Flash", "gemini-3.7-flash", "chat_completions", 1048576, imageInput({ dropParams: ["response_format", "parallel_tool_calls"] })),
+  route("kimi-k3", "kimi", "Kimi K3", "kimi-k3", "chat_completions", 1048576, imageInput({ dropParams: ["response_format", "parallel_tool_calls"] })),
+  route("xiaomi-mimo-v2-6-pro", "xiaomi", "MiMo V2.6 Pro", "mimo-v2.6-pro", "chat_completions", 1048576, imageInput({ dropParams: ["parallel_tool_calls"] })),
+  route("xiaomi-mimo-v2-6-flash", "xiaomi", "MiMo V2.6 Flash", "mimo-v2.6-flash", "chat_completions", 1048576, imageInput({ dropParams: ["parallel_tool_calls"] })),
+  route("minimax-m3-1-flash-preview", "minimax", "MiniMax M3.1 Flash Preview", "MiniMax-M3.1-Flash-Preview", "chat_completions", 204800, imageInput({
+    defaultReasoningLevel: "max", supportedReasoningLevels: reasoningLevels(["low", "medium", "high", "xhigh", "max"]),
+    dropParams: ["response_format", "parallel_tool_calls"],
+    description: "MiniMax 最新 Flash 预览模型，始终思考；上下文暂用保守回退值，具体权限与限额以平台为准。",
+  })),
+  route("stepfun-step-5-preview", "stepfun", "Step 5 Preview", "step-5-preview", "chat_completions", 1048576, imageInput({ dropParams: ["parallel_tool_calls"] })),
+  route("qianfan-ernie-5-0", "qianfan", "ERNIE 5.0", "ernie-5.0", "chat_completions", 128000, imageInput({ dropParams: ["parallel_tool_calls"] })),
+  route("hunyuan-tokenhub-hy4-preview", "hunyuan-tokenhub", "Hunyuan Hy4 Preview", "hy4-preview", "chat_completions", 1000000, { dropParams: ["parallel_tool_calls"] }),
+  route("hunyuan-tokenhub-hy3", "hunyuan-tokenhub", "Hunyuan Hy3", "hy3", "chat_completions", 256000, { dropParams: ["parallel_tool_calls"] }),
+  route("doubao-seed-2-1-pro", "volcengine", "Doubao Seed 2.1 Pro", "doubao-seed-2-1-pro-260915", "chat_completions", 1048576, imageInput({ dropParams: ["parallel_tool_calls"] })),
+  route("doubao-seed-2-1-lite", "volcengine", "Doubao Seed 2.1 Lite", "doubao-seed-2-1-lite-260915", "chat_completions", 1048576, imageInput({ dropParams: ["parallel_tool_calls"] })),
+  route("qwen3-8-max", "qwen", "Qwen3.8 Max", "qwen3.8-max", "chat_completions", 1000000, imageInput({ dropParams: ["parallel_tool_calls"] })),
+  route("qwen3-8-flash", "qwen", "Qwen3.8 Flash", "qwen3.8-flash", "chat_completions", 1000000, imageInput({ dropParams: ["parallel_tool_calls"] })),
+  route("qwen3-7-plus", "qwen", "Qwen3.7 Plus", "qwen3.7-plus", "chat_completions", 1000000, imageInput({ dropParams: ["parallel_tool_calls"] })),
+  route("glm-5-3", "zhipu", "GLM-5.3", "glm-5.3", "chat_completions", 1000000, {
+    defaultReasoningLevel: "max", supportedReasoningLevels: reasoningLevels(["low", "high", "max"]), dropParams: ["parallel_tool_calls"],
+  }),
+  route("openrouter-deepseek-v4-1-flash", "openrouter", "OpenRouter DeepSeek V4.1 Flash", "deepseek/deepseek-v4.1-flash", "chat_completions", 1000000, imageInput({ dropParams: ["parallel_tool_calls"] })),
 ];
 
 export function defaultSelectedModelIds(mode) {
   if (mode === "all_api") {
     return [
-      "openai-gpt-4-1",
-      "openai-gpt-4-1-mini",
+      "openai-gpt-5-6-sol",
+      "openai-gpt-5-6-luna",
       "deepseek-v4-pro",
       "deepseek-v4-flash",
       "kimi-k2-7-code",
@@ -388,6 +493,11 @@ function imageInput(extra = {}) {
     inputModalities: ["text", "image"],
     ...extra,
   };
+}
+
+function reasoningLevels(efforts) {
+  const descriptions = { low: "轻量推理", medium: "均衡推理", high: "深入推理", xhigh: "更高推理强度", max: "最高推理强度" };
+  return efforts.map(effort => ({ effort, description: descriptions[effort] }));
 }
 
 function codexFastMode(extra = {}) {
@@ -432,4 +542,19 @@ function codex56Metadata(defaultReasoningLevel, includeUltra, multiAgentVersion)
     toolMode: "code_mode_only",
     multiAgentVersion,
   };
+}
+
+function gpt6ReasoningMetadata(includeNone, includeUltra) {
+  // Public API effort support and native Ultra eligibility are separate.
+  // Do not reuse codex56Metadata: it also enables model-specific protocols.
+  const supportedReasoningLevels = [
+    ...(includeNone ? [{ effort: "none", description: "Respond without reasoning" }] : []),
+    { effort: "low", description: "Fast responses with lighter reasoning" },
+    { effort: "medium", description: "Balances speed and reasoning depth" },
+    { effort: "high", description: "Greater reasoning depth for complex problems" },
+    { effort: "xhigh", description: "Extra high reasoning depth for complex problems" },
+    { effort: "max", description: "Maximum reasoning depth for the hardest problems" },
+    ...(includeUltra ? [{ effort: "ultra", description: "Automatic task delegation when eligible for your account and client" }] : []),
+  ];
+  return { defaultReasoningLevel: "medium", supportedReasoningLevels };
 }

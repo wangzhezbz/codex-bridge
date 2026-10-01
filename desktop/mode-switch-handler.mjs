@@ -1,3 +1,5 @@
+import { selectedModelsForModeSwitch } from "./codex-provider.mjs";
+
 function modelIdSet(items, readId) {
   return new Set((Array.isArray(items) ? items : []).map((item) => String(readId(item))));
 }
@@ -30,6 +32,9 @@ export async function runModeSelect({
   rootDir,
   homeDir,
   mode,
+  preserveApiSelection = false,
+  preserveSelection = false,
+  expectedSelectedModelIds,
   routerRunning,
   refreshRouterHealth,
   locateCodexInstall,
@@ -37,7 +42,17 @@ export async function runModeSelect({
   getStatePayload,
   appendLog,
 } = {}) {
-  const selectedModelIds = settings.defaultSelectedModelIds(mode);
+  if (typeof preserveSelection !== "boolean" || typeof preserveApiSelection !== "boolean" || (preserveApiSelection && mode !== "all_api")) {
+    throw new Error("API 恢复只能切换到全部 API 模式。");
+  }
+  const selectedModelIds = preserveApiSelection || preserveSelection
+    ? selectedModelsForModeSwitch(
+        settings.readJsonIfExists(settings.selectionPath(rootDir), null)?.selectedModelIds,
+        expectedSelectedModelIds,
+        settings.modelCatalog(rootDir),
+        mode,
+      )
+    : settings.defaultSelectedModelIds(mode);
   let committedVerificationStarted = false;
   const verifyCommitted = routerRunning
     ? async ({ value } = {}) => {
@@ -57,6 +72,8 @@ export async function runModeSelect({
       homeDir,
       mode,
       selectedModelIds,
+      ...(preserveApiSelection ? { preserveApiSelection, expectedSelectedModelIds } : {}),
+      ...(preserveSelection ? { preserveSelection, expectedSelectedModelIds } : {}),
       verifyCommitted,
     });
   } catch (error) {

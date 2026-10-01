@@ -76,10 +76,10 @@ test("Windows packaging and smoke both execute the software-manager package gate
   assert.match(smokeSource, /assertWindowsSoftwareManagerPackagePaths/);
   assert.match(smokeSource, /CODEXBRIDGE_DESKTOP_SMOKE_SOFTWARE_MANAGER:\s*"1"/u);
   assert.match(smokeSource, /Software manager smoke passed/u);
-  assert.match(smokeSource, /softwareManager\.skills,\s*7/u);
-  assert.match(smokeSource, /softwareManager\.expandedPluginRows,\s*2/u);
-  assert.match(smokeSource, /softwareManager\.selectablePluginRows,\s*2/u);
-  assert.match(smokeSource, /softwareManager\.updateHasSkills,\s*false/u);
+  assert.match(smokeSource, /softwareManager\.components,\s*1/u);
+  assert.match(smokeSource, /softwareManager\.skills,\s*0/u);
+  assert.match(smokeSource, /softwareManager\.cards,\s*\["Codex"\]/u);
+  assert.match(smokeSource, /softwareManager\.checkedTabs,\s*\["install", "update", "uninstall"\]/u);
 });
 
 test("macOS packaging removes the Windows helper and renderer exposes no usable entrypoint", () => {

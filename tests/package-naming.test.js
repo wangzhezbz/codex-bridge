@@ -183,6 +183,8 @@ test("project and Windows CI gates include the complete desktop refresh flow", (
   assert.match(isolatedTests, /CODEXBRIDGE_PROJECT_CHECK_TEMP/u);
   assert.match(isolatedTests, /requiredPrefix:\s*"cbtest-"/u);
   assert.match(isolatedTests, /removeOwnedTemporaryDirectory/u);
+  assert.match(isolatedTests, /--test-concurrency=\$\{testConcurrency\}/u);
+  assert.match(isolatedTests, /Math\.min\(8, os\.availableParallelism\(\)\)/u);
   assert.match(syntaxRunner, /const sourceRoots/);
   assert.match(syntaxRunner, /vendor\/chatgpt-codex-bridge/);
   assert.match(syntaxRunner, /deploy\/codexbridge-installer/);
@@ -207,6 +209,16 @@ test("project and Windows CI gates include the complete desktop refresh flow", (
     projectCheck,
     /"test:software-manager"/u,
     "the full project gate must include the complete software-manager suite",
+  );
+  assert.equal(
+    packageJson.scripts["test:chatgpt-green"],
+    "node scripts/run-node-tests-isolated.mjs tests/software-manager-chatgpt-green-metadata.test.js tests/software-manager-chatgpt-green-template.test.js tests/software-manager-chatgpt-green-converter.test.js tests/software-manager-chatgpt-green-smoke.test.js tests/software-manager-publisher.test.js tests/software-manager-component-files.test.js tests/software-manager-components.test.js",
+    "the green-runtime release contract must have a fixed non-glob gate",
+  );
+  assert.match(
+    projectCheck,
+    /"test:chatgpt-green"/u,
+    "the full project check must retain the fixed green-runtime gate",
   );
   assert.match(
     packageJson.scripts["test:desktop"],
@@ -249,6 +261,8 @@ test("every Node test file is assigned to the fixed project check", () => {
     .sort();
   const covered = new Set();
   for (const scriptName of [
+    "test:astra",
+    "test:deepseek",
     "test:router",
     "test:desktop",
     "test:recovery",
@@ -433,6 +447,7 @@ test("desktop update launches installers and portable replacements automatically
   assert.match(main, /validateDownloadedReleaseAsset\?\.\(installerPath,\s*plan\.asset\)/);
   assert.match(main, /preparePortableUpdate/);
   assert.match(main, /launchPortableUpdateScript\(prepared\.scriptPath\)/);
+  assert.match(main, /await launchPortableUpdateScript\(prepared\.scriptPath\)/);
   assert.match(main, /phase:\s*"restarting"/);
   assert.match(main, /relaunching:\s*true/);
   assert.match(main, /downloadPath:\s*prepared\.downloadPath/);
@@ -451,10 +466,12 @@ test("desktop auto-launches the portable updater from the running app", () => {
   const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
 
   assert.match(main, /function launchPortableUpdateScript\(scriptPath\)/);
-  assert.match(main, /spawn\("powershell\.exe",\s*\[/);
+  assert.match(main, /await spawnDetachedWithConfirmation\(command, args/u);
+  assert.match(main, /const command = process\.platform === "win32" \? "powershell\.exe" : "\/bin\/sh"/);
   assert.match(main, /"-ExecutionPolicy",\s*"Bypass"/);
   assert.match(main, /"-File",\s*scriptPath/);
-  assert.match(main, /child\.unref\?\.\(\)/);
+  assert.match(main, /\{ spawnImpl: spawn \}/);
+  assert.doesNotMatch(main, /spawn\("powershell\.exe",\s*\[/);
   assert.match(main, /quitAfterUpdateLaunch\(\)/);
   assert.doesNotMatch(main, /function launchPortableUpdater/);
   assert.doesNotMatch(main, /function exitForPortableUpdate/);
@@ -462,7 +479,7 @@ test("desktop auto-launches the portable updater from the running app", () => {
   assert.doesNotMatch(main, /start "" \/min powershell\.exe/);
 });
 
-test("desktop updater uses the data update folder and auto-cleans update artifacts", () => {
+test("desktop updater uses the data update folder and the verified download helper", () => {
   const main = fs.readFileSync(path.join(process.cwd(), "desktop", "main.cjs"), "utf8");
 
   assert.match(main, /const updatesDir = portableUpdatesDir\(\)/);
@@ -470,8 +487,10 @@ test("desktop updater uses the data update folder and auto-cleans update artifac
   assert.doesNotMatch(main, /path\.resolve\(path\.dirname\(process\.execPath\), "\.\.", "updates"\)/);
   assert.doesNotMatch(main, /path\.join\(path\.dirname\(currentMacAppBundle\(\)\), "updates"\)/);
   assert.match(main, /const downloadPath = path\.join\(updatesDir, `\$\{stamp\}-\$\{plan\.asset\.name\}`\)/);
-  assert.match(main, /const finalBytes = fs\.statSync\(targetPath\)\.size/);
-  assert.match(main, /更新包下载不完整/);
+  assert.match(main, /const \{ downloadUpdateFile \} = require\("\.\/update-download\.cjs"\)/);
+  assert.match(main, /await downloadUpdateFile\(plan\.asset\.downloadUrl/);
+  // File ownership, size validation and timeout cleanup are exercised against
+  // real streams/files in desktop-updater.test.js, not source spelling here.
   assert.match(main, /function writeManualUpdateInstructions/);
   assert.match(main, /CodexBridge 免安装更新兜底说明/);
   assert.match(main, /自动更新通常会在下载后启动辅助脚本/);
@@ -639,7 +658,9 @@ test("Windows packaged smoke rejects stale Embedded Bridge contents", () => {
   assert.match(smoke, /visible-branding\.js/);
   assert.match(smoke, /bridge-auth\.js/);
   assert.match(smoke, /extensionProtocolVersion/);
-  assert.match(smoke, /v20260801-adaptive-office-wait/);
+  assert.match(smoke, /assert\.equal\(embedded\.version,\s*"0\.1\.95"\)/);
+  assert.match(smoke, /assert\.equal\(extension\.version,\s*"0\.1\.95"\)/);
+  assert.match(smoke, /v20260923-missing-recovery/);
   assert.match(smoke, /@hono["',]+\s*"node-server/);
   assert.match(smoke, /fast-uri/);
   assert.match(smoke, /assertDependencyVersionAtLeast/);
@@ -656,6 +677,7 @@ test("desktop cleans old managed update artifacts and previous installed apps af
   assert.match(main, /updateCleanupInstallerPath\(\)/);
   assert.match(main, /cleanupInstallerPackageAfterUpdate\(0\)/);
   assert.match(main, /setTimeout\(\(\) => cleanupInstallerPackageAfterUpdate\(attempt \+ 1\), 3000\)/);
+  assert.match(main, /retryTimer\.unref\?\.\(\)/);
   assert.match(main, /installedLegacyAppCleanupTargets\?\.\(/);
   assert.match(main, /managedUpdateDirectoryCleanupTargets\?\.\(portableUpdatesDir\(\)\)/);
   assert.match(main, /cleanupMacAppBackupsAfterRendererReady/);

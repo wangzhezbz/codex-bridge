@@ -68,6 +68,14 @@ function runtimeError(code, cause) {
   return error;
 }
 
+async function runRecoveryStep(code, operation) {
+  try {
+    return await operation();
+  } catch (error) {
+    throw runtimeError(code, error);
+  }
+}
+
 function requireWindowsPath(value, code) {
   if (typeof value !== "string" || value.length === 0 || value.trim() !== value
     || value.includes("\0") || !path.win32.isAbsolute(value)
@@ -305,6 +313,7 @@ async function createDefaultRootAdapters({
   const lazyHost = lazyFacade(getWindowsHost, HOST_METHODS);
   const componentFiles = rootFactories.createComponentFileService({
     fileCapabilities, installRootCapability, catalogService, workspace,
+    getInstalledComponent: async (componentId) => (await ownershipStore.load()).components?.[componentId] ?? null,
     versionReader: lazyHost, execFile, deleteAuthorizedTree,
   });
   const retainedInstallerStore = rootFactories.createRetainedInstallerStore({ fileCapabilities, installRootCapability });
@@ -501,11 +510,17 @@ export async function createProductionSoftwareManagerService({
   const recoverOffline = () => {
     if (recoveryInFlight !== null) return recoveryInFlight;
     const operation = Promise.resolve().then(async () => {
-      await infrastructure.ensureRuntimeDirectories();
+      await runRecoveryStep(
+        "software_manager_runtime_directories_failed",
+        () => infrastructure.ensureRuntimeDirectories(),
+      );
       // Establish the display and capability for the install root before
       // recovering interrupted work. A broken recovery record must not leave
       // the page with a placeholder path or disable choosing another root.
-      const beforeRecovery = await ownershipStore.load();
+      const beforeRecovery = await runRecoveryStep(
+        "software_manager_ownership_read_failed",
+        () => ownershipStore.load(),
+      );
       let initialRoot = beforeRecovery.installRoot;
       if (initialRoot === null) {
         try {
@@ -522,23 +537,47 @@ export async function createProductionSoftwareManagerService({
         ? installRootResolver.getCurrentPath()
         : null;
       if (typeof initialRoot === "string" && selectedBeforeRecovery !== initialRoot) {
-        await installRootResolver.restoreOwnedRoot(initialRoot);
+        await runRecoveryStep(
+          "software_manager_owned_root_restore_failed",
+          () => installRootResolver.restoreOwnedRoot(initialRoot),
+        );
       } else if (initialRoot === null && exactDefaultInstallRoot !== null
         && selectedBeforeRecovery !== exactDefaultInstallRoot) {
-        if (injectedEnsureDefaultInstallRoot) await injectedEnsureDefaultInstallRoot(exactDefaultInstallRoot);
-        else await infrastructure.ensureInstallRootDirectory(exactDefaultInstallRoot);
-        const chosen = await installRootResolver.choose(exactDefaultInstallRoot);
+        if (injectedEnsureDefaultInstallRoot) {
+          await runRecoveryStep(
+            "software_manager_default_root_create_failed",
+            () => injectedEnsureDefaultInstallRoot(exactDefaultInstallRoot),
+          );
+        } else {
+          await runRecoveryStep(
+            "software_manager_default_root_create_failed",
+            () => infrastructure.ensureInstallRootDirectory(exactDefaultInstallRoot),
+          );
+        }
+        const chosen = await runRecoveryStep(
+          "software_manager_default_root_choose_failed",
+          () => installRootResolver.choose(exactDefaultInstallRoot),
+        );
         const token = typeof chosen === "string" ? chosen : chosen?.token;
         if (typeof token !== "string") throw runtimeError("software_manager_install_root_invalid");
-        await installRootResolver.adopt(token);
+        await runRecoveryStep(
+          "software_manager_default_root_adopt_failed",
+          () => installRootResolver.adopt(token),
+        );
       }
-      const recovered = await recoverLocalTransactions({
-        ownershipStore,
-        journal,
-        authorizeRoot: infrastructure.authorizeRoot.bind(infrastructure),
-        createSlots: ({ installRootCapability }) => createSlots(installRootCapability),
-      });
-      let current = await ownershipStore.load();
+      const recovered = await runRecoveryStep(
+        "software_manager_transaction_recovery_failed",
+        () => recoverLocalTransactions({
+          ownershipStore,
+          journal,
+          authorizeRoot: infrastructure.authorizeRoot.bind(infrastructure),
+          createSlots: ({ installRootCapability }) => createSlots(installRootCapability),
+        }),
+      );
+      let current = await runRecoveryStep(
+        "software_manager_ownership_read_failed",
+        () => ownershipStore.load(),
+      );
       let installRoot = recovered.installRoot ?? current.installRoot;
       if (installRoot === null) {
         try {
@@ -556,7 +595,10 @@ export async function createProductionSoftwareManagerService({
       }
       let installRootCapability = null;
       if (typeof installRoot === "string") {
-        installRootCapability = await infrastructure.authorizeRoot(installRoot);
+        installRootCapability = await runRecoveryStep(
+          "software_manager_install_root_authorization_failed",
+          () => infrastructure.authorizeRoot(installRoot),
+        );
       }
       if (["skill-replace", "skill-uninstall"].includes(current.activeTask?.kind)) {
         const skillsRootCapability = await getSkillsRootCapability();
@@ -564,14 +606,23 @@ export async function createProductionSoftwareManagerService({
           ownership: structuredClone(current), installRootCapability, skillsRootCapability,
         });
         if (skillRecovery?.status === "recovered" && installRootCapability) {
-          await infrastructure.cleanupAbandonedPreparedSkills({
-            installRootCapability, heldLease: skillRecovery?.heldLease ?? null,
-          });
+          await runRecoveryStep(
+            "software_manager_skill_prepare_cleanup_failed",
+            () => infrastructure.cleanupAbandonedPreparedSkills({
+              installRootCapability, heldLease: skillRecovery?.heldLease ?? null,
+            }),
+          );
         }
       } else if (installRootCapability) {
-        await infrastructure.cleanupAbandonedPreparedSkills({ installRootCapability, heldLease: null });
+        await runRecoveryStep(
+          "software_manager_skill_prepare_cleanup_failed",
+          () => infrastructure.cleanupAbandonedPreparedSkills({ installRootCapability, heldLease: null }),
+        );
       }
-      current = await ownershipStore.load();
+      current = await runRecoveryStep(
+        "software_manager_ownership_read_failed",
+        () => ownershipStore.load(),
+      );
       let restoredRoot = current.installRoot;
       const selectedRoot = typeof installRootResolver.getCurrentPath === "function"
         ? installRootResolver.getCurrentPath()
@@ -582,20 +633,42 @@ export async function createProductionSoftwareManagerService({
         restoredRoot = selectedRoot;
       }
       if (typeof restoredRoot === "string") {
-        if (restoredRoot !== selectedRoot) await installRootResolver.restoreOwnedRoot(restoredRoot);
+        if (restoredRoot !== selectedRoot) {
+          await runRecoveryStep(
+            "software_manager_owned_root_restore_failed",
+            () => installRootResolver.restoreOwnedRoot(restoredRoot),
+          );
+        }
       } else if (exactDefaultInstallRoot !== null) {
-        if (injectedEnsureDefaultInstallRoot) await injectedEnsureDefaultInstallRoot(exactDefaultInstallRoot);
-        else await infrastructure.ensureInstallRootDirectory(exactDefaultInstallRoot);
-        const chosen = await installRootResolver.choose(exactDefaultInstallRoot);
+        if (injectedEnsureDefaultInstallRoot) {
+          await runRecoveryStep(
+            "software_manager_default_root_create_failed",
+            () => injectedEnsureDefaultInstallRoot(exactDefaultInstallRoot),
+          );
+        } else {
+          await runRecoveryStep(
+            "software_manager_default_root_create_failed",
+            () => infrastructure.ensureInstallRootDirectory(exactDefaultInstallRoot),
+          );
+        }
+        const chosen = await runRecoveryStep(
+          "software_manager_default_root_choose_failed",
+          () => installRootResolver.choose(exactDefaultInstallRoot),
+        );
         const token = typeof chosen === "string" ? chosen : chosen?.token;
         if (typeof token !== "string") throw runtimeError("software_manager_install_root_invalid");
-        await installRootResolver.adopt(token);
+        await runRecoveryStep(
+          "software_manager_default_root_adopt_failed",
+          () => installRootResolver.adopt(token),
+        );
         restoredRoot = exactDefaultInstallRoot;
       } else {
         await installRootResolver.clearCurrent();
       }
       if (recovered.installRoot === restoredRoot) return recovered;
       return Object.freeze({ ...recovered, status: "recovered", installRoot: restoredRoot });
+    }).catch((error) => {
+      throw runtimeError("software_manager_offline_recovery_failed", error);
     });
     recoveryInFlight = operation;
     operation.then(
@@ -607,6 +680,7 @@ export async function createProductionSoftwareManagerService({
   const service = createSoftwareManagerService({
     platform,
     catalogProvider,
+    codexOnly: true,
     adapterFactory: createRootRuntime,
     ownershipStore,
     recoverTransactions: recoverOffline,

@@ -5,17 +5,32 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import zlib from "node:zlib";
-import { loadConfig, routeForModel } from "../src/config.js";
+import { apiKeyForRoute, loadConfig, routeForModel } from "../src/config.js";
+import { readJsonRequest } from "../src/json.js";
 import { COMPACT_SUMMARY_PREFIX } from "../src/compact.js";
 import { ResponseHistory } from "../src/history.js";
-import { shouldUseImageGenerationFallback } from "../src/image-generation.js";
 import {
+  imageGenerationSettings,
+  proxyImageGenerationFallback,
+  shouldUseImageGenerationFallback,
+} from "../src/image-generation.js";
+import {
+  createCurrentConfigReader,
   createRouterServer as createRouterServerBase,
   isBenignRouterProcessError,
+  requestBodyLimitBytes,
+  responsesCompactRequestBodyLimitBytes,
+  spawnDetachedProcess,
 } from "../src/server.js";
 import { callJsonUpstream, proxyResponsesApi } from "../src/upstream.js";
-import { __resetRateLimiterForTests } from "../src/rate-limit.js";
+import {
+  __resetRateLimiterForTests,
+  __setRateLimitClockForTests,
+  routeRateLimitStatus,
+} from "../src/rate-limit.js";
+import { parseSseEvents } from "../src/sse.js";
 
 // This suite predates the user-facing default-off duplicate request setting and
 // exercises the protection behavior throughout. Keep the legacy protection
@@ -30,6 +45,308 @@ function createRouterServer(config, options) {
     options,
   );
 }
+
+test("HTTP budget errors preserve small nonzero amounts without another upstream call", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await readJson(req);
+    upstreamCalls += 1;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      id: "resp_smallbudget", object: "response", status: "completed", output: [],
+      usage: { input_tokens: 1000, output_tokens: 0, input_tokens_details: { cached_tokens: 0, cache_write_tokens: 1000 } },
+    }));
+  });
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1", port: 0, authToken: "router-token", defaultModel: "cb-smallbudget",
+    duplicateRequestProtection: false,
+    usageBudgets: { global: { dailyCostLimit: 1e-10, cacheWriteCostPerMillion: 4e-7 } },
+    models: [
+      { id: "cb-smallbudget", api: "responses", model: "small-model", baseUrl: serverUrl(upstream), apiKey: "test-key" },
+      { id: "cb-smallchat", api: "chat_completions", model: "small-chat", baseUrl: serverUrl(upstream), apiKey: "test-key" },
+    ],
+  });
+  await listen(router);
+  const send = (endpoint, payload) => fetch(`${serverUrl(router)}${endpoint}`, {
+    method: "POST",
+    headers: { authorization: "Bearer router-token", "content-type": "application/json" },
+    body: JSON.stringify({ model: "cb-smallbudget", ...payload }),
+  });
+  try {
+    const first = await send("/v1/responses", { input: "first", stream: false });
+    assert.equal(first.status, 200);
+    await first.text();
+    for (const [endpoint, payload] of [
+      ["/v1/responses", { input: "blocked", stream: false }],
+      ["/v1/responses", { input: "blocked stream", stream: true }],
+      ["/v1/chat/completions", { model: "cb-smallchat", messages: [{ role: "user", content: "blocked chat" }], stream: false }],
+    ]) {
+      const response = await send(endpoint, payload);
+      const body = await response.text();
+      assert.match(body, /4e-10 \/ 1e-10/);
+      assert.doesNotMatch(body, /已用 0 \/ 0/);
+      assert.equal(upstreamCalls, 1);
+    }
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("HTTP stops the next request after decimal fees exactly reach the daily cost limit", async () => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await readJson(req);
+    upstreamCalls += 1;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      id: `resp_decimal_${upstreamCalls}`, object: "response", status: "completed", output: [],
+      usage: { input_tokens: 1000, output_tokens: 0 },
+    }));
+  });
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1", port: 0, authToken: "router-token", defaultModel: "decimal-route",
+    duplicateRequestProtection: false,
+    usageBudgets: { global: { dailyCostLimit: 1, inputCostPerMillion: 100 } },
+    models: [{ id: "decimal-route", api: "responses", model: "decimal-model", baseUrl: serverUrl(upstream), apiKey: "test-key" }],
+  });
+  await listen(router);
+  try {
+    for (let index = 0; index < 11; index += 1) {
+      const response = await fetch(`${serverUrl(router)}/v1/responses`, {
+        method: "POST", headers: { authorization: "Bearer router-token", "content-type": "application/json" },
+        body: JSON.stringify({ model: "decimal-route", input: `request ${index}`, stream: false }),
+      });
+      assert.equal(response.status, 200);
+      const body = await response.text();
+      if (index < 10) assert.match(body, /resp_decimal_/);
+      else assert.match(body, /已达到本地每日预算上限/);
+    }
+    assert.equal(upstreamCalls, 10, "an eleventh charge must not bypass the exact cost cap");
+  } finally {
+    await close(router);
+    await close(upstream);
+  }
+});
+
+test("image generation settings clamp untrusted result limits before runtime use", () => {
+  const settings = imageGenerationSettings({
+    id: "cb-image-limits",
+    imageGeneration: {
+      enabled: true,
+      mode: "custom",
+      baseUrl: "https://images.example.com/v1",
+      endpoint: "/images/generations",
+      model: "image-v1",
+      apiKeyEnv: "IMAGE_API_KEY",
+      maxAssetBytes: Number.MAX_SAFE_INTEGER,
+      assetTimeoutMs: Number.MAX_SAFE_INTEGER,
+    },
+  });
+  assert.equal(settings.maxAssetBytes, 256 * 1024 * 1024);
+  assert.equal(settings.assetTimeoutMs, 30 * 60_000);
+});
+
+test("Router rejects oversized config before allocating or parsing its contents", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-config-limit-"));
+  const configPath = path.join(tempDir, "router.config.json");
+  const descriptor = fs.openSync(configPath, "w");
+  try { fs.ftruncateSync(descriptor, 16 * 1024 * 1024 + 1); }
+  finally { fs.closeSync(descriptor); }
+  try {
+    assert.throws(() => loadConfig(configPath), (error) => error?.code === "router_config_too_large");
+  } finally {
+    fs.unlinkSync(configPath);
+    fs.rmdirSync(tempDir);
+  }
+});
+
+test("Router config reader reparses only after the config file identity changes", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-config-cache-"));
+  const configPath = path.join(tempDir, "router.config.json");
+  const configValue = (port) => ({
+    host: "127.0.0.1",
+    port,
+    defaultModel: "route",
+    models: [{
+      id: "route", displayName: "Route", api: "responses",
+      baseUrl: "https://api.example.test/v1", model: "model",
+    }],
+  });
+  fs.writeFileSync(configPath, JSON.stringify(configValue(15722)), "utf8");
+  const initial = loadConfig(configPath);
+  let reloads = 0;
+  const reader = createCurrentConfigReader(initial, {
+    loadConfigImpl: (target) => { reloads += 1; return loadConfig(target); },
+  });
+  try {
+    assert.equal(reader().port, 15722);
+    assert.equal(reader().port, 15722);
+    assert.equal(reloads, 0);
+    fs.writeFileSync(configPath, JSON.stringify(configValue(15723)), "utf8");
+    const future = new Date(Date.now() + 2_000);
+    fs.utimesSync(configPath, future, future);
+    assert.equal(reader().port, 15723);
+    assert.equal(reloads, 1);
+    assert.equal(reader().port, 15723);
+    assert.equal(reloads, 1);
+  } finally {
+    fs.unlinkSync(configPath);
+    fs.rmdirSync(tempDir);
+  }
+});
+
+test("Router config reader never binds stale content to a newer file fingerprint", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-config-race-"));
+  const configPath = path.join(tempDir, "router.config.json");
+  const configValue = (port) => ({
+    host: "127.0.0.1",
+    port,
+    defaultModel: "route",
+    models: [{
+      id: "route", displayName: "Route", api: "responses",
+      baseUrl: "https://api.example.test/v1", model: "model",
+    }],
+  });
+  fs.writeFileSync(configPath, JSON.stringify(configValue(15722)), "utf8");
+  const initial = loadConfig(configPath);
+  let mutateAfterRead = true;
+  let reloads = 0;
+  let nextPort = 15724;
+  const reader = createCurrentConfigReader(initial, {
+    loadConfigImpl(target) {
+      reloads += 1;
+      const loaded = loadConfig(target);
+      if (mutateAfterRead) {
+        fs.writeFileSync(configPath, JSON.stringify(configValue(nextPort)), "utf8");
+        const future = new Date(Date.now() + (nextPort - 15720) * 1000);
+        fs.utimesSync(configPath, future, future);
+        nextPort += 1;
+      }
+      return loaded;
+    },
+  });
+  try {
+    fs.writeFileSync(configPath, JSON.stringify(configValue(15723)), "utf8");
+    fs.utimesSync(configPath, new Date(Date.now() + 2_000), new Date(Date.now() + 2_000));
+    assert.throws(reader, (error) => error?.code === "router_config_changed_during_read");
+    assert.equal(reloads, 3);
+
+    mutateAfterRead = false;
+    assert.equal(reader().port, 15726);
+    assert.equal(reloads, 4);
+    assert.equal(reader().port, 15726);
+    assert.equal(reloads, 4);
+  } finally {
+    fs.unlinkSync(configPath);
+    fs.rmdirSync(tempDir);
+  }
+});
+
+test("Router ignores an oversized local secrets file without reading it", () => {
+  const previous = process.env.CODEXBRIDGE_SECRETS_FILE;
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-secrets-limit-"));
+  const secretsPath = path.join(tempDir, "secrets.local.json");
+  const descriptor = fs.openSync(secretsPath, "w");
+  try { fs.ftruncateSync(descriptor, 4 * 1024 * 1024 + 1); }
+  finally { fs.closeSync(descriptor); }
+  process.env.CODEXBRIDGE_SECRETS_FILE = secretsPath;
+  try {
+    assert.equal(apiKeyForRoute({ apiKeyEnv: "TEST_SECRET" }), undefined);
+  } finally {
+    if (previous === undefined) delete process.env.CODEXBRIDGE_SECRETS_FILE;
+    else process.env.CODEXBRIDGE_SECRETS_FILE = previous;
+    fs.unlinkSync(secretsPath);
+    fs.rmdirSync(tempDir);
+  }
+});
+
+test("Router secrets reader never caches stale keys under a newer file fingerprint", () => {
+  const previous = process.env.CODEXBRIDGE_SECRETS_FILE;
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-secrets-race-"));
+  const secretsPath = path.join(tempDir, "secrets.local.json");
+  const secretDocument = (index) => JSON.stringify({ TEST_SECRET: `key-${index}` });
+  fs.writeFileSync(secretsPath, secretDocument(1), "utf8");
+  process.env.CODEXBRIDGE_SECRETS_FILE = secretsPath;
+  const originalReadSync = fs.readSync;
+  let mutation = 1;
+  fs.readSync = (...args) => {
+    const count = originalReadSync(...args);
+    if (count > 0 && mutation <= 3) {
+      mutation += 1;
+      fs.writeFileSync(secretsPath, secretDocument(mutation), "utf8");
+      const future = new Date(Date.now() + mutation * 1000);
+      fs.utimesSync(secretsPath, future, future);
+    }
+    return count;
+  };
+  try {
+    assert.equal(apiKeyForRoute({ apiKeyEnv: "TEST_SECRET" }), undefined);
+    assert.equal(mutation, 4);
+  } finally {
+    fs.readSync = originalReadSync;
+  }
+  try {
+    assert.equal(apiKeyForRoute({ apiKeyEnv: "TEST_SECRET" }), "key-4");
+    assert.equal(apiKeyForRoute({ apiKeyEnv: "TEST_SECRET" }), "key-4");
+  } finally {
+    if (previous === undefined) delete process.env.CODEXBRIDGE_SECRETS_FILE;
+    else process.env.CODEXBRIDGE_SECRETS_FILE = previous;
+    fs.unlinkSync(secretsPath);
+    fs.rmdirSync(tempDir);
+  }
+});
+
+test("Router secrets cache reloads changed keys and clears removed files", () => {
+  const previous = process.env.CODEXBRIDGE_SECRETS_FILE;
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-secrets-cache-"));
+  const secretsPath = path.join(tempDir, "secrets.local.json");
+  process.env.CODEXBRIDGE_SECRETS_FILE = secretsPath;
+  try {
+    fs.writeFileSync(secretsPath, JSON.stringify({ TEST_SECRET: "first" }), "utf8");
+    assert.equal(apiKeyForRoute({ apiKeyEnv: "TEST_SECRET" }), "first");
+    assert.equal(apiKeyForRoute({ apiKeyEnv: "TEST_SECRET" }), "first");
+    fs.writeFileSync(secretsPath, JSON.stringify({ TEST_SECRET: "second" }), "utf8");
+    const future = new Date(Date.now() + 2_000);
+    fs.utimesSync(secretsPath, future, future);
+    assert.equal(apiKeyForRoute({ apiKeyEnv: "TEST_SECRET" }), "second");
+    fs.unlinkSync(secretsPath);
+    assert.equal(apiKeyForRoute({ apiKeyEnv: "TEST_SECRET" }), undefined);
+  } finally {
+    if (previous === undefined) delete process.env.CODEXBRIDGE_SECRETS_FILE;
+    else process.env.CODEXBRIDGE_SECRETS_FILE = previous;
+    if (fs.existsSync(secretsPath)) fs.unlinkSync(secretsPath);
+    fs.rmdirSync(tempDir);
+  }
+});
+
+test("compressed request bodies stop during decompression at the decoded byte limit", async () => {
+  const encoded = zlib.gzipSync(Buffer.from(JSON.stringify({ value: "x".repeat(4096) })));
+  const request = Readable.from([encoded]);
+  request.headers = { "content-encoding": "gzip" };
+  await assert.rejects(
+    readJsonRequest(request, 1024),
+    (error) => error?.code === "request_body_too_large" && error?.statusCode === 413,
+  );
+});
+
+test("Router request body configuration cannot raise the 512 MiB hard ceiling", () => {
+  const unlimited = {
+    requestBodyLimitBytes: Number.MAX_SAFE_INTEGER,
+    responsesRequestBodyLimitBytes: Number.MAX_SAFE_INTEGER,
+    responsesCompactRequestBodyLimitBytes: Number.MAX_SAFE_INTEGER,
+  };
+  assert.equal(
+    requestBodyLimitBytes(unlimited, "/v1/responses"),
+    512 * 1024 * 1024,
+  );
+  assert.equal(
+    responsesCompactRequestBodyLimitBytes(unlimited, "/v1/responses/compact"),
+    512 * 1024 * 1024,
+  );
+});
 
 test("router handles client socket parser errors without crashing", () => {
   const router = createRouterServer({
@@ -81,6 +398,43 @@ test("router process guard classifies benign socket and undici network errors", 
   assert.equal(isBenignRouterProcessError(new Error("syntax exploded")), false);
 });
 
+test("detached local application launch has a hard startup deadline and cleans listeners", async () => {
+  const child = new EventEmitter();
+  child.killed = false;
+  child.kill = () => {
+    child.killed = true;
+    child.emit("close", null);
+  };
+  child.unref = () => {};
+
+  await assert.rejects(
+    spawnDetachedProcess("stalled-app", [], {
+      spawnImpl: () => child,
+      timeoutMs: 10,
+    }),
+    (error) => error?.code === "local_process_start_timeout",
+  );
+  assert.equal(child.killed, true);
+  assert.equal(child.listenerCount("spawn"), 0);
+  assert.equal(child.listenerCount("error"), 0);
+});
+
+test("detached local application launch resolves only after spawn evidence", async () => {
+  const child = new EventEmitter();
+  let unrefCalls = 0;
+  child.kill = () => {};
+  child.unref = () => { unrefCalls += 1; };
+  const started = spawnDetachedProcess("ready-app", [], {
+    spawnImpl: () => child,
+    timeoutMs: 100,
+  });
+  child.emit("spawn");
+  await started;
+  assert.equal(unrefCalls, 1);
+  assert.equal(child.listenerCount("spawn"), 0);
+  assert.equal(child.listenerCount("error"), 0);
+});
+
 test("router handles late client socket errors without crashing", () => {
   const router = createRouterServer({
     host: "127.0.0.1",
@@ -113,6 +467,187 @@ test("router handles late client socket errors without crashing", () => {
     );
   });
   assert.equal(socket.destroyed, true);
+});
+
+test("server stops a stalled capability provider at its configured hard deadline", async () => {
+  const stalledProvider = http.createServer(() => {
+    // Deliberately leave the request open; Router must abort it at the
+    // provider deadline instead of keeping the Codex request pending forever.
+  });
+  await listen(stalledProvider);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "gpt-compatible",
+    capabilityProviders: [
+      {
+        id: "stalled-search",
+        name: "Stalled Search",
+        capability: "web_search",
+        capabilities: ["web_search"],
+        adapter: "generic_http",
+        baseUrl: serverUrl(stalledProvider),
+        endpoint: "/search",
+        requestTimeoutMs: 30,
+        default: true,
+      },
+    ],
+    models: [
+      {
+        id: "gpt-compatible",
+        provider: "custom",
+        api: "responses",
+        model: "gpt-compatible",
+        baseUrl: "https://provider.example/v1",
+        apiKey: "upstream-key",
+      },
+    ],
+  });
+  await listen(router);
+  const startedAt = Date.now();
+
+  try {
+    const response = await fetch(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer router-token",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-compatible",
+        input: "search for bridge timeout evidence",
+        stream: false,
+        codexbridge_capability: {
+          capability: "web_search",
+          input: { query: "bridge timeout" },
+        },
+      }),
+    });
+    const payload = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(payload.codexbridge_capability.ok, false);
+    assert.equal(payload.codexbridge_capability.error.code, "provider_request_timeout");
+    assert.equal(payload.codexbridge_capability.errorPhase, "execute");
+    assert.match(payload.output_text, /请求超时|停止等待/);
+    assert.ok(Date.now() - startedAt < 1000);
+  } finally {
+    await close(router);
+    await close(stalledProvider);
+  }
+});
+
+test("server capability response hard ceiling cannot be raised by route configuration", async () => {
+  const oversizedProvider = http.createServer((_req, res) => {
+    res.writeHead(200, {
+      "content-type": "application/json",
+      "content-length": String((64 * 1024 * 1024) + 1),
+    });
+    res.end();
+  });
+  await listen(oversizedProvider);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "gpt-compatible",
+    capabilityProviders: [{
+      id: "oversized-search",
+      name: "Oversized Search",
+      capability: "web_search",
+      capabilities: ["web_search"],
+      adapter: "generic_http",
+      baseUrl: serverUrl(oversizedProvider),
+      endpoint: "/search",
+      maxResponseBytes: Number.MAX_SAFE_INTEGER,
+      default: true,
+    }],
+    models: [{
+      id: "gpt-compatible",
+      provider: "custom",
+      api: "responses",
+      model: "gpt-compatible",
+      baseUrl: "https://provider.example/v1",
+      apiKey: "upstream-key",
+    }],
+  });
+  await listen(router);
+  try {
+    const response = await fetch(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: { authorization: "Bearer router-token", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-compatible",
+        input: "search hard response limit",
+        stream: false,
+        codexbridge_capability: { capability: "web_search", input: { query: "hard limit" } },
+      }),
+    });
+    const payload = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(payload.codexbridge_capability.ok, false);
+    assert.equal(payload.codexbridge_capability.error.code, "provider_response_too_large");
+    assert.match(payload.codexbridge_capability.error.message, /67108864 bytes/u);
+  } finally {
+    await close(router);
+    await close(oversizedProvider);
+  }
+});
+
+test("server local-file hard ceiling cannot be raised and rejects before reading the sparse file", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-server-local-file-limit-"));
+  const filePath = path.join(tempDir, "oversized.txt");
+  const handle = fs.openSync(filePath, "w");
+  fs.ftruncateSync(handle, (8 * 1024 * 1024) + 1);
+  fs.closeSync(handle);
+  const router = createRouterServer({
+    host: "127.0.0.1",
+    port: 0,
+    authToken: "router-token",
+    defaultModel: "gpt-compatible",
+    capabilityProviders: [{
+      id: "local-file",
+      name: "Local File",
+      capability: "file_processing",
+      capabilities: ["file_processing"],
+      adapter: "local_file",
+      default: true,
+    }],
+    models: [{
+      id: "gpt-compatible",
+      provider: "custom",
+      api: "responses",
+      model: "gpt-compatible",
+      baseUrl: "https://provider.example/v1",
+      apiKey: "upstream-key",
+    }],
+  });
+  await listen(router);
+  try {
+    const response = await fetch(`${serverUrl(router)}/v1/responses`, {
+      method: "POST",
+      headers: { authorization: "Bearer router-token", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-compatible",
+        input: "read local file hard limit",
+        stream: false,
+        codexbridge_capability: {
+          capability: "file_processing",
+          input: { action: "extract_text", path: filePath, maxBytes: Number.MAX_SAFE_INTEGER },
+        },
+      }),
+    });
+    const payload = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(payload.codexbridge_capability.ok, false);
+    assert.equal(payload.codexbridge_capability.error.code, "local_file_too_large");
+    assert.match(payload.codexbridge_capability.error.message, /8388608 bytes/u);
+  } finally {
+    await close(router);
+    fs.unlinkSync(filePath);
+    fs.rmdirSync(tempDir);
+  }
 });
 
 test("router rejects browser origins unless they are explicitly trusted", async () => {
@@ -949,9 +1484,9 @@ test("server waits for provider cooldown before a completed rate-limit request r
     assert.equal(first.error.code, "upstream_rate_limit");
     assert.equal(second.error.code, "upstream_rate_limit");
     assert.match(first.error.message, /Kimi K2\.7 Code.*供应商限流/);
-    assert.match(first.error.message, /约 1 秒/);
+    assert.match(first.error.message, /至少等待 1 秒/);
     assert.match(second.error.message, /Kimi K2\.7 Code.*供应商限流/);
-    assert.match(second.error.message, /约 1 秒/);
+    assert.match(second.error.message, /至少等待 1 秒/);
     assert.equal(upstreamCalls, 2);
   } finally {
     await close(router);
@@ -3333,6 +3868,52 @@ test("chat routes can use a per-route custom image generation provider", async (
   }
 });
 
+test("streamed image generation releases its lifecycle before slow history persistence", async () => {
+  let resolveWrite;
+  const history = {
+    recordTurnAsync() {
+      return new Promise((resolve) => { resolveWrite = resolve; });
+    },
+  };
+  const response = imageFallbackResponseCollector();
+  const route = imageFallbackRoute({ historyWriteTimeoutMs: 1_000 });
+  const completed = await Promise.race([
+    proxyImageGenerationFallback(
+      { model: route.id, input: "draw a streamed bridge", stream: true },
+      route,
+      history,
+      response,
+      { requestId: "req_stream_image_history" },
+      async () => ({ data: [{ url: "https://images.example/streamed.png" }] }),
+    ),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("streamed image history blocked response")), 500)),
+  ]);
+  assert.equal(completed.status, "completed");
+  assert.equal(response.statusCode, 200);
+  assert.match(response.body(), /response\.completed/u);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(typeof resolveWrite, "function");
+  resolveWrite({ recordBytes: { messages: 1, response: 1, meta: 1 } });
+  await new Promise((resolve) => setImmediate(resolve));
+});
+
+test("non-stream image generation bounds history persistence before publishing JSON", async () => {
+  const response = imageFallbackResponseCollector();
+  const route = imageFallbackRoute({ historyWriteTimeoutMs: 20 });
+  const startedAt = Date.now();
+  await assert.rejects(proxyImageGenerationFallback(
+    { model: route.id, input: "draw a non-stream bridge", stream: false },
+    route,
+    { recordTurnAsync: () => new Promise(() => {}) },
+    response,
+    { requestId: "req_nonstream_image_history" },
+    async () => ({ data: [{ url: "https://images.example/nonstream.png" }] }),
+  ), (error) => error?.code === "history_write_timeout");
+  assert.equal(response.statusCode, null);
+  assert.equal(response.body(), "");
+  assert.ok(Date.now() - startedAt < 500);
+});
+
 test("server retries a completed image generation request when no request is pending", async () => {
   const previousEnv = snapshotEnv(["CUSTOM_IMAGE_API_KEY"]);
   process.env.CUSTOM_IMAGE_API_KEY = "custom-image-key";
@@ -4470,6 +5051,26 @@ test("server rejects explicit unknown model instead of silently using default", 
     await close(router);
     await close(upstream);
   }
+});
+
+test("Codex reserve fallback explains API recovery without silently using a selected model", async () => {
+  let upstreamCalls=0;
+  const upstream=http.createServer((_req,res)=>{upstreamCalls++;res.end('{}');});
+  await listen(upstream);
+  const router=createRouterServer({host:'127.0.0.1',port:0,authToken:'router-token',
+    defaultModel:'cb-deepseek',models:[{id:'cb-deepseek',api:'responses',baseUrl:serverUrl(upstream)+'/v1',
+      model:'deepseek-v4-flash',authMode:'api_key',apiKey:'fixture-provider-key'}]});
+  await listen(router);
+  try {
+    const response=await fetchJson(serverUrl(router)+'/v1/responses',{method:'POST',
+      headers:{'content-type':'application/json',authorization:'Bearer router-token','user-agent':'codex_cli_rs/0.142.2'},
+      body:JSON.stringify({model:'gpt-reserve',input:'continue'})});
+    assert.match(response.output_text,/Luna/);
+    assert.match(response.output_text,/API/);
+    assert.match(response.output_text,/重启/);
+    assert.doesNotMatch(response.output_text,/旧模型槽位|初始化 Codex 配置|新开会话/);
+    assert.equal(upstreamCalls,0);
+  } finally {await close(router);await close(upstream);}
 });
 
 test("api_key routes ignore incoming Codex bearer and use provider key", async () => {
@@ -11657,6 +12258,219 @@ test("codex_openai compact v2 preserves the native opaque compaction item", asyn
   }
 });
 
+for (const authMode of ["api_key", "codex_openai"]) {
+  for (const statusCode of [429, 503]) {
+    for (const stream of [false, true]) {
+      test(`Router preserves ${statusCode} Retry-After over ${stream ? "SSE" : "JSON"} for ${authMode}`, async () => {
+        const retryAfter = stream ? "Sun, 06 Sep 2026 00:03:00 GMT" : "180";
+        let now = Date.parse("Sun, 06 Sep 2026 00:00:00 GMT");
+        const sleeps = [];
+        const requests = [];
+        __resetRateLimiterForTests();
+        __setRateLimitClockForTests({
+          now: () => now,
+          sleep: async (ms) => { sleeps.push(ms); now += ms; },
+        });
+        const upstream = http.createServer(async (req, res) => {
+          requests.push({ body: await readJson(req), authorization: req.headers.authorization });
+          if (requests.length === 1) {
+            res.writeHead(statusCode, { "content-type": "application/json", "retry-after": retryAfter });
+            res.end(JSON.stringify({ error: {
+              code: statusCode === 429 ? "slow_down" : "server_is_overloaded",
+              message: "provider busy; Bearer sk-sensitive-provider-token",
+            } }));
+            return;
+          }
+          const response = {
+            id: "resp_explicit_retry_success",
+            object: "response",
+            status: "completed",
+            model: "gpt-6-astra",
+            output: [],
+            output_text: "",
+          };
+          if (requests.at(-1).body.stream) {
+            res.writeHead(200, { "content-type": "text/event-stream" });
+            res.end(`event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response })}\n\ndata: [DONE]\n\n`);
+          } else {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify(response));
+          }
+        });
+        await listen(upstream);
+        const route = {
+          id: "cb-astra-retry-after",
+          api: "responses",
+          authMode,
+          baseUrl: `${serverUrl(upstream)}/v1`,
+          model: "gpt-6-astra",
+          localRateLimitEnabled: false,
+          ...(authMode === "api_key" ? { apiKey: "fake-upstream-api-key" } : {}),
+        };
+        const router = createRouterServer({
+          host: "127.0.0.1", port: 0,
+          authToken: "router-token",
+          clientAuth: { allowOpenAiBearer: true },
+          defaultModel: route.id,
+          models: [route],
+        });
+        await listen(router);
+        const headers = {
+          "content-type": "application/json",
+          authorization: authMode === "api_key" ? "Bearer router-token" : "Bearer fake-codex-subscription-token",
+        };
+        try {
+          const response = await fetch(`${serverUrl(router)}/v1/responses`, {
+            method: "POST", headers,
+            body: JSON.stringify({ model: route.id, input: "initial request", stream }),
+          });
+          const responseText = await response.text();
+          assert.equal(response.headers.get("retry-after"), retryAfter);
+          assert.equal(response.status, stream ? 200 : statusCode);
+          const error = stream
+            ? JSON.parse(parseSseEvents(responseText).find((event) => event.event === "response.failed").data).response.error
+            : JSON.parse(responseText).error;
+          assert.equal(error.code, statusCode === 429 ? "upstream_rate_limit" : "upstream_provider_unavailable");
+          assert.equal(error.message.includes("sensitive-provider-token"), false);
+          assert.equal(routeRateLimitStatus(route).providerCooldownRemainingMs, 180_000);
+          assert.equal(requests.length, 1, "upstream errors must not cause an implicit retry");
+          const retried = await fetchJson(`${serverUrl(router)}/v1/responses`, {
+            method: "POST", headers,
+            body: JSON.stringify({ model: route.id, input: "explicit client retry" }),
+          });
+          assert.equal(retried.id, "resp_explicit_retry_success");
+          assert.equal(requests.length, 2);
+          assert.deepEqual(sleeps, [180_000]);
+          assert.equal(requests[1].body.model, "gpt-6-astra");
+          assert.equal(requests[1].authorization, authMode === "api_key"
+            ? "Bearer fake-upstream-api-key" : "Bearer fake-codex-subscription-token");
+        } finally {
+          await close(router);
+          await close(upstream);
+          __resetRateLimiterForTests();
+        }
+      });
+    }
+  }
+}
+
+for (const authMode of ["api_key", "codex_openai"]) {
+  for (const compactCase of [
+    { name: "v2 trigger-only", kind: "v2", input: [{ type: "compaction_trigger" }] },
+    {
+      name: "v2 full-input control",
+      kind: "v2",
+      input: [
+        { type: "message", role: "user", content: "preserve the latest compact detail" },
+        { type: "compaction_trigger" },
+      ],
+    },
+    { name: "v1 empty-input", kind: "v1", input: [] },
+  ]) {
+    test(`explicit ${compactCase.name} bypasses idle replay on ${authMode} Responses routes`, async () => {
+      const upstreamRequests = [];
+      const native = authMode === "codex_openai";
+      const upstream = http.createServer(async (req, res) => {
+        const body = await readJson(req);
+        upstreamRequests.push({ path: req.url, authorization: req.headers.authorization, body });
+        const first = upstreamRequests.length === 1;
+        const text = first ? "the old final answer" : "the new compact handoff summary";
+        const response = {
+          id: first ? "resp_before_explicit_compact" : "resp_after_explicit_compact",
+          object: "response",
+          created_at: 1,
+          status: "completed",
+          model: "gpt-6-astra",
+          output: !first && native
+            ? [{ id: "cmp_explicit", type: "compaction", encrypted_content: "opaque-explicit-compact" }]
+            : [{
+                id: "msg_explicit",
+                type: "message",
+                role: "assistant",
+                phase: "final_answer",
+                status: "completed",
+                content: [{ type: "output_text", text, annotations: [] }],
+              }],
+          output_text: !first && native ? "" : text,
+          usage: { input_tokens: 12, output_tokens: 4, total_tokens: 16 },
+        };
+        if (body.stream) {
+          res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+          res.write(`event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response })}\n\n`);
+          res.end("data: [DONE]\n\n");
+        } else {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify(response));
+        }
+      });
+      await listen(upstream);
+      const router = createRouterServer({
+        host: "127.0.0.1",
+        port: 0,
+        authToken: "router-token",
+        clientAuth: { allowOpenAiBearer: true },
+        defaultModel: "cb-astra-explicit-compact",
+        models: [{
+          id: "cb-astra-explicit-compact",
+          api: "responses",
+          baseUrl: `${serverUrl(upstream)}/v1`,
+          model: "gpt-6-astra",
+          authMode,
+          ...(native ? {} : { apiKey: "fake-upstream-api-key" }),
+        }],
+      });
+      await listen(router);
+      const headers = {
+        "content-type": "application/json",
+        authorization: native ? "Bearer fake-codex-subscription-token" : "Bearer router-token",
+      };
+      try {
+        const first = await fetchJson(`${serverUrl(router)}/v1/responses`, {
+          method: "POST", headers,
+          body: JSON.stringify({ model: "cb-astra-explicit-compact", input: "finish this turn" }),
+        });
+        assert.equal(first.id, "resp_before_explicit_compact");
+        const endpoint = compactCase.kind === "v1" ? "/v1/responses/compact" : "/v1/responses";
+        const compactResponse = await fetch(`${serverUrl(router)}${endpoint}`, {
+          method: "POST", headers,
+          body: JSON.stringify({
+            model: "cb-astra-explicit-compact",
+            previous_response_id: first.id,
+            stream: compactCase.kind === "v2",
+            input: compactCase.input,
+          }),
+        });
+        const responseText = await compactResponse.text();
+        assert.equal(compactResponse.ok, true, responseText);
+        assert.equal(upstreamRequests.length, 2, "explicit compact must make a new upstream request");
+        const completed = compactCase.kind === "v2"
+          ? JSON.parse(parseSseEvents(responseText).find((event) => event.event === "response.completed").data).response
+          : JSON.parse(responseText);
+        assert.notEqual(completed.id, first.id);
+        const compaction = completed.output.find((item) => item.type === "compaction");
+        assert.ok(compaction, "explicit compact must return compaction, not a replayed final message");
+        assert.equal(upstreamRequests[1].body.model, "gpt-6-astra");
+        assert.equal(upstreamRequests[1].authorization,
+          native ? "Bearer fake-codex-subscription-token" : "Bearer fake-upstream-api-key");
+        assert.equal(upstreamRequests[1].path,
+          native && compactCase.kind === "v1" ? "/v1/responses/compact" : "/v1/responses");
+        if (native) {
+          assert.equal(compaction.encrypted_content, "opaque-explicit-compact");
+          if (compactCase.kind === "v2") {
+            assert.deepEqual(upstreamRequests[1].body.input.at(-1), { type: "compaction_trigger" });
+          }
+        } else {
+          assert.match(JSON.stringify(upstreamRequests[1].body), /finish this turn/);
+          assert.match(compaction.encrypted_content, /the new compact handoff summary/);
+        }
+      } finally {
+        await close(router);
+        await close(upstream);
+      }
+    });
+  }
+}
+
 test("codex_openai compact v1 forwards the native endpoint and opaque compaction item", async () => {
   let upstreamBody;
   let upstreamUrl;
@@ -12170,6 +12984,79 @@ test("API-key image edits stay on the selected provider edit endpoint", async ()
   }
 });
 
+test("image edits do not reach the provider when the client disconnects during multipart parsing", { timeout: 5000 }, async (t) => {
+  const parsed = Promise.withResolvers();
+  const resumeParsing = Promise.withResolvers();
+  const clientClosed = Promise.withResolvers();
+  const handled = Promise.withResolvers();
+  const realFormData = Request.prototype.formData;
+  // Keep the real multipart decoder, but control its asynchronous completion
+  // to exercise a close event that precedes upstream cancellation setup.
+  t.mock.method(Request.prototype, "formData", async function () {
+    const form = await realFormData.call(this);
+    parsed.resolve();
+    await resumeParsing.promise;
+    return form;
+  });
+  let upstreamCalls = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await readJson(req);
+    upstreamCalls += 1;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ created: 1, data: [{ b64_json: "b2s=" }] }));
+  });
+  await listen(upstream);
+  const router = createRouterServer({
+    host: "127.0.0.1", port: 0, authToken: "router-token", defaultModel: "image-route",
+    models: [{
+      id: "image-route", provider: "openai", api: "responses",
+      baseUrl: `${serverUrl(upstream)}/v1`, model: "gpt-image-1.5",
+      apiKey: "fixture-key", authMode: "api_key",
+    }],
+  });
+  const handler = router.listeners("request")[0];
+  router.removeListener("request", handler);
+  router.on("request", (req, res) => {
+    res.once("close", () => clientClosed.resolve());
+    Promise.resolve(handler(req, res)).then(handled.resolve, handled.reject);
+  });
+  await listen(router);
+  const controller = new AbortController();
+  const makeForm = () => {
+    const form = new FormData();
+    form.append("model", "gpt-image-1.5");
+    form.append("prompt", "test edit");
+    form.append("image", new Blob(["fixture-image"], { type: "image/png" }), "image.png");
+    return form;
+  };
+  try {
+    const request = fetch(`${serverUrl(router)}/v1/images/edits`, {
+      method: "POST", headers: { authorization: "Bearer router-token" },
+      body: makeForm(), signal: controller.signal,
+    }).catch((error) => error);
+    await parsed.promise;
+    controller.abort();
+    await request;
+    await clientClosed.promise;
+    resumeParsing.resolve();
+    await handled.promise;
+    assert.equal(upstreamCalls, 0, "a client already gone must not start a provider request");
+
+    const live = await fetch(`${serverUrl(router)}/v1/images/edits`, {
+      method: "POST", headers: { authorization: "Bearer router-token" }, body: makeForm(),
+    });
+    assert.equal(live.status, 200, await live.text());
+    assert.equal(upstreamCalls, 1, "reading a live request body to completion must remain allowed");
+  } finally {
+    resumeParsing.resolve();
+    controller.abort();
+    router.closeAllConnections?.();
+    upstream.closeAllConnections?.();
+    await close(router);
+    await close(upstream);
+  }
+});
+
 test("API-key image edits normalize multipart files before forwarding to the edit endpoint", async () => {
   let upstreamBody;
   const upstream = http.createServer(async (req, res) => {
@@ -12557,6 +13444,45 @@ async function exerciseChatCompact413Route(routeOverrides = {}) {
     await close(router);
     await close(upstream);
   }
+}
+
+function imageFallbackRoute(overrides = {}) {
+  return {
+    id: "cb-image-history-test",
+    displayName: "Image History Test",
+    api: "chat_completions",
+    baseUrl: "https://chat.example/v1",
+    model: "chat-model",
+    apiKey: "chat-key",
+    imageGeneration: {
+      enabled: true,
+      mode: "custom",
+      displayName: "Image Test Provider",
+      baseUrl: "https://images.example/v1",
+      endpoint: "/images/generations",
+      model: "image-v1",
+      apiKey: "image-key",
+    },
+    ...overrides,
+  };
+}
+
+function imageFallbackResponseCollector() {
+  const chunks = [];
+  return {
+    statusCode: null,
+    headers: null,
+    writeHead(statusCode, headers) {
+      this.statusCode = statusCode;
+      this.headers = headers;
+    },
+    end(chunk) {
+      if (chunk) chunks.push(Buffer.from(chunk));
+    },
+    body() {
+      return Buffer.concat(chunks).toString("utf8");
+    },
+  };
 }
 
 async function readJson(req) {

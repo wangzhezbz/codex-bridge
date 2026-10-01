@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import http from "node:http";
 import { EventEmitter } from "node:events";
 import {
@@ -16,8 +17,10 @@ import * as upstreamModule from "../src/upstream.js";
 import {
   __resetRateLimiterForTests,
   __setRateLimitClockForTests,
+  routeRateLimitStatus,
 } from "../src/rate-limit.js";
 import {
+  createProxyAgentCache,
   proxySettingsForUrl,
 } from "../src/proxy.js";
 import {
@@ -41,6 +44,30 @@ test("default upstream response guards use 64 MiB and 600-second time boundaries
   );
   assert.equal(upstreamModule.upstreamResponseLimitBytes({}), 64 * 1024 * 1024);
   assert.equal(upstreamModule.upstreamResponseIdleTimeoutMs({}), 600000);
+});
+
+test("proxy agent cache is LRU bounded and closes invalidated connection pools", () => {
+  const closed = [];
+  const cache = createProxyAgentCache({
+    capacity: 2,
+    createAgent: (url) => ({ url, close: () => { closed.push(url); } }),
+  });
+  const first = cache.get("http://proxy-a.test");
+  cache.get("http://proxy-b.test");
+  assert.equal(cache.get("http://proxy-a.test"), first);
+  cache.get("http://proxy-c.test");
+  assert.deepEqual(closed, ["http://proxy-b.test"]);
+  assert.equal(cache.size(), 2);
+  assert.equal(cache.invalidate("http://proxy-a.test"), true);
+  assert.deepEqual(closed, ["http://proxy-b.test", "http://proxy-a.test"]);
+  assert.equal(cache.invalidate("http://proxy-a.test"), false);
+});
+
+test("stream content sniffing keeps a bounded UTF-8 tail instead of concatenating every prior chunk", () => {
+  const source = fs.readFileSync(new URL("../src/upstream.js", import.meta.url), "utf8");
+  const occurrences = source.match(/sniffText = sniffCandidate\.slice\(-2048\)/gu) || [];
+  assert.equal(occurrences.length >= 2, true);
+  assert.doesNotMatch(source, /const bufferedText = Buffer\.concat\(bufferedChunks\)\.toString\("utf8"\);\s*if \(!looksLikeSseResponse\(bufferedText\)\)/u);
 });
 
 test("stateless native Responses routes replace previous_response_id with local history", async () => {
@@ -1363,52 +1390,48 @@ test("streaming responses wait for downstream drain before writing more data", a
   }
 });
 
-test("streaming responses cancel upstream when downstream backpressure never drains", async () => {
-  const originalFetch = globalThis.fetch;
-  let cancelled = false;
-  let failSafeClose;
-  const stream = new ReadableStream({
-    start(controller) {
-      controller.enqueue(new TextEncoder().encode("data: first\n\n"));
-      controller.enqueue(new TextEncoder().encode("data: second\n\n"));
-    },
-    cancel() {
-      cancelled = true;
-    },
-  });
-  globalThis.fetch = async () =>
-    new Response(stream, {
-      status: 200,
-      headers: { "content-type": "text/event-stream; charset=utf-8" },
+test("streaming responses close both sides when downstream backpressure never drains", async (t) => {
+  for (const api of ["chat_completions", "responses"]) await t.test(api, async () => {
+    const originalFetch = globalThis.fetch;
+    let cancelled = false;
+    let failSafeClose;
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"first"}\n\n'));
+      },
+      cancel() {
+        cancelled = true;
+      },
     });
+    globalThis.fetch = async () =>
+      new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream; charset=utf-8" },
+      });
 
-  try {
-    const res = backpressuredResponse();
-    failSafeClose = setTimeout(() => res.emit("close"), 250);
-    await assert.rejects(
-      proxyDirectChatCompletions(
-        {
-          model: "blocked-client",
-          messages: [{ role: "user", content: "hello" }],
-          stream: true,
-        },
-        {
-          id: "blocked-client",
-          api: "chat_completions",
-          baseUrl: "https://provider.example/v1",
-          model: "blocked-client",
-          apiKey: "test-key",
-        },
-        res,
-        { downstreamDrainTimeoutMs: 25 },
-      ),
-      (error) => error?.code === "client_closed_request",
-    );
-    assert.equal(cancelled, true);
-  } finally {
-    clearTimeout(failSafeClose);
-    globalThis.fetch = originalFetch;
-  }
+    try {
+      const res = backpressuredResponse();
+      res.write = (chunk) => { res.writes.push(Buffer.from(chunk)); return false; };
+      failSafeClose = setTimeout(() => res.emit("close"), 250);
+      const request = { model: "blocked-client", input: "hello", messages: [{ role: "user", content: "hello" }], stream: true };
+      const route = { id: "blocked-client", api, baseUrl: "https://provider.example/v1", model: "blocked-client", apiKey: "test-key" };
+      const context = { downstreamDrainTimeoutMs: 25, clientSignal: new AbortController().signal };
+      await assert.rejects(
+        api === "responses"
+          ? proxyResponsesApi(request, route, new ResponseHistory(), res, context)
+          : proxyDirectChatCompletions(request, route, res, context),
+        (error) => error?.code === "client_closed_request",
+      );
+      assert.equal(cancelled, true);
+      assert.equal(res.destroyed, true);
+      assert.equal(res.writes.length, 1, "a closed client must not receive a second error/completion event");
+      assert.equal(res.writableEnded, false, "an interrupted stream must not be presented as a completed response");
+      for (const event of ["drain", "close", "error"]) assert.equal(res.listenerCount(event), 0);
+    } finally {
+      clearTimeout(failSafeClose);
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
 
 test("Anthropic streaming chat requests use native Messages endpoint and return compatible SSE", async () => {
@@ -3327,7 +3350,46 @@ test("DeepSeek Responses preserves visible text across delta, done snapshots, an
   }
 });
 
-test("native Responses sends completion before slow history persistence finishes", async () => {
+test("non-stream history persistence has a hard deadline before response publication", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    id: "chatcmpl_history_timeout",
+    object: "chat.completion",
+    model: "deepseek-chat",
+    choices: [{ index: 0, message: { role: "assistant", content: "not published" }, finish_reason: "stop" }],
+  }), { status: 200, headers: { "content-type": "application/json" } });
+  const res = collectResponse();
+  const startedAt = Date.now();
+  try {
+    await assert.rejects(proxyChatCompletions(
+      { model: "deepseek-chat", input: "history timeout", stream: false },
+      {
+        id: "deepseek-chat",
+        displayName: "DeepSeek Chat",
+        provider: "deepseek",
+        api: "chat_completions",
+        baseUrl: "https://api.deepseek.com/v1",
+        model: "deepseek-chat",
+        apiKey: "test-key",
+        historyWriteTimeoutMs: 20,
+      },
+      { recordTurnAsync: () => new Promise(() => {}) },
+      res,
+      {},
+    ), (error) => {
+      assert.equal(error.code, "local_history_storage_unavailable");
+      assert.equal(error.internalCode, "history_write_timeout");
+      return true;
+    });
+    assert.equal(res.statusCode, null);
+    assert.equal(res.body(), "");
+    assert.ok(Date.now() - startedAt < 500);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("native Responses releases the proxy lifecycle before slow history persistence finishes", async () => {
   const originalFetch = globalThis.fetch;
   let resolveWrite;
   let proxySettled = false;
@@ -3391,19 +3453,20 @@ test("native Responses sends completion before slow history persistence finishes
     });
 
     await waitFor(() => res.body().includes("response.completed"), 500);
-    assert.equal(proxySettled, false);
+    await waitFor(() => proxySettled, 500);
+    assert.equal(proxySettled, true);
     assert.equal(history.getResponse(completedResponse.id)?.status, "completed");
 
     resolveWrite({ recordBytes: { messages: 1, response: 1, meta: 1 } });
     await proxyPromise;
-    assert.equal(proxySettled, true);
+    await waitFor(() => history.lookup(completedResponse.id).pendingPersistence !== true, 500);
   } finally {
     history.close();
     globalThis.fetch = originalFetch;
   }
 });
 
-test("chat-compatible streaming sends completion before slow history persistence finishes", async () => {
+test("chat-compatible streaming releases the proxy lifecycle before slow history persistence finishes", async () => {
   const originalFetch = globalThis.fetch;
   let resolveWrite;
   let proxySettled = false;
@@ -3442,11 +3505,12 @@ test("chat-compatible streaming sends completion before slow history persistence
     });
 
     await waitFor(() => res.body().includes("response.completed"), 500);
-    assert.equal(proxySettled, false);
+    await waitFor(() => proxySettled, 500);
+    assert.equal(proxySettled, true);
 
     resolveWrite({ recordBytes: { messages: 1, response: 1, meta: 1 } });
     await proxyPromise;
-    assert.equal(proxySettled, true);
+    await new Promise((resolve) => setImmediate(resolve));
   } finally {
     history.close();
     globalThis.fetch = originalFetch;
@@ -3600,6 +3664,62 @@ test("streaming ChatGPT requests refresh a stalled proxy connection before the r
     restoreProxyEnv(originalEnv);
   }
 });
+
+for (const hintCase of [
+  { name: "overload numeric", status: 503, retryAfter: "180", waitMs: 180_000 },
+  { name: "overload HTTP-date", status: 503, retryAfter: "Sun, 06 Sep 2026 00:03:00 GMT", waitMs: 180_000 },
+  { name: "overload without hint", status: 503, waitMs: 0 },
+  { name: "overload invalid hint", status: 503, retryAfter: "later", waitMs: 0 },
+  { name: "unrelated gateway error", status: 502, retryAfter: "180", waitMs: 0 },
+  { name: "legacy 429 fallback", status: 429, waitMs: 30_000 },
+]) {
+  test(`upstream ${hintCase.name} observes only the specified provider cooldown with pacing disabled`, async () => {
+    const startedAt = Date.parse("Sun, 06 Sep 2026 00:00:00 GMT");
+    let now = startedAt;
+    const sleeps = [];
+    let upstreamCalls = 0;
+    __resetRateLimiterForTests();
+    __setRateLimitClockForTests({
+      now: () => now,
+      sleep: async (ms) => { sleeps.push(ms); now += ms; },
+    });
+    const upstream = httpServer(async (_req, res) => {
+      upstreamCalls += 1;
+      res.writeHead(upstreamCalls === 1 ? hintCase.status : 200, {
+        "content-type": "application/json",
+        ...(upstreamCalls === 1 && hintCase.retryAfter ? { "retry-after": hintCase.retryAfter } : {}),
+      });
+      res.end(JSON.stringify(upstreamCalls === 1
+        ? { error: { code: "server_is_overloaded", message: "try later" } }
+        : { ok: true }));
+    });
+    await listen(upstream);
+    const route = {
+      id: `local-retry-after-${hintCase.name}`,
+      baseUrl: `${serverUrl(upstream)}/v1`,
+      api: "responses",
+      model: "gpt-6-astra",
+      apiKey: "fake-api-key",
+      localRateLimitEnabled: false,
+      rpm: 60,
+    };
+    try {
+      await assert.rejects(callJsonUpstream(`${route.baseUrl}/responses`, route, { input: "initial request" }),
+        (error) => error.statusCode === hintCase.status);
+      assert.equal(routeRateLimitStatus(route).providerCooldownRemainingMs, hintCase.waitMs);
+      assert.equal(upstreamCalls, 1, "the error must not trigger an automatic retry");
+      const response = await callJsonUpstream(`${route.baseUrl}/responses`, route, { input: "explicit retry" });
+      assert.deepEqual(response, { ok: true });
+      assert.equal(upstreamCalls, 2);
+      assert.deepEqual(sleeps, hintCase.waitMs ? [hintCase.waitMs] : []);
+      assert.equal(routeRateLimitStatus(route).localPacingNextAfterMs, 0);
+    } finally {
+      __resetRateLimiterForTests();
+      __resetUpstreamFailureCacheForTests();
+      await close(upstream);
+    }
+  });
+}
 
 test("callJsonUpstream preserves Retry-After headers on HTTP errors", async () => {
   const upstream = httpServer(async (_req, res) => {
@@ -4212,7 +4332,7 @@ test("upstream 429 waits through relaxed local cooldown when local rate limiting
   }
 });
 
-test("upstream retry-after cooldown is capped to avoid long local waits", async () => {
+test("upstream Retry-After is not shortened to the local fallback cooldown cap", async () => {
   const originalFetch = globalThis.fetch;
   const sleeps = [];
   let now = 0;
@@ -4279,7 +4399,7 @@ test("upstream retry-after cooldown is capped to avoid long local waits", async 
     );
 
     assert.equal(calls, 2);
-    assert.deepEqual(sleeps, [120_000]);
+    assert.deepEqual(sleeps, [36_000_000]);
     assert.deepEqual(response, { ok: true });
   } finally {
     globalThis.fetch = originalFetch;
@@ -5554,6 +5674,11 @@ function backpressuredResponse() {
   response.writes = [];
   response.destroyed = false;
   response.writableEnded = false;
+  response.destroy = () => {
+    response.destroyed = true;
+    queueMicrotask(() => response.emit("close"));
+    return response;
+  };
   response.writeHead = (statusCode, headers) => {
     response.statusCode = statusCode;
     response.headers = headers;

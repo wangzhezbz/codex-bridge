@@ -5,6 +5,54 @@ import {
   UpstreamTimeoutError,
 } from "../src/upstream-response-guard.js";
 import { parseSseEvents } from "../src/sse.js";
+import { createUpstreamErrorPresentation } from "../src/upstream-error-presentation.js";
+import { UpstreamHttpError } from "../src/upstream-network-errors.js";
+
+test("HTTP error presentation preserves valid Retry-After in JSON and initial SSE headers", () => {
+  const presentation = createUpstreamErrorPresentation({ UpstreamHttpError });
+  for (const statusCode of [429, 503]) {
+    for (const retryAfter of ["180", "Sun, 06 Sep 2026 00:03:00 GMT", "0", "0.01"]) {
+      for (const asResponsesStream of [false, true]) {
+        const res = collectResponse();
+        presentation.sendUpstreamError(res, new UpstreamHttpError(
+          statusCode,
+          JSON.stringify({ error: { message: "provider busy; Bearer sk-secret-value" } }),
+          "https://provider.example/v1/responses?api_key=secret-value",
+          { id: "retry-header-route" },
+          { headers: new Headers({ "retry-after": retryAfter }) },
+        ), { asResponsesStream });
+        assert.equal(res.headers["retry-after"], retryAfter);
+        const error = asResponsesStream
+          ? JSON.parse(parseSseEvents(res.body()).find((event) => event.event === "response.failed").data).response.error
+          : JSON.parse(res.body()).error;
+        assert.equal(error.code, statusCode === 429 ? "upstream_rate_limit" : "upstream_provider_unavailable");
+        assert.equal(error.message.includes("secret-value"), false);
+      }
+    }
+  }
+});
+
+test("HTTP error presentation rejects invalid Retry-After and does not rewrite sent headers", () => {
+  const presentation = createUpstreamErrorPresentation({ UpstreamHttpError });
+  for (const asResponsesStream of [false, true]) {
+    for (const retryAfter of ["", "-1", "1.5.2", "Infinity", "60\r\nx-secret: leak"]) {
+      const res = collectResponse();
+      presentation.sendUpstreamError(res, new UpstreamHttpError(
+        503, "provider busy", "https://provider.example/v1/responses", {},
+        { headers: { "retry-after": retryAfter } },
+      ), { asResponsesStream });
+      assert.equal(res.headers["retry-after"], undefined);
+    }
+    const res = collectResponse();
+    res.writeHead(200, { "retry-after": "existing-header", "content-type": "text/event-stream" });
+    presentation.sendUpstreamError(res, new UpstreamHttpError(
+      503, "provider busy", "https://provider.example/v1/responses", {},
+      { headers: { "retry-after": "180" } },
+    ), { asResponsesStream });
+    assert.equal(res.headers["retry-after"], "existing-header");
+    assert.equal(res.statusCode, 200);
+  }
+});
 
 test("standalone upstream error presentation preserves the diagnostic code without leaking URL secrets", async () => {
   const {
@@ -166,8 +214,11 @@ function collectResponse() {
     headersSent: false,
     writableEnded: false,
     statusCode: 0,
-    writeHead(statusCode) {
+    headers: {},
+    writeHead(statusCode, headers = {}) {
+      assert.equal(this.headersSent, false, "headers may only be written once");
       this.statusCode = statusCode;
+      this.headers = headers;
       this.headersSent = true;
     },
     end(chunk = "") {

@@ -7,6 +7,7 @@ const HOSTED_OUTPUT_CALL_TYPES = new Set([
   "image_generation_call",
   "web_search_call",
   "web_search_preview_call",
+  "multi_agent_call",
 ]);
 
 export function buildToolContext(responseTools = [], options = {}) {
@@ -182,6 +183,7 @@ export function isResponseToolOutputItem(item) {
   if (!item || typeof item !== "object") {
     return false;
   }
+  if (item.type === "multi_agent_call_output") return false;
   if (
     [
       "function_call_output",

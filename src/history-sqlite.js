@@ -19,6 +19,8 @@ const DEFAULT_MAX_TOMBSTONE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_INCREMENTAL_VACUUM_PAGES = 128;
 const DEFAULT_WAL_AUTOCHECKPOINT_PAGES = 64;
 const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES = 512 * 1024;
+const DEFAULT_WRITER_PENDING_LIMIT = 32;
+const DEFAULT_WRITER_REQUEST_TIMEOUT_MS = 2 * 60_000;
 const SAFE_META_KEYS = new Set([
   "api",
   "routeId",
@@ -116,6 +118,14 @@ export class HistorySqliteStore {
     this.journalSizeLimitBytes = positiveNumber(
       options.journalSizeLimitBytes,
       DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
+    );
+    this.writerPendingLimit = Math.min(
+      positiveInteger(options.writerPendingLimit, DEFAULT_WRITER_PENDING_LIMIT),
+      256,
+    );
+    this.writerRequestTimeoutMs = Math.min(
+      positiveInteger(options.writerRequestTimeoutMs, DEFAULT_WRITER_REQUEST_TIMEOUT_MS),
+      10 * 60_000,
     );
     this.writer = null;
     fs.mkdirSync(path.dirname(this.path), { recursive: true });
@@ -264,6 +274,8 @@ export class HistorySqliteStore {
         incrementalVacuumPages: this.incrementalVacuumPages,
         walAutocheckpointPages: this.walAutocheckpointPages,
         journalSizeLimitBytes: this.journalSizeLimitBytes,
+        writerPendingLimit: this.writerPendingLimit,
+        writerRequestTimeoutMs: this.writerRequestTimeoutMs,
       });
     }
     return this.writer.recordTurn(turn, Number(this.now()));
@@ -274,17 +286,24 @@ export class HistorySqliteStore {
       return missingResult("missing");
     }
     try {
-      const row = this.db.prepare(
-        "SELECT * FROM response_history WHERE response_id = ?",
+      const metadata = this.db.prepare(
+        `SELECT expires_at, uncompressed_bytes, stored_bytes,
+          length(messages_gzip) AS messages_stored_bytes,
+          length(response_gzip) AS response_stored_bytes,
+          length(meta_gzip) AS meta_stored_bytes
+        FROM response_history WHERE response_id = ?`,
       ).get(responseId);
-      if (!row) {
+      if (!metadata) {
         const tombstone = this.db.prepare(
           "SELECT reason FROM response_history_tombstones WHERE response_id = ?",
         ).get(responseId);
         return missingResult(tombstone?.reason || "missing");
       }
       const now = Number(this.now());
-      if (Number(row.expires_at) <= now) {
+      if (!validHistoryRowMetadata(metadata, this.maxRecordBytes)) {
+        return missingResult("corrupt");
+      }
+      if (Number(metadata.expires_at) <= now) {
         this.db.exec("BEGIN IMMEDIATE");
         let pruneResult;
         try {
@@ -306,9 +325,23 @@ export class HistorySqliteStore {
       let response;
       let meta;
       try {
-        messages = decodeJson(row.messages_gzip);
-        response = decodeJson(row.response_gzip);
-        meta = decodeJson(row.meta_gzip);
+        const row = this.db.prepare(
+          "SELECT messages_gzip, response_gzip, meta_gzip FROM response_history WHERE response_id = ?",
+        ).get(responseId);
+        if (!row) return missingResult("missing");
+        let remainingBytes = this.maxRecordBytes;
+        const decodedMessages = decodeJson(row.messages_gzip, remainingBytes);
+        messages = decodedMessages.value;
+        remainingBytes -= decodedMessages.bytes;
+        const decodedResponse = decodeJson(row.response_gzip, remainingBytes);
+        response = decodedResponse.value;
+        remainingBytes -= decodedResponse.bytes;
+        const decodedMeta = decodeJson(row.meta_gzip, remainingBytes);
+        meta = decodedMeta.value;
+        const actualBytes = decodedMessages.bytes + decodedResponse.bytes + decodedMeta.bytes;
+        if (actualBytes !== Number(metadata.uncompressed_bytes)) {
+          return missingResult("corrupt");
+        }
       } catch {
         return missingResult("corrupt");
       }
@@ -323,8 +356,8 @@ export class HistorySqliteStore {
         response,
         meta,
         source: "sqlite",
-        uncompressedBytes: Number(row.uncompressed_bytes),
-        storedBytes: Number(row.stored_bytes),
+        uncompressedBytes: Number(metadata.uncompressed_bytes),
+        storedBytes: Number(metadata.stored_bytes),
       };
     } catch (error) {
       return {
@@ -585,6 +618,14 @@ class HistorySqliteWriter {
     this.pending = new Map();
     this.closed = false;
     this.closing = false;
+    this.pendingLimit = Math.min(
+      positiveInteger(options?.writerPendingLimit, DEFAULT_WRITER_PENDING_LIMIT),
+      256,
+    );
+    this.requestTimeoutMs = Math.min(
+      positiveInteger(options?.writerRequestTimeoutMs, DEFAULT_WRITER_REQUEST_TIMEOUT_MS),
+      10 * 60_000,
+    );
     this.worker = new Worker(new URL("./history-sqlite-worker.js", import.meta.url), {
       workerData: { historyPath, options },
     });
@@ -604,9 +645,17 @@ class HistorySqliteWriter {
         "Response history writer is closed.",
       ));
     }
+    if (this.pending.size >= this.pendingLimit) {
+      return Promise.reject(historyStorageError(
+        "history_writer_overloaded",
+        `Response history writer already has ${this.pending.size} pending writes.`,
+      ));
+    }
     const requestId = this.nextRequestId++;
-    return new Promise((resolve, reject) => {
-      this.pending.set(requestId, { resolve, reject });
+    let pending;
+    const completion = new Promise((resolve, reject) => {
+      pending = { resolve, reject, timer: null };
+      this.pending.set(requestId, pending);
       try {
         this.worker.postMessage({ type: "record_turn", requestId, turn, now });
       } catch (error) {
@@ -614,6 +663,21 @@ class HistorySqliteWriter {
         reject(error);
       }
     });
+    const deadline = new Promise((resolve, reject) => {
+      pending.timer = setTimeout(() => {
+        if (this.pending.get(requestId) !== pending) return;
+        const error = historyStorageError(
+          "history_writer_timeout",
+          `Response history writer did not finish within ${this.requestTimeoutMs}ms.`,
+        );
+        // Timing out the caller cannot cancel a posted SQLite write. Keep its
+        // capacity reserved and expose its eventual result for history recovery.
+        error.completion = completion;
+        reject(error);
+      }, this.requestTimeoutMs);
+      pending.timer.unref?.();
+    });
+    return Promise.race([completion, deadline]).finally(() => clearTimeout(pending.timer));
   }
 
   handleMessage(message = {}) {
@@ -625,6 +689,7 @@ class HistorySqliteWriter {
       return;
     }
     this.pending.delete(message.requestId);
+    clearTimeout(pending.timer);
     if (message.ok) {
       pending.resolve(message.result);
       return;
@@ -638,6 +703,7 @@ class HistorySqliteWriter {
     }
     this.closed = true;
     for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
       pending.reject(error);
     }
     this.pending.clear();
@@ -660,6 +726,7 @@ class HistorySqliteWriter {
       "Response history writer closed before the write completed.",
     );
     for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
       pending.reject(error);
     }
     this.pending.clear();
@@ -695,8 +762,32 @@ function encodeJson(value) {
   };
 }
 
-function decodeJson(value) {
-  return JSON.parse(zlib.gunzipSync(Buffer.from(value)).toString("utf8"));
+function decodeJson(value, maxOutputLength) {
+  if (!Number.isSafeInteger(maxOutputLength) || maxOutputLength <= 0) {
+    throw historyStorageError("history_record_too_large", "Response history decode budget is exhausted.");
+  }
+  const decoded = zlib.gunzipSync(Buffer.from(value), { maxOutputLength });
+  return {
+    value: JSON.parse(decoded.toString("utf8")),
+    bytes: decoded.length,
+  };
+}
+
+function validHistoryRowMetadata(row, maxRecordBytes) {
+  const uncompressed = Number(row?.uncompressed_bytes);
+  const stored = Number(row?.stored_bytes);
+  const lengths = [
+    Number(row?.messages_stored_bytes),
+    Number(row?.response_stored_bytes),
+    Number(row?.meta_stored_bytes),
+  ];
+  if (!Number.isSafeInteger(uncompressed) || uncompressed < 0 || uncompressed > maxRecordBytes
+    || !Number.isSafeInteger(stored) || stored < 0
+    || lengths.some((value) => !Number.isSafeInteger(value) || value < 0)
+    || lengths.reduce((sum, value) => sum + value, 0) !== stored) {
+    return false;
+  }
+  return stored <= maxRecordBytes + 1024 * 1024;
 }
 
 function sanitizeMeta(value) {

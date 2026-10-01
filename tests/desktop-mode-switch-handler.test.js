@@ -55,6 +55,66 @@ function successDependencies(overrides = {}) {
   };
 }
 
+test("API recovery preserves only the explicitly selected API models in their existing order", async () => {
+  let committedIds;
+  const saved = ['subscription','custom-b','api-a'];
+  const settings = baseSettings({
+    selectionPath:()=>'fixture-selection.json',
+    readJsonIfExists:()=>({selectedModelIds:saved}),
+    modelCatalog:()=>[
+      {presetId:'subscription',authMode:'codex_openai'},
+      {presetId:'api-a',authMode:'api_key'},
+      {presetId:'custom-b',authMode:'api_key'},
+      {presetId:'unselected',authMode:'api_key'},
+    ],
+    applyModeSwitchTransaction:async ({selectedModelIds})=>{committedIds=selectedModelIds;return {revision:'recovery',restartRequired:true};},
+  });
+  await runModeSelect({settings,...successDependencies({routerRunning:false}),
+    preserveApiSelection:true,expectedSelectedModelIds:[...saved]});
+  assert.deepEqual(committedIds,['custom-b','api-a']);
+  assert.deepEqual(saved,['subscription','custom-b','api-a']);
+});
+
+test("API recovery never substitutes defaults when no selected API model remains", async () => {
+  let writes=0;
+  const settings=baseSettings({selectionPath:()=>'',readJsonIfExists:()=>({selectedModelIds:['subscription']}),
+    modelCatalog:()=>[{presetId:'subscription',authMode:'codex_openai'},{presetId:'unselected',authMode:'api_key'}],
+    applyModeSwitchTransaction:async ()=>{writes++;return {};}});
+  await assert.rejects(runModeSelect({settings,...successDependencies({routerRunning:false}),
+    preserveApiSelection:true,expectedSelectedModelIds:['subscription']}),/API/);
+  assert.equal(writes,0);
+});
+
+test("API recovery refuses a changed selection rather than changing billing for unconfirmed models", async () => {
+  let writes=0;
+  const settings=baseSettings({selectionPath:()=>'',readJsonIfExists:()=>({selectedModelIds:['api-b']}),
+    modelCatalog:()=>[{presetId:'api-a',authMode:'api_key'},{presetId:'api-b',authMode:'api_key'}],
+    applyModeSwitchTransaction:async ()=>{writes++;return {};}});
+  await assert.rejects(runModeSelect({settings,...successDependencies({routerRunning:false}),
+    preserveApiSelection:true,expectedSelectedModelIds:['api-a']}),/变化|重新/);
+  assert.equal(writes,0);
+});
+
+test("switching back to hybrid preserves the current custom API selection and order", async () => {
+  let committedIds;
+  const settings=baseSettings({selectionPath:()=>'',readJsonIfExists:()=>({selectedModelIds:['custom-b','custom-a']}),
+    modelCatalog:()=>[{presetId:'subscription',authMode:'codex_openai'},{presetId:'custom-a',authMode:'api_key'},{presetId:'custom-b',authMode:'api_key'}],
+    applyModeSwitchTransaction:async ({selectedModelIds})=>{committedIds=selectedModelIds;return {revision:'switched'};}});
+  await runModeSelect({settings,...successDependencies({mode:'hybrid',routerRunning:false}),preserveSelection:true,
+    expectedSelectedModelIds:['custom-b','custom-a']});
+  assert.deepEqual(committedIds,['custom-b','custom-a']);
+});
+
+test("ordinary preserving mode switch rejects stale confirmation without restoring defaults", async () => {
+  let writes=0;
+  const settings=baseSettings({selectionPath:()=>'',readJsonIfExists:()=>({selectedModelIds:['api-b']}),
+    modelCatalog:()=>[{presetId:'api-a',authMode:'api_key'},{presetId:'api-b',authMode:'api_key'}],
+    applyModeSwitchTransaction:async ()=>{writes++;return {};}});
+  await assert.rejects(runModeSelect({settings,...successDependencies({mode:'hybrid',routerRunning:false}),preserveSelection:true,
+    expectedSelectedModelIds:['api-a']}),/变化|重新/);
+  assert.equal(writes,0);
+});
+
 test("mode selection waits for the transaction and running Router verification before locator and broadcast", async () => {
   const events = [];
   let releaseTransaction;

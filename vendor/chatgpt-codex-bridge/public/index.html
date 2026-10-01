@@ -78,16 +78,16 @@
       <main class="main-surface">
         <section id="projectView" class="project-view" aria-label="绑定当前会话">
           <div class="project-hero">
-            <p class="kicker">当前 Codex 会话</p>
-            <h1>先有 Codex 会话，再绑定右侧 G某T</h1>
-            <p>在当前 Codex 会话里打开这个页面后，绑定它自己的 G某T 会话和本地项目目录。后续消息、文件和上下文只归这个会话使用。</p>
+            <p class="kicker">已保存的项目</p>
+            <h1>选择项目，继续使用</h1>
+            <p>已绑定的项目会保存在下方，点击“进入”即可继续，无需重复绑定。第一次使用新项目时，再填写下方信息。</p>
           </div>
 
           <section id="onboardingGuide" class="onboarding-guide" aria-label="首次使用检查">
             <div class="onboarding-copy">
               <p class="kicker">首次使用</p>
               <h2>先确认三件事</h2>
-              <p>页面能打开说明本地服务已启动；绑定当前会话后点自检，确认扩展、G某T 会话和规则都在同一条链路上。</p>
+              <p>页面能打开说明本地服务已启动；绑定当前会话后点自检，确认扩展、GPT 会话和规则都在同一条链路上。</p>
             </div>
             <ol class="onboarding-steps">
               <li><span>1</span><strong>打开本页</strong></li>
@@ -104,7 +104,7 @@
               <input id="projectNameInput" name="name" autocomplete="off" placeholder="例如：游戏登录页">
             </label>
             <label>
-              G某T 会话
+              GPT 会话
               <input id="projectUrlInput" name="chatgptProjectUrl" type="text" autocomplete="off" spellcheck="false" placeholder="粘贴目标会话地址">
             </label>
             <label>
@@ -169,14 +169,14 @@
           <form id="chatForm" class="composer">
             <div id="composerBox" class="composer-box">
               <div id="attachmentTray" class="attachment-tray" hidden></div>
-              <textarea id="chatInput" name="text" placeholder="给 G某T 发消息"></textarea>
+              <textarea id="chatInput" name="text" placeholder="给 GPT 发消息"></textarea>
               <div class="composer-footer">
                 <label class="attach-button" title="添加本机文件" aria-label="添加本机文件">
                   <span aria-hidden="true">+</span>
                   <input id="composerFileInput" type="file" multiple>
                 </label>
                 <div class="composer-footer-right">
-                  <select id="modeSelect" class="preference-select mode-select" aria-label="G某T 模式">
+                  <select id="modeSelect" class="preference-select mode-select" aria-label="GPT 模式">
                     <option value="default">默认</option>
                     <option value="fast">极速 5.5</option>
                     <option value="balanced" selected>中</option>
@@ -184,7 +184,8 @@
                     <option value="high">极高</option>
                     <option value="pro">Pro</option>
                   </select>
-                  <select id="modelSelect" class="preference-select model-select" aria-label="G某T 模型">
+                  <select id="modelSelect" class="preference-select model-select" aria-label="GPT 模型">
+                    <option value="latest">最新（网页）</option>
                     <option value="gpt-5.6-sol">5.6 Sol</option>
                     <option value="gpt-5.5">5.5</option>
                     <option value="gpt-5.4">5.4</option>
@@ -210,7 +211,7 @@
         </form>
         <form id="bindingForm" class="settings-form">
           <label>
-            G某T 会话
+            GPT 会话
             <input id="settingsProjectUrlInput" name="chatgptProjectUrl" type="text" autocomplete="off" spellcheck="false">
           </label>
           <label>
@@ -218,6 +219,17 @@
             <input id="settingsTargetRepoInput" name="targetRepo" autocomplete="off">
           </label>
           <button type="submit">保存</button>
+        </form>
+      </dialog>
+
+      <dialog id="confirmActionDialog" class="panel-dialog" aria-labelledby="confirmActionTitle" aria-describedby="confirmActionMessage">
+        <form method="dialog" class="settings-form">
+          <h2 id="confirmActionTitle">确认操作</h2>
+          <p id="confirmActionMessage"></p>
+          <div class="dialog-actions">
+            <button type="submit" value="cancel" autofocus>取消</button>
+            <button type="submit" value="confirm">确认删除</button>
+          </div>
         </form>
       </dialog>
 
@@ -269,7 +281,7 @@
             <button type="submit" class="icon-button" aria-label="关闭">×</button>
           </div>
         </form>
-        <img id="imagePreview" alt="G某T 输出图片预览">
+        <img id="imagePreview" alt="GPT 输出图片预览">
       </dialog>
 
       <p id="toast" class="toast" role="status"></p>

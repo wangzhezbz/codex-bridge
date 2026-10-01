@@ -197,6 +197,23 @@ test("route health snapshot reports degraded routes and recovers after success",
   assert.equal(snapshot.routes[0].lastErrorType, "parameter_error");
 });
 
+test("route health discards records for routes removed from the current config", () => {
+  const store = createRouteHealthStore({
+    rateLimitStatus: () => ({ cooldownRemainingMs: 0, nextAfterMs: 0 }),
+  });
+  const oldRoute = {
+    id: "removed-route", provider: "custom", api: "responses", model: "old-model",
+  };
+  const currentRoute = {
+    id: "current-route", provider: "custom", api: "responses", model: "new-model",
+  };
+  store.recordError(oldRoute, { statusCode: 500, message: "old failure" });
+  store.snapshot({ models: [currentRoute] });
+  const readded = store.snapshot({ models: [oldRoute] });
+  assert.equal(readded.routes[0].status, "unknown");
+  assert.equal(readded.routes[0].lastError, "");
+});
+
 test("route health snapshot exposes route availability and cooldown state", () => {
   const store = createRouteHealthStore({
     rateLimitStatus: (route) => route.id === "cooling-route"

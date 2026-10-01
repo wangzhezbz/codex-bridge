@@ -1,6 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
 import { asArray, stringifyJson } from "./json.js";
-import { normalizeAdapterProfile, reasoningParamsForAdapter } from "./adapter-profile.js";
+import { isDeepSeekThinkingModel, normalizeAdapterProfile, reasoningParamsForAdapter } from "./adapter-profile.js";
 import { contextPolicyForRoute } from "./context-policy.js";
 import {
   buildToolContext,
@@ -2160,7 +2160,7 @@ function routeSupportsReasoningContent(route = {}) {
   ) {
     return true;
   }
-  if (provider.includes("deepseek") && /deepseek-v4/i.test(model)) {
+  if (provider.includes("deepseek") && isDeepSeekThinkingModel(model)) {
     return true;
   }
   try {
@@ -2168,7 +2168,7 @@ function routeSupportsReasoningContent(route = {}) {
     if (hostname.includes("moonshot") && /^kimi-k2\.[67]/i.test(model)) {
       return true;
     }
-    return hostname.includes("deepseek") && /deepseek-v4/i.test(model);
+    return hostname.includes("deepseek") && isDeepSeekThinkingModel(model);
   } catch {
     return false;
   }

@@ -1,6 +1,18 @@
 const { spawn } = require("node:child_process");
-const fs = require("node:fs");
 const path = require("node:path");
+const { spawnDetachedWithConfirmation } = require("./openai-desktop-compat.cjs");
+const {
+  cancelResponseBody,
+  readBoundedResponseText,
+} = require("../shared/bounded-response-body.cjs");
+const { readBoundedLocalFile } = require("../shared/bounded-local-file.cjs");
+const { runWithNetworkDeadline } = require("../shared/network-deadline.cjs");
+
+const MAX_LOCAL_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_LOCAL_BROWSER_BYTES = 16 * 1024 * 1024;
+const MAX_LOCAL_EXCERPT_CHARACTERS = 100_000;
+const MAX_LOCAL_REQUEST_TIMEOUT_MS = 5 * 60_000;
+const MAX_LOCAL_SCREENSHOT_BYTES = 32 * 1024 * 1024;
 
 function createDesktopLocalCapabilityExecutor(deps = {}) {
   return async function executeDesktopLocalCapability(payload = {}) {
@@ -52,33 +64,36 @@ async function executeDesktopLocalFileCapability(payload = {}, _deps = {}) {
     throwLocalError("local_file_missing_path", "本地文件处理需要提供 path、filePath 或 localPath。");
   }
 
-  let stat;
+  let read;
   try {
-    stat = fs.statSync(filePath);
-  } catch {
+    read = await readBoundedLocalFile(filePath, {
+      maxBytes: boundedPositiveInteger(input.maxBytes || input.max_bytes, 1024 * 1024, MAX_LOCAL_FILE_BYTES),
+    });
+  } catch (error) {
+    if (error?.code === "bounded_local_file_not_file") {
+      throwLocalError("local_file_not_file", `本地文件处理只能读取明确的文件路径：${filePath}`);
+    }
+    if (error?.code === "bounded_local_file_too_large") {
+      throwLocalError("local_file_too_large", `本地文件过大：${error.actualBytes} bytes，当前硬上限 ${error.maxBytes} bytes。`);
+    }
     throwLocalError("local_file_not_found", `本地文件不存在或不可访问：${filePath}`);
   }
-  if (!stat.isFile()) {
-    throwLocalError("local_file_not_file", `本地文件处理只能读取明确的文件路径：${filePath}`);
-  }
-
-  const maxBytes = positiveInteger(input.maxBytes || input.max_bytes, 1024 * 1024);
-  if (stat.size > maxBytes) {
-    throwLocalError("local_file_too_large", `本地文件过大：${stat.size} bytes，当前上限 ${maxBytes} bytes。`);
-  }
-
-  const buffer = fs.readFileSync(filePath);
+  const { buffer } = read;
   if (looksBinary(buffer)) {
     throwLocalError("local_file_binary_unsupported", "本地文件处理目前只支持文本文件，暂不读取明显的二进制文件。");
   }
 
   const content = buffer.toString("utf8").replace(/\u0000/g, "");
-  const excerptLimit = positiveInteger(input.maxCharacters || input.max_chars || input.limit, 6000);
+  const excerptLimit = boundedPositiveInteger(
+    input.maxCharacters || input.max_chars || input.limit, 6000, MAX_LOCAL_EXCERPT_CHARACTERS,
+  );
   const excerpt = content.slice(0, excerptLimit);
   const truncated = content.length > excerpt.length;
   const fileName = path.basename(filePath);
   if (isInspectFileAction(action)) {
-    const previewLimit = positiveInteger(input.maxCharacters || input.max_chars || input.limit, 2000);
+    const previewLimit = boundedPositiveInteger(
+      input.maxCharacters || input.max_chars || input.limit, 2000, MAX_LOCAL_EXCERPT_CHARACTERS,
+    );
     const preview = content.slice(0, previewLimit);
     const previewTruncated = content.length > preview.length;
     const mimeType = localTextMimeType(filePath);
@@ -88,7 +103,7 @@ async function executeDesktopLocalFileCapability(payload = {}, _deps = {}) {
         `文件检查：${fileName}`,
         filePath,
         `类型：${mimeType}`,
-        `大小：${stat.size} bytes`,
+        `大小：${read.size} bytes`,
         `行数：${countTextLines(content)}`,
         "",
         preview,
@@ -100,7 +115,7 @@ async function executeDesktopLocalFileCapability(payload = {}, _deps = {}) {
       extension,
       mimeType,
       encoding: "utf8",
-      sizeBytes: stat.size,
+      sizeBytes: read.size,
       lineCount: countTextLines(content),
       preview,
       truncated: previewTruncated,
@@ -114,7 +129,7 @@ async function executeDesktopLocalFileCapability(payload = {}, _deps = {}) {
     filePath,
     fileName,
     mimeType: localTextMimeType(filePath),
-    sizeBytes: stat.size,
+    sizeBytes: read.size,
     excerpt,
     truncated,
     providerId: provider.id || "",
@@ -189,11 +204,20 @@ async function captureComputerUseDesktopScreenshot({ input = {}, provider = {}, 
   }
 
   let bytes;
+  const timeoutMs = localScreenshotTimeoutMs(input);
   try {
-    bytes = await captureDesktopScreenshot({
+    bytes = await runWithNetworkDeadline((signal) => captureDesktopScreenshot({
       displayId: String(input.displayId || input.display_id || "").trim(),
+      signal,
+    }), {
+      timeoutMs,
+      createTimeoutError: () => localCapabilityError(
+        "local_desktop_screenshot_timeout",
+        `桌面截图超过 ${Math.ceil(timeoutMs / 1000)} 秒仍未完成，已停止等待。`,
+      ),
     });
   } catch (error) {
+    if (error?.code === "local_desktop_screenshot_timeout") throw error;
     throwLocalError("local_desktop_screenshot_failed", `桌面截图失败：${error?.message || "截图执行失败"}`);
   }
   const buffer = Buffer.isBuffer(bytes)
@@ -206,6 +230,7 @@ async function captureComputerUseDesktopScreenshot({ input = {}, provider = {}, 
   if (!buffer?.length) {
     throwLocalError("local_desktop_screenshot_failed", "桌面截图失败：桌面执行器没有返回图片内容。");
   }
+  assertLocalScreenshotSize(buffer, input);
   return {
     text: "桌面截图已生成。这不是完整 Computer Use，不会自动点击、输入或操作窗口。",
     action: "screenshot_desktop",
@@ -312,43 +337,61 @@ async function readBrowserUrl({ url = "", provider = {}, input = {}, fetchImpl =
   if (typeof fetchImpl !== "function") {
     throwLocalError("local_executor_not_configured", "本地浏览器读取能力还没有可用的网络执行器。");
   }
-  let response;
+  const timeoutMs = boundedPositiveInteger(
+    input.timeoutMs || input.timeout_ms || input.requestTimeoutMs || input.request_timeout_ms,
+    30_000,
+    MAX_LOCAL_REQUEST_TIMEOUT_MS,
+  );
+  let fetched;
   try {
-    response = await fetchImpl(url, {
-      method: "GET",
-      headers: {
-        accept: "text/html,text/plain,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "user-agent": "CodexBridge Local Browser Reader",
-      },
+    fetched = await runWithNetworkDeadline(async (signal) => {
+      const response = await fetchImpl(url, {
+        method: "GET",
+        headers: {
+          accept: "text/html,text/plain,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "user-agent": "CodexBridge Local Browser Reader",
+        },
+        ...(signal ? { signal } : {}),
+      });
+      const status = Number(response?.status || 0);
+      if (!response || response.ok === false) {
+        cancelResponseBody(response);
+        throw localCapabilityError("local_browser_fetch_failed", `网页读取失败：HTTP ${status || "unknown"}`);
+      }
+      const contentType = responseHeader(response, "content-type");
+      const maxBytes = boundedPositiveInteger(
+        input.maxBytes || input.max_bytes || input.maxBodyBytes || input.max_body_bytes,
+        2 * 1024 * 1024,
+        MAX_LOCAL_BROWSER_BYTES,
+      );
+      const body = await readBoundedResponseText(response, {
+        maxBytes,
+        signal,
+        createTooLargeError: ({ actualBytes }) => localCapabilityError(
+          "local_browser_response_too_large",
+          `网页内容过大：${actualBytes} bytes，当前上限 ${maxBytes} bytes。请减少页面范围后重试。`,
+        ),
+      });
+      return { body, contentType, status };
+    }, {
+      timeoutMs,
+      createTimeoutError: () => localCapabilityError(
+        "local_browser_timeout",
+        `网页读取超过 ${Math.ceil(timeoutMs / 1000)} 秒，已停止等待。请检查网址、网络或代理后重试。`,
+      ),
     });
   } catch (error) {
+    if (error?.code) {
+      throw error;
+    }
     throwLocalError("local_browser_fetch_failed", `网页读取失败：${error?.message || "网络请求失败"}`);
   }
 
-  const status = Number(response?.status || 0);
-  if (!response || response.ok === false) {
-    throwLocalError("local_browser_fetch_failed", `网页读取失败：HTTP ${status || "unknown"}`);
-  }
-
-  const contentType = responseHeader(response, "content-type");
-  const maxBytes = positiveInteger(input.maxBytes || input.max_bytes || input.maxBodyBytes || input.max_body_bytes, 2 * 1024 * 1024);
-  const contentLength = Number.parseInt(responseHeader(response, "content-length"), 10);
-  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
-    throwLocalError(
-      "local_browser_response_too_large",
-      `网页内容过大：${contentLength} bytes，当前上限 ${maxBytes} bytes。请调小页面范围或提高 maxBytes。`,
-    );
-  }
-  const body = typeof response.text === "function" ? await response.text() : "";
-  const bodyBytes = Buffer.byteLength(String(body || ""), "utf8");
-  if (bodyBytes > maxBytes) {
-    throwLocalError(
-      "local_browser_response_too_large",
-      `网页内容过大：${bodyBytes} bytes，当前上限 ${maxBytes} bytes。请调小页面范围或提高 maxBytes。`,
-    );
-  }
+  const { body, contentType, status } = fetched;
   const title = contentType.includes("html") ? extractHtmlTitle(body) : "";
-  const excerptLimit = positiveInteger(input.maxCharacters || input.max_chars || input.limit, 6000);
+  const excerptLimit = boundedPositiveInteger(
+    input.maxCharacters || input.max_chars || input.limit, 6000, MAX_LOCAL_EXCERPT_CHARACTERS,
+  );
   const fullText = contentType.includes("html") ? htmlToReadableText(body) : collapseWhitespace(String(body || ""));
   const excerpt = fullText.slice(0, excerptLimit);
   const truncated = fullText.length > excerpt.length;
@@ -379,13 +422,22 @@ async function captureBrowserScreenshot({
     throwLocalError("local_executor_not_configured", "本地网页截图能力还没有接入桌面执行器。");
   }
   let bytes;
+  const timeoutMs = localScreenshotTimeoutMs(input);
   try {
-    bytes = await capturePageScreenshot({
+    bytes = await runWithNetworkDeadline((signal) => capturePageScreenshot({
       url,
       viewport: normalizeViewport(input.viewport),
       fullPage: Boolean(input.fullPage || input.full_page),
+      signal,
+    }), {
+      timeoutMs,
+      createTimeoutError: () => localCapabilityError(
+        "local_browser_screenshot_timeout",
+        `网页截图超过 ${Math.ceil(timeoutMs / 1000)} 秒仍未完成，已停止等待。`,
+      ),
     });
   } catch (error) {
+    if (error?.code === "local_browser_screenshot_timeout") throw error;
     throwLocalError("local_browser_screenshot_failed", `网页截图失败：${error?.message || "截图执行失败"}`);
   }
   const buffer = Buffer.isBuffer(bytes)
@@ -398,6 +450,7 @@ async function captureBrowserScreenshot({
   if (!buffer?.length) {
     throwLocalError("local_browser_screenshot_failed", "网页截图失败：桌面执行器没有返回图片内容。");
   }
+  assertLocalScreenshotSize(buffer, input);
   return {
     text: `网页截图已生成：${url}`,
     action: "screenshot_url",
@@ -417,6 +470,28 @@ function localCapabilityInput(request = {}) {
     return { url: input };
   }
   return input && typeof input === "object" && !Array.isArray(input) ? input : {};
+}
+
+function localScreenshotTimeoutMs(input = {}) {
+  return boundedPositiveInteger(
+    input.timeoutMs || input.timeout_ms || input.requestTimeoutMs || input.request_timeout_ms,
+    60_000,
+    MAX_LOCAL_REQUEST_TIMEOUT_MS,
+  );
+}
+
+function assertLocalScreenshotSize(buffer, input = {}) {
+  const maxBytes = boundedPositiveInteger(
+    input.maxBytes || input.max_bytes || input.maxAssetBytes || input.max_asset_bytes,
+    MAX_LOCAL_SCREENSHOT_BYTES,
+    MAX_LOCAL_SCREENSHOT_BYTES,
+  );
+  if (buffer.length > maxBytes) {
+    throwLocalError(
+      "local_screenshot_too_large",
+      `本地截图过大：${buffer.length} bytes，当前硬上限 ${maxBytes} bytes。请降低分辨率或关闭整页截图。`,
+    );
+  }
 }
 
 function localBrowserUrlFromInput(input = {}) {
@@ -657,22 +732,15 @@ function normalizeComputerUseAppId(value = "") {
 }
 
 function defaultLaunchApp(command = "", args = []) {
-  return new Promise((resolve, reject) => {
-    if (!command) {
-      reject(new Error("missing command"));
-      return;
-    }
-    const child = spawn(command, Array.isArray(args) ? args : [], {
-      detached: true,
-      stdio: "ignore",
-      windowsHide: false,
-    });
-    child.once("error", reject);
-    child.once("spawn", () => {
-      child.unref();
-      resolve();
-    });
-  });
+  if (!command) return Promise.reject(new Error("missing command"));
+  return spawnDetachedWithConfirmation(command, args, {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: false,
+  }, {
+    spawnImpl: spawn,
+    timeoutMs: 5000,
+  }).then(() => undefined);
 }
 
 function extractHtmlTitle(html = "") {
@@ -727,6 +795,10 @@ function positiveInteger(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function boundedPositiveInteger(value, fallback, maximum) {
+  return Math.min(positiveInteger(value, fallback), maximum);
+}
+
 function plainObject(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
@@ -740,9 +812,13 @@ function collapseWhitespace(value = "") {
 }
 
 function throwLocalError(code, message) {
+  throw localCapabilityError(code, message);
+}
+
+function localCapabilityError(code, message) {
   const error = new Error(message);
   error.code = code;
-  throw error;
+  return error;
 }
 
 module.exports = {

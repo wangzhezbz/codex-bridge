@@ -17,7 +17,9 @@ export function routeCapabilityMatrix(route = {}) {
     providerFamily: profile.providerFamily,
     items: [
       matrixItem("image_input", "图片输入", imageInputState(capabilities.images), imageInputDetail(capabilities.images)),
-      matrixItem("tools", "工具调用", toolsState(capabilities.tools), toolsDetail(capabilities.tools)),
+      matrixItem("tools", "工具调用", toolsState(capabilities.tools), capabilities.toolConstraint === "responses-required"
+        ? "Astra 的工具调用需要 Responses；当前 Chat Completions 接口只用于文本生成。"
+        : toolsDetail(capabilities.tools)),
       matrixItem("mcp", "MCP", capabilities.mcpNamespaces === true ? "native" : "unavailable", capabilities.mcpNamespaces === true ? "保留 Codex MCP 命名空间。" : "不会转发 MCP 命名空间。"),
       matrixItem("files", "文件", fileState(capabilities.files), fileDetail(capabilities.files)),
       matrixItem("audio", "音频", audioState(capabilities.audio), audioDetail(capabilities.audio)),

@@ -170,6 +170,25 @@ test("streaming upstream requests disable content encoding for stable SSE bounda
   assert.equal(headers["accept-encoding"], "identity");
 });
 
+test("streaming headers override mixed-case custom headers on the actual HTTP header set", async () => {
+  const { upstreamHeaders } = await import("../src/upstream-header-policy.js");
+  const headers = new Headers(upstreamHeaders({
+    api: "chat_completions", apiKey: "route-key",
+    headers: { "Accept-Encoding": "gzip", Accept: "application/json" },
+  }, {}, { acceptEventStream: true }));
+  assert.equal(headers.get("accept-encoding"), "identity");
+  assert.equal(headers.get("accept"), "text/event-stream");
+});
+
+test("an explicit mixed-case API beta header is not combined with a client beta header", async () => {
+  const { upstreamHeaders } = await import("../src/upstream-header-policy.js");
+  const headers = new Headers(upstreamHeaders({
+    api: "responses", provider: "openai", apiKey: "route-key",
+    headers: { "OpenAI-Beta": "route-feature=v1" },
+  }, { clientHeaders: { "openai-beta": "client-feature=v2" } }));
+  assert.equal(headers.get("openai-beta"), "route-feature=v1");
+});
+
 test("native Responses streams keep their existing transport path unchanged", async () => {
   const { upstreamHeaders } = await import("../src/upstream-header-policy.js");
 

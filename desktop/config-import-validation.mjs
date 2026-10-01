@@ -187,6 +187,7 @@ const CUSTOM_MODEL_KEYS = new Set([
   "inputModalities",
   "dropParams",
   "custom",
+  "portableRemote",
 ]);
 const PROVIDER_OVERRIDE_KEYS = new Set([
   "id",
@@ -650,6 +651,25 @@ function validateCustomModels(value, path, context) {
       authMode: normalizeExactString(model.authMode, "api_key", `${modelPath}.authMode`, context),
       custom: normalizeExactBoolean(model.custom, true, `${modelPath}.custom`, context),
     };
+    if (Object.hasOwn(model, "portableRemote")) {
+      result.portableRemote = normalizeExactBoolean(
+        model.portableRemote,
+        true,
+        `${modelPath}.portableRemote`,
+        context,
+      );
+      if (
+        result.portableRemote === true &&
+        !result.presetId.startsWith(`remote-${result.providerId}-`)
+      ) {
+        addIssue(
+          context,
+          "invalid_portable_remote_identity",
+          `${modelPath}.portableRemote`,
+          "可移植远程模型 ID 必须属于同一个供应商的 remote 命名空间。",
+        );
+      }
+    }
     if (seen.has(result.presetId)) {
       addIssue(context, "duplicate_id", `${modelPath}.presetId`, "自定义模型 ID 重复。");
     }

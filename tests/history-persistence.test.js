@@ -419,6 +419,42 @@ test("failed staged persistence keeps the active in-memory conversation readable
   }
 });
 
+test("failed staged persistence does not permanently consume the staging budget", async () => {
+  const storage = {
+    async recordTurnAsync() {
+      const error = new Error("simulated recoverable history write failure");
+      error.code = "SQLITE_BUSY";
+      throw error;
+    },
+  };
+  const history = new ResponseHistory({
+    storage,
+    maxStagedEntries: 1,
+  });
+  const failedTurn = historyTurn("resp_staged_failed_budget", [
+    { role: "assistant", content: "keep the failed write in bounded memory" },
+  ]);
+  const nextTurn = historyTurn("resp_staged_after_failure", [
+    { role: "assistant", content: "the next stream can still be staged" },
+  ]);
+
+  try {
+    const failedId = history.stageTurn(failedTurn);
+    await assert.rejects(history.persistStagedTurnAsync(failedId));
+
+    const nextId = history.stageTurn(nextTurn);
+    assert.equal(nextId, nextTurn.responseId);
+    assert.equal(
+      history.get(failedId)[0].content,
+      "keep the failed write in bounded memory",
+    );
+    assert.equal(history.lookup(failedId).pendingPersistence, undefined);
+    assert.equal(history.lookup(nextId).pendingPersistence, true);
+  } finally {
+    history.close();
+  }
+});
+
 test("staged history enforces a total byte budget across pending turns", () => {
   const history = new ResponseHistory({
     storage: { recordTurnAsync: async () => ({}) },
@@ -939,6 +975,40 @@ test("persistent history distinguishes corrupt and unavailable storage", () => {
   }
 });
 
+test("persistent history stops a forged gzip row at the configured decode budget", () => {
+  const fixture = historyFixture();
+  let history;
+  try {
+    history = new ResponseHistory({ historyPath: fixture.historyPath, maxRecordBytes: 1024 });
+    history.recordTurn(historyTurn("resp_gzip_bomb", [
+      { role: "user", content: "small original" },
+    ]));
+    history.close();
+    history = null;
+
+    const bomb = zlib.gzipSync(Buffer.from(JSON.stringify({ value: "x".repeat(4096) })));
+    const db = new DatabaseSync(fixture.historyPath);
+    const sizes = db.prepare(
+      "SELECT length(response_gzip) AS response_bytes, length(meta_gzip) AS meta_bytes FROM response_history WHERE response_id = ?",
+    ).get("resp_gzip_bomb");
+    db.prepare(
+      "UPDATE response_history SET messages_gzip = ?, uncompressed_bytes = ?, stored_bytes = ? WHERE response_id = ?",
+    ).run(
+      bomb,
+      100,
+      bomb.length + Number(sizes.response_bytes) + Number(sizes.meta_bytes),
+      "resp_gzip_bomb",
+    );
+    db.close();
+
+    history = new ResponseHistory({ historyPath: fixture.historyPath, maxRecordBytes: 1024 });
+    assert.equal(history.lookup("resp_gzip_bomb").state, "corrupt");
+  } finally {
+    history?.close?.();
+    cleanupHistoryFixture(fixture);
+  }
+});
+
 test("persistent history refuses a newer SQLite schema", () => {
   const fixture = historyFixture();
   const db = new DatabaseSync(fixture.historyPath);
@@ -1099,6 +1169,271 @@ test("chat routing uses the async atomic history writer when it is available", a
   } finally {
     await closeIfListening(router);
     await closeIfListening(upstream);
+  }
+});
+
+test("async SQLite history writer bounds pending writes and recovers after pressure clears", async () => {
+  const fixture = historyFixture();
+  let history;
+  try {
+    history = new ResponseHistory({
+      historyPath: fixture.historyPath,
+      writerPendingLimit: 1,
+      writerRequestTimeoutMs: 60_000,
+    });
+    const first = history.recordTurnAsync(historyTurn("resp_writer_first", [
+      { role: "user", content: "first" },
+      { role: "assistant", content: "one" },
+    ]));
+    await assert.rejects(history.recordTurnAsync(historyTurn("resp_writer_overload", [
+      { role: "user", content: "second" },
+      { role: "assistant", content: "two" },
+    ])), (error) => {
+      assert.equal(error.code, "local_history_storage_unavailable");
+      assert.equal(error.internalCode, "history_writer_overloaded");
+      return true;
+    });
+    await first;
+    await history.recordTurnAsync(historyTurn("resp_writer_recovered", [
+      { role: "user", content: "third" },
+      { role: "assistant", content: "three" },
+    ]));
+    assert.equal(history.lookup("resp_writer_recovered").state, "available");
+  } finally {
+    history?.close?.();
+    cleanupHistoryFixture(fixture);
+  }
+});
+
+test("SQLite writer timeouts retain capacity until the actual write completes", async (t) => {
+  const fixture = historyFixture();
+  let history;
+  let blocker;
+  try {
+    history = new ResponseHistory({
+      historyPath: fixture.historyPath,
+      writerPendingLimit: 1,
+      writerRequestTimeoutMs: 60_000,
+    });
+    await history.recordTurnAsync(historyTurn("resp_timeout_warmup", []));
+    blocker = new DatabaseSync(fixture.historyPath);
+    blocker.exec("BEGIN IMMEDIATE");
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+
+    const timedOut = assert.rejects(
+      history.recordTurnAsync(historyTurn("resp_timeout_pending", [
+        { role: "assistant", content: "this write is still running after its caller times out" },
+      ])),
+      (error) => error.internalCode === "history_writer_timeout",
+    );
+    t.mock.timers.tick(60_000);
+    await timedOut;
+
+    const overloaded = assert.rejects(
+      history.recordTurnAsync(historyTurn("resp_timeout_not_admitted", [])),
+      (error) => error.internalCode === "history_writer_overloaded",
+    );
+    t.mock.timers.tick(60_000);
+    await overloaded;
+
+    const completed = once(history.storage.writer.worker, "message");
+    blocker.exec("COMMIT");
+    blocker.close();
+    blocker = null;
+    await completed;
+    t.mock.timers.reset();
+
+    await history.recordTurnAsync(historyTurn("resp_timeout_recovered", []));
+    assert.equal(history.storage.lookup("resp_timeout_pending").state, "available");
+    assert.equal(history.storage.lookup("resp_timeout_not_admitted").state, "missing");
+    assert.equal(history.lookup("resp_timeout_recovered").state, "available");
+    assert.equal(history.health().ok, true);
+  } finally {
+    t.mock.timers.reset();
+    blocker?.close();
+    history?.close();
+    cleanupHistoryFixture(fixture);
+  }
+});
+
+test("a late successful SQLite write clears both elapsed deadlines and applies retention", async (t) => {
+  const fixture = historyFixture();
+  let history;
+  let blocker;
+  let now = 1_000;
+  try {
+    history = new ResponseHistory({
+      historyPath: fixture.historyPath,
+      now: () => now,
+      ttlMs: 100,
+      writerRequestTimeoutMs: 60_000,
+    });
+    await history.recordTurnAsync(historyTurn("resp_before_late_commit", [
+      { role: "assistant", content: "this cached turn expires during the late write" },
+    ]));
+    now = 1_101;
+    blocker = new DatabaseSync(fixture.historyPath);
+    blocker.exec("BEGIN IMMEDIATE");
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+
+    const responseId = history.stageTurn(historyTurn("resp_late_commit", [
+      { role: "assistant", content: "keep the already completed answer" },
+    ]));
+    const timedOut = assert.rejects(
+      history.persistStagedTurnAsync(responseId),
+      (error) => error.internalCode === "history_write_timeout",
+    );
+    await Promise.resolve();
+    t.mock.timers.tick(60_000);
+    await timedOut;
+    assert.equal(history.lookup(responseId).pendingPersistence, false);
+    assert.equal(history.get(responseId)[0].content, "keep the already completed answer");
+
+    const completed = once(history.storage.writer.worker, "message");
+    blocker.exec("COMMIT");
+    blocker.close();
+    blocker = null;
+    await completed;
+
+    assert.equal(history.storage.lookup(responseId).state, "available");
+    assert.equal(history.lookup(responseId).pendingPersistence, undefined);
+    assert.equal(history.getResponse(responseId)?.id, responseId);
+    assert.deepEqual(history.get("resp_before_late_commit"), []);
+    assert.equal(history.lookup("resp_before_late_commit").state, "expired");
+  } finally {
+    t.mock.timers.reset();
+    blocker?.close();
+    history?.close();
+    cleanupHistoryFixture(fixture);
+  }
+});
+
+test("a late SQLite write rejection releases capacity without poisoning later writes", async (t) => {
+  const fixture = historyFixture();
+  let history;
+  try {
+    history = new ResponseHistory({
+      historyPath: fixture.historyPath,
+      maxRecordBytes: 1_024,
+      writerPendingLimit: 1,
+      writerRequestTimeoutMs: 60_000,
+    });
+    await history.recordTurnAsync(historyTurn("resp_late_reject_warmup", []));
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+
+    const completed = once(history.storage.writer.worker, "message");
+    const timedOut = assert.rejects(
+      history.recordTurnAsync(historyTurn("resp_late_rejected", [
+        { role: "assistant", content: "X".repeat(2_000) },
+      ])),
+      (error) => error.internalCode === "history_writer_timeout",
+    );
+    // Worker replies cannot be delivered until the current JavaScript turn
+    // yields, so advance only the caller's deadline before receiving the error.
+    t.mock.timers.tick(60_000);
+    await timedOut;
+    await completed;
+    await new Promise((resolve) => setImmediate(resolve));
+    t.mock.timers.reset();
+
+    assert.equal(history.storage.lookup("resp_late_rejected").state, "missing");
+    assert.equal(history.health().ok, true);
+    await history.recordTurnAsync(historyTurn("resp_after_late_rejection", []));
+    assert.equal(history.lookup("resp_after_late_rejection").state, "available");
+  } finally {
+    t.mock.timers.reset();
+    history?.close();
+    cleanupHistoryFixture(fixture);
+  }
+});
+
+test("a timed-out write still reports a later persistent storage failure", async () => {
+  let rejectCompletion;
+  const completion = new Promise((_resolve, reject) => { rejectCompletion = reject; });
+  const history = new ResponseHistory({
+    storage: {
+      async recordTurnAsync() {
+        const error = new Error("simulated caller deadline");
+        error.code = "history_writer_timeout";
+        error.completion = completion;
+        throw error;
+      },
+    },
+  });
+  try {
+    const responseId = history.stageTurn(historyTurn("resp_late_storage_failure", [
+      { role: "assistant", content: "keep this published response readable" },
+    ]));
+    await assert.rejects(history.persistStagedTurnAsync(responseId));
+    assert.equal(history.health().ok, true);
+
+    const failure = new Error("simulated disk failure after the caller deadline");
+    failure.code = "SQLITE_FULL";
+    rejectCompletion(failure);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(history.health().ok, false);
+    assert.equal(history.get(responseId)[0].content, "keep this published response readable");
+    await assert.rejects(
+      history.recordTurnAsync(historyTurn("resp_after_late_storage_failure", [])),
+      (error) => error.internalCode === "SQLITE_FULL",
+    );
+  } finally {
+    history.close();
+  }
+});
+
+test("late write recovery preserves a replacement staged turn under cache pressure", async () => {
+  let resolveOldCompletion;
+  let resolveReplacement;
+  const oldCompletion = new Promise((resolve) => { resolveOldCompletion = resolve; });
+  let writes = 0;
+  const history = new ResponseHistory({
+    maxTotalBytes: 100,
+    storage: {
+      lookup() {
+        return { state: "missing", messages: [], response: null, meta: null, source: "sqlite" };
+      },
+      recordTurnAsync() {
+        writes += 1;
+        if (writes === 1) {
+          const error = new Error("simulated caller deadline");
+          error.code = "history_writer_timeout";
+          error.completion = oldCompletion;
+          return Promise.reject(error);
+        }
+        return new Promise((resolve) => { resolveReplacement = resolve; });
+      },
+    },
+  });
+  try {
+    const responseId = history.stageTurn(historyTurn("resp_late_replaced", [
+      { role: "assistant", content: "X".repeat(200) },
+    ]));
+    await assert.rejects(history.persistStagedTurnAsync(responseId));
+    history.stageTurn(historyTurn("resp_promotes_failed_turn", []));
+    history.stageTurn(historyTurn(responseId, [
+      { role: "assistant", content: "new pending answer" },
+    ]));
+    const replacementWrite = history.persistStagedTurnAsync(responseId);
+    await Promise.resolve();
+    history.record("resp_pruned_by_late_write", [
+      { role: "assistant", content: "expired" },
+    ]);
+
+    resolveOldCompletion({ expiredIds: ["resp_pruned_by_late_write"], evictedIds: [] });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(history.lookup(responseId).pendingPersistence, true);
+    assert.equal(history.get(responseId)[0].content, "new pending answer");
+    assert.deepEqual(history.get("resp_pruned_by_late_write"), []);
+    resolveReplacement({ expiredIds: [], evictedIds: [] });
+    await replacementWrite;
+    assert.equal(history.lookup(responseId).pendingPersistence, undefined);
+    assert.equal(history.get(responseId)[0].content, "new pending answer");
+  } finally {
+    resolveReplacement?.({});
+    history.close();
   }
 });
 
@@ -1413,7 +1748,7 @@ for (const scenario of [
   { code: "SQLITE_BUSY", stream: true, recoverable: true },
   { code: "SQLITE_FULL", stream: false, recoverable: false },
 ]) {
-  test(`raw ${scenario.code} history writes return local 503 without image failover`, async () => {
+  test(`raw ${scenario.code} image history writes preserve the published response contract`, async () => {
     const imageBodies = [];
     const imageUpstream = http.createServer(async (req, res) => {
       imageBodies.push(await readJson(req));
@@ -1458,14 +1793,14 @@ for (const scenario of [
       });
       const firstText = await firstResponse.text();
 
-      assert.equal(firstResponse.status, 503, firstText);
       assert.deepEqual(imageBodies.map((body) => body.model), ["primary-image-model"]);
       assert.equal(storageWrites, 1);
       if (scenario.stream) {
-        assert.match(firstText, /event: response\.failed/);
-        assert.match(firstText, /local_history_storage_unavailable/);
-        assert.doesNotMatch(firstText, /event: response\.completed/);
+        assert.equal(firstResponse.status, 200, firstText);
+        assert.match(firstText, /event: response\.completed/);
+        assert.doesNotMatch(firstText, /event: response\.failed/);
       } else {
+        assert.equal(firstResponse.status, 503, firstText);
         assert.equal(
           JSON.parse(firstText).error?.code,
           "local_history_storage_unavailable",

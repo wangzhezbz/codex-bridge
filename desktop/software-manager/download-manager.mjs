@@ -4,8 +4,15 @@ import { createHash } from "node:crypto";
 import { pipeline } from "node:stream/promises";
 import { Readable, Transform } from "node:stream";
 
+import networkDeadline from "../../shared/network-deadline.cjs";
+
+const { runWithNetworkDeadline } = networkDeadline;
+
 const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
 const PROGRESS_INTERVAL_MS = 250;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_INACTIVITY_TIMEOUT_MS = 90_000;
+const DEFAULT_TOTAL_TIMEOUT_MS = 90 * 60_000;
 const DOWNLOAD_MANAGER_AUTHORITIES = new WeakMap();
 const NON_RETRYABLE_SOURCE_FAILURES = new WeakSet();
 
@@ -41,7 +48,8 @@ export function consumePreparedDownloadVerification(manager, receipt, expected) 
 export function createDownloadManager({
   fetchImpl = globalThis.fetch,
   fsApi = fsPromises,
-  retryPolicy = {}
+  retryPolicy = {},
+  timeoutPolicy = {},
 } = {}) {
   if (typeof fetchImpl !== "function") {
     throw new TypeError("fetchImpl must be a function");
@@ -49,35 +57,45 @@ export function createDownloadManager({
 
   const maxAttempts = positiveInteger(retryPolicy.maxAttempts ?? retryPolicy.maxRetries, 3);
   const delayMs = retryPolicy.delayMs ?? 100;
+  const requestTimeoutMs = positiveInteger(timeoutPolicy.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS);
+  const inactivityTimeoutMs = positiveInteger(timeoutPolicy.inactivityTimeoutMs, DEFAULT_INACTIVITY_TIMEOUT_MS);
+  const totalTimeoutMs = positiveInteger(timeoutPolicy.totalTimeoutMs, DEFAULT_TOTAL_TIMEOUT_MS);
   const fileOps = fsApi.promises ?? fsApi;
   const streamFs = typeof fsApi.createWriteStream === "function" ? fsApi : fs;
   const receipts = new WeakMap();
 
   async function transfer({ asset, destination = null, partPath = null, target = null, signal, onProgress, publish }) {
-    const originalOrigin = new URL(asset.url).origin;
-    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      try {
-        throwIfAborted(signal);
-        return await downloadOnce({
-          asset,
-          destination,
-          partPath,
-          target,
-          signal,
-          onProgress,
-          fetchImpl,
-          fileOps,
-          streamFs,
-          originalOrigin,
-          publish,
-        });
-      } catch (error) {
-        if (signal?.aborted && !(error instanceof AggregateError)) throw abortError(signal);
-        if (attempt === maxAttempts || !isRetryableDownloadFailure(error)) throw error;
-        await waitForRetry(delayMs, attempt, signal);
+    return runWithTransferDeadline(async (deadlineSignal) => {
+      const originalOrigin = new URL(asset.url).origin;
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        try {
+          throwIfAborted(deadlineSignal);
+          return await downloadOnce({
+            asset,
+            destination,
+            partPath,
+            target,
+            signal: deadlineSignal,
+            onProgress,
+            fetchImpl,
+            fileOps,
+            streamFs,
+            originalOrigin,
+            publish,
+            requestTimeoutMs,
+            inactivityTimeoutMs,
+          });
+        } catch (error) {
+          if (deadlineSignal?.aborted && !(error instanceof AggregateError)) throw abortError(deadlineSignal);
+          if (attempt === maxAttempts || !isRetryableDownloadFailure(error)) throw error;
+          await waitForRetry(delayMs, attempt, deadlineSignal);
+        }
       }
-    }
-    throw new Error("download retry budget exhausted");
+      throw new Error("download retry budget exhausted");
+    }, {
+      timeoutMs: totalTimeoutMs,
+      signal,
+    });
   }
 
   const manager = Object.freeze(Object.assign(Object.create(null), {
@@ -124,7 +142,7 @@ export function createDownloadManager({
 
 async function downloadOnce(context) {
   const existingSize = context.target
-    ? (await failFastSource(() => context.target.inspect())).size
+    ? (await failFastSource(() => context.target.inspect({ signal: context.signal }))).size
     : await fileSize(context.fileOps, context.partPath);
   if (existingSize > context.asset.size) {
     throw nonRetryableError("partial package exceeds the catalog length");
@@ -134,7 +152,14 @@ async function downloadOnce(context) {
   }
 
   const requestHeaders = existingSize > 0 ? { Range: `bytes=${existingSize}-` } : {};
-  const response = await fetchSignedOrigin(context.fetchImpl, context.asset.url, requestHeaders, context.signal, context.originalOrigin);
+  const response = await fetchSignedOrigin(
+    context.fetchImpl,
+    context.asset.url,
+    requestHeaders,
+    context.signal,
+    context.originalOrigin,
+    context.requestTimeoutMs,
+  );
   let append = existingSize > 0;
   let receivedBytes = existingSize;
   let resumed = append;
@@ -147,17 +172,17 @@ async function downloadOnce(context) {
       throwIfAborted(context.signal);
       if (context.target) await failFastSource(() => context.target.reset({ signal: context.signal }));
     } catch (error) {
-      return failWithResponseCleanup(response, error);
+      return failWithResponseCleanup(response, error, context);
     }
   } else if (append && response.status === 206) {
     const contentRange = response.headers.get("content-range");
     if (!new RegExp(`^bytes ${existingSize}-\\d+/(\\d+|\\*)$`, "i").test(contentRange ?? "")) {
       return failWithResponseCleanup(
-        response, nonRetryableError("resumed response has an invalid Content-Range"),
+        response, nonRetryableError("resumed response has an invalid Content-Range"), context,
       );
     }
   } else if (response.status !== 200 && response.status !== 206) {
-    return failWithResponseCleanup(response, responseError(response));
+    return failWithResponseCleanup(response, responseError(response), context);
   }
 
   if (!response.body) {
@@ -170,6 +195,11 @@ async function downloadOnce(context) {
   const progress = new Transform({
     transform(chunk, encoding, callback) {
       receivedBytes += chunk.length;
+      if (receivedBytes > context.asset.size) {
+        callback(nonRetryableError("download response exceeds the catalog length"));
+        return;
+      }
+      refreshInactivityDeadline();
       const timestamp = Date.now();
       const completed = receivedBytes === context.asset.size;
       if (progressReported && !completed && timestamp - lastProgressAt < PROGRESS_INTERVAL_MS) {
@@ -188,6 +218,13 @@ async function downloadOnce(context) {
       }, callback, chunk);
     }
   });
+  let inactivityTimer = null;
+  const refreshInactivityDeadline = () => {
+    if (inactivityTimer !== null) clearTimeout(inactivityTimer);
+    inactivityTimer = setTimeout(() => {
+      progress.destroy(timeoutError("download_stalled", context.inactivityTimeoutMs, true));
+    }, context.inactivityTimeoutMs);
+  };
   let output;
   try {
     output = context.target
@@ -198,10 +235,10 @@ async function downloadOnce(context) {
         context.partPath, { flags: append ? "a" : "w" },
       ));
   } catch (error) {
-    return failWithResponseCleanup(response, error);
+    return failWithResponseCleanup(response, error, context);
   }
 
-  const input = Readable.fromWeb(response.body);
+  const input = createDownloadInput(response.body, context);
   const upstreamErrors = new WeakSet();
   input.on("error", (error) => {
     if (error && (typeof error === "object" || typeof error === "function")) upstreamErrors.add(error);
@@ -210,6 +247,7 @@ async function downloadOnce(context) {
     if (!upstreamErrors.has(error)) markFailFastSource(error);
   });
   try {
+    refreshInactivityDeadline();
     await pipeline(input, progress, output, { signal: context.signal });
   } catch (error) {
     let destroyError = null;
@@ -218,10 +256,11 @@ async function downloadOnce(context) {
       ? new AggregateError([error, destroyError], error.message, { cause: error })
       : error;
     if (context.signal?.aborted === true) {
-      if (error?.name === "AbortError") throw error;
-      throw context.signal.reason ?? error;
+      throw abortError(context.signal);
     }
-    return failWithResponseCleanup(response, primary);
+    return failWithResponseCleanup(response, primary, context);
+  } finally {
+    if (inactivityTimer !== null) clearTimeout(inactivityTimer);
   }
 
   throwIfAborted(context.signal);
@@ -229,12 +268,8 @@ async function downloadOnce(context) {
 }
 
 function onProgressSafely(onProgress, event, callback, chunk) {
-  try {
-    onProgress(event);
-    callback(null, chunk);
-  } catch (error) {
-    callback(error);
-  }
+  reportProgressSafely(onProgress, event);
+  callback(null, chunk);
 }
 
 async function verifyDownloaded(context) {
@@ -243,7 +278,7 @@ async function verifyDownloaded(context) {
     throw nonRetryableError(`download length mismatch: expected ${context.asset.size}, received ${context.receivedBytes}`);
   }
   throwIfAborted(context.signal);
-  context.onProgress({
+  reportProgressSafely(context.onProgress, {
     phase: "verify-download",
     receivedBytes: context.receivedBytes,
     totalBytes: context.asset.size,
@@ -260,7 +295,11 @@ async function verifyDownloaded(context) {
     }
     sha256 = verified.sha256;
   } else {
-    sha256 = await failFastSource(() => hashFile(context.streamFs, context.partPath));
+    sha256 = await failFastSource(() => hashFile(
+      context.streamFs,
+      context.partPath,
+      context.signal,
+    ));
   }
   throwIfAborted(context.signal);
   if (sha256 !== context.asset.sha256.toLowerCase()) {
@@ -278,10 +317,10 @@ async function verifyDownloaded(context) {
   };
 }
 
-async function fetchSignedOrigin(fetchImpl, signedUrl, headers, signal, originalOrigin) {
+async function fetchSignedOrigin(fetchImpl, signedUrl, headers, signal, originalOrigin, requestTimeoutMs) {
   let nextUrl = signedUrl;
   for (let redirects = 0; redirects <= 5; redirects += 1) {
-    const response = await fetchImpl(nextUrl, { method: "GET", headers, redirect: "manual", signal });
+    const response = await fetchWithDeadline(fetchImpl, nextUrl, headers, signal, requestTimeoutMs);
     if (!REDIRECT_STATUS.has(response.status)) {
       return response;
     }
@@ -294,12 +333,122 @@ async function fetchSignedOrigin(fetchImpl, signedUrl, headers, signal, original
         throw nonRetryableError("download redirect crosses the signed asset origin");
       }
     } catch (error) {
-      return failWithResponseCleanup(response, error);
+      return failWithResponseCleanup(response, error, { signal, requestTimeoutMs });
     }
-    await cancelResponseBody(response);
+    await cancelResponseBody(response, { signal, requestTimeoutMs });
+    throwIfAborted(signal);
     nextUrl = redirectUrl.href;
   }
   throw nonRetryableError("download exceeded redirect limit");
+}
+
+async function fetchWithDeadline(fetchImpl, url, headers, signal, requestTimeoutMs) {
+  return runWithDownloadNetworkDeadline(async (requestSignal) => {
+    const requestController = new AbortController();
+    const linkedSignals = [signal, requestSignal].filter(Boolean);
+    const onAbort = (source) => {
+      if (!requestController.signal.aborted) requestController.abort(abortError(source));
+    };
+    const listeners = [];
+    for (const source of linkedSignals) {
+      if (source.aborted) onAbort(source);
+      else {
+        const listener = () => onAbort(source);
+        source.addEventListener("abort", listener, { once: true });
+        listeners.push([source, listener]);
+      }
+    }
+    try {
+      const response = await fetchImpl(url, {
+        method: "GET", headers, redirect: "manual", signal: requestController.signal,
+      });
+      if (requestController.signal.aborted) {
+        return failWithResponseCleanup(response, abortError(requestController.signal), {
+          signal: requestController.signal, requestTimeoutMs,
+        });
+      }
+      return response;
+    } finally {
+      for (const [source, listener] of listeners) source.removeEventListener("abort", listener);
+    }
+  }, {
+    signal,
+    timeoutMs: requestTimeoutMs,
+    createTimeoutError: ({ timeoutMs }) => timeoutError("download_request_timeout", timeoutMs, true),
+  });
+}
+
+async function runWithDownloadNetworkDeadline(operation, options) {
+  let operationFailure;
+  try {
+    return await runWithNetworkDeadline(async (signal) => {
+      try { return await operation(signal); }
+      catch (error) { operationFailure = error; throw error; }
+    }, options);
+  } catch (error) {
+    if (options.signal?.aborted) {
+      // Preserve cleanup failures already queued by a synchronous abort, without
+      // waiting for an uncooperative network operation or cancel() promise.
+      if (operationFailure === undefined) await new Promise((resolve) => setImmediate(resolve));
+      if (operationFailure !== undefined) throw operationFailure;
+    }
+    throw error;
+  }
+}
+
+function createDownloadInput(body, context) {
+  const reader = body.getReader();
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    reader.releaseLock();
+  };
+  // Native fromWeb() waits for reader.cancel() in its destroy callback. Bound
+  // only that network cleanup; pipeline still owns and awaits the file writer.
+  return Readable.fromWeb(new ReadableStream({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          release();
+          controller.close();
+        } else {
+          controller.enqueue(value);
+        }
+      } catch (error) {
+        release();
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      try { await cancelDownloadBody(() => reader.cancel(reason), context); }
+      finally { release(); }
+    },
+  }, { highWaterMark: 0 }));
+}
+
+async function runWithTransferDeadline(operation, { timeoutMs, signal } = {}) {
+  const controller = new AbortController();
+  const abortFrom = (source) => {
+    if (!controller.signal.aborted) controller.abort(abortError(source));
+  };
+  const parentAbort = () => abortFrom(signal);
+  if (signal?.aborted) parentAbort();
+  else signal?.addEventListener("abort", parentAbort, { once: true });
+  const timer = setTimeout(() => {
+    if (!controller.signal.aborted) {
+      controller.abort(timeoutError("download_timeout", timeoutMs, false));
+    }
+  }, timeoutMs);
+  try {
+    const result = await operation(controller.signal);
+    throwIfAborted(controller.signal);
+    return result;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", parentAbort);
+  }
 }
 
 async function fileSize(fileOps, path) {
@@ -314,12 +463,24 @@ async function fileSize(fileOps, path) {
   }
 }
 
-async function hashFile(streamFs, path) {
+async function hashFile(streamFs, path, signal) {
   const hash = createHash("sha256");
-  for await (const chunk of streamFs.createReadStream(path)) {
-    hash.update(chunk);
+  const stream = streamFs.createReadStream(path);
+  const onAbort = () => {
+    try { stream.destroy(abortError(signal)); } catch {}
+  };
+  if (signal?.aborted) onAbort();
+  else signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    for await (const chunk of stream) {
+      throwIfAborted(signal);
+      hash.update(chunk);
+    }
+    throwIfAborted(signal);
+    return hash.digest("hex");
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
   }
-  return hash.digest("hex");
 }
 
 function validateAsset(asset) {
@@ -348,6 +509,14 @@ function retryableError(message) {
 function nonRetryableError(message) {
   const error = new Error(message);
   error.retryable = false;
+  return error;
+}
+
+function timeoutError(code, timeoutMs, retryable) {
+  const error = new Error(code);
+  error.code = code;
+  error.timeoutMs = timeoutMs;
+  error.retryable = retryable;
   return error;
 }
 
@@ -385,9 +554,11 @@ function failFastSourceSync(action) {
   catch (error) { markFailFastSource(error); throw error; }
 }
 
-async function failWithResponseCleanup(response, primaryError) {
+async function failWithResponseCleanup(response, primaryError, context) {
   let cleanupError = null;
-  try { await cancelResponseBody(response); } catch (error) { cleanupError = error; }
+  try { await cancelResponseBody(response, context); } catch (error) { cleanupError = error; }
+  if (cleanupError === primaryError) throw primaryError;
+  if (context?.signal?.aborted && cleanupError === abortError(context.signal)) throw primaryError;
   if (primaryError?.name === "AbortError" && cleanupError?.name === "AbortError") throw primaryError;
   if (cleanupError) {
     throw new AggregateError([primaryError, cleanupError], primaryError.message, { cause: primaryError });
@@ -395,9 +566,9 @@ async function failWithResponseCleanup(response, primaryError) {
   throw primaryError;
 }
 
-async function cancelResponseBody(response) {
+async function cancelResponseBody(response, context) {
   try {
-    await response?.body?.cancel?.();
+    await cancelDownloadBody(() => response?.body?.cancel?.(), context);
   } catch (error) {
     if (response?.body?.locked === true
       && (error?.code === "ERR_INVALID_STATE" || /ReadableStream is locked/iu.test(error?.message ?? ""))) {
@@ -407,6 +578,17 @@ async function cancelResponseBody(response) {
   }
 }
 
+async function cancelDownloadBody(operation, { signal, requestTimeoutMs } = {}) {
+  return runWithDownloadNetworkDeadline(operation, {
+    // Attempt to release the body even after cancellation. The signal still
+    // bounds waiting for a cancel() implementation that does not settle.
+    allowAbortedStart: true,
+    signal,
+    timeoutMs: requestTimeoutMs,
+    createTimeoutError: ({ timeoutMs }) => timeoutError("download_cleanup_timeout", timeoutMs, false),
+  });
+}
+
 async function waitForRetry(delayMs, attempt, signal) {
   const delay = typeof delayMs === "function" ? delayMs(attempt) : delayMs;
   if (!Number.isFinite(delay) || delay <= 0) {
@@ -414,12 +596,32 @@ async function waitForRetry(delayMs, attempt, signal) {
     return;
   }
   await new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, delay);
-    signal?.addEventListener("abort", () => {
-      clearTimeout(timer);
-      reject(abortError(signal));
-    }, { once: true });
+    let settled = false;
+    let timer = null;
+    const cleanup = () => {
+      if (timer !== null) clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback(value);
+    };
+    const onAbort = () => finish(reject, abortError(signal));
+    timer = setTimeout(() => finish(resolve), delay);
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
   });
+}
+
+function reportProgressSafely(onProgress, event) {
+  try {
+    const pending = onProgress(event);
+    Promise.resolve(pending).catch(() => {});
+  } catch {
+    // Progress reporting is advisory and cannot invalidate package bytes.
+  }
 }
 
 function throwIfAborted(signal) {
@@ -429,7 +631,7 @@ function throwIfAborted(signal) {
 }
 
 function abortError(signal) {
-  if (signal?.reason?.name === "AbortError") {
+  if (signal?.reason instanceof Error) {
     return signal.reason;
   }
   return new DOMException("The download was aborted", "AbortError");

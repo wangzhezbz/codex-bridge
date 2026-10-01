@@ -4,6 +4,45 @@ import http from "node:http";
 import { createRouterServer } from "../src/server.js";
 import { runRouteRequestSmoke } from "../src/route-request-smoke.js";
 
+test("route request smoke has a hard deadline when fetch ignores AbortSignal", async () => {
+  let signal = null;
+  const startedAt = Date.now();
+  const report = await runRouteRequestSmoke({
+    baseUrl: "https://router.example",
+    timeoutMs: 20,
+    cases: [{ id: "stalled", body: { input: "stalled" }, expect: { status: 200 } }],
+    fetchImpl: async (_url, options) => {
+      signal = options.signal;
+      return new Promise(() => {});
+    },
+  });
+  assert.equal(report.ok, false);
+  assert.equal(report.results[0].errorCode, "route_smoke_timeout");
+  assert.equal(signal?.aborted, true);
+  assert.ok(Date.now() - startedAt < 500);
+});
+
+test("route request smoke bounds response bytes before using fallback text readers", async () => {
+  let textCalled = false;
+  const report = await runRouteRequestSmoke({
+    baseUrl: "https://router.example",
+    maxResponseBytes: 16,
+    cases: [{ id: "oversized", body: { input: "oversized" }, expect: { status: 200 } }],
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-length": "17" }),
+      async text() {
+        textCalled = true;
+        return "must not be read";
+      },
+    }),
+  });
+  assert.equal(report.ok, false);
+  assert.equal(report.results[0].errorCode, "route_smoke_response_too_large");
+  assert.equal(textCalled, false);
+});
+
 test("route request smoke exercises stale model, auxiliary task, and image proxy paths", async () => {
   const upstreamRequests = [];
   const imageRequests = [];

@@ -1,9 +1,10 @@
 import { randomBytes } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { realpath } from "node:fs/promises";
 import path from "node:path";
 
-import { updateWorkspaceBinding } from "./conversation-store.js";
+import { getWorkspaceBinding, updateWorkspaceBinding } from "./conversation-store.js";
 import { normalizeChatGptPreferences } from "./preference-compat.js";
+import {readJsonState, writeJsonState, withJsonStateLock} from "./json-state-store.js";
 
 const PROJECTS_FILE = "projects.json";
 
@@ -27,28 +28,20 @@ function projectsPath(storeRoot) {
   return path.join(storeRoot, PROJECTS_FILE);
 }
 
-async function ensureStoreRoot(storeRoot) {
-  await mkdir(storeRoot, { recursive: true });
+function validProjectState(value) {
+  return value && typeof value === "object" && !Array.isArray(value) && Array.isArray(value.projects) &&
+    (value.activeProjectId == null || typeof value.activeProjectId === "string") &&
+    value.projects.every(project => project && typeof project === "object" && !Array.isArray(project) &&
+      typeof project.id === "string" && project.id.length > 0 && typeof project.updatedAt === "string");
 }
 
 async function readProjectState(storeRoot) {
-  try {
-    const parsed = JSON.parse(await readFile(projectsPath(storeRoot), "utf8"));
-    return {
-      activeProjectId: parsed.activeProjectId || null,
-      projects: Array.isArray(parsed.projects) ? parsed.projects : []
-    };
-  } catch {
-    return {
-      activeProjectId: null,
-      projects: []
-    };
-  }
+  const stored=await readJsonState(projectsPath(storeRoot),validProjectState);
+  return stored.exists ? {...stored.value,activeProjectId:stored.value.activeProjectId || null} : {activeProjectId:null,projects:[]};
 }
 
 async function writeProjectState(storeRoot, state) {
-  await ensureStoreRoot(storeRoot);
-  await writeFile(projectsPath(storeRoot), `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  await writeJsonState(projectsPath(storeRoot),state,validProjectState);
 }
 
 function normalizeOptionalText(value) {
@@ -114,7 +107,7 @@ function visibleProjects(projects = []) {
   return projects.filter((project) => !project.deletedAt);
 }
 
-export async function createProject(storeRoot, input = {}) {
+async function createProjectLocked(storeRoot, input = {}) {
   const state = await readProjectState(storeRoot);
   const project = normalizeProjectInput(input);
   state.projects = sortProjects([project, ...state.projects]);
@@ -140,13 +133,14 @@ function findCurrentSessionProject(state, currentCodexThreadId, input = {}) {
   return sortProjects(visible).find((project) => project.currentCodexThreadId === currentCodexThreadId) || null;
 }
 
-export async function bindCurrentSessionProject(storeRoot, input = {}, options = {}) {
+async function bindCurrentSessionProjectLocked(storeRoot, input = {}, options = {}) {
   const currentCodexThreadId =
     normalizeOptionalText(options.currentCodexThreadId) || normalizeOptionalText(input.currentCodexThreadId);
   if (!currentCodexThreadId) {
     throw new Error("Current Codex thread id is required to bind a Bridge project");
   }
 
+  await getWorkspaceBinding(storeRoot);
   const state = await readProjectState(storeRoot);
   const existing = findCurrentSessionProject(state, currentCodexThreadId, input);
   const project = normalizeProjectInput(
@@ -213,7 +207,7 @@ export async function getProject(storeRoot, projectId) {
   return project;
 }
 
-export async function updateProject(storeRoot, projectId, input = {}) {
+async function updateProjectLocked(storeRoot, projectId, input = {}) {
   const state = await readProjectState(storeRoot);
   const existing = state.projects.find((item) => item.id === projectId && !item.deletedAt);
   if (!existing) {
@@ -226,7 +220,8 @@ export async function updateProject(storeRoot, projectId, input = {}) {
   return project;
 }
 
-export async function deleteProject(storeRoot, projectId) {
+async function deleteProjectLocked(storeRoot, projectId) {
+  await getWorkspaceBinding(storeRoot);
   const state = await readProjectState(storeRoot);
   const existing = state.projects.find((item) => item.id === projectId && !item.deletedAt);
   if (!existing) {
@@ -277,7 +272,7 @@ export async function deleteProject(storeRoot, projectId) {
   };
 }
 
-export async function ensureProjectForWorkspace(storeRoot, workspace = {}, options = {}) {
+async function ensureProjectForWorkspaceLocked(storeRoot, workspace = {}, options = {}) {
   if (!workspace.chatgptProjectUrl && !workspace.targetRepo) {
     return null;
   }
@@ -308,7 +303,7 @@ export async function ensureProjectForWorkspace(storeRoot, workspace = {}, optio
       chatgptProjectUrl: workspace.chatgptProjectUrl,
       targetRepo: workspace.targetRepo,
       conversationId: workspace.conversationId,
-      currentCodexThreadId: currentCodexThreadId || existing?.currentCodexThreadId || null,
+      currentCodexThreadId: existing ? existing.currentCodexThreadId : currentCodexThreadId,
       modePreference: workspace.modePreference,
       modelPreference: workspace.modelPreference
     },
@@ -325,7 +320,8 @@ export async function ensureProjectForWorkspace(storeRoot, workspace = {}, optio
   return project;
 }
 
-export async function selectProject(storeRoot, projectId) {
+async function selectProjectLocked(storeRoot, projectId) {
+  await getWorkspaceBinding(storeRoot);
   const state = await readProjectState(storeRoot);
   const project = state.projects.find((item) => item.id === projectId && !item.deletedAt);
   if (!project) {
@@ -355,3 +351,33 @@ export async function selectProject(storeRoot, projectId) {
     workspace
   };
 }
+
+// Lock order is projects -> workspace; workspace mutations never acquire the
+// projects lock. Hold through nested binding updates to prevent selection races.
+export function createProject(storeRoot,input={}) { return withJsonStateLock(projectsPath(storeRoot),()=>createProjectLocked(storeRoot,input)); }
+export function claimUnboundProject(storeRoot, input) {
+  return withJsonStateLock(projectsPath(storeRoot), async () => {
+    const state = await readProjectState(storeRoot);
+    const project = state.projects.find(p => p.id === input.projectId && !p.deletedAt);
+    if (!project || project.conversationId !== input.conversationId) throw new Error("Project scope mismatch");
+    if (!input.currentCodexThreadId) throw new Error("Current Codex thread is required");
+    if (project.currentCodexThreadId) {
+      if (project.currentCodexThreadId !== input.currentCodexThreadId) throw new Error("Project belongs to another Codex thread");
+      return project;
+    }
+    if (!project.targetRepo || !input.cwd) throw new Error("Project directory is required for first-use binding");
+    const [target, caller] = await Promise.all([realpath(project.targetRepo), realpath(input.cwd)]);
+    const key = value => process.platform === "win32" ? value.toLowerCase() : value;
+    if (key(target) !== key(caller)) throw new Error("Current Codex directory does not match the bound project");
+    const bound = {...project, currentCodexThreadId: input.currentCodexThreadId, updatedAt: nowIso()};
+    state.projects = state.projects.map(p => p.id === bound.id ? bound : p);
+    await writeProjectState(storeRoot, state);
+    return bound;
+  });
+}
+
+export function bindCurrentSessionProject(storeRoot,input={},options={}) { return withJsonStateLock(projectsPath(storeRoot),()=>bindCurrentSessionProjectLocked(storeRoot,input,options)); }
+export function updateProject(storeRoot,projectId,input={}) { return withJsonStateLock(projectsPath(storeRoot),()=>updateProjectLocked(storeRoot,projectId,input)); }
+export function deleteProject(storeRoot,projectId) { return withJsonStateLock(projectsPath(storeRoot),()=>deleteProjectLocked(storeRoot,projectId)); }
+export function ensureProjectForWorkspace(storeRoot,workspace={},options={}) { return withJsonStateLock(projectsPath(storeRoot),()=>ensureProjectForWorkspaceLocked(storeRoot,workspace,options)); }
+export function selectProject(storeRoot,projectId) { return withJsonStateLock(projectsPath(storeRoot),()=>selectProjectLocked(storeRoot,projectId)); }

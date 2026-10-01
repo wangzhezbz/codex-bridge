@@ -7,6 +7,29 @@ function requireApi(api) {
 
 const REAL_CONVERSATION_HOST = "chatgpt.com";
 
+export function projectsForPage(payload, hasPageScope) {
+  const projects = payload.projects || [];
+  if (hasPageScope) return projects;
+  return [...new Map([...projects, ...(payload.otherProjects || [])].map(p => [p.id, p])).values()];
+}
+
+export async function pageUrlForSavedProject({ api, project, pageUrl }) {
+  if (!project?.currentCodexThreadId) return null;
+  const scope = await requireApi(api)("/api/scopes", {
+    method: "POST",
+    body: JSON.stringify({
+      projectId: project.id,
+      conversationId: project.conversationId,
+      currentCodexThreadId: project.currentCodexThreadId
+    })
+  });
+  if (!scope.scopeToken) throw new Error("未能打开项目，请重试。");
+  const url = new URL(pageUrl);
+  url.searchParams.set("scope", scope.scopeToken);
+  url.searchParams.set("project", project.id);
+  return url.toString();
+}
+
 export function displayProjectConversationUrl(value = "") {
   return String(value || "");
 }
@@ -87,6 +110,23 @@ export async function selectProjectForScope({ api, projectId, currentCodexThread
   return callApi(`/api/projects/${encodeURIComponent(projectId)}/select`, {
     method: "POST",
     body: JSON.stringify({})
+  });
+}
+
+export async function createNewProjectForScope({ api, input }) {
+  const callApi = requireApi(api);
+  // Creation must never use current-session, which intentionally updates an
+  // existing binding for the service's calling thread.
+  const created = await callApi("/api/projects", {
+    method: "POST",
+    body: JSON.stringify({
+      name: input.name,
+      chatgptProjectUrl: input.chatgptProjectUrl,
+      targetRepo: input.targetRepo
+    })
+  });
+  return callApi(`/api/projects/${encodeURIComponent(created.project.id)}/select`, {
+    method: "POST", body: JSON.stringify({})
   });
 }
 

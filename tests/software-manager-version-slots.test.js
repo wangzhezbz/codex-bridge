@@ -665,6 +665,27 @@ function promotionPlan(
   };
 }
 
+test("rollback inspection detects a missing previous slot before advertising or stopping the app", async () => {
+  const fixture = fixtureWithInstalled({ currentVersion: "2.0.0", previousVersion: "1.0.0" });
+  assert.equal((await fixture.manager.inspectRollback("chatgpt")).available, true);
+  const before = fixture.state();
+  fixture.damageSlot("cp", "missing");
+  const inspected = await fixture.manager.inspectRollback("chatgpt");
+  assert.deepEqual(inspected, { available: false, reason: "rollback_slot_missing", version: "1.0.0" });
+  assert.deepEqual(fixture.state(), before, "Inspection must not erase ownership or the current program");
+  assert.equal(fixture.versions().current, "2.0.0");
+});
+
+test("rollback inspection rejects replaced slot identity without changing the rollback record", async () => {
+  const fixture = fixtureWithInstalled({ currentVersion: "2.0.0", previousVersion: "1.0.0" });
+  fixture.replaceSlotIdentity("cp");
+  const before = fixture.state();
+  const inspected = await fixture.manager.inspectRollback("chatgpt");
+  assert.equal(inspected.available, false);
+  assert.match(inspected.reason, /slot_.*(identity|ownership)/u);
+  assert.deepEqual(fixture.state(), before);
+});
+
 test("first install promotes only the verified staging slot and creates no rollback", async () => {
   const fixture = createFixture({ slots: { ct: null } });
   await fixture.manager.promotePreparedVersion(promotionPlan(fixture, "1.0.0"));

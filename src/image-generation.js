@@ -12,6 +12,11 @@ import { runCapabilityProxy } from "./capability-proxy.js";
 import { jsonResponse } from "./json.js";
 import { contextPolicyForRoute } from "./context-policy.js";
 import { createRouteSnapshot } from "./route-snapshot.js";
+import boundedResponseBody from "../shared/bounded-response-body.cjs";
+import networkDeadline from "../shared/network-deadline.cjs";
+
+const { cancelResponseBody, readBoundedResponseBytes } = boundedResponseBody;
+const { runWithNetworkDeadline } = networkDeadline;
 
 const OFFICIAL_IMAGE_GENERATION = {
   enabled: true,
@@ -25,6 +30,11 @@ const OFFICIAL_IMAGE_GENERATION = {
   apiKeyEnv: "OPENAI_API_KEY",
 };
 const INLINE_IMAGE_RESULT_MAX_BYTES = 512 * 1024;
+const DEFAULT_IMAGE_RESULT_MAX_BYTES = 64 * 1024 * 1024;
+const MAX_IMAGE_RESULT_BYTES = 256 * 1024 * 1024;
+const MAX_IMAGE_RESULT_TIMEOUT_MS = 30 * 60_000;
+const DEFAULT_IMAGE_HISTORY_WRITE_TIMEOUT_MS = 30_000;
+const MAX_IMAGE_HISTORY_WRITE_TIMEOUT_MS = 2 * 60_000;
 
 export function shouldUseImageGenerationFallback(requestBody, route) {
   const settings = imageGenerationSettings(route);
@@ -98,24 +108,15 @@ export async function proxyImageGenerationFallback(
     parentResponseId: requestBody.previous_response_id || null,
     routeSnapshot: imageHistoryRouteSnapshot(route),
   };
-  if (typeof history?.recordTurnAsync === "function") {
-    await history.recordTurnAsync({
-      responseId: response.id,
-      messages,
-      response,
-      meta,
-    });
-  } else if (typeof history?.recordTurn === "function") {
-    history.recordTurn({
-      responseId: response.id,
-      messages,
-      response,
-      meta,
-    });
-  } else {
-    history?.record?.(response.id, messages);
-    history?.recordResponse?.(response, meta);
-  }
+  const historyWrite = recordGeneratedImageHistory(history, {
+    responseId: response.id,
+    messages,
+    response,
+    meta,
+  }, {
+    deferPersistence: Boolean(requestBody.stream),
+    timeoutMs: imageHistoryWriteTimeoutMs(route),
+  });
 
   if (requestBody.stream) {
     res.writeHead(200, {
@@ -124,11 +125,71 @@ export async function proxyImageGenerationFallback(
       connection: "keep-alive",
     });
     res.end(responseToSse(response));
+    settleGeneratedImageHistory(historyWrite, context, route);
     return response;
   }
 
+  await historyWrite;
   jsonResponse(res, 200, response);
   return response;
+}
+
+async function recordGeneratedImageHistory(history, turn, options = {}) {
+  if (!history) return;
+  if (options.deferPersistence
+    && typeof history.stageTurn === "function"
+    && typeof history.persistStagedTurnAsync === "function") {
+    const responseId = history.stageTurn(turn);
+    await history.persistStagedTurnAsync(responseId);
+    return;
+  }
+  if (options.deferPersistence) await new Promise((resolve) => setImmediate(resolve));
+  if (typeof history.recordTurnAsync === "function") {
+    await waitForImageHistoryWrite(history.recordTurnAsync(turn), options.timeoutMs);
+    return;
+  }
+  if (typeof history.recordTurn === "function") {
+    history.recordTurn(turn);
+    return;
+  }
+  history.record?.(turn.responseId, turn.messages);
+  history.recordResponse?.(turn.response, turn.meta);
+}
+
+function settleGeneratedImageHistory(historyWrite, context = {}, route = {}) {
+  Promise.resolve(historyWrite).catch((error) => {
+    console.warn(
+      `[${new Date().toISOString()}] ${context.requestId || "req"} ` +
+        `!! image-history-write-after-stream route=${route.id || route.model || "-"} ` +
+        `error=${String(error?.message || error).slice(0, 240)}`,
+    );
+  });
+}
+
+async function waitForImageHistoryWrite(write, timeoutMs) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      Promise.resolve(write),
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(() => {
+          const error = new Error(`Image response history write timed out after ${timeoutMs}ms.`);
+          error.code = "history_write_timeout";
+          reject(error);
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
+function imageHistoryWriteTimeoutMs(route = {}) {
+  const value = Number(route.historyWriteTimeoutMs || route.history_write_timeout_ms);
+  const selected = Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : DEFAULT_IMAGE_HISTORY_WRITE_TIMEOUT_MS;
+  return Math.min(selected, MAX_IMAGE_HISTORY_WRITE_TIMEOUT_MS);
 }
 
 function imageHistoryRouteSnapshot(route = {}) {
@@ -293,6 +354,10 @@ export function friendlyImageGenerationError(error, provider = {}) {
     message = `${providerName} 的提示词太长。请缩短描述、减少参考内容，或拆成多次生成后再试。`;
   } else if (isImageGenerationModerationError(haystack)) {
     message = `${providerName} 的内容审核拦截了这次提示词。请换一种更明确、更安全的描述后再试。`;
+  } else if (error?.code === "image_result_timeout") {
+    message = `${providerName} 已返回图片地址，但结果下载超时。请检查网络、代理或图片 CDN 后重试。`;
+  } else if (error?.code === "image_result_too_large" || /result.*too large|结果.*过大/.test(haystack)) {
+    message = `${providerName} 返回的图片文件过大，CodexBridge 已停止下载，避免占用过多内存或磁盘。请调小图片尺寸后重试。`;
   } else if (/download failed|result download|保存|下载/.test(haystack)) {
     message = `${providerName} 已返回图片地址，但 CodexBridge 下载或保存图片失败。请检查网络、代理和本地 generated-images 目录权限。`;
   }
@@ -929,6 +994,14 @@ export function imageGenerationSettings(route = {}) {
       historyPath: raw.historyPath || "",
     };
   }
+  const maxAssetBytes = positiveImageResultByteLimit(
+    raw.maxAssetBytes || raw.max_asset_bytes,
+    0,
+  );
+  const assetTimeoutMs = positiveImageResultTimeoutMs(
+    raw.assetTimeoutMs || raw.asset_timeout_ms,
+    0,
+  );
 
   return {
     enabled: true,
@@ -961,6 +1034,8 @@ export function imageGenerationSettings(route = {}) {
     headers: normalizeImageGenerationHeaders(raw.headers),
     outputDir: raw.outputDir || process.env.CODEXBRIDGE_IMAGE_OUTPUT_DIR || "",
     historyPath: raw.historyPath || process.env.CODEXBRIDGE_IMAGE_HISTORY_PATH || "",
+    ...(maxAssetBytes ? { maxAssetBytes } : {}),
+    ...(assetTimeoutMs ? { assetTimeoutMs } : {}),
   };
 }
 
@@ -996,7 +1071,11 @@ async function localImageFromImageResult(result, settings = {}) {
 
   let image = null;
   try {
-    image = await readImagePayload(source);
+    image = await readImagePayload(
+      source,
+      imageResultMaxBytes(settings),
+      imageResultTimeoutMs(settings),
+    );
   } catch (error) {
     throw imageResultDownloadError(error);
   }
@@ -1026,7 +1105,9 @@ async function localImageFromImageResult(result, settings = {}) {
 
 function imageResultDownloadError(error) {
   const wrapped = new Error(`图片生成结果下载失败：${error?.message || String(error)}`);
-  wrapped.code = "image_result_download_failed";
+  wrapped.code = ["image_result_too_large", "image_result_timeout"].includes(error?.code)
+    ? error.code
+    : "image_result_download_failed";
   wrapped.statusCode = error?.statusCode || error?.status || 0;
   wrapped.cause = error;
   return wrapped;
@@ -1055,11 +1136,18 @@ function imagePayloadFromResult(result, responsePaths = {}) {
   return url ? { url } : null;
 }
 
-async function readImagePayload(source) {
+async function readImagePayload(
+  source,
+  maxBytes = DEFAULT_IMAGE_RESULT_MAX_BYTES,
+  timeoutMs = 120_000,
+) {
   if (source.base64) {
     const parsed = parseBase64Image(source.base64);
+    assertImageBase64WithinLimit(parsed.base64, maxBytes);
+    const bytes = Buffer.from(parsed.base64, "base64");
+    assertImageResultWithinLimit(bytes.length, maxBytes);
     return {
-      bytes: Buffer.from(parsed.base64, "base64"),
+      bytes,
       mimeType: parsed.mimeType || "image/png",
     };
   }
@@ -1068,8 +1156,11 @@ async function readImagePayload(source) {
   }
   if (source.url.startsWith("data:")) {
     const parsed = parseDataUrl(source.url);
+    assertImageBase64WithinLimit(parsed.base64, maxBytes);
+    const bytes = Buffer.from(parsed.base64, "base64");
+    assertImageResultWithinLimit(bytes.length, maxBytes);
     return {
-      bytes: Buffer.from(parsed.base64, "base64"),
+      bytes,
       mimeType: parsed.mimeType || "image/png",
     };
   }
@@ -1077,16 +1168,83 @@ async function readImagePayload(source) {
   if (!["http:", "https:"].includes(parsedUrl.protocol)) {
     return null;
   }
-  const response = await fetch(source.url);
-  if (!response.ok) {
-    throw new Error(`图片生成结果下载失败：HTTP ${response.status}`);
+  return runWithNetworkDeadline(async (signal) => {
+    const response = await fetch(source.url, signal ? { signal } : undefined);
+    if (!response.ok) {
+      cancelResponseBody(response);
+      throw new Error(`图片生成结果下载失败：HTTP ${response.status}`);
+    }
+    const contentType = String(response.headers.get("content-type") || "").split(";")[0].trim();
+    const bytes = await readBoundedResponseBytes(response, {
+      maxBytes,
+      signal,
+      createTooLargeError: ({ actualBytes }) => imageResultTooLargeError(actualBytes, maxBytes),
+    });
+    return {
+      bytes,
+      mimeType: contentType || mimeTypeFromUrl(source.url) || "image/png",
+    };
+  }, {
+    timeoutMs,
+    createTimeoutError: () => imageResultTimeoutError(timeoutMs),
+  });
+}
+
+function imageResultMaxBytes(settings = {}) {
+  return positiveImageResultByteLimit(
+    settings.maxAssetBytes ||
+      settings.max_asset_bytes ||
+      process.env.CODEXBRIDGE_IMAGE_RESULT_MAX_BYTES,
+    DEFAULT_IMAGE_RESULT_MAX_BYTES,
+  );
+}
+
+function imageResultTimeoutMs(settings = {}) {
+  return positiveImageResultTimeoutMs(
+    settings.assetTimeoutMs ||
+      settings.asset_timeout_ms ||
+      process.env.CODEXBRIDGE_IMAGE_RESULT_TIMEOUT_MS,
+    120_000,
+  );
+}
+
+function positiveImageResultByteLimit(value, fallback) {
+  const number = Number(value);
+  return Math.min(Number.isSafeInteger(number) && number > 0 ? number : fallback, MAX_IMAGE_RESULT_BYTES);
+}
+
+function positiveImageResultTimeoutMs(value, fallback) {
+  const number = Number(value);
+  return Math.min(
+    Number.isSafeInteger(number) && number > 0 ? number : fallback,
+    MAX_IMAGE_RESULT_TIMEOUT_MS,
+  );
+}
+
+function assertImageResultWithinLimit(actualBytes, maxBytes) {
+  if (actualBytes > maxBytes) {
+    throw imageResultTooLargeError(actualBytes, maxBytes);
   }
-  const contentType = String(response.headers.get("content-type") || "").split(";")[0].trim();
-  const bytes = Buffer.from(await response.arrayBuffer());
-  return {
-    bytes,
-    mimeType: contentType || mimeTypeFromUrl(source.url) || "image/png",
-  };
+}
+
+function assertImageBase64WithinLimit(value, maxBytes) {
+  const compact = String(value || "").replace(/\s+/g, "");
+  const padding = compact.endsWith("==") ? 2 : compact.endsWith("=") ? 1 : 0;
+  const estimatedBytes = Math.max(0, Math.floor((compact.length * 3) / 4) - padding);
+  assertImageResultWithinLimit(estimatedBytes, maxBytes);
+}
+
+function imageResultTooLargeError(actualBytes, maxBytes) {
+  const error = new Error(`Image generation result is too large: ${actualBytes} bytes; limit ${maxBytes} bytes.`);
+  error.code = "image_result_too_large";
+  return error;
+}
+
+function imageResultTimeoutError(timeoutMs) {
+  const error = new Error(`Image generation result download timed out after ${timeoutMs}ms.`);
+  error.code = "image_result_timeout";
+  error.timeoutMs = timeoutMs;
+  return error;
 }
 
 function parseBase64Image(value) {

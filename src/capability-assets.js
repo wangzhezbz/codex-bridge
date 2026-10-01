@@ -1,9 +1,19 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import fsNative from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import boundedResponseBody from "../shared/bounded-response-body.cjs";
+import networkDeadline from "../shared/network-deadline.cjs";
+
+const { cancelResponseBody, readBoundedResponseBytes } = boundedResponseBody;
+const { runWithNetworkDeadline } = networkDeadline;
 
 const INLINE_DISPLAY_ASSET_BYTE_LIMIT = 512 * 1024;
 const DEFAULT_CAPABILITY_ASSET_MAX_BYTES = 64 * 1024 * 1024;
+const MAX_CAPABILITY_ASSET_BYTES = 256 * 1024 * 1024;
+const MAX_CAPABILITY_ASSET_TIMEOUT_MS = 30 * 60_000;
 
 export async function saveCapabilityAssetResult(input = {}) {
   const capability = normalizeText(input.capability);
@@ -21,8 +31,28 @@ export async function saveCapabilityAssetResult(input = {}) {
     return null;
   }
   const fetchImpl = typeof input.fetchImpl === "function" ? input.fetchImpl : globalThis.fetch;
+  const maxBytes = capabilityProviderAssetMaxBytes(input.provider);
+  const timeoutMs = capabilityProviderAssetTimeoutMs(input.provider);
+  const streamed = await downloadCapabilityAssetToFile(source, fetchImpl, {
+    outputDir,
+    capability,
+    maxBytes,
+    timeoutMs,
+    signal: input.signal,
+  });
+  if (streamed !== undefined) {
+    if (!streamed) return null;
+    return {
+      capability,
+      providerId: input.provider?.id || "",
+      providerName: input.provider?.displayName || input.provider?.name || input.provider?.id || "",
+      ...streamed,
+    };
+  }
   const payload = await readCapabilityAssetPayload(source, fetchImpl, {
-    maxBytes: capabilityProviderAssetMaxBytes(input.provider),
+    maxBytes,
+    signal: input.signal,
+    timeoutMs,
   });
   if (!payload?.bytes?.length) {
     return null;
@@ -109,10 +139,176 @@ function firstStringValue(value, keys = []) {
   return "";
 }
 
+async function downloadCapabilityAssetToFile(source = {}, fetchImpl, options = {}) {
+  const url = normalizeText(source.url);
+  if (!url || url.startsWith("data:") || typeof fetchImpl !== "function") return undefined;
+  let parsedUrl;
+  try { parsedUrl = new URL(url); } catch { return undefined; }
+  if (!["http:", "https:"].includes(parsedUrl.protocol)) return undefined;
+  const maxBytes = positiveByteLimit(options.maxBytes, DEFAULT_CAPABILITY_ASSET_MAX_BYTES);
+  const timeoutMs = positiveTimeoutMs(options.timeoutMs, 120_000);
+
+  let activeOperation = null;
+  const operationState = { hasOwnedPartial: false };
+  try {
+    return await runWithNetworkDeadline((signal) => {
+      activeOperation = performCapabilityAssetDownload({
+        url,
+        fetchImpl,
+        signal,
+        timeoutMs,
+        maxBytes,
+        outputDir: options.outputDir,
+        capability: options.capability,
+        operationState,
+      });
+      return activeOperation;
+    }, {
+      timeoutMs,
+      signal: options.signal,
+      createTimeoutError: () => capabilityAssetTimeoutError(timeoutMs),
+    });
+  } catch (error) {
+    if (activeOperation && operationState.hasOwnedPartial) {
+      let timer = null;
+      try {
+        await Promise.race([
+          activeOperation.catch(() => {}),
+          new Promise((resolve) => { timer = setTimeout(resolve, 1_000); }),
+        ]);
+      } finally {
+        if (timer !== null) clearTimeout(timer);
+      }
+    }
+    throw error;
+  }
+}
+
+async function performCapabilityAssetDownload({
+  url,
+  fetchImpl,
+  signal,
+  timeoutMs,
+  maxBytes,
+  outputDir,
+  capability,
+  operationState,
+}) {
+  const response = await fetchImpl(url, signal ? { signal } : undefined);
+  if (signal?.aborted) {
+    try { void response?.body?.cancel?.(signal.reason); } catch {}
+    throw signal.reason ?? capabilityAssetTimeoutError(timeoutMs);
+  }
+  if (!response?.ok) {
+    cancelResponseBody(response);
+    const error = new Error(`能力结果下载失败：HTTP ${response?.status || 0}。`);
+    error.code = "asset_download_failed";
+    error.statusCode = Number(response?.status || 0);
+    throw error;
+  }
+  const mimeType = responseHeader(response, "content-type").split(";")[0].trim();
+  const body = response.body;
+  const canStream = body && (typeof body.getReader === "function"
+    || typeof body[Symbol.asyncIterator] === "function");
+  if (!canStream) {
+    const bytes = await readBoundedResponseBytes(response, {
+      maxBytes,
+      signal,
+      createTooLargeError: ({ actualBytes }) => capabilityAssetTooLargeError(actualBytes, maxBytes),
+    });
+    if (!bytes.length) return null;
+    const localPath = await writeCapabilityAsset(bytes, {
+      outputDir,
+      capability,
+      mimeType,
+      sourceUrl: url,
+    });
+    return {
+      localPath,
+      mimeType: mimeType || defaultCapabilityMimeType(capability),
+      sourceUrl: url,
+      bytes: bytes.length,
+      ...(shouldInlineCapabilityAsset(bytes, mimeType || defaultCapabilityMimeType(capability))
+        ? { base64: bytes.toString("base64") }
+        : {}),
+    };
+  }
+
+  const declared = Number(responseHeader(response, "content-length"));
+  if (Number.isSafeInteger(declared) && declared > maxBytes) {
+    try { void body.cancel?.(); } catch {}
+    throw capabilityAssetTooLargeError(declared, maxBytes);
+  }
+  const targetDir = path.resolve(normalizeText(outputDir));
+  await fs.mkdir(targetDir, { recursive: true });
+  const nonce = randomUUID();
+  const tempPath = path.join(targetDir, `.codexbridge-asset-${nonce}.part`);
+  let committed = false;
+  let totalBytes = 0;
+  const hash = createHash("sha256");
+  let inlineChunks = [];
+  let inlineBytes = 0;
+  const meter = new Transform({
+    transform(chunk, _encoding, callback) {
+      const bytes = Buffer.from(chunk);
+      totalBytes += bytes.length;
+      if (!Number.isSafeInteger(totalBytes) || totalBytes > maxBytes) {
+        callback(capabilityAssetTooLargeError(totalBytes, maxBytes));
+        return;
+      }
+      hash.update(bytes);
+      if (inlineChunks !== null) {
+        if (inlineBytes + bytes.length <= INLINE_DISPLAY_ASSET_BYTE_LIMIT) {
+          inlineChunks.push(bytes);
+          inlineBytes += bytes.length;
+        } else {
+          inlineChunks = null;
+          inlineBytes = 0;
+        }
+      }
+      callback(null, bytes);
+    },
+  });
+  try {
+    const input = typeof body.getReader === "function" ? Readable.fromWeb(body) : Readable.from(body);
+    operationState.hasOwnedPartial = true;
+    const output = fsNative.createWriteStream(tempPath, { flags: "wx" });
+    await pipeline(input, meter, output, { signal });
+    if (totalBytes === 0) return null;
+    const ext = capabilityAssetExtension(mimeType, url, capability);
+    const prefix = normalizeText(capability || "capability")
+      .replace(/[^a-z0-9_-]+/gi, "-")
+      .toLowerCase();
+    const digest = hash.digest("hex").slice(0, 16);
+    const target = path.resolve(
+      targetDir,
+      `codexbridge-${prefix}-${Date.now()}-${digest}-${nonce.slice(0, 8)}${ext}`,
+    );
+    await fs.rename(tempPath, target);
+    committed = true;
+    const inline = inlineChunks === null ? null : Buffer.concat(inlineChunks, inlineBytes);
+    return {
+      localPath: target,
+      mimeType: mimeType || defaultCapabilityMimeType(capability),
+      sourceUrl: url,
+      bytes: totalBytes,
+      ...(inline && shouldInlineCapabilityAsset(inline, mimeType || defaultCapabilityMimeType(capability))
+        ? { base64: inline.toString("base64") }
+        : {}),
+    };
+  } finally {
+    if (!committed) await fs.unlink(tempPath).catch((error) => {
+      if (error?.code !== "ENOENT") throw error;
+    });
+    operationState.hasOwnedPartial = false;
+  }
+}
+
 async function readCapabilityAssetPayload(source = {}, fetchImpl, options = {}) {
   const maxBytes = positiveByteLimit(options.maxBytes, DEFAULT_CAPABILITY_ASSET_MAX_BYTES);
   if (source.base64) {
     const parsed = parseCapabilityBase64(source.base64);
+    assertCapabilityBase64WithinLimit(parsed.base64, maxBytes);
     const bytes = Buffer.from(parsed.base64, "base64");
     assertCapabilityAssetWithinLimit(bytes.length, maxBytes);
     return {
@@ -126,6 +322,7 @@ async function readCapabilityAssetPayload(source = {}, fetchImpl, options = {}) 
   }
   if (url.startsWith("data:")) {
     const parsed = parseCapabilityDataUrl(url);
+    assertCapabilityBase64WithinLimit(parsed.base64, maxBytes);
     const bytes = Buffer.from(parsed.base64, "base64");
     assertCapabilityAssetWithinLimit(bytes.length, maxBytes);
     return {
@@ -145,21 +342,30 @@ async function readCapabilityAssetPayload(source = {}, fetchImpl, options = {}) 
   if (!["http:", "https:"].includes(parsedUrl.protocol)) {
     return null;
   }
-  const response = await fetchImpl(url);
-  if (!response?.ok) {
-    const error = new Error(`能力结果下载失败：HTTP ${response?.status || 0}。`);
-    error.code = "asset_download_failed";
-    error.statusCode = Number(response?.status || 0);
-    throw error;
-  }
-  const contentLength = Number.parseInt(responseHeader(response, "content-length"), 10);
-  assertCapabilityAssetWithinLimit(contentLength, maxBytes);
-  const bytes = Buffer.from(await response.arrayBuffer());
-  assertCapabilityAssetWithinLimit(bytes.length, maxBytes);
-  return {
-    bytes,
-    mimeType: responseHeader(response, "content-type").split(";")[0].trim(),
-  };
+  const timeoutMs = positiveTimeoutMs(options.timeoutMs, 120_000);
+  return runWithNetworkDeadline(async (signal) => {
+    const response = await fetchImpl(url, signal ? { signal } : undefined);
+    if (!response?.ok) {
+      cancelResponseBody(response);
+      const error = new Error(`能力结果下载失败：HTTP ${response?.status || 0}。`);
+      error.code = "asset_download_failed";
+      error.statusCode = Number(response?.status || 0);
+      throw error;
+    }
+    const bytes = await readBoundedResponseBytes(response, {
+      maxBytes,
+      signal,
+      createTooLargeError: ({ actualBytes }) => capabilityAssetTooLargeError(actualBytes, maxBytes),
+    });
+    return {
+      bytes,
+      mimeType: responseHeader(response, "content-type").split(";")[0].trim(),
+    };
+  }, {
+    timeoutMs,
+    signal: options.signal,
+    createTimeoutError: () => capabilityAssetTimeoutError(timeoutMs),
+  });
 }
 
 function capabilityProviderAssetMaxBytes(provider = {}) {
@@ -172,17 +378,53 @@ function capabilityProviderAssetMaxBytes(provider = {}) {
   );
 }
 
+function capabilityProviderAssetTimeoutMs(provider = {}) {
+  return positiveTimeoutMs(
+    provider.assetTimeoutMs || provider.asset_timeout_ms,
+    120_000,
+  );
+}
+
 function assertCapabilityAssetWithinLimit(bytes, maxBytes) {
   if (Number.isFinite(bytes) && bytes > maxBytes) {
-    const error = new Error(`Capability result asset is too large: ${bytes} bytes; limit ${maxBytes} bytes.`);
-    error.code = "asset_too_large";
-    throw error;
+    throw capabilityAssetTooLargeError(bytes, maxBytes);
   }
+}
+
+function capabilityAssetTooLargeError(bytes, maxBytes) {
+  const error = new Error(`Capability result asset is too large: ${bytes} bytes; limit ${maxBytes} bytes.`);
+  error.code = "asset_too_large";
+  return error;
+}
+
+function capabilityAssetTimeoutError(timeoutMs) {
+  const error = new Error(`能力结果下载超过 ${Math.ceil(timeoutMs / 1000)} 秒，已停止等待。`);
+  error.code = "asset_download_timeout";
+  error.timeoutMs = timeoutMs;
+  return error;
 }
 
 function positiveByteLimit(value, fallback) {
   const number = Number(value);
-  return Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback;
+  return Math.min(
+    Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback,
+    MAX_CAPABILITY_ASSET_BYTES,
+  );
+}
+
+function positiveTimeoutMs(value, fallback) {
+  const number = Number(value);
+  return Math.min(
+    Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback,
+    MAX_CAPABILITY_ASSET_TIMEOUT_MS,
+  );
+}
+
+function assertCapabilityBase64WithinLimit(value, maxBytes) {
+  const compact = String(value || "").replace(/\s+/g, "");
+  const padding = compact.endsWith("==") ? 2 : compact.endsWith("=") ? 1 : 0;
+  const estimatedBytes = Math.max(0, Math.floor((compact.length * 3) / 4) - padding);
+  assertCapabilityAssetWithinLimit(estimatedBytes, maxBytes);
 }
 
 function parseCapabilityBase64(value = "") {

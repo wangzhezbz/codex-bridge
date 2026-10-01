@@ -236,7 +236,7 @@ async function requireStableDirectory({ candidate, options, realpath, lstat, cod
   const expected = normalizeCanonicalWindowsPath(candidate, options);
   const resolved = normalizeCanonicalWindowsPath(await realpath(expected), options);
   if (resolved.toLowerCase() !== expected.toLowerCase()) throw policyError(`${code}_identity_changed`);
-  const stat = await lstat(expected);
+  const stat = await lstat(expected, { bigint: true });
   if (!stat?.isDirectory?.() || stat?.isSymbolicLink?.() || stat?.isReparsePoint?.()) {
     throw policyError(`${code}_reparse_or_not_directory`);
   }

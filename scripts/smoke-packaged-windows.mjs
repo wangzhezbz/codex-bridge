@@ -19,7 +19,7 @@ import {
   WINDOWS_RELEASE_BUILD_METADATA_FILE,
   packagedSmokeSourceEvidence,
 } from "./release-source-fingerprint.mjs";
-import { removeOwnedTemporaryDirectory } from "./smoke-temp-cleanup.mjs";
+import { removeOwnedTemporaryDirectory, resolveSmokeInstallBase } from "./smoke-temp-cleanup.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const appDir = newestPackagedAppDir();
@@ -92,10 +92,10 @@ async function smokeEmbeddedBridge(exePath, appRoot) {
   const entryPath = path.join(bridgeRoot, "src", "index.js");
   const embedded = JSON.parse(fs.readFileSync(embeddedManifestPath, "utf8"));
   const extension = JSON.parse(fs.readFileSync(extensionManifestPath, "utf8"));
-  assert.equal(embedded.version, "0.1.0");
+  assert.equal(embedded.version, "0.1.95");
   assert.equal(embedded.protocolVersion, 1);
   assert.equal(embedded.security?.apiTokenHeader, "X-Bridge-Token");
-  assert.equal(extension.version, "0.1.57");
+  assert.equal(extension.version, "0.1.95");
   assert.ok(fs.existsSync(path.join(bridgeRoot, "public", "bridge-api-client.js")));
   assert.ok(fs.existsSync(path.join(bridgeRoot, "public", "visible-branding.js")));
   assert.equal(fs.existsSync(path.join(bridgeRoot, "chrome-extension", "bridge-auth.js")), false);
@@ -137,9 +137,9 @@ async function smokeEmbeddedBridge(exePath, appRoot) {
     const health = await waitForEmbeddedBridge(port, 15000);
     const version = await httpGetJson(`http://127.0.0.1:${port}/version`);
     assert.equal(version.service, "chatgpt-codex-bridge");
-    assert.equal(version.version, "0.1.0");
+    assert.equal(version.version, "0.1.95");
     assert.equal(version.protocolVersion, 1);
-    assert.equal(version.extensionProtocolVersion, "v20260801-adaptive-office-wait");
+    assert.equal(version.extensionProtocolVersion, "v20260923-missing-recovery");
     return {
       ok: true,
       durationMs: Date.now() - startedAt,
@@ -252,6 +252,7 @@ function newestPackagedAppDir() {
 
 async function smokeDesktop(exePath) {
   const startedAt = Date.now();
+  const installBaseDir = resolveSmokeInstallBase({ override: process.env.CODEXBRIDGE_PACKAGED_SMOKE_INSTALL_BASE });
   const localAppData = String(process.env.LOCALAPPDATA || "").trim();
   const dataRoot = process.platform === "win32" && path.win32.isAbsolute(localAppData)
     ? localAppData
@@ -260,8 +261,9 @@ async function smokeDesktop(exePath) {
   const smokeHomeDir = path.join(dataDir, "home");
   const configDir = path.join(dataDir, "config");
   const smokeLocalAppData = path.join(dataDir, "local-app-data");
-  const smokeInstallRoot = path.join(os.homedir(), `CBP${process.pid.toString(36)}${Date.now().toString(36).slice(-4)}`);
-  const smokeSelectedInstallRoot = path.join(os.homedir(), `CBS${process.pid.toString(36)}${Date.now().toString(36).slice(-4)}`);
+  fs.mkdirSync(installBaseDir, { recursive: true });
+  const smokeInstallRoot = path.join(installBaseDir, `CBP${process.pid.toString(36)}${Date.now().toString(36).slice(-4)}`);
+  const smokeSelectedInstallRoot = path.join(installBaseDir, `CBS${process.pid.toString(36)}${Date.now().toString(36).slice(-4)}`);
   fs.mkdirSync(path.join(smokeHomeDir, ".codex"), { recursive: true });
   fs.mkdirSync(configDir, { recursive: true });
   fs.mkdirSync(smokeLocalAppData, { recursive: true });
@@ -342,14 +344,10 @@ async function smokeDesktop(exePath) {
   const softwareManager = JSON.parse(softwareManagerMatch[1]);
   assert.equal(softwareManager.readOnly, false);
   assert.equal(softwareManager.catalogAvailable, true);
-  assert.equal(softwareManager.components, 3);
-  assert.equal(softwareManager.skills, 7);
-  assert.deepEqual(softwareManager.cards, ["ChatGPT", "V2RayN", "Git", "Skills"]);
-  assert.equal(softwareManager.expandedSkillRows, 7);
-  assert.equal(softwareManager.expandedPluginRows, 2);
-  assert.equal(softwareManager.selectablePluginRows, 2);
-  assert.equal(softwareManager.updateCards, 3);
-  assert.equal(softwareManager.updateHasSkills, false);
+  assert.equal(softwareManager.components, 1);
+  assert.equal(softwareManager.skills, 0);
+  assert.deepEqual(softwareManager.cards, ["Codex"]);
+  assert.deepEqual(softwareManager.checkedTabs, ["install", "update", "uninstall"]);
   assert.equal(softwareManager.mainScrollTop, 0);
   assert.equal(softwareManager.initialInstallRootPath, smokeInstallRoot);
   assert.equal(softwareManager.installRootPath, smokeSelectedInstallRoot);
@@ -388,8 +386,8 @@ async function smokeDesktop(exePath) {
   };
   } finally {
     cleanupSmokeDirectories([
-      { targetPath: smokeInstallRoot, parentDirectory: os.homedir(), requiredPrefix: "CBP" },
-      { targetPath: smokeSelectedInstallRoot, parentDirectory: os.homedir(), requiredPrefix: "CBS" },
+      { targetPath: smokeInstallRoot, parentDirectory: installBaseDir, requiredPrefix: "CBP" },
+      { targetPath: smokeSelectedInstallRoot, parentDirectory: installBaseDir, requiredPrefix: "CBS" },
       { targetPath: dataDir, parentDirectory: dataRoot, requiredPrefix: "codexbridge-desktop-data-" },
     ]);
   }
@@ -697,7 +695,7 @@ async function waitForEmbeddedBridge(port, timeoutMs) {
       assert.equal(body.ok, true);
       assert.equal(body.service, "chatgpt-codex-bridge");
       assert.equal(body.status, "ready");
-      assert.equal(body.version, "0.1.0");
+      assert.equal(body.version, "0.1.95");
       assert.equal(body.protocolVersion, 1);
       return body;
     } catch (error) {

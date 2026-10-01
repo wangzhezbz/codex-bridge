@@ -1,18 +1,27 @@
+import boundedResponseBody from "../shared/bounded-response-body.cjs";
+import networkDeadline from "../shared/network-deadline.cjs";
+
+const { readBoundedResponseText } = boundedResponseBody;
+const { runWithNetworkDeadline } = networkDeadline;
+const MAX_HEALTH_BODY_BYTES = 256 * 1_024;
+
 export async function probeRouterHealth({
   origin = "http://127.0.0.1:15722",
   timeoutMs = 2500,
   fetchImpl = fetch,
 } = {}) {
   const target = `${String(origin || "").replace(/\/+$/, "")}/health`;
-  const controller = typeof AbortController !== "undefined"
-    ? new AbortController()
-    : null;
-  const timer = controller
-    ? setTimeout(() => controller.abort(), timeoutMs)
-    : null;
   try {
-    const response = await fetchImpl(target, controller ? { signal: controller.signal } : {});
-    const body = await response.json().catch(() => ({}));
+    const { response, body } = await runWithNetworkDeadline(async (signal) => {
+      const nextResponse = await fetchImpl(target, { signal });
+      return {
+        response: nextResponse,
+        body: await readHealthBody(nextResponse, signal),
+      };
+    }, {
+      timeoutMs,
+      createTimeoutError: () => routerHealthError("router_health_timeout", "Router health check timed out"),
+    });
     const models = Array.isArray(body?.models) ? body.models.map(String) : [];
     const routes = Array.isArray(body?.routes) ? body.routes : [];
     const unhealthyRoutes = Number.isFinite(Number(body?.unhealthyRoutes))
@@ -50,11 +59,37 @@ export async function probeRouterHealth({
       message: healthErrorMessage(error),
       checkedAt: new Date().toISOString(),
     };
-  } finally {
-    if (timer) {
-      clearTimeout(timer);
-    }
   }
+}
+
+async function readHealthBody(response, signal) {
+  if (response?.body || typeof response?.text === "function" || typeof response?.arrayBuffer === "function") {
+    const text = await readBoundedResponseText(response, {
+      maxBytes: MAX_HEALTH_BODY_BYTES,
+      signal,
+      createTooLargeError: () => routerHealthError(
+        "router_health_response_too_large",
+        "Router health response is too large",
+      ),
+    });
+    try { return text ? JSON.parse(text) : {}; }
+    catch { return {}; }
+  }
+  if (typeof response?.json === "function") {
+    const body = await response.json().catch(() => ({}));
+    const serialized = JSON.stringify(body);
+    if (Buffer.byteLength(serialized, "utf8") > MAX_HEALTH_BODY_BYTES) {
+      throw routerHealthError("router_health_response_too_large", "Router health response is too large");
+    }
+    return body;
+  }
+  return {};
+}
+
+function routerHealthError(code, message) {
+  const error = new Error(message || code);
+  error.code = code;
+  return error;
 }
 
 export async function waitForRouterHealth({

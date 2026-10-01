@@ -75,3 +75,42 @@ test("strict provider mode mapping rejects unknown and empty modes", () => {
     );
   }
 });
+
+const oldFlash = "remote-deepseek-deepseek-flash";
+const newFlash = "deepseek-v4-1-flash";
+const migrationModels = [
+  { presetId: "subscription", authMode: "codex_openai" },
+  { presetId: newFlash, authMode: "api_key" },
+  { presetId: "other-api", authMode: "api_key" },
+];
+
+for (const mode of ["all_api", "hybrid"]) {
+  test(`preserving ${mode} selection compares verified legacy identities without changing order`, () => {
+    const current = ["other-api", oldFlash, "subscription"];
+    const expected = ["other-api", newFlash, "subscription"];
+    const selected = codexProvider.selectedModelsForModeSwitch(current, expected, migrationModels, mode);
+    assert.deepEqual(selected, mode === "all_api" ? ["other-api", newFlash] : ["other-api", newFlash, "subscription"]);
+    assert.deepEqual(current, ["other-api", oldFlash, "subscription"]);
+    assert.deepEqual(expected, ["other-api", newFlash, "subscription"]);
+    assert.deepEqual(codexProvider.selectedModelsForModeSwitch(expected, current, migrationModels, mode), selected);
+  });
+}
+
+test("mode migration still rejects actual changes, order changes and unverified aliases", () => {
+  for (const [current, expected] of [
+    [[oldFlash], ["other-api"]],
+    [[oldFlash, "other-api"], ["other-api", newFlash]],
+    [[oldFlash], [newFlash, "other-api"]],
+    [[`${oldFlash}-2`], [newFlash]],
+    [[oldFlash], [{}]],
+  ]) {
+    assert.throws(() => codexProvider.selectedModelsForModeSwitch(current, expected, migrationModels, "all_api"), /变化/);
+  }
+  assert.throws(() => codexProvider.selectedModelsForModeSwitch([oldFlash], [newFlash], [migrationModels[0]], "all_api"), /未选择 API/);
+});
+
+test("an explicitly configured legacy slot is not mistaken for a different canonical slot", () => {
+  const models = [...migrationModels, { presetId: oldFlash, authMode: "api_key" }];
+  assert.deepEqual(codexProvider.selectedModelsForModeSwitch([oldFlash], [oldFlash], models, "all_api"), [oldFlash]);
+  assert.throws(() => codexProvider.selectedModelsForModeSwitch([oldFlash], [newFlash], models, "all_api"), /变化/);
+});

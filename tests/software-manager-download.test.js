@@ -15,6 +15,11 @@ import {
 } from "../desktop/software-manager/download-manager.mjs";
 
 const body = Buffer.from("CodexBridge component package: resumable and verified.");
+// Watchdogs bound the test harness, not the downloader's virtual deadlines.
+// Capture these before MockTimers is enabled so slow real file I/O can finish.
+const scheduleWatchdog = globalThis.setTimeout;
+const clearWatchdog = globalThis.clearTimeout;
+const FILE_IO_WATCHDOG_MS = 5_000;
 
 function assetFor(url, content = body) {
   return {
@@ -60,6 +65,20 @@ async function withTempDirectory(fn) {
       });
     }
     await rmdir(directory);
+  }
+}
+
+async function settleWithin(pending, timeoutMs = 250) {
+  let timer;
+  try {
+    return await Promise.race([
+      pending,
+      new Promise((_resolve, reject) => {
+        timer = scheduleWatchdog(() => reject(new Error("download_did_not_settle")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearWatchdog(timer);
   }
 }
 
@@ -128,6 +147,418 @@ test("high-frequency chunks are throttled before reaching IPC-facing progress li
     assert.equal(transfer.at(-1).percent, 100);
     assert.ok(transfer.length < 20, `expected throttled progress, received ${transfer.length} events`);
     assert.equal(progress.at(-1).phase, "verify-download");
+  });
+});
+
+test("progress callback failures cannot invalidate a verified software package", async () => {
+  const fetchImpl = async () => new Response(body, { status: 200 });
+  await withTempDirectory(async ({ destination: fixtureDestination }) => {
+    let progressCalls = 0;
+    const manager = createDownloadManager({ fetchImpl });
+    const destination = fixtureDestination("progress-isolated.zip");
+    const result = await manager.download({
+      asset: assetFor("https://download.example/component.zip"),
+      destination,
+      onProgress() {
+        progressCalls += 1;
+        if (progressCalls === 1) throw new Error("listener failed");
+        return Promise.reject(new Error("async listener failed"));
+      },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(result.size, body.length);
+    assert.deepEqual(await readFile(destination), body);
+    assert.ok(progressCalls >= 2);
+  });
+});
+
+test("a request that ignores AbortSignal stops at the hard header deadline", async () => {
+  await withTempDirectory(async ({ destination: fixtureDestination }) => {
+    const destination = fixtureDestination("stalled-request.zip");
+    let requestSignal = null;
+    const manager = createDownloadManager({
+      fetchImpl(_url, options) {
+        requestSignal = options.signal;
+        return new Promise(() => {});
+      },
+      retryPolicy: { maxAttempts: 1, delayMs: 0 },
+      timeoutPolicy: { requestTimeoutMs: 20, inactivityTimeoutMs: 100, totalTimeoutMs: 200 },
+    });
+
+    await assert.rejects(
+      manager.download({
+        asset: assetFor("https://download.example/stalled-request.zip"),
+        destination,
+      }),
+      (error) => error?.code === "download_request_timeout",
+    );
+    assert.equal(requestSignal?.aborted, true);
+    await assert.rejects(stat(destination), { code: "ENOENT" });
+    await assert.rejects(stat(`${destination}.part`), { code: "ENOENT" });
+  });
+});
+
+test("uncooperative requests obey cancellation and total deadlines before the header deadline", async (t) => {
+  for (const mode of ["cancel", "total"]) {
+    await t.test(mode, async () => {
+      await withTempDirectory(async ({ destination: fixtureDestination }) => {
+        const destination = fixtureDestination(`${mode}-before-headers.zip`);
+        const controller = new AbortController();
+        const cancellation = new Error("user_cancelled_before_headers");
+        const started = Promise.withResolvers();
+        const response = Promise.withResolvers();
+        let requestSignal;
+        let bodyCancellations = 0;
+        const manager = createDownloadManager({
+          fetchImpl(_url, options) {
+            requestSignal = options.signal;
+            started.resolve();
+            return response.promise;
+          },
+          retryPolicy: { maxAttempts: 3, delayMs: 0 },
+          timeoutPolicy: { requestTimeoutMs: 1_000, totalTimeoutMs: mode === "total" ? 20 : 2_000 },
+        });
+        const pending = manager.download({
+          asset: assetFor("https://download.example/component.zip"),
+          destination,
+          signal: controller.signal,
+        }).catch((error) => error);
+        try {
+          await started.promise;
+          if (mode === "cancel") controller.abort(cancellation);
+          const error = await settleWithin(pending);
+          if (mode === "cancel") assert.equal(error, cancellation);
+          else assert.equal(error.code, "download_timeout");
+          assert.equal(requestSignal.aborted, true);
+        } finally {
+          response.resolve(new Response(new ReadableStream({
+            cancel() {
+              bodyCancellations += 1;
+              throw new Error("late_response_cleanup_failed");
+            },
+          })));
+          await pending;
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+        assert.equal(bodyCancellations, 1);
+        await assert.rejects(stat(destination), { code: "ENOENT" });
+        await assert.rejects(stat(`${destination}.part`), { code: "ENOENT" });
+      });
+    });
+  }
+});
+
+test("a cooperative fetch abort cannot replace the retryable header timeout", async () => {
+  await withTempDirectory(async ({ destination: fixtureDestination }) => {
+    let requests = 0;
+    const destination = fixtureDestination("retry-after-header-timeout.zip");
+    const manager = createDownloadManager({
+      fetchImpl(_url, { signal }) {
+        requests += 1;
+        if (requests > 1) return new Response(body);
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener("abort", () => {
+            reject(new DOMException("transport aborted", "AbortError"));
+          }, { once: true });
+        });
+      },
+      retryPolicy: { maxAttempts: 2, delayMs: 0 },
+      timeoutPolicy: { requestTimeoutMs: 20, totalTimeoutMs: 2_000 },
+    });
+    await manager.download({ asset: assetFor("https://download.example/component.zip"), destination });
+    assert.equal(requests, 2);
+    assert.deepEqual(await readFile(destination), body);
+  });
+});
+
+test("response cleanup cannot outlive cancellation or the total download deadline", async (t) => {
+  for (const phase of ["http", "range", "redirect", "cross-origin", "reset", "writer"]) {
+    for (const mode of ["cancel", "total"]) {
+      await t.test(`${phase}: ${mode}`, async () => {
+        const controller = new AbortController();
+        const cancellation = new Error("user_cancelled_response_cleanup");
+        const cleanupStarted = Promise.withResolvers();
+        const cleanup = Promise.withResolvers();
+        let requests = 0;
+        let writers = 0;
+        const responseBody = new ReadableStream({
+          cancel() {
+            cleanupStarted.resolve();
+            return cleanup.promise;
+          },
+        });
+        const manager = createDownloadManager({
+          async fetchImpl() {
+            requests += 1;
+            assert.equal(requests, 1, "aborted cleanup must not start another request");
+            const status = phase === "http" ? 503 : phase === "range" ? 206
+              : phase.includes("redirect") || phase === "cross-origin" ? 302 : 200;
+            return new Response(responseBody, {
+              status,
+              headers: {
+                "Content-Range": "bytes 8-9/10",
+                Location: phase === "cross-origin" ? "https://attacker.example/package.zip" : "/final.zip",
+              },
+            });
+          },
+          retryPolicy: { maxAttempts: 3, delayMs: 0 },
+          timeoutPolicy: { requestTimeoutMs: 1_000, totalTimeoutMs: mode === "total" ? 20 : 2_000 },
+        });
+        const pending = manager.downloadPrepared({
+          asset: assetFor("https://download.example/component.zip"),
+          target: {
+            async inspect() { return { size: phase === "range" || phase === "reset" ? 7 : 0 }; },
+            async reset() { throw new Error("target_reset_failed"); },
+            async createWriteStream() { writers += 1; throw new Error("target_writer_failed"); },
+            async verify() { assert.fail("cancelled cleanup must not verify a package"); },
+          },
+          signal: controller.signal,
+        }).catch((error) => error);
+        try {
+          await cleanupStarted.promise;
+          if (mode === "cancel") controller.abort(cancellation);
+          const error = await settleWithin(pending);
+          if (mode === "cancel") assert.equal(error, cancellation);
+          else assert.equal(error.code, "download_timeout");
+          assert.equal(requests, 1);
+          assert.equal(writers, phase === "writer" ? 1 : 0);
+        } finally {
+          cleanup.resolve();
+          await pending;
+        }
+      });
+    }
+  }
+});
+
+test("response cleanup has its own deadline and consumes late rejection without retrying", async (t) => {
+  for (const phase of ["http", "redirect"]) {
+    await t.test(phase, async () => {
+      const cleanup = Promise.withResolvers();
+      let requests = 0;
+      const manager = createDownloadManager({
+        async fetchImpl() {
+          requests += 1;
+          return new Response(new ReadableStream({ cancel() { return cleanup.promise; } }), {
+            status: phase === "http" ? 503 : 302,
+            headers: { Location: "/final.zip" },
+          });
+        },
+        retryPolicy: { maxAttempts: 3, delayMs: 0 },
+        timeoutPolicy: { requestTimeoutMs: 20, totalTimeoutMs: 2_000 },
+      });
+      const pending = manager.downloadPrepared({
+        asset: assetFor("https://download.example/component.zip"),
+        target: {
+          async inspect() { return { size: 0 }; }, async reset() {},
+          async createWriteStream() { assert.fail("unreleased response must not open a writer"); },
+          async verify() { assert.fail("unreleased response must not verify a package"); },
+        },
+      }).catch((error) => error);
+      try {
+        const error = await settleWithin(pending);
+        if (phase === "http") {
+          assert.ok(error instanceof AggregateError);
+          assert.match(error.cause.message, /HTTP 503/u);
+          assert.equal(error.errors[1].code, "download_cleanup_timeout");
+        } else {
+          assert.equal(error.code, "download_cleanup_timeout");
+        }
+        assert.equal(requests, 1);
+      } finally {
+        cleanup.reject(new Error("late_body_cleanup_failed"));
+        await pending;
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    });
+  }
+});
+
+test("stuck body cancellation is bounded while pipeline still waits for the file handle to close", async (t) => {
+  for (const mode of ["cancel", "total", "inactivity"]) {
+    await t.test(mode, async (subtest) => {
+      await withTempDirectory(async ({ destination: fixtureDestination }) => {
+        subtest.mock.timers.enable({ apis: ["setTimeout"] });
+        const destination = fixtureDestination(`${mode}-during-transfer.zip`);
+        const controller = new AbortController();
+        const cleanup = Promise.withResolvers();
+        const cancellationStarted = Promise.withResolvers();
+        const closeStarted = Promise.withResolvers();
+        const allowClose = Promise.withResolvers();
+        const transferStarted = Promise.withResolvers();
+        const fileOpened = Promise.withResolvers();
+        let output;
+        let closed = false;
+        let settled = false;
+        let cancellations = 0;
+        const responseBody = new ReadableStream({
+          start(stream) { stream.enqueue(body.subarray(0, 8)); },
+          cancel() { cancellations += 1; cancellationStarted.resolve(); return cleanup.promise; },
+        });
+        const manager = createDownloadManager({
+          async fetchImpl() { return new Response(responseBody); },
+          fsApi: {
+            promises: fs.promises,
+            createReadStream: fs.createReadStream,
+            createWriteStream(path, options) {
+              output = fs.createWriteStream(path, {
+                ...options,
+                fs: {
+                  ...fs,
+                  close(fd, callback) {
+                    closeStarted.resolve();
+                    allowClose.promise.then(() => fs.close(fd, callback));
+                  },
+                },
+              });
+              output.once("open", () => fileOpened.resolve());
+              output.once("close", () => { closed = true; });
+              return output;
+            },
+          },
+          retryPolicy: { maxAttempts: 1, delayMs: 0 },
+          timeoutPolicy: {
+            requestTimeoutMs: 20,
+            inactivityTimeoutMs: mode === "inactivity" ? 20 : 1_000,
+            totalTimeoutMs: mode === "total" ? 20 : 2_000,
+          },
+        });
+        const pending = manager.download({
+          asset: assetFor("https://download.example/component.zip"),
+          destination,
+          signal: controller.signal,
+          onProgress(event) {
+            if (event.phase === "download") transferStarted.resolve();
+          },
+        }).catch((error) => error).finally(() => { settled = true; });
+        try {
+          // Establish the owned-file transfer phase before advancing any deadline.
+          // A cold Windows stat/open must not win a 20ms timer meant for transfer.
+          await settleWithin(Promise.all([transferStarted.promise, fileOpened.promise]), FILE_IO_WATCHDOG_MS);
+          subtest.mock.timers.tick(19);
+          await new Promise((resolve) => setImmediate(resolve));
+          assert.equal(settled, false);
+          assert.equal(cancellations, 0, "a transfer must not be cancelled before its deadline");
+          if (mode === "cancel") controller.abort();
+          else subtest.mock.timers.tick(1);
+          await settleWithin(Promise.all([closeStarted.promise, cancellationStarted.promise]), FILE_IO_WATCHDOG_MS);
+          // The response cancel promise deliberately never resolves; its own
+          // deadline must expire without abandoning the still-owned file handle.
+          subtest.mock.timers.tick(20);
+          await new Promise((resolve) => setImmediate(resolve));
+          assert.equal(settled, false, "a pending filesystem close must remain owned by the pipeline");
+          assert.equal(closed, false);
+          allowClose.resolve();
+          const error = await settleWithin(pending, FILE_IO_WATCHDOG_MS);
+          if (mode === "cancel") assert.equal(error.name, "AbortError");
+          else assert.equal(error.code, mode === "total" ? "download_timeout" : "download_stalled");
+          assert.equal(cancellations, 1);
+          assert.equal(closed, true);
+          assert.equal(output.closed, true);
+          await assert.rejects(stat(destination), { code: "ENOENT" });
+          assert.ok((await stat(`${destination}.part`)).size <= 8);
+        } finally {
+          controller.abort();
+          allowClose.resolve();
+          cleanup.resolve();
+          try { await settleWithin(pending, FILE_IO_WATCHDOG_MS); }
+          finally { subtest.mock.timers.reset(); }
+        }
+      });
+    });
+  }
+});
+
+test("a response body that stops producing bytes fails at the inactivity deadline", async (t) => {
+  for (const initialBytes of [0, 8]) await t.test(`durable prefix ${initialBytes}`, async (subtest) => {
+    await withTempDirectory(async ({ destination: fixtureDestination }) => {
+      const content = Buffer.from(Array.from({ length: 32 }, (_, index) => index));
+      const destination = fixtureDestination("stalled-body.zip");
+      if (initialBytes) await writeFile(`${destination}.part`, content.subarray(0, initialBytes));
+      subtest.mock.timers.enable({ apis: ["setTimeout"] });
+      const controller = new AbortController();
+      const transferStarted = Promise.withResolvers();
+      let cancelled = false;
+      let settled = false;
+      const bodyStream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(content.subarray(initialBytes, initialBytes + 8));
+        },
+        cancel() {
+          cancelled = true;
+        },
+      });
+      const manager = createDownloadManager({
+        fetchImpl: async () => new Response(bodyStream, {
+          status: initialBytes ? 206 : 200,
+          headers: initialBytes ? { "content-range": `bytes ${initialBytes}-31/32` } : {},
+        }),
+        retryPolicy: { maxAttempts: 1, delayMs: 0 },
+        timeoutPolicy: { requestTimeoutMs: 100, inactivityTimeoutMs: 20, totalTimeoutMs: 200 },
+      });
+
+      const pending = manager.download({
+        asset: assetFor("https://download.example/stalled-body.zip", content),
+        destination,
+        signal: controller.signal,
+        onProgress() { transferStarted.resolve(); },
+      }).catch(error => error).finally(() => { settled = true; });
+      try {
+        await settleWithin(transferStarted.promise, FILE_IO_WATCHDOG_MS);
+        subtest.mock.timers.tick(19);
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(settled, false, "an active stream must survive until its inactivity deadline");
+        subtest.mock.timers.tick(1);
+        const error = await settleWithin(pending, FILE_IO_WATCHDOG_MS);
+        assert.equal(error?.code, "download_stalled");
+        assert.equal(cancelled, true);
+        // Received bytes can still be queued for disk when the deadline fires.
+        // Preserve every previously durable byte and never promote a partial.
+        const partial = await readFile(`${destination}.part`);
+        assert.ok(partial.length >= initialBytes && partial.length <= initialBytes + 8);
+        assert.deepEqual(partial, content.subarray(0, partial.length));
+        await assert.rejects(stat(destination), { code: "ENOENT" });
+      } finally {
+        controller.abort();
+        try { await settleWithin(pending, FILE_IO_WATCHDOG_MS); }
+        finally { subtest.mock.timers.reset(); }
+      }
+    });
+  });
+});
+
+test("an oversized response is cut off before the excess chunk reaches disk", async () => {
+  await withTempDirectory(async ({ destination: fixtureDestination }) => {
+    const expected = Buffer.alloc(8, 1);
+    let cancelled = false;
+    const bodyStream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(expected);
+        controller.enqueue(Buffer.alloc(8, 2));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const manager = createDownloadManager({
+      fetchImpl: async () => new Response(bodyStream, { status: 200 }),
+      retryPolicy: { maxAttempts: 1, delayMs: 0 },
+      timeoutPolicy: { requestTimeoutMs: 100, inactivityTimeoutMs: 100, totalTimeoutMs: 500 },
+    });
+    const destination = fixtureDestination("oversized.zip");
+
+    await assert.rejects(
+      manager.download({
+        asset: assetFor("https://download.example/oversized.zip", expected),
+        destination,
+      }),
+      /exceeds the catalog length/u,
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(cancelled, true);
+    assert.ok((await stat(`${destination}.part`)).size <= expected.length);
+    await assert.rejects(stat(destination), { code: "ENOENT" });
   });
 });
 
@@ -223,6 +654,63 @@ test("prepared capability target resumes, writes, and verifies without reopening
   const receipt = await manager.downloadPrepared({ asset, target });
   assert.deepEqual(content, body);
   assert.deepEqual(calls, ["inspect", ["writer", true, body.length], "verify"]);
+  assert.deepEqual(consumePreparedDownloadVerification(manager, receipt, {
+    target, size: asset.size, sha256: asset.sha256,
+  }), { target, size: asset.size, sha256: asset.sha256 });
+});
+
+test("a stalled prepared capability download retries from its verified partial length", async () => {
+  let content = Buffer.alloc(0);
+  let fetches = 0;
+  let firstBodyCancelled = false;
+  const target = Object.freeze({
+    async inspect() { return { size: content.length }; },
+    async reset() { content = Buffer.alloc(0); },
+    async createWriteStream({ append, maxBytes }) {
+      if (!append) content = Buffer.alloc(0);
+      return new Writable({
+        write(chunk, _encoding, callback) {
+          content = Buffer.concat([content, Buffer.from(chunk)]);
+          callback(content.length <= maxBytes ? null : new Error("too_large"));
+        },
+      });
+    },
+    async verify({ size, sha256 }) {
+      assert.equal(content.length, size);
+      assert.equal(createHash("sha256").update(content).digest("hex"), sha256);
+      return { size, sha256 };
+    },
+  });
+  const manager = createDownloadManager({
+    async fetchImpl(_url, { headers }) {
+      fetches += 1;
+      if (fetches === 1) {
+        assert.equal(headers.Range, undefined);
+        return new Response(new ReadableStream({
+          start(controller) {
+            controller.enqueue(body.subarray(0, 7));
+          },
+          cancel() {
+            firstBodyCancelled = true;
+          },
+        }), { status: 200 });
+      }
+      assert.equal(headers.Range, "bytes=7-");
+      return new Response(body.subarray(7), {
+        status: 206,
+        headers: { "Content-Range": `bytes 7-${body.length - 1}/${body.length}` },
+      });
+    },
+    retryPolicy: { maxAttempts: 2, delayMs: 0 },
+    timeoutPolicy: { requestTimeoutMs: 100, inactivityTimeoutMs: 20, totalTimeoutMs: 500 },
+  });
+  const asset = assetFor("https://shanhaiyouling.com/codexbridge-test/packages/component.zip");
+
+  const receipt = await manager.downloadPrepared({ asset, target });
+
+  assert.equal(firstBodyCancelled, true);
+  assert.equal(fetches, 2);
+  assert.deepEqual(content, body);
   assert.deepEqual(consumePreparedDownloadVerification(manager, receipt, {
     target, size: asset.size, sha256: asset.sha256,
   }), { target, size: asset.size, sha256: asset.sha256 });

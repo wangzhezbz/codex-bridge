@@ -6,6 +6,7 @@ import { createCatalogCache } from "../desktop/software-manager/catalog-cache.mj
 import { createCachedCatalogProvider } from "../desktop/software-manager/catalog-provider.mjs";
 import { readBundledCatalogEnvelope } from "../desktop/software-manager/bundled-catalog.mjs";
 import { CATALOG_PUBLIC_KEY_SPKI } from "../desktop/software-manager/catalog-public-key.mjs";
+import { createSoftwareManagerService } from "../desktop/software-manager/service.mjs";
 
 const TEST_CATALOG_URL = "https://shanhaiyouling.com/codexbridge-install-test/component-catalog.json";
 const TEST_SIGNATURE_URL = `${TEST_CATALOG_URL}.sig`;
@@ -34,8 +35,8 @@ function catalogFixture(version = "1.2.3") {
   };
 }
 
-function signedFixture(version = "1.2.3") {
-  const jsonBytes = Buffer.from(JSON.stringify(catalogFixture(version)));
+function signedFixture(version = "1.2.3", overrides = {}) {
+  const jsonBytes = Buffer.from(JSON.stringify({ ...catalogFixture(version), ...overrides }));
   return {
     catalogUrl: TEST_CATALOG_URL,
     jsonBytes,
@@ -83,6 +84,51 @@ function providerOptions(overrides = {}) {
     cache: { readEnvelope: async () => null, replaceEnvelope: async () => {} },
     ...overrides,
   };
+}
+
+function completeSignedFixture(version) {
+  const template = catalogFixture(version).components[0];
+  return signedFixture(version, {
+    components: ["chatgpt", "v2rayn", "git"].map((id) => ({
+      ...template,
+      id,
+      name: id,
+      assetUrl: `https://shanhaiyouling.com/codexbridge-test/packages/${id}-${version}.zip`,
+      entrypoint: `${id}.exe`,
+      requiredFiles: [`${id}.exe`],
+    })),
+  });
+}
+
+function installationProbeService(catalogProvider, preparedTargets, installedVersion = null) {
+  return createSoftwareManagerService({
+    platform: "win32",
+    catalogProvider,
+    ownershipStore: { load: async () => ({ activeTask: null, components: {}, skills: {}, rollback: null }) },
+    installRootResolver: {
+      choose: async () => ({ token: "root_token_00000001", capability: {} }),
+      resolve: async () => ({}),
+      getCurrentToken: () => "root_token_00000001",
+      adopt: async () => {},
+      discard: async () => {},
+    },
+    adapterFactory: ({ catalogService }) => Object.fromEntries(["chatgpt", "v2rayn", "git"].map((id) => {
+      const entry = catalogService.getComponent(id);
+      const result = (action, status, versionAfter) => ({
+        componentId: id, action, status, versionBefore: installedVersion,
+        versionAfter, message: `probe_${action}`, rollbackAvailable: false,
+      });
+      return [id, {
+        inspectInstalled: async () => result("inspect", installedVersion ? "succeeded" : "skipped", installedVersion),
+        prepare: async () => {
+          preparedTargets.push({ id, version: entry.version, assetUrl: entry.assetUrl });
+          return result("prepare", "succeeded", entry.version);
+        },
+        // Package and filesystem work stop at this in-memory adapter boundary.
+        commit: async () => result("commit", "succeeded", entry.version),
+      }];
+    })),
+  });
 }
 
 test("null public key is offline and leaves network and cache untouched", async () => {
@@ -328,9 +374,11 @@ test("the production bundled catalog works offline on a first-run machine", asyn
 
   const service = await provider.getCurrent();
 
-  assert.equal(service.getComponent("chatgpt").version, "26.814.5517.0");
-  assert.equal(service.getComponent("v2rayn").version, "7.24.7.0");
-  assert.equal(service.getComponent("git").version, "2.55.0.5");
+  assert.equal(service.getComponent("chatgpt").version, "26.928.3736.0");
+  assert.equal(service.getComponent("chatgpt").sha256, "d48ed3a9b9100ea9a6464ad658ee7b3cffc70b8024ff32865f768820e7850244");
+  assert.equal(service.getComponent("chatgpt").assetUrl, "https://download.shanhaiyouling.com/codexbridge-test/packages/chatgpt-26.928.3736.0-x64.zip");
+  assert.equal(service.getComponent("v2rayn").version, "7.25.2.0");
+  assert.equal(service.getComponent("git").version, "2.56.0");
   assert.equal(service.listSkills().length, 7);
 });
 
@@ -495,6 +543,289 @@ test("refresh fetches only exact URLs with redirects disabled and caches only ve
   assert.deepEqual(calls.map(({ url }) => url), [TEST_CATALOG_URL, TEST_SIGNATURE_URL]);
   assert.equal(calls.every(({ options }) => options.redirect === "error" && options.signal instanceof AbortSignal), true);
   assert.equal(store.replacements.length, 1);
+});
+
+test("refresh rejects a signed rollback before replacing the bundled or newer cached baseline", async (t) => {
+  for (const scenario of [
+    { name: "first run", bundled: "4.5.6", cached: null, remote: "4.5.5", expected: "4.5.6" },
+    { name: "stale cache", bundled: "4.5.6", cached: "4.5.4", remote: "4.5.5", expected: "4.5.6" },
+    { name: "newer cache and remote below bundled", bundled: "4.5.6", cached: "6.0.0", remote: "4.5.5", expected: "6.0.0" },
+    { name: "newer cache and remote above bundled", bundled: "4.5.6", cached: "6.0.0", remote: "5.0.0", expected: "6.0.0" },
+    { name: "cache without bundled catalog", bundled: null, cached: "6.0.0", remote: "5.0.0", expected: "6.0.0" },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const store = memoryCacheStore();
+      const cache = createCatalogCache({ cacheStore: store });
+      if (scenario.cached) await cache.replaceEnvelope(signedFixture(scenario.cached));
+      const priorRecord = store.snapshot();
+      const priorWrites = store.replacements.length;
+      const incoming = signedFixture(scenario.remote);
+      const provider = createCachedCatalogProvider(providerOptions({
+        bundledEnvelope: scenario.bundled ? signedFixture(scenario.bundled) : null,
+        cache,
+        fetchImpl: async (url) => response(url === TEST_CATALOG_URL ? incoming.jsonBytes : incoming.signatureText),
+      }));
+
+      assert.equal((await provider.getCurrent()).getComponent("chatgpt").version, scenario.expected);
+      await assert.rejects(provider.refresh(), (error) => error?.code === "catalog_version_rollback");
+      assert.equal(store.replacements.length, priorWrites);
+      assert.deepEqual(store.snapshot(), priorRecord);
+      assert.equal((await provider.getCurrent()).getComponent("chatgpt").version, scenario.expected);
+    });
+  }
+});
+
+test("refresh applies the baseline to missing components and downgraded or missing Skills", async (t) => {
+  const skill = {
+    id: "documents", name: "Documents", description: "Document tools", version: "2.0.0",
+    assetUrl: "https://shanhaiyouling.com/codexbridge-test/packages/documents-2.0.0.zip",
+    size: 100, sha256: "b".repeat(64), files: ["SKILL.md"],
+  };
+  const bundledEnvelope = signedFixture("4.5.6", { skills: [skill] });
+  for (const scenario of [
+    { name: "component missing", overrides: { components: [], skills: [skill] } },
+    { name: "Skill missing", overrides: { skills: [] } },
+    { name: "Skill downgraded", overrides: { skills: [{ ...skill, version: "1.0.0" }] } },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const incoming = signedFixture("5.0.0", scenario.overrides);
+      const store = memoryCacheStore();
+      const provider = createCachedCatalogProvider(providerOptions({
+        bundledEnvelope,
+        cache: createCatalogCache({ cacheStore: store }),
+        fetchImpl: async (url) => response(url === TEST_CATALOG_URL ? incoming.jsonBytes : incoming.signatureText),
+      }));
+
+      await assert.rejects(provider.refresh(), (error) => error?.code === "catalog_version_rollback");
+      assert.equal(store.snapshot(), null);
+      assert.equal((await provider.getCurrent()).getSkill("documents").version, "2.0.0");
+    });
+  }
+});
+
+test("refresh accepts equal numeric versions and monotonic upgrades", async () => {
+  let incoming;
+  const store = memoryCacheStore();
+  const cache = createCatalogCache({ cacheStore: store });
+  const provider = createCachedCatalogProvider(providerOptions({
+    bundledEnvelope: signedFixture("4.5.6"),
+    cache,
+    fetchImpl: async (url) => response(url === TEST_CATALOG_URL ? incoming.jsonBytes : incoming.signatureText),
+  }));
+
+  for (const version of ["4.5.6", "4.5.6.0", "4.5.7", "5.0.0"]) {
+    incoming = signedFixture(version);
+    const refreshed = await provider.refresh();
+    assert.equal(refreshed.getComponent("chatgpt").version, version);
+    assert.equal(provider.describe(refreshed).source, "remote");
+    assert.equal((await provider.getCurrent()).getComponent("chatgpt").version, version);
+    assert.deepEqual(await cache.readEnvelope(), incoming);
+  }
+  assert.equal(store.replacements.length, 4);
+});
+
+test("a cache failure cannot erase a catalog version already verified in this process", async (t) => {
+  for (const mode of ["missing", "read error", "invalid signature", "older valid cache"]) {
+    await t.test(mode, async () => {
+      const current = signedFixture("6.0.0");
+      const older = signedFixture("5.0.0");
+      let degraded = false;
+      let writes = 0;
+      const provider = createCachedCatalogProvider(providerOptions({
+        bundledEnvelope: signedFixture("4.0.0"),
+        cache: {
+          async readEnvelope() {
+            if (!degraded) return current;
+            if (mode === "missing") return null;
+            if (mode === "read error") throw new Error("transient_cache_read_failure");
+            if (mode === "invalid signature") return { ...older, signatureText: Buffer.alloc(256).toString("base64") };
+            return older;
+          },
+          async replaceEnvelope() { writes += 1; },
+        },
+        fetchImpl: async (url) => response(url === TEST_CATALOG_URL ? older.jsonBytes : older.signatureText),
+      }));
+      assert.equal((await provider.getCurrent()).getComponent("chatgpt").version, "6.0.0");
+      degraded = true;
+      await assert.rejects(provider.refresh(), { code: "catalog_version_rollback" });
+      assert.equal(writes, 0);
+      assert.equal((await provider.getCurrent()).getComponent("chatgpt").version, "6.0.0");
+    });
+  }
+});
+
+test("a successfully refreshed catalog remains the installation baseline if its cache becomes unreadable", async () => {
+  let incoming = completeSignedFixture("6.0.0");
+  let cached = null;
+  let cacheFailed = false;
+  let writes = 0;
+  const preparedTargets = [];
+  const provider = createCachedCatalogProvider(providerOptions({
+    bundledEnvelope: completeSignedFixture("4.0.0"),
+    cache: {
+      async readEnvelope() {
+        if (cacheFailed) throw new Error("cache_locked");
+        return cached;
+      },
+      async replaceEnvelope(envelope) { cached = envelope; writes += 1; },
+    },
+    fetchImpl: async (url) => response(url === TEST_CATALOG_URL ? incoming.jsonBytes : incoming.signatureText),
+  }));
+  const service = installationProbeService(provider, preparedTargets);
+  await service.getSnapshot();
+  assert.equal((await service.refresh()).components.find((item) => item.id === "chatgpt").version, "6.0.0");
+  cacheFailed = true;
+  incoming = completeSignedFixture("5.0.0");
+  const after = await service.refresh();
+  assert.equal(after.readOnly, false);
+  assert.equal(after.catalog.refreshError, "catalog_version_rollback");
+  assert.equal(after.components.find((item) => item.id === "chatgpt").version, "6.0.0");
+  await service.startTask({ kind: "install", componentIds: ["chatgpt"], skillIds: [] });
+  assert.deepEqual(preparedTargets.map((item) => item.version), ["6.0.0"]);
+  assert.equal(writes, 1);
+});
+
+test("a late cache read cannot lower a more recently accepted remote catalog", async () => {
+  const older = signedFixture("6.0.0");
+  const newer = signedFixture("7.0.0");
+  let releaseRead;
+  const delayedRead = new Promise((resolve) => { releaseRead = resolve; });
+  let reads = 0;
+  let cached = older;
+  const provider = createCachedCatalogProvider(providerOptions({
+    bundledEnvelope: signedFixture("4.0.0"),
+    cache: {
+      readEnvelope() { return ++reads === 1 ? delayedRead : Promise.resolve(cached); },
+      async replaceEnvelope(envelope) { cached = envelope; },
+    },
+    fetchImpl: async (url) => response(url === TEST_CATALOG_URL ? newer.jsonBytes : newer.signatureText),
+  }));
+  const pending = provider.getCurrent();
+  assert.equal((await provider.refresh()).getComponent("chatgpt").version, "7.0.0");
+  releaseRead(older);
+  assert.equal((await pending).getComponent("chatgpt").version, "7.0.0");
+});
+
+test("a failed cache replacement does not advance the accepted in-memory version", async () => {
+  let cached = signedFixture("6.0.0");
+  let incoming = signedFixture("7.0.0");
+  let failWrite = true;
+  const writeError = new Error("cache_write_failed");
+  const provider = createCachedCatalogProvider(providerOptions({
+    bundledEnvelope: signedFixture("4.0.0"),
+    cache: {
+      async readEnvelope() { return cached; },
+      async replaceEnvelope(envelope) {
+        if (failWrite) throw writeError;
+        cached = envelope;
+      },
+    },
+    fetchImpl: async (url) => response(url === TEST_CATALOG_URL ? incoming.jsonBytes : incoming.signatureText),
+  }));
+  assert.equal((await provider.getCurrent()).getComponent("chatgpt").version, "6.0.0");
+  await assert.rejects(provider.refresh(), (error) => error === writeError);
+  assert.equal((await provider.getCurrent()).getComponent("chatgpt").version, "6.0.0");
+  failWrite = false;
+  incoming = signedFixture("6.5.0");
+  assert.equal((await provider.refresh()).getComponent("chatgpt").version, "6.5.0");
+});
+
+test("a verified refresh can repair an untrusted cache without trusting its version", async (t) => {
+  for (const bundledEnvelope of [null, signedFixture("4.5.6")]) {
+    await t.test(bundledEnvelope ? "with bundled baseline" : "without bundled baseline", async () => {
+      const invalid = signedFixture("99.0.0");
+      const store = memoryCacheStore({
+        catalogUrl: invalid.catalogUrl,
+        jsonBase64: invalid.jsonBytes.toString("base64"),
+        signatureText: Buffer.alloc(256).toString("base64"),
+      });
+      const incoming = signedFixture("5.0.0");
+      const cache = createCatalogCache({ cacheStore: store });
+      const provider = createCachedCatalogProvider(providerOptions({
+        bundledEnvelope,
+        cache,
+        fetchImpl: async (url) => response(url === TEST_CATALOG_URL ? incoming.jsonBytes : incoming.signatureText),
+      }));
+
+      assert.equal((await provider.refresh()).getComponent("chatgpt").version, "5.0.0");
+      assert.deepEqual(await cache.readEnvelope(), incoming);
+      assert.equal(store.replacements.length, 1);
+    });
+  }
+});
+
+test("a signed malformed refresh cannot replace a valid catalog above the baseline", async () => {
+  const current = signedFixture("5.0.0");
+  const store = memoryCacheStore();
+  const cache = createCatalogCache({ cacheStore: store });
+  await cache.replaceEnvelope(current);
+  const incoming = signedFixture("6.0.0", { schemaVersion: 2 });
+  const provider = createCachedCatalogProvider(providerOptions({
+    bundledEnvelope: signedFixture("4.5.6"),
+    cache,
+    fetchImpl: async (url) => response(url === TEST_CATALOG_URL ? incoming.jsonBytes : incoming.signatureText),
+  }));
+
+  await assert.rejects(provider.refresh(), (error) => error?.code === "catalog_schema_invalid");
+  assert.deepEqual(await cache.readEnvelope(), current);
+  assert.equal(store.replacements.length, 1);
+});
+
+test("a rejected refresh leaves the real software service writable and prepares the current installation asset", async (t) => {
+  for (const scenario of [
+    { name: "bundled", cached: null, remote: "26.814.5516.0", expected: "26.814.5517.0" },
+    { name: "newer cache", cached: "26.814.5518.0", remote: "26.814.5517.0", expected: "26.814.5518.0" },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const store = memoryCacheStore();
+      const cache = createCatalogCache({ cacheStore: store });
+      if (scenario.cached) await cache.replaceEnvelope(completeSignedFixture(scenario.cached));
+      const priorRecord = store.snapshot();
+      let incoming = completeSignedFixture(scenario.remote);
+      const provider = createCachedCatalogProvider(providerOptions({
+        bundledEnvelope: completeSignedFixture("26.814.5517.0"),
+        cache,
+        fetchImpl: async (url) => response(url === TEST_CATALOG_URL ? incoming.jsonBytes : incoming.signatureText),
+      }));
+      const preparedTargets = [];
+      const service = installationProbeService(provider, preparedTargets);
+
+      assert.equal((await service.getSnapshot()).components[0].version, scenario.expected);
+      const refreshed = await service.refresh();
+      assert.equal(refreshed.catalog.refreshError, "catalog_version_rollback");
+      assert.equal(refreshed.catalog.source, scenario.cached ? "cache" : "bundled");
+      assert.equal(refreshed.readOnly, false);
+      assert.equal(refreshed.catalog.available, true);
+      assert.equal(refreshed.components[0].version, scenario.expected);
+      assert.equal((await service.getSnapshot()).components[0].version, scenario.expected);
+      for (const kind of ["install", "update"]) {
+        const result = await service.startTask({ kind, componentIds: ["chatgpt"], skillIds: [] });
+        assert.equal(result.status, "succeeded");
+        assert.equal(result.components[0].versionAfter, scenario.expected);
+      }
+      assert.deepEqual(preparedTargets, ["install", "update"].map(() => ({
+        id: "chatgpt",
+        version: scenario.expected,
+        assetUrl: `https://shanhaiyouling.com/codexbridge-test/packages/chatgpt-${scenario.expected}.zip`,
+      })));
+      assert.deepEqual(store.snapshot(), priorRecord);
+
+      const installedService = installationProbeService(provider, preparedTargets, scenario.expected);
+      await installedService.refresh();
+      const current = await installedService.startTask({ kind: "update", componentIds: ["chatgpt"], skillIds: [] });
+      assert.equal(current.components[0].status, "skipped");
+      assert.equal(current.components[0].message, "software_manager_already_current");
+      assert.equal(preparedTargets.length, 2);
+
+      incoming = completeSignedFixture(scenario.expected);
+      const recovered = await service.refresh();
+      assert.equal(recovered.catalog.refreshError, null);
+      assert.equal(recovered.catalog.source, "remote");
+      assert.equal(recovered.components[0].version, scenario.expected);
+      assert.equal(recovered.readOnly, false);
+      assert.deepEqual(await cache.readEnvelope(), incoming);
+    });
+  }
 });
 
 test("overlapping refresh calls are one single-flight promise and one committed fetch pair", async () => {
@@ -695,6 +1026,52 @@ test("refresh aborts and rejects a fetch that exceeds its deadline", async () =>
 
   await assert.rejects(provider.refresh(), /catalog_fetch_timeout/u);
   assert.equal(observedSignal.aborted, true);
+});
+
+test("refresh bounds the baseline cache read and never commits after its deadline", async () => {
+  const incoming = signedFixture("5.0.0");
+  let releaseCache;
+  let writes = 0;
+  const provider = createCachedCatalogProvider(providerOptions({
+    bundledEnvelope: signedFixture("4.5.6"),
+    timeoutMs: 10,
+    cache: {
+      readEnvelope: () => new Promise((resolve) => { releaseCache = resolve; }),
+      replaceEnvelope: async () => { writes += 1; },
+    },
+    fetchImpl: async (url) => response(url === TEST_CATALOG_URL ? incoming.jsonBytes : incoming.signatureText),
+  }));
+
+  const refresh = provider.refresh();
+  const outcome = await Promise.race([
+    refresh.then(() => "resolved", (error) => error.code),
+    new Promise((resolve) => setTimeout(() => resolve("hung"), 100)),
+  ]);
+  releaseCache(null);
+  await refresh.catch(() => {});
+
+  assert.equal(outcome, "catalog_fetch_timeout");
+  assert.equal(writes, 0);
+});
+
+test("a response arriving after the catalog deadline is cancelled instead of leaked", async () => {
+  let resolveFetch;
+  let cancelled = false;
+  const lateBody = new ReadableStream({
+    pull() {},
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const provider = createCachedCatalogProvider(providerOptions({
+    timeoutMs: 10,
+    fetchImpl: async () => new Promise((resolve) => { resolveFetch = resolve; }),
+  }));
+
+  await assert.rejects(provider.refresh(), /catalog_fetch_timeout/u);
+  resolveFetch(response(lateBody));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(cancelled, true);
 });
 
 test("a failed signature verification preserves and continues serving the last valid cache", async () => {

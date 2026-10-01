@@ -1,7 +1,8 @@
 import { execFileSync } from "node:child_process";
 import { ProxyAgent } from "undici";
 
-const proxyAgents = new Map();
+const DEFAULT_PROXY_AGENT_CAPACITY = 8;
+const proxyAgentCache = createProxyAgentCache();
 let cachedWindowsProxySettings;
 let cachedMacosProxySettings;
 
@@ -24,13 +25,13 @@ export function invalidateProxyAgentForUrl(targetUrl) {
   if (!proxy?.url) {
     return false;
   }
-  return proxyAgents.delete(proxy.url);
+  return proxyAgentCache.invalidate(proxy.url);
 }
 
 export function refreshFetchInitWithProxy(targetUrl, init = {}) {
   const previous = proxySettingsForUrl(targetUrl);
   if (previous?.url) {
-    proxyAgents.delete(previous.url);
+    proxyAgentCache.invalidate(previous.url);
   }
   cachedWindowsProxySettings = undefined;
   cachedMacosProxySettings = undefined;
@@ -76,10 +77,55 @@ export function proxySettingsForUrl(targetUrl, env = process.env, options = {}) 
 }
 
 function proxyAgent(proxyUrl) {
-  if (!proxyAgents.has(proxyUrl)) {
-    proxyAgents.set(proxyUrl, new ProxyAgent(proxyUrl));
+  return proxyAgentCache.get(proxyUrl);
+}
+
+export function createProxyAgentCache({
+  capacity = DEFAULT_PROXY_AGENT_CAPACITY,
+  createAgent = (proxyUrl) => new ProxyAgent(proxyUrl),
+} = {}) {
+  const agents = new Map();
+  const limit = Number.isSafeInteger(Number(capacity)) && Number(capacity) > 0
+    ? Math.min(Number(capacity), 64)
+    : DEFAULT_PROXY_AGENT_CAPACITY;
+
+  function get(proxyUrl) {
+    const key = String(proxyUrl || "");
+    if (agents.has(key)) {
+      const existing = agents.get(key);
+      agents.delete(key);
+      agents.set(key, existing);
+      return existing;
+    }
+    const created = createAgent(key);
+    agents.set(key, created);
+    while (agents.size > limit) {
+      const oldestKey = agents.keys().next().value;
+      const oldest = agents.get(oldestKey);
+      agents.delete(oldestKey);
+      closeProxyAgent(oldest);
+    }
+    return created;
   }
-  return proxyAgents.get(proxyUrl);
+
+  function invalidate(proxyUrl) {
+    const key = String(proxyUrl || "");
+    if (!agents.has(key)) return false;
+    const agent = agents.get(key);
+    agents.delete(key);
+    closeProxyAgent(agent);
+    return true;
+  }
+
+  return Object.freeze({ get, invalidate, size: () => agents.size });
+}
+
+function closeProxyAgent(agent) {
+  try {
+    void Promise.resolve(agent?.close?.()).catch(() => {});
+  } catch {
+    // Proxy invalidation must not turn a fallback request into a process error.
+  }
 }
 
 function envProxyForProtocol(protocol, env) {

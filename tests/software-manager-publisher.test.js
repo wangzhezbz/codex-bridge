@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { createPackage, getRawHeader } from "@electron/asar";
+
 import { verifyCatalogEnvelope } from "../desktop/software-manager/catalog-trust.mjs";
 import {
   atomicReplacePublicFile,
@@ -16,6 +18,7 @@ import { migrateCatalogToDogeCloud } from "../scripts/software-manager/migrate-d
 import { publishChatGPT } from "../scripts/software-manager/publish-chatgpt.mjs";
 import { publishImportedAssets } from "../scripts/software-manager/publish-imported-assets.mjs";
 import { publishSkills } from "../scripts/software-manager/publish-skills.mjs";
+import { createGreenCodexDirectory } from "../scripts/software-manager/chatgpt-green-converter.mjs";
 
 const PACKAGE_BASE_URL = "https://shanhaiyouling.com/codexbridge-test/packages/";
 const COS_PACKAGE_BASE_URL = "https://codex-1431412335.cos.ap-guangzhou.myqcloud.com/codexbridge-test/packages/";
@@ -51,6 +54,80 @@ function createChatGPTSource(parent, version) {
   fs.writeFileSync(path.join(source, "ChatGPT.exe"), `chatgpt-${version}`);
   fs.writeFileSync(path.join(source, "resources", "app.asar"), `asar-${version}`);
   return source;
+}
+
+function fileSha256(filePath) {
+  return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+}
+
+async function createOfficialGreenPublisherFixture(value) {
+  const official = path.join(value.inputRoot, "OpenAI.Codex_26.917.9434.0_x64");
+  const resources = path.join(official, "app", "resources");
+  fs.mkdirSync(path.join(resources, "app.asar.unpacked", "native"), { recursive: true });
+  fs.writeFileSync(path.join(official, "AppxManifest.xml"), `<?xml version="1.0"?>
+<Package><Identity Name="OpenAI.Codex" ProcessorArchitecture="x64" Version="26.917.9434.0" Publisher="CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B" />
+<Dependencies><TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" /></Dependencies>
+<Applications><Application Id="App" Executable="app/ChatGPT.exe" EntryPoint="Windows.FullTrustApplication" /></Applications></Package>`);
+  fs.writeFileSync(path.join(official, "AppxSignature.p7x"), "signed");
+  fs.writeFileSync(path.join(official, "app", "ChatGPT.exe"), "153.0.8010.53");
+  fs.writeFileSync(path.join(resources, "codex.exe"), "new-codex-core");
+  fs.mkdirSync(path.join(resources, "native"));
+  fs.writeFileSync(path.join(resources, "native", "windows-account.node"), "new-windows-account");
+  fs.writeFileSync(path.join(resources, "native", "windows-updater.node"), "new-windows-updater");
+  fs.writeFileSync(path.join(resources, "app.asar.unpacked", "native", "addon.node"), "native");
+  const officialAsarSource = path.join(value.root, "official-asar-source");
+  fs.mkdirSync(path.join(officialAsarSource, ".vite", "build"), { recursive: true });
+  fs.writeFileSync(path.join(officialAsarSource, "package.json"), JSON.stringify({
+    devDependencies: { electron: "42.3.0" },
+    codexWindowsAppContainedCore: "1",
+  }, null, 2));
+  fs.writeFileSync(path.join(officialAsarSource, ".vite", "build", "main.js"), "electron.app.showTaskManager(); electron.app.setRuntimeFeatures();");
+  await createPackage(officialAsarSource, path.join(resources, "app.asar"));
+
+  const template = path.join(value.inputRoot, "green-template");
+  fs.mkdirSync(path.join(template, "resources"), { recursive: true });
+  fs.writeFileSync(path.join(template, "chrome.dll"), "green-chrome");
+  fs.writeFileSync(path.join(template, "owl-shell-runtime.json"), "{}");
+  fs.mkdirSync(path.join(template, "portable-overrides"));
+  fs.writeFileSync(path.join(template, "portable-overrides", "windows-account.node"), "portable-windows-account");
+  fs.writeFileSync(path.join(template, "portable-overrides", "windows-updater.node"), "portable-windows-updater");
+  const templateAsarSource = path.join(value.root, "template-asar-source");
+  fs.mkdirSync(path.join(templateAsarSource, ".vite", "build"), { recursive: true });
+  fs.writeFileSync(path.join(templateAsarSource, "package.json"), JSON.stringify({ devDependencies: { electron: "42.3.0" } }));
+  fs.writeFileSync(path.join(templateAsarSource, ".vite", "build", "main.js"), "electron.app.showTaskManager(); electron.app.setRuntimeFeatures();");
+  await createPackage(templateAsarSource, path.join(template, "resources", "app.asar"));
+  const templateHeaderSha256 = crypto.createHash("sha256")
+    .update(getRawHeader(path.join(template, "resources", "app.asar")).headerString).digest("hex");
+  fs.writeFileSync(path.join(template, "ChatGPT.exe"), `green-shell:${templateHeaderSha256}`);
+  const requiredShellFiles = [
+    "ChatGPT.exe", "chrome.dll", "owl-shell-runtime.json",
+    "portable-overrides/windows-account.node", "portable-overrides/windows-updater.node",
+  ]
+    .map((relativePath) => ({ relativePath, sha256: fileSha256(path.join(template, relativePath)) }));
+  fs.writeFileSync(path.join(template, ".codexbridge-green-runtime-template.json"), JSON.stringify({
+    schemaVersion: 2, templateVersion: "26.917.9434.0", architecture: "x64",
+    electronVersion: "42.3.0", minimumWindowsBuild: 17763,
+    supportedOwlAppApis: ["setRuntimeFeatures", "showTaskManager"], requiredShellFiles,
+    resourceOverrides: [
+      { sourceRelativePath: "portable-overrides/windows-account.node", targetRelativePath: "resources/native/windows-account.node" },
+      { sourceRelativePath: "portable-overrides/windows-updater.node", targetRelativePath: "resources/native/windows-updater.node" },
+    ],
+    acceptanceId: "green-smoke-26.901-build-17763",
+  }));
+  const candidate = path.join(value.inputRoot, "candidate");
+  const built = await createGreenCodexDirectory({
+    inputPath: official, runtimeTemplatePath: template, outputPath: candidate,
+    verifyAuthenticode: async () => "Valid", generatedAt: "2026-09-25T00:00:00.000Z",
+  });
+  const smokeReportPath = path.join(value.root, "green-smoke-report.json");
+  fs.writeFileSync(smokeReportPath, JSON.stringify({
+    schemaVersion: 1, ok: true, checkedAt: "2026-09-25T00:30:00.000Z",
+    officialVersion: built.officialVersion, contentTreeSha256: built.contentTreeSha256,
+    shellTemplateSha256: built.owlTemplateSha256,
+    processEvidence: { main: {}, renderer: {}, appServer: {} }, pageEvidence: { type: "page" },
+    cleanupEvidence: { processTreeExited: true, userDataRemoved: true },
+  }));
+  return { official, template, candidate, built, smokeReportPath };
 }
 
 function catalogEnvelope(result, fixtureValue) {
@@ -213,6 +290,59 @@ test("ChatGPT publisher verifies the DogeCloud object before exposing its CDN UR
   });
   assert.equal(catalogEnvelope(result, value).components[0].assetUrl, `${DOGECLOUD_PACKAGE_BASE_URL}chatgpt-1.2.4-x64.zip`);
   assert.deepEqual(result.events.slice(-4), ["package_verified", "object_verified", "signature_written", "catalog_replaced"]);
+});
+
+test("ChatGPT publisher converts official AppX by Identity.Version and gates catalog on smoke evidence", async () => {
+  const value = fixture();
+  const green = await createOfficialGreenPublisherFixture(value);
+  const result = await publishChatGPT({
+    config: loadPublisherConfig(value.env),
+    inputPath: green.official,
+    runtimeTemplatePath: green.template,
+    smokeReportPath: green.smokeReportPath,
+    verifyAuthenticode: async () => "Valid",
+    publishedAt: "2026-09-25T01:00:00.000Z",
+  });
+  assert.deepEqual(result.events, [
+    "green_converted", "green_verified", "green_smoke_verified",
+    "package_verified", "object_verified", "signature_written", "catalog_replaced",
+  ]);
+  const component = catalogEnvelope(result, value).components[0];
+  assert.equal(component.version, "26.917.9434.0");
+  assert.equal(component.entrypoint, "ChatGPT.exe");
+  assert.ok(component.requiredFiles.includes(".codexbridge-chatgpt-version.json"));
+  assert.ok(component.requiredFiles.includes(".codexbridge-green-codex.json"));
+  assert.ok(component.requiredFiles.includes("resources/codex.exe"));
+  assert.ok(component.requiredFiles.includes("resources/app.asar"));
+});
+
+test("official publisher leaves package, upload, and catalog untouched on smoke or object mismatch", async () => {
+  const missingSmoke = fixture();
+  const green = await createOfficialGreenPublisherFixture(missingSmoke);
+  let uploads = 0;
+  await assert.rejects(publishChatGPT({
+    config: loadPublisherConfig(missingSmoke.env), inputPath: green.official,
+    runtimeTemplatePath: green.template, verifyAuthenticode: async () => "Valid",
+    artifactPublisher: { publish: async () => { uploads += 1; } },
+  }), /publisher_green_smoke_required/u);
+  assert.equal(uploads, 0);
+  assert.equal(fs.existsSync(path.join(missingSmoke.publicRoot, "packages")), false);
+  assert.equal(fs.existsSync(path.join(missingSmoke.publicRoot, "component-catalog.json")), false);
+
+  const badObject = fixture();
+  const second = await createOfficialGreenPublisherFixture(badObject);
+  await assert.rejects(publishChatGPT({
+    config: loadPublisherConfig(badObject.env), inputPath: second.official,
+    runtimeTemplatePath: second.template, smokeReportPath: second.smokeReportPath,
+    verifyAuthenticode: async () => "Valid",
+    artifactPublisher: { publish: async ({ relativePath, expectedSize }) => ({
+      action: "verified", url: `${PACKAGE_BASE_URL}${relativePath}`,
+      size: expectedSize, sha256: "0".repeat(64),
+    }) },
+  }), /publisher_object_verification_failed/u);
+  const packageRoot = path.join(badObject.publicRoot, "packages");
+  assert.deepEqual(fs.existsSync(packageRoot) ? fs.readdirSync(packageRoot) : [], []);
+  assert.equal(fs.existsSync(path.join(badObject.publicRoot, "component-catalog.json")), false);
 });
 
 test("publisher refuses immutable-name overwrite and retains only current plus one fallback package", async () => {

@@ -84,6 +84,15 @@ async function proxyBridgeApi(message = {}) {
     ? message.options
     : {};
   const method = String(requestOptions.method || "GET").toUpperCase();
+  const binaryResponse = requestOptions.responseType === "base64";
+  if (binaryResponse) {
+    const target = new URL(apiPath, bridgeOrigin);
+    if (method !== "GET" || requestOptions.body ||
+        !/^\/api\/artifacts\/[A-Za-z0-9_-]+\/raw$/.test(target.pathname) ||
+        !target.searchParams.get("projectId")?.trim()) {
+      throw new Error("Binary Bridge reads require a scoped GET artifact raw path");
+    }
+  }
   const request = (token) => fetch(`${bridgeOrigin}${apiPath}`, {
     method,
     body: requestOptions.body,
@@ -116,6 +125,17 @@ async function proxyBridgeApi(message = {}) {
     response = await request(token);
   }
 
+  if (binaryResponse && response.ok) {
+    return {
+      ok: true,
+      response: {
+        ok: true,
+        status: response.status,
+        contentType: response.headers?.get("content-type") || "application/octet-stream",
+        base64Data: arrayBufferToBase64(await response.arrayBuffer())
+      }
+    };
+  }
   return {
     ok: true,
     response: {
@@ -178,9 +198,16 @@ function matchesExpectedFilename(item, expectedFilename) {
   }
 
   const expected = normalized(expectedFilename);
-  const actualName = normalized(basename(item.filename || ""));
-  const actualUrl = normalized(item.finalUrl || item.url || "");
-  return actualName === expected || actualName.includes(expected) || actualUrl.includes(expected);
+  const candidates = [
+    basename(item.filename || ""),
+    filenameFromUrl(item.finalUrl || item.url || "") || ""
+  ];
+  return candidates.some((value) => {
+    const actual = normalized(value);
+    // Chrome may append a numeric suffix on a local filename collision. Never
+    // accept an arbitrary substring from another filename, directory or query.
+    return actual === expected || actual.replace(/ \([1-9]\d*\)(?=\.[^.]+$|$)/, "") === expected;
+  });
 }
 
 function filenameFromUrl(value = "") {
@@ -189,12 +216,12 @@ function filenameFromUrl(value = "") {
     if (url.pathname.includes("/interpreter/download")) {
       const sandboxPath = url.searchParams.get("sandbox_path");
       if (sandboxPath) {
-        return basename(decodeURIComponent(sandboxPath));
+        return basename(sandboxPath);
       }
     }
     const fn = url.searchParams.get("fn");
     if (fn) {
-      return decodeURIComponent(fn);
+      return basename(fn);
     }
     return basename(decodeURIComponent(url.pathname));
   } catch {
@@ -319,22 +346,32 @@ async function importFetchedItem(watch, item) {
 }
 
 async function completeDownloadWatch(watch, item) {
-  try {
-    const imported = await importDownloadedItem(watch, item);
-    await cleanupChromeDownloadHistory(watch, item);
-    finishWatch(watch, {
-      ok: true,
-      artifact: imported.artifact,
-      download: {
-        id: item.id,
-        filename: item.filename,
-        url: item.finalUrl || item.url || null
-      }
-    });
-  } catch (error) {
-    await cleanupChromeDownloadHistory(watch, item);
-    failWatch(watch, error);
+  if (watch.done) {
+    return;
   }
+  // Chrome completion events and the timeout search may observe the same item
+  // while its import is still pending. Share that import, including cleanup.
+  if (!watch.completionPromise) {
+    watch.completionPromise = (async () => {
+      try {
+        const imported = await importDownloadedItem(watch, item);
+        await cleanupChromeDownloadHistory(watch, item);
+        finishWatch(watch, {
+          ok: true,
+          artifact: imported.artifact,
+          download: {
+            id: item.id,
+            filename: item.filename,
+            url: item.finalUrl || item.url || null
+          }
+        });
+      } catch (error) {
+        await cleanupChromeDownloadHistory(watch, item);
+        failWatch(watch, error);
+      }
+    })();
+  }
+  return watch.completionPromise;
 }
 
 async function completeContentUrlWatch(watch, url) {
@@ -409,7 +446,7 @@ function claimContentUrlForWatch(tabId, url) {
 
   const filename = filenameFromUrl(url) || "";
   for (const watch of watches.values()) {
-    if (watch.done || watch.contentUrl) {
+    if (watch.done || watch.contentUrl || watch.nativeDownloadOnly) {
       continue;
     }
     if (watch.tabId && tabId && watch.tabId !== tabId) {
@@ -437,6 +474,7 @@ function startDownloadWatch(input = {}) {
     bridgeApiToken: input.bridgeApiToken || null,
     syncJobId: input.syncJobId || null,
     expectedFilename: input.expectedFilename || null,
+    nativeDownloadOnly: input.nativeDownloadOnly === true,
     tabId: input.tabId || null,
     url: input.url || null,
     contentType: input.contentType || null,
@@ -675,6 +713,10 @@ async function fallbackOrFailWatch(watch, error) {
   if (watch?.done) {
     return true;
   }
+  if (watch?.nativeDownloadOnly) {
+    failWatch(watch,error);
+    return false;
+  }
 
   try {
     if (await completePageContextUrlWatch(watch, watch?.url || watch?.contentUrl || null)) {
@@ -808,6 +850,42 @@ function debuggerCall(method, ...args) {
   });
 }
 
+function attachDebugger(target) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timedOut = false;
+    const timeoutId = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      timedOut = true;
+      reject(new Error("Chrome debugger command timed out"));
+    }, DEBUGGER_CALL_TIMEOUT_MS);
+    try {
+      chrome.debugger.attach(target, "1.3", () => {
+        const error = chrome.runtime.lastError;
+        if (settled) {
+          // A timeout does not cancel Chrome's attach. Release only a connection
+          // this request actually acquired; never execute its expired input.
+          if (timedOut && !error) {
+            timedOut = false;
+            void debuggerCall(chrome.debugger.detach, target).catch(() => {});
+          }
+          return;
+        }
+        settled = true;
+        clearTimeout(timeoutId);
+        if (error) reject(new Error(error.message));
+        else resolve();
+      });
+    } catch (error) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      reject(error);
+    }
+  });
+}
+
 function normalizedProjectTabUrl(value = "") {
   try {
     const url = new URL(value);
@@ -866,7 +944,7 @@ async function trustedClick(sender, input = {}) {
     if (chrome.tabs?.update) {
       await debuggerCall(chrome.tabs.update, tabId, { active: true });
     }
-    await debuggerCall(chrome.debugger.attach, target, "1.3");
+    await attachDebugger(target);
     attached = true;
     await debuggerCall(chrome.debugger.sendCommand, target, "Input.dispatchMouseEvent", {
       type: "mouseMoved",
@@ -926,7 +1004,7 @@ async function trustedInsertText(sender, input = {}) {
     if (chrome.tabs?.update) {
       await debuggerCall(chrome.tabs.update, tabId, { active: true });
     }
-    await debuggerCall(chrome.debugger.attach, target, "1.3");
+    await attachDebugger(target);
     attached = true;
     await debuggerCall(chrome.debugger.sendCommand, target, "Input.dispatchKeyEvent", {
       type: "keyDown",

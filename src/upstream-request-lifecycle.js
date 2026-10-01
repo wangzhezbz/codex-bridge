@@ -6,6 +6,7 @@ import { responseUsesEventStream } from "./responses-stream-policy.js";
 
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 600_000;
 const DEFAULT_STREAMING_PROXY_HEADER_TIMEOUT_MS = 600_000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 export function streamingProxyFetchOptions(route = {}, options = {}, usedProxy = false) {
   if (!usedProxy || !options.streamingResponse) {
@@ -18,7 +19,7 @@ export function streamingProxyFetchOptions(route = {}, options = {}, usedProxy =
       route.proxy_header_timeout_ms,
   );
   const headerTimeout = Number.isFinite(configuredHeaderTimeout) && configuredHeaderTimeout > 0
-    ? Math.floor(configuredHeaderTimeout)
+    ? Math.min(Math.floor(configuredHeaderTimeout), MAX_TIMER_DELAY_MS)
     : DEFAULT_STREAMING_PROXY_HEADER_TIMEOUT_MS;
   return {
     ...options,
@@ -121,7 +122,7 @@ export function upstreamTimeoutMs(route = {}, options = {}) {
       route.request_timeout_ms,
   );
   if (Number.isFinite(value) && value >= 0) {
-    return Math.floor(value);
+    return Math.min(Math.floor(value), MAX_TIMER_DELAY_MS);
   }
   return DEFAULT_UPSTREAM_TIMEOUT_MS;
 }

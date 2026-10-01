@@ -8,10 +8,13 @@ const OFFICIAL_OPENAI_DESKTOP_WIN32_APP_IDS = new Set([
   "com.openai.codex",
   "com.openai.chatgpt",
 ]);
+const DEFAULT_COMMAND_OUTPUT_BYTES = 1024 * 1024;
+const MAX_COMMAND_OUTPUT_BYTES = 8 * 1024 * 1024;
 const SOURCE_PRIORITY = Object.freeze({
   running: 0,
   saved: 1,
   env: 2,
+  managed: 3,
   common: 3,
   shortcut: 4,
   shortcut_target: 5,
@@ -185,7 +188,7 @@ function authorizeOpenAIDesktopProcesses(processes = [], trustedTargets = [], { 
     const brand = openAIDesktopBrand(entry.target);
     if (
       trustedPathsByBrand.has(brand) &&
-      ["saved", "env", "common", "shortcut_target", "restricted"].includes(entry.source) &&
+      ["saved", "env", "managed", "common", "shortcut_target", "restricted"].includes(entry.source) &&
       isOpenAIDesktopExecutablePath(entry.target)
     ) {
       trustedPathsByBrand.get(brand).add(normalizedWindowsPath(entry.target));
@@ -303,6 +306,21 @@ function selectOpenAIDesktopLaunchEntry(entries = [], isLaunchable = () => true)
     }
   }
   return null;
+}
+
+async function readManagedOpenAIDesktopCandidate(getService) {
+  const snapshot = await (await getService()).getSnapshot();
+  if (!snapshot?.enabled || snapshot.task || snapshot.pendingRecovery) return null;
+  const installed = snapshot.components?.find(entry => entry.id === "chatgpt");
+  if (!installed || !/^\d+(?:\.\d+){1,3}$/.test(installed.installedVersion || "")
+    || !["current", "update-available"].includes(installed.updateState)) return null;
+  const root = installed.installPath;
+  if (typeof root !== "string" || !/^[A-Za-z]:\\/.test(root)
+    || root.includes("/") || path.win32.normalize(root) !== root
+    || path.win32.basename(root).toLowerCase() !== "c"
+    || root.slice(3).split("\\").some(part => !part || /[<>:"|?*\u0000-\u001f]/.test(part) || /[ .]$/.test(part))) return null;
+  const target = path.win32.join(root, "ChatGPT.exe");
+  return isOpenAIDesktopExecutablePath(target) ? { target, source: "managed" } : null;
 }
 
 function prioritizeOpenAIDesktopCandidates(entries = []) {
@@ -520,9 +538,17 @@ function parseMacOpenAIDesktopProcesses(output = "") {
 
 function runCommandCaptureWithTimeout(command, args = [], options = {}) {
   const spawnImpl = typeof options.spawnImpl === "function" ? options.spawnImpl : nodeSpawn;
+  const killProcessTree = options.killProcessTree === true && (options.platform || process.platform) === "win32";
   const timeoutMs = Number.isFinite(Number(options.timeoutMs)) && Number(options.timeoutMs) > 0
     ? Math.max(1, Math.round(Number(options.timeoutMs)))
     : 5000;
+  const configuredMaxOutputBytes = Number(options.maxOutputBytes);
+  const maxOutputBytes = Math.min(
+    Number.isSafeInteger(configuredMaxOutputBytes) && configuredMaxOutputBytes > 0
+      ? configuredMaxOutputBytes
+      : DEFAULT_COMMAND_OUTPUT_BYTES,
+    MAX_COMMAND_OUTPUT_BYTES,
+  );
   const spawnOptions = {
     windowsHide: options.windowsHide !== false,
     stdio: options.stdio || ["ignore", "pipe", "ignore"],
@@ -531,10 +557,26 @@ function runCommandCaptureWithTimeout(command, args = [], options = {}) {
 
   return new Promise((resolve) => {
     let child;
-    let stdout = "";
+    const stdoutChunks = [];
+    let stdoutBytes = 0;
     let settled = false;
+    let aborting = false;
+    let rootClosed = false;
+    let completeTreeCleanup = () => {};
     let timer = null;
-    const finish = (result) => {
+    const capturedStdout = () => Buffer.concat(stdoutChunks, stdoutBytes).toString("utf8");
+    const cleanup = () => {
+      child?.stdout?.removeListener?.("data", onStdout);
+      child?.removeListener?.("close", onClose);
+      child?.removeListener?.("error", onError);
+    };
+    const guardLateChildError = () => {
+      const ignoreLateError = () => {};
+      const releaseLateErrorGuard = () => child?.removeListener?.("error", ignoreLateError);
+      child?.once?.("error", ignoreLateError);
+      child?.once?.("close", releaseLateErrorGuard);
+    };
+    const finish = (result, { guardLateError = false } = {}) => {
       if (settled) {
         return;
       }
@@ -542,7 +584,90 @@ function runCommandCaptureWithTimeout(command, args = [], options = {}) {
       if (timer) {
         clearTimeout(timer);
       }
+      cleanup();
+      if (guardLateError) guardLateChildError();
       resolve(result);
+    };
+    const killChild = () => {
+      try {
+        child?.kill?.("SIGKILL");
+      } catch {
+        // The timeout or output-limit result remains authoritative.
+      }
+    };
+    const failAndStop = (result) => {
+      if (settled || aborting) return;
+      aborting = true;
+      if (timer) clearTimeout(timer);
+      if (!killProcessTree) {
+        finish(result, { guardLateError: true });
+        killChild();
+        return;
+      }
+      const processId = child?.pid;
+      if (!Number.isSafeInteger(processId) || processId <= 1 || rootClosed || child?.exitCode != null || child?.signalCode != null) {
+        finish({ ...result, processId, terminationConfirmed: false }, { guardLateError: true });
+        return;
+      }
+      let killer, treeStopped = false, cleanupFinished = false;
+      const configuredCleanup = Number(options.terminationTimeoutMs);
+      const cleanupMs = Number.isFinite(configuredCleanup) && configuredCleanup > 0 ? Math.min(5000, Math.max(1, Math.round(configuredCleanup))) : 5000;
+      const finishCleanup = (confirmed) => {
+        if (cleanupFinished) return;
+        cleanupFinished = true;
+        clearTimeout(cleanupTimer);
+        if (!confirmed) killChild();
+        finish({ ...result, processId, terminationConfirmed: confirmed }, { guardLateError: true });
+      };
+      completeTreeCleanup = () => { if (treeStopped && rootClosed) finishCleanup(true); };
+      const cleanupTimer = setTimeout(() => {
+        try { killer?.kill?.("SIGKILL"); } catch { /* The failed cleanup remains explicit. */ }
+        finishCleanup(false);
+      }, cleanupMs);
+      try {
+        const taskkill = path.win32.join(process.env.SystemRoot || process.env.WINDIR || "C:\\Windows", "System32", "taskkill.exe");
+        killer = spawnImpl(taskkill, ["/PID", String(processId), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+        killer.once("error", () => finishCleanup(false));
+        killer.once("close", (code) => {
+          if (code !== 0) { finishCleanup(false); return; }
+          treeStopped = true;
+          completeTreeCleanup();
+        });
+      } catch { finishCleanup(false); }
+    };
+    const onStdout = (chunk) => {
+      if (settled || aborting) return;
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const remaining = maxOutputBytes - stdoutBytes;
+      if (bytes.length > remaining) {
+        if (remaining > 0) {
+          stdoutChunks.push(bytes.subarray(0, remaining));
+          stdoutBytes += remaining;
+        }
+        failAndStop({
+          ok: false,
+          stdout: capturedStdout(),
+          timedOut: false,
+          outputTooLarge: true,
+          exitCode: null,
+        });
+        return;
+      }
+      stdoutChunks.push(bytes);
+      stdoutBytes += bytes.length;
+    };
+    const onClose = (code) => {
+      rootClosed = true;
+      if (aborting) { completeTreeCleanup(); return; }
+      finish({ ok: code === 0, stdout: capturedStdout(), timedOut: false, exitCode: code });
+    };
+    const onError = () => {
+      if (aborting) return;
+      if (killProcessTree && Number.isSafeInteger(child?.pid) && child.pid > 1) {
+        failAndStop({ ok: false, stdout: capturedStdout(), timedOut: false, exitCode: null });
+        return;
+      }
+      finish({ ok: false, stdout: capturedStdout(), timedOut: false, exitCode: null });
     };
 
     try {
@@ -552,26 +677,18 @@ function runCommandCaptureWithTimeout(command, args = [], options = {}) {
       return;
     }
 
-    child.stdout?.on?.("data", (chunk) => {
-      stdout += chunk.toString("utf8");
-    });
-    child.once?.("exit", (code) => {
-      finish({ ok: code === 0, stdout, timedOut: false, exitCode: code });
-    });
-    child.once?.("error", () => {
-      finish({ ok: false, stdout, timedOut: false, exitCode: null });
-    });
+    child.stdout?.on?.("data", onStdout);
+    child.once?.("close", onClose);
+    child.once?.("error", onError);
     timer = setTimeout(() => {
       if (settled) {
         return;
       }
-      try {
-        child.kill?.("SIGKILL");
-      } catch {
-        // The timeout result remains authoritative even if the helper already exited.
-      }
-      finish({ ok: false, stdout, timedOut: true, exitCode: null });
+      failAndStop(
+        { ok: false, stdout: capturedStdout(), timedOut: true, exitCode: null },
+      );
     }, timeoutMs);
+    timer.unref?.();
   });
 }
 
@@ -579,7 +696,12 @@ function spawnDetachedWithConfirmation(
   command,
   args = [],
   options = {},
-  { spawnImpl = nodeSpawn } = {},
+  {
+    spawnImpl = nodeSpawn,
+    timeoutMs = 5000,
+    setTimeoutFn = setTimeout,
+    clearTimeoutFn = clearTimeout,
+  } = {},
 ) {
   return new Promise((resolve, reject) => {
     let child;
@@ -590,21 +712,48 @@ function spawnDetachedWithConfirmation(
       return;
     }
     let settled = false;
-    child.once("error", (error) => {
-      if (settled) {
-        return;
-      }
+    let timer = null;
+    const cleanup = () => {
+      if (timer !== null) clearTimeoutFn(timer);
+      child.removeListener?.("error", onError);
+      child.removeListener?.("spawn", onSpawn);
+    };
+    const guardLateChildError = () => {
+      const ignoreLateError = () => {};
+      const releaseGuard = () => child.removeListener?.("error", ignoreLateError);
+      child.once?.("error", ignoreLateError);
+      child.once?.("close", releaseGuard);
+    };
+    const finish = (callback, value, { terminate = false } = {}) => {
+      if (settled) return;
       settled = true;
-      reject(error);
-    });
-    child.once("spawn", () => {
-      if (settled) {
-        return;
+      cleanup();
+      if (terminate) {
+        guardLateChildError();
+        try { child.kill?.(); } catch {}
       }
-      settled = true;
-      child.unref?.();
-      resolve({ ok: true });
-    });
+      callback(value);
+    };
+    const onError = (error) => finish(reject, error);
+    const onSpawn = () => {
+      try {
+        child.unref?.();
+        finish(resolve, { ok: true });
+      } catch (error) {
+        finish(reject, error, { terminate: true });
+      }
+    };
+    child.once("error", onError);
+    child.once("spawn", onSpawn);
+    const deadlineMs = Number.isSafeInteger(timeoutMs) && timeoutMs > 0
+      ? Math.min(timeoutMs, 30_000)
+      : 5000;
+    timer = setTimeoutFn(() => {
+      const error = new Error(`Desktop application did not report startup within ${deadlineMs} ms.`);
+      error.code = "desktop_launch_timeout";
+      finish(reject, error, { terminate: true });
+    }, deadlineMs);
+    timer?.unref?.();
   });
 }
 
@@ -747,7 +896,7 @@ function sourcePriority(source) {
 }
 
 function explicitSourcePriority(source) {
-  return source === "saved" || source === "env" ? 0 : 1;
+  return source === "saved" || source === "env" ? 0 : source === "managed" ? 1 : 2;
 }
 
 function brandPriority(brand) {
@@ -793,6 +942,7 @@ module.exports = {
   openAIDesktopTargetFromShortcutResolution,
   openAIDesktopBrand,
   prioritizeOpenAIDesktopCandidates,
+  readManagedOpenAIDesktopCandidate,
   recoverOpenAIProjectsSequentially,
   runCommandCaptureWithTimeout,
   selectMacOpenAIDesktopApp,

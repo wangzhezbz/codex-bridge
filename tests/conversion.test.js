@@ -886,7 +886,7 @@ test("chat conversion adapts Codex reasoning requests by provider", () => {
     { ...route, provider: "deepseek", model: "deepseek-v4-pro" },
     new ResponseHistory(),
   );
-  assert.equal(deepseekV4.body.reasoning_effort, "max");
+  assert.equal(deepseekV4.body.reasoning_effort, "high");
   assert.deepEqual(deepseekV4.body.thinking, { type: "enabled" });
   assert.equal(deepseekV4.body.reasoning, undefined);
 

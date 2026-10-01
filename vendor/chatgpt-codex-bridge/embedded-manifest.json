@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-codex-bridge",
-  "version": "0.1.0",
+  "version": "0.1.95",
   "protocolVersion": 1,
   "entrypoints": {
     "http": "src/index.js",

@@ -1,5 +1,12 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+
+export function resolveSmokeInstallBase({ override, homeDirectory = os.homedir() } = {}) {
+  const base = String(override || "").trim() || homeDirectory;
+  if (!path.isAbsolute(base)) throw new Error("Smoke install base must be an absolute directory path.");
+  return path.resolve(base);
+}
 
 export function removeOwnedTemporaryDirectory(targetPath, {
   parentDirectory,

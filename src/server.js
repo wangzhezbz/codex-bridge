@@ -39,11 +39,25 @@ import { saveCapabilityAssetResult } from "./capability-assets.js";
 import { normalizeContextPolicyConfig } from "./context-policy.js";
 import { createPendingRequestGuard } from "./pending-request-guard.js";
 import { createCodexModelSelectionState } from "./codex-model-selection.js";
+import boundedResponseBody from "../shared/bounded-response-body.cjs";
+import boundedLocalFile from "../shared/bounded-local-file.cjs";
+import networkDeadline from "../shared/network-deadline.cjs";
+
+const { cancelResponseBody, readBoundedResponseText } = boundedResponseBody;
+const { readBoundedLocalFile } = boundedLocalFile;
+const { runWithNetworkDeadline } = networkDeadline;
 
 const DEFAULT_JSON_BODY_LIMIT_BYTES = 25 * 1024 * 1024;
 const DEFAULT_RESPONSES_BODY_LIMIT_BYTES = 100 * 1024 * 1024;
 const DEFAULT_RESPONSES_COMPACT_BODY_LIMIT_BYTES = 200 * 1024 * 1024;
+const MAX_REQUEST_BODY_LIMIT_BYTES = 512 * 1024 * 1024;
 const DEFAULT_CAPABILITY_PROVIDER_RESPONSE_MAX_BYTES = 8 * 1024 * 1024;
+const MAX_CAPABILITY_PROVIDER_RESPONSE_BYTES = 64 * 1024 * 1024;
+const MAX_CAPABILITY_REQUEST_TIMEOUT_MS = 10 * 60_000;
+const MAX_LOCAL_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_LOCAL_BROWSER_BYTES = 16 * 1024 * 1024;
+const MAX_LOCAL_EXCERPT_CHARACTERS = 100_000;
+const MAX_LOCAL_REQUEST_TIMEOUT_MS = 5 * 60_000;
 const BENIGN_ROUTER_PROCESS_ERROR_CODES = new Set([
   "ECONNRESET",
   "EPIPE",
@@ -117,13 +131,14 @@ export function createRouterServer(
   const usageBudgetGuard = createUsageBudgetGuard();
   const pendingRequestGuard = createPendingRequestGuard();
   const codexModelSelection = createCodexModelSelectionState();
+  const readCurrentConfig = createCurrentConfigReader(config);
   const socketsWithErrorHandler = new WeakSet();
 
   const server = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url || "/", "http://127.0.0.1");
       logAccess(req, url);
-      const activeConfig = currentConfig(config);
+      const activeConfig = currentConfig(readCurrentConfig());
       const originPolicy = requestOriginPolicy(req, activeConfig);
       if (!originPolicy.ok) {
         jsonResponse(
@@ -1146,7 +1161,12 @@ function modelNotConfiguredLocalResponse(requestedModel, error) {
     .slice(2, 8)}`;
   const requested = requestedModel || "(default)";
   const detail = error?.message ? `\n\n技术细节：${error.message}` : "";
-  const outputText =
+  const outputText = String(requestedModel || "").trim().toLowerCase() === "gpt-reserve"
+    ? "Codex 已进入 Luna 储备模式，并把本次请求的模型改成了 gpt-reserve。\n" +
+      "如果要继续使用第三方 API 模型，请打开 CodexBridge 概览，点击“使用 API 继续”，确认后完全退出并重启 Codex，再选择原来的 API 模型。\n" +
+      "API 使用各供应商的密钥和余额，不会消耗 Codex 订阅额度；若已切换全部 API，请重启 Codex 后重新选择模型。\n" +
+      "本次未调用上游模型，也没有把 Luna 自动映射为其他模型。"
+    :
     `检测到旧模型槽位请求：${requested}。\n` +
     "这通常来自旧对话或旧 Codex 模型槽位重放。本次没有请求任何上游 provider，也没有消耗上游模型 token。\n" +
     "请在当前对话的模型下拉里重新选择 CodexBridge 的 cb-* 模型，或点击 CodexBridge「初始化 Codex 配置」后新开会话再继续。" +
@@ -1307,7 +1327,7 @@ function usageBudgetValueText(value) {
   if (!Number.isFinite(numericValue)) {
     return String(value ?? "0");
   }
-  return String(Math.round(numericValue * 1_000_000_000) / 1_000_000_000);
+  return String(Number(numericValue.toPrecision(15)));
 }
 
 function usageBudgetScopeLabel(budgetCheck = {}) {
@@ -1458,7 +1478,9 @@ function capabilityProxyCanTryBackup(result = {}) {
   }
   return [
     "provider_http_error",
+    "provider_request_timeout",
     "asset_download_failed",
+    "asset_download_timeout",
     "invalid_response_format",
     "fetch_unavailable",
   ].includes(code);
@@ -1524,13 +1546,25 @@ async function executeGenericServerCapabilityProvider(provider = {}, request = {
     headers.Authorization = `Bearer ${apiKey}`;
   }
 
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(serverCapabilityPayload(provider, request, capability)),
-  });
-  const body = await readCapabilityResponseBody(response, {
-    maxBytes: capabilityProviderResponseMaxBytes(provider),
+  const requestTimeoutMs = serverCapabilityRequestTimeoutMs(provider, config);
+  const { response, body } = await runWithNetworkDeadline(async (signal) => {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(serverCapabilityPayload(provider, request, capability)),
+      ...(signal ? { signal } : {}),
+    });
+    const body = await readCapabilityResponseBody(response, {
+      maxBytes: capabilityProviderResponseMaxBytes(provider),
+      signal,
+    });
+    return { response, body };
+  }, {
+    timeoutMs: requestTimeoutMs,
+    createTimeoutError: () => capabilityServerError(
+      "provider_request_timeout",
+      `Capability provider request timed out after ${requestTimeoutMs}ms.`,
+    ),
   });
   if (!response.ok) {
     throw capabilityServerError(
@@ -1578,28 +1612,34 @@ async function executeServerLocalFileProvider(provider = {}, request = {}, capab
     throw capabilityServerError("local_file_missing_path", "本地文件处理需要提供 path、filePath 或 localPath。");
   }
 
-  let stat;
+  let read;
   try {
-    stat = fs.statSync(filePath);
-  } catch {
+    read = await readBoundedLocalFile(filePath, {
+      maxBytes: serverBoundedPositiveInteger(
+        input.maxBytes || input.max_bytes, 1024 * 1024, MAX_LOCAL_FILE_BYTES,
+      ),
+    });
+  } catch (error) {
+    if (error?.code === "bounded_local_file_not_file") {
+      throw capabilityServerError("local_file_not_file", `本地文件处理只能读取明确的文件路径：${filePath}`);
+    }
+    if (error?.code === "bounded_local_file_too_large") {
+      throw capabilityServerError(
+        "local_file_too_large",
+        `本地文件过大：${error.actualBytes} bytes，当前硬上限 ${error.maxBytes} bytes。`,
+      );
+    }
     throw capabilityServerError("local_file_not_found", `本地文件不存在或不可访问：${filePath}`);
   }
-  if (!stat.isFile()) {
-    throw capabilityServerError("local_file_not_file", `本地文件处理只能读取明确的文件路径：${filePath}`);
-  }
-
-  const maxBytes = serverPositiveInteger(input.maxBytes || input.max_bytes, 1024 * 1024);
-  if (stat.size > maxBytes) {
-    throw capabilityServerError("local_file_too_large", `本地文件过大：${stat.size} bytes，当前上限 ${maxBytes} bytes。`);
-  }
-
-  const buffer = fs.readFileSync(filePath);
+  const { buffer } = read;
   if (serverLooksBinary(buffer)) {
     throw capabilityServerError("local_file_binary_unsupported", "本地文件处理目前只支持文本文件，暂不读取明显的二进制文件。");
   }
 
   const content = buffer.toString("utf8").replace(/\u0000/g, "");
-  const excerptLimit = serverPositiveInteger(input.maxCharacters || input.max_chars || input.limit, 6000);
+  const excerptLimit = serverBoundedPositiveInteger(
+    input.maxCharacters || input.max_chars || input.limit, 6000, MAX_LOCAL_EXCERPT_CHARACTERS,
+  );
   const excerpt = content.slice(0, excerptLimit);
   const truncated = content.length > excerpt.length;
   const fileName = path.basename(filePath);
@@ -1612,7 +1652,7 @@ async function executeServerLocalFileProvider(provider = {}, request = {}, capab
         `文件检查：${fileName}`,
         filePath,
         `类型：${mimeType}`,
-        `大小：${stat.size} bytes`,
+        `大小：${read.size} bytes`,
         `行数：${serverCountTextLines(content)}`,
         "",
         preview,
@@ -1624,7 +1664,7 @@ async function executeServerLocalFileProvider(provider = {}, request = {}, capab
       extension,
       mimeType,
       encoding: "utf8",
-      sizeBytes: stat.size,
+      sizeBytes: read.size,
       lineCount: serverCountTextLines(content),
       preview,
       truncated,
@@ -1638,7 +1678,7 @@ async function executeServerLocalFileProvider(provider = {}, request = {}, capab
     filePath,
     fileName,
     mimeType: serverLocalTextMimeType(filePath),
-    sizeBytes: stat.size,
+    sizeBytes: read.size,
     excerpt,
     truncated,
     providerId: provider.id || "",
@@ -1822,55 +1862,70 @@ async function executeServerLocalBrowserProvider(provider = {}, request = {}, ca
     throw capabilityServerError("fetch_unavailable", "当前 Router 运行环境不能读取网页 URL。");
   }
 
-  let response;
+  const requestTimeoutMs = serverBoundedPositiveInteger(
+    input.timeoutMs || input.timeout_ms || input.requestTimeoutMs || input.request_timeout_ms,
+    serverCapabilityRequestTimeoutMs(provider, config),
+    MAX_LOCAL_REQUEST_TIMEOUT_MS,
+  );
+  let fetched;
   try {
-    response = await fetch(url, {
-      method: "GET",
-      headers: {
-        accept: "text/html,text/plain,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "user-agent": "CodexBridge Router Local Browser Reader",
-      },
+    fetched = await runWithNetworkDeadline(async (signal) => {
+      const response = await fetch(url, {
+        method: "GET",
+        headers: {
+          accept: "text/html,text/plain,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "user-agent": "CodexBridge Router Local Browser Reader",
+        },
+        ...(signal ? { signal } : {}),
+      });
+      const status = Number(response?.status || 0);
+      if (!response?.ok) {
+        cancelResponseBody(response);
+        throw capabilityServerError(
+          "local_browser_fetch_failed",
+          `网页读取失败：HTTP ${status || "unknown"}`,
+          { statusCode: status },
+        );
+      }
+      const contentType = serverResponseHeader(response, "content-type");
+      const maxBytes = serverBoundedPositiveInteger(
+        input.maxBytes || input.max_bytes || input.maxBodyBytes || input.max_body_bytes,
+        2 * 1024 * 1024,
+        MAX_LOCAL_BROWSER_BYTES,
+      );
+      const body = await readBoundedResponseText(response, {
+        maxBytes,
+        signal,
+        createTooLargeError: ({ actualBytes }) => capabilityServerError(
+          "local_browser_response_too_large",
+          `网页内容过大：${actualBytes} bytes，当前上限 ${maxBytes} bytes。请减少页面范围后重试。`,
+        ),
+      });
+      return { body, contentType, status };
+    }, {
+      timeoutMs: requestTimeoutMs,
+      createTimeoutError: () => capabilityServerError(
+        "local_browser_timeout",
+        `网页读取超过 ${Math.ceil(requestTimeoutMs / 1000)} 秒，已停止等待。`,
+      ),
     });
   } catch (error) {
+    if (error?.code) {
+      throw error;
+    }
     throw capabilityServerError(
       "local_browser_fetch_failed",
       `网页读取失败：${error?.message || "网络请求失败"}`,
     );
   }
 
-  const status = Number(response?.status || 0);
-  if (!response?.ok) {
-    throw capabilityServerError(
-      "local_browser_fetch_failed",
-      `网页读取失败：HTTP ${status || "unknown"}`,
-      { statusCode: status },
-    );
-  }
-
-  const contentType = serverResponseHeader(response, "content-type");
-  const maxBytes = serverPositiveInteger(
-    input.maxBytes || input.max_bytes || input.maxBodyBytes || input.max_body_bytes,
-    2 * 1024 * 1024,
-  );
-  const contentLength = Number.parseInt(serverResponseHeader(response, "content-length"), 10);
-  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
-    throw capabilityServerError(
-      "local_browser_response_too_large",
-      `网页内容过大：${contentLength} bytes，当前上限 ${maxBytes} bytes。请调小页面范围或提高 maxBytes。`,
-    );
-  }
-  const body = typeof response.text === "function" ? await response.text() : "";
-  const bodyBytes = Buffer.byteLength(String(body || ""), "utf8");
-  if (bodyBytes > maxBytes) {
-    throw capabilityServerError(
-      "local_browser_response_too_large",
-      `网页内容过大：${bodyBytes} bytes，当前上限 ${maxBytes} bytes。请调小页面范围或提高 maxBytes。`,
-    );
-  }
+  const { body, contentType, status } = fetched;
   const isHtml = /html/i.test(contentType);
   const title = isHtml ? serverExtractHtmlTitle(body) : "";
   const fullText = isHtml ? serverHtmlToReadableText(body) : serverCollapseWhitespace(body);
-  const excerptLimit = serverPositiveInteger(input.maxCharacters || input.max_chars || input.limit, 6000);
+  const excerptLimit = serverBoundedPositiveInteger(
+    input.maxCharacters || input.max_chars || input.limit, 6000, MAX_LOCAL_EXCERPT_CHARACTERS,
+  );
   const excerpt = fullText.slice(0, excerptLimit);
   const truncated = fullText.length > excerpt.length;
   const heading = title ? `已读取网页：${title}` : `已读取网页：${url}`;
@@ -1962,29 +2017,44 @@ async function executeServerLocalCapabilityBridge({ adapter = "", capability = "
     );
   }
 
-  let response;
+  const requestTimeoutMs = serverCapabilityRequestTimeoutMs(provider, config);
+  let fetched;
   try {
-    response = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({
-        adapter,
-        capability,
-        provider: serverLocalBridgeProvider(provider),
-        request,
-      }),
+    fetched = await runWithNetworkDeadline(async (signal) => {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          adapter,
+          capability,
+          provider: serverLocalBridgeProvider(provider),
+          request,
+        }),
+        ...(signal ? { signal } : {}),
+      });
+      const body = await readCapabilityResponseBody(response, { signal });
+      return { response, ...body };
+    }, {
+      timeoutMs: requestTimeoutMs,
+      createTimeoutError: () => capabilityServerError(
+        "local_executor_bridge_timeout",
+        `桌面端执行器通道超过 ${Math.ceil(requestTimeoutMs / 1000)} 秒没有完成，已停止等待。`,
+      ),
     });
   } catch (error) {
+    if (error?.code === "local_executor_bridge_timeout") {
+      throw error;
+    }
     throw capabilityServerError(
       "local_executor_bridge_failed",
       `桌面端执行器通道连接失败：${error?.message || error || "请求失败。"}`,
     );
   }
 
-  const { text, json } = await readCapabilityResponseBody(response);
+  const { response, text, json } = fetched;
   if (!response.ok) {
     throw capabilityServerError(
       "local_executor_bridge_failed",
@@ -2394,11 +2464,14 @@ function serverOpenUrlCommand(url = "", platform = process.platform) {
   };
 }
 
-function spawnDetachedProcess(command = "", args = []) {
+export function spawnDetachedProcess(command = "", args = [], {
+  spawnImpl = spawn,
+  timeoutMs = 5_000,
+} = {}) {
   return new Promise((resolve, reject) => {
     let child;
     try {
-      child = spawn(command, args, {
+      child = spawnImpl(command, args, {
         detached: true,
         stdio: "ignore",
         windowsHide: true,
@@ -2408,20 +2481,50 @@ function spawnDetachedProcess(command = "", args = []) {
       return;
     }
     let settled = false;
-    const settle = (callback, value) => {
+    let timer = null;
+    const cleanup = () => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      child.removeListener?.("error", onError);
+      child.removeListener?.("spawn", onSpawn);
+    };
+    const guardLateChildError = () => {
+      const ignoreLateError = () => {};
+      const releaseGuard = () => child.removeListener?.("error", ignoreLateError);
+      child.once?.("error", ignoreLateError);
+      child.once?.("close", releaseGuard);
+    };
+    const settle = (callback, value, { guardLateError = false } = {}) => {
       if (settled) {
         return;
       }
       settled = true;
+      cleanup();
+      if (guardLateError) guardLateChildError();
       callback(value);
     };
-    child.once("error", (error) => settle(reject, error));
-    child.once("spawn", () => {
-      if (typeof child.unref === "function") {
-        child.unref();
+    const onError = (error) => settle(reject, error);
+    const onSpawn = () => {
+      try {
+        if (typeof child.unref === "function") {
+          child.unref();
+        }
+        settle(resolve);
+      } catch (error) {
+        settle(reject, error);
       }
-      settle(resolve);
-    });
+    };
+    child.once("error", onError);
+    child.once("spawn", onSpawn);
+    timer = setTimeout(() => {
+      const error = new Error("Local application did not report startup in time.");
+      error.code = "local_process_start_timeout";
+      settle(reject, error, { guardLateError: true });
+      try { child.kill?.(); } catch {}
+    }, Math.max(1, Number(timeoutMs) || 5_000));
+    timer.unref?.();
   });
 }
 
@@ -2533,6 +2636,10 @@ function serverCollapseWhitespace(value = "") {
 function serverPositiveInteger(value, fallback) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback;
+}
+
+function serverBoundedPositiveInteger(value, fallback, maximum) {
+  return Math.min(serverPositiveInteger(value, fallback), maximum);
 }
 
 function capabilityLocalResponse(requestBody = {}, result = {}) {
@@ -2653,22 +2760,16 @@ function capabilityProviderApiKey(provider = {}) {
 }
 
 async function readCapabilityResponseBody(response, options = {}) {
-  const maxBytes = serverPositiveInteger(options.maxBytes, DEFAULT_CAPABILITY_PROVIDER_RESPONSE_MAX_BYTES);
-  const contentLength = Number.parseInt(serverResponseHeader(response, "content-length"), 10);
-  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
-    throw capabilityServerError(
+  const maxBytes = serverBoundedPositiveInteger(
+    options.maxBytes, DEFAULT_CAPABILITY_PROVIDER_RESPONSE_MAX_BYTES, MAX_CAPABILITY_PROVIDER_RESPONSE_BYTES,
+  );
+  const text = await readBoundedResponseText(response, {
+    maxBytes,
+    createTooLargeError: ({ actualBytes }) => capabilityServerError(
       "provider_response_too_large",
-      `Capability provider response is too large: ${contentLength} bytes; limit ${maxBytes} bytes.`,
-    );
-  }
-  const text = await response.text();
-  const bodyBytes = Buffer.byteLength(String(text || ""), "utf8");
-  if (bodyBytes > maxBytes) {
-    throw capabilityServerError(
-      "provider_response_too_large",
-      `Capability provider response is too large: ${bodyBytes} bytes; limit ${maxBytes} bytes.`,
-    );
-  }
+      `Capability provider response is too large: ${actualBytes} bytes; limit ${maxBytes} bytes.`,
+    ),
+  });
   if (!text.trim()) {
     return { text, json: {} };
   }
@@ -2684,12 +2785,26 @@ async function readCapabilityResponseBody(response, options = {}) {
 }
 
 function capabilityProviderResponseMaxBytes(provider = {}) {
-  return serverPositiveInteger(
+  return serverBoundedPositiveInteger(
     provider.maxResponseBytes ||
       provider.max_response_bytes ||
       provider.responseMaxBytes ||
       provider.response_max_bytes,
     DEFAULT_CAPABILITY_PROVIDER_RESPONSE_MAX_BYTES,
+    MAX_CAPABILITY_PROVIDER_RESPONSE_BYTES,
+  );
+}
+
+function serverCapabilityRequestTimeoutMs(provider = {}, config = {}) {
+  return serverBoundedPositiveInteger(
+    provider.requestTimeoutMs ||
+      provider.request_timeout_ms ||
+      provider.timeoutMs ||
+      provider.timeout_ms ||
+      config.capabilityRequestTimeoutMs ||
+      config.capability_request_timeout_ms,
+    30_000,
+    MAX_CAPABILITY_REQUEST_TIMEOUT_MS,
   );
 }
 
@@ -2798,14 +2913,26 @@ function capabilityFailureText(error = {}, provider = {}, capability = "") {
   if (error?.code === "provider_response_too_large") {
     return `${providerName} 返回的${capabilityName}响应过大，已停止读取，避免卡住或把异常页面写进结果。请调小返回内容、改用文件链接，或提高该能力供应商的 maxResponseBytes 上限。`;
   }
+  if (error?.code === "provider_request_timeout") {
+    return `${providerName} 的${capabilityName}请求超时，CodexBridge 已停止等待。请检查网络、代理、Base URL 或供应商状态后重试。`;
+  }
+  if (error?.code === "local_browser_timeout") {
+    return `${providerName} 的网页读取请求超时，CodexBridge 已停止等待。请检查网址、网络或代理后重试。`;
+  }
+  if (error?.code === "local_executor_bridge_timeout") {
+    return `${providerName} 的桌面端执行器请求超时，CodexBridge 已停止等待。请确认桌面端仍在运行后重试。`;
+  }
   if (error?.code === "asset_download_failed") {
     const status = Number(error?.statusCode || 0);
     const statusText = status ? `（HTTP ${status}）` : "";
     const assetName = capabilityAssetNameForMessage(capability);
     return `${providerName} 已返回 ${capabilityName} 结果，但结果文件下载失败${statusText}。请检查${assetName}链接是否过期、是否需要权限，或稍后重试。`;
   }
+  if (error?.code === "asset_download_timeout") {
+    return `${providerName} 已返回 ${capabilityName}结果，但结果文件下载超时。请检查网络、代理或结果链接后重试。`;
+  }
   if (error?.code === "asset_too_large") {
-    return `${providerName} 已返回 ${capabilityName} 结果，但结果文件过大，已停止下载，避免占用过多内存或磁盘。请调小图片、音频或视频尺寸，改用更小的结果，或提高该能力供应商的 maxAssetBytes 上限。`;
+    return `${providerName} 已返回 ${capabilityName} 结果，但结果文件过大，已停止下载，避免占用过多内存或磁盘。请调小图片、音频或视频尺寸后重试。`;
   }
   if (error?.code === "invalid_asset_data") {
     return `${providerName} 已返回 ${capabilityName} 结果，但结果文件格式无效，当前无法保存展示。请检查供应商返回格式。`;
@@ -2882,7 +3009,7 @@ function attachClientSocketErrorHandler(socket, socketsWithErrorHandler) {
   });
 }
 
-function requestBodyLimitBytes(config = {}, pathname = "") {
+export function requestBodyLimitBytes(config = {}, pathname = "") {
   const isImageEdit = isImageEditsPostPath(pathname);
   const isResponsesRequest = isResponsesPostPath(pathname);
   const configured = isImageEdit
@@ -2903,7 +3030,7 @@ function requestBodyLimitBytes(config = {}, pathname = "") {
         )
     : Number(config.requestBodyLimitBytes ?? config.request_body_limit_bytes);
   if (Number.isFinite(configured) && configured > 0) {
-    return Math.floor(configured);
+    return Math.min(Math.floor(configured), MAX_REQUEST_BODY_LIMIT_BYTES);
   }
   if (isImageEdit || isResponsesRequest) {
     return DEFAULT_RESPONSES_BODY_LIMIT_BYTES;
@@ -2911,7 +3038,7 @@ function requestBodyLimitBytes(config = {}, pathname = "") {
   return DEFAULT_JSON_BODY_LIMIT_BYTES;
 }
 
-function responsesCompactRequestBodyLimitBytes(config = {}, pathname = "") {
+export function responsesCompactRequestBodyLimitBytes(config = {}, pathname = "") {
   const ordinaryLimit = requestBodyLimitBytes(config, pathname);
   const configured = Number(
     config.responsesCompactRequestBodyLimitBytes ??
@@ -2920,7 +3047,7 @@ function responsesCompactRequestBodyLimitBytes(config = {}, pathname = "") {
   const compactLimit = Number.isFinite(configured) && configured > 0
     ? Math.floor(configured)
     : DEFAULT_RESPONSES_COMPACT_BODY_LIMIT_BYTES;
-  return Math.max(ordinaryLimit, compactLimit);
+  return Math.min(Math.max(ordinaryLimit, compactLimit), MAX_REQUEST_BODY_LIMIT_BYTES);
 }
 
 export function startServer(config = loadConfig()) {
@@ -2978,10 +3105,41 @@ function authorizeClient(req, config, route) {
 }
 
 function currentConfig(config) {
-  const loadedConfig = config.__path ? loadConfig(config.__path) : config;
   return applyGlobalRateLimitConfig(
-    normalizeContextPolicyConfig(resolveRouterAuthToken(loadedConfig)),
+    normalizeContextPolicyConfig(resolveRouterAuthToken(config)),
   );
+}
+
+export function createCurrentConfigReader(config, { loadConfigImpl = loadConfig } = {}) {
+  if (!config?.__path) return () => config;
+  const configPath = path.resolve(config.__path);
+  let cached = config;
+  let fingerprint = configFileFingerprint(configPath);
+  return () => {
+    const currentFingerprint = configFileFingerprint(configPath);
+    if (currentFingerprint === fingerprint) return cached;
+    let before = currentFingerprint;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const loaded = loadConfigImpl(configPath);
+      const after = configFileFingerprint(configPath);
+      if (before === after) {
+        cached = loaded;
+        fingerprint = after;
+        return cached;
+      }
+      before = after;
+    }
+    const error = new Error("Router config changed during three consecutive reload attempts.");
+    error.code = "router_config_changed_during_read";
+    throw error;
+  };
+}
+
+function configFileFingerprint(configPath) {
+  const stat = fs.statSync(configPath, { bigint: true });
+  return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs]
+    .map(String)
+    .join(":");
 }
 
 function resolveRouterAuthToken(config = {}) {
@@ -3040,6 +3198,11 @@ function clientAbortContext(req, res) {
   res.once("close", abort);
   req.socket?.once?.("close", abort);
   req.socket?.once?.("error", socketError);
+  // Parsing multipart files can finish after the close events have fired.
+  // Do not use req.destroyed: consuming a live request body also sets it.
+  if (req.aborted || res.destroyed || req.socket?.destroyed) {
+    abort();
+  }
   return {
     signal: controller.signal,
     cleanup() {

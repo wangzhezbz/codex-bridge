@@ -166,8 +166,27 @@ export class ResponseHistory {
     try {
       pruneResult = await this.storage.recordTurnAsync(turn);
     } catch (error) {
+      if (error?.code === "history_writer_timeout" && error.completion) {
+        error.completion.then((result) => {
+          const staged = this.stagedTurns.get(responseId);
+          if (staged && staged.turn !== turn) {
+            // A replacement can reuse this ID after a failed turn was promoted.
+            // The old turn's cache trim must not discard that pending response.
+            this.applyPruneResult(result);
+            return;
+          }
+          this.cachePersistedTurn(responseId, turn, result);
+          if (this.stagedTurns.get(responseId)?.turn === turn) {
+            this.deleteStagedTurn(responseId);
+          }
+        }).catch((lateError) => this.handleStorageWriteError(lateError));
+      }
       throw this.handleStorageWriteError(error);
     }
+    this.cachePersistedTurn(responseId, turn, pruneResult);
+  }
+
+  cachePersistedTurn(responseId, turn, pruneResult) {
     const messages = Array.isArray(turn.messages) ? turn.messages : [];
     const response = turn.response || null;
     const meta = turn.meta || {};
@@ -193,6 +212,7 @@ export class ResponseHistory {
     if (existing) {
       return responseId;
     }
+    this.promoteFailedStagedTurns();
     const estimatedBytes = boundedValueBytes(turn, this.maxStagedBytes + 1);
     if (
       this.stagedTurns.size >= this.maxStagedEntries ||
@@ -446,6 +466,30 @@ export class ResponseHistory {
       this.totalStagedBytes - Number(staged.estimatedBytes || 0),
     );
     return true;
+  }
+
+  promoteFailedStagedTurns() {
+    let promoted = false;
+    for (const [responseId, staged] of this.stagedTurns) {
+      if (!staged?.error || !staged.turn) {
+        continue;
+      }
+      const messages = cloneJson(
+        Array.isArray(staged.turn.messages) ? staged.turn.messages : [],
+      );
+      const response = cloneJson(staged.turn.response || null);
+      const meta = cloneJson(staged.turn.meta || {});
+      this.setEntry(responseId, messages);
+      if (response) {
+        this.responses.set(responseId, response);
+      }
+      this.responseMeta.set(responseId, meta);
+      this.deleteStagedTurn(responseId);
+      promoted = true;
+    }
+    if (promoted) {
+      this.trim();
+    }
   }
 
   trim() {

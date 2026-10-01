@@ -6,6 +6,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import * as z from "zod/v4";
 
 import { createBridgeTools } from "./bridge-tools.js";
+import { SERVICE_VERSION } from "./service-metadata.js";
 
 function textResult(value) {
   const structuredContent =
@@ -33,8 +34,22 @@ export function createMcpServer(options = {}) {
   };
   const server = new McpServer({
     name: "chatgpt-codex-bridge",
-    version: "0.1.0"
+    version: SERVICE_VERSION
   });
+
+  server.registerTool(
+    "get_runtime_identity",
+    {
+      description: "Read this MCP process's actual data root, fingerprint and versions without binding, claiming or sending anything. Compare expected fields from the HTTP /api/config runtime object to detect a different data directory. Matching does not prove project scope or GPT connectivity.",
+      inputSchema: {
+        expectedDataRootId: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+        expectedProtocolVersion: z.number().int().positive().optional(),
+        expectedExtensionProtocolVersion: z.string().min(1).optional()
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+    },
+    async input => textResult(tools.getRuntimeIdentity(input))
+  );
 
   server.registerTool(
     "create_task",

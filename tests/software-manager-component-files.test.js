@@ -47,11 +47,12 @@ function component(id, version, format, entrypoint, requiredFiles = [entrypoint]
 function trustedCatalog(
   chatgptRequiredFiles = ["ChatGPT.exe", "resources/app.asar"],
   v2raynRequiredFiles = ["v2rayN.exe"],
+  chatgptEntrypoint = "ChatGPT.exe",
 ) {
   const catalog = {
     schemaVersion: 1,
     components: [
-      component("chatgpt", "2.0.0", "zip", "ChatGPT.exe", chatgptRequiredFiles),
+      component("chatgpt", "2.0.0", "zip", chatgptEntrypoint, chatgptRequiredFiles),
       component("v2rayn", "7.0.4", "7z", "v2rayN.exe", v2raynRequiredFiles),
       component("git", "2.50.0", "exe", "cmd/git.exe"),
     ],
@@ -218,6 +219,7 @@ function fakeFiles(initial = {}) {
 
 function componentFixture({
   files = fakeFiles(), version = "2.0.0", execFile,
+  getInstalledComponent,
   catalogService = CATALOG,
   versionReader = { async readFileVersion(filePath) { return filePath.endsWith("v2rayN.exe") ? "7.0.4" : version; } },
 } = {}) {
@@ -227,6 +229,7 @@ function componentFixture({
     fileCapabilities: files.fileCapabilities,
     installRootCapability,
     catalogService,
+    getInstalledComponent,
     workspace: {
       async consumePromotedPackageProof(proof, expected) {
         assert.equal(proof, PACKAGE_PROOF);
@@ -324,6 +327,75 @@ test("ChatGPT verifies its signed package version marker instead of Chromium PE 
   assert.equal(peReads, 0);
 });
 
+test("new green ChatGPT cross-checks both bounded markers against the signed catalog", async () => {
+  const legacyMarker = ".codexbridge-chatgpt-version.json";
+  const greenMarker = ".codexbridge-green-codex.json";
+  const stagingName = `.p-${"e".repeat(32)}`;
+  const stagingRoot = `D:\\CBApps\\${stagingName}`;
+  const marker = (officialVersion = "2.0.0") => JSON.stringify({
+    schemaVersion: 1,
+    formatVersion: 2,
+    componentId: "chatgpt",
+    officialVersion,
+    electronVersion: "42.3.0",
+    officialResourceTreeSha256: "1".repeat(64),
+    portableResourceTreeSha256: "4".repeat(64),
+    portablePatchIds: ["disable-app-contained-core"],
+    owlTemplateVersion: "26.901.5280.0",
+    owlTemplateSha256: "2".repeat(64),
+    contentTreeSha256: "3".repeat(64),
+    generatedAt: "2026-09-25T00:00:00.000Z",
+  });
+  const makeFiles = (legacyVersion = "2.0.0", officialVersion = "2.0.0") => fakeFiles({
+    [`${stagingRoot}\\ChatGPT.exe`]: {},
+    [`${stagingRoot}\\${legacyMarker}`]: {
+      data: JSON.stringify({ schemaVersion: 1, componentId: "chatgpt", version: legacyVersion }),
+    },
+    [`${stagingRoot}\\${greenMarker}`]: { data: marker(officialVersion) },
+  });
+  const plan = {
+    componentId: "chatgpt", phase: "staging", stagingName,
+    rootPath: stagingRoot, entrypointPath: `${stagingRoot}\\ChatGPT.exe`,
+    requiredFiles: [
+      `${stagingRoot}\\${legacyMarker}`, `${stagingRoot}\\${greenMarker}`, `${stagingRoot}\\ChatGPT.exe`,
+    ],
+    expectedVersion: "2.0.0", expectedPackageSha256: HASH, packageProof: PACKAGE_PROOF,
+  };
+  const catalogService = trustedCatalog([legacyMarker, greenMarker, "ChatGPT.exe"]);
+  await componentFixture({ files: makeFiles(), catalogService }).service.verifyComponent(plan);
+  await assert.rejects(
+    componentFixture({ files: makeFiles("1.9.0"), catalogService }).service.verifyComponent(plan),
+    /component_green_marker_mismatch/u,
+  );
+  await assert.rejects(
+    componentFixture({ files: makeFiles("2.0.0", "2.0.1"), catalogService }).service.verifyComponent(plan),
+    /component_green_marker_mismatch/u,
+  );
+});
+
+test("raw AppX layout is rejected while root-entrypoint legacy green remains valid", async () => {
+  const stagingName = `.p-${"f".repeat(32)}`;
+  const stagingRoot = `D:\\CBApps\\${stagingName}`;
+  const rawCatalog = trustedCatalog(["app/ChatGPT.exe", "AppxManifest.xml"], undefined, "app/ChatGPT.exe");
+  const rawFiles = fakeFiles({
+    [`${stagingRoot}\\app\\ChatGPT.exe`]: {},
+  });
+  await assert.rejects(componentFixture({ files: rawFiles, catalogService: rawCatalog }).service.verifyComponent({
+    componentId: "chatgpt", phase: "staging", stagingName,
+    rootPath: stagingRoot, entrypointPath: `${stagingRoot}\\app\\ChatGPT.exe`,
+    requiredFiles: [`${stagingRoot}\\app\\ChatGPT.exe`], expectedVersion: "2.0.0",
+    expectedPackageSha256: HASH, packageProof: PACKAGE_PROOF,
+  }), /component_green_marker_missing/u);
+
+  const legacyFiles = fakeFiles({ [`${stagingRoot}\\ChatGPT.exe`]: {} });
+  await componentFixture({ files: legacyFiles, catalogService: trustedCatalog(["ChatGPT.exe"]) }).service.verifyComponent({
+    componentId: "chatgpt", phase: "staging", stagingName,
+    rootPath: stagingRoot, entrypointPath: `${stagingRoot}\\ChatGPT.exe`,
+    requiredFiles: [`${stagingRoot}\\ChatGPT.exe`], expectedVersion: "2.0.0",
+    expectedPackageSha256: HASH, packageProof: PACKAGE_PROOF,
+  });
+});
+
 test("component verification rejects caller-substituted catalog files before consuming package authority", async () => {
   const files = fakeFiles({ "D:\\CBApps\\ct\\evil.exe": {} });
   const fixture = componentFixture({ files });
@@ -379,6 +451,55 @@ test("component verification fails closed on reparse, hardlink, ADS, or version 
     requiredFiles: ["D:\\CBApps\\c\\ChatGPT.exe", "D:\\CBApps\\c\\resources\\app.asar"],
     expectedVersion: "2.0.0",
   }), /component_version_mismatch/u);
+});
+
+test("installed and rolled-back versions are verified against recorded files, not the latest catalog", async () => {
+  const root = "D:\\CBApps\\c";
+  const entrypointPath = `${root}\\ChatGPT.exe`;
+  const requiredFiles = [entrypointPath, `${root}\\resources\\app.asar`];
+  const files = fakeFiles(Object.fromEntries(requiredFiles.map(file => [file, {}])));
+  // New catalog introduces a file that the old installation never contained.
+  const catalogService = trustedCatalog(["ChatGPT.exe", "Codex.exe", "resources/app.asar"]);
+  for (const version of ["1.9.0", "2.0.0", "2.1.0"]) {
+    const record = { managed: true, installPath: root, version, entrypointPath, requiredFiles };
+    const fixture = componentFixture({ files, version, catalogService,
+      getInstalledComponent: async () => record });
+    assert.deepEqual(await fixture.service.verifyComponent({
+      componentId: "chatgpt", phase: "current", rootPath: root,
+      entrypointPath, requiredFiles, expectedVersion: version,
+    }), { componentId: "chatgpt", version });
+    assert.deepEqual(fixture.consumed, []);
+  }
+});
+
+test("recorded current verification rejects missing ownership, substituted paths, missing files and wrong actual versions", async () => {
+  const root = "D:\\CBApps\\c";
+  const entrypointPath = `${root}\\ChatGPT.exe`;
+  const requiredFiles = [entrypointPath, `${root}\\resources\\app.asar`];
+  const record = { managed: true, installPath: root, version: "1.9.0", entrypointPath, requiredFiles };
+  const plan = { componentId: "chatgpt", phase: "current", rootPath: root,
+    entrypointPath, requiredFiles, expectedVersion: "1.9.0" };
+  const files = fakeFiles(Object.fromEntries(requiredFiles.map(file => [file, {}])));
+  const make = (overrides = {}) => componentFixture({ files, version: "1.9.0",
+    getInstalledComponent: async () => record, ...overrides }).service;
+  await assert.rejects(make({ getInstalledComponent: async () => null }).verifyComponent(plan), /component_owned_record_invalid/);
+  await assert.rejects(make().verifyComponent({ ...plan, requiredFiles: [entrypointPath] }), /component_catalog_path_mismatch/);
+  const outside = "D:\\CBApps\\cp\\ChatGPT.exe";
+  await assert.rejects(make({ getInstalledComponent: async () => ({ ...record, entrypointPath: outside, requiredFiles: [outside] }) })
+    .verifyComponent({ ...plan, entrypointPath: outside, requiredFiles: [outside] }), /component_catalog_path_mismatch/);
+  await assert.rejects(make({ version: "1.8.0" }).verifyComponent(plan), /component_version_mismatch/);
+  await assert.rejects(make({ files: fakeFiles({ [entrypointPath]: {} }) }).verifyComponent(plan), { code: "ENOENT" });
+});
+
+test("staging still requires the catalog version even when an older installed record exists", async () => {
+  const stagingName = `.p-${"c".repeat(32)}`;
+  const root = `D:\\CBApps\\${stagingName}`;
+  const fixture = componentFixture({ getInstalledComponent: async () => { throw new Error("staging must not read ownership"); } });
+  await assert.rejects(fixture.service.verifyComponent({
+    componentId: "chatgpt", phase: "staging", stagingName, rootPath: root,
+    entrypointPath: `${root}\\ChatGPT.exe`, requiredFiles: [`${root}\\ChatGPT.exe`],
+    expectedVersion: "1.9.0", expectedPackageSha256: HASH, packageProof: PACKAGE_PROOF,
+  }), /component_catalog_version_mismatch/);
 });
 
 test("Git verification executes only the pinned exact executable with a bounded no-shell call", async () => {

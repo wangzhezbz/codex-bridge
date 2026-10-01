@@ -409,6 +409,20 @@ test("construction is side-effect free and catalog refresh remains explicit", as
   assert.equal(harness.calls.filter((entry) => entry === "catalog:refresh").length, 1);
 });
 
+test("production software management only exposes Codex and rejects retired selections", async () => {
+  const harness = fixture();
+  const runtime = await createProductionSoftwareManagerService(harness.options);
+  const snapshot = await runtime.service.getSnapshot();
+  assert.deepEqual(snapshot.catalog.components.map(entry => entry.id), ["chatgpt"]);
+  assert.deepEqual(snapshot.catalog.skills, []);
+  for (const kind of ["install", "update", "uninstall", "rollback"]) {
+    for (const componentIds of [["git"], ["v2rayn"], ["chatgpt", "git"]]) {
+      await assert.rejects(runtime.service.startTask({ kind, componentIds, skillIds: [] }), /software_manager_request_invalid/);
+    }
+    await assert.rejects(runtime.service.startTask({ kind, componentIds: [], skillIds: ["documents"] }), /software_manager_request_invalid/);
+  }
+});
+
 test("adapter creation waits for both a catalog and one selected root capability", async () => {
   const harness = fixture();
   const runtime = await createProductionSoftwareManagerService(harness.options);
@@ -546,6 +560,16 @@ test("default root composition binds workspace, files, and adapters to the selec
   await runtime.selectInstallRoot("D:\\CBApps");
   assert.equal(seen.workspace.installRootCapability.path, "D:\\CBApps");
   assert.equal(seen.files.installRootCapability, seen.workspace.installRootCapability);
+  const store = harness.runtimeFactories.lastInfrastructure.ownershipStore;
+  const installedState = await store.load();
+  installedState.components.chatgpt = { managed: true, version: "1.0.0", installPath: "D:\\CBApps\\c",
+    entrypointPath: "D:\\CBApps\\c\\ChatGPT.exe", requiredFiles: ["D:\\CBApps\\c\\ChatGPT.exe"] };
+  await store.save(installedState);
+  assert.deepEqual(await seen.files.getInstalledComponent("chatgpt"), installedState.components.chatgpt);
+  installedState.components.chatgpt.version = "0.9.0";
+  await store.save(installedState);
+  assert.equal((await seen.files.getInstalledComponent("chatgpt")).version, "0.9.0");
+  assert.equal(await seen.files.getInstalledComponent("v2rayn"), null);
   assert.equal(seen.retained.installRootCapability, seen.workspace.installRootCapability);
   assert.equal(seen.adapters.installRootCapability, seen.workspace.installRootCapability);
   assert.equal(typeof seen.archive.spawnFile, "function");

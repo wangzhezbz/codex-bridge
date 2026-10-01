@@ -9,6 +9,13 @@ import { removeOwnedTemporaryDirectory } from "./smoke-temp-cleanup.mjs";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const testFiles = expandTestArguments(process.argv.slice(2));
 if (!testFiles.length) throw new Error("At least one test file or test glob is required.");
+const defaultTestConcurrency = Math.max(1, Math.min(8, os.availableParallelism()));
+const configuredTestConcurrency = Number(process.env.CODEXBRIDGE_TEST_CONCURRENCY);
+const testConcurrency = Number.isSafeInteger(configuredTestConcurrency)
+  && configuredTestConcurrency > 0
+  && configuredTestConcurrency <= 8
+  ? configuredTestConcurrency
+  : defaultTestConcurrency;
 
 const inheritedTemp = inheritedProjectCheckTemp();
 const ownsTemp = !inheritedTemp;
@@ -25,7 +32,11 @@ let testError = null;
 let cleanupError = null;
 
 try {
-  const result = spawnSync(process.execPath, ["--test", ...testFiles], {
+  const result = spawnSync(process.execPath, [
+    "--test",
+    `--test-concurrency=${testConcurrency}`,
+    ...testFiles,
+  ], {
     cwd: repoRoot,
     env: childEnv,
     stdio: "inherit",

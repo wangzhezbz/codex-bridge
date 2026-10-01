@@ -6,6 +6,7 @@ import { createRequire } from "node:module";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import vm from "node:vm";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -136,14 +137,14 @@ test("manual shortcut selection resolves the shortcut target before rejecting it
   assert.match(body, /verifiedOpenAIDesktopShortcutLaunchTarget\(resolution\)/);
 });
 
-test("config package exports capture resource snapshots and config under one exclusive lease", () => {
+test("config package exports keep slow resource discovery outside the configuration lease", () => {
   for (const handlerName of ["configPackage:export", "configPackage:exportToSyncDir"]) {
     const body = ipcHandlerBody(handlerName);
-    assert.match(
-      body,
-      /runSharedConfigExclusive\s*\(\s*\(\)\s*=>\s*\{[\s\S]*?loadDesktopOptions\(dataRootDir\)[\s\S]*?readCodexResourceSnapshots[\s\S]*?exportConfigPackage/,
-      handlerName,
-    );
+    const discovery = body.indexOf("await readCurrentCodexResourceSnapshots(settings)");
+    const lease = body.indexOf("settings.runSharedConfigExclusive");
+    assert.ok(discovery >= 0 && lease > discovery, handlerName);
+    assert.doesNotMatch(body.slice(lease), /readCurrentCodexResourceSnapshots/u, handlerName);
+    assert.match(body.slice(lease), /exportConfigPackage/u, handlerName);
   }
 });
 
@@ -208,7 +209,10 @@ test("state snapshots keep slow desktop discovery outside the configuration tran
     mainSource,
     /createResilientStateReader\s*\(/,
   );
-  assert.match(mainSource, /readSnapshot:\s*\(options = \{\}\) => buildStatePayload\(settings, options\)/);
+  assert.match(
+    mainSource,
+    /readSnapshot:\s*\(options = \{\}\) => buildConsistentStateSnapshot\(\{[\s\S]*?readRevision:\s*\(\) => desktopStateRevision\(settings\)[\s\S]*?buildSnapshot:\s*\(\) => buildStatePayload\(settings, options\)/,
+  );
   assert.doesNotMatch(
     mainSource,
     /readSnapshot:[\s\S]*?settings\.runSharedConfigExclusive\(\(\) =>[\s\S]*?buildStatePayload\(settings, options\)/,
@@ -221,6 +225,44 @@ test("state snapshots keep slow desktop discovery outside the configuration tran
     mainSource,
     /async function broadcastState\(\)[\s\S]*?await getStatePayload\(settings, \{ lite: true \}\)/,
   );
+});
+
+test("optional detail failures stay local and never publish a globally unavailable core state", () => {
+  const body = functionBody("buildStatePayload");
+  assert.match(body, /try\s*\{[\s\S]*?await runCodexSessionSnapshotWorker[\s\S]*?catch \(error\)[\s\S]*?detailSectionErrors\.sessions/u);
+  assert.match(body, /try\s*\{[\s\S]*?await readCodexResourceSnapshotsRetained[\s\S]*?catch \(error\)[\s\S]*?detailSectionErrors\.resources/u);
+  assert.match(body, /detailSectionErrors\.capabilities = detailSnapshotError/u);
+  assert.match(body, /detailSectionErrors\.preflight = detailSnapshotError/u);
+  assert.match(body, /detailSectionErrors\.settings = detailSnapshotError/u);
+  assert.match(body, /stateDetailLoaded:\s*fullDetail && allDetailSectionsLoaded/u);
+  assert.match(body, /detailSectionErrors,/u);
+  assert.doesNotMatch(body, /stateUnavailable:\s*true/u);
+});
+
+test("ordinary configuration mutations return lightweight state without rescanning Codex resources", () => {
+  for (const handlerName of [
+    "options:save",
+    "models:saveImageInput",
+    "models:saveImageGeneration",
+    "models:repairReferences",
+    "imageProviders:save",
+    "imageProviders:remove",
+    "capabilityProviders:save",
+    "capabilityProviders:remove",
+    "models:saveCapabilities",
+    "models:resetCapabilities",
+    "providers:refreshModels",
+    "providers:save",
+    "providers:reset",
+    "logos:select",
+    "customModel:remove",
+    "profiles:save",
+    "profiles:apply",
+  ]) {
+    const body = ipcHandlerBody(handlerName);
+    assert.match(body, /getStatePayload\(settings, \{ lite: true \}\)/u, handlerName);
+    assert.doesNotMatch(body, /getStatePayload\(settings\)(?!,)/u, handlerName);
+  }
 });
 
 test("post-commit logging cannot turn a durable mutation into an IPC failure", () => {
@@ -472,13 +514,15 @@ test("detailed resource refresh bypasses only the Codex resource snapshot cache"
 
 test("desktop verification includes the resource snapshot worker", () => {
   assert.match(packageJson.scripts["check:syntax"], /desktop\/resource-snapshot-worker\.cjs/);
+  assert.match(packageJson.scripts["check:syntax"], /desktop\/session-snapshot-worker\.cjs/);
+  assert.match(packageJson.scripts["test:desktop"], /tests\/desktop-session-snapshot-worker\.test\.js/);
 });
 
 test("desktop automatically refreshes ChatGPT resources when the resource page opens", () => {
   const rendererSource = fs.readFileSync(path.join(repoRoot, "desktop", "renderer", "app.js"), "utf8");
   assert.match(
     rendererSource,
-    /ensureDetailedStateForSection[\s\S]*?sectionId === "resources"[\s\S]*?forceResourceRefresh:\s*true/,
+    /ensureDetailedStateForSection[\s\S]*?detailSection:\s*sectionId[\s\S]*?forceResourceRefresh:\s*sectionId === "resources"/,
   );
 });
 
@@ -491,15 +535,119 @@ test("deferred startup never auto-launches ChatGPT projects or polls the session
 
 test("startup check reuses one shared CLI and prompt-input resource snapshot", () => {
   const body = ipcHandlerBody("startup:check");
-  assert.match(body, /loadDesktopOptions\(dataRootDir\)/);
   assert.match(
     body,
-    /readCodexResourceSnapshots\s*\(\s*\{\s*desktopOptions\s*\}\s*\)/,
+    /await readCurrentCodexResourceSnapshots\(settings, \{ forceRefresh: true \}\)/,
   );
   assert.match(body, /codexCliSnapshot\s*,/);
   assert.match(body, /codexPromptInputSnapshot\s*,/);
   assert.doesNotMatch(body, /readCodex(?:CliResource|PromptInput)Snapshot\s*\(/);
   assert.doesNotMatch(body, /\bbroadcastState\s*\(/);
+});
+
+test("main-thread diagnostics and exports never run synchronous Codex resource discovery", () => {
+  assert.doesNotMatch(mainSource, /settings\.readCodexResourceSnapshots\s*\(/u);
+  for (const handlerName of [
+    "startup:check",
+    "configPackage:export",
+    "configPackage:exportToSyncDir",
+    "diagnostics:copy",
+    "diagnostics:save",
+    "releaseGate:save",
+  ]) {
+    assert.match(ipcHandlerBody(handlerName), /readCurrentCodexResourceSnapshots/u, handlerName);
+  }
+});
+
+test("user-selected config and diagnostics saves avoid synchronous main-thread writes", () => {
+  for (const handlerName of ["configPackage:export", "diagnostics:save"]) {
+    const body = ipcHandlerBody(handlerName);
+    assert.match(body, /await fs\.promises\.writeFile/u, handlerName);
+    assert.doesNotMatch(body, /fs\.writeFileSync/u, handlerName);
+  }
+});
+
+test("desktop logging coalesces bounded usage persistence off the main call path", () => {
+  const appendBody = functionBody("appendLog");
+  assert.match(appendBody, /boundedDesktopLogLine/u);
+  assert.match(appendBody, /scheduleUsageEventsPersistence/u);
+  assert.match(appendBody, /scheduleLogRendererPublication/u);
+  assert.doesNotMatch(appendBody, /persistUsageEvents\s*\(/u);
+  assert.doesNotMatch(appendBody, /sendToRenderer/u);
+
+  const enqueueBody = functionBody("enqueueUsageEventsPersistence");
+  assert.match(enqueueBody, /usageEventsPersistChain/u);
+  assert.match(enqueueBody, /USAGE_EVENTS_MAX_BYTES/u);
+  assert.doesNotMatch(enqueueBody, /writeFileSync/u);
+
+  const writeBody = functionBody("writeUsageEventsSnapshot");
+  assert.match(writeBody, /await fs\.promises\.writeFile/u);
+  assert.match(writeBody, /await fs\.promises\.rename/u);
+  assert.match(writeBody, /await fs\.promises\.unlink/u);
+  assert.doesNotMatch(writeBody, /writeFileSync/u);
+
+  const lifecycleBody = functionBody("loadRouterLifecycleController");
+  assert.match(lifecycleBody, /await flushUsageEventsPersistence\(\)/u);
+});
+
+test("desktop config and restart entrypoints share the isolated desktop home", () => {
+  assert.match(functionBody("recoverPendingConfigTransactions"), /homeDir:\s*desktopHomeDir\(\)/u);
+  assert.match(functionBody("repairManagedCodexCompatibilityOnStartup"), /homeDir:\s*desktopHomeDir\(\)/u);
+  assert.match(ipcHandlerBody("mode:select"), /homeDir:\s*desktopHomeDir\(\)/u);
+  assert.match(ipcHandlerBody("backups:restore"), /homeDir:\s*desktopHomeDir\(\)/u);
+  assert.match(ipcHandlerBody("codex:restore"), /homeDir:\s*desktopHomeDir\(\)/u);
+  assert.match(functionBody("locateMacOpenAIDesktopApp"), /const homeDir = desktopHomeDir\(\)/u);
+  assert.match(functionBody("locateCodexRestartTarget"), /const homeDir = desktopHomeDir\(\)/u);
+});
+
+test("generic and diagnostic clipboard writes share one hard byte ceiling", () => {
+  const helper = functionBody("writeBoundedClipboardText");
+  assert.match(helper, /Buffer\.byteLength/u);
+  assert.match(helper, /CLIPBOARD_TEXT_MAX_BYTES/u);
+  assert.match(helper, /clipboard_text_too_large/u);
+  assert.match(ipcHandlerBody("clipboard:write"), /writeBoundedClipboardText/u);
+  assert.match(ipcHandlerBody("diagnostics:copy"), /writeBoundedClipboardText/u);
+});
+
+test("hidden screenshot pages clean up safely when their abort signal destroys the window", () => {
+  const body = functionBody("loadHiddenPage");
+  assert.match(body, /const webContents = win\.webContents/u);
+  assert.match(body, /signal\?\.removeEventListener\("abort", onAbort\)/u);
+  assert.match(body, /try \{ webContents\.removeListener\("did-finish-load", onFinish\); \} catch \{\}/u);
+  assert.match(body, /try \{ webContents\.stop\(\); \} catch \{\}/u);
+});
+
+test("session exports run off Main with bounded clipboard publication and async file writes", () => {
+  for (const handlerName of [
+    "sessions:export",
+    "sessions:exportProject",
+    "sessions:exportLoose",
+    "sessions:exportAll",
+    "sessions:exportFiltered",
+  ]) {
+    const body = ipcHandlerBody(handlerName);
+    assert.match(body, /runCodexSessionExportWorker/u, handlerName);
+    assert.match(body, /await fs\.promises\.writeFile/u, handlerName);
+    assert.match(body, /copySessionExportMarkdown/u, handlerName);
+    assert.doesNotMatch(body, /settings\.exportCodex/u, handlerName);
+    assert.doesNotMatch(body, /fs\.writeFileSync/u, handlerName);
+  }
+  assert.match(functionBody("copySessionExportMarkdown"), /SESSION_EXPORT_CLIPBOARD_MAX_BYTES/u);
+  assert.match(functionBody("runCodexSessionExportWorker"), /normalizeSessionExportRequest/u);
+  assert.match(functionBody("normalizeSessionExportRequest"), /SESSION_EXPORT_MAX_IDS/u);
+});
+
+test("local executor listen is single-flight, bounded, cancellable, and clears stale endpoints", () => {
+  const ensureBody = functionBody("ensureLocalExecutorServer");
+  const startBody = functionBody("startLocalExecutorServer");
+  const stopBody = functionBody("stopLocalExecutorServer");
+  assert.match(ensureBody, /localExecutorServer\?\.listening/u);
+  assert.match(ensureBody, /if \(localExecutorStartPromise\) return localExecutorStartPromise/u);
+  assert.match(startBody, /await listenServerWithDeadline/u);
+  assert.match(startBody, /timeoutMs:\s*5_000/u);
+  assert.match(startBody, /server\.once\("close", \(\) => clearLocalExecutorServer\(server\)\)/u);
+  assert.match(stopBody, /localExecutorStartingServer = null/u);
+  assert.match(stopBody, /clearLocalExecutorServer\(active\)/u);
 });
 
 test("desktop smoke treats unreadable resource authorities as unknown instead of zero", () => {
@@ -826,6 +974,70 @@ test("desktop launch target compatibility keeps explicit priority and excludes C
   );
 });
 
+test("managed current installation wins automatic restart over old running and common executables", () => {
+  const { buildOpenAIDesktopRestartPlan, classifyOpenAIDesktopProcess } = require(desktopCompatPath);
+  const old = "C:\\Old\\ChatGPT.exe";
+  const current = "E:\\codex\\c\\ChatGPT.exe";
+  const candidates = [{ target: old, source: "common" }, { target: current, source: "managed" }];
+  const running = [classifyOpenAIDesktopProcess({ name: "ChatGPT.exe", processId: 9001, executablePath: old })];
+  assert.equal(buildOpenAIDesktopRestartPlan(running, candidates).launchTarget, current);
+  assert.equal(buildOpenAIDesktopRestartPlan([], candidates).launchTarget, current);
+  for (const source of ["saved", "env"]) {
+    assert.equal(buildOpenAIDesktopRestartPlan(running, [...candidates, { target: old, source }]).launchTarget, old);
+  }
+  assert.equal(buildOpenAIDesktopRestartPlan(running, candidates, { isLaunchable: value => value !== current }).launchTarget, old);
+  const managedRunning = [classifyOpenAIDesktopProcess({ name: "ChatGPT.exe", processId: 9002, executablePath: current })];
+  assert.equal(buildOpenAIDesktopRestartPlan(managedRunning, candidates).authorizedProcesses[0].safeToStop, true);
+});
+
+test("managed launch discovery refreshes installed state and refuses stale or unverified records", async () => {
+  const { readManagedOpenAIDesktopCandidate } = require(desktopCompatPath);
+  let snapshot = { enabled: true, pendingRecovery: false, task: null, components: [{
+    id: "chatgpt", installedVersion: "26.928.3736.0", updateState: "current", installPath: "E:\\codex\\c",
+  }] };
+  const getService = async () => ({ getSnapshot: async () => snapshot });
+  assert.deepEqual(await readManagedOpenAIDesktopCandidate(getService), { target: "E:\\codex\\c\\ChatGPT.exe", source: "managed" });
+  snapshot = { ...snapshot, components: [{ ...snapshot.components[0], installedVersion: "26.814.5517.0", updateState: "update-available", installPath: "D:\\CBApps\\c" }] };
+  assert.equal((await readManagedOpenAIDesktopCandidate(getService)).target, "D:\\CBApps\\c\\ChatGPT.exe");
+  const good = snapshot;
+  for (const patch of [{ task: { phase: "commit" } }, { pendingRecovery: true }, { enabled: false }, { components: [] }]) {
+    snapshot = { ...good, ...patch };
+    assert.equal(await readManagedOpenAIDesktopCandidate(getService), null);
+  }
+  for (const patch of [{ updateState: "error" }, { installedVersion: null }, { installPath: "[REDACTED_PATH]" }, { installPath: "D:\\CBApps\\cp" }, { installPath: "D:\\CBApps\\..\\c" }]) {
+    snapshot = { ...good, components: [{ ...good.components[0], ...patch }] };
+    assert.equal(await readManagedOpenAIDesktopCandidate(getService), null);
+  }
+  await assert.rejects(readManagedOpenAIDesktopCandidate(async () => { throw new Error("unavailable"); }), /unavailable/);
+});
+
+test("main restart discovery actually reads software management instead of reusing an old shortcut", async () => {
+  const compat = require(desktopCompatPath);
+  const start = mainSource.indexOf("async function codexDesktopLaunchCandidateEntries(");
+  const end = mainSource.indexOf("\nfunction codexDesktopShortcutCandidates(", start);
+  assert.ok(start >= 0 && end > start);
+  let installPath = "E:\\codex\\c";
+  const old = "C:\\Old\\ChatGPT.exe";
+  const context = {
+    ...compat, process: { platform: "win32" },
+    getSoftwareManagerService: async () => ({ getSnapshot: async () => ({ enabled: true,
+      components: [{ id: "chatgpt", installedVersion: "26.928.3736.0", updateState: "current", installPath }] }) }),
+    codexDesktopCandidateEntries: () => [{ target: old, source: "common" }],
+    codexDesktopShortcutCandidates: () => [], resolveOpenAIDesktopShortcutCandidates: async () => [],
+    codexDesktopShellAppCandidates: async () => [], codexDesktopWhereCandidates: async () => [],
+    appendRuntimeLog: () => {}, formatError: (_label, error) => error.message,
+  };
+  vm.runInNewContext(mainSource.slice(start, end), context);
+  let candidates = await context.codexDesktopLaunchCandidateEntries({});
+  assert.equal(compat.buildOpenAIDesktopRestartPlan([], candidates).launchTarget, "E:\\codex\\c\\ChatGPT.exe");
+  installPath = "D:\\CBApps\\c";
+  candidates = await context.codexDesktopLaunchCandidateEntries({});
+  assert.equal(compat.buildOpenAIDesktopRestartPlan([], candidates).launchTarget, "D:\\CBApps\\c\\ChatGPT.exe");
+  context.getSoftwareManagerService = async () => { throw new Error("unavailable"); };
+  candidates = await context.codexDesktopLaunchCandidateEntries({});
+  assert.equal(compat.buildOpenAIDesktopRestartPlan([], candidates).launchTarget, old);
+});
+
 test("Windows shortcut resolver safely preserves spaces, Chinese, and apostrophes", (t) => {
   if (process.platform !== "win32") {
     t.skip("Windows shortcut fixture");
@@ -892,6 +1104,7 @@ test("desktop command capture times out and terminates a stalled helper", async 
   let killedWith = "";
   child.kill = (signal) => {
     killedWith = signal;
+    child.emit("close", 0);
     return true;
   };
   const resultPromise = runCommandCaptureWithTimeout("powershell.exe", ["-NoProfile"], {
@@ -907,6 +1120,40 @@ test("desktop command capture times out and terminates a stalled helper", async 
     exitCode: null,
   });
   assert.equal(killedWith, "SIGKILL");
+  assert.equal(child.stdout.listenerCount("data"), 0);
+  assert.equal(child.listenerCount("close"), 0);
+  assert.equal(child.listenerCount("error"), 0);
+});
+
+test("desktop command capture bounds stdout and waits for close before success", async () => {
+  const { runCommandCaptureWithTimeout } = require(desktopCompatPath);
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  let killedWith = "";
+  child.kill = (signal) => {
+    killedWith = signal;
+    child.emit("close", 0);
+    return true;
+  };
+  const resultPromise = runCommandCaptureWithTimeout("powershell.exe", ["-NoProfile"], {
+    spawnImpl: () => child,
+    timeoutMs: 1000,
+    maxOutputBytes: 4,
+  });
+
+  child.emit("exit", 0);
+  child.stdout.emit("data", Buffer.from("12345", "utf8"));
+
+  assert.deepEqual(await resultPromise, {
+    ok: false,
+    stdout: "1234",
+    timedOut: false,
+    outputTooLarge: true,
+    exitCode: null,
+  });
+  assert.equal(killedWith, "SIGKILL");
+  assert.equal(child.stdout.listenerCount("data"), 0);
+  assert.equal(child.listenerCount("error"), 0);
 });
 
 test("detached desktop launch waits for spawn success and rejects startup errors", async () => {
@@ -941,6 +1188,39 @@ test("detached desktop launch waits for spawn success and rejects startup errors
     }),
     /EACCES/,
   );
+});
+
+test("detached desktop launch times out, terminates the child, and removes startup listeners", async () => {
+  const { spawnDetachedWithConfirmation } = require(desktopCompatPath);
+  const child = new EventEmitter();
+  let killed = 0;
+  let fireTimeout;
+  const timer = { unrefCalled: false, unref() { this.unrefCalled = true; } };
+  child.unref = () => {};
+  child.kill = () => {
+    killed += 1;
+    child.emit("close", null);
+  };
+
+  const pending = spawnDetachedWithConfirmation("ChatGPT.exe", [], {}, {
+    spawnImpl: () => child,
+    timeoutMs: 5000,
+    setTimeoutFn(callback, timeoutMs) {
+      assert.equal(timeoutMs, 5000);
+      fireTimeout = callback;
+      return timer;
+    },
+    clearTimeoutFn(value) {
+      assert.equal(value, timer);
+    },
+  });
+  assert.equal(timer.unrefCalled, true);
+  fireTimeout();
+
+  await assert.rejects(pending, (error) => error?.code === "desktop_launch_timeout");
+  assert.equal(killed, 1);
+  assert.equal(child.listenerCount("spawn"), 0);
+  assert.equal(child.listenerCount("error"), 0);
 });
 
 test("automatic project recovery waits for each ChatGPT project before launching the next", async () => {

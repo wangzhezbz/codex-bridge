@@ -1,6 +1,8 @@
-import { readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
+import { observeRouterRecovery } from "./router-recovery.js";
 import path from "node:path";
 import { resolveBridgeDataDir } from "./runtime-config.js";
+import { runtimeIdentity } from "./runtime-identity.js";
 
 import {
   getArtifact,
@@ -36,7 +38,7 @@ import { completeRoomCodexTaskWithMessage } from "./room-codex-completion.js";
 import { decideRoomRoute } from "./room-routing-policy.js";
 import { createRouterOrchestrator } from "./router-orchestrator.js";
 import { createRouterRunStore } from "./router-run-store.js";
-import { bindCurrentSessionProject, getProject, listProjects } from "./project-store.js";
+import { bindCurrentSessionProject, claimUnboundProject, getProject, listProjects } from "./project-store.js";
 import {
   createTask,
   getTask,
@@ -204,7 +206,7 @@ function workspaceFromProject(project, fallback = {}) {
     chatgptProjectUrl: project.chatgptProjectUrl,
     targetRepo: project.targetRepo,
     conversationId: project.conversationId,
-    currentCodexThreadId: project.currentCodexThreadId || fallback.currentCodexThreadId || null,
+    currentCodexThreadId: project.currentCodexThreadId || null,
     modePreference: fallback.modePreference || null,
     modelPreference: fallback.modelPreference || null,
     preferenceUpdatedAt: fallback.preferenceUpdatedAt || null
@@ -297,14 +299,26 @@ export function createBridgeTools(options = {}) {
     return attachRoutingRules(await updateWorkspaceBinding(storeRoot, {}));
   }
 
-  function assertWorkspaceThreadScope(workspace = {}) {
+  async function resolveWorkspaceThreadScope(workspace = {}) {
     const boundThreadId = normalizeOptionalText(workspace.currentCodexThreadId);
     if (!boundThreadId || !currentCodexThreadId) {
-      return;
+      return workspace;
     }
     if (boundThreadId !== currentCodexThreadId) {
-      throw new Error(BRIDGE_THREAD_SCOPE_ERROR);
+      let caller, target;
+      try {
+        if (!workspace.targetRepo) throw new Error("Missing project directory");
+        [caller, target] = await Promise.all([
+          realpath(options.cwd || process.cwd()), realpath(workspace.targetRepo)
+        ]);
+      } catch { throw new Error(BRIDGE_THREAD_SCOPE_ERROR); }
+      const key = value => platform === "win32" ? value.toLowerCase() : value;
+      if (key(caller) !== key(target)) throw new Error(BRIDGE_THREAD_SCOPE_ERROR);
+      // The project binding is reusable in its own directory. Each Router run
+      // still belongs to its actual caller; opening another task is not a rebind.
+      return { ...workspace, currentCodexThreadId };
     }
+    return workspace;
   }
 
   async function resolveWorkspaceForInput(input = {}) {
@@ -314,7 +328,7 @@ export function createBridgeTools(options = {}) {
 
     if (projectId) {
       workspace = workspaceFromProject(await getProject(storeRoot, projectId), await getWorkspaceBinding(storeRoot));
-      assertWorkspaceThreadScope(workspace);
+      workspace = await resolveWorkspaceThreadScope(workspace);
       return attachRoutingRules(workspace);
     }
 
@@ -323,7 +337,7 @@ export function createBridgeTools(options = {}) {
       if (activeWorkspace.conversationId === conversationId) {
         if (activeWorkspace.projectId) {
           workspace = workspaceFromProject(await getProject(storeRoot, activeWorkspace.projectId), activeWorkspace);
-          assertWorkspaceThreadScope(workspace);
+          workspace = await resolveWorkspaceThreadScope(workspace);
           return attachRoutingRules(workspace);
         }
         return attachRoutingRules(activeWorkspace);
@@ -335,7 +349,7 @@ export function createBridgeTools(options = {}) {
         throw new Error(`Bridge conversation not found: ${conversationId}`);
       }
       workspace = workspaceFromProject(project, activeWorkspace);
-      assertWorkspaceThreadScope(workspace);
+      workspace = await resolveWorkspaceThreadScope(workspace);
       return attachRoutingRules(workspace);
     }
 
@@ -1000,6 +1014,15 @@ export function createBridgeTools(options = {}) {
   }
 
   async function delegateCurrentRequestV2(input = {}) {
+    if (input.projectId && input.conversationId && currentCodexThreadId) {
+      const project = await getProject(storeRoot, input.projectId);
+      if (!project.currentCodexThreadId) {
+        await claimUnboundProject(storeRoot, {
+          projectId: input.projectId, conversationId: input.conversationId,
+          currentCodexThreadId, cwd: options.cwd || process.cwd()
+        });
+      }
+    }
     if (
       semanticRouterEnabled &&
       input.routingProposal &&
@@ -1067,10 +1090,11 @@ export function createBridgeTools(options = {}) {
       .reverse()
       .find((stage) => stage.replyText != null);
     const waited = orchestration.transportResult?.raw?.waited || null;
-    const stillRunning = waited?.stillRunning === true;
+    const stillRunning = orchestration.observationState === "recovering" ||
+      (waited?.stillRunning === true && ["pending", "queued", "running"].includes(orchestration.routerRun.status));
     return {
       ...orchestration,
-      observationState: stillRunning ? "still_running" : null,
+      observationState: orchestration.observationState || (stillRunning ? "still_running" : null),
       nextAction: stillRunning
         ? {
             tool: "continue_router_run",
@@ -1220,7 +1244,7 @@ export function createBridgeTools(options = {}) {
     }
     const scope = routerScopeFromWorkspace(workspace);
     const runId = normalizeOptionalText(input.runId);
-    const routerRun = runId
+    let routerRun = runId
       ? await resolveRouterRunStore().get(runId, scope)
       : (await resolveRouterRunStore().list(scope))[0] || null;
     if (!routerRun) {
@@ -1231,12 +1255,43 @@ export function createBridgeTools(options = {}) {
         nextAction: null
       };
     }
+    // A queued stage can already be running in Chrome while no caller is
+    // waiting. Observe the transport without driving or rewriting the run.
+    const activeStage = routerRun.stages?.[routerRun.currentStageIndex];
+    let recovery = null;
+    const failedStage = routerRun.status === "failed" && activeStage?.status === "failed" &&
+      activeStage.submissionState === "submitted" &&
+      routerRun.stages.slice(routerRun.currentStageIndex + 1).every(stage => stage.status === "pending");
+    if (routerRun.transportId === "web-sync" &&
+        ((["pending", "queued", "running"].includes(routerRun.status) && activeStage?.status === "queued") || failedStage) &&
+        activeStage.transportRequestId) {
+      const job = await getSyncJob(storeRoot, activeStage.transportRequestId).catch(() => null);
+      const repoKey = (value) => {
+        if (!value) return null;
+        const resolved = path.resolve(value);
+        return platform === "win32" ? resolved.toLowerCase() : resolved;
+      };
+      const recoveryObservation = observeRouterRecovery(routerRun, job, { platform });
+      const recovering = Boolean(recoveryObservation);
+      if ((recovering || (!failedStage && job?.status === "running")) && job.routerRunId === routerRun.id &&
+          job.projectId === scope.projectId && job.conversationId === scope.conversationId &&
+          job.codexThreadId === scope.codexThreadId &&
+          repoKey(job.targetRepo) === repoKey(routerRun.targetRepo)) {
+        const status = job.status === "pending" ? "queued" : "running";
+        if (recovering) recovery = recoveryObservation.recovery;
+        routerRun = recovering ? recoveryObservation.routerRun : {
+          ...routerRun, status, stages: routerRun.stages.map((stage, index) =>
+            index === routerRun.currentStageIndex ? {...stage, status} : stage)
+        };
+      }
+    }
     const lastReplyStage = [...(routerRun.stages || [])]
       .reverse()
       .find((stage) => stage.replyText != null);
     const stillActive = ["pending", "queued", "running"].includes(routerRun.status);
     return {
       routerRun,
+      ...(recovery ? { observationState: "recovering", recovery } : {}),
       replyText: lastReplyStage?.replyText ?? null,
       projectArtifactPaths: routerRun.projectArtifactPaths || [],
       nextAction: stillActive
@@ -1280,6 +1335,10 @@ export function createBridgeTools(options = {}) {
   return {
     async bindCurrentCodexSession(input) {
       return bindCurrentCodexSessionToProject(input);
+    },
+
+    getRuntimeIdentity(expected = {}) {
+      return runtimeIdentity({ storeRoot, currentCodexThreadId }, expected);
     },
 
     async createTask(input) {

@@ -223,6 +223,19 @@ async function withSyncJobReconciliationFileLock(jobPath, operation, options = {
   let heartbeat = null;
   let result;
   let primaryError = null;
+  let transientAccessStartedAt = null;
+  const retryTransientAccess = async (error) => {
+    // Windows may briefly deny open/read while another owner deletes a lock.
+    // Never enter the critical section on that evidence or retry owned writes.
+    if (lockHandle || process.platform !== "win32" || !TRANSIENT_LOCK_CLEANUP_CODES.has(error.code)) {
+      return false;
+    }
+    throwIfAborted(signal);
+    transientAccessStartedAt ??= Date.now();
+    if (Date.now() - transientAccessStartedAt >= 2_000) return false;
+    await sleep(20, signal);
+    return true;
+  };
   try {
     await awaitWithAbort(previous.catch(() => {}), signal);
     throwIfAborted(signal);
@@ -239,12 +252,13 @@ async function withSyncJobReconciliationFileLock(jobPath, operation, options = {
         heartbeat.unref?.();
       } catch (error) {
         if (error.code !== "EEXIST") {
+          if (await retryTransientAccess(error)) continue;
           throw error;
         }
         try {
           const [lockStat, ownerText] = await Promise.all([
             stat(lockPath),
-            readFile(lockPath, "utf8")
+            lockReadFile(lockPath, "utf8")
           ]);
           if (
             Date.now() - lockStat.mtimeMs > SYNC_JOB_LOCK_STALE_MS &&
@@ -255,10 +269,13 @@ async function withSyncJobReconciliationFileLock(jobPath, operation, options = {
           }
         } catch (lockError) {
           if (lockError.code !== "ENOENT") {
+            if (await retryTransientAccess(lockError)) continue;
             throw lockError;
           }
+          transientAccessStartedAt = null;
           continue;
         }
+        transientAccessStartedAt = null;
         if (Date.now() - startedAt > SYNC_JOB_LOCK_TIMEOUT_MS) {
           throw new Error(
             `Timed out waiting for Router reconciliation lease: ${path.basename(jobPath)}`
@@ -327,6 +344,18 @@ function compactTimestamp(iso) {
 
 function syncJobIdFromDate(date = new Date()) {
   return `sync_${compactTimestamp(date.toISOString())}_${randomBytes(3).toString("hex")}`;
+}
+
+export function syncJobAttemptStartedAt(job = {}, nowMs = Date.now()) {
+  const original = job.sentAt || job.updatedAt || job.createdAt || null;
+  const originalMs = Date.parse(original || "");
+  const recoveryMs = Date.parse(job.recoveryStartedAt || "");
+  if (["capture", "resend"].includes(job.recoveryMode) &&
+      Number.isFinite(recoveryMs) && recoveryMs <= nowMs &&
+      (!Number.isFinite(originalMs) || recoveryMs > originalMs)) {
+    return job.recoveryStartedAt;
+  }
+  return original;
 }
 
 function syncJobsDir(storeRoot) {
@@ -522,6 +551,8 @@ function normalizeSyncJob(job = {}) {
   }
   return {
     ...job,
+    recoveryStartedAt: normalizeOptionalIsoTimestamp(job.recoveryStartedAt),
+    recoveryMode: ["capture", "resend"].includes(job.recoveryMode) ? job.recoveryMode : null,
     routerTerminalSignalRequired: routerTerminalSignalRequired(job),
     routerRunId: String(job.routerRunId || "").trim() || null,
     projectId: String(job.projectId || "").trim() || null,
@@ -568,7 +599,7 @@ function urlsMatchProject(jobUrl, activeUrl) {
   return active === job || active.startsWith(`${job}/`) || job.startsWith(`${active}/`);
 }
 
-async function createSyncJobUnlocked(storeRoot, input) {
+async function createSyncJobUnlocked(storeRoot, input, initialRecovery = null) {
   await ensureSyncJobsDir(storeRoot);
   const payloadText = input.payloadText?.trim();
   if (!payloadText) {
@@ -711,6 +742,8 @@ async function createSyncJobUnlocked(storeRoot, input) {
     workerId: null,
     claimedAt: null,
     sentAt: null,
+    recoveryStartedAt: null,
+    recoveryMode: null,
     completedAt: null,
     routerTerminalSignalRequired: requiresRouterTerminalSignal,
     routerRunId: requestedRouterRunId,
@@ -745,8 +778,56 @@ async function createSyncJobUnlocked(storeRoot, input) {
     updatedAt: createdAt
   };
 
+  if (initialRecovery) Object.assign(job, initialRecovery);
   await writeJson(syncJobPath(storeRoot, job.id), job);
   return job;
+}
+
+export function missingArtifactRecoveryFilenames(job = {}, capturedFilenames = []) {
+  if (job.status !== "succeeded" || job.recoverySourceJobId || !job.sentAt || !job.submittedPromptTurnId ||
+      !job.projectId || !job.conversationId || !job.codexThreadId || !job.projectUrl || !job.targetRepo) return [];
+  const captured = new Set(capturedFilenames.map(name => String(name).toLowerCase()));
+  const inputs = new Set((job.inputArtifacts || []).map(a => String(a.filename || "").toLowerCase()));
+  return [...new Set((job.artifactErrors || []).filter(error => error?.error || error?.code === "missing_download")
+    .map(error => String(error.filename || "").trim())
+    .filter(name => name && name.length <= 255 && !/[<>:"/\\|?*\u0000-\u001f]/.test(name) &&
+      /^.+\.[a-z0-9]{1,16}$/i.test(name) && !captured.has(name.toLowerCase()) && !inputs.has(name.toLowerCase())))];
+}
+
+export function missingArtifactRecoveryId(sourceJobId) {
+  return `sync_missing_${createHash("sha256").update(normalizeSyncJobId(sourceJobId)).digest("hex").slice(0,32)}`;
+}
+
+export async function createMissingArtifactRecovery(storeRoot, sourceJobId, {capturedFilenames = []} = {}) {
+  const id = missingArtifactRecoveryId(sourceJobId);
+  await ensureSyncJobsDir(storeRoot);
+  return withSyncJobLock(syncJobPath(storeRoot,id), async()=>{
+    const source = await getSyncJob(storeRoot,sourceJobId);
+    const filenames = missingArtifactRecoveryFilenames(source,capturedFilenames);
+    if (!filenames.length) throw new Error("No safely recoverable missing artifacts");
+    try {
+      const existing = await getSyncJob(storeRoot,id);
+      if (existing.recoverySourceJobId !== source.id || existing.projectId !== source.projectId ||
+          existing.conversationId !== source.conversationId || existing.codexThreadId !== source.codexThreadId ||
+          existing.projectUrl !== source.projectUrl || normalizeTargetRepo(existing.targetRepo) !== normalizeTargetRepo(source.targetRepo) ||
+          existing.submittedPromptTurnId !== source.submittedPromptTurnId ||
+          JSON.stringify(existing.recoveryFilenames) !== JSON.stringify(filenames)) throw new Error("Recovery identity conflict");
+      return existing;
+    } catch(error) { if(error.code !== "ENOENT") throw error; }
+    return createSyncJobUnlocked(storeRoot,{
+      id,kind:"chat_message",projectUrl:source.projectUrl,targetRepo:source.targetRepo,
+      conversationId:source.conversationId,projectId:source.projectId,codexThreadId:source.codexThreadId,
+      payloadText:source.payloadText,userText:`只补收缺失附件：${filenames.join("、")}。不重新发送或生成。`,
+      modePreference:source.modePreference,modelPreference:source.modelPreference
+    },{
+      recoverySourceJobId:source.id,recoveryFilenames:filenames,
+      sentAt:source.sentAt,submittedPromptTurnId:source.submittedPromptTurnId,
+      submittedPromptTurnIndex:source.submittedPromptTurnIndex ?? null,
+      previousAssistantText:source.previousAssistantText || "",
+      recoveryMode:"capture",recoveryStartedAt:nowIso(),
+      artifactBaselineImageKeys:source.artifactBaselineImageKeys || []
+    });
+  });
 }
 
 export async function createSyncJob(storeRoot, input, options = {}) {
@@ -839,7 +920,7 @@ async function claimNextSyncJobUnlocked(storeRoot, input = {}) {
     ) {
       continue;
     }
-    const activityAt = job.sentAt;
+    const activityAt = syncJobAttemptStartedAt(job);
     const activityMs = Date.parse(activityAt || "");
     if (
       !Number.isFinite(activityMs) ||
@@ -855,7 +936,7 @@ async function claimNextSyncJobUnlocked(storeRoot, input = {}) {
       if (!current.sentAt) {
         return null;
       }
-      const currentActivityAt = current.sentAt;
+      const currentActivityAt = syncJobAttemptStartedAt(current);
       const currentActivityMs = Date.parse(currentActivityAt || "");
       if (
         !Number.isFinite(currentActivityMs) ||
@@ -1018,12 +1099,22 @@ export async function markSyncJobSent(storeRoot, jobId, input = {}) {
       return null;
     }
     const sentAt = existing.sentAt && !input.refreshSentAt ? existing.sentAt : nowIso();
+    const suppliedTurnId = input.submittedPromptTurnId;
+    if (suppliedTurnId != null && (typeof suppliedTurnId !== "string" ||
+        !suppliedTurnId.trim() || suppliedTurnId.length > 256 || /[\u0000-\u001f]/.test(suppliedTurnId))) {
+      throw new Error("Invalid submitted prompt turn identity");
+    }
+    const turnId = suppliedTurnId?.trim() || existing.submittedPromptTurnId || null;
+    if (existing.submittedPromptTurnId && turnId !== existing.submittedPromptTurnId) {
+      throw new Error("Submitted prompt turn identity cannot change for a sent job");
+    }
     return {
       status: "running",
       workerId: input.workerId || existing.workerId || "unknown",
       claimedAt: existing.claimedAt || nowIso(),
       sentAt,
       previousAssistantText: input.previousAssistantText ?? existing.previousAssistantText ?? null,
+      submittedPromptTurnId: turnId,
       submittedPromptTurnIndex: Number.isInteger(input.submittedPromptTurnIndex)
         ? input.submittedPromptTurnIndex
         : existing.submittedPromptTurnIndex ?? null,
@@ -1294,15 +1385,21 @@ export async function markSyncJobTerminalMessageProjected(storeRoot, jobId, expe
   });
 }
 
-export async function reopenFailedSyncJobForCapture(storeRoot, jobId) {
+export async function reopenFailedSyncJobForCapture(storeRoot, jobId, options = {}) {
   return updateSyncJob(storeRoot, jobId, (existing) => {
     const sentReplyTimeout = Boolean(existing.sentAt && existing.errorCode === "reply_timeout");
     const generationStartedBeforeConfirmation = existing.errorCode === "pre_send_expired";
-    if (existing.status !== "failed" || (!sentReplyTimeout && !generationStartedBeforeConfirmation)) {
+    const sentFileCaptureFailure = Boolean(existing.sentAt && (existing.errorCode === "missing_download" ||
+      (options.allowResolvedClientBlock === true && existing.errorCode === "client_blocked")));
+    const anchoredScopeFailure = Boolean(existing.sentAt && existing.errorCode === "reply_scope_ambiguous" &&
+      typeof existing.submittedPromptTurnId === "string" && existing.submittedPromptTurnId.trim());
+    if (existing.status !== "failed" || (!sentReplyTimeout && !generationStartedBeforeConfirmation && !sentFileCaptureFailure && !anchoredScopeFailure)) {
       return null;
     }
     return {
       status: "running",
+      recoveryStartedAt: nowIso(),
+      recoveryMode: "capture",
       sentAt: existing.sentAt || existing.claimedAt || existing.updatedAt || new Date().toISOString(),
       completedAt: null,
       routerTerminalSignalPending: false,
@@ -1333,18 +1430,28 @@ export async function reopenFailedSyncJobForResend(storeRoot, jobId, options = {
     if (options.allowPreSendExpired === true) {
       allowedErrorCodes.push("pre_send_expired");
     }
+    const unsentRouterFailure = options.allowUnsentRouterFailure === true &&
+      routerTerminalSignalRequired(existing) && !existing.sentAt &&
+      ["input_artifact_fetch_failed", "preference_not_applied", "pre_send_stale", "composer_text_not_applied"].includes(existing.errorCode || "");
     if (
       existing.status !== "failed" ||
-      !allowedErrorCodes.includes(existing.errorCode || "")
+      (!allowedErrorCodes.includes(existing.errorCode || "") && !unsentRouterFailure)
     ) {
       return null;
     }
     return {
+      ...(unsentRouterFailure ? normalizeChatGptPreferences({
+        modePreference: options.modePreference || existing.modePreference,
+        modelPreference: options.modelPreference || existing.modelPreference
+      }) : {}),
       status: "pending",
+      recoveryStartedAt: nowIso(),
+      recoveryMode: "resend",
       workerId: null,
       claimedAt: null,
       sentAt: null,
       submittedPromptTurnIndex: null,
+      submittedPromptTurnId: null,
       artifactBaselineImageKeys: [],
       completedAt: null,
       routerTerminalSignalPending: false,

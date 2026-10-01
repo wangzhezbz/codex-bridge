@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import path from "node:path";
 import test from "node:test";
 import {
   cleanupSourceDesktopSmokeFixture,
@@ -23,6 +24,23 @@ test("source desktop smoke fixture isolates Codex home, app data, and resource d
     assert.deepEqual(snapshot.codexAppServerSnapshot.plugins.items, []);
     assert.deepEqual(snapshot.codexAppServerSnapshot.apps.items, []);
     assert.deepEqual(snapshot.codexAppServerSnapshot.skills.items, []);
+    fs.mkdirSync(path.join(fixture.codexDir, "skills"), { recursive: true });
+    for (const filePath of [
+      path.join(fixture.dataDir, "model-catalog.json"),
+      path.join(fixture.dataDir, "config", "desktop-options.json"),
+      path.join(fixture.dataDir, "config", "model-selection.json"),
+      path.join(fixture.dataDir, "config", "router.config.json"),
+      path.join(fixture.dataDir, "state", "response-history.sqlite3"),
+      path.join(fixture.dataDir, "state", "response-history.sqlite3-shm"),
+      path.join(fixture.dataDir, "state", "response-history.sqlite3-wal"),
+      path.join(fixture.codexDir, "codexbridge-model-catalog.json"),
+      path.join(fixture.codexDir, "config.toml"),
+      path.join(fixture.codexDir, "config.codexbridge-router-original.toml"),
+    ]) {
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, "", "utf8");
+    }
+    fs.mkdirSync(path.join(fixture.dataDir, "config", ".transactions"), { recursive: true });
   } finally {
     cleanupSourceDesktopSmokeFixture(fixture);
   }
@@ -34,4 +52,13 @@ test("source desktop smoke launcher always applies and cleans the isolated fixtu
   assert.match(source, /createSourceDesktopSmokeFixture\(\)/);
   assert.match(source, /\.\.\.fixture\.env/);
   assert.match(source, /cleanupSourceDesktopSmokeFixture\(fixture\)/);
+});
+
+
+test("software smoke waits for initialization and checks the Codex-only management tabs", () => {
+  const source = fs.readFileSync(new URL("../desktop/main.cjs", import.meta.url), "utf8");
+  const smoke = source.slice(source.indexOf("let softwareManagerSmoke = null;"));
+  assert.match(smoke, /softwareManagerLoaded && !softwareManagerLoading[\s\S]*?"software manager initialization"[\s\S]*?"Codex-only " \+ tab/);
+  assert.match(smoke, /cardNames\.join\(","\) !== "Codex"/);
+  assert.doesNotMatch(smoke, /unified Skill list|selectablePluginRows/);
 });

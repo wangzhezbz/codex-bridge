@@ -355,7 +355,7 @@ function validatePathStats(stats, kind) {
   if (
     stats?.isSymbolicLink?.() ||
     (kind === "directory" ? !isDirectory : !isFile) ||
-    (kind === "file" && Number.isInteger(stats.nlink) && stats.nlink !== 1)
+    (kind === "file" && (typeof stats.nlink === "bigint" || Number.isInteger(stats.nlink)) && Number(stats.nlink) !== 1)
   ) {
     throw privateAclError("windows_private_acl_invalid_path");
   }
@@ -512,12 +512,12 @@ export function createWindowsPrivateAcl({
       throw privateAclError("windows_private_acl_invalid_path");
     }
 
-    const before = await ops.lstat(target);
+    const before = await ops.lstat(target, { bigint: true });
     validatePathStats(before, kind);
     const identity = await currentIdentity();
     const trustedSids = [...new Set([identity.sid, ...TRUSTED_SYSTEM_SIDS])];
     await applyAndVerify(target, trustedSids, kind, identity);
-    const after = await ops.lstat(target);
+    const after = await ops.lstat(target, { bigint: true });
     validatePathStats(after, kind);
     if (statsIdentity(after) !== statsIdentity(before)) {
       throw privateAclError("windows_private_acl_path_changed");
@@ -536,12 +536,12 @@ export function createWindowsPrivateAcl({
       throw privateAclError("windows_private_acl_invalid_path");
     }
 
-    const before = await ops.lstat(target);
+    const before = await ops.lstat(target, { bigint: true });
     validatePathStats(before, kind);
     const identity = await currentIdentity();
     const trustedSids = [...new Set([identity.sid, ...TRUSTED_SYSTEM_SIDS])];
     await verify(target, trustedSids, kind, identity);
-    const after = await ops.lstat(target);
+    const after = await ops.lstat(target, { bigint: true });
     validatePathStats(after, kind);
     if (statsIdentity(after) !== statsIdentity(before)) {
       throw privateAclError("windows_private_acl_path_changed");

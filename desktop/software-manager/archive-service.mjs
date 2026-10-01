@@ -116,6 +116,7 @@ function createPolicyCollector() {
   const entries = [];
   const normalizedNames = new Set();
   const knownPathKinds = new Map();
+  const knownAncestors = new Set();
   let totalUnpackedBytes = 0n;
   let maxRelativePath = 0;
 
@@ -128,9 +129,9 @@ function createPolicyCollector() {
       for (let index = 1; index < normalized.segments.length; index += 1) {
         const ancestorKey = normalized.segments.slice(0, index).join("/").toLowerCase();
         if (knownPathKinds.get(ancestorKey) === false) throw archiveError("archive_path_conflict");
+        knownAncestors.add(ancestorKey);
       }
-      if (!normalized.directory
-        && [...knownPathKinds.keys()].some((knownKey) => knownKey.startsWith(`${normalized.key}/`))) {
+      if (!normalized.directory && knownAncestors.has(normalized.key)) {
         throw archiveError("archive_path_conflict");
       }
       normalizedNames.add(normalized.key);

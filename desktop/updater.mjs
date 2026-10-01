@@ -3,6 +3,11 @@ import fsSync from "node:fs";
 import { createHash, timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import { fetchInitWithProxy, proxyLogLabel } from "../src/proxy.js";
+import boundedResponseBody from "../shared/bounded-response-body.cjs";
+import networkDeadline from "../shared/network-deadline.cjs";
+
+const { cancelResponseBody, readBoundedResponseText } = boundedResponseBody;
+const { runWithNetworkDeadline } = networkDeadline;
 
 export const GITHUB_LATEST_RELEASE_URL =
   "https://api.github.com/repos/wangzhezbz/codex-bridge/releases/latest";
@@ -622,36 +627,55 @@ export async function fetchLatestRelease({
   fetchImpl = globalThis.fetch,
   releaseUrl = GITHUB_LATEST_RELEASE_URL,
   latestReleasePageUrl = GITHUB_LATEST_RELEASE_PAGE_URL,
+  timeoutMs = 15_000,
 } = {}) {
   if (typeof fetchImpl !== "function") {
     throw new Error("当前运行环境没有可用的 fetch，无法检查更新。");
   }
-  return fetchLatestReleaseWithFallback({ fetchImpl, releaseUrl, latestReleasePageUrl });
+  return fetchLatestReleaseWithFallback({ fetchImpl, releaseUrl, latestReleasePageUrl, timeoutMs });
 }
 
 async function fetchLatestReleaseWithFallback({
   fetchImpl,
   releaseUrl,
   latestReleasePageUrl,
+  timeoutMs,
 }) {
   let apiError = null;
   try {
-    const response = await fetchImpl(releaseUrl, fetchInitWithProxy(releaseUrl, {
-      headers: {
-        accept: "application/vnd.github+json",
-        "user-agent": "CodexBridge",
-      },
-    }));
-    if (response.ok) {
-      return response.json();
-    }
-    apiError = new Error(`GitHub API 返回 HTTP ${response.status}`);
+    const checked = await runWithNetworkDeadline(async (signal) => {
+      const response = await fetchImpl(releaseUrl, fetchInitWithProxy(releaseUrl, {
+        headers: {
+          accept: "application/vnd.github+json",
+          "user-agent": "CodexBridge",
+        },
+        ...(signal ? { signal } : {}),
+      }));
+      if (!response.ok) {
+        cancelResponseBody(response);
+        throw new Error(`GitHub API 返回 HTTP ${response.status}`);
+      }
+      const text = await readBoundedResponseText(response, {
+        maxBytes: 4 * 1024 * 1024,
+        signal,
+        createTooLargeError: () => updateCheckError("GitHub API 返回内容过大"),
+      });
+      try {
+        return JSON.parse(text);
+      } catch {
+        throw updateCheckError("GitHub API 返回了无效 JSON");
+      }
+    }, {
+      timeoutMs,
+      createTimeoutError: () => updateCheckError("GitHub API 检查更新超时"),
+    });
+    return checked;
   } catch (error) {
     apiError = error;
   }
 
   try {
-    return await fetchLatestReleaseFromLatestPage({ fetchImpl, latestReleasePageUrl });
+    return await fetchLatestReleaseFromLatestPage({ fetchImpl, latestReleasePageUrl, timeoutMs });
   } catch (fallbackError) {
     throw new Error(
       `检查更新失败：${apiError?.message || "GitHub API 不可用"}；releases/latest 兜底也失败：${fallbackError.message}`,
@@ -662,23 +686,41 @@ async function fetchLatestReleaseWithFallback({
 async function fetchLatestReleaseFromLatestPage({
   fetchImpl,
   latestReleasePageUrl,
+  timeoutMs,
 }) {
-  const response = await fetchImpl(latestReleasePageUrl, fetchInitWithProxy(latestReleasePageUrl, {
-    redirect: "manual",
-    headers: {
-      accept: "text/html,*/*",
-      "user-agent": "CodexBridge",
-    },
-  }));
+  return runWithNetworkDeadline(async (signal) => {
+    const response = await fetchImpl(latestReleasePageUrl, fetchInitWithProxy(latestReleasePageUrl, {
+      redirect: "manual",
+      headers: {
+        accept: "text/html,*/*",
+        "user-agent": "CodexBridge",
+      },
+      ...(signal ? { signal } : {}),
+    }));
 
-  let latestTag = releaseTagFromLatestResponse(response, latestReleasePageUrl);
-  if (!latestTag && response.ok && typeof response.text === "function") {
-    latestTag = releaseTagFromText(await response.text());
-  }
-  if (!latestTag) {
-    throw new Error(`无法从 HTTP ${response.status} 解析最新版本标签`);
-  }
-  return releaseFromLatestTag(latestTag);
+    let latestTag = releaseTagFromLatestResponse(response, latestReleasePageUrl);
+    if (!latestTag && response.ok) {
+      latestTag = releaseTagFromText(await readBoundedResponseText(response, {
+        maxBytes: 1024 * 1024,
+        signal,
+        createTooLargeError: () => updateCheckError("releases/latest 页面内容过大"),
+      }));
+    }
+    if (!latestTag) {
+      cancelResponseBody(response);
+      throw new Error(`无法从 HTTP ${response.status} 解析最新版本标签`);
+    }
+    return releaseFromLatestTag(latestTag);
+  }, {
+    timeoutMs,
+    createTimeoutError: () => updateCheckError("releases/latest 兜底检查超时"),
+  });
+}
+
+function updateCheckError(message) {
+  const error = new Error(message);
+  error.code = "update_check_failed";
+  return error;
 }
 
 function releaseTagFromLatestResponse(response, baseUrl) {

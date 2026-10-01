@@ -105,6 +105,7 @@ function runtimeRequiredRelativeFiles(componentId, entry) {
   const relativeFiles = componentId === "chatgpt"
     ? entry.requiredFiles.filter((file) => [
       ".codexbridge-chatgpt-version.json",
+      ".codexbridge-green-codex.json",
       "ChatGPT.exe",
       "Codex.exe",
       "chrome.dll",
@@ -951,6 +952,44 @@ export function createComponentAdapters({
     }
   }
 
+  async function discardPreparedComponent(componentId, rawContext) {
+    const context = rejectForbiddenContext(rawContext);
+    const taskId = requireTaskId(context.taskId);
+    const key = `${componentId}\0${taskId}`;
+    const prepared = preparedComponents.get(key);
+    if (!prepared) return false;
+    // Transfer cleanup ownership before awaiting, so a second discard or commit
+    // cannot use the same plan or release its handles twice.
+    preparedComponents.delete(key);
+    const cleanupErrors = [];
+    if (componentId === "git") {
+      try { await releaseGitPlan(prepared.pin); }
+      catch (error) { cleanupErrors.push(error); }
+    }
+    if (cleanupErrors.length === 0) {
+      try {
+        await runOwnership(async () => {
+          await revalidateInstallRootCapability(installRootCapability);
+          await assertPrepareClaim(prepared.claim);
+          if (componentId !== "git") {
+            await discardPreparedVersion({
+              componentId, taskId, leaseNonce: prepared.claim.leaseNonce,
+            });
+          }
+          await clearPrepareClaim(prepared.claim, null, { releaseLease: false });
+        });
+      } catch (error) { cleanupErrors.push(error); }
+    }
+    // Failed cleanup leaves its durable claim for recovery, but must not retain
+    // a live lease that would prevent recovery in this process.
+    try { await prepared.operationLease.release(); }
+    catch (error) { cleanupErrors.push(error); }
+    if (cleanupErrors.length > 0) {
+      throw combineOperationErrors(cleanupErrors[0], cleanupErrors.slice(1), "component_prepare_cleanup_failed");
+    }
+    return true;
+  }
+
   async function commitArchiveComponent(componentId, rawContext) {
     const action = "commit";
     let before = null;
@@ -1051,7 +1090,21 @@ export function createComponentAdapters({
         warnings.push(`runtime_metadata:${errorMessage(error)}`);
       }
       const recordedShortcut = stateAfter?.shortcuts?.find((record) => record?.componentId === componentId);
-      if (!recordedShortcut) {
+      let needsShortcut = !recordedShortcut;
+      if (recordedShortcut) {
+        try {
+          await ensureDesktopAuthority();
+          await revalidateFixedDirectoryCapability(activeDesktopCapability);
+          const inspected = await requireMethod(windowsHost, "inspectRecordedShortcut", "shortcut_inspection_required")(recordedShortcut);
+          if (inspected?.kind === "absent") {
+            const repaired = structuredClone(stateAfter);
+            repaired.shortcuts = repaired.shortcuts.filter(record => record.componentId !== componentId);
+            stateAfter = await saveState(repaired);
+            needsShortcut = true;
+          } else if (inspected?.kind !== "shortcut") throw adapterError("shortcut_inspection_invalid");
+        } catch (error) { warnings.push(`shortcut:${errorMessage(error)}`); }
+      }
+      if (needsShortcut) {
         try {
           await ensureDesktopAuthority();
           const planned = await planShortcut({
@@ -1137,9 +1190,13 @@ export function createComponentAdapters({
         requiredFiles: record.requiredFiles,
         expectedVersion: record.version,
       });
+      const rollbackInspection = stateRollbackAvailable(state, componentId)
+        ? await requireMethod(versionSlots, "inspectRollback", "component_rollback_inspection_required")(componentId)
+        : { available: false, reason: null };
       return result(componentId, "inspect", "succeeded", {
-        versionBefore: record.version, versionAfter: record.version, message: "component_installed",
-        rollbackAvailable: stateRollbackAvailable(state, componentId),
+        versionBefore: record.version, versionAfter: record.version,
+        message: rollbackInspection.reason ? `component_installed_with_warning:${rollbackInspection.reason}` : "component_installed",
+        rollbackAvailable: rollbackInspection.available === true,
         details: {
           installPath: record.installPath,
           previousVersion: stateRollbackVersion(state, componentId),
@@ -1234,6 +1291,8 @@ export function createComponentAdapters({
         throw adapterError("component_runtime_metadata_missing");
       }
       oldEntrypoint = record.entrypointPath;
+      const rollbackInspection = await requireMethod(versionSlots, "inspectRollback", "component_rollback_inspection_required")(componentId);
+      if (!rollbackInspection?.available) throw adapterError(rollbackInspection?.reason || "rollback_not_available");
       const stopped = await windowsHost.stopOwnedProcesses([oldEntrypoint]);
       wasRunning = Array.isArray(stopped?.stoppedProcessIds) && stopped.stoppedProcessIds.length > 0;
       const rolled = await rollbackVersion(componentId);
@@ -1266,6 +1325,7 @@ export function createComponentAdapters({
     return Object.freeze({
       inspectInstalled: (context) => inspectManaged(componentId, context),
       prepare: (context) => prepareArchiveComponent(componentId, context),
+      discardPrepared: (context) => discardPreparedComponent(componentId, context),
       commit: (context) => commitArchiveComponent(componentId, context),
       verify: (context) => verifyManaged(componentId, context),
       uninstall: (context) => uninstallManaged(componentId, context),
@@ -2413,7 +2473,7 @@ export function createComponentAdapters({
   const coordinatedArchiveAdapter = (componentId) => {
     const adapter = archiveAdapter(componentId);
     return Object.freeze(Object.fromEntries(Object.entries(adapter).map(([name, operation]) => [
-      name, name === "prepare" ? operation : async (...args) => {
+      name, ["prepare", "discardPrepared"].includes(name) ? operation : async (...args) => {
         try {
           return await coordinated(operation, {
             install: true, desktop: desktopCapabilityProvider === null, skills: false,
@@ -2430,6 +2490,7 @@ export function createComponentAdapters({
     v2rayn: coordinatedArchiveAdapter("v2rayn"),
     git: Object.freeze({
       inspectInstalled: coordinated(inspectGit, { install: true }), prepare: prepareGit,
+      discardPrepared: (context) => discardPreparedComponent("git", context),
       commit: async (...args) => {
         try { return await commitGit(...args); }
         catch (error) { return failed("git", "commit", error); }

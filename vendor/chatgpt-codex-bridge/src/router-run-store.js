@@ -1,7 +1,9 @@
 import { randomBytes } from "node:crypto";
+import { routerRecovery } from "./router-recovery.js";
 import { mkdir, open, readFile, readdir, rename, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { resolveBridgeDataDir } from "./runtime-config.js";
+import { acquireRouterLockGuard } from "./router-lock-guard.js";
 
 const ROUTER_RUNS_DIR = "router-runs";
 const RUN_STATUSES = new Set(["pending", "queued", "running", "succeeded", "failed", "cancelled"]);
@@ -14,6 +16,7 @@ const FILE_LOCKS = new Map();
 const RUN_LOCK_STALE_MS = 30_000;
 const RUN_LOCK_TIMEOUT_MS = 35_000;
 const RUN_LOCK_HEARTBEAT_MS = 5_000;
+const RUN_LOCK_ACCESS_RETRY_MS = 2_000;
 const TRANSIENT_LOCK_CLEANUP_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
 
 function abortError(signal) {
@@ -98,9 +101,19 @@ async function unlinkLockWithRetry(filePath, unlinkFile) {
   }
 }
 
-function lockOwnerPid(value = "") {
-  const match = String(value).match(/^(\d+)-[a-f0-9]+\s/i);
-  return match ? Number(match[1]) : null;
+async function readLockMetadataWithRetry(operation) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (process.platform !== "win32" || !TRANSIENT_LOCK_CLEANUP_CODES.has(error.code) || attempt >= 2) throw error;
+      await sleep(10 * (attempt + 1));
+    }
+  }
+}
+
+function sameLockFile(first, second) {
+  return Boolean(first && second && first.ino && second.ino && first.dev === second.dev && first.ino === second.ino);
 }
 
 function processIsAlive(pid) {
@@ -120,7 +133,9 @@ function processIsAlive(pid) {
 
 async function reclaimStaleLock(lockPath) {
   let ownerText = "";
+  let identity;
   try {
+    identity = await stat(lockPath, {bigint:true});
     ownerText = await readFile(lockPath, "utf8");
   } catch (error) {
     if (error.code === "ENOENT") {
@@ -128,25 +143,27 @@ async function reclaimStaleLock(lockPath) {
     }
     throw error;
   }
-  if (processIsAlive(lockOwnerPid(ownerText))) {
+  const owner = /^([1-9]\d*)-([a-f0-9]{16}) (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)( kernel-v1)?\n(?:released ([1-9]\d*-[a-f0-9]{16})\n)?$/.exec(ownerText);
+  if (!owner || owner[0] !== ownerText) return false;
+  const pid = Number(owner[1]), timestamp = Date.parse(owner[3]);
+  if (!Number.isSafeInteger(pid) || pid > 0x7fffffff || !Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== owner[3]) return false;
+  const currentProtocol = Boolean(owner[4]);
+  if (owner[5] && (!currentProtocol || owner[5] !== `${owner[1]}-${owner[2]}`)) return false;
+  const released = Boolean(owner[5]);
+  if (processIsAlive(pid) && !released) {
     return false;
   }
-
-  const quarantine = `${lockPath}.stale.${process.pid}.${randomBytes(6).toString("hex")}`;
+  if (!currentProtocol && Date.now() - Number(identity.mtimeMs) <= RUN_LOCK_STALE_MS) return false;
+  // The caller owns the OS guard throughout this check and removal. All
+  // upgraded acquirers/reclaimers are excluded, not merely checked twice.
   try {
-    await rename(lockPath, quarantine);
+    if (!sameLockFile(identity, await stat(lockPath, {bigint:true}))) return false;
+    await unlink(lockPath);
   } catch (error) {
     if (error.code === "ENOENT") {
       return true;
     }
     throw error;
-  }
-  try {
-    await unlink(quarantine);
-  } catch (error) {
-    if (error.code !== "ENOENT") {
-      throw error;
-    }
   }
   return true;
 }
@@ -156,6 +173,7 @@ async function withFileLock(lockPath, operation, options = {}) {
   const lockOpen = options.lockOperations?.open || open;
   const lockReadFile = options.lockOperations?.readFile || readFile;
   const lockUnlink = options.lockOperations?.unlink || unlink;
+  const lockStat = options.lockOperations?.stat || stat;
   throwIfAborted(signal);
   const canonicalLockPath = path.resolve(lockPath);
   const previous = FILE_LOCKS.get(canonicalLockPath) || Promise.resolve();
@@ -165,7 +183,20 @@ async function withFileLock(lockPath, operation, options = {}) {
   });
   FILE_LOCKS.set(canonicalLockPath, current);
   let handle = null;
+  let releaseGuard = null;
   let heartbeat = null;
+  let acquiredFile = null;
+  let ownerWritten = false;
+  let ownerRecord = "";
+  let accessRetryStartedAt = null;
+  const retryTransientAccess = async (error) => {
+    if (handle || process.platform !== "win32" || !TRANSIENT_LOCK_CLEANUP_CODES.has(error.code)) return false;
+    accessRetryStartedAt ??= Date.now();
+    const remaining = RUN_LOCK_ACCESS_RETRY_MS - (Date.now() - accessRetryStartedAt);
+    if (remaining <= 0) return false;
+    await sleep(Math.min(20, remaining), signal);
+    return true;
+  };
   const ownerToken = `${process.pid}-${randomBytes(8).toString("hex")}`;
   const startedAt = Date.now();
   let result;
@@ -173,11 +204,15 @@ async function withFileLock(lockPath, operation, options = {}) {
   try {
     await awaitWithAbort(previous.catch(() => {}), signal);
     throwIfAborted(signal);
+    releaseGuard = await acquireRouterLockGuard(canonicalLockPath, {signal, timeoutMs:RUN_LOCK_TIMEOUT_MS});
     while (!handle) {
       throwIfAborted(signal);
       try {
         handle = await lockOpen(canonicalLockPath, "wx");
-        await handle.writeFile(`${ownerToken} ${new Date().toISOString()}\n`, "utf8");
+        ownerRecord = `${ownerToken} ${new Date().toISOString()} kernel-v1\n`;
+        acquiredFile = handle.stat ? await readLockMetadataWithRetry(() => handle.stat({ bigint: true })) : null;
+        await handle.writeFile(ownerRecord, "utf8");
+        ownerWritten = true;
         throwIfAborted(signal);
         heartbeat = setInterval(() => {
           const heartbeatAt = new Date();
@@ -185,17 +220,17 @@ async function withFileLock(lockPath, operation, options = {}) {
         }, RUN_LOCK_HEARTBEAT_MS);
         heartbeat.unref?.();
       } catch (error) {
+        if (await retryTransientAccess(error)) continue;
+        if (handle) throw error;
         if (error.code !== "EEXIST") {
           throw error;
         }
         try {
-          const lockStat = await stat(canonicalLockPath);
-          if (Date.now() - lockStat.mtimeMs > RUN_LOCK_STALE_MS) {
-            if (await reclaimStaleLock(canonicalLockPath)) {
-              continue;
-            }
+          if (await reclaimStaleLock(canonicalLockPath)) {
+            continue;
           }
         } catch (lockError) {
+          if (await retryTransientAccess(lockError)) continue;
           if (lockError.code !== "ENOENT") {
             throw lockError;
           }
@@ -223,14 +258,27 @@ async function withFileLock(lockPath, operation, options = {}) {
       clearInterval(heartbeat);
     }
     if (handle) {
+      // The operation is settled, but keep the OS guard until every cleanup
+      // attempt ends. A following process can then verify this release even
+      // if this process remains alive and path cleanup was denied.
+      if (ownerWritten) {
+        try {
+          await handle.writeFile(`released ${ownerToken}\n`, "utf8");
+        } catch (error) { cleanupErrors.push(error); }
+      }
       try {
         await handle.close();
       } catch (error) {
         cleanupErrors.push(error);
       }
       try {
-        const lockOwner = await lockReadFile(canonicalLockPath, "utf8");
-        if (lockOwner.startsWith(`${ownerToken} `)) {
+        const lockOwner = await readLockMetadataWithRetry(() => lockReadFile(canonicalLockPath, "utf8"));
+        let owned = lockOwner.startsWith(`${ownerToken} `);
+        if (acquiredFile && (owned || (!ownerWritten && ownerRecord.startsWith(lockOwner)))) {
+          const currentFile = await readLockMetadataWithRetry(() => lockStat(canonicalLockPath, { bigint: true }));
+          owned = sameLockFile(acquiredFile, currentFile);
+        }
+        if (owned) {
           await unlinkLockWithRetry(canonicalLockPath, lockUnlink);
         }
       } catch (error) {
@@ -240,6 +288,9 @@ async function withFileLock(lockPath, operation, options = {}) {
       }
     }
   } finally {
+    if (releaseGuard) {
+      try { await releaseGuard(); } catch (error) { cleanupErrors.push(error); }
+    }
     release();
     if (FILE_LOCKS.get(canonicalLockPath) === current) {
       FILE_LOCKS.delete(canonicalLockPath);
@@ -698,6 +749,26 @@ export function createRouterRunStore(options = {}) {
     }, lockOptions({ signal, commitOnOperationReturn: true }));
   }
 
+  async function cancelRecoveredStage(runId, scope, { job, reason, signal } = {}) {
+    const targetPath = runPath(runId);
+    return withRunFileLock(targetPath, async () => {
+      throwIfAborted(signal);
+      const existing = await get(runId, scope);
+      if (existing.status !== "failed") return existing;
+      if (job?.status !== "failed" || job.errorCode !== "manual_cancelled" ||
+          !routerRecovery(existing, job, { allowTerminal: true })) {
+        throw new Error("Recovered Router cancellation requires an exact cancelled transport");
+      }
+      const updated = normalizeRun({
+        ...existing, status: "cancelled", error: reason || "Router recovery cancelled",
+        stages: existing.stages.map((stage, index) => index === existing.currentStageIndex
+          ? {...stage, status: "cancelled", error: reason || "Router recovery cancelled", completedAt: nowIso(clock)} : stage)
+      }, { createdAt: existing.createdAt, updatedAt: nowIso(clock) });
+      throwIfAborted(signal);
+      return writeRun(updated);
+    }, lockOptions({ signal, commitOnOperationReturn: true }));
+  }
+
   async function withRunLease(runId, scope, operation, options = {}) {
     if (typeof operation !== "function") {
       throw new Error("Router run lease requires an operation function");
@@ -863,6 +934,7 @@ export function createRouterRunStore(options = {}) {
     get,
     update,
     reopenFailedStageForSucceededTransport,
+    cancelRecoveredStage,
     withRunLease,
     withSubmissionLease,
     withFinalizationLease,

@@ -101,11 +101,10 @@ export function registerSoftwareManagerIpc({
   getService,
   selectInstallRoot,
   sendEvent = () => {},
-  cancelExternalTask = () => null,
 } = {}) {
   const registrar = requireRegistrar(ipcMain);
   if (typeof getService !== "function" || typeof selectInstallRoot !== "function"
-    || typeof sendEvent !== "function" || typeof cancelExternalTask !== "function") {
+    || typeof sendEvent !== "function") {
     throw new TypeError("software manager IPC dependencies are required");
   }
 
@@ -153,8 +152,6 @@ export function registerSoftwareManagerIpc({
   registrar.handle(CHANNELS.cancelTask, async (_event, ...args) => {
     requireWindows(platform);
     exactZeroArguments(args);
-    const external = cancelExternalTask();
-    if (external && typeof external === "object") return external;
     return (await service()).cancelTask();
   });
 

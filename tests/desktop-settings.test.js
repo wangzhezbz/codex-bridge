@@ -69,6 +69,7 @@ import {
   readConfigPackageSyncStatus,
   readModelCapabilityOverrides,
   readModelDirectory,
+  readJsonIfExists,
   readRouterConfig,
   readCustomModels,
   readProviderOverrides,
@@ -130,6 +131,49 @@ import {
   updateCodexPluginResource,
   writeRouterConfigFromSelection,
 } from "../desktop/settings.mjs";
+
+test("desktop JSON readers reject oversized local state before parsing", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-local-json-limit-"));
+  const target = path.join(tempDir, "oversized.json");
+  const descriptor = fs.openSync(target, "w");
+  try { fs.ftruncateSync(descriptor, 16 * 1024 * 1024 + 1); }
+  finally { fs.closeSync(descriptor); }
+  try {
+    assert.throws(
+      () => readJsonIfExists(target, null),
+      (error) => error?.code === "bounded_local_file_too_large",
+    );
+  } finally {
+    fs.unlinkSync(target);
+    fs.rmdirSync(tempDir);
+  }
+});
+
+test("desktop JSON readers reject symbolic-link state files before opening their targets", (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codexbridge-local-json-link-"));
+  const target = path.join(tempDir, "target.json");
+  const link = path.join(tempDir, "linked.json");
+  fs.writeFileSync(target, JSON.stringify({ secret: true }), "utf8");
+  try {
+    try {
+      fs.symlinkSync(target, link, "file");
+    } catch (error) {
+      if (["EPERM", "EACCES", "ENOTSUP"].includes(error?.code)) {
+        t.skip(`symbolic links are unavailable: ${error.code}`);
+        return;
+      }
+      throw error;
+    }
+    assert.throws(
+      () => readJsonIfExists(link, null),
+      (error) => error?.code === "bounded_local_file_not_file",
+    );
+  } finally {
+    if (fs.existsSync(link)) fs.unlinkSync(link);
+    if (fs.existsSync(target)) fs.unlinkSync(target);
+    fs.rmdirSync(tempDir);
+  }
+});
 
 const require = createRequire(import.meta.url);
 
@@ -327,6 +371,7 @@ test("saveSecrets records only non-empty values", () => {
     DEEPSEEK_API_KEY: false,
     GEMINI_API_KEY: false,
     HUNYUAN_API_KEY: false,
+    TOKENHUB_API_KEY: false,
     KIMI_CODE_API_KEY: false,
     MIMO_API_KEY: false,
     MINIMAX_API_KEY: false,
@@ -364,6 +409,7 @@ test("saveSecrets records only non-empty values", () => {
     STEPFUN_API_KEY: false,
     XAI_API_KEY: false,
     ZHIPUAI_API_KEY: false,
+    TOKENHUB_API_KEY: false,
   });
 });
 
@@ -1280,6 +1326,45 @@ test("router config exports usage budgets for router-side guards", () => {
     routes: { "cb-kimi-k2-7-code": { dailyTokenLimit: 500, outputCostPerMillion: 2.5 } },
     providers: { deepseek: { dailyCallLimit: 5, dailyCostLimit: 0.75, cacheCostPerMillion: 0.125 } },
   });
+});
+
+test("cache-write prices round trip through desktop options and router config", () => {
+  const rootDir = makeTempProject();
+  const options = saveDesktopOptions(rootDir, {
+    usageBudgets: {
+      global: { inputCostPerMillion: 10, cacheWriteCostPerMillion: 12.5 },
+      routes: { "cb-astra": { cache_write_cost_per_million: 0 } },
+      providers: { openai: { cache_write_cost_per_million: "7.25" } },
+    },
+  });
+  const expected = {
+    global: { inputCostPerMillion: 10, cacheWriteCostPerMillion: 12.5 },
+    routes: { "cb-astra": { cacheWriteCostPerMillion: 0 } },
+    providers: { openai: { cacheWriteCostPerMillion: 7.25 } },
+  };
+  assert.deepEqual(options.usageBudgets, expected);
+  assert.deepEqual(loadDesktopOptions(rootDir).usageBudgets, expected);
+  saveDesktopOptions(rootDir, { bypassSystemProxy: true });
+  assert.deepEqual(buildRouterConfigFromSelection(rootDir, MODE_HYBRID).usageBudgets, expected);
+});
+
+test("invalid cache-write prices stay unset instead of becoming free prices", () => {
+  const rootDir = makeTempProject();
+  for (const value of [-1, "invalid", Infinity, null, "", " "]) {
+    const options = saveDesktopOptions(rootDir, {
+      usageBudgets: { global: { inputCostPerMillion: 10, cacheWriteCostPerMillion: value } },
+    });
+    assert.deepEqual(options.usageBudgets, { global: { inputCostPerMillion: 10 } });
+  }
+});
+
+test("positive cache-write prices are not rounded down to explicit free writes", () => {
+  const rootDir = makeTempProject();
+  const options = saveDesktopOptions(rootDir, {
+    usageBudgets: { global: { cacheWriteCostPerMillion: 0.0000001 } },
+  });
+  assert.equal(options.usageBudgets.global.cacheWriteCostPerMillion, 0.0000001);
+  assert.equal(loadDesktopOptions(rootDir).usageBudgets.global.cacheWriteCostPerMillion, 0.0000001);
 });
 
 test("routerRuntimeEnv disables system proxy when desktop option is enabled", () => {
@@ -6391,6 +6476,18 @@ test("Codex app-server refresh keeps the last authoritative app snapshot when a 
   assert.equal(retained.snapshotSource, "last_authoritative_cache");
 });
 
+test("Codex app-server probe bounds stdout before line materialization and drains pipes", () => {
+  const source = fs.readFileSync(new URL("../desktop/codex-app-server-probe.mjs", import.meta.url), "utf8");
+  assert.match(source, /child\.stderr\.resume\(\)/u);
+  assert.match(source, /MAX_RESPONSE_LINE_BYTES/u);
+  assert.match(source, /createBoundedLineDecoder/u);
+  assert.doesNotMatch(source, /readline\.createInterface/u);
+  assert.match(source, /EXPECTED_RESPONSE_IDS\.has\(message\.id\)/u);
+  assert.match(source, /child\.once\("close"/u);
+  assert.match(source, /timeout:\s*5000/u);
+  assert.match(source, /app_server_exited/u);
+});
+
 test("ChatGPT Desktop plugin visibility policy follows the installed renderer selector", () => {
   const currentSelector = "function visible(plugin){return plugin.name !== `browser` && plugin.name !== 'legacy-lab'}";
   const futureSelector = "function visible(plugin){return Boolean(plugin && plugin.name)}";
@@ -9400,6 +9497,10 @@ test("GPT subscription and OpenAI presets omit GPT from display names without ch
     .map((model) => [model.presetId, model.displayName, model.model]);
 
   assert.deepEqual(official, [
+    ["codex-gpt-6-astra", "6-Astra", "gpt-6-astra"],
+    ["codex-gpt-6-1-sol", "6.1-Sol", "gpt-6.1-sol"],
+    ["codex-gpt-6-sol", "6-Sol", "gpt-6-sol"],
+    ["codex-gpt-6-luna", "6-Luna", "gpt-6-luna"],
     ["codex-gpt-5-6", "5.6（订阅兼容）", "gpt-5.6"],
     ["codex-gpt-5-6-sol", "5.6-Sol", "gpt-5.6-sol"],
     ["codex-gpt-5-6-terra", "5.6-Terra", "gpt-5.6-terra"],
@@ -9407,8 +9508,15 @@ test("GPT subscription and OpenAI presets omit GPT from display names without ch
     ["codex-gpt-5-5", "5.5", "gpt-5.5"],
     ["codex-gpt-5-4", "5.4", "gpt-5.4"],
     ["codex-gpt-5-4-mini", "5.4-Mini", "gpt-5.4-mini"],
+    ["openai-gpt-6-astra", "OpenAI 6-Astra", "gpt-6-astra"],
+    ["openai-gpt-6-1-sol", "OpenAI 6.1-Sol", "gpt-6.1-sol"],
+    ["openai-gpt-6-sol", "OpenAI 6-Sol", "gpt-6-sol"],
+    ["openai-gpt-6-luna", "OpenAI 6-Luna", "gpt-6-luna"],
     ["openai-gpt-4-1", "OpenAI 4.1", "gpt-4.1"],
     ["openai-gpt-4-1-mini", "OpenAI 4.1 Mini", "gpt-4.1-mini"],
+    ["openai-gpt-5-6-sol", "OpenAI 5.6-Sol", "gpt-5.6-sol"],
+    ["openai-gpt-5-6-terra", "OpenAI 5.6-Terra", "gpt-5.6-terra"],
+    ["openai-gpt-5-6-luna", "OpenAI 5.6-Luna", "gpt-5.6-luna"],
   ]);
 });
 
@@ -9437,7 +9545,7 @@ test("vision-capable presets advertise image input and text-only presets stay te
   assert.deepEqual(byId.get("minimax-m3")?.inputModalities, ["text", "image"]);
   assert.deepEqual(byId.get("qwen3-vl-plus")?.inputModalities, ["text", "image"]);
   assert.deepEqual(byId.get("glm-4-6v")?.inputModalities, ["text", "image"]);
-  assert.equal(byId.get("deepseek-v4-pro")?.inputModalities, undefined);
+  assert.deepEqual(byId.get("deepseek-v4-pro")?.inputModalities, ["text"]);
   assert.equal(byId.get("qwen3-coder-plus")?.inputModalities, undefined);
 });
 
@@ -9559,8 +9667,8 @@ test("buildRouterConfigFromSelection exposes selected models with independent Co
   ]);
   assert.equal(config.defaultModel, "cb-gpt-5-5");
   assert.equal(config.models[2].displayName, "DeepSeek V4 Pro");
-  assert.equal(config.models[2].api, "chat_completions");
-  assert.equal(config.models[2].supportsResponsePreviousId, undefined);
+  assert.equal(config.models[2].api, "responses");
+  assert.equal(config.models[2].supportsResponsePreviousId, false);
   assert.equal(config.models[3].api, "responses");
   assert.equal(config.models[3].supportsResponsePreviousId, false);
   assert.equal(config.models[3].supportsFiles, "text-placeholder");
@@ -9630,6 +9738,7 @@ test("buildRouterConfigFromSelection preserves native GPT speed tiers", () => {
 test("chat completion routes get a conservative default tool guard", () => {
   const rootDir = makeTempProject();
   saveSelection(rootDir, ["deepseek-v4-pro", "kimi-k2-7-code"], MODE_HYBRID);
+  saveModelCapabilityOverride(rootDir, "deepseek-v4-pro", { api: "chat_completions" });
 
   const config = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
 
@@ -9779,7 +9888,7 @@ test("all-api Codex-visible model catalog keeps provider display names", () => {
   const names = new Map(catalog.models.map((model) => [model.slug, model.display_name]));
 
   assert.match(written, new RegExp(`model_catalog_json = "${escapeRegExp(toFixtureTomlPath(catalogFile))}"`));
-  assert.equal(names.get("cb-openai-gpt-4-1"), "OpenAI 4.1");
+  assert.equal(names.get("cb-openai-gpt-5-6-sol"), "OpenAI 5.6-Sol");
   assert.equal(names.get("cb-deepseek-v4-pro"), "DeepSeek V4 Pro");
   assert.equal(names.get("cb-kimi-k2-7-code"), "Kimi K2.7 Code");
   assert.equal(catalog.models.some((model) => model.display_name === "自定义"), false);
@@ -9819,7 +9928,7 @@ test("Codex-visible model catalog keeps tool and MCP capability metadata in both
     assert.equal(first.codexbridge_capabilities.mcp_namespaces, "native");
     assert.equal(first.codexbridge_capabilities.matrix.version, "route-capability-matrix-v1");
     assert.equal(first.codexbridge_capabilities.summary.version, "route-capability-matrix-v1");
-    assert.equal(deepseek.supports_tools, "chat-functions");
+    assert.equal(deepseek.supports_tools, "native");
     assert.equal(deepseek.supports_mcp_namespaces, true);
     assert.equal(deepseek.codexbridge_capabilities.mcp_namespaces, "native");
     assert.equal(
@@ -9960,7 +10069,7 @@ test("preset image upload support can be overridden per model", () => {
   saveSelection(rootDir, ["deepseek-v4-pro"]);
 
   const defaultConfig = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
-  assert.equal(defaultConfig.models[0].inputModalities, undefined);
+  assert.deepEqual(defaultConfig.models[0].inputModalities, ["text"]);
 
   saveModelImageInputOverride(rootDir, "deepseek-v4-pro", true);
   const enabledConfig = buildRouterConfigFromSelection(rootDir, MODE_HYBRID);
@@ -10156,6 +10265,45 @@ test("custom capability providers can be saved and selected per ability", () => 
   const removed = removeCapabilityProvider(rootDir, "paddle-ocr");
   assert.equal(removed.defaults.ocr, undefined);
   assert.equal(capabilityProviderRegistry(rootDir).select("ocr"), null);
+});
+
+test("provider resource and timeout limits are clamped to desktop hard ceilings", () => {
+  const rootDir = makeTempProject();
+  saveCapabilityProvider(rootDir, {
+    id: "bounded-ocr",
+    name: "Bounded OCR",
+    capability: "ocr",
+    adapter: "generic_http",
+    baseUrl: "https://ocr.example.com/v1",
+    endpoint: "/ocr",
+    apiKeyEnv: "OCR_API_KEY",
+    maxResponseBytes: Number.MAX_SAFE_INTEGER,
+    requestTimeoutMs: Number.MAX_SAFE_INTEGER,
+    maxAssetBytes: Number.MAX_SAFE_INTEGER,
+    assetTimeoutMs: Number.MAX_SAFE_INTEGER,
+  });
+  saveImageProvider(rootDir, {
+    id: "bounded-image",
+    name: "Bounded Image",
+    adapter: "generic_template",
+    baseUrl: "https://images.example.com/v1",
+    endpoint: "/images/generations",
+    model: "image-v1",
+    apiKeyEnv: "IMAGE_API_KEY",
+    maxAssetBytes: Number.MAX_SAFE_INTEGER,
+    requestTimeoutMs: Number.MAX_SAFE_INTEGER,
+    assetTimeoutMs: Number.MAX_SAFE_INTEGER,
+  });
+
+  const capability = readCapabilityProviderConfig(rootDir).providers.find(({ id }) => id === "bounded-ocr");
+  const image = readImageProviderConfig(rootDir).providers.find(({ id }) => id === "bounded-image");
+  assert.equal(capability.maxResponseBytes, 64 * 1024 * 1024);
+  assert.equal(capability.requestTimeoutMs, 10 * 60_000);
+  assert.equal(capability.maxAssetBytes, 256 * 1024 * 1024);
+  assert.equal(capability.assetTimeoutMs, 30 * 60_000);
+  assert.equal(image.maxAssetBytes, 256 * 1024 * 1024);
+  assert.equal(image.requestTimeoutMs, 10 * 60_000);
+  assert.equal(image.assetTimeoutMs, 30 * 60_000);
 });
 
 test("capability provider connection test posts a generic HTTP health request and stores result", async () => {
@@ -10377,6 +10525,35 @@ test("capability provider connection diagnostics flag invalid JSON response form
   assert.match(result.checks.find((check) => check.id === "response_format").message, /JSON|格式/);
 });
 
+test("capability provider connection test stops a stalled request at its hard deadline", async () => {
+  const rootDir = makeTempProject();
+  saveCapabilityProvider(rootDir, {
+    id: "stalled-search",
+    name: "Stalled Search",
+    capability: "web_search",
+    adapter: "generic_http",
+    baseUrl: "https://search.example.com/v1",
+    endpoint: "/search",
+    apiKeyEnv: "STALLED_SEARCH_API_KEY",
+  });
+  saveSecrets(rootDir, { STALLED_SEARCH_API_KEY: "search-secret" });
+  let seenSignal = null;
+  const startedAt = Date.now();
+
+  const result = await testCapabilityProviderConnection(rootDir, "stalled-search", {
+    timeoutMs: 20,
+    fetchImpl: async (_url, init) => {
+      seenSignal = init.signal;
+      return new Promise(() => {});
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.match(result.message, /超时/);
+  assert.equal(seenSignal?.aborted, true);
+  assert.ok(Date.now() - startedAt < 500);
+});
+
 test("capability provider connection failures never reflect API keys or remote response bodies", async () => {
   const rootDir = makeTempProject();
   const secret = "opaque-capability-key-314159";
@@ -10585,6 +10762,44 @@ test("executeCapabilityProvider rejects oversized generic HTTP responses before 
   assert.equal(history[0].ok, false);
   assert.equal(history[0].errorCode, "provider_response_too_large");
   assert.equal(history[0].errorPhase, "execute");
+});
+
+test("executeCapabilityProvider stops a stalled generic request and records the timeout", async () => {
+  const rootDir = makeTempProject();
+  saveCapabilityProvider(rootDir, {
+    id: "stalled-ocr",
+    name: "Stalled OCR",
+    capability: "ocr",
+    adapter: "generic_http",
+    baseUrl: "https://ocr.example.com/v1",
+    endpoint: "/ocr",
+    apiKeyEnv: "STALLED_OCR_API_KEY",
+    makeDefault: true,
+  });
+  saveSecrets(rootDir, { STALLED_OCR_API_KEY: "ocr-secret" });
+  let seenSignal = null;
+  const startedAt = Date.now();
+
+  const result = await executeCapabilityProvider(rootDir, {
+    capability: "ocr",
+    input: { imageUrl: "https://example.com/stalled.png" },
+    requestId: "req_stalled_ocr",
+  }, {
+    timeoutMs: 20,
+    fetchImpl: async (_url, init) => {
+      seenSignal = init.signal;
+      return new Promise(() => {});
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "provider_request_timeout");
+  assert.equal(result.errorPhase, "execute");
+  assert.match(result.response.output_text, /请求超时|停止等待/);
+  assert.equal(seenSignal?.aborted, true);
+  assert.ok(Date.now() - startedAt < 500);
+  const history = readCapabilityExecutionHistory(rootDir);
+  assert.equal(history[0].errorCode, "provider_request_timeout");
 });
 
 test("executeCapabilityProvider includes provider default payload fields without overriding request fields", async () => {
@@ -11825,6 +12040,8 @@ test("image provider test settings include local output and history paths", () =
     size: "1024x1024",
     apiKeyEnv: "SILICONFLOW_API_KEY",
     apiKey: "typed-key",
+    maxAssetBytes: 5 * 1024 * 1024,
+    assetTimeoutMs: 45_000,
     defaults: {
       batch_size: 1,
     },
@@ -11834,6 +12051,8 @@ test("image provider test settings include local output and history paths", () =
   assert.equal(settings.providerId, "siliconflow-kolors");
   assert.equal(settings.displayName, "硅基流动 Kolors");
   assert.equal(settings.apiKey, "typed-key");
+  assert.equal(settings.maxAssetBytes, 5 * 1024 * 1024);
+  assert.equal(settings.assetTimeoutMs, 45_000);
   assert.equal(settings.outputDir, imageOutputDirPath(rootDir));
   assert.equal(settings.historyPath, imageGenerationHistoryPath(rootDir));
   assert.equal(settings.response.imageUrlPath, "images[0].url");
@@ -12064,6 +12283,129 @@ test("image provider test reports local image download failures in Chinese", asy
     assert.equal(history[0].ok, false);
     assert.match(history[0].errorMessage, /下载|保存/);
     assert.equal(history[0].errorPhase, "saveResult");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("image provider test cancels an oversized chunked image result at maxAssetBytes", async () => {
+  const { generateImageWithSettings } = await import("../src/image-generation.js");
+  const rootDir = makeTempProject();
+  const originalFetch = globalThis.fetch;
+  let pulls = 0;
+  let canceled = false;
+  let arrayBufferCalled = false;
+  const body = new ReadableStream({
+    pull(controller) {
+      pulls += 1;
+      if (pulls <= 5) {
+        controller.enqueue(new Uint8Array(800));
+      } else {
+        controller.close();
+      }
+    },
+    cancel() {
+      canceled = true;
+    },
+  });
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    headers: new Headers({ "content-type": "image/png" }),
+    body,
+    async arrayBuffer() {
+      arrayBufferCalled = true;
+      throw new Error("unbounded image arrayBuffer reader must not be called");
+    },
+  });
+
+  try {
+    const result = await generateImageWithSettings({
+      id: "chunked-image-test",
+      providerId: "chunked-image-test",
+      displayName: "Chunked Image Test",
+      enabled: true,
+      mode: "custom",
+      baseUrl: "https://images.example.com/v1",
+      endpoint: "/images/generations",
+      model: "image-url",
+      size: "1024x1024",
+      apiKeyEnv: "IMAGE_API_KEY",
+      apiKey: "typed-secret",
+      maxAssetBytes: 1024,
+      outputDir: imageOutputDirPath(rootDir),
+      historyPath: imageGenerationHistoryPath(rootDir),
+    }, "画一张分块返回的大图", {
+      route: {
+        id: "desktop-image-provider-test",
+        displayName: "图片供应商测试",
+      },
+      requestedModel: "image-provider-test",
+      sourceModel: "设置页测试",
+      captureErrors: true,
+      callJsonUpstream: async () => ({
+        data: [{ url: "https://cdn.example.com/chunked.png" }],
+      }),
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.error.code, "image_result_too_large");
+    assert.equal(result.errorPhase, "saveResult");
+    assert.match(result.response.output_text, /图片文件过大|maxAssetBytes/);
+    assert.equal(canceled, true);
+    assert.equal(arrayBufferCalled, false);
+    assert.ok(pulls < 6, `chunked image was read to completion (${pulls} pulls)`);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("image provider test stops a stalled image download at assetTimeoutMs", async () => {
+  const { generateImageWithSettings } = await import("../src/image-generation.js");
+  const rootDir = makeTempProject();
+  const originalFetch = globalThis.fetch;
+  let seenSignal = null;
+  globalThis.fetch = async (_url, init) => {
+    seenSignal = init.signal;
+    return new Promise(() => {});
+  };
+  const startedAt = Date.now();
+
+  try {
+    const result = await generateImageWithSettings({
+      id: "stalled-image-test",
+      providerId: "stalled-image-test",
+      displayName: "Stalled Image Test",
+      enabled: true,
+      mode: "custom",
+      baseUrl: "https://images.example.com/v1",
+      endpoint: "/images/generations",
+      model: "image-url",
+      size: "1024x1024",
+      apiKeyEnv: "IMAGE_API_KEY",
+      apiKey: "typed-secret",
+      assetTimeoutMs: 20,
+      outputDir: imageOutputDirPath(rootDir),
+      historyPath: imageGenerationHistoryPath(rootDir),
+    }, "画一张下载会卡住的图", {
+      route: {
+        id: "desktop-image-provider-test",
+        displayName: "图片供应商测试",
+      },
+      requestedModel: "image-provider-test",
+      sourceModel: "设置页测试",
+      captureErrors: true,
+      callJsonUpstream: async () => ({
+        data: [{ url: "https://cdn.example.com/stalled.png" }],
+      }),
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.error.code, "image_result_timeout");
+    assert.equal(result.errorPhase, "saveResult");
+    assert.match(result.response.output_text, /下载超时/);
+    assert.equal(seenSignal?.aborted, true);
+    assert.ok(Date.now() - startedAt < 500);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -12637,6 +12979,29 @@ test("provider model directory refresh classifies fetch failures and preserves c
   assert.match(result.error, /provider_models_connect_timeout/);
   assert.doesNotMatch(result.error, /private upstream details|fetch failed/);
   assert.ok(result.error.length <= 240);
+});
+
+test("provider model directory refresh cancels an HTTP error body", async () => {
+  const rootDir = makeTempProject();
+  saveSecrets(rootDir, { DEEPSEEK_API_KEY: "deepseek-secret" });
+  let canceled = false;
+  const result = await refreshProviderModelDirectory(rootDir, "deepseek", {
+    fetchImpl: async () => ({
+      ok: false,
+      status: 503,
+      headers: new Headers(),
+      body: {
+        cancel() {
+          canceled = true;
+          return Promise.resolve();
+        },
+      },
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(result.ok, false);
+  assert.equal(canceled, true);
 });
 
 test("provider model directory refresh rejects oversized responses before reading the body", async () => {
@@ -13329,10 +13694,10 @@ test("provider overrides cannot replace built-in per-model API contracts", () =>
   assert.equal(provider.api, "chat_completions");
   assert.equal(pro.baseUrl, "https://proxy.example.com/v1");
   assert.equal(flash.baseUrl, "https://proxy.example.com/v1");
-  assert.equal(pro.api, "chat_completions");
+  assert.equal(pro.api, "responses");
   assert.equal(flash.api, "responses");
   assert.equal(config.models[0].baseUrl, "https://proxy.example.com/v1");
-  assert.equal(config.models[0].api, "chat_completions");
+  assert.equal(config.models[0].api, "responses");
   assert.equal(config.models[1].api, "responses");
 });
 
@@ -13428,16 +13793,16 @@ test("provider logo candidate detects a source path swap while reading", () => {
   const source = path.join(rootDir, "source-logo.png");
   const moved = path.join(rootDir, "source-logo-original.png");
   fs.writeFileSync(source, "trusted-logo-bytes", "utf8");
-  const originalReadFileSync = fs.readFileSync;
+  const originalReadSync = fs.readSync;
   let swapped = false;
 
-  fs.readFileSync = function patchedReadFileSync(file, ...args) {
+  fs.readSync = function patchedReadSync(file, ...args) {
     if (!swapped && typeof file === "number") {
       swapped = true;
       fs.renameSync(source, moved);
       fs.writeFileSync(source, "attacker-replacement-bytes", "utf8");
     }
-    return originalReadFileSync.call(this, file, ...args);
+    return originalReadSync.call(this, file, ...args);
   };
   try {
     assert.throws(
@@ -13446,7 +13811,7 @@ test("provider logo candidate detects a source path swap while reading", () => {
     );
     assert.equal(swapped, true);
   } finally {
-    fs.readFileSync = originalReadFileSync;
+    fs.readSync = originalReadSync;
   }
 });
 
@@ -13520,6 +13885,27 @@ test("provider connection test can use a typed unsaved API key", async () => {
   assert.equal(result.ok, true);
   assert.equal(result.providerId, "deepseek");
   assert.equal(result.status, 200);
+});
+
+test("provider connection test stops a stalled model-list request at its hard deadline", async () => {
+  const rootDir = makeTempProject();
+  let seenSignal = null;
+  const startedAt = Date.now();
+  const result = await testProviderConnection(rootDir, {
+    providerId: "deepseek",
+    apiKey: "typed-secret",
+  }, {
+    timeoutMs: 20,
+    fetchImpl: async (_url, init) => {
+      seenSignal = init.signal;
+      return new Promise(() => {});
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.match(result.message, /超时/);
+  assert.equal(seenSignal?.aborted, true);
+  assert.ok(Date.now() - startedAt < 500);
 });
 
 test("Claude, Grok, and Gemini are independent built-in providers", () => {
@@ -13821,7 +14207,7 @@ test("manual capability overrides apply to one route without changing route-spec
   assert.equal(config.models[0].contextWindow, 123456);
   assert.equal(config.models[0].api, "responses");
   assert.equal(config.models[0].capabilityOverrides.reasoning.mode, "unknown");
-  assert.deepEqual(config.models[0].dropParams, ["response_format", "parallel_tool_calls"]);
+  assert.equal(config.models[0].dropParams, undefined);
   assert.equal(config.models[1].sourcePresetId, "kimi-k2-7-code");
   assert.equal(config.models[1].contextWindow, 258400);
 });
@@ -14686,9 +15072,9 @@ test("prepareRouterStartConfig refreshes stale Codex local endpoint before route
   const written = fs.readFileSync(target, "utf8");
   assert.equal(result.config.defaultModel, "cb-gpt-5-5");
   const deepseek = result.config.models.find((model) => model.id === "cb-deepseek-v4-pro");
-  assert.equal(deepseek.api, "chat_completions");
+  assert.equal(deepseek.api, "responses");
   assert.equal(deepseek.baseUrl, "https://api.deepseek.com/v1");
-  assert.equal(deepseek.supportsResponsePreviousId, undefined);
+  assert.equal(deepseek.supportsResponsePreviousId, false);
   const flash = result.config.models.find((model) => model.id === "cb-deepseek-v4-flash");
   assert.equal(flash.api, "responses");
   assert.equal(flash.baseUrl, "https://api.deepseek.com/v1");

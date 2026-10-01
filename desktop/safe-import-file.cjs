@@ -11,14 +11,14 @@ function readBoundedRegularUtf8File(filePath, {
     throw new TypeError("Import byte limit must be a positive integer.");
   }
 
-  const checked = fsImpl.lstatSync(filePath);
+  const checked = fsImpl.lstatSync(filePath, { bigint: true });
   assertSingleLinkRegularFile(checked);
   assertBoundedSize(checked.size, limit);
 
   let descriptor = null;
   try {
     descriptor = fsImpl.openSync(filePath, "r");
-    const opened = fsImpl.fstatSync(descriptor);
+    const opened = fsImpl.fstatSync(descriptor, { bigint: true });
     assertSingleLinkRegularFile(opened);
     assertSameIdentity(checked, opened);
     assertBoundedSize(opened.size, limit);
@@ -43,7 +43,7 @@ function readBoundedRegularUtf8File(filePath, {
       offset += bytesRead;
     }
 
-    const afterRead = fsImpl.fstatSync(descriptor);
+    const afterRead = fsImpl.fstatSync(descriptor, { bigint: true });
     assertSingleLinkRegularFile(afterRead);
     assertSameIdentity(opened, afterRead);
     if (Number(afterRead.size) !== byteLength) {

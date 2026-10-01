@@ -8,7 +8,7 @@ export const BRIDGE_RULES_VERSION = "2026-07-01-auto-delegate-v3";
 export const CODEX_DELEGATION_FILE = "AGENTS.md";
 export const CODEX_DELEGATION_BEGIN = "<!-- BEGIN CODEXBRIDGE CODEX DELEGATION -->";
 export const CODEX_DELEGATION_END = "<!-- END CODEXBRIDGE CODEX DELEGATION -->";
-export const CODEX_DELEGATION_VERSION = "2026-08-02-per-call-thread-v3";
+export const CODEX_DELEGATION_VERSION = "2026-09-23-project-task-context-v4";
 
 export function bridgeRulesPathForTarget(targetRepo) {
   return path.join(path.resolve(targetRepo), BRIDGE_RULES_FILE);
@@ -24,6 +24,43 @@ export function hasBridgeRoutingMarker(text = "") {
 
 export function hasCodexDelegationMarker(text = "") {
   return text.includes(CODEX_DELEGATION_BEGIN) && text.includes(CODEX_DELEGATION_END);
+}
+
+function managedBlock(text, begin, end) {
+  const start = text.indexOf(begin);
+  const finish = text.indexOf(end, start);
+  return start >= 0 && finish >= start ? text.slice(start, finish + end.length).replace(/\r\n/g, "\n") : null;
+}
+
+// Read actual per-project files, not the metadata of whichever room was last
+// selected globally. Status polling must never rewrite a binding or rule file.
+export async function readProjectRoutingRuleStatus(input = {}) {
+  const status = { bridgeRulesPath: null, codexDelegationPath: null };
+  if (!input.targetRepo) return status;
+  async function readManaged(file, begin, end) {
+    try { return managedBlock(await readFile(file, "utf8"), begin, end); }
+    catch (error) {
+      if (["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(error.code)) return null;
+      throw error;
+    }
+  }
+  const rulesPath = bridgeRulesPathForTarget(input.targetRepo);
+  const agentsPath = codexDelegationPathForTarget(input.targetRepo);
+  const [rules, agents] = await Promise.all([
+    readManaged(rulesPath, BRIDGE_RULES_BEGIN, BRIDGE_RULES_END),
+    readManaged(agentsPath, CODEX_DELEGATION_BEGIN, CODEX_DELEGATION_END)
+  ]);
+  if (rules === buildBridgeRoutingRules(input)) status.bridgeRulesPath = rulesPath;
+  const projectId = input.projectId || input.id;
+  const required = [
+    `- Version: ${CODEX_DELEGATION_VERSION}`,
+    projectId && `- Bridge project: ${projectId}`,
+    input.conversationId && `- Bridge conversation: ${input.conversationId}`,
+    input.chatgptProjectUrl && `- Bound GPT session: ${input.chatgptProjectUrl}`,
+    `- Bound local project root: ${path.resolve(input.targetRepo)}`
+  ].filter(Boolean);
+  if (agents && required.every(line => agents.split("\n").includes(line))) status.codexDelegationPath = agentsPath;
+  return status;
 }
 
 function replaceMarkedBlock(existing, beginMarker, endMarker, block) {
@@ -85,20 +122,19 @@ export function buildCodexDelegationInstructions({
   const bridgeProjectLine = projectId ? `- Bridge project: ${projectId}` : null;
   const projectLine = chatgptProjectUrl ? `- Bound GPT session: ${chatgptProjectUrl}` : null;
   const conversationLine = conversationId ? `- Bridge conversation: ${conversationId}` : null;
-  const threadLine = currentCodexThreadId
-    ? `- Bound Codex thread: ${currentCodexThreadId}`
-    : null;
   const targetLine = targetRepo ? `- Bound local project root: ${path.resolve(targetRepo)}` : null;
   const hasExactRouterScope = Boolean(projectId && conversationId && currentCodexThreadId);
   const scopeLine = hasExactRouterScope
-    ? `- Required MCP scope for Router V2: include \`projectId: "${projectId}"\`, \`conversationId: "${conversationId}"\`, and \`currentCodexThreadId: "${currentCodexThreadId}"\` in every Router call.`
+    ? `- Required MCP scope for Router V2: include \`projectId: "${projectId}"\`, \`conversationId: "${conversationId}"\`, and the calling task's real CODEX_THREAD_ID as currentCodexThreadId. Never copy a thread ID from another task or from the HTTP service.`
+    : projectId && conversationId
+      ? `- Required MCP scope for Router V2: include \`projectId: "${projectId}"\`, \`conversationId: "${conversationId}"\`, and the calling task's real CODEX_THREAD_ID as currentCodexThreadId. Never substitute the HTTP service's startup thread ID.`
     : conversationId
       ? `- Required MCP scope: include \`conversationId: "${conversationId}"\` in every legacy Bridge MCP call for this project; Router V2 additionally requires the bound projectId and currentCodexThreadId.`
       : "- Required MCP scope: use the exact bound project, conversation, and Codex thread; Router V2 requires `projectId`, `conversationId`, and `currentCodexThreadId`.";
   const scopeCallText = hasExactRouterScope
     ? "the exact `projectId`, `conversationId`, and `currentCodexThreadId`"
     : "the exact bound scope (`projectId`, `conversationId`, and `currentCodexThreadId` are required by Router V2)";
-  const contextLines = [bridgeProjectLine, projectLine, conversationLine, threadLine, targetLine].filter(Boolean);
+  const contextLines = [bridgeProjectLine, projectLine, conversationLine, targetLine].filter(Boolean);
 
   return [
     CODEX_DELEGATION_BEGIN,
@@ -110,6 +146,7 @@ export function buildCodexDelegationInstructions({
     "",
     ...(contextLines.length > 0 ? ["### Binding", "", ...contextLines, scopeLine, ""] : []),
     "### Activation scope",
+    "- The project binding can be reused by different Codex tasks working in this same local project directory. Always send your own CODEX_THREAD_ID; do not ask the user to rebind merely because the task changed. Router runs keep their original caller identity.",
     "- These rules apply only inside this bound local project and the bound Bridge conversation above.",
     "- Do not use Bridge from any other Codex project or conversation, even if another Bridge room is active globally.",
     "- Never route an unrelated project through the active Bridge room. If the current Codex project is not this bound project, ignore this block and handle normally in Codex.",
@@ -196,13 +233,7 @@ export async function ensureBridgeRoutingRules(input = {}) {
   try {
     const existing = await readFile(rulesPath, "utf8");
     if (hasBridgeRoutingMarker(existing)) {
-      if (
-        markedBlockNeedsRefresh(existing, [
-          BRIDGE_RULES_VERSION,
-          "Codex 默认只做整理、落地和低成本验收",
-          "不要编造 GPT 结果"
-        ])
-      ) {
+      if (managedBlock(existing, BRIDGE_RULES_BEGIN, BRIDGE_RULES_END) !== block) {
         const refreshed = replaceMarkedBlock(existing, BRIDGE_RULES_BEGIN, BRIDGE_RULES_END, block);
         await writeFile(rulesPath, refreshed, "utf8");
         return {
@@ -297,12 +328,7 @@ export async function ensureCodexDelegationInstructions(input = {}) {
     requiredDelegationSnippets.push(`Bridge conversation: ${input.conversationId}`);
     requiredDelegationSnippets.push(`conversationId: "${input.conversationId}"`);
   }
-  if (input.currentCodexThreadId) {
-    requiredDelegationSnippets.push(`Bound Codex thread: ${input.currentCodexThreadId}`);
-    requiredDelegationSnippets.push(
-      `currentCodexThreadId: "${input.currentCodexThreadId}"`
-    );
-  }
+  requiredDelegationSnippets.push("Always send your own CODEX_THREAD_ID");
   if (input.targetRepo) {
     requiredDelegationSnippets.push(`Bound local project root: ${path.resolve(input.targetRepo)}`);
   }

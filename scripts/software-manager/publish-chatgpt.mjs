@@ -9,8 +9,11 @@ import { promisify } from "node:util";
 import { compareVersions } from "../../shared/software-manager/catalog-schema.mjs";
 import { replaceCatalogEntry, readCurrentCatalog, replaceSignedCatalog } from "./catalog-builder.mjs";
 import { createDogeCloudArtifactPublisher } from "./dogecloud-artifact-publisher.mjs";
+import { createGreenCodexDirectory, verifyGreenCodexDirectory } from "./chatgpt-green-converter.mjs";
+import { hashPackageTree } from "./chatgpt-green-metadata.mjs";
 import { inspectPackageTree, writeImmutableStoredZip } from "./package-inspector.mjs";
 import { loadPublisherConfig } from "./publisher-config.mjs";
+import { removeOwnedTemporaryDirectory } from "../smoke-temp-cleanup.mjs";
 
 const execFileAsync = promisify(execFile);
 const VERSION = /^\d+(?:\.\d+){0,3}$/u;
@@ -55,6 +58,102 @@ function sha256File(filePath) {
   return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
 }
 
+function exists(filePath) {
+  try { fs.lstatSync(filePath); return true; } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function readSmokeReport(reportPath, built) {
+  if (!reportPath) throw publishError("publisher_green_smoke_required");
+  const target = exactInput(reportPath);
+  let stat;
+  try { stat = fs.lstatSync(target); } catch (error) { throw publishError("publisher_green_smoke_required", error); }
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 1 || stat.size > 256 * 1024) {
+    throw publishError("publisher_green_smoke_invalid");
+  }
+  let value;
+  try { value = JSON.parse(fs.readFileSync(target, "utf8")); }
+  catch (error) { throw publishError("publisher_green_smoke_invalid", error); }
+  const expectedKeys = [
+    "schemaVersion", "ok", "checkedAt", "officialVersion", "contentTreeSha256",
+    "shellTemplateSha256", "processEvidence", "pageEvidence", "cleanupEvidence",
+  ];
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || Object.keys(value).sort().join("\0") !== expectedKeys.sort().join("\0")
+    || value.schemaVersion !== 1 || value.ok !== true || !Number.isFinite(Date.parse(value.checkedAt ?? ""))
+    || value.officialVersion !== built.officialVersion
+    || value.contentTreeSha256 !== built.contentTreeSha256
+    || value.shellTemplateSha256 !== built.owlTemplateSha256
+    || value.cleanupEvidence?.processTreeExited !== true
+    || value.cleanupEvidence?.userDataRemoved !== true) {
+    throw publishError("publisher_green_smoke_mismatch");
+  }
+  return value;
+}
+
+async function prepareChatGPTSource({
+  source, runtimeTemplatePath, verifyAuthenticode, version, versionInspector, workRoot,
+}) {
+  const markerPath = path.join(source, ".codexbridge-green-codex.json");
+  if (exists(markerPath)) {
+    const built = await verifyGreenCodexDirectory({ inputPath: source });
+    if (version && version !== built.officialVersion) throw publishError("publisher_chatgpt_version_invalid");
+    return Object.freeze({ root: source, built, version: built.officialVersion, modern: true, converted: false });
+  }
+  if (exists(path.join(source, "AppxManifest.xml"))) {
+    if (!runtimeTemplatePath) throw publishError("publisher_green_template_required");
+    const workingDirectory = exactInput(workRoot);
+    fs.mkdirSync(workingDirectory, { recursive: true });
+    const workStat = fs.lstatSync(workingDirectory);
+    if (!workStat.isDirectory() || workStat.isSymbolicLink()) {
+      throw publishError("publisher_green_work_root_invalid");
+    }
+    const temporaryRoot = path.join(workingDirectory, `.codex-green-publish-${crypto.randomUUID()}`);
+    const built = await createGreenCodexDirectory({
+      inputPath: source,
+      runtimeTemplatePath: exactInput(runtimeTemplatePath),
+      outputPath: temporaryRoot,
+      verifyAuthenticode,
+    });
+    if (version && version !== built.officialVersion) {
+      removeOwnedTemporaryDirectory(temporaryRoot, {
+        parentDirectory: workingDirectory, requiredPrefix: ".codex-green-publish-",
+      });
+      throw publishError("publisher_chatgpt_version_invalid");
+    }
+    return Object.freeze({
+      root: temporaryRoot,
+      workRoot: workingDirectory,
+      built,
+      version: built.officialVersion,
+      modern: true,
+      converted: true,
+    });
+  }
+
+  const tree = inspectPackageTree(source);
+  if (!tree.files.includes("ChatGPT.exe")) throw publishError("publisher_chatgpt_entrypoint_missing");
+  const inspectedVersion = String(await versionInspector(path.join(source, "ChatGPT.exe"))).trim();
+  const selectedVersion = String(version || inspectedVersion).trim();
+  if (!VERSION.test(selectedVersion) || inspectedVersion !== selectedVersion) {
+    throw publishError("publisher_chatgpt_version_invalid");
+  }
+  return Object.freeze({
+    root: source,
+    tree,
+    version: selectedVersion,
+    modern: false,
+    converted: false,
+    built: Object.freeze({
+      officialVersion: selectedVersion,
+      contentTreeSha256: hashPackageTree(source),
+      owlTemplateSha256: sha256File(path.join(source, "ChatGPT.exe")),
+    }),
+  });
+}
+
 function packageVersion(name) {
   const match = /^chatgpt-(\d+(?:\.\d+){0,3})-x64\.zip$/u.exec(name);
   return match?.[1] || null;
@@ -77,51 +176,71 @@ export async function publishChatGPT({
   version = "",
   publishedAt = new Date().toISOString(),
   versionInspector = defaultVersionInspector,
+  runtimeTemplatePath = "",
+  smokeReportPath = "",
+  verifyAuthenticode,
+  workRoot = "",
   artifactPublisher = null,
 } = {}) {
   const source = exactInput(inputPath);
-  const tree = inspectPackageTree(source);
-  if (!tree.files.includes("ChatGPT.exe")) throw publishError("publisher_chatgpt_entrypoint_missing");
-  const inspectedVersion = String(await versionInspector(path.join(source, "ChatGPT.exe"))).trim();
-  const selectedVersion = String(version || inspectedVersion).trim();
-  if (!VERSION.test(selectedVersion) || inspectedVersion !== selectedVersion) {
-    throw publishError("publisher_chatgpt_version_invalid");
-  }
   if (!validPublishedAt(publishedAt)) throw publishError("publisher_published_at_invalid");
-  const packageDirectory = path.join(config.publicRoot, "packages");
-  const packageName = `chatgpt-${selectedVersion}-x64.zip`;
-  const packagePath = path.join(packageDirectory, packageName);
-  await writeImmutableStoredZip({ tree, destination: packagePath });
-  const size = fs.statSync(packagePath).size;
-  const sha256 = sha256File(packagePath);
-  const events = ["package_verified"];
-  const stored = await (artifactPublisher ?? createDogeCloudArtifactPublisher({
-    packageBaseUrl: config.packageBaseUrl,
-  })).publish({
-    sourcePath: packagePath,
-    relativePath: packageName,
-    expectedSize: size,
-    expectedSha256: sha256,
+  const prepared = await prepareChatGPTSource({
+    source,
+    runtimeTemplatePath,
+    verifyAuthenticode,
+    version,
+    versionInspector,
+    workRoot: workRoot ? exactInput(workRoot) : path.join(config.publicRoot, ".green-work"),
   });
-  if (stored.action !== "local") events.push("object_verified");
-  const current = readCurrentCatalog(config.publicRoot, { signingKeyFile: config.signingKeyFile });
-  const previousName = path.basename(current.components.find((item) => item.id === "chatgpt")?.assetUrl || "");
-  const component = {
-    id: "chatgpt",
-    name: "ChatGPT",
-    version: selectedVersion,
-    architecture: "x64",
-    format: "zip",
-    assetUrl: stored.url,
-    size,
-    sha256,
-    entrypoint: "ChatGPT.exe",
-    requiredFiles: [...tree.files],
-    maxRelativePathLength: tree.maxRelativePathLength,
-    publishedAt: new Date(publishedAt).toISOString(),
-    supportsRollback: true,
-  };
+  let packagePath = "";
+  let packageCreated = false;
   try {
+    const events = [];
+    if (prepared.converted) events.push("green_converted");
+    if (prepared.modern) {
+      events.push("green_verified");
+      readSmokeReport(smokeReportPath, prepared.built);
+      events.push("green_smoke_verified");
+    }
+    const tree = prepared.tree ?? inspectPackageTree(prepared.root);
+    const packageDirectory = path.join(config.publicRoot, "packages");
+    const packageName = `chatgpt-${prepared.version}-x64.zip`;
+    packagePath = path.join(packageDirectory, packageName);
+    await writeImmutableStoredZip({ tree, destination: packagePath });
+    packageCreated = true;
+    const size = fs.statSync(packagePath).size;
+    const sha256 = sha256File(packagePath);
+    events.push("package_verified");
+    const stored = await (artifactPublisher ?? createDogeCloudArtifactPublisher({
+      packageBaseUrl: config.packageBaseUrl,
+    })).publish({
+      sourcePath: packagePath,
+      relativePath: packageName,
+      expectedSize: size,
+      expectedSha256: sha256,
+    });
+    if (!stored || stored.size !== size || stored.sha256 !== sha256
+      || typeof stored.url !== "string" || !stored.url) {
+      throw publishError("publisher_object_verification_failed");
+    }
+    if (prepared.modern || stored.action !== "local") events.push("object_verified");
+    const current = readCurrentCatalog(config.publicRoot, { signingKeyFile: config.signingKeyFile });
+    const previousName = path.basename(current.components.find((item) => item.id === "chatgpt")?.assetUrl || "");
+    const component = {
+      id: "chatgpt",
+      name: "ChatGPT",
+      version: prepared.version,
+      architecture: "x64",
+      format: "zip",
+      assetUrl: stored.url,
+      size,
+      sha256,
+      entrypoint: "ChatGPT.exe",
+      requiredFiles: [...tree.files],
+      maxRelativePathLength: tree.maxRelativePathLength,
+      publishedAt: new Date(publishedAt).toISOString(),
+      supportsRollback: true,
+    };
     const result = await replaceSignedCatalog({
       config,
       catalog: replaceCatalogEntry(current, { component }),
@@ -130,10 +249,16 @@ export async function publishChatGPT({
     await retainChatGPTPackages(packageDirectory, [packageName, previousName]);
     return Object.freeze({ ...result, packagePath, component: Object.freeze(component) });
   } catch (error) {
-    await fsPromises.unlink(packagePath).catch((failure) => {
+    if (packageCreated) await fsPromises.unlink(packagePath).catch((failure) => {
       if (failure?.code !== "ENOENT") throw failure;
     });
     throw error;
+  } finally {
+    if (prepared.converted && exists(prepared.root)) {
+      removeOwnedTemporaryDirectory(prepared.root, {
+        parentDirectory: prepared.workRoot, requiredPrefix: ".codex-green-publish-",
+      });
+    }
   }
 }
 
@@ -142,6 +267,8 @@ function args(values) {
   for (let index = 0; index < values.length; index += 1) {
     if (values[index] === "--input") result.inputPath = values[++index];
     else if (values[index] === "--version") result.version = values[++index];
+    else if (values[index] === "--runtime-template") result.runtimeTemplatePath = values[++index];
+    else if (values[index] === "--smoke-report") result.smokeReportPath = values[++index];
     else if (values[index] === "--published-at") result.publishedAt = values[++index];
     else throw publishError("publisher_argument_invalid");
   }

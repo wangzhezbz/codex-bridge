@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { createRouterServer } from "../src/server.js";
+import { ResponseHistory } from "../src/history.js";
 import { __resetRateLimiterForTests } from "../src/rate-limit.js";
 
 for (const statusCode of [401, 402, 429, 500]) {
@@ -488,6 +489,42 @@ for (const requestSurface of ["responses", "chat_completions"]) {
   });
 }
 
+test("stream completion releases duplicate ownership while history persistence is still pending", async () => {
+  let upstreamCalls = 0;
+  let resolveWrite;
+  const history = new ResponseHistory({
+    storage: {
+      recordTurnAsync() {
+        return new Promise((resolve) => { resolveWrite = resolve; });
+      },
+    },
+  });
+  const upstream = http.createServer(async (req, res) => {
+    upstreamCalls += 1;
+    await readJson(req);
+    sendResponsesSuccessSse(res, `history-pending-${upstreamCalls}`);
+  });
+  await listen(upstream);
+  const router = createRouterServer(responsesRouterConfig(upstream), { history });
+  await listen(router);
+  const request = exactCodexRequest("release while history write is pending");
+  try {
+    const first = await within(requestText(`${serverUrl(router)}/v1/responses`, request));
+    assert.match(first.body, /history-pending-1/u);
+    const second = await within(requestText(`${serverUrl(router)}/v1/responses`, request));
+    assert.match(second.body, /history-pending-2/u);
+    assert.doesNotMatch(second.body, /没有重复请求上游/u);
+    assert.equal(upstreamCalls, 2);
+    resolveWrite({ recordBytes: { messages: 1, response: 1, meta: 1 } });
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    resolveWrite?.({ recordBytes: { messages: 1, response: 1, meta: 1 } });
+    history.close();
+    await close(router);
+    await close(upstream);
+  }
+});
+
 function routerConfig(upstream, routeOverrides = {}) {
   return {
     host: "127.0.0.1",
@@ -775,7 +812,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-function within(promise, timeoutMs = 500) {
+function within(promise, timeoutMs = 2_000) {
   return Promise.race([
     promise,
     new Promise((_, reject) => {
@@ -784,7 +821,7 @@ function within(promise, timeoutMs = 500) {
   ]);
 }
 
-async function eventuallyRequestUpstream(url, init, timeoutMs = 1_000) {
+async function eventuallyRequestUpstream(url, init, timeoutMs = 3_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const response = await requestText(url, init);

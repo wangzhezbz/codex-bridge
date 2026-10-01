@@ -1,4 +1,5 @@
 import { authModeForRoute, requireApiKey } from "./config.js";
+import { normalizeAdapterProfile } from "./adapter-profile.js";
 
 const CODEX_EXACT_PASSTHROUGH_HEADERS = [
   "user-agent",
@@ -62,7 +63,7 @@ export function upstreamHeaders(route, context = {}, options = {}) {
     ? route.headers
     : {};
   for (const [name, value] of Object.entries(customHeaders)) {
-    const key = String(name || "").trim();
+    const key = String(name || "").trim().toLowerCase();
     const valueText = String(value ?? "").trim();
     if (!key || !valueText || blockedCustomUpstreamHeader(key)) {
       continue;
@@ -86,6 +87,11 @@ export function upstreamHeaders(route, context = {}, options = {}) {
         chatgptAccountIdFromBearerToken(context.clientAuth?.bearerToken),
       );
     }
+  } else if (route.api === "responses" && normalizeAdapterProfile(route).providerFamily === "openai") {
+    // Beta feature negotiation belongs to the request. Do not forward the
+    // client's subscription credentials, account or organization to API routes.
+    const beta = headerValue(context.clientHeaders, "openai-beta");
+    if (beta && !headerValue(headers, "openai-beta")) headers["openai-beta"] = beta;
   }
 
   return headers;

@@ -1,33 +1,17 @@
 (function attachSoftwareManagerUi(global) {
   "use strict";
 
-  const COMPONENT_ORDER = ["chatgpt", "v2rayn", "git"];
+  const COMPONENT_ORDER = ["chatgpt"];
+  const MAX_RENDERED_TASK_LOG_LINES = 120;
   const TAB_LABELS = Object.freeze({
     install: "下载安装",
     update: "检查更新",
     uninstall: "卸载软件",
     rollback: "回滚",
   });
-  const REGISTER_URL = "https://w1.soxo.top/auth/register?code=2aEq";
-  const HIDDEN_LEGACY_SKILL_IDS = new Set([
-    "brainstorming", "executing-plans", "finishing-a-development-branch", "hyperframes", "pdf",
-    "playwright", "playwright-interactive", "ppt-master", "receiving-code-review", "remotion",
-    "requesting-code-review", "systematic-debugging", "test-driven-development", "using-git-worktrees",
-    "using-superpowers", "verification-before-completion", "writing-plans",
-  ]);
-  const CURATED_SKILL_DESCRIPTIONS = Object.freeze({
-    pua: "帮助推进任务、减少拖延。",
-    "frontend-design": "帮助设计和优化前端界面。",
-    "taste-skill": "帮助提升网页的视觉品质。",
-    "humanizer-zh": "帮助减少中文内容的 AI 写作痕迹。",
-    "agent-reach": "帮助跨网页、社交和视频平台检索信息。",
-    "video-use": "帮助完成视频检索、转写、剪辑和渲染。",
-    "seedance-prompt-zh": "帮助编写 Seedance 2.0 中文视频提示词。",
-    "claude-mem": "为 Codex 增加跨会话记忆能力。",
-    cowart: "为 Codex 增加图像生成和画布创作能力。",
-  });
   const STATUS_LABELS = Object.freeze({ succeeded: "成功", partial: "部分失败", failed: "失败", cancelled: "已取消", skipped: "已跳过" });
   const PHASE_LABELS = Object.freeze({
+    starting: "正在启动",
     prepare: "准备文件", download: "下载安装包", "verify-download": "校验安装包", extract: "解压安装文件",
     inspect: "检查本机状态", commit: "应用更改",
     verify: "验证安装结果", uninstall: "卸载软件", rollback: "恢复上一版本", plugin: "处理完整插件", cancelling: "正在取消", finishing: "正在完成",
@@ -50,6 +34,25 @@
     software_manager_task_failed: "软件管理任务失败",
     software_manager_task_cancelled: "软件管理任务已取消",
   });
+  const RESULT_REASON_LABELS = Object.freeze({
+    rollback_slot_missing: "上一版本备份目录缺失，无法回滚；当前安装不会被删除，请重新安装或更新",
+    rollback_not_available: "没有可恢复的上一版本，请重新安装或更新",
+    slot_rollback_ownership_mismatch: "上一版本备份与安装记录不一致，已停止回滚以保留当前安装",
+    slot_ownership_mismatch: "当前程序与安装记录不一致，已停止回滚以保留文件",
+    component_disk_space_insufficient: "安装磁盘空间不足，请更换安装位置或释放空间后重试",
+    ENOSPC: "磁盘空间已用尽，请释放空间后重试",
+    download_request_timeout: "连接下载服务器超时，请检查网络后重试",
+    download_stalled: "下载长时间没有收到新数据，已安全停止并保留断点",
+    download_timeout: "下载总时长超过安全上限，已停止本次任务",
+    authenticode_query_failed: "安装程序签名校验超时或失败",
+    process_list_failed: "读取本机进程状态失败",
+    git_registry_query_failed: "读取 Git 安装信息失败",
+    git_path_query_failed: "检查 Git 命令位置失败",
+    software_manager_blocked_by_plugin_failure: "完整插件未能卸载，为保留清理入口，本次没有卸载 ChatGPT",
+    curated_plugin_requires_chatgpt_install: "ChatGPT 安装失败，无法继续安装完整插件",
+    curated_plugin_task_result_invalid: "完整插件返回了无效结果，已停止后续关联操作",
+    software_manager_cancelled: "任务已取消",
+  });
 
   function escapeHtml(value) {
     return String(value ?? "")
@@ -64,15 +67,7 @@
     return [...new Set((Array.isArray(values) ? values : []).filter((value) => typeof value === "string"))];
   }
 
-  function conciseSkillDescription(item) {
-    return CURATED_SKILL_DESCRIPTIONS[item?.id] || String(item?.description || "").trim();
-  }
 
-  function catalogSkills(snapshot) {
-    return (Array.isArray(snapshot?.catalog?.skills) ? snapshot.catalog.skills : [])
-      .filter((item) => !HIDDEN_LEGACY_SKILL_IDS.has(item?.id))
-      .map((item) => ({ ...item, description: conciseSkillDescription(item) }));
-  }
 
   function formatBytes(value) {
     const bytes = Number(value);
@@ -84,13 +79,20 @@
     return `${amount.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
   }
 
-  function taskResultFeedback(result) {
-    if (result?.status === "partial") return Object.freeze({ message: "部分项目处理失败，请查看任务报告。", tone: "error" });
-    if (result?.status === "failed") return Object.freeze({ message: "软件管理任务失败，请查看任务报告。", tone: "error" });
+  function taskResultFeedback(result, state = {}) {
+    const copyText = buildTaskReport({ ...state, lastResult: result, pendingResult: null });
+    const failure = [...(result?.components ?? []), ...(result?.skills ?? [])].find(entry => entry?.status === "failed");
+    if (["partial", "failed"].includes(result?.status)) return Object.freeze({
+      message: failure ? `${componentName(failure.componentId, state.snapshot)} ${resultMessage(failure, result.kind)}`
+        : result.status === "partial" ? "部分项目处理失败，请查看任务报告。" : "软件管理任务失败，请查看任务报告。",
+      tone: "error", copyText,
+    });
     if (result?.status === "cancelled") return Object.freeze({ message: "软件管理任务已取消。", tone: "info" });
     const entries = [...(result?.components ?? []), ...(result?.skills ?? []), ...(result?.plugins ?? [])];
     if (entries.some((entry) => /warning|警告/iu.test(String(entry?.message || "")))) {
-      return Object.freeze({ message: "主要安装已完成，但附加步骤存在警告，请查看任务报告。", tone: "error" });
+      const shortcutWarning = entries.some(entry => /shortcut/iu.test(String(entry?.message || "")));
+      return Object.freeze({ message: shortcutWarning ? "Codex 已安装，但桌面快捷方式处理失败；请复制报告查看原因。"
+        : "主要安装已完成，但附加步骤存在警告，请查看任务报告。", tone: "error", copyText });
     }
     return Object.freeze({ message: "软件管理任务已完成。", tone: "success" });
   }
@@ -135,6 +137,12 @@
     return `${action}成功`;
   }
 
+  function localizedResultReason(value) {
+    const reason = String(value || "请复制任务报告后重试");
+    const label = RESULT_REASON_LABELS[reason];
+    return label ? `${label}（${reason}）` : reason;
+  }
+
   function resultMessage(entry, kind) {
     if (entry?.status === "succeeded") {
       return /warning|警告/iu.test(String(entry?.message || ""))
@@ -143,7 +151,7 @@
     }
     if (entry?.status === "skipped") return "当前项目无需处理";
     if (entry?.status === "cancelled") return "任务已取消";
-    return `${actionResultLabel(kind, "failed")}：${String(entry?.message || "请复制任务报告后重试")}`;
+    return `${actionResultLabel(kind, "failed")}：${localizedResultReason(entry?.message)}`;
   }
 
   function transferText(task) {
@@ -158,12 +166,14 @@
     if (Number.isFinite(task?.percent)) return "";
     if (task?.phase === "extract") return "正在持续解压文件，较大的安装包可能需要数分钟。";
     if (task?.phase === "verify") return "正在校验安装内容，完成前不会报告成功。";
+    if (["commit", "uninstall", "rollback"].includes(task?.phase)) return "正在安全应用更改，完成前不会提前报告成功。";
     if (task?.phase === "plugin") return "正在处理完整插件和固定版本的 Marketplace。";
     if (task?.phase === "cancelling") return "正在等待当前子进程完成安全取消。";
     return task ? "任务仍在进行，请等待当前阶段完成。" : "";
   }
 
   function componentName(id, snapshot) {
+    if (id === "chatgpt") return "Codex";
     return snapshot?.components?.find((entry) => entry.id === id)?.name
       || snapshot?.catalog?.components?.find((entry) => entry.id === id)?.name
       || snapshot?.curatedPlugins?.find((entry) => entry.id === id)?.name
@@ -177,16 +187,16 @@
       ? `；清单发布时间 ${catalog.publishedAt.replace("T", " ").replace(/\.\d+Z$/u, "Z")}`
       : "";
     if (catalog.refreshError) {
-      return { label: "在线刷新失败", warning: true, detail: `当前继续使用已验证的本地清单${published}。` };
+      return { label: "在线刷新失败", warning: true, summary: "当前使用已验证的本地清单。", detail: `当前继续使用已验证的本地清单${published}。` };
     }
     if (catalog.source === "remote") {
       return { label: "在线清单已更新", warning: false, detail: "" };
     }
     if (catalog.source === "cache") {
-      return { label: "使用缓存清单", warning: true, detail: `尚未取得新的在线清单${published}。` };
+      return { label: "使用缓存清单", warning: true, summary: "当前使用本地缓存清单。", detail: `尚未取得新的在线清单${published}。` };
     }
     if (catalog.source === "bundled") {
-      return { label: "使用内置清单", warning: true, detail: `当前为随安装包提供的离线清单${published}。` };
+      return { label: "使用内置清单", warning: true, summary: "已加载随软件附带的离线清单。", detail: `当前为随安装包提供的离线清单${published}。` };
     }
     return { label: "安装服务可用", warning: false, detail: "" };
   }
@@ -205,12 +215,21 @@
       lines.push("", "处理结果：");
       for (const entry of entries) {
         const label = componentName(entry.componentId, snapshot);
-        lines.push(`- ${label}：${STATUS_LABELS[entry.status] ?? entry.status ?? "未知"}${entry.message ? `（${entry.message}）` : ""}`);
+        lines.push(`- ${label}：${STATUS_LABELS[entry.status] ?? entry.status ?? "未知"}${entry.message ? `（${localizedResultReason(entry.message)}）` : ""}`);
+        if (entry.versionBefore) lines.push(`  处理前版本：${entry.versionBefore}`);
+        if (entry.versionAfter) lines.push(`  处理后版本：${entry.versionAfter}`);
+        if (entry.details?.installPath) lines.push(`  安装位置：${entry.details.installPath}`);
       }
     }
     const logs = (snapshot?.logs ?? []).slice(-500);
     if (logs.length > 0) lines.push("", "任务日志：", ...logs.map((line) => `- ${localizedLogLine(line)}`));
     return lines.join("\n");
+  }
+
+  function availableTabs(snapshot) {
+    return (Array.isArray(snapshot?.tabs) ? snapshot.tabs : []).filter((tab) =>
+      Object.hasOwn(TAB_LABELS, tab) && (tab !== "rollback"
+        || (snapshot.rollback ?? []).some((entry) => COMPONENT_ORDER.includes(entry.id))));
   }
 
   function defaultSelection(snapshot, tab) {
@@ -220,18 +239,25 @@
     if (tab === "install" || tab === "update") {
       const configured = snapshot.defaults?.[tab] ?? {};
       return Object.freeze({
-        componentIds: Object.freeze(uniqueIds(configured.componentIds)),
-        skillIds: Object.freeze(uniqueIds(configured.skillIds)),
+        componentIds: Object.freeze(uniqueIds(configured.componentIds).filter((id) => COMPONENT_ORDER.includes(id))),
+        skillIds: Object.freeze([]),
         pluginIds: Object.freeze([]),
       });
     }
     return Object.freeze({ componentIds: Object.freeze([]), skillIds: Object.freeze([]), pluginIds: Object.freeze([]) });
   }
 
-  function hasInstalledChatGpt(snapshot) {
-    const entry = (snapshot?.components ?? []).find((item) => item?.id === "chatgpt");
-    return typeof entry?.installedVersion === "string" && entry.installedVersion.length > 0;
+  function retainedSelection(snapshot, tab, current) {
+    if (!snapshot || snapshot.readOnly) return { componentIds: [], skillIds: [], pluginIds: [] };
+    const rows = tab === "rollback" ? snapshot.rollback ?? [] : snapshot.components ?? [];
+    const available = new Set(rows.filter((item) => item?.selectable !== false).map((item) => item?.id));
+    return {
+      componentIds: current.selectedComponentIds.filter((id) => COMPONENT_ORDER.includes(id) && available.has(id)),
+      skillIds: [],
+      pluginIds: [],
+    };
   }
+
 
   function createInitialState() {
     return {
@@ -248,6 +274,12 @@
       loading: false,
       error: null,
       lastResult: null,
+      taskRevision: 0,
+      awaitingTaskId: false,
+      awaitingResultTaskId: null,
+      submissionId: null,
+      pendingResult: null,
+      completedTaskIds: [],
     };
   }
 
@@ -257,41 +289,82 @@
     return [...set];
   }
 
+  function optionalFiniteNumber(value) {
+    if (value === null || value === undefined || value === "") return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+
+  function completeTask(current, result, taskId) {
+    return {
+      ...current,
+      snapshot: current.snapshot ? { ...current.snapshot, task: null } : current.snapshot,
+      lastResult: result ?? null,
+      confirmationPending: false,
+      taskRevision: (current.taskRevision ?? 0) + 1,
+      awaitingTaskId: false,
+      awaitingResultTaskId: null,
+      submissionId: null,
+      pendingResult: null,
+      completedTaskIds: uniqueIds([...(current.completedTaskIds ?? []), taskId]).slice(-128),
+    };
+  }
+
   function reduce(state, action) {
     const current = state ?? createInitialState();
     if (!action || typeof action !== "object") return current;
+    if (action.expectedTaskRevision !== undefined && action.expectedTaskRevision !== (current.taskRevision ?? 0)) return current;
     if (action.type === "loading") return { ...current, loading: Boolean(action.loading), error: null };
     if (action.type === "error") return { ...current, loading: false, error: String(action.error || "软件管理暂不可用") };
     if (action.type === "snapshot") {
+      // Local submissions belong to their IPC result. A fresh, revision-checked
+      // read may reconcile an observed server task if its finish event was lost
+      // while opening the page; unversioned broadcasts cannot do that.
+      if (current.submissionId || current.awaitingTaskId) return current;
       const nextSnapshot = action.snapshot && typeof action.snapshot === "object" ? action.snapshot : null;
-      const tabs = Array.isArray(nextSnapshot?.tabs) ? nextSnapshot.tabs : [];
+      const activeTask = current.snapshot?.task;
+      if (nextSnapshot?.task && current.completedTaskIds?.includes(nextSnapshot.task.taskId)) return current;
+      if (activeTask && (action.expectedTaskRevision === undefined || !nextSnapshot
+        || nextSnapshot.task?.taskId === activeTask.taskId)) return current;
+      const reconciledTaskId = activeTask?.taskId;
+      const tabs = availableTabs(nextSnapshot);
       const activeTab = tabs.includes(current.activeTab) ? current.activeTab : (tabs[0] ?? "install");
       const defaults = defaultSelection(nextSnapshot, activeTab);
+      const preserveCurrent = Boolean(current.snapshot) && activeTab === current.activeTab;
+      const selection = preserveCurrent
+        ? retainedSelection(nextSnapshot, activeTab, current)
+        : defaults;
       return {
         ...current,
         snapshot: nextSnapshot,
         activeTab,
-        selectedComponentIds: [...defaults.componentIds],
-        selectedSkillIds: [...defaults.skillIds],
-        selectedPluginIds: [...defaults.pluginIds],
+        selectedComponentIds: [...selection.componentIds],
+        selectedSkillIds: [...selection.skillIds],
+        selectedPluginIds: [...selection.pluginIds],
         skillsExpanded: false,
         confirmationPending: false,
         loading: false,
         error: null,
+        awaitingTaskId: false,
+        awaitingResultTaskId: reconciledTaskId || (nextSnapshot?.task ? null : current.awaitingResultTaskId ?? null),
+        taskRevision: (current.taskRevision ?? 0) + (reconciledTaskId ? 1 : 0),
+        completedTaskIds: reconciledTaskId
+          ? uniqueIds([...(current.completedTaskIds ?? []), reconciledTaskId]).slice(-128)
+          : current.completedTaskIds ?? [],
+        lastResult: reconciledTaskId ? null : current.lastResult,
       };
     }
     if (action.type === "curated-plugins") {
-      if (!current.snapshot) return current;
       return {
         ...current,
-        snapshot: {
-          ...current.snapshot,
-          curatedPlugins: Array.isArray(action.plugins) ? [...action.plugins] : [],
-        },
+        selectedSkillIds: [],
+        selectedPluginIds: [],
+        skillsExpanded: false,
+        confirmationPending: current.confirmationPending && current.selectedSkillIds.length === 0 && current.selectedPluginIds.length === 0,
       };
     }
     if (action.type === "tab") {
-      const tabs = current.snapshot?.tabs ?? [];
+      const tabs = availableTabs(current.snapshot);
       if (!tabs.includes(action.tab)) return current;
       const defaults = defaultSelection(current.snapshot, action.tab);
       return {
@@ -306,31 +379,55 @@
       };
     }
     if (action.type === "toggle-component") {
-      const selectedComponentIds = toggle(current.selectedComponentIds, action.componentId, action.checked);
-      const selectedPluginIds = action.componentId === "chatgpt" && action.checked === false
-        && current.activeTab === "install" && !hasInstalledChatGpt(current.snapshot)
-        ? []
-        : current.selectedPluginIds;
-      return { ...current, selectedComponentIds, selectedPluginIds, confirmationPending: false };
+      if (!COMPONENT_ORDER.includes(action.componentId)) return current;
+      const selectedComponentIds = toggle(current.selectedComponentIds.filter((id) => COMPONENT_ORDER.includes(id)), action.componentId, action.checked);
+      return { ...current, selectedComponentIds, selectedSkillIds: [], selectedPluginIds: [], confirmationPending: false };
     }
     if (action.type === "toggle-skill") {
-      return { ...current, selectedSkillIds: toggle(current.selectedSkillIds, action.skillId, action.checked), confirmationPending: false };
+      return { ...current, selectedSkillIds: [], selectedPluginIds: [], confirmationPending: false };
     }
     if (action.type === "toggle-plugin") {
-      const selectedPluginIds = toggle(current.selectedPluginIds, action.pluginId, action.checked);
-      const selectedComponentIds = action.checked === true && current.activeTab === "install"
-        && !hasInstalledChatGpt(current.snapshot)
-        ? toggle(current.selectedComponentIds, "chatgpt", true)
-        : current.selectedComponentIds;
-      return { ...current, selectedComponentIds, selectedPluginIds, confirmationPending: false };
+      return { ...current, selectedSkillIds: [], selectedPluginIds: [], confirmationPending: false };
     }
-    if (action.type === "skill-query") return { ...current, skillQuery: String(action.query ?? "") };
-    if (action.type === "toggle-skills") return { ...current, skillsExpanded: !current.skillsExpanded };
+    if (action.type === "skill-query") return { ...current, skillQuery: "" };
+    if (action.type === "toggle-skills") return { ...current, skillsExpanded: false };
     if (action.type === "install-root") {
       return { ...current, installRootToken: action.token, customInstallRootSelected: true, confirmationPending: false };
     }
-    if (action.type === "confirm-open") return { ...current, confirmationPending: true };
+    if (action.type === "confirm-open") {
+      const canConfirm = current.snapshot && !current.snapshot.readOnly && !current.snapshot.task
+        && current.selectedComponentIds.some((id) => COMPONENT_ORDER.includes(id));
+      return { ...current, selectedComponentIds: current.selectedComponentIds.filter((id) => COMPONENT_ORDER.includes(id)), selectedSkillIds: [], selectedPluginIds: [], confirmationPending: Boolean(canConfirm) };
+    }
     if (action.type === "confirm-close") return { ...current, confirmationPending: false };
+    if (action.type === "task-starting") {
+      if (!current.snapshot || current.snapshot.task || current.submissionId) return current;
+      return {
+        ...current,
+        snapshot: {
+          ...current.snapshot,
+          task: {
+            taskId: String(action.taskId || `software-starting-${Date.now()}`),
+            kind: action.kind || current.activeTab,
+            phase: "starting",
+            componentId: action.componentId ?? null,
+            percent: null,
+            critical: false,
+            cancellable: false,
+            downloadedBytes: null,
+            totalBytes: null,
+            bytesPerSecond: null,
+          },
+        },
+        confirmationPending: false,
+        error: null,
+        taskRevision: (current.taskRevision ?? 0) + 1,
+        awaitingTaskId: true,
+        awaitingResultTaskId: null,
+        submissionId: typeof action.submissionId === "string" ? action.submissionId : null,
+        pendingResult: null,
+      };
+    }
     if (action.type === "task-event") {
       const snapshot = current.snapshot;
       if (!snapshot) return current;
@@ -345,90 +442,59 @@
         });
       }
       if (event.type === "progress") {
+        if (typeof event.taskId !== "string" || !event.taskId || current.completedTaskIds?.includes(event.taskId)
+          || current.pendingResult
+          || snapshot.task && !current.awaitingTaskId && snapshot.task.taskId !== event.taskId) return current;
         const task = {
           taskId: event.taskId,
           kind: snapshot.task?.kind ?? current.activeTab,
           phase: event.phase,
           componentId: event.componentId ?? null,
-          percent: Number.isFinite(Number(event.percent)) ? Number(event.percent) : null,
-          critical: event.cancellable === false,
+          percent: optionalFiniteNumber(event.percent),
+          critical: event.critical === true,
           cancellable: event.cancellable === true,
-          downloadedBytes: Number.isFinite(Number(event.downloadedBytes)) ? Number(event.downloadedBytes) : null,
-          totalBytes: Number.isFinite(Number(event.totalBytes)) ? Number(event.totalBytes) : null,
-          bytesPerSecond: Number.isFinite(Number(event.bytesPerSecond)) ? Number(event.bytesPerSecond) : null,
+          downloadedBytes: optionalFiniteNumber(event.downloadedBytes),
+          totalBytes: optionalFiniteNumber(event.totalBytes),
+          bytesPerSecond: optionalFiniteNumber(event.bytesPerSecond),
         };
         const priorLogs = snapshot.logs ?? [];
         const logs = event.message && priorLogs.at(-1) !== event.message
           ? [...priorLogs, event.message].slice(-500)
           : priorLogs;
-        return { ...current, snapshot: { ...snapshot, task, logs }, confirmationPending: false };
+        return { ...current, snapshot: { ...snapshot, task, logs }, confirmationPending: false,
+          awaitingTaskId: false, awaitingResultTaskId: null, taskRevision: (current.taskRevision ?? 0) + 1 };
       }
       if (event.type === "finished") {
-        return { ...current, snapshot: { ...snapshot, task: null }, lastResult: event.result ?? null, confirmationPending: false };
+        const taskId = event.taskId ?? event.result?.taskId;
+        const awaitingResult = current.awaitingResultTaskId === taskId && !snapshot.task && !current.submissionId;
+        if (typeof taskId !== "string" || !taskId || (current.completedTaskIds?.includes(taskId) && !awaitingResult)
+          || event.result?.taskId && event.result.taskId !== taskId
+          || snapshot.task && (current.awaitingTaskId || snapshot.task.taskId !== taskId)) return current;
+        if (awaitingResult && !event.result) return current;
+        if (current.submissionId) {
+          if (!event.result || current.pendingResult) return current;
+          // Keep the local submission reserved until its own invocation settles.
+          // Preserve the authoritative event if that invocation later rejects.
+          return { ...current, pendingResult: event.result,
+            snapshot: { ...snapshot, task: { ...snapshot.task, phase: "finishing", critical: false, cancellable: false, percent: null } },
+            taskRevision: (current.taskRevision ?? 0) + 1 };
+        }
+        return completeTask(current, event.result, taskId);
       }
     }
     if (action.type === "task-result") {
-      return {
-        ...current,
-        snapshot: current.snapshot ? { ...current.snapshot, task: null } : current.snapshot,
-        lastResult: action.result ?? null,
-        confirmationPending: false,
-      };
+      const taskId = action.result?.taskId;
+      if (typeof taskId !== "string" || !taskId) return current;
+      if (action.submissionId !== undefined) {
+        if (action.submissionId !== current.submissionId) return current;
+      } else if (current.submissionId || (current.completedTaskIds?.includes(taskId) && current.awaitingResultTaskId !== taskId)
+        || current.snapshot?.task && (current.awaitingTaskId || current.snapshot.task.taskId !== taskId)) return current;
+      return completeTask(current, action.result, taskId);
     }
     return current;
   }
 
-  function installedSkills(snapshot) {
-    const catalog = new Map(catalogSkills(snapshot).map((item) => [item.id, item]));
-    return (snapshot?.skills ?? [])
-      .filter((item) => item?.status === "succeeded" && item?.versionAfter)
-      .map((item) => {
-        const id = item.componentId ?? item.id;
-        const known = catalog.get(id);
-        return { id, name: known?.name ?? item.name ?? id, description: known?.description ?? "已安装 Skill", version: item.versionAfter };
-      });
-  }
 
-  function renderSkillPicker({
-    mode, items, selectedIds, pluginItems = [], selectedPluginIds = [], query = "", maxVisibleRows = 6,
-  } = {}) {
-    const selected = new Set(uniqueIds(selectedIds));
-    const selectedPlugins = new Set(uniqueIds(selectedPluginIds));
-    const needle = String(query).trim().toLocaleLowerCase("zh-CN");
-    const visible = (Array.isArray(items) ? items : []).filter((item) => {
-      const haystack = `${item?.name ?? ""} ${item?.id ?? ""} ${item?.description ?? ""}`.toLocaleLowerCase("zh-CN");
-      return !needle || haystack.includes(needle);
-    });
-    const visiblePlugins = (Array.isArray(pluginItems) ? pluginItems : []).filter((item) => {
-      const haystack = `${item?.name ?? ""} ${item?.id ?? ""} ${item?.description ?? ""} ${(item?.capabilities ?? []).join(" ")}`.toLocaleLowerCase("zh-CN");
-      return !needle || haystack.includes(needle);
-    });
-    const skillRows = visible.map((item) => `
-        <label class="software-skill-row">
-          <input type="checkbox" data-software-skill="${escapeHtml(item.id)}"${selected.has(item.id) ? " checked" : ""}>
-          <span><strong>${escapeHtml(item.name || item.id)}</strong><small>${escapeHtml(item.description || "")}</small></span>
-          <code>${escapeHtml(item.id)}</code>
-        </label>`).join("");
-    const pluginRows = visiblePlugins.map((item) => {
-      const disabled = item.selectable === false;
-      const detail = conciseSkillDescription(item);
-      return `
-        <label class="software-skill-row${disabled ? " disabled" : ""}">
-          <input type="checkbox" data-software-plugin="${escapeHtml(item.id)}"${selectedPlugins.has(item.id) ? " checked" : ""}${disabled ? " disabled" : ""}>
-          <span><strong>${escapeHtml(item.name || item.id)}</strong><small>${escapeHtml(detail)}</small></span>
-          <code>${escapeHtml(item.id)}</code>
-        </label>`;
-    }).join("");
-    const rows = skillRows || pluginRows ? `${skillRows}${pluginRows}` : '<div class="software-empty-row">没有匹配的 Skill</div>';
-    return `
-      <section class="software-skill-picker" data-skill-picker-mode="${escapeHtml(mode)}" data-visible-rows="${Number(maxVisibleRows) || 6}">
-        <div class="software-skill-search">
-          <input type="search" data-software-skill-query value="${escapeHtml(query)}" placeholder="搜索 Skill 名称或用途" aria-label="搜索 Skill 名称或用途">
-          <span>已选择 ${selected.size + selectedPlugins.size} 项</span>
-        </div>
-        <div class="software-skill-list">${rows}</div>
-      </section>`;
-  }
 
   function componentStatus(entry, tab) {
     if (tab === "update") {
@@ -452,21 +518,11 @@
   }
 
   function componentNote(entry, tab) {
-    let note;
-    if (entry.id === "chatgpt") {
-      if (tab === "uninstall") note = "删除程序和 ChatGPT 快捷方式，保留登录、配置和历史";
-      else if (tab === "update") note = entry.updateState === "update-available" ? "更新后保留当前版本用于一次回滚" : "ChatGPT 登录与历史不会改变";
-      else note = "创建 ChatGPT 桌面图标；登录、配置和历史保存在官方 .codex 目录";
-    } else if (entry.id === "v2rayn") {
-      if (tab === "uninstall") note = "删除程序和 V2RayN 快捷方式，保留订阅和节点配置";
-      else note = `创建 V2RayN 桌面图标 · <button type="button" class="software-link-button" data-software-register data-url="${REGISTER_URL}">没有账号？打开注册地址</button>`;
-    } else {
-      const owner = entry.ownership === "external" || entry.message === "git_external_installed" ? "外部安装" : entry.installedVersion ? "CodexBridge 管理" : "尚未安装";
-      const installPath = entry.installPath ? ` · <code>${escapeHtml(entry.installPath)}</code>` : "";
-      note = tab === "uninstall"
-        ? `卸载 Git 程序，保留配置、SSH 密钥和仓库 · ${owner}${installPath}`
-        : `已有 Git 会在原位置更新；不创建桌面图标 · ${owner}${installPath}`;
-    }
+    let note = tab === "uninstall"
+      ? "删除 Codex 程序和快捷方式，保留登录、配置和聊天历史"
+      : tab === "update"
+        ? entry.updateState === "update-available" ? "更新后保留当前版本用于一次回滚" : "Codex 登录与历史不会改变"
+        : "创建 Codex 桌面图标；登录、配置和历史保存在官方 .codex 目录";
     if (entry.installedVersion && entry.installPath) {
       note += ` · <button type="button" class="software-link-button" data-software-open-folder="${escapeHtml(entry.installPath)}">打开安装目录</button>`;
     }
@@ -495,7 +551,7 @@
       return `
         <label class="software-component-card${selected.has(entry.id) ? " selected" : ""}${unavailable ? " disabled" : ""}">
           <div class="software-component-head">
-            <span><input type="checkbox" data-software-component="${escapeHtml(entry.id)}"${selected.has(entry.id) ? " checked" : ""}${unavailable || snapshot.readOnly || snapshot.task ? " disabled" : ""}> <strong>${escapeHtml(entry.name)}</strong></span>
+            <span><input type="checkbox" data-software-component="${escapeHtml(entry.id)}"${selected.has(entry.id) ? " checked" : ""}${unavailable || snapshot.readOnly || snapshot.task ? " disabled" : ""}> <strong>${escapeHtml(componentName(entry.id, snapshot))}</strong></span>
             <span class="software-state ${statusClass}">${escapeHtml(status)}</span>
           </div>
           <div class="software-component-version">${componentDetail(entry, tab)}</div>
@@ -504,38 +560,13 @@
     }).join("");
   }
 
-  function renderSkillsCard(state) {
-    const snapshot = state.snapshot;
-    const installed = installedSkills(snapshot);
-    const available = catalogSkills(snapshot);
-    const plugins = Array.isArray(snapshot?.curatedPlugins) ? snapshot.curatedPlugins : [];
-    const availablePlugins = plugins;
-    const installedPlugins = plugins.filter((plugin) => plugin.installed === true);
-    const selectedCount = state.selectedSkillIds.length + state.selectedPluginIds.length;
-    const unavailable = snapshot.readOnly || state.activeTab === "rollback";
-    const status = state.activeTab === "uninstall"
-      ? `${installed.length + installedPlugins.length} 项已安装`
-      : `${selectedCount} 项已选`;
-    const detail = state.activeTab === "uninstall"
-      ? "从已安装列表中精确选择要卸载的 Skill"
-      : `按名称和用途选择需要的 Skill（共 ${available.length + availablePlugins.length} 项）`;
-    return `
-      <article class="software-component-card software-skills-card${state.skillsExpanded ? " selected" : ""}${unavailable ? " disabled" : ""}">
-        <div class="software-component-head">
-          <strong>Skills</strong>
-          <span class="software-state ${selectedCount > 0 || installed.length > 0 ? "installed" : "missing"}">${escapeHtml(status)}</span>
-        </div>
-        <div class="software-component-version">${escapeHtml(detail)}</div>
-        <button type="button" class="software-skills-toggle" data-software-toggle-skills${unavailable || snapshot.task ? " disabled" : ""}>${state.skillsExpanded ? "收起 Skill 列表" : "展开 Skill 列表"} <span aria-hidden="true">${state.skillsExpanded ? "↑" : "→"}</span></button>
-      </article>`;
-  }
 
   function renderRollbackCards(state) {
     const selected = new Set(state.selectedComponentIds);
-    return (state.snapshot?.rollback ?? []).map((entry) => `
+    return (state.snapshot?.rollback ?? []).filter((entry) => COMPONENT_ORDER.includes(entry.id)).map((entry) => `
       <label class="software-component-card rollback${selected.has(entry.id) ? " selected" : ""}">
         <div class="software-component-head">
-          <span><input type="checkbox" data-software-component="${escapeHtml(entry.id)}"${selected.has(entry.id) ? " checked" : ""}${state.snapshot.readOnly || state.snapshot.task ? " disabled" : ""}> <strong>${escapeHtml(entry.name || componentName(entry.id, state.snapshot))}</strong></span>
+          <span><input type="checkbox" data-software-component="${escapeHtml(entry.id)}"${selected.has(entry.id) ? " checked" : ""}${state.snapshot.readOnly || state.snapshot.task ? " disabled" : ""}> <strong>${escapeHtml(componentName(entry.id, state.snapshot))}</strong></span>
           <span class="software-state rollback">可回滚</span>
         </div>
         <div class="software-component-version">当前 ${escapeHtml(entry.version || "-")}<br><b>恢复到 ${escapeHtml(entry.previousVersion || "上一版本")}</b></div>
@@ -543,46 +574,13 @@
       </label>`).join("");
   }
 
-  function renderSkillsDrawer(state) {
-    if (!state.skillsExpanded || !["install", "uninstall"].includes(state.activeTab)) return "";
-    const pickerItems = state.activeTab === "install"
-      ? catalogSkills(state.snapshot)
-      : installedSkills(state.snapshot);
-    const allPlugins = Array.isArray(state.snapshot?.curatedPlugins) ? state.snapshot.curatedPlugins : [];
-    const pluginItems = state.activeTab === "install"
-      ? allPlugins
-      : allPlugins.filter((plugin) => plugin.installed === true);
-    const picker = renderSkillPicker({
-      mode: state.activeTab,
-      items: pickerItems,
-      selectedIds: state.selectedSkillIds,
-      pluginItems,
-      selectedPluginIds: state.selectedPluginIds,
-      query: state.skillQuery,
-      maxVisibleRows: 6,
-    });
-    return `<section class="software-skills-panel software-skills-drawer">
-      <div class="software-skills-title"><div><strong>Skills 列表</strong><p>${state.activeTab === "uninstall" ? "只显示本机已安装且可安全卸载的项目" : "勾选后安装；同名 Skill 会直接替换为所选版本"}</p></div><span>${pickerItems.length + pluginItems.length} 项</span></div>
-      ${picker}
-    </section>`;
-  }
 
   function actionLabel(tab) {
     return ({ install: "确认并开始", update: "开始更新", uninstall: "确认卸载", rollback: "确认回滚" })[tab] ?? "开始";
   }
 
   function selectionNames(state) {
-    const componentNames = state.selectedComponentIds.map((id) => componentName(id, state.snapshot));
-    const skillMap = new Map([
-      ...catalogSkills(state.snapshot),
-      ...installedSkills(state.snapshot),
-    ].map((item) => [item.id, item.name || item.id]));
-    const pluginMap = new Map((state.snapshot?.curatedPlugins ?? []).map((item) => [item.id, item.name || item.id]));
-    return [
-      ...componentNames,
-      ...state.selectedSkillIds.map((id) => skillMap.get(id) ?? id),
-      ...state.selectedPluginIds.map((id) => pluginMap.get(id) ?? id),
-    ];
+    return state.selectedComponentIds.filter((id) => COMPONENT_ORDER.includes(id)).map((id) => componentName(id, state.snapshot));
   }
 
   function renderConfirmation(state) {
@@ -590,9 +588,8 @@
     const names = selectionNames(state);
     return `
       <section class="software-confirmation" aria-label="操作确认">
-        <div><strong>请确认本次操作</strong><p>${escapeHtml(names.join("、") || "尚未选择内容")}</p>
-          ${state.activeTab === "install" && state.selectedSkillIds.length > 0 ? "<p class=\"software-warning\">同名 Skill 将被替换，原内容不会保留。</p>" : ""}
-          ${state.activeTab === "uninstall" ? "<p class=\"software-warning\">只删除所选程序本体和已记录快捷方式；登录、订阅、Git 配置、SSH 密钥与项目文件保留。</p>" : ""}
+        <div><strong>请确认本次操作</strong><p>已选择 ${names.length} 项 · ${escapeHtml(names.join("、") || "尚未选择内容")}</p>
+          ${state.activeTab === "uninstall" ? "<p class=\"software-warning\">只删除 Codex 程序和已记录快捷方式；登录、配置、聊天历史与项目文件保留。</p>" : ""}
         </div>
         <div class="software-confirm-actions">
           <button type="button" class="plain-button" data-software-confirm-cancel>返回</button>
@@ -603,7 +600,7 @@
 
   function renderTask(state) {
     const task = state.snapshot?.task;
-    const logs = (state.snapshot?.logs ?? []).slice(-500);
+    const logs = (state.snapshot?.logs ?? []).slice(-MAX_RENDERED_TASK_LOG_LINES);
     if (!task && logs.length === 0 && !state.lastResult) return "";
     const hasPercent = Number.isFinite(task?.percent);
     const percent = hasPercent ? Math.max(0, Math.min(100, task.percent)) : null;
@@ -614,7 +611,7 @@
     const resultSummary = !task && result ? `
       <div class="software-result-summary ${escapeHtml(result.status ?? "failed")}" role="status">
         <strong>${escapeHtml(actionResultLabel(result.kind, result.status))}</strong>
-        <span>${resultEntries.filter((entry) => entry.status === "succeeded").length} 项成功 · ${resultEntries.filter((entry) => entry.status === "failed").length} 项失败</span>
+        <span>${escapeHtml(resultCountsText(resultEntries))}</span>
       </div>
       ${resultEntries.length > 0 ? `<div class="software-result-list">${resultEntries.map((entry) => `
         <div class="software-result-row ${escapeHtml(entry.status ?? "failed")}">
@@ -626,15 +623,48 @@
     return `
       <section class="software-task-panel" aria-live="polite">
         <div class="software-task-head">
-          <div><strong>${task ? "任务正在执行" : "最近一次任务"}</strong><span>${escapeHtml(task ? PHASE_LABELS[task.phase] ?? task.phase : STATUS_LABELS[state.lastResult?.status] ?? "已完成")}</span></div>
-          <div>${task ? `<button type="button" class="plain-button" data-software-cancel${task.cancellable && !task.critical ? "" : " disabled"}>取消任务</button>` : ""}<button type="button" class="plain-button" data-software-copy-report>复制任务报告</button></div>
+          <div><strong>${task ? "任务正在执行" : result ? "最近一次任务" : "任务记录"}</strong><span>${escapeHtml(task ? PHASE_LABELS[task.phase] ?? task.phase : STATUS_LABELS[state.lastResult?.status] ?? "历史日志")}</span></div>
+          ${task ? "" : '<div><button type="button" class="plain-button" data-software-copy-report>复制任务报告</button></div>'}
         </div>
         ${task ? `<div class="software-progress${hasPercent ? "" : " indeterminate"}"><progress max="100"${hasPercent ? ` value="${percent}"` : ""} aria-label="${hasPercent ? `任务进度 ${percent}%` : "任务正在进行"}"></progress></div>` : ""}
         ${transfer ? `<div class="software-transfer-status">${escapeHtml(transfer)}</div>` : ""}
         ${activity ? `<div class="software-phase-activity">${escapeHtml(activity)}</div>` : ""}
         ${resultSummary}
-        <div class="software-log">${logs.map((line) => `<div class="software-log-line">${escapeHtml(localizedLogLine(line))}</div>`).join("")}</div>
+        ${logs.length ? `<details class="software-task-log"><summary>任务日志（最近 ${logs.length} 条）</summary><div class="software-log">${logs.map((line) => `<div class="software-log-line">${escapeHtml(localizedLogLine(line))}</div>`).join("")}</div></details>` : ""}
       </section>`;
+  }
+
+  function resultCountsText(entries) {
+    const categories = [["succeeded", "成功"], ["failed", "失败"], ["cancelled", "已取消"], ["skipped", "无需处理"]];
+    const parts = [];
+    let knownCount = 0;
+    for (const [status, label] of categories) {
+      const count = entries.filter(entry => entry?.status === status).length;
+      knownCount += count;
+      if (count) parts.push(`${count} 项${label}`);
+    }
+    if (knownCount < entries.length) parts.push(`${entries.length - knownCount} 项结果待确认`);
+    return parts.join(" · ") || "没有逐项结果";
+  }
+
+  function taskViewKey(state) {
+    const task = state?.snapshot?.task;
+    const result = state?.lastResult;
+    return `${task ? "running" : result ? "finished" : "idle"}:${task?.taskId || task?.id || result?.taskId || ""}`;
+  }
+
+  function renderTaskFooter(task) {
+    const percent = Number.isFinite(task.percent) ? Math.max(0, Math.min(100, task.percent)) : null;
+    const phase = PHASE_LABELS[task.phase] ?? task.phase ?? "任务正在执行";
+    const cancellable = Boolean(task.cancellable && !task.critical);
+    const detail = task.critical ? "正在应用更改，当前步骤不可取消" : transferText(task) || (cancellable ? "可取消当前任务" : "当前阶段暂不可取消");
+    return `<section class="software-action-bar software-task-dock">
+      <div><strong>${escapeHtml(phase)}${percent === null ? "" : ` · ${percent}%`}</strong><p>${escapeHtml(detail)}</p></div>
+      <div class="software-confirm-actions">
+        <button type="button" class="plain-button" data-software-cancel${cancellable ? "" : " disabled"}>取消任务</button>
+        <button type="button" class="plain-button" data-software-copy-report>复制任务报告</button>
+      </div>
+    </section>`;
   }
 
   function renderBody(state) {
@@ -649,50 +679,67 @@
         : "";
     const healthMessage = blockingMessage;
     const catalogHealth = catalogStatus(snapshot);
-    const tabs = (snapshot.tabs ?? []).map((tab) => `
+    const tabs = availableTabs(snapshot).map((tab) => `
       <button type="button" class="software-tab${state.activeTab === tab ? " active" : ""}" data-software-tab="${tab}" aria-selected="${state.activeTab === tab}">${TAB_LABELS[tab]}</button>`).join("");
     const cards = state.activeTab === "rollback" ? renderRollbackCards(state) : renderComponentCards(state);
-    const selectedCount = state.selectedComponentIds.length + state.selectedSkillIds.length + state.selectedPluginIds.length;
+    const selectedCount = state.selectedComponentIds.filter((id) => COMPONENT_ORDER.includes(id)).length;
     const operationDisabled = snapshot.readOnly || Boolean(snapshot.task) || selectedCount === 0;
+    const installRootLabel = snapshot.installRootPath || (state.customInstallRootSelected ? "已选择自定义位置" : "默认安全位置 · CBApps");
     return `
+      <div class="software-scroll-area" data-software-scroll-tab="${escapeHtml(state.activeTab)}" data-software-task-view="${escapeHtml(taskViewKey(state))}">
       <div class="software-manager-heading">
-        <div><h2>软件管理</h2><p>${state.activeTab === "install" ? "安装 ChatGPT 常用环境，并按你的选择创建桌面图标。" : state.activeTab === "update" ? "检查并安装可用的新版本；没有新版的项目不会重复处理。" : state.activeTab === "uninstall" ? "精确选择要卸载的软件或 Skill，用户数据始终保留。" : "恢复上一次更新前的程序版本。"}</p></div>
+        <div><h2>软件管理</h2><p>${state.activeTab === "install" ? "安装 Codex，并创建桌面快捷方式。" : state.activeTab === "update" ? "检查并更新 Codex；未安装时会进行首次安装。" : state.activeTab === "uninstall" ? "卸载 Codex 程序，保留登录、配置和聊天历史。" : "恢复上一次更新前的 Codex 版本。"}</p></div>
         <div class="software-heading-actions"><span class="software-health-badge ${healthMessage || catalogHealth.warning ? "warning" : ""}">${blockingMessage ? "安装清单不可用" : escapeHtml(catalogHealth.label)}</span><button type="button" class="ghost-button light" data-software-refresh${snapshot.task ? " disabled" : ""}>重新检测</button></div>
       </div>
       <div class="software-tabs" role="tablist">${tabs}</div>
       ${blockingMessage ? `<div class="software-unavailable"><strong>当前仅可查看</strong><p>${blockingMessage}</p></div>` : ""}
-      ${!blockingMessage && catalogHealth.detail ? `<div class="software-catalog-notice">${escapeHtml(catalogHealth.detail)}</div>` : ""}
+      ${!blockingMessage && catalogHealth.detail ? `<div class="software-catalog-notice"><span>${escapeHtml(catalogHealth.summary || catalogHealth.detail)}</span>${catalogHealth.summary ? `<details class="software-catalog-details"><summary>清单详情</summary><p>${escapeHtml(catalogHealth.detail)}</p></details>` : ""}</div>` : ""}
+      ${renderTask(state)}
       ${state.activeTab === "install" || state.activeTab === "update" ? `
         <section class="software-install-root">
-          <div class="software-install-root-copy"><strong>安装位置</strong><div class="software-install-root-value">${escapeHtml(snapshot.installRootPath || (state.customInstallRootSelected ? "已选择自定义位置" : "默认安全位置 · CBApps"))}</div><p>${state.activeTab === "update" ? "未安装的软件会安装到这里；已有软件在原位置更新" : "ChatGPT 自动使用短目录层级；登录、配置和历史仍保存在官方 .codex 目录"}</p></div>
+          <div class="software-install-root-copy"><strong>安装位置</strong><div class="software-install-root-value" title="${escapeHtml(installRootLabel)}">${escapeHtml(installRootLabel)}</div><p>${state.activeTab === "update" ? "未安装时使用此位置；已安装的 Codex 在原位置更新" : "Codex 使用短目录层级；登录、配置和历史仍保存在官方 .codex 目录"}</p></div>
           <button type="button" class="plain-button" data-software-choose-root${snapshot.readOnly || snapshot.task ? " disabled" : ""}>选择位置</button>
         </section>` : ""}
-      ${state.activeTab === "uninstall" ? '<div class="software-warning-banner">卸载只删除所选程序本体和已记录快捷方式；ChatGPT 登录与历史、V2RayN 订阅、Git 配置、SSH 密钥和项目文件都会保留。</div>' : ""}
+      ${state.activeTab === "uninstall" ? '<div class="software-warning-banner">仅删除 Codex 程序和已记录快捷方式；登录、配置、聊天历史及项目文件保留。</div>' : ""}
       ${state.activeTab === "rollback" ? '<div class="software-warning-banner">回滚只恢复上一次更新前的程序版本，成功后会删除当前新版本并消费这条回滚记录。</div>' : ""}
-      <div class="software-manager-grid">${cards}${["install", "uninstall"].includes(state.activeTab) ? renderSkillsCard(state) : ""}</div>
-      ${renderSkillsDrawer(state)}
+      <div class="software-manager-grid software-manager-codex-only">${cards}</div>
+      </div>
+      <div class="software-footer">
+      ${snapshot.task ? renderTaskFooter(snapshot.task) : state.confirmationPending ? renderConfirmation(state) : `
       <section class="software-action-bar">
         <div><strong>${selectedCount > 0 ? `已选择 ${selectedCount} 项` : "尚未选择处理内容"}</strong><p>${escapeHtml(selectionNames(state).join("、") || "勾选后会在执行前再次确认")}</p></div>
         <button type="button" class="primary-button" data-software-start${operationDisabled ? " disabled" : ""}>${actionLabel(state.activeTab)}</button>
-      </section>
-      ${renderConfirmation(state)}
-      ${renderTask(state)}`;
+      </section>`}
+      </div>`;
   }
+
 
   function render(root, state) {
     if (!root || typeof root !== "object") throw new TypeError("software_manager_root_required");
-    root.innerHTML = renderBody(state ?? createInitialState());
+    const previousScroll = root.querySelector?.(".software-scroll-area");
+    const sameTask = previousScroll?.dataset?.softwareTaskView === taskViewKey(state);
+    const scrollTop = previousScroll?.dataset?.softwareScrollTab === state?.activeTab && sameTask ? previousScroll.scrollTop : 0;
+    const detailsOpen = root.querySelector?.(".software-catalog-details")?.open === true;
+    const logsOpen = sameTask && root.querySelector?.(".software-task-log")?.open === true;
+    const html = renderBody(state ?? createInitialState());
+    root.innerHTML = html;
+    const nextScroll = root.querySelector?.(".software-scroll-area");
+    const nextDetails = root.querySelector?.(".software-catalog-details");
+    const nextLogs = root.querySelector?.(".software-task-log");
+    if (nextDetails) nextDetails.open = detailsOpen;
+    if (nextLogs) nextLogs.open = logsOpen;
+    if (nextScroll) nextScroll.scrollTop = scrollTop;
     return root;
   }
 
   function readSelection(root) {
-    const checked = (selector, key) => [...(root?.querySelectorAll?.(`${selector}:checked`) ?? [])]
-      .map((element) => element?.dataset?.[key])
-      .filter(Boolean);
+    const componentIds = [...(root?.querySelectorAll?.("[data-software-component]:checked") ?? [])]
+      .map((element) => element?.dataset?.softwareComponent)
+      .filter((id) => COMPONENT_ORDER.includes(id));
     return Object.freeze({
-      componentIds: Object.freeze(uniqueIds(checked("[data-software-component]", "softwareComponent"))),
-      skillIds: Object.freeze(uniqueIds(checked("[data-software-skill]", "softwareSkill"))),
-      pluginIds: Object.freeze(uniqueIds(checked("[data-software-plugin]", "softwarePlugin"))),
+      componentIds: Object.freeze(uniqueIds(componentIds)),
+      skillIds: Object.freeze([]),
+      pluginIds: Object.freeze([]),
     });
   }
 
@@ -704,7 +751,6 @@
     readSelection,
     reduce,
     render,
-    renderSkillPicker,
     taskResultFeedback,
   });
 }(window));

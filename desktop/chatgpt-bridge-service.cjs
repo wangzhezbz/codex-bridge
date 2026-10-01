@@ -1,13 +1,24 @@
 const fs = require("node:fs");
-const http = require("node:http");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
+const { requestBoundedJsonOverHttp } = require("./bounded-http-json.cjs");
+const { buildConsistentStateSnapshot } = require("./consistent-state-snapshot.cjs");
+const {
+  readBoundedLocalFile,
+  readBoundedLocalFileSync,
+} = require("../shared/bounded-local-file.cjs");
 
 const SERVICE_NAME = "chatgpt-codex-bridge";
 const PROTOCOL_VERSION = 1;
 const DEFAULT_PORT = 4317;
 const EXTENSION_MANAGER_REVISION = "verified-stable-dir-v2";
+const MAX_BRIDGE_METADATA_BYTES = 1024 * 1024;
+const MAX_EXTENSION_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_CODEX_CONFIG_BYTES = 16 * 1024 * 1024;
+const MAX_CHROME_PREFERENCES_BYTES = 32 * 1024 * 1024;
+const MAX_CHROME_MANIFEST_BYTES = 1024 * 1024;
+const MAX_EXTENSION_RUNTIME_ATTEMPTS = 3;
 
 function createChatgptBridgeService({
   appRootDir,
@@ -16,7 +27,7 @@ function createChatgptBridgeService({
   homeDir = process.env.USERPROFILE || process.env.HOME || "",
   chromeUserDataDir = defaultChromeUserDataDir(),
   spawnImpl = spawn,
-  requestJson = requestJsonOverHttp,
+  requestJson = requestBoundedJsonOverHttp,
   stopTimeoutMs = 5000,
   delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   log = () => {},
@@ -40,15 +51,23 @@ function createChatgptBridgeService({
   let lifecycleStatus = "";
   let lastError = "";
   let lastExtensionError = "";
+  let serviceStartEpoch = 0;
+  let serviceStartPromise = null;
+  let extensionPreparationPromise = null;
   let lastExtensionDeployment = readExtensionDeploymentReceipt(
     extensionDeploymentReceiptPath,
     extensionDir,
   );
 
+  function logSafely(message) {
+    // A broken log sink must not change process ownership or abort maintenance.
+    try { Promise.resolve(log(message)).catch(() => {}); } catch {}
+  }
+
   function loadConfig() {
     let saved = {};
     try {
-      saved = JSON.parse(fs.readFileSync(configPath, "utf8"));
+      saved = JSON.parse(readBoundedUtf8(configPath, MAX_BRIDGE_METADATA_BYTES));
     } catch {
       saved = {};
     }
@@ -137,6 +156,20 @@ function createChatgptBridgeService({
   }
 
   async function getState() {
+    return buildConsistentStateSnapshot({
+      readRevision: () => {
+        const config = loadConfig();
+        return JSON.stringify([
+          serviceStartEpoch, Boolean(child), ownedRuntime?.port, lifecycleStatus,
+          config.port, config.apiToken, lastError, lastExtensionError,
+          lastExtensionDeployment?.updatedAt,
+        ]);
+      },
+      buildSnapshot: buildStateSnapshot,
+    });
+  }
+
+  async function buildStateSnapshot() {
     const configuredInfo = runtimeInfo();
     const info = serviceRuntimeInfo();
     const [health, versionStatus, diagnosticsStatus] = await Promise.all([
@@ -161,7 +194,7 @@ function createChatgptBridgeService({
       expectedManifest: extensionManifest,
     });
     const extensionFiles = extensionDisk;
-    const chromeInstallations = discoverChromeBridgeExtensionInstallations(chromeUserDataDir);
+    const chromeInstallations = await discoverChromeBridgeExtensionInstallations(chromeUserDataDir);
     const extensionDiagnostics = diagnosticsStatus.response?.extension || {};
     const extensionRegisteredDirs = uniqueResolvedPaths(
       chromeInstallations.map((entry) => entry.path),
@@ -282,19 +315,49 @@ function createChatgptBridgeService({
       return true;
     } catch (error) {
       lastExtensionError = extensionErrorMessage(error);
-      log(`[double-quota] extension refresh skipped context=${context} error=${lastExtensionError}`);
+      logSafely(`[double-quota] extension refresh skipped context=${context} error=${lastExtensionError}`);
       return false;
     }
   }
 
-  async function prepareExtension() {
-    const info = runtimeInfo();
+  function prepareExtension() {
+    if (extensionPreparationPromise) {
+      return extensionPreparationPromise;
+    }
+    const pending = prepareExtensionForStableRuntime();
+    const tracked = pending.finally(() => {
+      if (extensionPreparationPromise === tracked) {
+        extensionPreparationPromise = null;
+      }
+    });
+    extensionPreparationPromise = tracked;
+    return tracked;
+  }
+
+  async function prepareExtensionForStableRuntime() {
+    for (let attempt = 0; attempt < MAX_EXTENSION_RUNTIME_ATTEMPTS; attempt += 1) {
+      // Saving a port does not move a live owned service until explicit restart.
+      // Extension repair must keep targeting that service in the meantime.
+      const info = serviceRuntimeInfo();
+      const state = await prepareExtensionOnce(info);
+      const current = serviceRuntimeInfo();
+      if (current.origin === info.origin && current.config.apiToken === info.config.apiToken) {
+        return state;
+      }
+    }
+    throw bridgeStopError(
+      "bridge_extension_config_changed",
+      "扩展准备期间服务配置持续变化，请停止修改端口后重试。",
+    );
+  }
+
+  async function prepareExtensionOnce(info) {
     const sourceDir = path.join(vendorDir, manifest.extensionDir || "chrome-extension");
     if (!fs.existsSync(path.join(sourceDir, "manifest.json"))) {
       throw new Error("双倍额度 Chrome 扩展不完整，缺少 manifest.json。");
     }
     const configSource = bridgeExtensionConfigSource(info.origin, info.config.apiToken);
-    deployExtensionFiles(sourceDir, extensionDir, configSource);
+    await deployExtensionFiles(sourceDir, extensionDir, configSource);
     const deploymentTargets = [
       verifyExtensionTarget(sourceDir, extensionDir, configSource),
     ];
@@ -312,12 +375,14 @@ function createChatgptBridgeService({
       const failed = deploymentTargets.filter((target) => !target.verified).map((target) => target.path);
       throw new Error(`扩展文件复制后校验失败：${failed.join("；") || "没有可校验的目标目录"}`);
     }
-    lastExtensionDeployment = persistExtensionDeploymentReceipt(
+    lastExtensionDeployment = await persistExtensionDeploymentReceipt(
       extensionDeploymentReceiptPath,
       receipt,
     );
     lastExtensionError = "";
-    return getState();
+    // The enclosing deployment loop validates configuration and redeploys when
+    // needed. Do not abort that recovery using the public snapshot guard.
+    return buildStateSnapshot();
   }
 
   async function manageExtension() {
@@ -326,7 +391,7 @@ function createChatgptBridgeService({
       current = await prepareExtension();
     } catch (error) {
       lastExtensionError = extensionErrorMessage(error);
-      log(`[double-quota] extension update failed error=${lastExtensionError}`);
+      logSafely(`[double-quota] extension update failed error=${lastExtensionError}`);
       return {
         ...(await getState()),
         extensionUpdate: {
@@ -355,8 +420,22 @@ function createChatgptBridgeService({
     };
   }
 
-  async function start() {
+  function start() {
+    if (serviceStartPromise) {
+      return serviceStartPromise;
+    }
+    const epoch = ++serviceStartEpoch;
+    const pending = startOnce(epoch);
+    const tracked = pending.finally(() => {
+      if (serviceStartPromise === tracked) serviceStartPromise = null;
+    });
+    serviceStartPromise = tracked;
+    return tracked;
+  }
+
+  async function startOnce(epoch) {
     const existing = await probe();
+    assertCurrentServiceStart(epoch);
     if (existing.compatible) {
       lastError = "";
       return getState();
@@ -369,6 +448,7 @@ function createChatgptBridgeService({
     }
 
     await prepareExtensionBestEffort("service-start");
+    assertCurrentServiceStart(epoch);
     const info = runtimeInfo();
     if (!fs.existsSync(info.httpEntry)) {
       throw new Error("双倍额度服务入口不存在，请重新安装 CodexBridge。");
@@ -402,21 +482,56 @@ function createChatgptBridgeService({
       throw error;
     }
     const launchedChild = child;
-    launchedChild.stdout?.on("data", (chunk) => log(`[double-quota] ${String(chunk).trim()}`));
-    launchedChild.stderr?.on("data", (chunk) => log(`[double-quota] ${String(chunk).trim()}`));
-    launchedChild.once("exit", (code, signal) => {
+    let launchError = null;
+    let childExitObserved = false;
+    const onChildExit = (code, signal) => {
+      if (childExitObserved) return;
+      childExitObserved = true;
+      launchedChild.removeListener("exit", onChildExit);
+      launchedChild.removeListener("close", onChildExit);
       if (child === launchedChild) {
         child = null;
         ownedRuntime = null;
+        const starting = lifecycleStatus === "starting";
         lifecycleStatus = "";
         if (code !== 0 && signal !== "SIGTERM") {
           lastError = `双倍额度服务已退出（code=${code ?? "-"}, signal=${signal || "-"}）。`;
+        } else if (starting) {
+          lastError = `双倍额度服务启动后提前退出（code=${code ?? "-"}, signal=${signal || "-"}）。`;
         }
       }
+    };
+    launchedChild.on("error", (error) => {
+      // Errors can repeat or arrive after exit; an old child must not change
+      // the state of its replacement or leave a later error unhandled.
+      if (child !== launchedChild) return;
+      if (Number.isSafeInteger(launchedChild.pid) && launchedChild.pid > 0) {
+        // A failed kill/send also emits error. A PID proves spawn succeeded,
+        // not that the process exited: keep ownership until exit/close.
+        lastError = `双倍额度服务进程操作失败：${error?.message || error}`;
+        logSafely(`[double-quota] ${lastError}`);
+        return;
+      }
+      launchError = error;
+      child = null;
+      ownedRuntime = null;
+      lifecycleStatus = "";
+      lastError = `双倍额度服务启动失败：${error?.message || error}`;
     });
+    for (const [channel, stream] of [["stdout", launchedChild.stdout], ["stderr", launchedChild.stderr]]) {
+      stream?.on("data", (chunk) => logSafely(`[double-quota] ${String(chunk).trim()}`));
+      // Pipes can still report errors after the child exit event. Retain the
+      // handler for the pipe lifetime rather than removing it on process exit.
+      stream?.on("error", (error) => logSafely(
+        `[double-quota] ${channel} stream error: ${String(error?.message || error)}`,
+      ));
+    }
+    launchedChild.once("exit", onChildExit);
+    launchedChild.once("close", onChildExit);
 
     for (let attempt = 0; attempt < 60; attempt += 1) {
       const health = await probe();
+      assertCurrentServiceStart(epoch);
       if (health.compatible) {
         lifecycleStatus = "";
         return getState();
@@ -426,16 +541,32 @@ function createChatgptBridgeService({
       }
       await delay(250);
     }
+    if (launchError) {
+      throw bridgeStopError("bridge_start_failed", lastError || "双倍额度服务启动失败。");
+    }
+    if (child !== launchedChild) {
+      throw bridgeStopError(
+        "bridge_start_exited",
+        lastError || "双倍额度服务启动后提前退出，请检查日志后重试。",
+      );
+    }
     const failedChild = child;
-    child = null;
+    try {
+      await terminateOwnedChild(failedChild, stopTimeoutMs);
+    } catch (error) {
+      lifecycleStatus = "";
+      lastError = `双倍额度服务启动超时，且无法确认子进程已退出：${error?.message || error}`;
+      throw new Error(lastError);
+    }
+    if (child === failedChild) child = null;
     ownedRuntime = null;
     lifecycleStatus = "";
-    failedChild?.kill("SIGTERM");
     lastError = "双倍额度服务启动超时，请检查日志后重试。";
     throw new Error(lastError);
   }
 
   async function stop() {
+    serviceStartEpoch += 1;
     if (!child) {
       const state = await getState();
       return state.externalProcess
@@ -468,6 +599,11 @@ function createChatgptBridgeService({
       : state;
   }
 
+  function assertCurrentServiceStart(epoch) {
+    if (epoch === serviceStartEpoch) return;
+    throw bridgeStopError("bridge_start_cancelled", "双倍额度服务启动已取消。");
+  }
+
   async function assertMaintenanceSafe(action = "维护") {
     const state = await getState();
     if (!state.running) {
@@ -485,12 +621,18 @@ function createChatgptBridgeService({
   }
 
   async function restart() {
+    const epoch = serviceStartEpoch;
     const state = await assertMaintenanceSafe("重启");
+    assertCurrentServiceStart(epoch);
     if (state.externalProcess) {
       throw new Error("当前 Bridge 服务由外部程序管理，CodexBridge 不会重启它。");
     }
     if (child) {
+      // Account for this restart's own stop, but never undo a newer stop
+      // while maintenance probes or the post-stop state are still pending.
+      const stoppedEpoch = serviceStartEpoch + 1;
       await stop();
+      assertCurrentServiceStart(stoppedEpoch);
     }
     return start();
   }
@@ -499,20 +641,23 @@ function createChatgptBridgeService({
     const info = runtimeInfo();
     fs.mkdirSync(path.dirname(codexConfigPath), { recursive: true });
     const existing = fs.existsSync(codexConfigPath)
-      ? fs.readFileSync(codexConfigPath, "utf8")
+      ? readBoundedUtf8(codexConfigPath, MAX_CODEX_CONFIG_BYTES)
       : "";
-    let backupPath = "";
-    if (fs.existsSync(codexConfigPath)) {
-      backupPath = `${codexConfigPath}.double-quota-${timestampForFile()}.bak`;
-      fs.copyFileSync(codexConfigPath, backupPath);
-    }
     const next = upsertChatgptBridgeMcpConfig(existing, {
       command: execPath,
       mcpEntry: info.mcpEntry,
       dataDir: bridgeDataDir,
     });
+    if (next === existing) {
+      return { ...(await getState()), backupPath: "", unchanged: true };
+    }
+    let backupPath = "";
+    if (fs.existsSync(codexConfigPath)) {
+      backupPath = `${codexConfigPath}.double-quota-${timestampForFile()}.bak`;
+      fs.copyFileSync(codexConfigPath, backupPath);
+    }
     writeFileAtomic(codexConfigPath, next);
-    return { ...(await getState()), backupPath };
+    return { ...(await getState()), backupPath, unchanged: false };
   }
 
   return {
@@ -588,12 +733,21 @@ function verifyExtensionTarget(sourceDir, targetDir, configSource) {
     }
     const sourcePath = path.join(sourceDir, relativePath);
     const targetPath = path.join(targetDir, relativePath);
-    if (!fs.existsSync(targetPath) || sha256File(sourcePath) !== sha256File(targetPath)) {
+    try {
+      if (!fs.existsSync(targetPath) || sha256File(sourcePath) !== sha256File(targetPath)) {
+        mismatches.push(relativePath);
+      }
+    } catch {
       mismatches.push(relativePath);
     }
   }
   const configPath = path.join(targetDir, "bridge-config.js");
-  if (!fs.existsSync(configPath) || fs.readFileSync(configPath, "utf8") !== configSource) {
+  try {
+    if (!fs.existsSync(configPath)
+      || readBoundedUtf8(configPath, MAX_EXTENSION_FILE_BYTES) !== configSource) {
+      mismatches.push("bridge-config.js");
+    }
+  } catch {
     mismatches.push("bridge-config.js");
   }
   return {
@@ -603,30 +757,32 @@ function verifyExtensionTarget(sourceDir, targetDir, configSource) {
   };
 }
 
-function deployExtensionFiles(sourceDir, targetDir, configSource) {
+async function deployExtensionFiles(sourceDir, targetDir, configSource) {
   for (const relativePath of listRegularFiles(sourceDir)) {
     if (relativePath.toLowerCase() === "bridge-config.js") {
       continue;
     }
     const sourcePath = path.join(sourceDir, relativePath);
     const targetPath = path.join(targetDir, relativePath);
-    const content = withTransientFsRetry(() => fs.readFileSync(sourcePath));
-    withTransientFsRetry(() => writeFileAtomic(targetPath, content));
+    const { buffer: content } = await withTransientFsRetry(() =>
+      readBoundedLocalFile(sourcePath, { maxBytes: MAX_EXTENSION_FILE_BYTES }));
+    await withTransientFsRetry(() => writeFileAtomicAsync(targetPath, content));
   }
-  withTransientFsRetry(() => writeFileAtomic(path.join(targetDir, "bridge-config.js"), configSource));
+  await withTransientFsRetry(() =>
+    writeFileAtomicAsync(path.join(targetDir, "bridge-config.js"), configSource));
 }
 
-function withTransientFsRetry(operation, attempts = 4) {
+async function withTransientFsRetry(operation, attempts = 4) {
   let lastError;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
-      return operation();
+      return await operation();
     } catch (error) {
       lastError = error;
       if (!["EIO", "EBUSY", "EPERM"].includes(String(error?.code || "")) || attempt + 1 >= attempts) {
         throw error;
       }
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 40 * (attempt + 1));
+      await new Promise((resolve) => setTimeout(resolve, 40 * (attempt + 1)));
     }
   }
   throw lastError;
@@ -647,7 +803,13 @@ function listRegularFiles(rootDir, relativeDir = "") {
 }
 
 function sha256File(filePath) {
-  return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+  return crypto.createHash("sha256")
+    .update(readBoundedLocalFileSync(filePath, { maxBytes: MAX_EXTENSION_FILE_BYTES }).buffer)
+    .digest("hex");
+}
+
+function readBoundedUtf8(filePath, maxBytes) {
+  return readBoundedLocalFileSync(filePath, { maxBytes }).buffer.toString("utf8");
 }
 
 function defaultChromeUserDataDir() {
@@ -657,14 +819,14 @@ function defaultChromeUserDataDir() {
     : "";
 }
 
-function discoverChromeBridgeExtensionInstallations(chromeUserDataDir) {
+async function discoverChromeBridgeExtensionInstallations(chromeUserDataDir) {
   const root = String(chromeUserDataDir || "").trim();
   if (!root || !path.isAbsolute(root)) {
     return [];
   }
   let childProfiles;
   try {
-    childProfiles = fs.readdirSync(root, { withFileTypes: true })
+    childProfiles = (await fs.promises.readdir(root, { withFileTypes: true }))
       .filter((entry) => entry.isDirectory() && (
         entry.name === "Default" ||
         entry.name === "Guest Profile" ||
@@ -683,11 +845,10 @@ function discoverChromeBridgeExtensionInstallations(chromeUserDataDir) {
       const preferencesPath = path.join(profile, preferencesName);
       let preferences;
       try {
-        const stat = fs.statSync(preferencesPath);
-        if (!stat.isFile() || stat.size > 32 * 1024 * 1024) {
-          continue;
-        }
-        preferences = JSON.parse(fs.readFileSync(preferencesPath, "utf8"));
+        const { buffer } = await readBoundedLocalFile(preferencesPath, {
+          maxBytes: MAX_CHROME_PREFERENCES_BYTES,
+        });
+        preferences = JSON.parse(buffer.toString("utf8"));
       } catch {
         continue;
       }
@@ -705,7 +866,7 @@ function discoverChromeBridgeExtensionInstallations(chromeUserDataDir) {
           continue;
         }
         const resolved = path.resolve(candidate);
-        if (isVerifiedBridgeExtensionDirectory(resolved)) {
+        if (await isVerifiedBridgeExtensionDirectory(resolved)) {
           discovered.push({
             id: String(id || "").trim(),
             path: resolved,
@@ -723,14 +884,13 @@ function discoverChromeBridgeExtensionInstallations(chromeUserDataDir) {
   return [...unique.values()];
 }
 
-function isVerifiedBridgeExtensionDirectory(candidate) {
+async function isVerifiedBridgeExtensionDirectory(candidate) {
   try {
     const manifestPath = path.join(candidate, "manifest.json");
-    const stat = fs.statSync(manifestPath);
-    if (!stat.isFile() || stat.size > 1024 * 1024) {
-      return false;
-    }
-    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    const { buffer } = await readBoundedLocalFile(manifestPath, {
+      maxBytes: MAX_CHROME_MANIFEST_BYTES,
+    });
+    const manifest = JSON.parse(buffer.toString("utf8"));
     const scripts = Array.isArray(manifest.content_scripts)
       ? manifest.content_scripts.flatMap((entry) => Array.isArray(entry?.js) ? entry.js : [])
       : [];
@@ -747,7 +907,7 @@ function isVerifiedBridgeExtensionDirectory(candidate) {
 function readAndValidateManifest(manifestPath) {
   let manifest;
   try {
-    manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    manifest = JSON.parse(readBoundedUtf8(manifestPath, MAX_BRIDGE_METADATA_BYTES));
   } catch (error) {
     throw new Error(`双倍额度嵌入清单无法读取：${error.message}`);
   }
@@ -764,7 +924,7 @@ function readAndValidateManifest(manifestPath) {
 
 function readExtensionManifest(manifestPath) {
   try {
-    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    const manifest = JSON.parse(readBoundedUtf8(manifestPath, MAX_BRIDGE_METADATA_BYTES));
     return {
       name: String(manifest.name || "").trim(),
       version: String(manifest.version || "").trim(),
@@ -848,7 +1008,7 @@ function upsertChatgptBridgeMcpConfig(content, { command, mcpEntry, dataDir }) {
 function hasChatgptBridgeMcpConfig(configPath) {
   try {
     return /^\s*\[mcp_servers\.chatgpt_codex_bridge\]\s*$/m.test(
-      fs.readFileSync(configPath, "utf8"),
+      readBoundedUtf8(configPath, MAX_CODEX_CONFIG_BYTES),
     );
   } catch {
     return false;
@@ -1048,7 +1208,7 @@ function sameResolvedPath(left, right) {
 
 function readExtensionDeploymentReceipt(receiptPath, extensionDir) {
   try {
-    const parsed = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+    const parsed = JSON.parse(readBoundedUtf8(receiptPath, MAX_BRIDGE_METADATA_BYTES));
     if (
       parsed?.schemaVersion !== 1 ||
       parsed?.verified !== true ||
@@ -1066,13 +1226,25 @@ function readExtensionDeploymentReceipt(receiptPath, extensionDir) {
   }
 }
 
-function persistExtensionDeploymentReceipt(receiptPath, receipt) {
-  writeFileAtomic(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`);
+async function persistExtensionDeploymentReceipt(receiptPath, receipt) {
+  await writeFileAtomicAsync(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`);
   return {
     ...receipt,
     persisted: true,
     receiptPath: path.resolve(receiptPath),
   };
+}
+
+async function writeFileAtomicAsync(target, content) {
+  await fs.promises.mkdir(path.dirname(target), { recursive: true });
+  const temp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await fs.promises.writeFile(temp, content, Buffer.isBuffer(content) ? undefined : "utf8");
+    await fs.promises.rename(temp, target);
+  } catch (error) {
+    await fs.promises.unlink(temp).catch(() => {});
+    throw error;
+  }
 }
 
 function writeFileAtomic(target, content) {
@@ -1095,55 +1267,60 @@ function timestampForFile() {
   return new Date().toISOString().replaceAll(":", "").replaceAll(".", "-");
 }
 
-function requestJsonOverHttp(url, { timeoutMs = 1200, headers = {} } = {}) {
-  return new Promise((resolve) => {
-    const request = http.get(url, { timeout: timeoutMs, headers }, (response) => {
-      const chunks = [];
-      response.on("data", (chunk) => chunks.push(chunk));
-      response.on("end", () => {
-        if (response.statusCode !== 200) {
-          resolve(null);
-          return;
-        }
-        try {
-          resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-        } catch {
-          resolve(null);
-        }
-      });
-    });
-    request.on("timeout", () => request.destroy());
-    request.on("error", () => resolve(null));
-  });
-}
-
 function terminateOwnedChild(child, timeoutMs = 5000) {
   return new Promise((resolve, reject) => {
     let settled = false;
+    let forced = false;
+    let forceTimer = null;
     const finish = (error, result = { forced: false }) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      clearTimeout(gracefulTimer);
+      if (forceTimer !== null) clearTimeout(forceTimer);
+      child.removeListener("exit", onExit);
+      child.removeListener("close", onExit);
       if (error) reject(error);
       else resolve(result);
     };
-    const timer = setTimeout(() => {
+    const onExit = () => finish(null, { forced });
+    const gracefulTimer = setTimeout(() => {
+      forced = true;
       try {
-        child.kill("SIGKILL");
-        finish(null, { forced: true });
+        if (!child.kill("SIGKILL")) {
+          finish(bridgeStopError(
+            "bridge_force_stop_signal_rejected",
+            "双倍额度服务强制退出信号发送失败。",
+          ));
+          return;
+        }
+        if (settled) return;
+        forceTimer = setTimeout(() => finish(bridgeStopError(
+          "bridge_force_stop_unconfirmed",
+          "双倍额度服务收到强制退出信号后仍未确认退出。",
+        )), timeoutMs);
       } catch (error) {
         finish(error);
       }
     }, timeoutMs);
-    child.once("exit", () => finish(null, { forced: false }));
+    child.once("exit", onExit);
+    child.once("close", onExit);
     try {
       if (!child.kill("SIGTERM")) {
-        finish(new Error("双倍额度服务退出信号发送失败。"));
+        finish(bridgeStopError(
+          "bridge_stop_signal_rejected",
+          "双倍额度服务退出信号发送失败。",
+        ));
       }
     } catch (error) {
       finish(error);
     }
   });
+}
+
+function bridgeStopError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
 }
 
 module.exports = {

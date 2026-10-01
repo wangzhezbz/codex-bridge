@@ -90,19 +90,19 @@ function normalizeCachedEnvelope(value, catalogUrl, maxCatalogBytes, maxSignatur
   return { catalogUrl, jsonBytes, signatureText };
 }
 
-function isBehindBundledBaseline(candidate, bundled) {
-  if (!candidate || !bundled) return false;
+function isBehindBaseline(candidate, baseline) {
+  if (!candidate || !baseline) return false;
   for (const componentId of COMPONENT_IDS) {
-    let bundledEntry;
-    try { bundledEntry = bundled.getComponent(componentId); } catch { continue; }
+    let baselineEntry;
+    try { baselineEntry = baseline.getComponent(componentId); } catch { continue; }
     let candidateEntry;
     try { candidateEntry = candidate.getComponent(componentId); } catch { return true; }
-    if (compareVersions(candidateEntry.version, bundledEntry.version) < 0) return true;
+    if (compareVersions(candidateEntry.version, baselineEntry.version) < 0) return true;
   }
-  for (const bundledSkill of bundled.listSkills()) {
+  for (const baselineSkill of baseline.listSkills()) {
     let candidateSkill;
-    try { candidateSkill = candidate.getSkill(bundledSkill.id); } catch { return true; }
-    if (compareVersions(candidateSkill.version, bundledSkill.version) < 0) return true;
+    try { candidateSkill = candidate.getSkill(baselineSkill.id); } catch { return true; }
+    if (compareVersions(candidateSkill.version, baselineSkill.version) < 0) return true;
   }
   return false;
 }
@@ -183,7 +183,14 @@ async function readBounded(response, maxBytes, signal) {
 async function fetchBounded(fetchImpl, url, maxBytes, signal) {
   let response;
   try {
-    response = await raceWithSignal(fetchImpl(url, { redirect: "error", signal }), signal);
+    const pending = Promise.resolve(fetchImpl(url, { redirect: "error", signal })).then((value) => {
+      if (signal.aborted) {
+        cancelBody(value);
+        throw signal.reason ?? timeoutError();
+      }
+      return value;
+    });
+    response = await raceWithSignal(pending, signal);
     return await readBounded(response, maxBytes, signal);
   } catch (error) {
     if (signal.aborted) throw signal.reason ?? timeoutError();
@@ -241,18 +248,28 @@ export function createCachedCatalogProvider({
     })), "bundled");
   const offlineRefresh = Promise.resolve(null);
   let refreshInFlight = null;
+  let lastTrustedService = bundledService;
+
+  function rememberCatalog(service) {
+    if (service && !isBehindBaseline(service, lastTrustedService)) {
+      lastTrustedService = service;
+    }
+    return lastTrustedService;
+  }
 
   async function getCurrent() {
     if (publicKeyPem === null) return null;
     try {
       const cached = await cache.readEnvelope();
-      if (cached === null) return bundledService;
+      if (cached === null) return lastTrustedService;
       const envelope = normalizeCachedEnvelope(cached, catalogUrl, maxCatalogBytes, maxSignatureBytes);
       const catalog = verifyCatalogEnvelope({ ...envelope, publicKeyPem });
       const cachedService = mark(createTrustedCatalogService(catalog), "cache");
-      return isBehindBundledBaseline(cachedService, bundledService) ? bundledService : cachedService;
+      // A disappearing/older disk cache, including a late read, must not erase
+      // a newer verified catalog already in use by this provider instance.
+      return rememberCatalog(cachedService);
     } catch (error) {
-      if (bundledService) return bundledService;
+      if (lastTrustedService) return lastTrustedService;
       throw error;
     }
   }
@@ -268,8 +285,15 @@ export function createCachedCatalogProvider({
       const envelope = { catalogUrl, jsonBytes, signatureText };
       const catalog = verifyCatalogEnvelope({ ...envelope, publicKeyPem });
       const service = mark(createTrustedCatalogService(catalog), "remote", new Date().toISOString());
+      // An invalid cache can be repaired by a verified refresh, but a valid
+      // current catalog and the bundled floor must not be rolled back.
+      await raceWithSignal(getCurrent().catch(() => null), controller.signal);
+      if (isBehindBaseline(service, bundledService) || isBehindBaseline(service, lastTrustedService)) {
+        throw catalogError("catalog_version_rollback");
+      }
       await cache.replaceEnvelope(envelope);
-      return service;
+      // A failed cache replacement must not advance the accepted baseline.
+      return rememberCatalog(service);
     } finally {
       clearTimeout(timer);
     }

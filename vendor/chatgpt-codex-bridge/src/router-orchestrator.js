@@ -3,6 +3,7 @@ import { createReadStream, createWriteStream } from "node:fs";
 import { mkdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
+import { routerRecovery, observeRouterRecovery } from "./router-recovery.js";
 
 const TERMINAL_STATUSES = new Set(["succeeded", "failed", "cancelled"]);
 const TRANSPORT_STATUSES = new Set(["queued", "running", "succeeded", "failed", "cancelled"]);
@@ -294,8 +295,9 @@ function payloadForStage(run, stageIndex, options = {}) {
   }
   const preservesConversationContext = options.preservesConversationContext === true;
   const context = preservesConversationContext ? "" : priorStageContext(run, stageIndex);
+  const stageInstructions = [...new Set([stage.payloadText?.trim(), stage.instruction?.trim()].filter(Boolean))];
   return [
-    stage.instruction || `请完成“${stage.title}”。`,
+    stageInstructions.join("\n\n") || `请完成“${stage.title}”。`,
     preservesConversationContext ? "" : null,
     preservesConversationContext
       ? "请严格承接本会话中已经完成的前序阶段结果，不要重复复述前序内容。"
@@ -1772,6 +1774,7 @@ export function createRouterOrchestrator(options = {}) {
             throwIfAborted(input.signal);
             const waitPromise = transport.wait(stage.transportRequestId, {
               ...(input.waitOptions || {}),
+              ...(input.waitForGpt !== true ? { timeoutMs: 1, pollMs: 1, timeoutGraceMs: 0, failOnTimeout: false } : {}),
               signal: input.signal
             });
             lateTransportResult = validateTransportResult(
@@ -1786,7 +1789,13 @@ export function createRouterOrchestrator(options = {}) {
             return result(run);
           }
           if (lateTransportResult.status !== "succeeded") {
-            return result(run, lateTransportResult);
+            let latest = await runStore.get(run.id, input.scope);
+            const job = lateTransportResult.raw?.waited?.finalJob;
+            if (lateTransportResult.status === "cancelled" && routerRecovery(latest, job, { allowTerminal: true })) {
+              latest = await runStore.cancelRecoveredStage(run.id, input.scope, { job, reason: lateTransportResult.error, signal: input.signal });
+            }
+            const observation = observeRouterRecovery(latest, job);
+            return { ...result(latest, lateTransportResult), ...(observation || {}) };
           }
           throwIfAborted(input.signal);
           run = await runStore.reopenFailedStageForSucceededTransport(run.id, input.scope, {
@@ -1960,6 +1969,31 @@ export function createRouterOrchestrator(options = {}) {
 
     while (true) {
       let run = await runStore.get(input.runId, input.scope);
+      const failedStage = run.stages?.[run.currentStageIndex];
+      if (run.transportId === "web-sync" && run.status === "failed" &&
+          failedStage?.status === "failed" && failedStage.submissionState === "submitted" &&
+          failedStage.transportRequestId) {
+        const transport = transportRegistry.resolve(run.transportId);
+        const requestId = failedStage.transportRequestId;
+        const observed = validateTransportResult(await transport.wait(requestId, {
+          timeoutMs: 1, pollMs: 1, timeoutGraceMs: 0, failOnTimeout: false, signal: input.signal
+        }), run.transportId, requestId);
+        const job = observed.raw?.waited?.finalJob;
+        if (routerRecovery(run, job, { allowTerminal: true })) {
+          transportResult = validateTransportResult(await transport.cancel(requestId, { reason }), run.transportId, requestId);
+          if (transportResult.status === "cancelled") {
+            run = await runStore.cancelRecoveredStage(run.id, input.scope, { job: transportResult.raw, reason, signal: input.signal });
+            return result(run, transportResult);
+          }
+          if (transportResult.status === "succeeded") {
+            const settled = await continueRouterRun({ ...input, waitForGpt: false,
+              waitOptions: { timeoutMs: 1, pollMs: 1, timeoutGraceMs: 0, failOnTimeout: false } });
+            if (settled.routerRun.status === "failed" || TERMINAL_STATUSES.has(settled.routerRun.status)) return settled;
+            continue;
+          }
+          return result(run, transportResult);
+        }
+      }
       if (TERMINAL_STATUSES.has(run.status)) {
         return result(run, transportResult);
       }

@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 
 const DEFAULT_CAPACITY = 1_024;
 const MAX_DIAGNOSTIC_TEXT_LENGTH = 160;
+const MAX_FINGERPRINT_DEPTH = 128;
+const MAX_FINGERPRINT_NODES = 200_000;
 const FINGERPRINT_NAMESPACE = "codexbridge-pending-request-v1";
 const CLIENT_IDENTITY_HEADERS = Object.freeze([
   "x-codex-thread-id",
@@ -34,7 +36,16 @@ export function createPendingRequestGuard(options = {}) {
       };
     }
 
-    const fingerprint = fingerprintPendingRequest(input);
+    let fingerprint;
+    try {
+      fingerprint = fingerprintPendingRequest(input);
+    } catch {
+      return {
+        status: "fingerprint_bypass",
+        protected: false,
+        reasonCode: "pending_guard_fingerprint_unavailable",
+      };
+    }
     const existing = pending.get(fingerprint);
     if (existing) {
       return {
@@ -283,10 +294,14 @@ function normalizedOwnershipToken(value) {
 }
 
 function stableJson(value) {
-  return stableJsonValue(value, new Set(), false);
+  return stableJsonValue(value, new Set(), false, { nodes: 0 }, 0);
 }
 
-function stableJsonValue(value, ancestors, arrayMember) {
+function stableJsonValue(value, ancestors, arrayMember, state, depth) {
+  state.nodes += 1;
+  if (state.nodes > MAX_FINGERPRINT_NODES || depth > MAX_FINGERPRINT_DEPTH) {
+    throw new TypeError("request body exceeds duplicate fingerprint complexity limits");
+  }
   if (value === null) {
     return "null";
   }
@@ -313,12 +328,12 @@ function stableJsonValue(value, ancestors, arrayMember) {
   let serialized;
   if (Array.isArray(value)) {
     serialized = `[${value
-      .map((item) => stableJsonValue(item, ancestors, true) ?? "null")
+      .map((item) => stableJsonValue(item, ancestors, true, state, depth + 1) ?? "null")
       .join(",")}]`;
   } else {
     const fields = [];
     for (const key of Object.keys(value).sort()) {
-      const field = stableJsonValue(value[key], ancestors, false);
+      const field = stableJsonValue(value[key], ancestors, false, state, depth + 1);
       if (field !== undefined) {
         fields.push(`${JSON.stringify(key)}:${field}`);
       }

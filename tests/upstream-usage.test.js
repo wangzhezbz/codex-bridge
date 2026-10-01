@@ -81,6 +81,104 @@ test("camelCase usage fields derive total tokens when the provider omits them", 
   );
 });
 
+test("Responses and Chat usage split nested cache writes from ordinary input", async () => {
+  const { normalizeUsage } = await import("../src/upstream-usage.js");
+  const cases = [
+    {
+      input_tokens: 100_000,
+      output_tokens: 25,
+      input_tokens_details: { cached_tokens: 0, cache_write_tokens: 100_000 },
+      expectedFresh: 0,
+      expectedRead: 0,
+      expectedWrite: 100_000,
+    },
+    {
+      prompt_tokens: 100_000,
+      completion_tokens: 25,
+      prompt_tokens_details: { cached_tokens: 20_000, cache_write_tokens: 30_000 },
+      expectedFresh: 50_000,
+      expectedRead: 20_000,
+      expectedWrite: 30_000,
+    },
+    {
+      inputTokens: 100_000,
+      outputTokens: 25,
+      inputTokensDetails: { cachedTokens: 20_000, cacheWriteTokens: 30_000 },
+      expectedFresh: 50_000,
+      expectedRead: 20_000,
+      expectedWrite: 30_000,
+    },
+  ];
+  for (const { expectedFresh, expectedRead, expectedWrite, ...raw } of cases) {
+    const usage = normalizeUsage(raw);
+    assert.equal(usage.prompt_tokens, 100_000);
+    assert.equal(usage.fresh_prompt_tokens, expectedFresh);
+    assert.equal(usage.cache_read_tokens, expectedRead);
+    assert.equal(usage.cache_creation_tokens, expectedWrite);
+    assert.equal(usage.total_tokens, 100_025);
+  }
+});
+
+test("native Anthropic cache counters are additional to ordinary input", async () => {
+  const { normalizeUsage } = await import("../src/upstream-usage.js");
+  assert.deepEqual(normalizeUsage({
+    input_tokens: 10,
+    cache_read_input_tokens: 20,
+    cache_creation_input_tokens: 30,
+    output_tokens: 5,
+  }), {
+    prompt_tokens: 60,
+    fresh_prompt_tokens: 10,
+    cache_read_tokens: 20,
+    cache_creation_tokens: 30,
+    cache_miss_tokens: 0,
+    completion_tokens: 5,
+    total_tokens: 65,
+  });
+});
+
+test("modern write pricing provenance is restricted to known official API models", async () => {
+  const { normalizeUsage } = await import("../src/upstream-usage.js");
+  const raw = { input_tokens: 100, input_tokens_details: { cache_write_tokens: 100 } };
+  const cases = [
+    [{ model: "gpt-6-astra", baseUrl: "https://api.openai.com/v1", authMode: "api_key" }, "openai"],
+    [{ model: "gpt-5.6-sol", baseUrl: "https://api.openai.com/v1" }, "openai"],
+    [{ model: "gpt-5.6-terra", baseUrl: "https://api.openai.com/v1" }, "openai"],
+    [{ model: "gpt-5.6-luna", baseUrl: "https://api.openai.com/v1" }, "openai"],
+    [{ model: "gpt-5.5", baseUrl: "https://api.openai.com/v1" }, "input"],
+    [{ model: "gpt-6-astra", baseUrl: "https://proxy.example/v1", provider: "openai" }, "input"],
+    [{ model: "gpt-6-astra", baseUrl: "https://api.openai.com.example/v1" }, "input"],
+    [{ model: "gpt-6-astra", baseUrl: "https://api.openai.com/v1", authMode: "codex_openai" }, "input"],
+    [{}, "input"],
+  ];
+  for (const [route, expected] of cases) {
+    const normalized = normalizeUsage(raw, route);
+    assert.equal(normalized.cache_write_rate_kind, expected, JSON.stringify(route));
+    assert.deepEqual(normalizeUsage(normalized, route), normalized);
+  }
+  assert.equal(normalizeUsage({
+    input_tokens: 100,
+    input_tokens_details: { cache_write_tokens: 0 },
+  }).cache_write_rate_kind, "input");
+  assert.equal(normalizeUsage({ prompt_tokens: 100, cache_creation_tokens: 100 }).cache_write_rate_kind, undefined);
+});
+
+test("explicit zero fresh or cache-miss counts do not fall back to prompt input", async () => {
+  const { normalizeUsage } = await import("../src/upstream-usage.js");
+  assert.equal(normalizeUsage({
+    prompt_tokens: 100,
+    prompt_cache_miss_tokens: 0,
+    prompt_cache_hit_tokens: 70,
+    cache_creation_tokens: 30,
+  }).fresh_prompt_tokens, 0);
+  assert.equal(normalizeUsage({
+    prompt_tokens: 100,
+    fresh_prompt_tokens: 0,
+    cache_read_tokens: 70,
+    cache_creation_tokens: 30,
+  }).fresh_prompt_tokens, 0);
+});
+
 test("Responses SSE usage extraction returns the completed event usage", async () => {
   const { extractResponsesUsage } = await import("../src/upstream-usage.js");
   const stream = [

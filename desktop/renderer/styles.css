@@ -6074,6 +6074,10 @@ body.resizing-usage-column {
   gap: 12px;
 }
 
+.software-manager-grid.software-manager-codex-only {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .software-component-card {
   display: block;
   min-width: 0;

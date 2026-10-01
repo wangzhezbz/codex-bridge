@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "Codex G某T Bridge",
-  "version": "0.1.57",
-  "version_name": "0.1.57 - 20260801",
-  "description": "Sync Codex workbench messages with a bound G某T session.",
+  "name": "Codex GPT Bridge",
+  "version": "0.1.95",
+  "version_name": "0.1.95 - 20260923",
+  "description": "Sync Codex workbench messages with a bound GPT session.",
   "permissions": [
     "downloads",
     "debugger",

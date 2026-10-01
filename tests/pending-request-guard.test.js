@@ -119,6 +119,19 @@ test("capacity never evicts an active owner and bypasses only a different new ke
   assert.equal(guard.release(first), true);
 });
 
+test("deep request bodies bypass duplicate fingerprinting instead of overflowing the stack", () => {
+  const guard = createPendingRequestGuard();
+  let body = { value: "leaf" };
+  for (let depth = 0; depth < 256; depth += 1) body = { nested: body };
+  const result = beginProtected(guard, exactRequest({ requestBody: body }));
+  assert.deepEqual(result, {
+    status: "fingerprint_bypass",
+    protected: false,
+    reasonCode: "pending_guard_fingerprint_unavailable",
+  });
+  assert.equal(guard.size(), 0);
+});
+
 test("disabled protection bypasses without hashing, token creation, or Map writes", () => {
   let tokensCreated = 0;
   const guard = createPendingRequestGuard({

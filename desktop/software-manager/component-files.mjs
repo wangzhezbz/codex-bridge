@@ -10,8 +10,11 @@ const GIT_VERSION_OUTPUT = /^git version (\d+(?:\.\d+){1,3})\.windows\.([1-9]\d*
 const SHA256 = /^[a-f0-9]{64}$/u;
 const CHATGPT_VERSION_MARKER = ".codexbridge-chatgpt-version.json";
 const CHATGPT_VERSION_MARKER_MAX_BYTES = 1_024;
+const CHATGPT_GREEN_MARKER = ".codexbridge-green-codex.json";
+const CHATGPT_GREEN_MARKER_MAX_BYTES = 4 * 1_024;
 const CHATGPT_RUNTIME_REQUIRED_FILES = new Set([
   CHATGPT_VERSION_MARKER,
+  CHATGPT_GREEN_MARKER,
   "ChatGPT.exe",
   "Codex.exe",
   "chrome.dll",
@@ -164,10 +167,48 @@ function parseChatGPTVersionMarker(bytes) {
   return value.version;
 }
 
+function parseChatGPTGreenMarker(bytes) {
+  if (!Buffer.isBuffer(bytes) || bytes.length === 0 || bytes.length > CHATGPT_GREEN_MARKER_MAX_BYTES) {
+    throw componentError("component_green_marker_invalid");
+  }
+  let value;
+  try { value = JSON.parse(bytes.toString("utf8")); } catch (error) {
+    throw componentError("component_green_marker_invalid", error);
+  }
+  const versionOneKeys = [
+    "schemaVersion", "formatVersion", "componentId", "officialVersion", "electronVersion",
+    "officialResourceTreeSha256", "owlTemplateVersion", "owlTemplateSha256", "contentTreeSha256", "generatedAt",
+  ];
+  const versionTwoKeys = [...versionOneKeys, "portableResourceTreeSha256", "portablePatchIds"];
+  const formatValid = value.formatVersion === 1
+    ? exactKeys(value, versionOneKeys)
+    : value.formatVersion === 2 && exactKeys(value, versionTwoKeys)
+      && SHA256.test(value.portableResourceTreeSha256 ?? "")
+      && Array.isArray(value.portablePatchIds)
+      && value.portablePatchIds.every((item) => [
+        "disable-app-contained-core",
+        "replace-windows-account-native",
+        "replace-windows-updater-native",
+        "rebind-embedded-asar-integrity",
+      ].includes(item))
+      && new Set(value.portablePatchIds).size === value.portablePatchIds.length;
+  if (!formatValid || value.schemaVersion !== 1
+    || value.componentId !== "chatgpt" || !VERSION.test(value.officialVersion ?? "")
+    || !/^\d+(?:\.\d+){2,3}$/u.test(value.electronVersion ?? "")
+    || !VERSION.test(value.owlTemplateVersion ?? "")
+    || !SHA256.test(value.officialResourceTreeSha256 ?? "")
+    || !SHA256.test(value.owlTemplateSha256 ?? "") || !SHA256.test(value.contentTreeSha256 ?? "")
+    || !Number.isFinite(Date.parse(value.generatedAt ?? ""))) {
+    throw componentError("component_green_marker_invalid");
+  }
+  return value;
+}
+
 export function createComponentFileService({
   fileCapabilities,
   installRootCapability,
   catalogService,
+  getInstalledComponent,
   workspace,
   versionReader,
   execFile,
@@ -178,6 +219,9 @@ export function createComponentFileService({
   const packages = requireWorkspace(workspace);
   const versions = requireVersionReader(versionReader);
   if (!isTrustedCatalogService(catalogService)) throw componentError("trusted_catalog_service_required");
+  if (getInstalledComponent !== undefined && typeof getInstalledComponent !== "function") {
+    throw componentError("component_ownership_reader_invalid");
+  }
   if (typeof execFile !== "function") throw componentError("component_exec_file_required");
   if (typeof deleteAuthorizedTree !== "function") throw componentError("component_delete_capability_required");
   if (!Number.isSafeInteger(gitTimeoutMs) || gitTimeoutMs <= 0 || gitTimeoutMs > 60_000) {
@@ -207,13 +251,34 @@ export function createComponentFileService({
   async function verifyComponent(rawPlan) {
     const plan = validateVerificationPlan(rawPlan);
     const entry = catalogService.getComponent(plan.componentId);
-    if (entry.version !== plan.expectedVersion) throw componentError("component_catalog_version_mismatch");
+    // Download authority comes from the signed catalog; installed authority
+    // comes from the persisted record, including after restoring a prior slot.
+    const recordedCurrent = plan.phase === "current" && getInstalledComponent !== undefined;
+    if (!recordedCurrent && entry.version !== plan.expectedVersion) throw componentError("component_catalog_version_mismatch");
+    if (!recordedCurrent && plan.componentId === "chatgpt" && entry.entrypoint !== "ChatGPT.exe") {
+      throw componentError("component_green_marker_missing");
+    }
     const expectedRoot = plan.phase === "staging"
       ? path.win32.join(componentRoot(installRoot, plan.componentId), plan.stagingName)
       : slotRoot(installRoot, plan.componentId, plan.phase);
-    const expectedEntrypoint = relativeFile(expectedRoot, entry.entrypoint);
-    const expectedRequiredFiles = runtimeRequiredRelativeFiles(entry)
+    let expectedEntrypoint = relativeFile(expectedRoot, entry.entrypoint);
+    let expectedRequiredFiles = runtimeRequiredRelativeFiles(entry)
       .map((item) => relativeFile(expectedRoot, item));
+    if (recordedCurrent) {
+      const record = await getInstalledComponent(plan.componentId);
+      if (!isPlainRecord(record) || record.managed !== true || record.version !== plan.expectedVersion
+        || record.installPath !== expectedRoot || !Array.isArray(record.requiredFiles)) {
+        throw componentError("component_owned_record_invalid");
+      }
+      expectedEntrypoint = canonicalPath(record.entrypointPath, "component_catalog_path_mismatch");
+      expectedRequiredFiles = record.requiredFiles.map(file => canonicalPath(file, "component_catalog_path_mismatch"));
+      // A persisted record cannot authorize another slot, a sibling directory,
+      // or raw AppX entrypoints. Pin every recorded file, not the new manifest.
+      relativeBudget(expectedRoot, [expectedEntrypoint, ...expectedRequiredFiles]);
+      if (plan.componentId === "chatgpt" && !samePath(expectedEntrypoint, relativeFile(expectedRoot, "ChatGPT.exe"))) {
+        throw componentError("component_catalog_path_mismatch");
+      }
+    }
     let rootPath;
     let entrypointPath;
     let requiredFiles;
@@ -256,8 +321,11 @@ export function createComponentFileService({
       }
       let actualVersion;
       const markerPath = relativeFile(expectedRoot, CHATGPT_VERSION_MARKER);
+      const greenMarkerPath = relativeFile(expectedRoot, CHATGPT_GREEN_MARKER);
+      const hasVersionMarker = uniquePaths.some((item) => samePath(item, markerPath));
+      const hasGreenMarker = uniquePaths.some((item) => samePath(item, greenMarkerPath));
       if (plan.componentId === "chatgpt"
-        && uniquePaths.some((item) => samePath(item, markerPath))) {
+        && hasVersionMarker) {
         const markerPin = pinsByPath.get(markerPath.toLowerCase());
         if (typeof markerPin?.readFileNoFollow !== "function") {
           throw componentError("component_version_marker_capability_required");
@@ -267,6 +335,19 @@ export function createComponentFileService({
         );
       } else {
         actualVersion = await versions.readFileVersion(entrypointPath);
+      }
+      if (plan.componentId === "chatgpt" && hasGreenMarker) {
+        if (!hasVersionMarker) throw componentError("component_green_marker_missing");
+        const greenPin = pinsByPath.get(greenMarkerPath.toLowerCase());
+        if (typeof greenPin?.readFileNoFollow !== "function") {
+          throw componentError("component_green_marker_capability_required");
+        }
+        const green = parseChatGPTGreenMarker(
+          await greenPin.readFileNoFollow(CHATGPT_GREEN_MARKER_MAX_BYTES),
+        );
+        if (green.officialVersion !== actualVersion || green.officialVersion !== plan.expectedVersion) {
+          throw componentError("component_green_marker_mismatch");
+        }
       }
       if (!VERSION.test(actualVersion ?? "") || compareVersions(actualVersion, plan.expectedVersion) !== 0) {
         throw componentError("component_version_mismatch");

@@ -39,6 +39,8 @@ const GIT_UNINSTALLER_ARGS = Object.freeze([
 const SHORTCUT_NAMES = new Set(["ChatGPT", "V2RayN"]);
 const MAX_SHORTCUT_COLLISIONS = 1_000;
 const MAX_COMMAND_OUTPUT_BYTES = 4 * 1_024 * 1_024;
+const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
+const AUTHENTICODE_TIMEOUT_MS = 120_000;
 
 function hostError(code, cause) {
   const error = new Error(code, cause === undefined ? undefined : { cause });
@@ -114,6 +116,7 @@ function commandOptions(env, overrides = {}) {
     windowsHide: true,
     encoding: "utf8",
     maxBuffer: MAX_COMMAND_OUTPUT_BYTES,
+    timeout: DEFAULT_COMMAND_TIMEOUT_MS,
     env: childEnvironment(env),
     ...overrides,
   };
@@ -575,7 +578,7 @@ export function createWindowsHost({
         powershellPath,
         [...POWERSHELL_ARGS, AUTHENTICODE_COMMAND],
         {
-          options: { env: { CB_SM_PACKAGE_PATH: packagePath } },
+          options: { env: { CB_SM_PACKAGE_PATH: packagePath }, timeout: AUTHENTICODE_TIMEOUT_MS },
           errorCode: "authenticode_query_failed",
         },
       );

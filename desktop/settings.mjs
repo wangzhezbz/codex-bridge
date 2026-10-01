@@ -13,6 +13,8 @@ import {
   providerById,
 } from "./presets.mjs";
 import { normalizeAdapterProfile } from "../src/adapter-profile.js";
+import { optionalUsageCostRate } from "../shared/usage-cost.cjs";
+import { canonicalModelReference, canonicalModelReferenceMap } from "../shared/model-preset-aliases.cjs";
 import { routeCapabilityMatrix, routeCapabilitySummary } from "../src/route-capability-matrix.js";
 import {
   createCapabilityProviderRegistry,
@@ -33,6 +35,7 @@ import {
   CODEX_BRIDGE_PROVIDER_ID,
   codexBridgeProviderIdForMode,
   codexBridgeProviderTomlLinesForMode,
+  selectedModelsForModeSwitch,
 } from "./codex-provider.mjs";
 import { createConfigWriteCoordinator } from "./config-write-coordinator.mjs";
 import {
@@ -61,6 +64,9 @@ export function parseConfigPackageImportCandidate(input) {
 import { locateCodexCliSync, locateOpenAIDesktopSync } from "./codex-locator.mjs";
 import { readCodexDesktopPluginPagePolicy } from "./codex-desktop-plugin-page-policy.mjs";
 import { assetNameForPlatform } from "./updater.mjs";
+import boundedResponseBody from "../shared/bounded-response-body.cjs";
+import boundedLocalFile from "../shared/bounded-local-file.cjs";
+import networkDeadline from "../shared/network-deadline.cjs";
 import {
   applyCodexThreadCatalogRecovery,
   previewCodexThreadCatalogRecovery,
@@ -68,6 +74,9 @@ import {
   restoreCodexThreadCatalogRecoveryBackup,
 } from "./codex-thread-catalog-recovery.mjs";
 
+const { cancelResponseBody, readBoundedResponseBytes } = boundedResponseBody;
+const { readBoundedLocalFileSync } = boundedLocalFile;
+const { runWithNetworkDeadline } = networkDeadline;
 const require = createRequire(import.meta.url);
 const repoRootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -88,6 +97,7 @@ export const MODE_ALL_API = "all_api";
 export const MODE_HYBRID = "hybrid";
 
 export const sharedConfigWriteCoordinator = createConfigWriteCoordinator();
+const MAX_LOCAL_JSON_BYTES = 16 * 1024 * 1024;
 
 const KNOWN_CAPABILITY_PROVIDER_GROUPS = [
   "image_generation",
@@ -132,6 +142,10 @@ const CONFIG_PACKAGE_MAX_EMBEDDED_LOGO_BYTES = 256 * 1024;
 const HISTORY_INLINE_THUMBNAIL_MAX_BYTES = 512 * 1024;
 const CODEX_CONFIG_RESTORE_MAX_BYTES = 2 * 1024 * 1024;
 const DEFAULT_CAPABILITY_PROVIDER_RESPONSE_MAX_BYTES = 8 * 1024 * 1024;
+const MAX_CAPABILITY_PROVIDER_RESPONSE_BYTES = 64 * 1024 * 1024;
+const MAX_CAPABILITY_ASSET_BYTES = 256 * 1024 * 1024;
+const MAX_CAPABILITY_REQUEST_TIMEOUT_MS = 10 * 60_000;
+const MAX_CAPABILITY_ASSET_TIMEOUT_MS = 30 * 60_000;
 const PROVIDER_MODEL_DIRECTORY_TIMEOUT_MS = 15_000;
 const PROVIDER_MODEL_REFRESH_REQUEST = Symbol("providerModelRefreshRequest");
 const providerModelRefreshRequests = new Map();
@@ -193,7 +207,7 @@ function invalidateCodexResourceSnapshotCaches() {
   codexAppServerResourceSnapshotCache = null;
 }
 
-const CODEX_REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh"]);
+const CODEX_REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max", "ultra"]);
 const CODEX_SANDBOX_MODES = new Set([
   "read-only",
   "workspace-write",
@@ -825,7 +839,8 @@ export function readJsonIfExists(filePath, fallback = null) {
   if (!fs.existsSync(filePath)) {
     return fallback;
   }
-  return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  const { buffer } = readBoundedLocalFileSync(filePath, { maxBytes: MAX_LOCAL_JSON_BYTES });
+  return JSON.parse(buffer.toString("utf8"));
 }
 
 function writeTextAtomic(target, text) {
@@ -921,16 +936,101 @@ export function saveConfigProfile(rootDir, profile = {}) {
   return normalized;
 }
 
+function configPackageModelReferences({
+  selection = {},
+  desktopOptions = {},
+  modelCapabilities = {},
+  modelImageGeneration = {},
+  profiles = [],
+} = {}) {
+  const ids = new Set();
+  const add = (value) => {
+    const raw = String(value || "").trim();
+    if (!raw) return;
+    const presetId = raw.startsWith(CODEX_BRIDGE_MODEL_ID_PREFIX)
+      ? raw.slice(CODEX_BRIDGE_MODEL_ID_PREFIX.length)
+      : raw;
+    ids.add(canonicalModelReference(presetId));
+  };
+  const addDesktopOptions = (options = {}) => {
+    add(options.codexAuxiliaryModelId);
+    for (const rule of Object.values(options.smartRouting?.autoSelectRules || {})) add(rule?.routeId);
+    for (const routeId of options.smartRouting?.failover?.routeIds || []) add(routeId);
+    for (const routeId of Object.keys(options.usageBudgets?.routes || {})) add(routeId);
+  };
+  for (const presetId of selection.selectedModelIds || []) add(presetId);
+  addDesktopOptions(desktopOptions);
+  for (const presetId of Object.keys(modelCapabilities.imageInput || {})) add(presetId);
+  for (const presetId of Object.keys(modelCapabilities.overrides || {})) add(presetId);
+  for (const presetId of Object.keys(modelImageGeneration || {})) add(presetId);
+  for (const profile of profiles || []) {
+    for (const presetId of profile.selectedModelIds || []) add(presetId);
+    addDesktopOptions(profile.desktopOptions);
+  }
+  return ids;
+}
+
+function portableReferencedRemoteModels(rootDir, packageState, savedCustomModels = []) {
+  const references = configPackageModelReferences(packageState);
+  const builtInIds = new Set(MODEL_PRESETS.map((model) => model.presetId));
+  const savedIds = new Set(savedCustomModels.map((model) => model.presetId));
+  return modelCatalog(rootDir)
+    .filter((model) =>
+      references.has(model.presetId) &&
+      model.synced === true &&
+      !builtInIds.has(model.presetId) &&
+      !savedIds.has(model.presetId) &&
+      model.authMode === "api_key" &&
+      ["responses", "chat_completions"].includes(model.api)
+    )
+    .map((model) => ({
+      presetId: model.presetId,
+      providerId: model.providerId,
+      providerName: model.providerName || providerById(model.providerId)?.name || model.providerId,
+      displayName: model.displayName,
+      description: model.description,
+      api: model.api,
+      baseUrl: model.baseUrl,
+      model: model.model,
+      authMode: "api_key",
+      apiKeyEnv: model.apiKeyEnv || model.keyEnv || providerById(model.providerId)?.keyEnv,
+      keyEnv: model.keyEnv || model.apiKeyEnv || providerById(model.providerId)?.keyEnv,
+      contextWindow: model.contextWindow,
+      inputModalities: Array.isArray(model.inputModalities) ? [...model.inputModalities] : ["text"],
+      ...(Array.isArray(model.dropParams) && model.dropParams.length
+        ? { dropParams: [...model.dropParams] }
+        : {}),
+      custom: true,
+      portableRemote: true,
+    }));
+}
+
 export function exportConfigPackage(rootDir, options = {}) {
   const config = readRouterConfig(rootDir);
   const mode = options.mode || detectModeFromConfig(config);
   const status = secretStatus(rootDir);
   const desktopOptions = portableDesktopOptions(loadDesktopOptions(rootDir));
-  const customModels = portableCustomModels(readCustomModels(rootDir), rootDir);
+  const selection = { mode, selectedModelIds: readSelection(rootDir, mode) };
+  const modelCapabilities = {
+    imageInput: readModelImageInputOverrides(rootDir),
+    overrides: readModelCapabilityOverrides(rootDir),
+  };
+  const profiles = portableConfigProfiles(loadConfigProfiles(rootDir));
+  const modelImageGeneration = portableModelImageGenerationOverrides(readModelImageGenerationOverrides(rootDir));
+  const savedCustomModels = readCustomModels(rootDir);
+  const customModels = portableCustomModels([
+    ...savedCustomModels,
+    ...portableReferencedRemoteModels(rootDir, {
+      selection,
+      desktopOptions,
+      modelCapabilities,
+      modelImageGeneration,
+      profiles,
+    }, savedCustomModels),
+  ], rootDir);
   const providerOverrides = portableProviderOverrides(readProviderOverrides(rootDir), rootDir);
   const capabilityProviders = portableCapabilityProviderConfig(readCapabilityProviderConfig(rootDir));
   const imageProviders = portableImageProviderConfig(readImageProviderConfig(rootDir));
-  const modelImageGeneration = portableModelImageGenerationOverrides(readModelImageGenerationOverrides(rootDir));
   const codexResources = options.includeCodexResources === false
     ? null
     : portableCodexResourceManifest(rootDir, {
@@ -946,10 +1046,7 @@ export function exportConfigPackage(rootDir, options = {}) {
     exportedAt: new Date().toISOString(),
     includesSecrets: false,
     mode,
-    selection: {
-      mode,
-      selectedModelIds: readSelection(rootDir, mode),
-    },
+    selection,
     desktopOptions,
     customModels,
     providerOverrides,
@@ -960,11 +1057,8 @@ export function exportConfigPackage(rootDir, options = {}) {
       customModels,
       providerOverrides,
     }),
-    modelCapabilities: {
-      imageInput: readModelImageInputOverrides(rootDir),
-      overrides: readModelCapabilityOverrides(rootDir),
-    },
-    profiles: portableConfigProfiles(loadConfigProfiles(rootDir)),
+    modelCapabilities,
+    profiles,
     ...(codexResources ? { codexResources } : {}),
     secretKeys: Object.entries(status)
       .filter(([, saved]) => Boolean(saved))
@@ -1251,7 +1345,9 @@ function sameProviderLogoFileSnapshot(expected, actual) {
     Number(expected?.size) === Number(actual?.size) &&
     Number(expected?.nlink) === Number(actual?.nlink) &&
     Number(expected?.mtimeMs) === Number(actual?.mtimeMs) &&
-    Number(expected?.ctimeMs) === Number(actual?.ctimeMs);
+    Number(expected?.ctimeMs) === Number(actual?.ctimeMs) &&
+    expected?.mtimeNs === actual?.mtimeNs &&
+    expected?.ctimeNs === actual?.ctimeNs;
 }
 
 function providerLogoChangedError() {
@@ -1269,7 +1365,7 @@ function readProviderLogoFileSafely(sourcePath, {
     throw new TypeError("Provider logo byte limit must be a positive integer.");
   }
   const source = path.resolve(String(sourcePath || "").trim());
-  const checked = fs.lstatSync(source);
+  const checked = fs.lstatSync(source, { bigint: true });
   assertSingleLinkProviderLogoFile(checked);
   assertProviderLogoByteLimit(checked.size, limit);
 
@@ -1277,18 +1373,31 @@ function readProviderLogoFileSafely(sourcePath, {
   let descriptor = null;
   try {
     descriptor = fs.openSync(source, fs.constants.O_RDONLY | noFollow);
-    const opened = fs.fstatSync(descriptor);
+    const opened = fs.fstatSync(descriptor, { bigint: true });
     assertSingleLinkProviderLogoFile(opened);
-    assertProviderLogoByteLimit(opened.size, limit);
+    const expectedSize = assertProviderLogoByteLimit(opened.size, limit);
     if (!sameProviderLogoFileSnapshot(checked, opened)) {
       throw providerLogoChangedError();
     }
 
-    const bytes = fs.readFileSync(descriptor);
-    const afterRead = fs.fstatSync(descriptor);
+    const bytes = Buffer.alloc(expectedSize);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = fs.readSync(descriptor, bytes, offset, bytes.length - offset, offset);
+      if (!Number.isInteger(count) || count <= 0 || count > bytes.length - offset) {
+        throw providerLogoChangedError();
+      }
+      offset += count;
+    }
+    // Probe at most one extra byte; readFileSync could consume an arbitrarily
+    // enlarged file after the size check above, before we reject its snapshot.
+    if (fs.readSync(descriptor, Buffer.alloc(1), 0, 1, expectedSize) !== 0) {
+      throw providerLogoChangedError();
+    }
+    const afterRead = fs.fstatSync(descriptor, { bigint: true });
     let afterPath;
     try {
-      afterPath = fs.lstatSync(source);
+      afterPath = fs.lstatSync(source, { bigint: true });
     } catch {
       throw providerLogoChangedError();
     }
@@ -1432,9 +1541,14 @@ function assertManagedProviderLogoPath(rootDir, targetPath, {
   return target;
 }
 
-function unlinkSingleProviderLogoTemp(tempPath) {
+function unlinkSingleProviderLogoTemp(tempPath, identity) {
+  if (!identity) return;
   try {
-    fs.unlinkSync(tempPath);
+    const current = fs.lstatSync(tempPath, { bigint: true });
+    if (current.isFile() && !current.isSymbolicLink() && Number(current.nlink) === 1
+      && current.dev === identity.dev && current.ino === identity.ino) {
+      fs.unlinkSync(tempPath);
+    }
   } catch (error) {
     if (error?.code !== "ENOENT") {
       throw error;
@@ -1454,6 +1568,7 @@ function writeProviderLogoAtomic(rootDir, targetPath, content) {
   );
   let descriptor = null;
   let removeTemp = false;
+  let tempIdentity = null;
   try {
     descriptor = fs.openSync(
       temp,
@@ -1461,11 +1576,12 @@ function writeProviderLogoAtomic(rootDir, targetPath, content) {
       0o600,
     );
     removeTemp = true;
-    const opened = fs.fstatSync(descriptor);
+    const opened = fs.fstatSync(descriptor, { bigint: true });
     assertSingleLinkProviderLogoFile(opened);
+    tempIdentity = { dev: opened.dev, ino: opened.ino };
     fs.writeFileSync(descriptor, bytes);
     fs.fsyncSync(descriptor);
-    const written = fs.fstatSync(descriptor);
+    const written = fs.fstatSync(descriptor, { bigint: true });
     assertSingleLinkProviderLogoFile(written);
     if (
       String(opened.dev) !== String(written.dev) ||
@@ -1477,7 +1593,7 @@ function writeProviderLogoAtomic(rootDir, targetPath, content) {
     fs.closeSync(descriptor);
     descriptor = null;
 
-    const tempStat = fs.lstatSync(temp);
+    const tempStat = fs.lstatSync(temp, { bigint: true });
     assertSingleLinkProviderLogoFile(tempStat);
     if (
       String(written.dev) !== String(tempStat.dev) ||
@@ -1491,7 +1607,7 @@ function writeProviderLogoAtomic(rootDir, targetPath, content) {
     fs.renameSync(temp, target);
     removeTemp = false;
 
-    const committed = fs.lstatSync(target);
+    const committed = fs.lstatSync(target, { bigint: true });
     assertSingleLinkProviderLogoFile(committed);
     if (
       String(tempStat.dev) !== String(committed.dev) ||
@@ -1505,7 +1621,7 @@ function writeProviderLogoAtomic(rootDir, targetPath, content) {
       fs.closeSync(descriptor);
     }
     if (removeTemp) {
-      unlinkSingleProviderLogoTemp(temp);
+      unlinkSingleProviderLogoTemp(temp, tempIdentity);
     }
   }
 }
@@ -2569,6 +2685,7 @@ function usageBudgetHasCost(budget = {}) {
   return Boolean(
     Number(budget.inputCostPerMillion || 0) ||
       Number(budget.cacheCostPerMillion || 0) ||
+      budget.cacheWriteCostPerMillion !== undefined ||
       Number(budget.outputCostPerMillion || 0),
   );
 }
@@ -2598,6 +2715,9 @@ function usageBudgetCostText(budget = {}) {
   }
   if (Number(budget.cacheCostPerMillion || 0) > 0) {
     parts.push(`缓存 ${usageBudgetCostNumberText(budget.cacheCostPerMillion)}/百万`);
+  }
+  if (budget.cacheWriteCostPerMillion !== undefined) {
+    parts.push(`写缓存 ${usageBudgetCostNumberText(budget.cacheWriteCostPerMillion)}/百万`);
   }
   if (Number(budget.outputCostPerMillion || 0) > 0) {
     parts.push(`输出 ${usageBudgetCostNumberText(budget.outputCostPerMillion)}/百万`);
@@ -8286,8 +8406,11 @@ export function codexProjectRecoveryPlan({
   homeDir = os.homedir(),
   limit = 500,
   exists = fs.existsSync,
+  sessionTree = null,
 } = {}) {
-  const tree = listCodexSessionTree({ homeDir, limit });
+  const tree = sessionTree && typeof sessionTree === "object" && !Array.isArray(sessionTree)
+    ? sessionTree
+    : listCodexSessionTree({ homeDir, limit });
   const roots = [];
   const seen = new Set();
   for (const project of tree.projects || []) {
@@ -11010,8 +11133,12 @@ export function modelCatalog(rootDir, state = null) {
   const customModels = state && Object.prototype.hasOwnProperty.call(state, "customModels")
     ? state.customModels
     : readCustomModels(rootDir);
+  const portableRemoteIds = new Set(
+    customModels.filter((model) => model.portableRemote === true).map((model) => model.presetId),
+  );
   return [
-    ...effectiveBuiltInModels(rootDir, providers, state),
+    ...effectiveBuiltInModels(rootDir, providers, state)
+      .filter((model) => !portableRemoteIds.has(model.presetId)),
     ...effectiveCustomModels(rootDir, customModels, providers, state),
   ]
     .map((model) => applyProviderSettingsToModel(model, providerMap.get(model.providerId)))
@@ -11098,6 +11225,17 @@ function effectiveBuiltInModels(rootDir, providers = providerCatalog(rootDir), s
       continue;
     }
     models.push(...modelsForProviderDirectoryEntry(provider, entry, presets, usedPresetIds));
+    // A saved /models snapshot is not a permanent replacement for the bundled
+    // directory. New official presets must remain visible after an app update.
+    // Never inject official models into a user-selected compatible gateway.
+    const official = PROVIDERS.find(candidate => candidate.id === providerId);
+    const endpointKey = value => String(value || "").replace(/\/+$/u, "");
+    if (official && entry.fetchedAt && entry.presetRevision !== "2026-09-30"
+      && endpointKey(provider.baseUrl) === endpointKey(official.baseUrl)
+      && (!entry.baseUrl || endpointKey(entry.baseUrl) === endpointKey(official.baseUrl))) {
+      const existing = new Set(models.filter(model => model.providerId === providerId).map(model => model.model));
+      models.push(...presets.filter(model => !existing.has(model.model)));
+    }
   }
   return models;
 }
@@ -11120,7 +11258,7 @@ function modelsForProviderDirectoryEntry(provider, entry, presets, usedPresetIds
       usedPresetIds,
     );
     usedPresetIds.add(presetId);
-    const dropParams = exact?.dropParams || fallbackTemplate?.dropParams || [];
+    const dropParams = exact ? (exact.dropParams || []) : (fallbackTemplate?.dropParams || []);
     const displayName = exact?.displayName || providerDirectoryModelDisplayName(
       provider,
       remoteModel,
@@ -11507,7 +11645,7 @@ function imageInputOverridesFromCapabilities(saved) {
       overrides[presetId] = enabled;
     }
   }
-  return overrides;
+  return canonicalModelReferenceMap(overrides);
 }
 
 export function readModelCapabilityOverrides(rootDir) {
@@ -11524,11 +11662,11 @@ export function readModelCapabilityOverrides(rootDir) {
       overrides[presetId] = normalized;
     }
   }
-  return overrides;
+  return canonicalModelReferenceMap(overrides);
 }
 
 export function saveModelImageInputOverride(rootDir, presetId, enabled) {
-  const id = String(presetId || "").trim();
+  const id = canonicalModelReference(presetId);
   if (!id) {
     throw new Error("Model id is required.");
   }
@@ -11551,7 +11689,7 @@ export function saveModelImageInputOverride(rootDir, presetId, enabled) {
 }
 
 export function saveModelCapabilityOverride(rootDir, presetId, override = {}, options = {}) {
-  const id = String(presetId || "").trim();
+  const id = canonicalModelReference(presetId);
   if (!id) {
     throw new Error("Model id is required.");
   }
@@ -11578,7 +11716,7 @@ export function saveModelCapabilityOverride(rootDir, presetId, override = {}, op
 }
 
 export function resetModelCapabilityOverride(rootDir, presetId) {
-  const id = String(presetId || "").trim();
+  const id = canonicalModelReference(presetId);
   if (!id) {
     throw new Error("Model id is required.");
   }
@@ -11684,6 +11822,7 @@ export async function fetchProviderModelDirectoryCandidate(rootDir, providerId, 
       deadline,
     ]);
     if (!response?.ok) {
+      cancelResponseBody(response);
       throw new Error(`HTTP ${response?.status || 0}: provider model directory request failed.`);
     }
     const body = await Promise.race([
@@ -11736,6 +11875,7 @@ export async function fetchProviderModelDirectoryCandidate(rootDir, providerId, 
 
 export async function testProviderConnection(rootDir, providerInput, {
   fetchImpl = globalThis.fetch,
+  timeoutMs = 30_000,
 } = {}) {
   const provider = resolveConnectionProvider(rootDir, providerInput);
   const providerId = provider?.id || String(providerInput || "").trim();
@@ -11842,15 +11982,27 @@ export async function testProviderConnection(rootDir, providerInput, {
   );
   const headers = providerApiHeaders(provider, apiKey);
   try {
-    const response = await fetchImpl(endpoint, {
-      method: "GET",
-      headers,
+    const requestTimeoutMs = capabilityProviderRequestTimeoutMs(provider, timeoutMs);
+    const { response, body } = await runWithNetworkDeadline(async (signal) => {
+      const response = await fetchImpl(endpoint, {
+        method: "GET",
+        headers,
+        ...(signal ? { signal } : {}),
+      });
+      const body = await readProviderConnectionBody(response, {
+        maxBytes: capabilityProviderResponseMaxBytes(provider),
+        signal,
+      });
+      return { response, body };
+    }, {
+      timeoutMs: requestTimeoutMs,
+      createTimeoutError: () => capabilityExecutionError(
+        "provider_request_timeout",
+        `Provider request timed out after ${requestTimeoutMs}ms.`,
+      ),
     });
     const ok = Boolean(response?.ok);
     const status = Number(response?.status || 0);
-    const body = await readProviderConnectionBody(response, {
-      maxBytes: capabilityProviderResponseMaxBytes(provider),
-    });
     if (!ok) {
       const friendly = providerConnectionHttpError(status, body.text, provider);
       const rateLimited = providerConnectionIsRateLimited(status, body.text);
@@ -12036,6 +12188,17 @@ function capabilityProviderResponseMaxBytes(provider = {}) {
   );
 }
 
+function capabilityProviderRequestTimeoutMs(provider = {}, override) {
+  return positiveProviderTimeoutMs(
+    override ||
+      provider.requestTimeoutMs ||
+      provider.request_timeout_ms ||
+      provider.timeoutMs ||
+      provider.timeout_ms,
+    30_000,
+  );
+}
+
 function capabilityProviderAssetMaxBytes(provider = {}) {
   return positiveProviderResponseBytes(
     provider.maxAssetBytes ||
@@ -12043,12 +12206,26 @@ function capabilityProviderAssetMaxBytes(provider = {}) {
       provider.assetMaxBytes ||
       provider.asset_max_bytes,
     DEFAULT_CAPABILITY_ASSET_MAX_BYTES,
+    MAX_CAPABILITY_ASSET_BYTES,
   );
 }
 
-function positiveProviderResponseBytes(value, fallback) {
+function capabilityProviderAssetTimeoutMs(provider = {}) {
+  return positiveProviderTimeoutMs(
+    provider.assetTimeoutMs || provider.asset_timeout_ms,
+    120_000,
+    MAX_CAPABILITY_ASSET_TIMEOUT_MS,
+  );
+}
+
+function positiveProviderResponseBytes(value, fallback, maximum = MAX_CAPABILITY_PROVIDER_RESPONSE_BYTES) {
   const number = Number(value);
-  return Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback;
+  return Math.min(Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback, maximum);
+}
+
+function positiveProviderTimeoutMs(value, fallback, maximum = MAX_CAPABILITY_REQUEST_TIMEOUT_MS) {
+  const number = Number(value);
+  return Math.min(Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback, maximum);
 }
 
 function providerConnectionSummary(checks = [], extra = {}) {
@@ -12180,7 +12357,7 @@ function providerConnectionCaughtError(error = {}) {
   if (error?.code === "provider_response_too_large") {
     return "供应商响应超过安全大小限制，连接体检已停止。";
   }
-  if (error?.code === "provider_model_directory_timeout" || error?.name === "AbortError") {
+  if (["provider_model_directory_timeout", "provider_request_timeout"].includes(error?.code) || error?.name === "AbortError") {
     return "供应商连接请求超时，请稍后重试。";
   }
   return "供应商连接请求失败，请检查网络、代理和供应商地址后重试。";
@@ -12485,15 +12662,27 @@ export async function testCapabilityProviderConnection(rootDir, input = {}, opti
   };
 
   try {
-    const response = await fetchImpl(endpoint, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
+    const requestTimeoutMs = capabilityProviderRequestTimeoutMs(provider, options.timeoutMs);
+    const { response, body } = await runWithNetworkDeadline(async (signal) => {
+      const response = await fetchImpl(endpoint, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+        ...(signal ? { signal } : {}),
+      });
+      const body = await readProviderConnectionBody(response, {
+        maxBytes: capabilityProviderResponseMaxBytes(provider),
+        signal,
+      });
+      return { response, body };
+    }, {
+      timeoutMs: requestTimeoutMs,
+      createTimeoutError: () => capabilityExecutionError(
+        "provider_request_timeout",
+        `Capability provider request timed out after ${requestTimeoutMs}ms.`,
+      ),
     });
     const status = Number(response?.status || 0);
-    const body = await readProviderConnectionBody(response, {
-      maxBytes: capabilityProviderResponseMaxBytes(provider),
-    });
     if (!response?.ok) {
       const friendly = capabilityProviderHttpError(status, body.text, provider);
       const modelFailure = capabilityProviderModelError(status, body.text, provider);
@@ -12637,6 +12826,7 @@ export async function executeCapabilityProvider(rootDir, input = {}, options = {
         capability: targetCapability,
         fetchImpl,
         localCapabilityExecutor: options.localCapabilityExecutor,
+        timeoutMs: options.timeoutMs,
       }),
     saveResult: ({ capability: targetCapability, provider, request: currentRequest, upstream }) =>
       saveCapabilityExecutionResult(rootDir, {
@@ -12821,15 +13011,27 @@ async function executeGenericCapabilityProvider(rootDir, provider = {}, request 
     headers.Authorization = `Bearer ${apiKey}`;
   }
 
-  const response = await fetchImpl(endpoint, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(capabilityExecutionPayload(provider, request, options.capability)),
+  const requestTimeoutMs = capabilityProviderRequestTimeoutMs(provider, options.timeoutMs);
+  const { response, body } = await runWithNetworkDeadline(async (signal) => {
+    const response = await fetchImpl(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(capabilityExecutionPayload(provider, request, options.capability)),
+      ...(signal ? { signal } : {}),
+    });
+    const body = await readProviderConnectionBody(response, {
+      maxBytes: capabilityProviderResponseMaxBytes(provider),
+      signal,
+    });
+    return { response, body };
+  }, {
+    timeoutMs: requestTimeoutMs,
+    createTimeoutError: () => capabilityExecutionError(
+      "provider_request_timeout",
+      `Capability provider request timed out after ${requestTimeoutMs}ms.`,
+    ),
   });
   const status = Number(response?.status || 0);
-  const body = await readProviderConnectionBody(response, {
-    maxBytes: capabilityProviderResponseMaxBytes(provider),
-  });
   if (!response?.ok) {
     throw capabilityExecutionError(
       "provider_http_error",
@@ -12860,6 +13062,7 @@ async function saveCapabilityExecutionResult(rootDir, input = {}) {
   const fetchImpl = typeof input.fetchImpl === "function" ? input.fetchImpl : globalThis.fetch;
   const payload = await readCapabilityAssetPayload(source, fetchImpl, {
     maxBytes: capabilityProviderAssetMaxBytes(input.provider),
+    timeoutMs: capabilityProviderAssetTimeoutMs(input.provider),
   });
   if (!payload?.bytes?.length) {
     return null;
@@ -12950,9 +13153,12 @@ function firstStringValue(value, keys = []) {
 }
 
 async function readCapabilityAssetPayload(source = {}, fetchImpl, options = {}) {
-  const maxBytes = positiveProviderResponseBytes(options.maxBytes, DEFAULT_CAPABILITY_ASSET_MAX_BYTES);
+  const maxBytes = positiveProviderResponseBytes(
+    options.maxBytes, DEFAULT_CAPABILITY_ASSET_MAX_BYTES, MAX_CAPABILITY_ASSET_BYTES,
+  );
   if (source.base64) {
     const parsed = parseCapabilityBase64(source.base64);
+    assertCapabilityBase64WithinLimit(parsed.base64, maxBytes);
     const bytes = Buffer.from(parsed.base64, "base64");
     assertCapabilityAssetWithinLimit(bytes.length, maxBytes);
     return {
@@ -12966,6 +13172,7 @@ async function readCapabilityAssetPayload(source = {}, fetchImpl, options = {}) 
   }
   if (url.startsWith("data:")) {
     const parsed = parseCapabilityDataUrl(url);
+    assertCapabilityBase64WithinLimit(parsed.base64, maxBytes);
     const bytes = Buffer.from(parsed.base64, "base64");
     assertCapabilityAssetWithinLimit(bytes.length, maxBytes);
     return {
@@ -12985,24 +13192,38 @@ async function readCapabilityAssetPayload(source = {}, fetchImpl, options = {}) 
   if (!["http:", "https:"].includes(parsedUrl.protocol)) {
     return null;
   }
-  const response = await fetchImpl(url);
-  if (!response?.ok) {
-    throw capabilityExecutionError(
-      "asset_download_failed",
-      `能力结果下载失败：HTTP ${response?.status || 0}。`,
-      { statusCode: Number(response?.status || 0) },
-    );
-  }
-  const contentLength = Number.parseInt(responseHeader(response, "content-length"), 10);
-  if (Number.isFinite(contentLength)) {
-    assertCapabilityAssetWithinLimit(contentLength, maxBytes);
-  }
-  const bytes = Buffer.from(await response.arrayBuffer());
-  assertCapabilityAssetWithinLimit(bytes.length, maxBytes);
-  return {
-    bytes,
-    mimeType: responseHeader(response, "content-type").split(";")[0].trim(),
-  };
+  const timeoutMs = positiveProviderTimeoutMs(
+    options.timeoutMs, 120_000, MAX_CAPABILITY_ASSET_TIMEOUT_MS,
+  );
+  return runWithNetworkDeadline(async (signal) => {
+    const response = await fetchImpl(url, signal ? { signal } : undefined);
+    if (!response?.ok) {
+      cancelResponseBody(response);
+      throw capabilityExecutionError(
+        "asset_download_failed",
+        `能力结果下载失败：HTTP ${response?.status || 0}。`,
+        { statusCode: Number(response?.status || 0) },
+      );
+    }
+    const bytes = await readBoundedResponseBytes(response, {
+      maxBytes,
+      signal,
+      createTooLargeError: ({ actualBytes }) => capabilityExecutionError(
+        "asset_too_large",
+        `Capability result asset is too large: ${actualBytes} bytes; limit ${maxBytes} bytes.`,
+      ),
+    });
+    return {
+      bytes,
+      mimeType: responseHeader(response, "content-type").split(";")[0].trim(),
+    };
+  }, {
+    timeoutMs,
+    createTimeoutError: () => capabilityExecutionError(
+      "asset_download_timeout",
+      `Capability result download timed out after ${timeoutMs}ms.`,
+    ),
+  });
 }
 
 function assertCapabilityAssetWithinLimit(bytes, maxBytes) {
@@ -13012,6 +13233,13 @@ function assertCapabilityAssetWithinLimit(bytes, maxBytes) {
       `Capability result asset is too large: ${bytes} bytes; limit ${maxBytes} bytes.`,
     );
   }
+}
+
+function assertCapabilityBase64WithinLimit(value, maxBytes) {
+  const compact = String(value || "").replace(/\s+/g, "");
+  const padding = compact.endsWith("==") ? 2 : compact.endsWith("=") ? 1 : 0;
+  const estimatedBytes = Math.max(0, Math.floor((compact.length * 3) / 4) - padding);
+  assertCapabilityAssetWithinLimit(estimatedBytes, maxBytes);
 }
 
 function parseCapabilityBase64(value = "") {
@@ -13297,6 +13525,9 @@ function capabilityExecutionErrorMessage(error = {}, provider = {}, capability =
   if (error.code === "provider_response_too_large") {
     return `${providerName} 返回的${capabilityName}响应过大，CodexBridge 已停止读取，避免卡住或把异常页面写进结果。请调小返回内容、改用文件链接，或提高该能力供应商的 maxResponseBytes 上限。`;
   }
+  if (error.code === "provider_request_timeout") {
+    return `${providerName} 的${capabilityName}请求超时，CodexBridge 已停止等待。请检查网络、代理、Base URL 或供应商状态后重试。`;
+  }
   if (error.code === "asset_too_large") {
     return `${providerName} 返回的${capabilityName}结果文件过大，CodexBridge 已停止下载，避免占用过多内存或磁盘。请调小图片/音频/视频尺寸，改用更小的结果，或提高该能力供应商的 maxAssetBytes 上限。`;
   }
@@ -13304,6 +13535,9 @@ function capabilityExecutionErrorMessage(error = {}, provider = {}, capability =
     const status = Number(error.statusCode || 0);
     const statusText = status ? `（HTTP ${status}）` : "";
     return `${providerName} 已返回 ${capabilityName}结果，但结果文件下载失败${statusText}。请检查图片链接是否过期、是否需要权限，或稍后重试。`;
+  }
+  if (error.code === "asset_download_timeout") {
+    return `${providerName} 已返回 ${capabilityName}结果，但结果文件下载超时。请检查网络、代理或结果链接后重试。`;
   }
   if (error.code === "invalid_asset_data") {
     return `${providerName} 已返回 ${capabilityName}结果，但结果文件格式无效，CodexBridge 无法保存展示。请检查供应商返回格式。`;
@@ -13783,9 +14017,18 @@ function normalizeCustomCapabilityProvider(input = {}) {
       input.responseMaxBytes ||
       input.response_max_bytes,
     0,
+    MAX_CAPABILITY_PROVIDER_RESPONSE_BYTES,
   );
   if (maxResponseBytes) {
     provider.maxResponseBytes = maxResponseBytes;
+  }
+  const requestTimeoutMs = positiveProviderTimeoutMs(
+    input.requestTimeoutMs || input.request_timeout_ms || input.timeoutMs || input.timeout_ms,
+    0,
+    MAX_CAPABILITY_REQUEST_TIMEOUT_MS,
+  );
+  if (requestTimeoutMs) {
+    provider.requestTimeoutMs = requestTimeoutMs;
   }
   const maxAssetBytes = positiveProviderResponseBytes(
     input.maxAssetBytes ||
@@ -13793,9 +14036,18 @@ function normalizeCustomCapabilityProvider(input = {}) {
       input.assetMaxBytes ||
       input.asset_max_bytes,
     0,
+    MAX_CAPABILITY_ASSET_BYTES,
   );
   if (maxAssetBytes) {
     provider.maxAssetBytes = maxAssetBytes;
+  }
+  const assetTimeoutMs = positiveProviderTimeoutMs(
+    input.assetTimeoutMs || input.asset_timeout_ms,
+    0,
+    MAX_CAPABILITY_ASSET_TIMEOUT_MS,
+  );
+  if (assetTimeoutMs) {
+    provider.assetTimeoutMs = assetTimeoutMs;
   }
   const defaults = plainObject(input.defaults);
   if (Object.keys(defaults).length) {
@@ -13850,9 +14102,26 @@ function normalizeImageProvider(input = {}) {
       input.assetMaxBytes ||
       input.asset_max_bytes,
     0,
+    MAX_CAPABILITY_ASSET_BYTES,
   );
   if (maxAssetBytes) {
     provider.maxAssetBytes = maxAssetBytes;
+  }
+  const requestTimeoutMs = positiveProviderTimeoutMs(
+    input.requestTimeoutMs || input.request_timeout_ms || input.timeoutMs || input.timeout_ms,
+    0,
+    MAX_CAPABILITY_REQUEST_TIMEOUT_MS,
+  );
+  if (requestTimeoutMs) {
+    provider.requestTimeoutMs = requestTimeoutMs;
+  }
+  const assetTimeoutMs = positiveProviderTimeoutMs(
+    input.assetTimeoutMs || input.asset_timeout_ms,
+    0,
+    MAX_CAPABILITY_ASSET_TIMEOUT_MS,
+  );
+  if (assetTimeoutMs) {
+    provider.assetTimeoutMs = assetTimeoutMs;
   }
   const defaults = plainObject(input.defaults);
   if (Object.keys(defaults).length) {
@@ -13900,7 +14169,9 @@ function capabilityProviderFromCustomProvider(provider = {}, options = {}) {
     ...(provider.model ? { model: provider.model } : {}),
     ...(provider.apiKeyEnv ? { apiKeyEnv: provider.apiKeyEnv } : {}),
     ...(provider.maxResponseBytes ? { maxResponseBytes: provider.maxResponseBytes } : {}),
+    ...(provider.requestTimeoutMs ? { requestTimeoutMs: provider.requestTimeoutMs } : {}),
     ...(provider.maxAssetBytes ? { maxAssetBytes: provider.maxAssetBytes } : {}),
+    ...(provider.assetTimeoutMs ? { assetTimeoutMs: provider.assetTimeoutMs } : {}),
     ...(Object.keys(plainObject(provider.defaults)).length ? { defaults: plainObject(provider.defaults) } : {}),
     index: Number.isFinite(Number(options.index)) ? Number(options.index) : 0,
     ...(provider.lastTest ? { lastTest: provider.lastTest } : {}),
@@ -13933,6 +14204,8 @@ function capabilityProviderFromImageProvider(provider = {}, options = {}) {
     ...(Object.keys(plainObject(provider.request)).length ? { request: plainObject(provider.request) } : {}),
     ...(Object.keys(plainObject(provider.headers)).length ? { headers: plainObject(provider.headers) } : {}),
     ...(provider.maxAssetBytes ? { maxAssetBytes: provider.maxAssetBytes } : {}),
+    ...(provider.requestTimeoutMs ? { requestTimeoutMs: provider.requestTimeoutMs } : {}),
+    ...(provider.assetTimeoutMs ? { assetTimeoutMs: provider.assetTimeoutMs } : {}),
     ...(Object.keys(plainObject(provider.defaults)).length ? { defaults: plainObject(provider.defaults) } : {}),
     index: Number.isFinite(Number(options.index)) ? Number(options.index) : 0,
     ...(provider.lastTest ? { lastTest: provider.lastTest } : {}),
@@ -14294,11 +14567,11 @@ export function readModelImageGenerationOverrides(rootDir) {
       }
     }
   }
-  return overrides;
+  return canonicalModelReferenceMap(overrides);
 }
 
 export function saveModelImageGenerationOverride(rootDir, presetId, settings) {
-  const id = String(presetId || "").trim();
+  const id = canonicalModelReference(presetId);
   if (!id) {
     throw new Error("Model id is required.");
   }
@@ -15025,6 +15298,9 @@ export async function applyModeSwitchTransaction({
   homeDir = os.homedir(),
   mode,
   selectedModelIds = [],
+  preserveApiSelection = false,
+  preserveSelection = false,
+  expectedSelectedModelIds,
   coordinator = sharedConfigWriteCoordinator,
   verifyCommitted,
 } = {}) {
@@ -15040,7 +15316,9 @@ export async function applyModeSwitchTransaction({
     rootDir,
     homeDir,
     operation: "mode:select",
-    payload: { mode, selectedModelIds },
+    payload: { mode, selectedModelIds,
+      ...(preserveApiSelection ? { preserveApiSelection, expectedSelectedModelIds } : {}),
+      ...(preserveSelection ? { preserveSelection, expectedSelectedModelIds } : {}) },
     coordinator,
     verifyCommitted,
   });
@@ -15134,6 +15412,7 @@ function providerModelDirectoryEntry(result = {}) {
     baseUrl: String(result.baseUrl || "").trim().replace(/\/+$/, ""),
     endpoint: String(result.endpoint || "").trim(),
     source: "remote",
+    presetRevision: "2026-09-30",
     fetchedAt: String(result.fetchedAt || "").trim(),
     models: Array.isArray(result.models) ? result.models : [],
   };
@@ -15522,6 +15801,23 @@ function configPackageReferenceError(section) {
   return error;
 }
 
+function canonicalizePromotedPackageReferences(candidate) {
+  return {
+    ...candidate,
+    ...(candidate.selection ? { selection: {
+      ...candidate.selection,
+      selectedModelIds: [...new Set(candidate.selection.selectedModelIds.map(canonicalModelReference))],
+    } } : {}),
+    ...(candidate.modelCapabilities ? { modelCapabilities: {
+      ...candidate.modelCapabilities,
+      imageInput: canonicalModelReferenceMap(candidate.modelCapabilities.imageInput),
+      overrides: canonicalModelReferenceMap(candidate.modelCapabilities.overrides),
+    } } : {}),
+    ...(candidate.modelImageGeneration ? { modelImageGeneration: canonicalModelReferenceMap(candidate.modelImageGeneration) } : {}),
+    ...(candidate.profiles ? { profiles: candidate.profiles.map(normalizeConfigProfile) } : {}),
+  };
+}
+
 function mutateConfigState(rootDir, baseState, operation, payload = {}, options = {}) {
   const state = cloneConfigMutationState(baseState);
   const touched = new Set(
@@ -15533,7 +15829,9 @@ function mutateConfigState(rootDir, baseState, operation, payload = {}, options 
   let operationResult = {};
 
   if (operation === "configPackage:import" || operation === "configPackage:restoreLatestImportBackup") {
-    const candidate = parseConfigPackageImport(payload.candidate || payload.input || payload.package || payload);
+    const candidate = canonicalizePromotedPackageReferences(
+      parseConfigPackageImport(payload.candidate || payload.input || payload.package || payload),
+    );
     const imported = applyConfigPackageCandidateToState(state, candidate, touched);
     assertConfigPackageProspectiveReferences(rootDir, state, candidate);
     const requiredSecretKeys = candidate.requiredSecretKeys || [];
@@ -15569,18 +15867,28 @@ function mutateConfigState(rootDir, baseState, operation, payload = {}, options 
     if (payload.mode !== MODE_ALL_API && payload.mode !== MODE_HYBRID) {
       throw new Error("Unsupported mode.");
     }
+    if (payload.preserveApiSelection || payload.preserveSelection) {
+      if (payload.preserveApiSelection && payload.mode !== MODE_ALL_API) throw new Error("API 恢复只能切换到全部 API 模式。");
+      // Revalidate under the config transaction lock, after any queued writes.
+      state.selectedModelIds = selectedModelsForModeSwitch(
+        state.selectedModelIds, payload.expectedSelectedModelIds, modelCatalog(rootDir, state), payload.mode,
+      );
+    } else {
+      state.selectedModelIds = Array.isArray(payload.selectedModelIds) ? payload.selectedModelIds : [];
+    }
     state.mode = payload.mode;
-    state.selectedModelIds = Array.isArray(payload.selectedModelIds)
-      ? payload.selectedModelIds
-      : [];
   } else if (operation === "models:saveSelection") {
-    state.selectedModelIds = Array.isArray(payload.selectedModelIds)
-      ? payload.selectedModelIds
-      : Array.isArray(payload)
-        ? payload
-        : [];
+    const selectedModelIds = Array.isArray(payload.selectedModelIds)
+      ? payload.selectedModelIds.map(canonicalModelReference)
+      : Array.isArray(payload) ? payload.map(canonicalModelReference) : [];
+    if (payload.exactSelection === true) {
+      if (payload.expectedMode !== state.mode) throw new Error("计费模式已变化，请刷新后重新确认保存模型。");
+      const exact = selectedModelsForModeSwitch(selectedModelIds, selectedModelIds, modelCatalog(rootDir, state), state.mode);
+      if (!sameStringArray(exact, selectedModelIds)) throw new Error("选择包含当前模式不可用的模型；不会自动替换成其他模型。");
+    }
+    state.selectedModelIds = selectedModelIds;
   } else if (operation === "models:saveImageInput") {
-    const presetId = String(payload.presetId || "").trim();
+    const presetId = canonicalModelReference(payload.presetId);
     if (!presetId) {
       throw new Error("Model id is required.");
     }
@@ -15600,7 +15908,7 @@ function mutateConfigState(rootDir, baseState, operation, payload = {}, options 
     touched.add("modelCapabilities");
     operationResult = { saved: { presetId, imageInput: enabled } };
   } else if (operation === "models:saveImageGeneration") {
-    const presetId = String(payload.presetId || "").trim();
+    const presetId = canonicalModelReference(payload.presetId);
     if (!presetId) {
       throw new Error("Model id is required.");
     }
@@ -15619,7 +15927,7 @@ function mutateConfigState(rootDir, baseState, operation, payload = {}, options 
       saved: { presetId, imageGeneration: state.modelImageGeneration[presetId] },
     };
   } else if (operation === "models:saveCapabilities") {
-    const presetId = String(payload.presetId || "").trim();
+    const presetId = canonicalModelReference(payload.presetId);
     const normalized = normalizeModelCapabilityOverride(payload.capabilities || payload.override || {});
     if (!presetId || !normalized) {
       throw new Error("Model id and at least one capability override are required.");
@@ -15632,7 +15940,7 @@ function mutateConfigState(rootDir, baseState, operation, payload = {}, options 
     touched.add("modelCapabilities");
     operationResult = { saved };
   } else if (operation === "models:resetCapabilities") {
-    const presetId = String(payload.presetId || payload || "").trim();
+    const presetId = canonicalModelReference(payload.presetId || payload);
     if (!presetId) {
       throw new Error("Model id is required.");
     }
@@ -16060,6 +16368,10 @@ export async function applyConfigMutationTransaction({
         models,
       });
       state.selectedModelIds = routerCandidate.selectedModelIds;
+      if (operation === "models:saveSelection" && payload.exactSelection === true &&
+          !sameStringArray(state.selectedModelIds, (Array.isArray(payload.selectedModelIds) ? payload.selectedModelIds : []).map(canonicalModelReference))) {
+        throw new Error("模型列表在保存时发生变化，已停止保存；不会替换成其他模型。");
+      }
       state.desktopOptions = routerCandidate.desktopOptions;
       const routerConfig = routerCandidate.routerConfig;
       const catalog = buildModelCatalog(routerConfig);
@@ -17046,24 +17358,24 @@ function stableCodexRestoreSourceBytes(sourcePath, targetDir) {
   if (path.dirname(resolvedSource) !== resolvedTargetDir) {
     throw new Error("Codex restore source must remain inside the Codex config directory.");
   }
-  const directoryBefore = fs.lstatSync(resolvedTargetDir);
+  const directoryBefore = fs.lstatSync(resolvedTargetDir, { bigint: true });
   if (!directoryBefore.isDirectory() || directoryBefore.isSymbolicLink()) {
     throw new Error("Codex restore directory must be one real directory.");
   }
-  const before = fs.lstatSync(resolvedSource);
+  const before = fs.lstatSync(resolvedSource, { bigint: true });
   if (!codexRestoreSourceStatIsSafe(before)) {
     throw new Error("Codex restore source must be one bounded regular file.");
   }
   const descriptor = fs.openSync(resolvedSource, "r");
   try {
-    const opened = fs.fstatSync(descriptor);
+    const opened = fs.fstatSync(descriptor, { bigint: true });
     if (!codexRestoreSourceStatIsSafe(opened) || !sameCodexRestoreSourceStat(before, opened)) {
       throw new Error("Codex restore source changed while it was being opened.");
     }
-    const bytes = readBoundedCodexRestoreDescriptor(descriptor, opened.size);
-    const afterRead = fs.fstatSync(descriptor);
-    const afterPath = fs.lstatSync(resolvedSource);
-    const directoryAfter = fs.lstatSync(resolvedTargetDir);
+    const bytes = readBoundedCodexRestoreDescriptor(descriptor, Number(opened.size));
+    const afterRead = fs.fstatSync(descriptor, { bigint: true });
+    const afterPath = fs.lstatSync(resolvedSource, { bigint: true });
+    const directoryAfter = fs.lstatSync(resolvedTargetDir, { bigint: true });
     if (
       codexRestoreSourceStatIsSafe(afterRead) &&
       codexRestoreSourceStatIsSafe(afterPath) &&
@@ -17103,7 +17415,7 @@ function codexRestoreSourceStatIsSafe(stat) {
     stat &&
     stat.isFile() &&
     !stat.isSymbolicLink?.() &&
-    (!Number.isInteger(stat.nlink) || stat.nlink === 1) &&
+    (!(typeof stat.nlink === "bigint" || Number.isInteger(stat.nlink)) || Number(stat.nlink) === 1) &&
     stat.size >= 0 &&
     stat.size <= CODEX_CONFIG_RESTORE_MAX_BYTES
   );
@@ -17118,7 +17430,9 @@ function sameCodexRestoreSourceStat(left, right) {
     left.nlink === right.nlink &&
     left.size === right.size &&
     left.mtimeMs === right.mtimeMs &&
-    left.ctimeMs === right.ctimeMs
+    left.ctimeMs === right.ctimeMs &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs
   );
 }
 
@@ -18279,7 +18593,7 @@ const LEGACY_KIMI_CODE_MODEL_REFERENCES = new Map([
 ]);
 
 function normalizeLegacyKimiCodeModelReference(value) {
-  const id = String(value || "").trim();
+  const id = canonicalModelReference(value);
   const hasRoutePrefix = id.startsWith(CODEX_BRIDGE_MODEL_ID_PREFIX);
   const sourceId = hasRoutePrefix
     ? id.slice(CODEX_BRIDGE_MODEL_ID_PREFIX.length)
@@ -18452,7 +18766,7 @@ function builtInVisionPresetIds() {
   );
 }
 
-function codexBridgeRouteIdForModel(model = {}) {
+export function codexBridgeRouteIdForModel(model = {}) {
   const upstreamModel = String(model.model || "").trim();
   if (model.authMode === "codex_openai" && upstreamModel) {
     return `${CODEX_BRIDGE_MODEL_ID_PREFIX}${slugify(upstreamModel)}`;
@@ -18509,6 +18823,14 @@ function routeForSelectedModel(
     "supportedReasoningLevels",
     "supportsReasoningSummaries",
     "defaultReasoningSummary",
+    "useResponsesLite",
+    "supportVerbosity",
+    "defaultVerbosity",
+    "webSearchToolType",
+    "toolMode",
+    "multiAgentVersion",
+    "catalogContextWindow",
+    "truncationPolicy",
     "additionalSpeedTiers",
     "serviceTiers",
     "maxToolContinuationTurns",
@@ -18713,6 +19035,8 @@ function imageGenerationForProvider(provider) {
     response: provider.response,
     request: provider.request,
     headers: provider.headers,
+    maxAssetBytes: provider.maxAssetBytes,
+    assetTimeoutMs: provider.assetTimeoutMs,
   });
 }
 
@@ -18786,6 +19110,16 @@ function normalizeImageGenerationSettings(input = {}) {
     const response = plainObject(input.response);
     const request = normalizeImageProviderRequest(input.request);
     const headers = normalizeImageProviderHeaders(input.headers);
+    const maxAssetBytes = positiveProviderResponseBytes(
+      input.maxAssetBytes || input.max_asset_bytes,
+      0,
+      MAX_CAPABILITY_ASSET_BYTES,
+    );
+    const assetTimeoutMs = positiveProviderTimeoutMs(
+      input.assetTimeoutMs || input.asset_timeout_ms,
+      0,
+      MAX_CAPABILITY_ASSET_TIMEOUT_MS,
+    );
     for (const nested of [defaults, response, request, headers]) {
       if (Object.keys(nested).length) {
         assertCredentialFreeProviderObject(nested);
@@ -18806,6 +19140,8 @@ function normalizeImageGenerationSettings(input = {}) {
       ...(Object.keys(response).length ? { response } : {}),
       ...(Object.keys(request).length ? { request } : {}),
       ...(Object.keys(headers).length ? { headers } : {}),
+      ...(maxAssetBytes ? { maxAssetBytes } : {}),
+      ...(assetTimeoutMs ? { assetTimeoutMs } : {}),
       ...(input.outputDir ? { outputDir: String(input.outputDir).trim() } : {}),
       ...(input.historyPath ? { historyPath: String(input.historyPath).trim() } : {}),
     };
@@ -18867,6 +19203,7 @@ function normalizeCustomModel(input = {}) {
     inputModalities: normalizeInputModalities(input.inputModalities, ["text"]),
     ...(dropParams.length && input.api !== "responses" ? { dropParams } : {}),
     custom: true,
+    ...(input.portableRemote === true ? { portableRemote: true } : {}),
   };
 }
 
@@ -19050,6 +19387,8 @@ function normalizeModelDirectory(saved) {
       baseUrl: String(entry.baseUrl || "").trim(),
       endpoint: String(entry.endpoint || "").trim(),
       source: String(entry.source || "remote").trim(),
+      ...(typeof entry.presetRevision === "string" && /^\d{4}-\d{2}-\d{2}$/u.test(entry.presetRevision)
+        ? { presetRevision: entry.presetRevision } : {}),
       fetchedAt: String(entry.fetchedAt || "").trim(),
       models: normalizeProviderModelList({ data: entry.models || [] }),
     };
@@ -19449,7 +19788,7 @@ function normalizeDesktopOptions(options = {}) {
     duplicateRequestProtectionPolicyVersion:
       DUPLICATE_REQUEST_PROTECTION_POLICY_VERSION,
     interceptCodexAuxiliaryTasks: Boolean(options.interceptCodexAuxiliaryTasks),
-    codexAuxiliaryModelId: String(options.codexAuxiliaryModelId || "").trim(),
+    codexAuxiliaryModelId: canonicalModelReference(options.codexAuxiliaryModelId),
     autoSelectModel: Boolean(options.autoSelectModel),
     autoFailover: Boolean(options.autoFailover),
     smartRouting: normalizeDesktopSmartRouting(options.smartRouting),
@@ -19496,7 +19835,7 @@ function normalizeDesktopSmartRule(rule = {}) {
   const mode = DESKTOP_SMART_RULE_MODES.has(source.mode) ? source.mode : "auto";
   return {
     mode,
-    routeId: String(source.routeId || "").trim(),
+    routeId: canonicalModelReference(source.routeId),
   };
 }
 
@@ -19510,7 +19849,7 @@ function normalizeDesktopSmartFailover(input = {}) {
       : [];
   return {
     mode,
-    routeIds: [...new Set(routeIds.map((routeId) => String(routeId || "").trim()).filter(Boolean))],
+    routeIds: [...new Set(routeIds.map(canonicalModelReference).filter(Boolean))],
   };
 }
 
@@ -19546,7 +19885,7 @@ function normalizeUsageBudgetOptions(input = {}) {
   if (Object.keys(global).length) {
     result.global = global;
   }
-  const routes = normalizeUsageBudgetMap(input.routes);
+  const routes = normalizeUsageBudgetMap(canonicalModelReferenceMap(input.routes));
   if (Object.keys(routes).length) {
     result.routes = routes;
   }
@@ -19578,6 +19917,7 @@ function normalizeUsageBudgetScope(input = {}) {
   const dailyCostLimit = positiveUsageCostNumber(input.dailyCostLimit);
   const inputCostPerMillion = positiveUsageCostNumber(input.inputCostPerMillion);
   const cacheCostPerMillion = positiveUsageCostNumber(input.cacheCostPerMillion);
+  const cacheWriteCostPerMillion = optionalUsageCostRate(input.cacheWriteCostPerMillion ?? input.cache_write_cost_per_million);
   const outputCostPerMillion = positiveUsageCostNumber(input.outputCostPerMillion);
   if (dailyTokenLimit) {
     result.dailyTokenLimit = dailyTokenLimit;
@@ -19593,6 +19933,9 @@ function normalizeUsageBudgetScope(input = {}) {
   }
   if (cacheCostPerMillion) {
     result.cacheCostPerMillion = cacheCostPerMillion;
+  }
+  if (cacheWriteCostPerMillion !== undefined) {
+    result.cacheWriteCostPerMillion = cacheWriteCostPerMillion;
   }
   if (outputCostPerMillion) {
     result.outputCostPerMillion = outputCostPerMillion;
@@ -19622,7 +19965,7 @@ function normalizeConfigProfile(profile = {}) {
     name,
     mode,
     selectedModelIds: Array.isArray(profile.selectedModelIds)
-      ? [...new Set(profile.selectedModelIds.map((item) => String(item || "").trim()).filter(Boolean))]
+      ? [...new Set(profile.selectedModelIds.map(canonicalModelReference).filter(Boolean))]
       : [],
     desktopOptions: normalizeDesktopOptions(profile.desktopOptions || {}),
     note: String(profile.note || "").trim().slice(0, 240),

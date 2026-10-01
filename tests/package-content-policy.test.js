@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import vm from "node:vm";
 import { removeOwnedTemporaryDirectory } from "../scripts/smoke-temp-cleanup.mjs";
+import * as smokeDirectories from "../scripts/smoke-temp-cleanup.mjs";
 
 let packagePolicy = {};
 try {
@@ -48,6 +50,48 @@ test("Windows package policy excludes development residue and local secret mater
   }
 });
 
+test("package filtering and final audit reject loose logs and npm credential configuration", () => {
+  for (const candidate of [
+    ".astra-final-check.log", "/.recheck-final.log", "desktop/debug.LOG", "runtime.log.1", "runtime.log.2.gz",
+    ".npmrc", "vendor/chatgpt-codex-bridge/.npmrc", "node_modules/example/.NPMRC",
+  ]) {
+    assert.equal(packagePolicy.shouldIgnoreWindowsPackagePath(candidate), true, candidate);
+    assert.throws(() => packagePolicy.assertWindowsPackageFilePaths(["src/server.js", candidate]),
+      { code: "forbidden_package_content" }, candidate);
+  }
+  for (const candidate of ["src/logging.js", "src/transport.log.js", "node_modules/loglevel/lib/loglevel.js"]) {
+    assert.equal(packagePolicy.shouldIgnoreWindowsPackagePath(candidate), false, candidate);
+  }
+});
+
+test("smoke install directories can be isolated without changing the native user profile", () => {
+  assert.equal(typeof smokeDirectories.resolveSmokeInstallBase, "function");
+  const nativeProfile = process.env.USERPROFILE;
+  const homeDirectory = path.join(os.tmpdir(), "native-home");
+  const override = path.join(os.tmpdir(), "isolated-installs");
+  assert.equal(smokeDirectories.resolveSmokeInstallBase({ override, homeDirectory }), path.resolve(override));
+  assert.equal(smokeDirectories.resolveSmokeInstallBase({ homeDirectory }), path.resolve(homeDirectory));
+  assert.throws(() => smokeDirectories.resolveSmokeInstallBase({ override: "relative/folder", homeDirectory }), /absolute/i);
+  assert.equal(process.env.USERPROFILE, nativeProfile);
+});
+
+test("packaged smoke validates an install-base override before allocating fixture directories", async () => {
+  const source = fs.readFileSync(new URL("../scripts/smoke-packaged-windows.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("async function smokeDesktop(");
+  const end = source.indexOf("\nfunction createResourceE2EFixture(", start);
+  assert.ok(start >= 0 && end > start);
+  let allocated = 0;
+  const context = {
+    process: { platform: process.platform, env: { CODEXBRIDGE_PACKAGED_SMOKE_INSTALL_BASE: "relative/folder" } },
+    os, path,
+    fs: { mkdtempSync: () => { allocated += 1; return path.join(os.tmpdir(), "unexpected-fixture"); } },
+    resolveSmokeInstallBase: smokeDirectories.resolveSmokeInstallBase,
+  };
+  vm.runInNewContext(source.slice(start, end), context);
+  await assert.rejects(context.smokeDesktop("unused-test-executable"), /absolute/i);
+  assert.equal(allocated, 0, "Invalid configuration must not leave a new fixture directory behind");
+});
+
 test("Windows package policy preserves runtime code dependencies and public examples", () => {
   assert.equal(typeof packagePolicy.shouldIgnoreWindowsPackagePath, "function");
 
@@ -64,6 +108,23 @@ test("Windows package policy preserves runtime code dependencies and public exam
       candidate,
     );
   }
+});
+
+test("desktop packages exclude local UI audit output while retaining the renderer stylesheet", () => {
+  for (const candidate of [
+    "/.audit-artifacts",
+    "/.audit-artifacts/ui-redesign/1180-models.png",
+    ".audit-artifacts/ui-redesign/result.json",
+    ".audit-artifacts\\cleanup-plan.json",
+    "/.AUDIT-ARTIFACTS/local-profile.txt",
+  ]) {
+    assert.equal(packagePolicy.shouldIgnoreWindowsPackagePath(candidate), true, candidate);
+  }
+  assert.equal(packagePolicy.shouldIgnoreWindowsPackagePath("/desktop/renderer/console-layout.css"), false);
+  assert.equal(packagePolicy.shouldIgnoreWindowsPackagePath("/desktop/renderer/assets/providers/deepseek.svg"), false);
+  assert.throws(() => packagePolicy.assertWindowsPackageFilePaths([
+    "desktop/renderer/console-layout.css", ".audit-artifacts/ui-redesign/result.json",
+  ]), {code:"forbidden_package_content"});
 });
 
 test("Windows package audit reports every forbidden packaged path with its rule", () => {

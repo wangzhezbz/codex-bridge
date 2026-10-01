@@ -9,6 +9,7 @@ import {
 import { createSyncJob } from "./sync-store.js";
 import { createTask, listTasks } from "./task-store.js";
 import { normalizeChatGptPreferences } from "./preference-compat.js";
+import {readJsonState, writeJsonState, withJsonStateLock} from "./json-state-store.js";
 
 const CHAT_DIR = "chat";
 const MESSAGES_FILE = "messages.ndjson";
@@ -50,8 +51,10 @@ async function ensureChatDir(storeRoot) {
   await mkdir(chatDir(storeRoot), { recursive: true });
 }
 
-async function writeJson(filePath, value) {
-  await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+function validWorkspaceState(value) {
+  return value && typeof value === "object" && !Array.isArray(value) &&
+    ["projectId","conversationId","chatgptProjectUrl","targetRepo","modePreference","modelPreference","syncMode"]
+      .every(key => value[key] == null || typeof value[key] === "string");
 }
 
 function normalizeOptionalText(value) {
@@ -89,17 +92,15 @@ function normalizeWorkspaceBinding(binding) {
 }
 
 export async function getWorkspaceBinding(storeRoot) {
-  try {
-    return normalizeWorkspaceBinding({
-      ...defaultBinding(),
-      ...JSON.parse(await readFile(workspacePath(storeRoot), "utf8"))
-    });
-  } catch {
-    return defaultBinding();
-  }
+  const stored=await readJsonState(workspacePath(storeRoot),validWorkspaceState);
+  return stored.exists ? normalizeWorkspaceBinding({...defaultBinding(),...stored.value}) : defaultBinding();
 }
 
 export async function updateWorkspaceBinding(storeRoot, input = {}) {
+  return withJsonStateLock(workspacePath(storeRoot),()=>updateWorkspaceBindingLocked(storeRoot,input));
+}
+
+async function updateWorkspaceBindingLocked(storeRoot, input = {}) {
   await ensureStoreRoot(storeRoot);
   const existing = await getWorkspaceBinding(storeRoot);
   const updatedAt = nowIso();
@@ -165,6 +166,7 @@ export async function updateWorkspaceBinding(storeRoot, input = {}) {
       conversationId: updated.conversationId
     });
     const delegation = await ensureCodexDelegationInstructions({
+      projectId: updated.projectId,
       targetRepo: updated.targetRepo,
       chatgptProjectUrl: updated.chatgptProjectUrl,
       conversationId: updated.conversationId
@@ -184,7 +186,7 @@ export async function updateWorkspaceBinding(storeRoot, input = {}) {
     updated.codexDelegationUpdatedAt = null;
   }
 
-  await writeJson(workspacePath(storeRoot), updated);
+  await writeJsonState(workspacePath(storeRoot),updated,validWorkspaceState);
   return updated;
 }
 

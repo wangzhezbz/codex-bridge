@@ -1,6 +1,10 @@
 const MODE_PREFERENCES = new Set(["fast", "balanced", "advanced", "high", "pro"]);
-const MODEL_PREFERENCES = new Set(["gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.3", "o3"]);
+const MODEL_PREFERENCES = new Set(["latest", "gpt-6-astra", "gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.3", "o3"]);
 const MODEL_MODE_PREFERENCES = {
+  latest: ["fast", "balanced", "advanced", "high", "pro"],
+  // A separately named Astra web picker has not been observed. Do not import
+  // API effort values into the web UI contract.
+  "gpt-6-astra": [],
   "gpt-5.6-sol": ["fast", "balanced", "advanced", "high", "pro"],
   "gpt-5.5": ["fast", "balanced", "advanced", "high", "pro"],
   "gpt-5.4": ["fast", "balanced", "advanced", "high", "pro"],

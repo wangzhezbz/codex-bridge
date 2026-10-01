@@ -1,7 +1,11 @@
 import { spawn, spawnSync } from "node:child_process";
 import path from "node:path";
-import readline from "node:readline";
+import boundedLineDecoder from "./bounded-line-decoder.cjs";
 
+const { createBoundedLineDecoder } = boundedLineDecoder;
+
+const MAX_RESPONSE_LINE_BYTES = 1024 * 1024;
+const EXPECTED_RESPONSE_IDS = new Set([0, 1, 2, 3]);
 const options = JSON.parse(process.argv[2] || "{}");
 const executable = String(options.executable || "");
 const homeDir = String(options.homeDir || "");
@@ -21,32 +25,35 @@ const child = spawn(executable, ["app-server"], {
     ...(homeDir ? { CODEX_HOME: path.join(homeDir, ".codex") } : {}),
   },
 });
-const lines = readline.createInterface({ input: child.stdout });
+child.stderr.resume();
 const responses = new Map();
 let finished = false;
 let appRetryRequested = false;
 let appRetryTimer = null;
+let responseDecoder = null;
 
 function send(message) {
   child.stdin.write(`${JSON.stringify(message)}\n`);
 }
 
-function finish(result) {
+function finish(result, { terminate = true } = {}) {
   if (finished) return;
   finished = true;
   clearTimeout(timer);
   if (appRetryTimer) clearTimeout(appRetryTimer);
+  responseDecoder?.close();
   try {
     child.stdin.end();
   } catch {
     // The probe may already have closed stdin while exiting.
   }
-  if (process.platform === "win32" && Number.isInteger(child.pid)) {
+  if (terminate && process.platform === "win32" && Number.isInteger(child.pid)) {
     spawnSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
       windowsHide: true,
       stdio: "ignore",
+      timeout: 5000,
     });
-  } else {
+  } else if (terminate) {
     child.kill("SIGTERM");
   }
   process.stdout.write(JSON.stringify(result));
@@ -92,14 +99,14 @@ function maybeFinishSnapshot() {
   });
 }
 
-lines.on("line", (line) => {
+function handleResponseLine(line) {
   let message;
   try {
     message = JSON.parse(line);
   } catch {
     return;
   }
-  if (message.id === undefined) return;
+  if (!EXPECTED_RESPONSE_IDS.has(message.id)) return;
   responses.set(message.id, message);
   if (message.id === 0 && !message.error) {
     send({ method: "initialized", params: {} });
@@ -108,13 +115,47 @@ lines.on("line", (line) => {
     return;
   }
   maybeFinishSnapshot();
+}
+
+responseDecoder = createBoundedLineDecoder({
+  maxLineBytes: MAX_RESPONSE_LINE_BYTES,
+  onLine: handleResponseLine,
+  onError: (error) => finish(error?.code === "bounded_line_too_large"
+    ? {
+        ok: false,
+        code: "response_too_large",
+        error: "Codex app-server returned an oversized response line.",
+      }
+    : {
+        ok: false,
+        code: "response_processing_failed",
+        error: error?.message || "Codex app-server response processing failed.",
+      }),
 });
+child.stdout.on("data", (chunk) => responseDecoder.push(chunk));
+child.stdout.on("end", () => responseDecoder.end());
+child.stdout.on("error", (error) => finish({
+  ok: false,
+  code: "stdout_failed",
+  error: error.message,
+}));
+child.stdin.on("error", (error) => finish({
+  ok: false,
+  code: "stdin_failed",
+  error: error.message,
+}));
 
 child.on("error", (error) => finish({
   ok: false,
   code: "start_failed",
   error: error.message,
 }));
+
+child.once("close", (code, signal) => finish({
+  ok: false,
+  code: "app_server_exited",
+  error: `Codex app-server exited before completing the snapshot (code=${code ?? "-"}, signal=${signal || "-"}).`,
+}, { terminate: false }));
 
 send({
   method: "initialize",

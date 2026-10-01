@@ -1,3 +1,6 @@
+import { normalizeUsage } from "./upstream-usage.js";
+import { estimateUsageTokenCosts, normalizeUsageCostRates } from "../shared/usage-cost.cjs";
+
 export function usageBudgetOptions(config = {}) {
   const source = config.usageBudgets && typeof config.usageBudgets === "object"
     ? config.usageBudgets
@@ -13,6 +16,14 @@ export function usageBudgetOptions(config = {}) {
 
 export function createUsageBudgetGuard({ now = () => new Date() } = {}) {
   const counters = new Map();
+  let activeDay = "";
+
+  function synchronizeDay(day) {
+    if (day !== activeDay) {
+      counters.clear();
+      activeDay = day;
+    }
+  }
 
   function check(config = {}, route = {}) {
     const budgets = usageBudgetOptions(config);
@@ -20,9 +31,10 @@ export function createUsageBudgetGuard({ now = () => new Date() } = {}) {
       return { ok: true };
     }
     const day = localDayKey(now());
+    synchronizeDay(day);
     const candidates = budgetCandidates(budgets, route);
     for (const candidate of candidates) {
-      const counter = counters.get(counterKey(day, candidate.scope, candidate.id)) || zeroCounter();
+      const counter = counters.get(counterKey(candidate.scope, candidate.id)) || zeroCounter();
       const blocked = blockedByBudget(candidate, counter);
       if (blocked) {
         return {
@@ -50,14 +62,21 @@ export function createUsageBudgetGuard({ now = () => new Date() } = {}) {
       return;
     }
     const day = localDayKey(now());
-    const tokens = usageTokens(usage);
+    synchronizeDay(day);
+    const normalizedUsage = normalizeUsage(usage, route);
+    const tokens = usageTokens(normalizedUsage);
     const candidates = budgetCandidates(budgets, route);
     for (const candidate of candidates) {
-      const key = counterKey(day, candidate.scope, candidate.id);
+      const key = counterKey(candidate.scope, candidate.id);
       const counter = counters.get(key) || zeroCounter();
       counter.calls += 1;
       counter.tokens += tokens;
-      counter.cost += usageCost(usage, candidate.budget);
+      // Compensate summation error instead of rounding individual charges:
+      // ten 0.1 charges must reach 1, and tiny charges must still accumulate.
+      const adjustedCost = usageCost(normalizedUsage, candidate.budget) - counter.costCorrection;
+      const nextCost = counter.cost + adjustedCost;
+      counter.costCorrection = Number.isFinite(nextCost) ? (nextCost - counter.cost) - adjustedCost : 0;
+      counter.cost = nextCost;
       counters.set(key, counter);
     }
   }
@@ -104,12 +123,16 @@ function blockedByBudget(candidate, counter) {
       unit: "Token",
     };
   }
-  if (budget.dailyCostLimit && counter.cost >= budget.dailyCostLimit) {
+  // Compare with the same significant precision used by published budget
+  // amounts, so a one-ulp calculation difference cannot bypass an exact cap.
+  const comparableCost = Number.isFinite(counter.cost) ? roundCost(counter.cost) : counter.cost;
+  const comparableLimit = roundCost(budget.dailyCostLimit);
+  if (budget.dailyCostLimit && comparableCost >= comparableLimit) {
     return {
       metric: "cost",
       used: roundCost(counter.cost),
       limit: budget.dailyCostLimit,
-      remaining: roundCost(Math.max(0, budget.dailyCostLimit - counter.cost)),
+      remaining: roundCost(Math.max(0, comparableLimit - comparableCost)),
       unit: "费用单位",
     };
   }
@@ -136,9 +159,7 @@ function normalizeScope(input = {}) {
     dailyTokenLimit: positiveInteger(input.dailyTokenLimit ?? input.daily_tokens ?? input.tokens),
     dailyCallLimit: positiveInteger(input.dailyCallLimit ?? input.daily_calls ?? input.calls),
     dailyCostLimit: positiveNumber(input.dailyCostLimit ?? input.daily_cost ?? input.cost),
-    inputCostPerMillion: positiveNumber(input.inputCostPerMillion ?? input.input_cost_per_million),
-    cacheCostPerMillion: positiveNumber(input.cacheCostPerMillion ?? input.cache_cost_per_million),
-    outputCostPerMillion: positiveNumber(input.outputCostPerMillion ?? input.output_cost_per_million),
+    ...normalizeUsageCostRates(input),
   };
 }
 
@@ -163,65 +184,29 @@ function usageTokens(usage = {}) {
 }
 
 function usageCost(usage = {}, budget = {}) {
-  const inputRate = Number(budget.inputCostPerMillion || 0);
-  const cacheRate = Number(budget.cacheCostPerMillion || inputRate || 0);
-  const outputRate = Number(budget.outputCostPerMillion || 0);
-  if (inputRate <= 0 && cacheRate <= 0 && outputRate <= 0) {
-    return 0;
-  }
-  const cacheTokens = usageTokenField(usage, [
-    "cached_tokens",
-    "cache_read_tokens",
-    "cacheReadTokens",
-    "cached",
-  ]);
-  const freshTokens = usageTokenField(usage, [
-    "fresh_tokens",
-    "freshPromptTokens",
-    "fresh_prompt_tokens",
-    "fresh",
-  ]);
-  const promptTokens = usageTokenField(usage, [
-    "prompt_tokens",
-    "promptTokens",
-    "prompt",
-  ]);
-  const completionTokens = usageTokenField(usage, [
-    "completion_tokens",
-    "completionTokens",
-    "completion",
-    "output_tokens",
-    "outputTokens",
-  ]);
-  const billableInputTokens = freshTokens || Math.max(0, promptTokens - cacheTokens);
-  return roundCost(
-    (billableInputTokens * inputRate +
-      cacheTokens * cacheRate +
-      completionTokens * outputRate) / 1_000_000,
-  );
-}
-
-function usageTokenField(usage = {}, names = []) {
-  for (const name of names) {
-    const number = Number(usage?.[name] || 0);
-    if (Number.isFinite(number) && number > 0) {
-      return number;
-    }
-  }
-  return 0;
+  // Preserve each nonzero charge while accumulating; rounding belongs to the
+  // presented totals, otherwise many individually small charges become free.
+  return positiveNumber(estimateUsageTokenCosts({
+    freshPromptTokens: usage.fresh_prompt_tokens,
+    cacheReadTokens: usage.cache_read_tokens,
+    cacheCreationTokens: usage.cache_creation_tokens,
+    openaiCacheWriteTokens: usage.cache_write_rate_kind === "openai" ? usage.cache_creation_tokens : 0,
+    inputCacheWriteTokens: usage.cache_write_rate_kind === "input" ? usage.cache_creation_tokens : 0,
+    completionTokens: usage.completion_tokens,
+  }, budget).totalCost);
 }
 
 function roundCost(value) {
   const number = Number(value || 0);
-  return Number.isFinite(number) ? Math.round(number * 1_000_000_000) / 1_000_000_000 : 0;
+  return Number.isFinite(number) ? Number(number.toPrecision(15)) : 0;
 }
 
 function zeroCounter() {
-  return { calls: 0, tokens: 0, cost: 0 };
+  return { calls: 0, tokens: 0, cost: 0, costCorrection: 0 };
 }
 
-function counterKey(day, scope, id) {
-  return `${day}:${scope}:${id}`;
+function counterKey(scope, id) {
+  return `${scope}:${id}`;
 }
 
 function providerId(route = {}) {
