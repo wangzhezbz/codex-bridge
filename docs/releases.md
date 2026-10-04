@@ -22,6 +22,56 @@ sudo xattr -cr /Applications/CodexBridge.app
 
 [GitHub Releases](https://github.com/wangzhezbz/codex-bridge/releases)
 
+## v0.4.1
+
+- 更新模型目录，兼容 GPT-6.1 Sol、GPT-6 Sol、GPT-6 Luna、Astra 和 DeepSeek V4.1。
+- 优化流式输出、跨模型历史和上下文压缩处理，增强供应商错误识别与恢复。
+- 软件管理仅保留 Codex 本体，内置下载清单更新到绿色版 26.928.3736.0。
+- 修复旧版安装被误判为“检测异常”，以及回滚后按最新版清单校验失败的问题。
+- 修复通过 Bridge 打开已更新 Codex 时仍选择旧版路径的问题；自动查找优先使用验证过的当前安装，保留用户手动指定的启动项。
+- 统计页按模型和最近请求直接显示总、输入、输出、缓存 Token；输入包含缓存，缓存不重复计入总量。
+- 优化模型选择、软件管理、双倍额度和设置页面；右下角提示 5 秒自动关闭，移除提示框“复制”按钮，保留复制任务报告。
+- 更新内置 ChatGPT-Codex-Bridge 到 v0.1.95，并加固本地状态保存、安装事务和安全退出流程。
+- 更新网络与 MCP 间接依赖的安全修复版本，发布依赖审计无已知告警。
+
+## v0.3.42
+
+- 修复 DeepSeek、GPT 兼容路由和自动故障转移场景首段输出被本地缓冲的问题，普通文本会按上游到达顺序立即流式转发。
+- 加固 Responses 历史、模型切换、压缩恢复与错误呈现，避免跨供应商引用和推理内容造成后续请求失败。
+- 重做软件管理任务边界：主进程跟踪完整插件批次，支持安全取消和退出保护，并在界面持续展示下载速度、阶段活动与最终结果。
+- 完整插件按固定提交安装和卸载其专属 Marketplace；Skills 继续独立安装、检测和卸载，不进入更新流程。
+- V2RayN 改用官方签名桌面 ZIP，发布前固定校验 PGP 指纹、ZIP 路径和实际文件版本；目录离线或刷新失败时会明确提示来源状态。
+- 升级到 Electron 44，消除构建依赖中的已知高危解压路径穿越问题。
+
+## v0.3.3
+
+- 修复 Windows 用户目录、中文用户名及目录联接场景下的配置写入与恢复失败。
+- 修复双倍额度服务因扩展目录不存在而无法启动，并让扩展准备失败降级为可诊断状态。
+- 修复旧版自定义模型保存入口、失效模型引用修复和模型选择保存失败。
+- 优化模型选择保存：提交成功后只回读轻量状态，不再同步扫描资源、会话和能力数据。
+- 补充配置事务、双倍额度服务、主进程 IPC 与 Renderer 回归测试。
+
+## v0.3.2
+
+- 修复 CodexBridge 打开后长时间无响应的问题。
+- 将 Codex CLI、prompt-input 和 app-server 资源探测移至独立 Worker，长扫描期间不再阻塞桌面主线程。
+- Router 启动和停止不再等待完整资源扫描或占用配置事务队列。
+- 状态广播固定使用轻量快照，避免进入资源页后所有后续广播都重复执行完整扫描。
+- 取消启动时自动逐项目恢复，保留会话页的显式手动恢复入口。
+- 完整 Router、Desktop、历史恢复、打包后 Windows smoke 均已通过。
+
+## v0.3.1
+
+- 兼容新版 ChatGPT/Codex 桌面端，并保留旧版 Codex 启动支持。
+- 修复 Router 配置事务、启动、停止、恢复和健康检查链路。
+- 修复历史会话 provider 作用域及项目可见性问题。
+- 改进模型能力、资源、插件、应用、MCP 和技能诊断。
+- 修复 GPT 原生生图与自定义图片供应商路由。
+- 新增“双倍额度”独立页面，内置 ChatGPT-Codex-Bridge 服务、Chrome 扩展和 MCP 管理。
+- 双倍额度 MCP 自动继承当前 Codex 任务 ID，保持任务和项目隔离。
+- 优化 Router 开关响应，不再让资源与会话详细扫描阻塞按钮。
+- 更新 Windows 安装、便携更新和跨平台发布流程。
+
 ## Package Naming / 包名规范
 
 GitHub Release assets use a stable package name so tutorials can keep one latest-download link:
@@ -30,6 +80,7 @@ GitHub Release 附件使用稳定包名，教程里可以固定引用最新版�
 
 ```text
 CodexBridge-Windows-x64-Portable.zip
+CodexBridge-Windows-x64-Setup.exe
 CodexBridge-macOS-arm64-Portable.zip
 CodexBridge-macOS-x64-Portable.zip
 ```
@@ -51,12 +102,52 @@ Before tagging a release:
 发布打 tag 前：
 
 ```powershell
+npm run release:preflight
+npm run release:code-ready
 npm run check
 npm run package:win
 npm run package:win:smoke
+npm run package:win:artifacts
 npm run package:mac
 npm run package:mac:smoke
 ```
+
+`package:win:artifacts` only accepts the exact Windows app proven by the current `packaged-smoke-report.json`; an old package or a report from another app path cannot be turned into release artifacts.
+
+`npm run release:code-ready` is the local code readiness gate. It still reports missing real Router, provider, or installer evidence, but only exits non-zero when repository code/config work remains. In JSON output, use `codeReady.ignoredRealEvidenceItemIds` and `codeReady.ignoredLocalSetupItemIds` to hand those non-code checks to the real test machine.
+
+`npm run release:code-ready` 是本地代码就绪门禁。它仍会报告真实 Router、供应商或安装器证据缺口，但只有仓库代码/配置还有阻断项时才会非零退出。JSON 里的 `codeReady.ignoredRealEvidenceItemIds` 和 `codeReady.ignoredLocalSetupItemIds` 可以直接交给真实测试机继续验收。
+
+After Windows artifacts are generated, run the strict final gate before tagging:
+
+Windows 发布包生成后，打 tag 前再跑一次严格门禁：
+
+```powershell
+node scripts/release-preflight.mjs --platform win32 --arch x64 --release-dir dist-artifacts --write-acceptance-report .\release-acceptance.json --write-gate-report .\release-gate.json
+npm run release:gate -- --platform win32 --arch x64 --release-dir dist-artifacts --acceptance-report .\release-acceptance.json --write-gate-report .\release-gate.json
+```
+
+`npm run release:gate` is the strict release gate; it runs `release-preflight` with `--strict-warnings` so warning-only gaps still block tagging until they are handled or documented.
+
+The plain CLI output and `release-gate.json` split blockers into three groups: `真实环境验收缺口` / `realEvidenceBlockingItemIds` for real Router, provider, or installer evidence; `本机配置/运行待办` / `localSetupBlockingItemIds` for setup steps on the current test machine; and `仓库代码/配置阻断项` / `codeOrConfigBlockingItemIds` for repo changes that must be fixed before tagging.
+
+CLI 输出和 `release-gate.json` 会把阻断项分成三类：`真实环境验收缺口` 是真实 Router、供应商或安装器证据；`本机配置/运行待办` 是当前测试机需要启动、保存或刷新；`仓库代码/配置阻断项` 才是必须回到仓库里修的代码或配置问题。
+
+You can also save the same style of machine-readable gate evidence from the desktop preflight page with `保存门禁报告` after selecting the release artifact directory.
+
+也可以在桌面端体检页选择发布目录后点击 `保存门禁报告`，保存同类机器可读门禁证据。
+
+If real Router, image provider, capability provider, and installer checks were completed separately, pass the evidence JSON too:
+
+如果真实 Router、图片供应商、能力供应商和安装器验收是分开完成的，也可以把留证 JSON 一起传给体检：
+
+```powershell
+npm run release:gate -- --platform win32 --arch x64 --release-dir dist-artifacts --acceptance-report .\release-acceptance.json --write-gate-report .\release-gate.json
+```
+
+`release-gate.json` and the CI-generated `windows-release-gate.json` / `macos-*-release-gate.json` files are for diagnostics. Do not attach them as public downloads; public release assets should stay limited to the installer and portable packages.
+
+`release-gate.json` 以及 CI 生成的 `windows-release-gate.json` / `macos-*-release-gate.json` 只用于诊断留证，不作为公开下载文件发布；公开 release 里只放安装包和免安装包。
 
 Then push a tag:
 
@@ -67,6 +158,6 @@ git tag v0.1.10
 git push origin v0.1.10
 ```
 
-GitHub Actions builds the Windows portable zip and both macOS portable zips, then attaches them to the same release.
+GitHub Actions builds the Windows installer, Windows portable zip, and both macOS portable zips, then attaches them to the same release.
 
-GitHub Actions 会构建 Windows 和 macOS 免安装包，并把 zip 附加到 release。
+GitHub Actions 会构建 Windows 安装版、Windows 免安装备用包，以及两个 macOS 免安装包，并把它们附加到 release。

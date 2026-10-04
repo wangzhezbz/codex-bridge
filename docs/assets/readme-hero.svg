@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="440" viewBox="0 0 1280 440" role="img" aria-labelledby="title desc">
+  <title id="title">CodexBridge — One Codex. Many models.</title>
+  <desc id="desc">A local multi-model gateway for Codex. GPT, DeepSeek, Kimi and your own routes, in one model picker.</desc>
+  <rect x="1" y="1" width="1278" height="438" rx="26" fill="#101416" stroke="#293336" stroke-width="2"/>
+  <g font-family="Segoe UI,Arial,sans-serif">
+    <rect x="48" y="43" width="48" height="48" rx="12" fill="#d9f5e9"/>
+    <text x="72" y="74" fill="#0f4032" font-size="22" font-weight="800" text-anchor="middle">CB</text>
+    <text x="112" y="75" fill="#f4f7f6" font-size="23" font-weight="700">CodexBridge</text>
+    <rect x="1030" y="49" width="201" height="34" rx="17" fill="#19241f" stroke="#304139"/>
+    <circle cx="1050" cy="66" r="4" fill="#71d6a7"/>
+    <text x="1065" y="71" fill="#c4d7ce" font-size="12" font-weight="700" letter-spacing="2">RUNS LOCALLY</text>
+    <text x="640" y="205" fill="#ffffff" font-size="78" font-weight="800" text-anchor="middle" letter-spacing="-2">One Codex.</text>
+    <text x="640" y="292" fill="#ffffff" font-size="78" font-weight="800" text-anchor="middle" letter-spacing="-2">Many models.</text>
+    <text x="640" y="337" fill="#b9c6c8" font-size="20" text-anchor="middle">GPT · DeepSeek · Kimi · your own routes</text>
+    <path d="M953 253 H1012 Q1050 253 1050 215 V184 Q1050 142 1092 142 H1184" fill="none" stroke="#536963" stroke-width="2"/>
+    <circle cx="1184" cy="142" r="5" fill="#71d6a7"/>
+    <path d="M84 250 H166 Q202 250 202 284 V306" fill="none" stroke="#33433e" stroke-width="2"/>
+    <circle cx="84" cy="250" r="4" fill="#809a8f"/>
+    <path d="M48 375 H1231" stroke="#2b3538"/>
+    <text x="49" y="407" fill="#b0bdbf" font-size="11" font-weight="600" letter-spacing="2">ONE MODEL PICKER. YOUR LOCAL WORKFLOW.</text>
+    <text x="1230" y="407" fill="#b0bdbf" font-size="11" font-weight="600" letter-spacing="2" text-anchor="end">OPEN SOURCE · MIT</text>
+  </g>
+</svg>
