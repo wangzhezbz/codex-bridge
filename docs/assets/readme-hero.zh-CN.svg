@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="440" viewBox="0 0 1280 440" role="img" aria-labelledby="title desc">
+  <title id="title">CodexBridge — 一个 Codex，连接更多模型。</title>
+  <desc id="desc">Codex 本地多模型网关。在一个模型栏中使用 GPT、DeepSeek、Kimi 和自定义模型，保留你的本地工作流。</desc>
+  <rect x="1" y="1" width="1278" height="438" rx="26" fill="#101416" stroke="#293336" stroke-width="2"/>
+  <g font-family="Segoe UI,Microsoft YaHei,PingFang SC,Noto Sans CJK SC,sans-serif">
+    <rect x="48" y="43" width="48" height="48" rx="12" fill="#d9f5e9"/>
+    <text x="72" y="74" fill="#0f4032" font-size="22" font-weight="800" text-anchor="middle">CB</text>
+    <text x="112" y="75" fill="#f4f7f6" font-size="23" font-weight="700">CodexBridge</text>
+    <rect x="1080" y="49" width="151" height="34" rx="17" fill="#19241f" stroke="#304139"/>
+    <circle cx="1100" cy="66" r="4" fill="#71d6a7"/>
+    <text x="1115" y="71" fill="#c4d7ce" font-size="14" font-weight="700" letter-spacing="1">本地运行</text>
+    <text x="640" y="205" fill="#ffffff" font-size="78" font-weight="800" text-anchor="middle">一个 Codex。</text>
+    <text x="640" y="292" fill="#ffffff" font-size="78" font-weight="800" text-anchor="middle">连接更多模型。</text>
+    <text x="640" y="337" fill="#b9c6c8" font-size="20" text-anchor="middle">GPT · DeepSeek · Kimi · 自定义模型</text>
+    <path d="M953 253 H1012 Q1050 253 1050 215 V184 Q1050 142 1092 142 H1184" fill="none" stroke="#536963" stroke-width="2"/>
+    <circle cx="1184" cy="142" r="5" fill="#71d6a7"/>
+    <path d="M84 250 H166 Q202 250 202 284 V306" fill="none" stroke="#33433e" stroke-width="2"/>
+    <circle cx="84" cy="250" r="4" fill="#809a8f"/>
+    <path d="M48 375 H1231" stroke="#2b3538"/>
+    <text x="49" y="407" fill="#b0bdbf" font-size="14" font-weight="600">一个模型栏，保留你的本地工作流。</text>
+    <text x="1230" y="407" fill="#b0bdbf" font-size="14" font-weight="600" text-anchor="end">开源 · MIT 许可</text>
+  </g>
+</svg>

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/readme-hero.svg" width="100%" alt="CodexBridge — One Codex. Many models. 一个 Codex，多个模型。" />
+  <img src="docs/assets/readme-hero.zh-CN.svg" width="100%" alt="CodexBridge — 一个 Codex，连接更多模型。" />
 </p>
 
 <p align="center">
